@@ -1,4 +1,4 @@
-use crate::model::{Embed, Message, Reaction, ReplyPreview};
+use crate::model::{Attachment, Embed, Message, Reaction, ReplyPreview};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -47,6 +47,7 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN is_own INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE messages ADD COLUMN avatar_url TEXT",
             "ALTER TABLE messages ADD COLUMN embeds TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN sender_id TEXT",
         ] {
             let _ = conn.execute(stmt, []);
@@ -70,6 +71,7 @@ impl Store {
         is_own: bool,
         avatar_url: Option<&str>,
         embeds: &[Embed],
+        attachments: &[Attachment],
         sender_id: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -79,9 +81,10 @@ impl Store {
         // Discord's message-list response already reports.
         let reactions_json = if initial_reactions.is_empty() { None } else { Some(serde_json::to_string(initial_reactions)?) };
         let embeds_json = if embeds.is_empty() { None } else { Some(serde_json::to_string(embeds)?) };
+        let attachments_json = if attachments.is_empty() { None } else { Some(serde_json::to_string(attachments)?) };
         conn.execute(
-            "INSERT INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16)",
+            "INSERT INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'))",
             params![
                 msg_id,
                 buffer_id,
@@ -99,6 +102,7 @@ impl Store {
                 avatar_url,
                 embeds_json,
                 sender_id,
+                attachments_json,
             ],
         )?;
         Ok(())
@@ -109,12 +113,13 @@ impl Store {
     /// false (a harmless no-op for the caller) if the message was never
     /// recorded locally in the first place - editing something outside
     /// our loaded history isn't something there's a visible row to update.
-    pub fn update_message_body(&self, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed]) -> Result<bool> {
+    pub fn update_message_body(&self, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let embeds_json = serde_json::to_string(embeds)?;
+        let attachments_json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
-            "UPDATE messages SET body = ?1, edited = 1, embeds = ?4 WHERE buffer_id = ?2 AND msg_id = ?3",
-            params![body, buffer_id, msg_id, embeds_json],
+            "UPDATE messages SET body = ?1, edited = 1, embeds = ?4, attachments = ?5 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![body, buffer_id, msg_id, embeds_json, attachments_json],
         )?;
         Ok(rows > 0)
     }
@@ -217,7 +222,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -235,6 +240,8 @@ impl Store {
             let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
             let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
             let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
+            let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
+            let attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
             Ok(Message {
                 id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 buffer_id: buffer_id.to_string(),
@@ -250,6 +257,7 @@ impl Store {
                 is_own: row.get::<_, i64>(12)? != 0,
                 avatar_url: row.get(13)?,
                 embeds,
+                attachments,
                 sender_id: row.get(15)?,
             })
         })?;
@@ -268,7 +276,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
@@ -285,6 +293,8 @@ impl Store {
             let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
             let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
             let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
+            let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
+            let attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
             Ok(Message {
                 id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 buffer_id: buffer_id.to_string(),
@@ -300,6 +310,7 @@ impl Store {
                 is_own: row.get::<_, i64>(12)? != 0,
                 avatar_url: row.get(13)?,
                 embeds,
+                attachments,
                 sender_id: row.get(15)?,
             })
         })?;

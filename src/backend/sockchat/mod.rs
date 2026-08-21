@@ -438,14 +438,14 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
         // actually stored (e.g. this is the first time we've ever seen it,
         // and it just happens to already carry prior edit history) does
         // it fall through to being recorded as an ordinary new message.
-        if m.message_edit_date > 0 && !m.message_uuid.is_empty() && state.runtime.update_message(state, &buffer_id, &m.message_uuid, &body, &[]) {
+        if m.message_edit_date > 0 && !m.message_uuid.is_empty() && state.runtime.update_message(state, &buffer_id, &m.message_uuid, &body, &[], &[]) {
             continue;
         }
         // Always attributed to the room this specific connection is
         // joined to, rather than trusting the wire's own room_id - this
         // connection should only ever see traffic for its own room anyway.
         let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
-        state.runtime.record_message(state, account_id, buffer_name, "channel", &m.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), None);
+        state.runtime.record_message(state, account_id, buffer_name, "channel", &m.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), Vec::new(), None);
         // Only for messages with a real, stable id - nothing to re-target
         // a later body-patch at otherwise (see spawn_attachment_resolve).
         if !m.message_uuid.is_empty() {
@@ -462,7 +462,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
                     None => None,
                 };
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                state.runtime.record_message(state, account_id, "Whispers", "dm", &w.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), None);
+                state.runtime.record_message(state, account_id, "Whispers", "dm", &w.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), Vec::new(), None);
                 if !w.message_uuid.is_empty() {
                     spawn_attachment_resolve(state.clone(), http.clone(), crate::model::buffer_id(account_id, "Whispers"), w.message_uuid.clone(), body);
                 }

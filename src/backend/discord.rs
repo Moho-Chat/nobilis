@@ -17,7 +17,7 @@
 //! surface) often enough in a long-running session that a human had to
 //! notice and manually reconnect every time - not viable long-term.
 use crate::accounts::DiscordAccountConfig;
-use crate::model::{self, Embed, Reaction, ReplyPreview};
+use crate::model::{self, Attachment, Embed, Reaction, ReplyPreview};
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Context, Result};
@@ -664,13 +664,6 @@ fn extract_body(d: &Value) -> Option<String> {
     if !content.is_empty() {
         parts.push(content.to_string());
     }
-    if let Some(atts) = d["attachments"].as_array() {
-        for att in atts {
-            if let Some(url) = att["url"].as_str() {
-                parts.push(url.to_string());
-            }
-        }
-    }
     if let Some(embeds) = d["embeds"].as_array() {
         for embed in embeds {
             if let Some(url) = embed["video"]["url"].as_str() {
@@ -689,6 +682,37 @@ fn extract_body(d: &Value) -> Option<String> {
     } else {
         Some(parts.join("\n"))
     }
+}
+
+/// Discord's own `attachments` array, kept structured instead of being
+/// flattened into body text. Discord already reports filename, size,
+/// dimensions and content type per file, so there is nothing to infer - and
+/// unlike Matrix or Sneedchat these URLs are directly loadable by a frontend,
+/// so no local cache copy is needed and `path` stays unset.
+fn extract_attachments(d: &Value) -> Vec<Attachment> {
+    let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
+    atts.iter()
+        .filter_map(|att| {
+            let url = att["url"].as_str()?;
+            let mimetype = att["content_type"].as_str().map(str::to_string);
+            let kind = match mimetype.as_deref().unwrap_or("") {
+                m if m.starts_with("image/") => "image",
+                m if m.starts_with("video/") => "video",
+                m if m.starts_with("audio/") => "audio",
+                _ => "file",
+            };
+            Some(Attachment {
+                kind: kind.to_string(),
+                filename: att["filename"].as_str().map(str::to_string),
+                size: att["size"].as_u64(),
+                width: att["width"].as_u64().map(|v| v as u32),
+                height: att["height"].as_u64().map(|v| v as u32),
+                url: Some(url.to_string()),
+                mimetype,
+                ..Default::default()
+            })
+        })
+        .collect()
 }
 
 /// A rich embed's title/description/color/timestamp/url, structured
@@ -803,6 +827,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
         let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown");
         let is_own = author["id"].as_str() == Some(user_id);
         let embeds = extract_embeds(msg);
+        let attachments = extract_attachments(msg);
         let body = extract_body(msg).unwrap_or_default();
         if body.is_empty() && embeds.is_empty() {
             continue;
@@ -816,7 +841,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, None) {
+        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, None) {
             tracing::warn!("discord: storing history message: {e}");
         }
     }
@@ -1225,6 +1250,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             .unwrap_or("unknown")
                             .to_string();
                         let embeds = extract_embeds(d);
+                        let attachments = extract_attachments(d);
                         let body = extract_body(d).unwrap_or_default();
                         if body.is_empty() && embeds.is_empty() {
                             continue;
@@ -1243,7 +1269,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         // Discord's own id through (rather than letting
                         // record_message generate one) is what lets a later
                         // edit/delete/reaction on this exact message find it.
-                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, None);
+                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, None);
                     }
                     "MESSAGE_UPDATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
@@ -1257,10 +1283,11 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             continue;
                         }
                         let embeds = extract_embeds(d);
+                        let attachments = extract_attachments(d);
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
-                        state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds);
+                        state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);
                     }
                     "MESSAGE_DELETE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
@@ -1465,7 +1492,59 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
 
 #[cfg(test)]
 mod tests {
-    use super::reaction_path_segment;
+    use super::{extract_attachments, extract_body, reaction_path_segment};
+    use serde_json::json;
+
+    #[test]
+    fn keeps_discord_attachment_metadata_instead_of_flattening_it_to_a_url() {
+        let d = json!({
+            "content": "look at this",
+            "attachments": [{
+                "url": "https://cdn.discordapp.com/attachments/1/2/cat.png",
+                "filename": "cat.png",
+                "size": 12345,
+                "width": 800,
+                "height": 600,
+                "content_type": "image/png"
+            }]
+        });
+        let atts = extract_attachments(&d);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].kind, "image");
+        assert_eq!(atts[0].filename.as_deref(), Some("cat.png"));
+        assert_eq!(atts[0].mimetype.as_deref(), Some("image/png"));
+        assert_eq!(atts[0].size, Some(12345));
+        assert_eq!((atts[0].width, atts[0].height), (Some(800), Some(600)));
+        // Directly loadable, so no local copy is made.
+        assert!(atts[0].path.is_none());
+
+        // The body keeps what the user actually typed - the attachment URL is
+        // no longer appended to it.
+        assert_eq!(extract_body(&d).as_deref(), Some("look at this"));
+    }
+
+    #[test]
+    fn classifies_non_image_attachments_by_content_type() {
+        let d = json!({ "attachments": [
+            { "url": "https://cdn/x.mp4", "content_type": "video/mp4" },
+            { "url": "https://cdn/x.ogg", "content_type": "audio/ogg" },
+            { "url": "https://cdn/x.zip", "content_type": "application/zip" },
+            { "url": "https://cdn/x.bin" }
+        ]});
+        let atts = extract_attachments(&d);
+        let kinds: Vec<&str> = atts.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["video", "audio", "file", "file"]);
+    }
+
+    #[test]
+    fn an_attachment_only_message_still_has_a_renderable_body_or_attachments() {
+        // No text at all: the body is now empty rather than being the URL, so
+        // the attachment list is the only thing carrying the message.
+        let d = json!({ "content": "", "attachments": [{ "url": "https://cdn/a.png", "content_type": "image/png" }] });
+        assert!(extract_body(&d).is_none());
+        assert_eq!(extract_attachments(&d).len(), 1);
+    }
+
 
     #[test]
     fn unwraps_a_static_custom_emoji() {

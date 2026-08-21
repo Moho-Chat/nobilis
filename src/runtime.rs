@@ -1,5 +1,5 @@
 use crate::accounts::irc_account_to_json;
-use crate::model::{self, Account, Buffer, Embed, Message, ReplyPreview};
+use crate::model::{self, Account, Attachment, Buffer, Embed, Message, ReplyPreview};
 use crate::state::AppState;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -965,6 +965,7 @@ impl Runtime {
         force_highlight: bool,
         avatar_url: Option<String>,
         embeds: Vec<Embed>,
+        attachments: Vec<Attachment>,
         sender_id: Option<String>,
     ) {
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
@@ -998,7 +999,7 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        if let Err(e) = state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, sender_id.as_deref()) {
+        if let Err(e) = state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref()) {
             tracing::warn!("failed to persist message: {e}");
         }
 
@@ -1035,6 +1036,7 @@ impl Runtime {
             is_own,
             avatar_url: avatar_url.clone(),
             embeds,
+            attachments,
             sender_id,
         };
         state.events.emit("message", serde_json::to_value(&message).unwrap());
@@ -1063,10 +1065,10 @@ impl Runtime {
     /// when an "edit" (a message_edit_date bump) arrives for a uuid it
     /// never actually stored, e.g. seeing a message for the first time
     /// that already carries prior edit history.
-    pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed]) -> bool {
-        match state.store.update_message_body(buffer_id, msg_id, body, embeds) {
+    pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
+        match state.store.update_message_body(buffer_id, msg_id, body, embeds, attachments) {
             Ok(true) => {
-                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "embeds": embeds }));
+                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "embeds": embeds, "attachments": attachments }));
                 true
             }
             Ok(false) => false,

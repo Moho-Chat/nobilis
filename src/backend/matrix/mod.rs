@@ -33,6 +33,7 @@ pub mod verification;
 
 use crate::accounts::MatrixAccountConfig;
 use crate::model;
+use crate::model::Attachment;
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use anyhow::{Context, Result};
@@ -510,41 +511,37 @@ async fn handle_timeline_event(
         }
         let (new_body, _) = protocol::message_body(protocol::edit_new_content(&content));
         if !new_body.is_empty() {
-            state.runtime.update_message(state, buffer_id, target_event, &new_body, &[]);
+            state.runtime.update_message(state, buffer_id, target_event, &new_body, &[], &[]);
         }
         return;
     }
 
+    // Media travels as a described attachment, not as text: Matrix already
+    // separates the two (`body` is the filename, the bytes are behind an mxc
+    // URI plus an `info` block), and every Matrix client from Element down
+    // keeps them separate. Fetching is still ours to do - a frontend has no
+    // access token, and for an encrypted room the server only holds
+    // ciphertext - so the bytes land in the local cache and the attachment
+    // reports that path, the same shape matrix-rust-sdk hands a client.
+    let mut attachments: Vec<Attachment> = Vec::new();
     let (mut body, is_action) = if undecryptable {
         ("[unable to decrypt message]".to_string(), false)
     } else if let Some(mxc) = protocol::media_mxc_uri(&content) {
         let ext = extension_for_mimetype(content["info"]["mimetype"].as_str().unwrap_or(""));
-        let body = match cached_media_path(homeserver_url, access_token, mxc, ext).await {
-            // Swapped in for the plain filename body - the frontend's
-            // existing generic URL-based media detector picks up the
-            // resulting file:// URL automatically,
-            // same trick backend/discord.rs's QR code and backend/sockchat's
-            // avatar caching already use for content a plain <Image>
-            // element has no route to fetch (here: no Bearer auth header) -
-            // *if* it has a real extension for that detector's own
-            // extension-regex check to match (see extension_for_mimetype's
-            // own doc comment on why this needs to be threaded through
-            // explicitly rather than left off like the mxc id itself is).
-            Some(path) => path,
-            None => protocol::message_body(&content).0,
-        };
-        (body, false)
+        let path = cached_media_path(homeserver_url, access_token, mxc, ext).await;
+        attachments.push(build_attachment(&content, path, thumbnail_for(&content, homeserver_url, access_token).await));
+        (protocol::message_body(&content).0, false)
     } else if let Some(file) = protocol::encrypted_media_file(&content) {
         let ext = extension_for_mimetype(content["info"]["mimetype"].as_str().unwrap_or(""));
-        let body = match cached_encrypted_media_path(homeserver_url, access_token, file, ext).await {
-            Some(path) => path,
-            None => protocol::message_body(&content).0,
-        };
-        (body, false)
+        let path = cached_encrypted_media_path(homeserver_url, access_token, file, ext).await;
+        attachments.push(build_attachment(&content, path, thumbnail_for(&content, homeserver_url, access_token).await));
+        (protocol::message_body(&content).0, false)
     } else {
         protocol::message_body(&content)
     };
-    if body.is_empty() {
+    // An attachment with no caption legitimately has an empty body; dropping
+    // the message then would lose the media entirely.
+    if body.is_empty() && attachments.is_empty() {
         return;
     }
 
@@ -587,6 +584,7 @@ async fn handle_timeline_event(
         false,
         sender_avatar_url,
         Vec::new(),
+        attachments,
         Some(sender.to_string()),
     );
 }
@@ -611,14 +609,60 @@ async fn decrypt_event(session: &crypto::CryptoSession, event: &Value, room_id: 
     crypto::decrypt_room_event(session, event, &room_id).await
 }
 
+/// Turns a media event's `content` into an Attachment, carrying across the
+/// `info` block Matrix already provides - mimetype, size, intrinsic
+/// dimensions and blurhash - rather than reducing all of it to a file path.
+/// The dimensions in particular let a frontend reserve layout space before
+/// any bytes arrive, which is why Element's timeline doesn't reflow as
+/// images load.
+fn build_attachment(content: &Value, path: Option<String>, thumbnail_path: Option<String>) -> Attachment {
+    let info = &content["info"];
+    let mimetype = info["mimetype"].as_str().map(str::to_string);
+    Attachment {
+        kind: match content["msgtype"].as_str().unwrap_or("") {
+            "m.image" => "image",
+            "m.video" => "video",
+            "m.audio" => "audio",
+            _ => "file",
+        }
+        .to_string(),
+        filename: content["body"].as_str().map(str::to_string),
+        size: info["size"].as_u64(),
+        width: info["w"].as_u64().map(|v| v as u32),
+        height: info["h"].as_u64().map(|v| v as u32),
+        // MSC2448, still under its unstable prefix on most servers.
+        blurhash: info["xyz.amorgan.blurhash"].as_str().or_else(|| info["blurhash"].as_str()).map(str::to_string),
+        mimetype,
+        path,
+        thumbnail_path,
+        url: None,
+    }
+}
+
+/// Fetches the server-generated thumbnail a media event points at, when it
+/// has one. Preferring this for previews is what keeps a timeline from
+/// pulling full-size originals off the homeserver just to draw something
+/// small - the same reason Element requests the thumbnail endpoint.
+async fn thumbnail_for(content: &Value, homeserver_url: &str, access_token: &str) -> Option<String> {
+    let info = &content["info"];
+    // Encrypted rooms carry the thumbnail as its own EncryptedFile rather
+    // than a plain mxc URI, and it needs the same decrypt path as the body.
+    if let Some(file) = info.get("thumbnail_file").filter(|v| v.is_object()) {
+        return cached_encrypted_media_path(homeserver_url, access_token, file, "").await;
+    }
+    let mxc = info["thumbnail_url"].as_str()?;
+    cached_media_path(homeserver_url, access_token, mxc, "").await
+}
+
 /// Matrix's own mxc:// media ids carry no file extension - unlike
 /// backend/sockchat/mod.rs's cached attachments, which keep whatever
-/// extension the original filename already had. Without a real extension
-/// on the cached file, the client's media detector (a plain URL-pattern
-/// classifier, not a content-type prober for file:// paths - deliberately
-/// so, since those are always nobilis's own already-fetched output rather
-/// than something worth a network round trip to classify) never
-/// recognizes the resulting file:// path as embeddable media at all - the
+/// extension the original filename already had. The cached file still gets a
+/// real extension so that anything reading it off disk (an image viewer the
+/// user opens it in, a frontend sniffing by name) sees the right type - but
+/// this is now a detail of how the cache is named, not something the wire
+/// contract depends on: the mimetype travels on the attachment itself.
+/// Historically this existed because the client classified media by URL
+/// pattern - the
 /// same class of bug already fixed once for Discord/klipy's own
 /// extensionless CDN URLs (see opaqueImageHosts there), just hit again
 /// here from a different direction (no extension at all, rather than an
@@ -1247,6 +1291,60 @@ async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, usern
 mod tests {
     use super::*;
     use crate::state::AppState;
+
+    #[test]
+    fn carries_the_matrix_info_block_onto_the_attachment() {
+        // Matrix already describes media properly; the point of build_attachment
+        // is to stop throwing that description away.
+        let content = serde_json::json!({
+            "msgtype": "m.image",
+            "body": "holiday.jpg",
+            "url": "mxc://example.org/abc",
+            "info": {
+                "mimetype": "image/jpeg",
+                "size": 148213,
+                "w": 1920,
+                "h": 1080,
+                "xyz.amorgan.blurhash": "LEHV6nWB2yk8"
+            }
+        });
+        let a = build_attachment(&content, Some("file:///cache/abc.jpg".into()), None);
+        assert_eq!(a.kind, "image");
+        assert_eq!(a.mimetype.as_deref(), Some("image/jpeg"));
+        // `body` is the filename in Matrix, which is exactly what it is here.
+        assert_eq!(a.filename.as_deref(), Some("holiday.jpg"));
+        assert_eq!(a.size, Some(148213));
+        assert_eq!((a.width, a.height), (Some(1920), Some(1080)));
+        assert_eq!(a.blurhash.as_deref(), Some("LEHV6nWB2yk8"));
+        assert_eq!(a.path.as_deref(), Some("file:///cache/abc.jpg"));
+    }
+
+    #[test]
+    fn maps_every_media_msgtype_to_a_renderer_kind() {
+        for (msgtype, want) in [
+            ("m.image", "image"),
+            ("m.video", "video"),
+            ("m.audio", "audio"),
+            ("m.file", "file"),
+        ] {
+            let content = serde_json::json!({ "msgtype": msgtype, "body": "x", "info": {} });
+            assert_eq!(build_attachment(&content, None, None).kind, want, "for {msgtype}");
+        }
+    }
+
+    #[test]
+    fn an_unfetched_attachment_still_describes_itself() {
+        // A failed or pending download must not lose the metadata - a frontend
+        // can still show a placeholder of the right size and offer a retry.
+        let content = serde_json::json!({
+            "msgtype": "m.image", "body": "big.png",
+            "info": { "mimetype": "image/png", "w": 640, "h": 480 }
+        });
+        let a = build_attachment(&content, None, None);
+        assert!(a.path.is_none());
+        assert_eq!((a.width, a.height), (Some(640), Some(480)));
+        assert_eq!(a.filename.as_deref(), Some("big.png"));
+    }
 
     /// Phase-2 live check: real login, a fresh private room created for
     /// the test (a throwaway account has no rooms of its own, and posting

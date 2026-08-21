@@ -132,7 +132,7 @@ pub fn announce_membership_changes(state: &AppState, account_id: &str, buffer_na
             continue;
         }
         let Some((kind, body)) = classify_membership_change(event) else { continue };
-        state.runtime.record_message(state, account_id, buffer_name, buffer_kind, "*", &body, false, kind, None, None, false, None, Vec::new(), None);
+        state.runtime.record_message(state, account_id, buffer_name, buffer_kind, "*", &body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
     }
 }
 

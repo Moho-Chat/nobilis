@@ -358,7 +358,7 @@ async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut Clien
                     Command::Response(code, args) if is_connection_banner(*code) => {
                         if let Some(text) = banner_text(*code, args) {
                             let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                            state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), None);
+                            state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                         }
                         if matches!(code, Response::RPL_WELCOME) {
                             return Ok(());
@@ -429,9 +429,9 @@ async fn handle_message(
                 (from.clone(), "dm")
             };
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
             } else {
-                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
 
@@ -453,10 +453,10 @@ async fn handle_message(
                 wait.notice(&from, &body);
             }
             if is_channel(&target) {
-                state.runtime.record_message(state, account_id, &target, "channel", &from, &body, false, "chat", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, &target, "channel", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
             } else {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", &from, &body, false, "system", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, host, "server", &from, &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
 
@@ -515,14 +515,14 @@ async fn handle_message(
         Command::Response(Response::RPL_TOPIC, args) => {
             if let (Some(channel), Some(topic)) = (args.get(1), args.get(2)) {
                 let body = format!("Topic for {channel}: {topic}");
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
 
         // A live topic change while we're in the channel.
         Command::TOPIC(channel, Some(topic)) => {
             let body = format!("{from} changed the topic to: {topic}");
-            state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), None);
+            state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
         }
 
         // Connection banner (001-005), LUSERS (251-255, 265-266), and MOTD
@@ -535,7 +535,7 @@ async fn handle_message(
         Command::Response(code, args) if is_connection_banner(code) => {
             if let Some(text) = banner_text(code, &args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
 
@@ -548,7 +548,7 @@ async fn handle_message(
         Command::Response(code, args) if is_channel_error(code) => {
             if let Some(text) = channel_error_text(&args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
 
@@ -667,7 +667,7 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
             "me" => {
                 sender.send_action(target_buffer, arg)?;
                 let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
-                state.runtime.record_message(state, account_id, target_buffer, buffer_kind_hint(target_buffer), &own_nick, arg, true, "chat", None, None, false, None, Vec::new(), None);
+                state.runtime.record_message(state, account_id, target_buffer, buffer_kind_hint(target_buffer), &own_nick, arg, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
                 Ok(())
             }
             "nick" => sender.send(Command::NICK(arg.to_string())).map_err(|e| anyhow!(e)),
@@ -728,7 +728,7 @@ fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str,
     // back to us - record it locally, same as libpurple's write_im/
     // write_chat firing for locally-sent messages too.
     let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
-    state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), None);
+    state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
     Ok(())
 }
 

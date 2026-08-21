@@ -143,6 +143,61 @@ pub struct Embed {
     pub url: Option<String>,
 }
 
+/// A file attached to a message, described rather than inlined.
+///
+/// Modelled on how Matrix itself carries media and how matrix-rust-sdk hands
+/// it to a client: the metadata travels beside the message, and the bytes are
+/// resolved separately into a local cache file whose path is reported here.
+/// The message body keeps whatever text the protocol actually sent (for Matrix
+/// media that is the filename), so a frontend never has to reverse-engineer an
+/// attachment back out of prose.
+///
+/// Every protocol that has attachments already describes them this way -
+/// Matrix in `content.info`, Discord in its `attachments` array - so this is
+/// mostly a matter of not throwing that structure away.
+///
+/// `path`/`thumbnail_path` are local `file://` URLs, present once the daemon
+/// has fetched the bytes. They are the only route a frontend has to media
+/// behind Tor, a Matrix access token, or E2EE decryption - the same reason
+/// matrix-rust-sdk returns a temp-file handle rather than a URL.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Attachment {
+    /// "image" | "video" | "audio" | "file" - the broad shape, so a frontend
+    /// can choose a renderer without parsing mimetypes itself.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
+    /// The original filename, where the protocol supplies one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    /// Intrinsic pixel dimensions, when known. A frontend can reserve layout
+    /// space with these before any bytes arrive, which is what stops a message
+    /// list reflowing as images load.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// A compact placeholder to paint while the real image loads (Matrix's
+    /// blurhash, where the sender provided one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blurhash: Option<String>,
+    /// Locally cached full-size media.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Locally cached thumbnail, when the protocol offers one. Preferring this
+    /// for previews avoids pulling a full-size original over Tor or off a
+    /// homeserver just to draw a small image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_path: Option<String>,
+    /// The remote URL, for "open the original" and for re-fetching after a
+    /// cache sweep. Not directly loadable by a frontend for Sneedchat (Tor)
+    /// or Matrix (auth), which is what `path` is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// Matches Message JSON (daemon/nobilis/uiops_conv.c + store.c's row shape).
 #[derive(Serialize, Clone, Debug)]
 pub struct Message {
@@ -181,6 +236,10 @@ pub struct Message {
     /// dumping an embed's title/description into `body` as plain text.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub embeds: Vec<Embed>,
+    /// Files attached to this message, described rather than inlined into
+    /// `body` - see Attachment.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     /// The sender's real protocol-level id (Matrix only - a full MXID like
     /// `@user:server`, as opposed to `from`'s display name, which can
     /// collide between users or be a locally-set nickname unrelated to
