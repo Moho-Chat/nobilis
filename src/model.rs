@@ -189,7 +189,7 @@ pub struct Attachment {
     /// Locally cached thumbnail, when the protocol offers one. Preferring this
     /// for previews avoids pulling a full-size original over Tor or off a
     /// homeserver just to draw a small image.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "thumbnailPath", skip_serializing_if = "Option::is_none")]
     pub thumbnail_path: Option<String>,
     /// The remote URL, for "open the original" and for re-fetching after a
     /// cache sweep. Not directly loadable by a frontend for Sneedchat (Tor)
