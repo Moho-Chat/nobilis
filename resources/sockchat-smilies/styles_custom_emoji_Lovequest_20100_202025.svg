@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Generator: Adobe Illustrator 16.0.0, SVG Export Plug-In . SVG Version: 6.00 Build 0)  -->
+
+<svg
+   version="1.1"
+   id="heart"
+   x="0px"
+   y="0px"
+   width="19.259001"
+   height="16.382"
+   viewBox="0 0 19.259001 16.382"
+   enable-background="new 0 0 20 26"
+   xml:space="preserve"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"><defs
+   id="defs6"><linearGradient
+     id="linearGradient7"><stop
+       style="stop-color:#e892ff;stop-opacity:1;"
+       offset="0"
+       id="stop7" /><stop
+       style="stop-color:#c041ff;stop-opacity:1;"
+       offset="0.40166205"
+       id="stop8" /></linearGradient><linearGradient
+     xlink:href="#linearGradient7"
+     id="linearGradient8"
+     x1="10.023384"
+     y1="5.3903284"
+     x2="9.9791183"
+     y2="19.448767"
+     gradientUnits="userSpaceOnUse"
+     gradientTransform="translate(-0.32742074,-3.8045154)" /></defs>
+
+<style
+   id="style1">
+#heart-path {
+    animation: pulse 1s steps(1, end) infinite;
+    transform-origin: center;
+    transform-box: fill-box;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        transform: scale(1);
+    }
+    50% {
+        transform: scale(1.05);
+    }
+}
+</style>
+
+<path
+   style="fill:url(#linearGradient8);fill-opacity:1;stroke:#000000;stroke-width:0.518;stroke-dasharray:none;stroke-opacity:1"
+   d="M 7.5080883,13.93675 C 4.8388814,11.800285 4.4357238,11.455191 3.2650078,10.304767 1.9491631,9.0117286 1.3957091,8.2110646 0.99066341,7.0145436 0.74957801,6.3023686 0.76764601,4.7778487 1.0261375,4.0213498 1.9662063,1.2701527 5.4888988,-0.07064003 8.235789,1.2772419 8.5658167,1.4391844 9.0251903,1.7383031 9.2566193,1.9419501 L 9.6773997,2.3122174 10.090956,1.9403955 c 0.571812,-0.5141097 1.477383,-0.9351411 2.386299,-1.10947357 0.875319,-0.1678886 1.82836,-0.092617 2.746583,0.21692637 3.20195,1.0794139 4.306732,4.6092261 2.362014,7.5467053 -0.486872,0.735417 -1.947177,2.2128344 -3.312298,3.3511124 -1.690855,1.409884 -4.5300403,3.66438 -4.6116593,3.661954 -0.03787,-0.0011 -1.0070812,-0.753018 -2.1538064,-1.67087 z"
+   id="heart-path" /><g
+   id="g6"
+   transform="matrix(0.88777101,0,0,0.88777101,0.81591221,-2.5737562)">
+	<path
+   fill="#ffffff"
+   d="M 3.065,9.695 2.915,8.999 3.768,8.25 V 8.247 h 1.136 v 5.438 H 3.764 L 3.768,9.693 Z"
+   id="path3" />
+	<path
+   fill="#ffffff"
+   d="M 8.582,12.937 7.774,13.686 H 5.358 V 8.996 L 6.171,8.248 H 8.582 Z M 6.502,9.281 v 3.373 h 0.94 V 9.281 Z"
+   id="path4" />
+	<path
+   fill="#ffffff"
+   d="m 12.206,12.937 -0.808,0.749 H 8.984 V 8.996 L 9.796,8.248 h 2.41 z M 10.127,9.281 v 3.373 h 0.939 V 9.281 Z"
+   id="path5" />
+	<path
+   fill="#ffffff"
+   d="M 14.658,10.27 14.12,10.974 H 12.609 V 8.951 l 0.578,-0.704 h 1.471 z m -1.736,3.126 3.835,-5.186 0.44,0.305 -3.881,5.208 z m 0.458,-3.115 h 0.517 V 8.939 H 13.38 Z m 4.08,2.7 -0.575,0.705 H 15.41 v -2.024 l 0.538,-0.704 h 1.512 z m -1.286,0.011 h 0.523 V 11.65 h -0.523 z"
+   id="path6" />
+</g>
+
+
+</svg>
