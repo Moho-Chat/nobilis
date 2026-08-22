@@ -228,6 +228,7 @@ async fn run_housekeeping(state: AppState) {
         backend::sockchat::sweep_avatar_cache().await;
         backend::sockchat::sweep_attachment_cache().await;
         backend::matrix::sweep_media_cache().await;
+        backend::discord::sweep_thumbnail_cache().await;
 
         tokio::time::sleep(backend::sockchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
     }

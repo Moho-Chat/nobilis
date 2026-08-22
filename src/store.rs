@@ -135,6 +135,19 @@ impl Store {
         Ok(rows > 0)
     }
 
+    /// Replaces a message's attachment list without touching its text or
+    /// marking it edited - for a cached preview arriving, or links being
+    /// re-signed after they expired. Neither is a change the sender made.
+    pub fn update_message_attachments(&self, buffer_id: &str, msg_id: &str, attachments: &[Attachment]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(attachments)?;
+        let rows = conn.execute(
+            "UPDATE messages SET attachments = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![json, buffer_id, msg_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Discord's MESSAGE_DELETE - removes the row outright (Discord's own
     /// clients don't show a tombstone either, they just remove it).
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {

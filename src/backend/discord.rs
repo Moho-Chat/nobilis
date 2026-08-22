@@ -873,6 +873,191 @@ fn extract_body(d: &Value) -> Option<String> {
     }
 }
 
+/// Downloads a preview of each image attachment and records where it landed.
+///
+/// Runs in the background rather than inline: a message should appear the
+/// moment it arrives, not after its picture has been fetched. The stored
+/// message is updated once the copies exist, and the change is broadcast so
+/// anything already showing that message picks them up.
+pub fn cache_thumbnails(state: AppState, buffer_id: String, msg_id: String, attachments: Vec<Attachment>) {
+    if !attachments.iter().any(|a| a.kind == "image" && a.thumbnail_path.is_none()) {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut updated = attachments;
+        let mut any = false;
+        for att in &mut updated {
+            if att.kind != "image" || att.thumbnail_path.is_some() {
+                continue;
+            }
+            let Some(url) = att.url.as_deref() else { continue };
+            let Some(src) = thumbnail_source(url, att.width.unwrap_or(0), att.height.unwrap_or(0)) else { continue };
+            if let Some(path) = fetch_thumbnail(&src, url).await {
+                att.thumbnail_path = Some(path);
+                any = true;
+            }
+        }
+        if !any {
+            return;
+        }
+        // Not an edit: the message text is untouched, only where its preview
+        // can be found locally.
+        if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &updated) {
+            tracing::debug!("discord: recording thumbnails: {e}");
+            return;
+        }
+        state.events.emit(
+            "messageUpdated",
+            json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "attachments": updated }),
+        );
+    });
+}
+
+async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String> {
+    let dir = thumbnail_cache_dir();
+    // Keyed by the *unsigned* part of the URL - the signature changes on every
+    // refresh, so including it would cache the same picture repeatedly.
+    let stable = cache_key.split('?').next().unwrap_or(cache_key);
+    let mut hasher = Sha256::new();
+    hasher.update(stable.as_bytes());
+    let path = dir.join(format!("{:x}", hasher.finalize()));
+
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Some(format!("file://{}", path.display()));
+    }
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), http_client().get(src).send())
+        .await
+        .ok()?
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    tokio::fs::write(&path, &bytes).await.ok()?;
+    Some(format!("file://{}", path.display()))
+}
+
+/// Re-signs a message's attachment links by asking Discord for the message
+/// again.
+///
+/// Discord signs CDN links when it serves them, so a fresh read of the same
+/// message carries fresh signatures - which is the way in, because the
+/// dedicated `/attachments/refresh-urls` endpoint refuses this backend's
+/// user-token requests outright (see message_link's doc comment). The
+/// messages endpoint used here is the same one history paging already uses,
+/// so it is known to work with this token.
+///
+/// `around` rather than fetching the message by id directly: the single
+/// message endpoint is bot-only, while `around` is what a user client uses.
+pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: &str) -> Result<Vec<Attachment>> {
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
+
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", "1"), ("around", message_id)])
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .context("re-fetching the message")?;
+    if !resp.status().is_success() {
+        bail!("Discord refused the request ({})", resp.status());
+    }
+    let messages: Vec<Value> = resp.json().await.context("parsing the re-fetched message")?;
+    let message = messages
+        .iter()
+        .find(|m| m["id"].as_str() == Some(message_id))
+        .context("Discord no longer has that message")?;
+
+    let attachments = extract_attachments(message);
+    if attachments.is_empty() {
+        bail!("that message no longer has any attachments");
+    }
+    // Keep whatever previews were already cached - they are keyed by the
+    // unsigned URL, so they stay valid across a re-sign.
+    let attachments = match state.store.get_message(buffer_id, message_id) {
+        Ok(Some(old)) => attachments
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut a)| {
+                if let Some(prev) = old.attachments.get(i) {
+                    a.thumbnail_path = a.thumbnail_path.or_else(|| prev.thumbnail_path.clone());
+                }
+                a
+            })
+            .collect(),
+        _ => attachments,
+    };
+
+    state.store.update_message_attachments(buffer_id, message_id, &attachments)?;
+    state.events.emit(
+        "messageUpdated",
+        json!({ "bufferId": buffer_id, "id": message_id, "edited": false, "attachments": attachments }),
+    );
+    Ok(attachments)
+}
+
+/// Where cached Discord thumbnails live. Every CDN link Discord serves is
+/// signed and lapses roughly a day later, so a message read back out of
+/// scrollback after that has a URL that no longer loads. A small local copy
+/// taken while the link still works is what lets an old message still show
+/// its picture rather than a dead box.
+fn thumbnail_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("discord-thumbnails")
+}
+
+/// Deliberately smaller than the attachment caches: these are previews, not
+/// the originals, and the full-size image is always one refresh away.
+const THUMBNAIL_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+pub async fn sweep_thumbnail_cache() {
+    super::sockchat::sweep_cache_dir(&thumbnail_cache_dir(), THUMBNAIL_CACHE_MAX_BYTES, "discord thumbnail").await;
+}
+
+/// The width to ask Discord's media proxy for. Big enough to look right in a
+/// message list at any sane window size, small enough that caching one per
+/// image is cheap.
+const THUMBNAIL_WIDTH: u32 = 480;
+
+/// Rewrites a CDN link into a resized one through Discord's media proxy,
+/// which is the same trick its own clients use for previews. Returns None for
+/// anything that isn't a Discord-hosted image, so nothing else gets proxied.
+fn thumbnail_source(url: &str, width: u32, height: u32) -> Option<String> {
+    if !url.starts_with("https://cdn.discordapp.com/") && !url.starts_with("https://media.discordapp.net/") {
+        return None;
+    }
+    let proxied = url.replacen("https://cdn.discordapp.com/", "https://media.discordapp.net/", 1);
+    // Preserve the aspect ratio: asking for a square would letterbox it.
+    let (w, h) = if width == 0 || height == 0 {
+        (THUMBNAIL_WIDTH, THUMBNAIL_WIDTH)
+    } else if width >= height {
+        (THUMBNAIL_WIDTH, (height * THUMBNAIL_WIDTH / width).max(1))
+    } else {
+        ((width * THUMBNAIL_WIDTH / height).max(1), THUMBNAIL_WIDTH)
+    };
+    let sep = if proxied.contains('?') { '&' } else { '?' };
+    Some(format!("{proxied}{sep}width={w}&height={h}"))
+}
+
+/// The `ex=` query parameter is the link's expiry, as a hex unix timestamp.
+/// Reading it lets a stale link be recognised before it is requested, rather
+/// than after a failed load.
+fn attachment_expired(url: &str) -> bool {
+    let Some(ex) = url.split(['?', '&']).find_map(|p| p.strip_prefix("ex=")) else { return false };
+    let Ok(expiry) = u64::from_str_radix(ex, 16) else { return false };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now >= expiry
+}
+
 /// Discord's own `attachments` array, kept structured instead of being
 /// flattened into body text. Discord already reports filename, size,
 /// dimensions and content type per file, so there is nothing to infer - and
@@ -1458,7 +1643,18 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         // Discord's own id through (rather than letting
                         // record_message generate one) is what lets a later
                         // edit/delete/reaction on this exact message find it.
+                        // Cache previews before the links expire, so this
+                        // message still shows its pictures when it is read
+                        // back out of scrollback tomorrow.
+                        let thumb_target = (
+                            model::buffer_id(&account_id, &buffer_name),
+                            real_msg_id.clone().unwrap_or_default(),
+                            attachments.clone(),
+                        );
                         state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, None);
+                        if !thumb_target.1.is_empty() {
+                            cache_thumbnails(state.clone(), thumb_target.0, thumb_target.1, thumb_target.2);
+                        }
                     }
                     "MESSAGE_UPDATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
@@ -1681,8 +1877,43 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_attachments, extract_body, reaction_path_segment};
+    use super::{attachment_expired, extract_attachments, extract_body, reaction_path_segment, thumbnail_source};
     use serde_json::json;
+
+    #[test]
+    fn reads_the_expiry_out_of_a_signed_cdn_link() {
+        // ex= is a hex unix timestamp. Year 2000 is long gone; year 2100 is not.
+        let past = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=386d4380&is=1&hm=2";
+        let future = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=f4143f80&is=1&hm=2";
+        assert!(attachment_expired(past));
+        assert!(!attachment_expired(future));
+        // An unsigned link has no expiry to read, so it is never "expired".
+        assert!(!attachment_expired("https://example.com/a.png"));
+    }
+
+    #[test]
+    fn builds_a_proxied_thumbnail_preserving_aspect_ratio() {
+        let src = thumbnail_source("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1", 1000, 500)
+            .expect("should proxy a Discord link");
+        // Resizing goes through the media proxy, not the raw CDN host.
+        assert!(src.starts_with("https://media.discordapp.net/"), "{src}");
+        assert!(src.contains("width=480"), "{src}");
+        assert!(src.contains("height=240"), "{src}");
+        // The existing query string is kept, not replaced.
+        assert!(src.contains("ex=1"), "{src}");
+    }
+
+    #[test]
+    fn taller_than_wide_is_bounded_by_height() {
+        let src = thumbnail_source("https://media.discordapp.net/attachments/1/2/a.png", 500, 1000).unwrap();
+        assert!(src.contains("width=240"), "{src}");
+        assert!(src.contains("height=480"), "{src}");
+    }
+
+    #[test]
+    fn only_discord_hosted_images_are_proxied() {
+        assert!(thumbnail_source("https://example.com/a.png", 10, 10).is_none());
+    }
 
     #[test]
     fn keeps_discord_attachment_metadata_instead_of_flattening_it_to_a_url() {

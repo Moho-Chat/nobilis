@@ -321,6 +321,20 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "url": url })), None)
         }
 
+        // Ask Discord for the message again so its attachment links come
+        // back freshly signed - the links expire about a day after they are
+        // issued, and the dedicated refresh endpoint refuses user tokens.
+        "refreshDiscordAttachments" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some("refreshDiscordAttachments requires \"bufferId\" and \"messageId\"".to_string())),
+            };
+            match backend::discord::refresh_attachments(state, buffer_id, message_id).await {
+                Ok(attachments) => (Some(serde_json::json!({ "attachments": attachments })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "partBuffer" => match p_str_opt(params, "bufferId") {
             None => (None, Some("no such buffer".to_string())),
             Some(buffer_id) => {

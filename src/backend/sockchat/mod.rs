@@ -502,7 +502,7 @@ pub const AVATAR_CACHE_SWEEP_INTERVAL: std::time::Duration = std::time::Duration
 /// attachment caches below - same growth problem (a permanent per-item
 /// file that's never re-checked once cached, see cached_avatar_path's and
 /// resolve_attachment's own doc comments), same fix.
-async fn sweep_cache_dir(dir: &std::path::Path, max_bytes: u64, label: &str) {
+pub async fn sweep_cache_dir(dir: &std::path::Path, max_bytes: u64, label: &str) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
 
     let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
