@@ -367,6 +367,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: Arc::new(crate::runtime::Runtime::new()),
             tor: Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         };
         let config = MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

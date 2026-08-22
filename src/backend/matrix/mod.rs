@@ -1391,6 +1391,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         let config = MatrixAccountConfig {
@@ -1502,6 +1503,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         let config = MatrixAccountConfig {
@@ -1607,6 +1609,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         let config_a = MatrixAccountConfig {
@@ -1757,6 +1760,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         let config = MatrixAccountConfig {
@@ -1906,6 +1910,7 @@ mod tests {
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
 
         let config = MatrixAccountConfig {
