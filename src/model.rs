@@ -290,3 +290,40 @@ impl MemberRank {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire contract is camelCase throughout, and a frontend reading the
+    /// wrong key sees nothing rather than an error - a mismatch here is silent
+    /// on both sides, so it gets a test rather than trust.
+    #[test]
+    fn attachment_serializes_with_camelcase_wire_names() {
+        let a = Attachment {
+            kind: "image".into(),
+            mimetype: Some("image/png".into()),
+            filename: Some("x.png".into()),
+            size: Some(1),
+            width: Some(2),
+            height: Some(3),
+            blurhash: Some("b".into()),
+            path: Some("file:///x".into()),
+            thumbnail_path: Some("file:///t".into()),
+            url: Some("https://x".into()),
+        };
+        let v = serde_json::to_value(&a).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert!(keys.contains(&"thumbnailPath"), "got {keys:?}");
+        assert!(!keys.iter().any(|k| k.contains('_')), "snake_case leaked: {keys:?}");
+    }
+
+    /// Absent fields are omitted rather than sent as null, so a frontend can
+    /// treat presence as meaning "known".
+    #[test]
+    fn empty_attachment_fields_are_omitted() {
+        let a = Attachment { kind: "file".into(), ..Default::default() };
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["kind"]);
+    }
+}
