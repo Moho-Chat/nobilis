@@ -1044,9 +1044,13 @@ async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -
             if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
                 state.events.emit(
                     "messageUpdated",
-                    json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments }),
+                    json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments.clone() }),
                 );
             }
+            // The link is valid again right now, and this message reached a
+            // re-sign because its preview was needed - so take one while it can
+            // still be fetched, and the next expiry has something to show.
+            cache_thumbnails(state.clone(), buffer_id.to_string(), id.to_string(), attachments);
             handled += 1;
         }
 
@@ -1134,8 +1138,11 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     state.store.update_message_attachments(buffer_id, message_id, &attachments)?;
     state.events.emit(
         "messageUpdated",
-        json!({ "bufferId": buffer_id, "id": message_id, "edited": false, "attachments": attachments }),
+        json!({ "bufferId": buffer_id, "id": message_id, "edited": false, "attachments": attachments.clone() }),
     );
+    // Same reasoning as the batch sweep: capture a preview while this link is
+    // freshly signed, so the next expiry is not another round-trip.
+    cache_thumbnails(state.clone(), buffer_id.to_string(), message_id.to_string(), attachments.clone());
     Ok(attachments)
 }
 
@@ -1202,6 +1209,18 @@ fn attachment_expired(url: &str) -> bool {
 /// dimensions and content type per file, so there is nothing to infer - and
 /// unlike Matrix or Sneedchat these URLs are directly loadable by a frontend,
 /// so no local cache copy is needed and `path` stays unset.
+/// Whether a Discord message carries nothing worth storing.
+///
+/// Discord emits messages that are pure protocol noise (a pin notice, a
+/// thread-created marker), and those genuinely have nothing to show. An
+/// uncaptioned picture is not one of them: its body is empty because the
+/// content is the attachment. Attachment URLs were once appended to the body,
+/// which hid this distinction - testing the body alone now drops the most
+/// ordinary kind of image post there is.
+fn is_empty_message(body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
+    body.is_empty() && embeds.is_empty() && attachments.is_empty()
+}
+
 fn extract_attachments(d: &Value) -> Vec<Attachment> {
     let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
     atts.iter()
@@ -1342,7 +1361,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
         let embeds = extract_embeds(msg);
         let attachments = extract_attachments(msg);
         let body = extract_body(msg).unwrap_or_default();
-        if body.is_empty() && embeds.is_empty() {
+        if is_empty_message(&body, &embeds, &attachments) {
             continue;
         }
         let body = resolve_mentions(&body, msg, user_id, own_display_name);
@@ -1356,7 +1375,12 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             .unwrap_or(0);
         if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, None) {
             tracing::warn!("discord: storing history message: {e}");
+            continue;
         }
+        // Backfilled messages need previews as much as live ones do - more so,
+        // since a channel read for the first time is all history and none of it
+        // would otherwise survive its links expiring.
+        cache_thumbnails(state.clone(), buffer_id.to_string(), msg_id.to_string(), attachments);
     }
 }
 
@@ -1765,7 +1789,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         let embeds = extract_embeds(d);
                         let attachments = extract_attachments(d);
                         let body = extract_body(d).unwrap_or_default();
-                        if body.is_empty() && embeds.is_empty() {
+                        if is_empty_message(&body, &embeds, &attachments) {
                             continue;
                         }
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
@@ -2017,8 +2041,8 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
 #[cfg(test)]
 mod tests {
     use super::{
-        attachment_expired, extract_attachments, extract_body, reaction_path_segment,
-        stale_message_ids, thumbnail_source,
+        attachment_expired, extract_attachments, extract_body, extract_embeds, is_empty_message,
+        reaction_path_segment, stale_message_ids, thumbnail_source,
     };
     use crate::model::{Attachment, Message};
     use serde_json::json;
@@ -2169,6 +2193,24 @@ mod tests {
         let d = json!({ "content": "", "attachments": [{ "url": "https://cdn/a.png", "content_type": "image/png" }] });
         assert!(extract_body(&d).is_none());
         assert_eq!(extract_attachments(&d).len(), 1);
+    }
+
+    #[test]
+    fn an_uncaptioned_picture_is_not_an_empty_message() {
+        // The regression this guards: moving attachment URLs out of the body
+        // made an uncaptioned image look empty, and both the live and history
+        // paths dropped it instead of storing it.
+        let d = json!({ "content": "", "attachments": [{ "url": "https://cdn/a.png", "content_type": "image/png" }] });
+        let body = extract_body(&d).unwrap_or_default();
+        assert!(!is_empty_message(&body, &extract_embeds(&d), &extract_attachments(&d)));
+    }
+
+    #[test]
+    fn a_message_with_no_text_embeds_or_attachments_is_empty() {
+        // Pin notices and thread markers really do have nothing to show.
+        let d = json!({ "content": "", "attachments": [], "embeds": [] });
+        let body = extract_body(&d).unwrap_or_default();
+        assert!(is_empty_message(&body, &extract_embeds(&d), &extract_attachments(&d)));
     }
 
 
