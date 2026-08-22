@@ -565,6 +565,62 @@ pub async fn sweep_attachment_cache() {
     sweep_cache_dir(&attachment_cache_dir(), ATTACHMENT_CACHE_MAX_BYTES, "attachment").await;
 }
 
+/// The file extension an image's own leading bytes call for, or None if the
+/// format isn't recognised.
+///
+/// Content, not the URL: the site hands out avatar links ending in .jpg and
+/// its CDN answers them with WebP, so the name a link implies is not evidence
+/// of what arrived.
+fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => Some("png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("jpg"),
+        [b'G', b'I', b'F', b'8', ..] => Some("gif"),
+        // RIFF is a container; the form is named four bytes into the payload.
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("webp"),
+        // Likewise ISO-BMFF: AVIF, HEIC and MP4 share the ftyp box and are
+        // told apart by the brand that follows it.
+        [_, _, _, _, b'f', b't', b'y', b'p', b, r, a, n, ..] => match [*b, *r, *a, *n] {
+            [b'a', b'v', b'i', b'f'] | [b'a', b'v', b'i', b's'] => Some("avif"),
+            [b'h', b'e', b'i', b'c'] | [b'h', b'e', b'i', b'x'] => Some("heic"),
+            _ => Some("mp4"),
+        },
+        _ => None,
+    }
+}
+
+/// Every extension sniff_image_ext can produce, plus the ones older caches
+/// were written with - what a lookup has to consider, since the name a
+/// cached avatar ended up under depends on what its bytes turned out to be.
+const CACHED_AVATAR_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "mp4"];
+
+/// An existing cache entry for this user, if one is there and is what its
+/// name claims.
+///
+/// The extension check is what lets a cache written before content sniffing
+/// heal itself: an entry whose bytes disagree with its name is treated as
+/// absent, so it is re-fetched and rewritten under the right one. Only the
+/// first few bytes are read, so this stays cheap enough to run per message.
+async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> Option<std::path::PathBuf> {
+    for ext in CACHED_AVATAR_EXTS {
+        let path = dir.join(format!("{user_id}.{ext}"));
+        let Ok(mut file) = tokio::fs::File::open(&path).await else { continue };
+        let mut head = [0u8; 16];
+        use tokio::io::AsyncReadExt;
+        let Ok(n) = file.read(&mut head).await else { continue };
+        match sniff_image_ext(&head[..n]) {
+            // "jpeg" and "jpg" are the same thing under two names.
+            Some(actual) if actual == ext || (actual == "jpg" && ext == "jpeg") => return Some(path),
+            // Unrecognised bytes: nothing better to go on, so keep it.
+            None => return Some(path),
+            Some(_) => {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+    }
+    None
+}
+
 /// Resolves a wire `avatar_url` (a relative path or an absolute URL)
 /// against `host`, fetches it through the same Tor-routed client used for
 /// everything else, and caches it to a local file - the frontend's plain
@@ -584,11 +640,10 @@ async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, 
     }
     let url = if raw_avatar_url.starts_with('/') { format!("https://{host}{raw_avatar_url}") } else { raw_avatar_url.to_string() };
 
-    let ext = url.rsplit('.').next().filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("jpg");
+    let url_ext = url.rsplit('.').next().filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("jpg");
     let dir = avatar_cache_dir();
-    let path = dir.join(format!("{user_id}.{ext}"));
 
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+    if let Some(path) = cached_avatar_file(&dir, user_id).await {
         return Some(format!("file://{}", path.display()));
     }
 
@@ -608,6 +663,12 @@ async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, 
                 tracing::debug!("sockchat: creating avatar cache dir: {e}");
                 return None;
             }
+            // Name the file after what it actually is. The site's avatar URLs
+            // end in .jpg while the CDN transparently serves WebP, so trusting
+            // the URL wrote WebP into a .jpg - which anything that dispatches
+            // on extension then refuses to load.
+            let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
+            let path = dir.join(format!("{user_id}.{ext}"));
             if let Err(e) = tokio::fs::write(&path, &bytes).await {
                 tracing::debug!("sockchat: caching avatar for user {user_id}: {e}");
                 return None;
@@ -1015,7 +1076,7 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
 
 #[cfg(test)]
 mod tests {
-    use super::find_attachment_url;
+    use super::{cached_avatar_file, find_attachment_url, sniff_image_ext};
 
     #[test]
     fn matches_the_real_reported_url() {
@@ -1118,6 +1179,54 @@ mod tests {
         for s in super::smilies::SMILIES {
             assert!(assets_dir.join(s.file).is_file(), "missing bundled asset for {:?}: {}", s.label, s.file);
         }
+    }
+
+    #[test]
+    fn names_an_image_by_its_own_bytes() {
+        assert_eq!(sniff_image_ext(b"\x89PNG\r\n\x1a\n....."), Some("png"));
+        assert_eq!(sniff_image_ext(b"\xff\xd8\xff\xe0 jfif"), Some("jpg"));
+        assert_eq!(sniff_image_ext(b"GIF89a......"), Some("gif"));
+        assert_eq!(sniff_image_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("webp"));
+        assert_eq!(sniff_image_ext(b"\x00\x00\x00\x20ftypavif...."), Some("avif"));
+        assert_eq!(sniff_image_ext(b"\x00\x00\x00\x20ftypisom...."), Some("mp4"));
+    }
+
+    #[test]
+    fn a_riff_that_is_not_a_webp_is_not_claimed() {
+        // RIFF also fronts WAV and AVI; only the WEBP form is an image here.
+        assert_eq!(sniff_image_ext(b"RIFF\x00\x00\x00\x00WAVEfmt "), None);
+        assert_eq!(sniff_image_ext(b"nothing recognisable"), None);
+        assert_eq!(sniff_image_ext(b""), None);
+    }
+
+    /// The regression this whole change exists for: the site serves WebP from
+    /// a .jpg URL, so entries cached before sniffing carry the wrong name.
+    #[tokio::test]
+    async fn a_mislabelled_cache_entry_is_discarded_so_it_gets_refetched() {
+        let dir = std::env::temp_dir().join(format!("nobilis-avatar-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("42.jpg");
+        std::fs::write(&stale, b"RIFF\x00\x00\x00\x00WEBPVP8 payload").unwrap();
+
+        assert!(cached_avatar_file(&dir, "42").await.is_none(), "kept a WebP named .jpg");
+        assert!(!stale.exists(), "left the mislabelled file behind");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_correctly_named_entry_is_reused() {
+        let dir = std::env::temp_dir().join(format!("nobilis-avatar-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("7.webp");
+        std::fs::write(&good, b"RIFF\x00\x00\x00\x00WEBPVP8 payload").unwrap();
+
+        assert_eq!(cached_avatar_file(&dir, "7").await.as_deref(), Some(good.as_path()));
+        // A real JPEG under .jpg must also survive - this must not re-fetch
+        // every avatar on every message.
+        let jpg = dir.join("8.jpg");
+        std::fs::write(&jpg, b"\xff\xd8\xff\xe0 jfif payload").unwrap();
+        assert_eq!(cached_avatar_file(&dir, "8").await.as_deref(), Some(jpg.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
