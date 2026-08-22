@@ -37,6 +37,17 @@ pub async fn dispatch(
             None,
         ),
 
+        // Stop the daemon cleanly. A client that adopted an already-running
+        // nobilis has no child process to signal, so this is the only way it
+        // can stop one it did not spawn. Returns before the exit actually
+        // happens - the daemon still has to send QUITs to every connected
+        // network first, and the caller's socket closing is the real signal
+        // that it is gone.
+        "shutdown" => {
+            state.shutdown.notify_one();
+            (Some(ok_node()), None)
+        }
+
         "listProtocols" => (
             Some(serde_json::json!([
                 { "id": "irc", "name": "IRC" },

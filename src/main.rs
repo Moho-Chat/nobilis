@@ -149,6 +149,7 @@ async fn main() -> Result<()> {
         events: EventBus::new(),
         runtime: Arc::new(Runtime::new()),
         tor: Arc::new(net::tor::TorManager::new(&opts.data_dir)),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     };
 
     // Reconnect every saved account, same as
@@ -173,8 +174,11 @@ async fn main() -> Result<()> {
     let socket_path = opts.socket_path.unwrap_or_else(rpc::default_socket_path);
     let rpc_state = state.clone();
 
+    let shutdown_rpc = state.shutdown.clone();
     tokio::select! {
         result = rpc::start(rpc_state, socket_path) => result,
+        // Either route - a signal, or a client asking over the socket -
+        // takes the same clean exit below.
         _ = shutdown_signal() => {
             // A bare process kill just drops every TCP connection without
             // telling the server - confirmed live against Libera.Chat, an
@@ -184,6 +188,12 @@ async fn main() -> Result<()> {
             // fail with "Nickname is already in use". Send real QUITs and
             // give them a moment to reach the network before exiting.
             tracing::info!("shutting down, sending QUIT to all connected accounts");
+            state.runtime.quit_all("Leaving");
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            Ok(())
+        }
+        _ = shutdown_rpc.notified() => {
+            tracing::info!("shutdown requested over the socket, sending QUIT to all connected accounts");
             state.runtime.quit_all("Leaving");
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Ok(())

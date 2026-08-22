@@ -4,6 +4,7 @@ use crate::net::tor::TorManager;
 use crate::runtime::Runtime;
 use crate::store::Store;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// Shared daemon state, handed to every RPC connection task. Cheap to
 /// clone (Arc-wrapped internals) - see daemon/nobilis/api.c's module-level
@@ -19,4 +20,9 @@ pub struct AppState {
     /// backend) - bootstrapping a circuit is expensive enough that it must
     /// happen once per daemon process, not once per account.
     pub tor: Arc<TorManager>,
+    /// Fired by the `shutdown` RPC. A client that adopted an already-running
+    /// daemon has no child process to signal, so asking over the socket is
+    /// the only way it can stop one it did not spawn - see main.rs, which
+    /// waits on this alongside SIGTERM and runs the identical clean exit.
+    pub shutdown: Arc<Notify>,
 }
