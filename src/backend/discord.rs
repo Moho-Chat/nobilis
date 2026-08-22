@@ -462,6 +462,8 @@ fn register_dm_channel(state: &AppState, account_id: &str, ch: &Value, channel_m
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(&buf.id, channel_id);
+    ensure_dm_group(state, account_id);
+    state.runtime.set_buffer_group(state, &buf.id, &dm_group_id(account_id));
     channel_map.insert(channel_id.to_string(), (name, "dm".to_string()));
     Some((buf.id, channel_id.to_string()))
 }
@@ -534,6 +536,8 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -
     let name = dm_channel_name(&ch);
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(&buffer.id, channel_id);
+    ensure_dm_group(state, account_id);
+    state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
     Ok(buffer.id)
 }
 
@@ -709,6 +713,27 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     let account_id = config.account_id();
     let mut new_channels: Vec<(String, String)> = Vec::new();
 
+    // The guild's own rail entry. Registered before its channels so a
+    // frontend never briefly sees a buffer pointing at a group it has not
+    // heard of. Discord's `position` is the order the user themselves put
+    // their servers in, which is worth preserving.
+    let group_id = guild_group_id(&account_id, guild_id);
+    state.runtime.upsert_buffer_group(
+        state,
+        crate::model::BufferGroup {
+            id: group_id.clone(),
+            account_id: account_id.clone(),
+            service: "discord".to_string(),
+            kind: "guild".to_string(),
+            name: guild_name.clone(),
+            // Filled in by the background fetch below once it lands; the rail
+            // shows initials until then rather than waiting on the network.
+            icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
+            position: guild["position"].as_i64().unwrap_or(0),
+        },
+    );
+    cache_guild_icon(state.clone(), account_id.clone(), guild_id.to_string(), guild_name.clone(), guild["icon"].as_str().map(str::to_string), guild["position"].as_i64().unwrap_or(0));
+
     for ch in channels {
         // 0 = GUILD_TEXT, 5 = GUILD_ANNOUNCEMENT - the only channel types
         // this milestone renders as buffers (voice/category/forum/etc.
@@ -729,6 +754,7 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
         let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
         state.runtime.set_discord_channel(&buf.id, channel_id);
         state.runtime.set_discord_guild(&buf.id, guild_id);
+        state.runtime.set_buffer_group(state, &buf.id, &group_id);
         // Custom emoji are per-guild, not per-channel, but buffers only
         // carry a channel id (see discord_channels) - simplest to just
         // hand each of the guild's channels its own copy of the same
@@ -1144,6 +1170,108 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     // freshly signed, so the next expiry is not another round-trip.
     cache_thumbnails(state.clone(), buffer_id.to_string(), message_id.to_string(), attachments.clone());
     Ok(attachments)
+}
+
+/// Rail entry id for one guild. Scoped by account so two accounts in the same
+/// guild get their own entry rather than colliding on one.
+pub fn guild_group_id(account_id: &str, guild_id: &str) -> String {
+    format!("{account_id}|guild:{guild_id}")
+}
+
+/// The rail entry holding an account's direct messages, matching how Discord's
+/// own client gives DMs a place in the server column rather than scattering
+/// them among the guilds.
+pub fn dm_group_id(account_id: &str) -> String {
+    format!("{account_id}|dms")
+}
+
+/// Registers the account's direct-message rail entry. Idempotent, and only
+/// called once a DM actually exists, so an account with no DMs does not get an
+/// empty entry sitting in the rail.
+fn ensure_dm_group(state: &AppState, account_id: &str) {
+    state.runtime.upsert_buffer_group(
+        state,
+        crate::model::BufferGroup {
+            id: dm_group_id(account_id),
+            account_id: account_id.to_string(),
+            service: "discord".to_string(),
+            kind: "dms".to_string(),
+            name: "Direct Messages".to_string(),
+            icon_url: None,
+            // Above the guilds, where Discord puts it.
+            position: -1,
+        },
+    );
+}
+
+fn guild_icon_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("discord-icons")
+}
+
+pub async fn sweep_guild_icon_cache() {
+    super::sockchat::sweep_cache_dir(&guild_icon_cache_dir(), GUILD_ICON_CACHE_MAX_BYTES, "discord guild icon").await;
+}
+
+/// Guild icons are small and there are only as many as the user has servers,
+/// so this is a much smaller cap than the message thumbnail cache.
+const GUILD_ICON_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Where a guild's icon would already be on disk, if it has been fetched.
+///
+/// Keyed by the icon hash as well as the guild id, so a server changing its
+/// icon fetches the new one rather than showing the old one forever.
+async fn cached_guild_icon(guild_id: &str, icon_hash: Option<&str>) -> Option<String> {
+    let hash = icon_hash?;
+    let path = guild_icon_cache_dir().join(format!("{guild_id}-{hash}.png"));
+    tokio::fs::try_exists(&path).await.unwrap_or(false).then(|| format!("file://{}", path.display()))
+}
+
+/// Fetches a guild's icon in the background and re-registers the rail entry
+/// once it lands.
+///
+/// Background rather than inline: this runs while connecting, and a user with
+/// thirty servers should not wait on thirty image fetches before any of their
+/// channels appear. A guild with no icon set is not an error - the rail draws
+/// initials for it, the same as Discord does.
+fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name: String, icon_hash: Option<String>, position: i64) {
+    let Some(hash) = icon_hash else { return };
+    tokio::spawn(async move {
+        let dir = guild_icon_cache_dir();
+        let path = dir.join(format!("{guild_id}-{hash}.png"));
+        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            // Animated icons have an a_ prefix and are served as .gif; asking
+            // for .png yields a still frame of the same thing, which is what a
+            // rail wants anyway.
+            let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128");
+            let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(20), http_client().get(&url).send()).await else {
+                tracing::debug!("discord: guild icon fetch for {guild_id} timed out");
+                return;
+            };
+            if !resp.status().is_success() {
+                tracing::debug!("discord: guild icon for {guild_id} returned HTTP {}", resp.status());
+                return;
+            }
+            let Ok(bytes) = resp.bytes().await else { return };
+            if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &bytes).await.is_err() {
+                return;
+            }
+        }
+        state.runtime.upsert_buffer_group(
+            &state,
+            crate::model::BufferGroup {
+                id: guild_group_id(&account_id, &guild_id),
+                account_id,
+                service: "discord".to_string(),
+                kind: "guild".to_string(),
+                name,
+                icon_url: Some(format!("file://{}", path.display())),
+                position,
+            },
+        );
+    });
 }
 
 /// Where cached Discord thumbnails live. Every CDN link Discord serves is

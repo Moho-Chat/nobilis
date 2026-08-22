@@ -51,6 +51,10 @@ pub struct Runtime {
     conn_states: Mutex<HashMap<String, ConnState>>,
     irc_handles: Mutex<HashMap<String, IrcHandle>>,
     buffers: Mutex<HashMap<String, Buffer>>,
+    /// Rail entries by group id - Discord guilds, Matrix spaces, and the
+    /// account-level entry every other protocol gets. Held here rather than
+    /// per-backend so listBufferGroups is one lookup regardless of protocol.
+    buffer_groups: Mutex<HashMap<String, crate::model::BufferGroup>>,
     /// Registered the instant a connection task is spawned - before there's
     /// any IrcHandle/Sender to gracefully QUIT with. Lets setAccountConnected
     /// (and removeAccount) actually stop a connection attempt that's still
@@ -250,6 +254,7 @@ impl Runtime {
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
             discord_channels: Mutex::new(HashMap::new()),
+            buffer_groups: Mutex::new(HashMap::new()),
             discord_guild_id: Mutex::new(HashMap::new()),
             discord_history_inflight: Mutex::new(HashSet::new()),
             discord_buffer_emojis: Mutex::new(HashMap::new()),
@@ -320,6 +325,53 @@ impl Runtime {
         self.buffers.lock().unwrap().get(buffer_id).cloned()
     }
 
+    /// Rail entries, ordered the way a frontend should draw them: by the
+    /// backend's own position, then name, so the order is stable across
+    /// restarts rather than whatever order the gateway happened to send.
+    pub fn list_buffer_groups(&self) -> Vec<crate::model::BufferGroup> {
+        let mut out: Vec<_> = self.buffer_groups.lock().unwrap().values().cloned().collect();
+        out.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+        out
+    }
+
+    /// Registers or updates a rail entry, broadcasting only when something
+    /// actually changed - a reconnect re-registers every guild it sees, and
+    /// re-broadcasting identical entries would churn every connected frontend.
+    pub fn upsert_buffer_group(&self, state: &AppState, group: crate::model::BufferGroup) {
+        {
+            let mut groups = self.buffer_groups.lock().unwrap();
+            if groups.get(&group.id) == Some(&group) {
+                return;
+            }
+            groups.insert(group.id.clone(), group.clone());
+        }
+        state.events.emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
+    }
+
+    /// Files a buffer under a rail entry. Idempotent, and re-broadcasts the
+    /// buffer so a frontend that already listed it moves it into place.
+    pub fn set_buffer_group(&self, state: &AppState, buffer_id: &str, group_id: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.group_id.as_deref() != Some(group_id) => {
+                    b.group_id = Some(group_id.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Drops every rail entry for an account - for when it is removed, so its
+    /// guilds don't sit in the rail forever with no buffers under them.
+    pub fn clear_buffer_groups_for_account(&self, account_id: &str) {
+        self.buffer_groups.lock().unwrap().retain(|_, g| g.account_id != account_id);
+    }
+
     /// Re-reads a buffer's last-activity timestamp from persisted
     /// scrollback and re-broadcasts it - used after a Discord history
     /// backfill/pagination fetch inserts messages directly into the store
@@ -380,7 +432,18 @@ impl Runtime {
             return existing.clone();
         }
         let last_activity_ts = state.store.last_activity(&id).unwrap_or(0);
-        let buffer = Buffer { id: id.clone(), account_id: account_id.to_string(), kind: kind.to_string(), name: name.to_string(), last_activity_ts, avatar_url: None, encrypted: None };
+        // Defaults to the account's own rail entry; a backend with real
+        // grouping moves it with set_buffer_group once it knows where it goes.
+        let buffer = Buffer {
+            id: id.clone(),
+            account_id: account_id.to_string(),
+            kind: kind.to_string(),
+            name: name.to_string(),
+            last_activity_ts,
+            avatar_url: None,
+            encrypted: None,
+            group_id: Some(model::account_group_id(account_id)),
+        };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
         buffer

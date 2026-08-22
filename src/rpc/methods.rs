@@ -19,6 +19,34 @@ pub async fn dispatch(
 
         "listBuffers" => (Some(serde_json::to_value(state.runtime.list_buffers()).unwrap()), None),
 
+        // The rail: whatever the backends registered (Discord guilds today,
+        // Matrix spaces later), plus an entry for every account whose protocol
+        // has no grouping of its own. Synthesised here rather than registered
+        // per-backend so IRC and Sneedchat need no code to appear at all.
+        "listBufferGroups" => {
+            let mut groups = state.runtime.list_buffer_groups();
+            let registered: std::collections::HashSet<String> = groups.iter().map(|g| g.id.clone()).collect();
+            for account in state.runtime.list_accounts(state) {
+                let id = crate::model::account_group_id(&account.id);
+                if registered.contains(&id) {
+                    continue;
+                }
+                groups.push(crate::model::BufferGroup {
+                    id,
+                    account_id: account.id.clone(),
+                    service: account.service.clone(),
+                    kind: "account".to_string(),
+                    name: account.display_name.clone(),
+                    icon_url: account.avatar_url.clone(),
+                    // After the guilds, which are the entries a user picks
+                    // between most often.
+                    position: 1000,
+                });
+            }
+            groups.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+            (Some(serde_json::to_value(groups).unwrap()), None)
+        }
+
         "listBufferEmoji" => match p_str_opt(params, "bufferId") {
             None => (None, Some("listBufferEmoji requires \"bufferId\"".to_string())),
             Some(buffer_id) => (Some(serde_json::json!(state.runtime.get_discord_buffer_emojis(buffer_id))), None),
@@ -167,6 +195,9 @@ pub async fn dispatch(
                 // linger in listBuffers indefinitely (nothing else clears
                 // them - disconnecting alone doesn't).
                 state.runtime.remove_buffers_for_account(state, id);
+                // Its guilds would otherwise stay in the rail with nothing
+                // under them.
+                state.runtime.clear_buffer_groups_for_account(id);
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),

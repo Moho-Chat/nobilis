@@ -87,6 +87,53 @@ pub struct Buffer {
     /// mark_matrix_room_encrypted.
     #[serde(rename = "encrypted", skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
+    /// Which BufferGroup this buffer belongs to - a Discord guild, a Matrix
+    /// space, or the account itself for protocols with no such concept.
+    /// Absent only while a backend has not yet placed it.
+    #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+}
+
+/// The rail entry a buffer belongs to when its protocol has no grouping of
+/// its own - IRC and Sneedchat today, Matrix until spaces are read. Backends
+/// that do have grouping (Discord guilds) override it per buffer, so this is
+/// the default rather than a special case.
+pub fn account_group_id(account_id: &str) -> String {
+    format!("account:{account_id}")
+}
+
+/// One entry in a frontend's server rail: a Discord guild, a Matrix space, an
+/// account's direct messages, or - for IRC and Sneedchat, which have no such
+/// concept - the account itself.
+///
+/// Deliberately one generic shape rather than per-protocol fields. What a
+/// frontend needs to draw a rail is the same regardless of where the grouping
+/// came from, and a protocol that gains grouping later (Matrix spaces) becomes
+/// a backend change with no wire change and no frontend change.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BufferGroup {
+    /// Stable across restarts and unique across accounts, so a frontend can
+    /// persist which entry was selected.
+    pub id: String,
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+    /// "irc" | "discord" | "sockchat" | "matrix" - what brand mark to fall
+    /// back to when there is no icon.
+    pub service: String,
+    /// "guild" | "space" | "dms" | "account".
+    pub kind: String,
+    pub name: String,
+    /// A local `file://` path once fetched, absent when the group has no icon
+    /// of its own. Remote URLs are never handed out: a Discord guild icon is
+    /// on a CDN the client can reach, but a Matrix space avatar is behind an
+    /// access token and a Sneedchat one is only reachable over Tor, so
+    /// resolving them here is what keeps every frontend uniform.
+    #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    /// Rail ordering. Ties break on name, so the order is stable rather than
+    /// whatever the gateway happened to send.
+    #[serde(default)]
+    pub position: i64,
 }
 
 /// A cached snapshot of the message being replied to, taken at receive
