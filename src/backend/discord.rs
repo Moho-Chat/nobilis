@@ -939,6 +939,159 @@ async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String> {
     Some(format!("file://{}", path.display()))
 }
 
+/// Buffers with a re-sign already running, so a burst of getBacklog calls
+/// (opening, scrolling, opening again) issues one sweep rather than several
+/// against a rate-limited endpoint.
+fn resigning() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    IN_FLIGHT.get_or_init(Default::default)
+}
+
+/// How many history pages one sweep will pull. Each covers ~50 messages, so
+/// this reaches a few screenfuls; past that the remaining stale messages are
+/// left for the per-message refresh a click triggers, rather than hammering a
+/// rate-limited endpoint on every buffer open.
+const MAX_RESIGN_FETCHES: usize = 3;
+
+/// Re-signs every expired attachment across a page of scrollback, in as few
+/// requests as it can manage.
+///
+/// Discord's own client batches this through `/attachments/refresh-urls`,
+/// which refuses user tokens here. But a history read re-signs every
+/// attachment in the page it returns, so one fetch of ~50 messages does the
+/// same job for a screenful - far better than one request per image, which is
+/// what refreshing each on click costs.
+///
+/// Runs in the background: the buffer opens immediately showing cached
+/// previews, and re-signed links arrive as messageUpdated events.
+pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[crate::model::Message]) {
+    let stale = stale_message_ids(messages);
+    if stale.is_empty() {
+        return;
+    }
+
+    if !resigning().lock().unwrap().insert(buffer_id.clone()) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        if let Err(e) = run_resign(&state, &buffer_id, stale).await {
+            tracing::debug!("discord: re-signing {buffer_id}: {e}");
+        }
+        resigning().lock().unwrap().remove(&buffer_id);
+    });
+}
+
+/// Which messages in a page carry a lapsed attachment link, newest first.
+///
+/// Newest first because those are the ones most likely to be on screen, so
+/// the first fetch re-signs what the reader is actually looking at.
+///
+/// Attachments with no `url` at all are nobilis's own locally-cached media
+/// (Matrix, Sneedchat) and never expire, so a non-Discord buffer produces an
+/// empty list here and costs nothing.
+fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<String> {
+    let mut ids: Vec<String> = messages
+        .iter()
+        .filter(|m| {
+            m.attachments
+                .iter()
+                .any(|a| a.url.as_deref().is_some_and(attachment_expired))
+        })
+        .map(|m| m.id.clone())
+        .collect();
+    // Discord ids are snowflakes: lexicographically ordered for equal length,
+    // and longer means newer, so sort by length first.
+    ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
+    ids
+}
+
+async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -> Result<()> {
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel")?;
+
+    for _ in 0..MAX_RESIGN_FETCHES {
+        let Some(anchor) = stale.first().cloned() else { break };
+        // `around` centres the page on the message, so one fetch covers what
+        // sits either side of it - usually the rest of the same screenful.
+        let resp = http_client()
+            .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+            .query(&[("limit", "50"), ("around", anchor.as_str())])
+            .header("Authorization", &config.token)
+            .send()
+            .await
+            .context("fetching a page to re-sign")?;
+        if !resp.status().is_success() {
+            bail!("Discord refused the request ({})", resp.status());
+        }
+        let page: Vec<Value> = resp.json().await.context("parsing the re-signed page")?;
+        if page.is_empty() {
+            break;
+        }
+
+        let mut handled = 0usize;
+        for message in &page {
+            let Some(id) = message["id"].as_str() else { continue };
+            if !stale.iter().any(|s| s == id) {
+                continue;
+            }
+            let attachments = merge_cached_thumbnails(state, buffer_id, id, extract_attachments(message));
+            if attachments.is_empty() {
+                continue;
+            }
+            if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
+                state.events.emit(
+                    "messageUpdated",
+                    json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments }),
+                );
+            }
+            handled += 1;
+        }
+
+        let covered: std::collections::HashSet<&str> = page.iter().filter_map(|m| m["id"].as_str()).collect();
+        // Drop everything this page spanned, not just what it re-signed - a
+        // message inside the returned range that came back without
+        // attachments was deleted or edited, and asking again won't change
+        // that. Without this the anchor would not advance and the loop would
+        // refetch the same page.
+        stale.retain(|id| !covered.contains(id.as_str()));
+        if stale.is_empty() {
+            break;
+        }
+        // Nothing in range matched and nothing was dropped: give up rather
+        // than spin.
+        if handled == 0 && covered.is_empty() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Cached previews are keyed by the unsigned URL, so they stay valid across a
+/// re-sign and are carried over rather than re-fetched.
+fn merge_cached_thumbnails(
+    state: &AppState,
+    buffer_id: &str,
+    message_id: &str,
+    attachments: Vec<Attachment>,
+) -> Vec<Attachment> {
+    match state.store.get_message(buffer_id, message_id) {
+        Ok(Some(old)) => attachments
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut a)| {
+                if let Some(prev) = old.attachments.get(i) {
+                    a.thumbnail_path = a.thumbnail_path.or_else(|| prev.thumbnail_path.clone());
+                }
+                a
+            })
+            .collect(),
+        _ => attachments,
+    }
+}
+
 /// Re-signs a message's attachment links by asking Discord for the message
 /// again.
 ///
@@ -976,21 +1129,7 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     if attachments.is_empty() {
         bail!("that message no longer has any attachments");
     }
-    // Keep whatever previews were already cached - they are keyed by the
-    // unsigned URL, so they stay valid across a re-sign.
-    let attachments = match state.store.get_message(buffer_id, message_id) {
-        Ok(Some(old)) => attachments
-            .into_iter()
-            .enumerate()
-            .map(|(i, mut a)| {
-                if let Some(prev) = old.attachments.get(i) {
-                    a.thumbnail_path = a.thumbnail_path.or_else(|| prev.thumbnail_path.clone());
-                }
-                a
-            })
-            .collect(),
-        _ => attachments,
-    };
+    let attachments = merge_cached_thumbnails(state, buffer_id, message_id, attachments);
 
     state.store.update_message_attachments(buffer_id, message_id, &attachments)?;
     state.events.emit(
@@ -1877,8 +2016,75 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
 
 #[cfg(test)]
 mod tests {
-    use super::{attachment_expired, extract_attachments, extract_body, reaction_path_segment, thumbnail_source};
+    use super::{
+        attachment_expired, extract_attachments, extract_body, reaction_path_segment,
+        stale_message_ids, thumbnail_source,
+    };
+    use crate::model::{Attachment, Message};
     use serde_json::json;
+
+    fn msg(id: &str, urls: &[&str]) -> Message {
+        Message {
+            id: id.into(),
+            buffer_id: "b".into(),
+            from: "x".into(),
+            body: String::new(),
+            ts: 0,
+            is_action: false,
+            is_highlight: false,
+            kind: "chat".into(),
+            reply_to: None,
+            edited: false,
+            reactions: Vec::new(),
+            is_own: false,
+            avatar_url: None,
+            embeds: Vec::new(),
+            attachments: urls
+                .iter()
+                .map(|u| Attachment {
+                    kind: "image".into(),
+                    url: Some((*u).to_string()),
+                    ..Default::default()
+                })
+                .collect(),
+            sender_id: None,
+        }
+    }
+
+    const PAST: &str = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=386d4380&is=1&hm=2";
+    const FUTURE: &str = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=f4143f80&is=1&hm=2";
+
+    #[test]
+    fn only_messages_with_a_lapsed_link_need_re_signing() {
+        let page = vec![msg("100", &[FUTURE]), msg("101", &[PAST]), msg("102", &[])];
+        assert_eq!(stale_message_ids(&page), vec!["101"]);
+    }
+
+    #[test]
+    fn a_message_is_stale_if_any_of_its_attachments_is() {
+        let page = vec![msg("100", &[FUTURE, PAST])];
+        assert_eq!(stale_message_ids(&page), vec!["100"]);
+    }
+
+    #[test]
+    fn stale_ids_come_back_newest_first() {
+        // Snowflakes: longer is newer, and equal lengths sort lexically.
+        let page = vec![msg("100", &[PAST]), msg("1000", &[PAST]), msg("300", &[PAST])];
+        assert_eq!(stale_message_ids(&page), vec!["1000", "300", "100"]);
+    }
+
+    #[test]
+    fn locally_cached_media_never_looks_stale() {
+        // Matrix and Sneedchat attachments carry a path, not a url, so a
+        // non-Discord buffer costs nothing here.
+        let mut m = msg("100", &[]);
+        m.attachments = vec![Attachment {
+            kind: "image".into(),
+            path: Some("file:///cache/x.png".into()),
+            ..Default::default()
+        }];
+        assert!(stale_message_ids(&[m]).is_empty());
+    }
 
     #[test]
     fn reads_the_expiry_out_of_a_signed_cdn_link() {

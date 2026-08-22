@@ -82,7 +82,18 @@ pub async fn dispatch(
                     }
                 }
                 match state.store.get_backlog(buffer_id, before, limit) {
-                    Ok(messages) => (Some(serde_json::to_value(messages).unwrap()), None),
+                    Ok(messages) => {
+                        // Discord's CDN links lapse about a day after they are
+                        // issued, so scrollback this far back routinely carries
+                        // dead ones. Re-sign them in the background: one history
+                        // read re-signs every attachment in the page it returns,
+                        // so a screenful costs one request rather than one per
+                        // image. The page returns immediately either way - cached
+                        // previews are already showing, and re-signed links
+                        // arrive as messageUpdated.
+                        backend::discord::resign_stale_attachments(state.clone(), buffer_id.to_string(), &messages);
+                        (Some(serde_json::to_value(messages).unwrap()), None)
+                    }
                     Err(e) => (None, Some(e.to_string())),
                 }
             }
