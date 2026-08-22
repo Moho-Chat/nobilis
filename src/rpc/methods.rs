@@ -346,6 +346,49 @@ pub async fn dispatch(
             }
         }
 
+        // Repairs scrollback by re-reading recent history and storing only
+        // what is missing. With no "bufferId" it sweeps every Discord buffer,
+        // which is the useful shape after a storage bug: the messages that
+        // went missing are by definition ones nobody knows to go looking for.
+        "refillDiscordHistory" => {
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as u32;
+            let targets: Vec<String> = match p_str_opt(params, "bufferId") {
+                Some(b) => vec![b.to_string()],
+                None => state
+                    .runtime
+                    .list_buffers()
+                    .into_iter()
+                    .filter(|b| state.runtime.get_discord_channel(&b.id).is_some())
+                    .map(|b| b.id)
+                    .collect(),
+            };
+
+            let mut recovered = 0usize;
+            let mut scanned = 0usize;
+            let mut failed = 0usize;
+            for (i, buffer_id) in targets.iter().enumerate() {
+                // Space the requests out; a sweep is dozens of calls against
+                // one token and there is no hurry about it.
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
+                match backend::discord::refill_history(state, buffer_id, limit).await {
+                    Ok(n) => {
+                        scanned += 1;
+                        recovered += n;
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::debug!("discord: refilling {buffer_id}: {e}");
+                    }
+                }
+            }
+            (
+                Some(serde_json::json!({ "scanned": scanned, "recovered": recovered, "failed": failed })),
+                None,
+            )
+        }
+
         "partBuffer" => match p_str_opt(params, "bufferId") {
             None => (None, Some("no such buffer".to_string())),
             Some(buffer_id) => {

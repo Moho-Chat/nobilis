@@ -1415,6 +1415,61 @@ fn extract_reactions(msg: &Value) -> Vec<Reaction> {
 /// before) or if a request for this same buffer is already in flight
 /// (getBacklog can be called concurrently by more than one connected
 /// client - see the multi-screen-instance lesson from the QR login bug).
+/// Re-reads a channel's recent history and stores only what is missing.
+///
+/// Unlike extend_history this deliberately re-reads a range already stored,
+/// so it exists to repair scrollback rather than to deepen it: a message that
+/// Discord sent but that was never written locally (dropped by a storage bug,
+/// or missed while the daemon was down) has no other way back. Everything
+/// already present is left untouched, so it is safe to run repeatedly.
+///
+/// Returns how many messages were recovered.
+pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Result<usize> {
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
+
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", limit.clamp(1, 100).to_string().as_str())])
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .context("re-reading history")?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Honour Discord's own pacing rather than guessing at a backoff.
+        let wait = resp
+            .json::<Value>()
+            .await
+            .ok()
+            .and_then(|v| v["retry_after"].as_f64())
+            .unwrap_or(5.0);
+        bail!("rate limited, retry after {wait:.1}s");
+    }
+    if !resp.status().is_success() {
+        // No READ_MESSAGE_HISTORY on this channel is a normal outcome for a
+        // sweep across every buffer, not a failure worth stopping for.
+        bail!("Discord refused the request ({})", resp.status());
+    }
+    let messages: Vec<Value> = resp.json().await.context("parsing re-read history")?;
+
+    let ids: Vec<&str> = messages.iter().filter_map(|m| m["id"].as_str()).collect();
+    let known = state.store.existing_msg_ids(buffer_id, &ids)?;
+    let missing: Vec<Value> = messages
+        .into_iter()
+        .filter(|m| m["id"].as_str().is_some_and(|id| !known.contains(id)))
+        .collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
+    // Same storage path as any other history read, so recovered messages get
+    // the current guard and preview caching rather than a parallel copy.
+    store_history_messages(state, buffer_id, &missing, &config.user_id, config.display_name.as_deref());
+    state.runtime.refresh_buffer_activity(state, buffer_id);
+    Ok(missing.len())
+}
+
 pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
     if !state.runtime.try_start_discord_history_fetch(buffer_id) {
         return;

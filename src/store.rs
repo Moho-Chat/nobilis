@@ -1,6 +1,7 @@
 use crate::model::{Attachment, Embed, Message, Reaction, ReplyPreview};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -207,6 +208,34 @@ impl Store {
         Ok(exists)
     }
 
+    /// Which of `ids` this buffer already stores.
+    ///
+    /// `msg_id` carries no uniqueness constraint - append_message is a plain
+    /// INSERT, because every normal write path is already known not to
+    /// overlap (live gateway messages are new by definition, and
+    /// extend_history pages strictly older than the oldest stored id).
+    /// Re-reading a range that was already stored is the one case that can
+    /// overlap, so it has to ask first or it would duplicate the lot.
+    pub fn existing_msg_ids(&self, buffer_id: &str, ids: &[&str]) -> Result<HashSet<String>> {
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT msg_id FROM messages WHERE buffer_id = ?1 AND msg_id IN ({placeholders})"
+        ))?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(ids.len() + 1);
+        params.push(&buffer_id);
+        for id in ids {
+            params.push(id);
+        }
+        let found = stmt
+            .query_map(params.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<String>>>()?;
+        Ok(found)
+    }
+
     /// Most recent message timestamp for a buffer, 0 if none - seeds
     /// Buffer::last_activity_ts when a buffer is (re)created so activity
     /// sorting reflects persisted scrollback immediately, not just
@@ -364,5 +393,60 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch("PRAGMA incremental_vacuum(200);")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Store;
+
+    fn store() -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "nobilis-store-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scrollback.db");
+        let _ = std::fs::remove_file(&path);
+        (Store::open(&path).expect("opening store"), dir)
+    }
+
+    fn append(s: &Store, buffer: &str, id: &str) {
+        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None)
+            .expect("appending");
+    }
+
+    #[test]
+    fn reports_only_the_ids_this_buffer_already_stores() {
+        let (s, dir) = store();
+        append(&s, "discord:a|#chan", "100");
+        append(&s, "discord:a|#chan", "101");
+
+        let known = s.existing_msg_ids("discord:a|#chan", &["100", "101", "102"]).unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.contains("100") && known.contains("101"));
+        // 102 is what a refill would go on to store.
+        assert!(!known.contains("102"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn does_not_confuse_the_same_id_in_another_buffer() {
+        // Discord snowflakes are unique, but IRC/Sneedchat ids are not
+        // globally so - a refill keyed on id alone would skip storing a
+        // message because some other buffer happens to hold that id.
+        let (s, dir) = store();
+        append(&s, "discord:a|#one", "100");
+
+        assert!(s.existing_msg_ids("discord:a|#two", &["100"]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_empty_request_asks_the_database_nothing() {
+        let (s, dir) = store();
+        assert!(s.existing_msg_ids("discord:a|#chan", &[]).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
