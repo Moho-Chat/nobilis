@@ -103,6 +103,11 @@ pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, o
                 "userId": user_id,
                 "prefix": "",
                 "away": !online,
+                // Stated as well as implied by `away`: a frontend uses the
+                // presence of this field to know the roster can be split into
+                // online and offline at all, rather than having to know which
+                // protocols report presence.
+                "status": if online { "online" } else { "offline" },
                 "powerLevel": moderation::user_power_level(&power_levels, user_id),
             })
         })
