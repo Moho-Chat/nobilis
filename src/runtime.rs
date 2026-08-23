@@ -168,6 +168,11 @@ pub struct Runtime {
     /// one; this is the only record of who is where, since Discord reports
     /// voice membership solely over the gateway.
     discord_voice_states: Mutex<HashMap<(String, String), String>>,
+    /// (account, user) -> what to call them. Filled from the member Discord
+    /// attaches to a voice state, because someone in a voice channel is often
+    /// in no loaded member list - a channel list showing raw snowflakes would
+    /// be useless.
+    discord_voice_names: Mutex<HashMap<(String, String), String>>,
     /// account -> the voice channel we are in, if any.
     discord_voice_self: Mutex<HashMap<String, String>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
@@ -289,6 +294,7 @@ impl Runtime {
             discord_member_list_targets: Mutex::new(HashMap::new()),
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
+            discord_voice_names: Mutex::new(HashMap::new()),
             discord_voice_self: Mutex::new(HashMap::new()),
             discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
@@ -668,7 +674,10 @@ impl Runtime {
 
     /// Records where someone is, or that they left. Returns the channel they
     /// were in before, so a caller can tell a move from an arrival.
-    pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>) -> Option<String> {
+    pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>, name: Option<&str>) -> Option<String> {
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            self.remember_discord_name(account_id, user_id, name);
+        }
         let mut states = self.discord_voice_states.lock().unwrap();
         let key = (account_id.to_string(), user_id.to_string());
         match channel_id {
@@ -686,6 +695,52 @@ impl Runtime {
             .filter(|((a, u), c)| a == account_id && c.as_str() == channel_id && u != except)
             .map(|((_, u), _)| u.clone())
             .collect()
+    }
+
+    /// Records what to call someone, from wherever their name was seen.
+    ///
+    /// Kept after they leave a channel: names change rarely, and having one
+    /// ready matters more than the handful of bytes it costs.
+    pub fn remember_discord_name(&self, account_id: &str, user_id: &str, name: &str) {
+        if name.is_empty() {
+            return;
+        }
+        self.discord_voice_names
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), user_id.to_string()), name.to_string());
+    }
+
+    /// Everyone in a voice channel, as (user id, what to call them).
+    ///
+    /// Nobody is excluded here: a channel list has to show you your own
+    /// presence, which is how you can tell you are in a call at all.
+    pub fn discord_voice_members(&self, account_id: &str, channel_id: &str) -> Vec<(String, String)> {
+        let names = self.discord_voice_names.lock().unwrap();
+        let mut out: Vec<(String, String)> = self
+            .discord_voice_states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((a, _), c)| a == account_id && c.as_str() == channel_id)
+            .map(|((a, u), _)| {
+                let name = names.get(&(a.clone(), u.clone())).cloned().unwrap_or_else(|| u.clone());
+                (u.clone(), name)
+            })
+            .collect();
+        // Stable order, so a list does not reshuffle itself on every update.
+        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        out
+    }
+
+    /// Which guild a voice channel belongs to, if it is one we know about.
+    pub fn discord_guild_of_voice_channel(&self, account_id: &str, channel_id: &str) -> Option<String> {
+        self.discord_voice_channels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|((a, _), channels)| a == account_id && channels.iter().any(|(id, _, _)| id == channel_id))
+            .map(|((_, g), _)| g.clone())
     }
 
     pub fn set_discord_voice_self(&self, account_id: &str, channel_id: Option<&str>) {

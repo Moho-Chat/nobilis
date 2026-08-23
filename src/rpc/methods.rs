@@ -487,6 +487,34 @@ pub async fn dispatch(
             Err(e) => (None, Some(e.to_string())),
         },
 
+        // Where we are in voice, if anywhere. Reported per account because a
+        // client showing a "connected" bar has to name the channel, and the
+        // gateway is the only thing that knows.
+        "getVoiceSession" => {
+            let sessions: Vec<Value> = state
+                .voice
+                .connected_accounts()
+                .iter()
+                .filter_map(|id| {
+                    let (guild_id, channel_id) = state.voice.current_channel(id)?;
+                    let name = state
+                        .runtime
+                        .discord_voice_channels(id, &guild_id)
+                        .into_iter()
+                        .find(|(c, _, _)| *c == channel_id)
+                        .map(|(_, n, _)| n)
+                        .unwrap_or_else(|| channel_id.clone());
+                    Some(serde_json::json!({
+                        "accountId": id,
+                        "guildId": guild_id,
+                        "channelId": channel_id,
+                        "channelName": name,
+                    }))
+                })
+                .collect();
+            (Some(serde_json::json!(sessions)), None)
+        }
+
         // What is actually going in and out, for a level meter - and for
         // telling "nobody is talking" apart from "their audio never arrives",
         // which are otherwise the same silence.
@@ -580,13 +608,23 @@ pub async fn dispatch(
                 .discord_voice_channels(account_id, guild_id)
                 .into_iter()
                 .map(|(id, name, limit)| {
-                    let occupants = state.runtime.discord_voice_occupants(account_id, &id, &own);
+                    let others = state.runtime.discord_voice_occupants(account_id, &id, &own);
+                    // Everyone including us, since a channel list has to show
+                    // you your own presence; `empty` deliberately still means
+                    // "nobody else", which is what the join rule tests.
+                    let members: Vec<Value> = state
+                        .runtime
+                        .discord_voice_members(account_id, &id)
+                        .into_iter()
+                        .map(|(user_id, nick)| serde_json::json!({ "userId": user_id, "nick": nick, "isSelf": user_id == own }))
+                        .collect();
                     serde_json::json!({
                         "id": id,
                         "name": name,
                         "userLimit": limit,
-                        "occupants": occupants.len(),
-                        "empty": occupants.is_empty()
+                        "occupants": others.len(),
+                        "empty": others.is_empty(),
+                        "members": members
                     })
                 })
                 .collect();

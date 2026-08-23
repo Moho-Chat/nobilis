@@ -733,11 +733,26 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
         state.runtime.set_discord_voice_channels(&account_id, guild_id, voice);
     }
 
+    // Whatever the guild told us about who its people are. Recorded before
+    // the voice states below, so anyone already in a channel has a name.
+    for m in guild["members"].as_array().into_iter().flatten() {
+        if let Some(user_id) = m["user"]["id"].as_str() {
+            let nick = m["nick"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| m["user"]["global_name"].as_str().filter(|s| !s.is_empty()))
+                .or_else(|| m["user"]["username"].as_str());
+            if let Some(nick) = nick {
+                state.runtime.remember_discord_name(&account_id, user_id, nick);
+            }
+        }
+    }
+
     // Who is already in them. This arrives once, with the guild; everything
     // after is VOICE_STATE_UPDATE.
     for vs in guild["voice_states"].as_array().into_iter().flatten() {
         if let (Some(user_id), Some(channel_id)) = (vs["user_id"].as_str(), vs["channel_id"].as_str()) {
-            state.runtime.set_discord_voice_state(&account_id, user_id, Some(channel_id));
+            state.runtime.set_discord_voice_state(&account_id, user_id, Some(channel_id), voice_member_name(vs));
         }
     }
 
@@ -2097,7 +2112,8 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                     "VOICE_STATE_UPDATE" => {
                         let Some(user_id) = d["user_id"].as_str() else { continue };
                         let channel_id = d["channel_id"].as_str();
-                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id);
+                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id, voice_member_name(d));
+                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {
                             // Our own move. The session id here is half of what
@@ -2139,7 +2155,8 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                     "VOICE_STATE_UPDATE_OLD" => {
                         let Some(user_id) = d["user_id"].as_str() else { continue };
                         let channel_id = d["channel_id"].as_str();
-                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id);
+                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id, voice_member_name(d));
+                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {
                             // Our own move. The session id here is half of what
@@ -2678,6 +2695,7 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// channel asks for a fresh SYNC, which is what Discord's own client does when
 /// its view changes.
 fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let mut members: Vec<Value> = Vec::new();
     let mut saw_sync = false;
 
@@ -2699,6 +2717,12 @@ fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
                 .or_else(|| user["username"].as_str())
                 .unwrap_or("unknown");
             let status = member["presence"]["status"].as_str().unwrap_or("offline");
+            // Names are learned here and remembered for anywhere they are
+            // needed. Voice is the case that matters: Discord attaches a
+            // member to a voice state only when someone moves, so anyone
+            // already sitting in a channel when we connect would otherwise be
+            // shown as a raw snowflake forever.
+            state.runtime.remember_discord_name(&account_id, user_id, nick);
             members.push(json!({
                 "nick": nick,
                 "userId": user_id,
@@ -2785,6 +2809,38 @@ fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
         state.runtime.set_presence(&buffer.id, member_list.clone());
         state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
     }
+}
+
+/// What to call the person a voice state belongs to.
+///
+/// Discord attaches the member to a voice state, which matters because
+/// somebody sitting in a voice channel is frequently in no member list the
+/// client has loaded - a nickname first, since that is what they chose to be
+/// called here, then the display name, then the account name.
+fn voice_member_name(vs: &Value) -> Option<&str> {
+    vs["member"]["nick"]
+        .as_str()
+        .or_else(|| vs["member"]["user"]["global_name"].as_str())
+        .or_else(|| vs["member"]["user"]["username"].as_str())
+        .filter(|n| !n.is_empty())
+}
+
+/// Tells clients that a voice channel's membership changed.
+///
+/// Carries the guild rather than the channel because a client showing a
+/// channel list needs to know that list is stale, and somebody leaving one
+/// channel for another changes two of its rows at once.
+fn announce_voice_membership(state: &AppState, account_id: &str, guild_id: Option<&str>, channel_id: Option<&str>) {
+    // A leave carries no guild, so it is recovered from the channel that was
+    // left; without this, leaving would never refresh anyone's list.
+    let guild = guild_id
+        .map(String::from)
+        .or_else(|| channel_id.and_then(|c| state.runtime.discord_guild_of_voice_channel(account_id, c)));
+    let Some(guild_id) = guild else { return };
+    state.events.emit(
+        "voiceMembershipChanged",
+        json!({ "accountId": account_id, "guildId": guild_id }),
+    );
 }
 
 /// Joins a voice channel under the given options.
