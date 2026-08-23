@@ -40,6 +40,7 @@ pub struct AudioDevice {
 /// mode 0600, and these are preferences that belong to the machine rather than
 /// to any account.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct VoicePrefs {
     /// Device ids, or None for "whatever the sound server considers default",
     /// which is the right behaviour for someone who has never chosen.
@@ -176,8 +177,7 @@ fn parse_devices(json: &str, kind: &str, default_name: &str) -> Result<Vec<Audio
 /// Routing is done by moving the stream rather than by opening the device
 /// directly: on PipeWire an application is a stream the server routes, and
 /// moving it is both what the desktop's own mixer does and what survives the
-/// device disappearing. Matching on process id rather than on a name means a
-/// second copy of nobilis cannot have its microphone moved by this one.
+/// device disappearing.
 pub fn route_input(device_id: &str) -> Result<bool> {
     route_stream(Stream::Input, device_id)
 }
@@ -203,6 +203,31 @@ impl Stream {
             Stream::Output => "move-sink-input",
         }
     }
+
+    /// How the ALSA plugin names the node it creates.
+    fn node_prefix(self) -> &'static str {
+        match self {
+            Stream::Input => "alsa_capture",
+            Stream::Output => "alsa_playback",
+        }
+    }
+}
+
+/// The name PipeWire gives this process's streams.
+///
+/// Identifying our own streams by name is not the obvious choice - a process
+/// id would be exact - but the ALSA plugin every cpal stream goes through
+/// publishes no process id at all: the only identifying property it sets is
+/// `node.name`, built from the executable's own file name. Two daemons cannot
+/// collide here in practice because nobilis holds a single-instance lock (see
+/// main.rs), and the exact match keeps a differently-named build, such as a
+/// test binary, from being mistaken for the daemon.
+fn stream_node_name(stream: Stream) -> String {
+    let binary = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "nobilis".to_string());
+    format!("{}.{binary}", stream.node_prefix())
 }
 
 fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
@@ -211,13 +236,13 @@ fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
     }
     let json = pactl(&["-f", "json", "list", stream.list()])?;
     let streams: serde_json::Value = serde_json::from_str(&json).context("parsing pactl output")?;
-    let pid = std::process::id().to_string();
+    let want = stream_node_name(stream);
     let mine: Vec<String> = streams
         .as_array()
         .map(|s| s.as_slice())
         .unwrap_or_default()
         .iter()
-        .filter(|s| s["properties"]["application.process.id"].as_str() == Some(pid.as_str()))
+        .filter(|s| s["properties"]["node.name"].as_str() == Some(want.as_str()))
         .filter_map(|s| s["index"].as_u64().map(|i| i.to_string()))
         .collect();
 
@@ -564,6 +589,18 @@ mod tests {
         // falls back to the only name there is rather than showing blank.
         assert_eq!(devices[1].name, devices[1].id);
         assert!(!devices[1].is_default);
+    }
+
+    #[test]
+    fn our_own_streams_are_identified_the_way_the_sound_server_names_them() {
+        // The ALSA plugin publishes no process id, only a node name built from
+        // the executable's file name. Matching on anything else silently finds
+        // nothing, which looks exactly like a device that cannot be routed to.
+        let input = stream_node_name(Stream::Input);
+        let output = stream_node_name(Stream::Output);
+        assert!(input.starts_with("alsa_capture."), "unexpected: {input}");
+        assert!(output.starts_with("alsa_playback."), "unexpected: {output}");
+        assert_ne!(input, "alsa_capture.", "the executable name was lost");
     }
 
     #[test]
