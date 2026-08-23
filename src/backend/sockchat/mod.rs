@@ -807,11 +807,30 @@ fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str)
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
-pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str) -> Result<()> {
-    let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
+/// Sends a message, optionally as a reply to someone.
+///
+/// Sneedchat has no reply field: the site's own client answers somebody by
+/// opening the message with an `@Name,` mention, which is what its users and
+/// its own notification rules recognise as being replied to. So a reply here
+/// is that mention, added by the daemon rather than left to each frontend to
+/// know the convention - and skipped when the message already opens with it,
+/// so replying twice to the same person does not stack them up.
+pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<&str>) -> Result<()> {
+    let body = as_reply(body, reply_to);
+    let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
     sender.send(text).map_err(|_| anyhow!("chat socket closed"))?;
     Ok(())
+}
+
+/// Opens a message with the mention Sneedchat treats as a reply.
+fn as_reply(body: &str, reply_to: Option<&str>) -> String {
+    match reply_to {
+        Some(nick) if !nick.is_empty() && !body.trim_start().starts_with(&format!("@{nick},")) => {
+            format!("@{nick}, {}", body.trim_start())
+        }
+        _ => body.to_string(),
+    }
 }
 
 /// postimg.cc's own anonymous upload endpoint - undocumented (its
@@ -1002,7 +1021,9 @@ pub async fn send_attachment(state: &AppState, account_id: &str, buffer_name: &s
 
     let wrapped = format!("[url={short_page_url}][img]{direct_url}[/img][/url]");
     let text = if caption.trim().is_empty() { wrapped } else { format!("{caption}\n{wrapped}") };
-    send_message(state, account_id, buffer_name, &text)
+    // The caption already carries any mention the caller wanted; an image
+    // post is not separately a reply.
+    send_message(state, account_id, buffer_name, &text, None)
 }
 
 /// `editMessage`'s SockChat branch (see rpc/methods.rs). The server has no
@@ -1083,6 +1104,30 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_reply_opens_with_the_mention_sneedchat_understands() {
+        // Sneedchat has no reply field; answering somebody by name is what
+        // the site's own client does and what its notifications look for.
+        assert_eq!(super::as_reply("sure", Some("Alexcellence")), "@Alexcellence, sure");
+        // Leading space would otherwise land between the comma and the text.
+        assert_eq!(super::as_reply("   sure", Some("Bob")), "@Bob, sure");
+    }
+
+    #[test]
+    fn replying_twice_does_not_stack_mentions() {
+        // Somebody who types the mention themselves, or replies again to the
+        // same person, should not end up with "@Bob, @Bob, ...".
+        assert_eq!(super::as_reply("@Bob, already there", Some("Bob")), "@Bob, already there");
+    }
+
+    #[test]
+    fn a_message_that_is_not_a_reply_is_untouched() {
+        assert_eq!(super::as_reply("plain", None), "plain");
+        // A reply to somebody whose name is unknown - dropped from scrollback -
+        // still sends rather than being lost to a missing mention.
+        assert_eq!(super::as_reply("plain", Some("")), "plain");
+    }
+
     use super::{cached_avatar_file, find_attachment_url, sniff_image_ext};
 
     #[test]

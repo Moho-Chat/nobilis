@@ -773,16 +773,21 @@ pub async fn dispatch(
                     }
                 },
                 Some(buffer) if buffer.account_id.starts_with("sockchat:") => {
-                    if reply_to_id.is_some() {
-                        return (None, Some("replies aren't supported for this service".to_string()));
-                    }
+                    // Sneedchat answers somebody by name rather than by
+                    // message id, so a reply needs whoever wrote the message
+                    // being replied to. A reply to something no longer in
+                    // scrollback still sends, just without the mention -
+                    // losing the message would be the worse trade.
+                    let reply_to_nick = reply_to_id
+                        .and_then(|id| state.store.get_message(buffer_id, id).ok().flatten())
+                        .map(|m| m.from);
                     // Unlike Discord, Sneedchat's own chat protocol has no
                     // upload endpoint at all - see backend::sockchat::
                     // send_attachment's own doc comment for how this
                     // still ends up posting a real image.
                     let result = match attachment_path {
                         Some(path) => backend::sockchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path).await,
-                        None => backend::sockchat::send_message(state, &buffer.account_id, &buffer.name, body),
+                        None => backend::sockchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
