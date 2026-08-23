@@ -420,7 +420,7 @@ pub async fn dispatch(
             )
         }
 
-        /// Sets how this account presents itself: online, idle, or dnd.
+        /// Sets how this account presents itself: online or idle.
         ///
         /// Applied to whichever protocol the account belongs to, and recorded
         /// either way so a reconnect carries it. Sneedchat has no presence
@@ -430,8 +430,8 @@ pub async fn dispatch(
                 (Some(a), Some(s)) => (a, s),
                 _ => return (None, Some("setAccountStatus requires \"accountId\" and \"status\"".to_string())),
             };
-            if !matches!(status, "online" | "idle" | "dnd") {
-                return (None, Some("status must be online, idle or dnd".to_string()));
+            if !matches!(status, "online" | "idle") {
+                return (None, Some("status must be online or idle".to_string()));
             }
             // Recorded before it is applied: a status set while disconnected
             // still has to survive to the next connection.
@@ -445,12 +445,10 @@ pub async fn dispatch(
                     Err(e) => return (None, Some(e.to_string())),
                 }
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
-                // IRC has only away/back, so idle and dnd are both away.
+                // IRC has only away and back.
                 let result = match status {
                     "online" => sender.send(irc::proto::Command::AWAY(None)),
-                    _ => sender.send(irc::proto::Command::AWAY(Some(
-                        if status == "dnd" { "Do not disturb".to_string() } else { "Idle".to_string() },
-                    ))),
+                    _ => sender.send(irc::proto::Command::AWAY(Some("Idle".to_string()))),
                 };
                 result.is_ok()
             } else {

@@ -2430,13 +2430,12 @@ mod tests {
 
 /// Discord's presence shape for one of our statuses.
 ///
-/// Discord's own vocabulary is "online" / "idle" / "dnd", which is why these
-/// pass through unchanged - the mapping only exists so an unrecognised value
+/// Discord's own vocabulary matches ours for both values, so they pass
+/// through unchanged - the mapping only exists so an unrecognised value
 /// cannot put the account into some unintended state.
 fn presence_payload(status: &str) -> serde_json::Value {
     let discord_status = match status {
         "idle" => "idle",
-        "dnd" => "dnd",
         _ => "online",
     };
     json!({ "status": discord_status, "since": 0, "activities": [], "afk": status == "idle" })

@@ -158,8 +158,8 @@ pub struct Runtime {
     /// owns it has been seen, or the other way round - so both directions
     /// consult this rather than depending on which came first.
     matrix_space_parents: Mutex<HashMap<(String, String), String>>,
-    /// account id -> "online" | "idle" | "dnd". Absent means online, which is
-    /// what every backend does on connect anyway.
+    /// account id -> "online" | "idle". Absent means online, which is what
+    /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
     /// change can push a presence update on the existing connection instead of

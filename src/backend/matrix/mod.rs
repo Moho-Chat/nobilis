@@ -205,7 +205,7 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
         // mid-session has to take effect on the next sync, not the next
         // reconnect.
         let presence = match state.runtime.account_status(account_id).as_str() {
-            "idle" | "dnd" => "unavailable",
+            "idle" => "unavailable",
             _ => "online",
         };
         let url = sync_url(&config.homeserver_url, next_batch.as_deref(), presence);
@@ -2120,10 +2120,8 @@ async fn register_space(
 
 /// Pushes a status to the homeserver.
 ///
-/// Matrix has three presence values - online, unavailable, offline - and no
-/// concept of "do not disturb". Both idle and DND therefore map to
-/// unavailable: it is the honest answer to "am I here", and claiming online
-/// while refusing notifications would misrepresent us to everyone else.
+/// Matrix has three presence values - online, unavailable and offline. Idle
+/// maps to unavailable, which is the closest honest answer to "am I here".
 pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
     // Re-read rather than trusting the config passed in: a re-login rotates
     // the token, and a stale one fails with a bare 401.
@@ -2133,7 +2131,7 @@ pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status
         .context("account is no longer configured")?;
     let access_token = account.access_token;
     let presence = match status {
-        "idle" | "dnd" => "unavailable",
+        "idle" => "unavailable",
         _ => "online",
     };
     let user = url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>();
