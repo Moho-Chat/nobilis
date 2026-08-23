@@ -520,7 +520,13 @@ pub async fn dispatch(
                 (Some(a), Some(g), Some(c)) => (a, g, c),
                 _ => return (None, Some("joinVoiceChannel requires \"accountId\", \"guildId\" and \"channelId\"".to_string())),
             };
-            match backend::discord::join_voice(state, account_id, guild_id, channel_id) {
+            // Both default to the cautious setting, so a caller that says
+            // nothing gets an empty channel and a closed microphone.
+            let options = backend::discord_voice::VoiceOptions {
+                solo: params.get("soloOnly").and_then(|v| v.as_bool()).unwrap_or(true),
+                transmit: params.get("transmit").and_then(|v| v.as_bool()).unwrap_or(false),
+            };
+            match backend::discord::join_voice(state, account_id, guild_id, channel_id, options) {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e.to_string())),
             }

@@ -2125,7 +2125,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             // the daemon's job rather than the caller's: by the
                             // time a client could react it would already have
                             // been in a channel with a stranger.
-                            if ours == theirs {
+                            if ours == theirs && state.voice.options(&account_id).solo {
                                 tracing::info!("discord[{account_id}]: leaving voice - another user joined");
                                 leave_voice(state, &account_id);
                                 state.events.emit(
@@ -2167,7 +2167,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             // the daemon's job rather than the caller's: by the
                             // time a client could react it would already have
                             // been in a channel with a stranger.
-                            if ours == theirs {
+                            if ours == theirs && state.voice.options(&account_id).solo {
                                 tracing::info!("discord[{account_id}]: leaving voice - another user joined");
                                 leave_voice(state, &account_id);
                                 state.events.emit(
@@ -2787,21 +2787,36 @@ fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
     }
 }
 
-/// Joins a voice channel, or refuses if anyone is already in it.
+/// Joins a voice channel under the given options.
 ///
-/// The refusal is deliberate and lives here rather than in the caller: this is
-/// a real server full of real people, and "only empty channels" is a rule
-/// worth enforcing where it cannot be forgotten. Joining is opcode 4 on the
-/// main gateway, which the server answers with VOICE_STATE_UPDATE (our session
-/// id) and VOICE_SERVER_UPDATE (where to connect and with what token).
-pub fn join_voice(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str) -> Result<()> {
+/// With `solo` set - the default, and what a caller should use against a
+/// server full of strangers - an occupied channel is refused outright and
+/// anyone arriving later ends the session. The check lives here rather than in
+/// the caller so it cannot be forgotten, but it is an argument rather than a
+/// law: in a guild the user controls, a listener joining is the point.
+///
+/// Joining is opcode 4 on the main gateway, which the server answers with
+/// VOICE_STATE_UPDATE (our session id) and VOICE_SERVER_UPDATE (where to
+/// connect and with what token).
+pub fn join_voice(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    channel_id: &str,
+    options: super::discord_voice::VoiceOptions,
+) -> Result<()> {
     let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
     let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
 
-    let occupants = state.runtime.discord_voice_occupants(account_id, channel_id, &config.user_id);
-    if !occupants.is_empty() {
-        bail!("channel is not empty - {} already in it", occupants.len());
+    if options.solo {
+        let occupants = state.runtime.discord_voice_occupants(account_id, channel_id, &config.user_id);
+        if !occupants.is_empty() {
+            bail!("channel is not empty - {} already in it", occupants.len());
+        }
     }
+    // Recorded before the join, since the handshake it triggers can complete
+    // before this function returns.
+    state.voice.set_options(account_id, options);
 
     sender.send(
         json!({
@@ -2809,11 +2824,11 @@ pub fn join_voice(state: &AppState, account_id: &str, guild_id: &str, channel_id
             "d": {
                 "guild_id": guild_id,
                 "channel_id": channel_id,
-                // Deafened and muted: this establishes a session, it does not
-                // carry audio, and announcing otherwise to a room would be a
-                // misrepresentation.
-                "self_mute": true,
-                "self_deaf": true,
+                // A session that carries no audio joins muted and deafened:
+                // showing an open microphone to a room that cannot hear one
+                // would misrepresent what is happening.
+                "self_mute": !options.transmit,
+                "self_deaf": !options.transmit,
                 // Discord's own client always sends this field; omitting it
                 // gets the frame accepted and then ignored, with no error.
                 "self_video": false

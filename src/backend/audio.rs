@@ -107,7 +107,7 @@ pub struct Capture {
 /// difference ever proves audible.
 pub fn start_capture<F>(device_name: Option<&str>, mut sink: F) -> Result<Capture>
 where
-    F: FnMut(&[i16]) + Send + 'static,
+    F: FnMut(&[f32]) + Send + 'static,
 {
     let device = input_device(device_name)?;
     let config = device.default_input_config().context("querying the input device")?;
@@ -136,8 +136,8 @@ where
             let base = src * channels as usize;
             let l = samples.get(base).copied().unwrap_or(0.0);
             let r = if channels > 1 { samples.get(base + 1).copied().unwrap_or(l) } else { l };
-            out.push((l.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-            out.push((r.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
+            out.push(l.clamp(-1.0, 1.0));
+            out.push(r.clamp(-1.0, 1.0));
         }
         sink(&out);
     };
@@ -194,6 +194,74 @@ mod tests {
         assert!(err.to_string().contains("not available"), "unexpected: {err}");
     }
 
+    #[test]
+    fn a_quiet_microphone_is_not_the_end_of_the_stream() {
+        // The failure this guards against is subtle: returning 0 bytes is how
+        // a file says it is over, so a moment of silence would end the call.
+        use std::io::Read;
+        let (mut source, _sink) = MicSource::new();
+        let mut buf = [1u8; 256];
+        let n = source.read(&mut buf).expect("reading a live source should not fail");
+        assert!(n > 0, "a silent microphone reported end-of-stream");
+        assert!(buf[..n].iter().all(|b| *b == 0), "silence should read as zeroes");
+    }
+
+    #[test]
+    fn captured_audio_reaches_the_source_and_stops_when_the_capture_does() {
+        use std::io::Read;
+        let (mut source, mut sink) = MicSource::new();
+        sink(&[1.0f32, -1.0]);
+
+        let mut buf = [0u8; 8];
+        source.read_exact(&mut buf).expect("captured audio should be readable");
+        assert_eq!(f32::from_le_bytes(buf[..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(buf[4..].try_into().unwrap()), -1.0);
+
+        // Dropping the capture is what ends a call; the source must agree.
+        drop(sink);
+        assert_eq!(source.read(&mut buf).unwrap(), 0, "the source outlived its microphone");
+    }
+
+    #[test]
+    fn a_stalled_reader_does_not_grow_the_backlog_without_limit() {
+        let (source, mut sink) = MicSource::new();
+        let chunk = vec![0.5f32; 4800];
+        for _ in 0..100 {
+            sink(&chunk);
+        }
+        let buffered = source.buffer.lock().unwrap().len();
+        // One second of 48kHz stereo f32, and not the ten seconds pushed in.
+        assert!(buffered <= 48_000 * 2 * 4, "backlog grew to {buffered} bytes");
+    }
+
+    #[test]
+    fn songbird_can_decode_what_the_microphone_produces() {
+        // This is a dependency-shape test, not a logic test, and it earns its
+        // place: songbird builds its codec registry from whatever the shared
+        // symphonia crate has compiled in, and depends on it with no default
+        // features. Without a PCM decoder enabled somewhere in the tree, a
+        // voice connection still opens, negotiates crypto and announces a
+        // microphone - and then discards the track 40ms later with "no
+        // compatible track found", which from the outside is indistinguishable
+        // from a working connection that nobody is talking on.
+        use songbird::input::core::codecs::{CodecParameters, CODEC_TYPE_PCM_F32LE};
+        use songbird::input::core::sample::SampleFormat;
+        // The same parameters songbird's own raw reader describes the stream
+        // with, so this asks exactly the question the mixer asks.
+        let params = CodecParameters::new()
+            .for_codec(CODEC_TYPE_PCM_F32LE)
+            .with_sample_rate(TARGET_RATE)
+            .with_bits_per_coded_sample(32)
+            .with_bits_per_sample(32)
+            .with_sample_format(SampleFormat::F32)
+            .with_max_frames_per_packet(TARGET_RATE as u64 / 50)
+            .with_channels(songbird::input::core::audio::Channels::FRONT_LEFT | songbird::input::core::audio::Channels::FRONT_RIGHT)
+            .clone();
+        songbird::input::codecs::get_codec_registry()
+            .make(&params, &Default::default())
+            .expect("no decoder for the raw f32 audio a microphone produces");
+    }
+
     /// Opens the real default microphone. Ignored by default: it needs
     /// hardware and a running sound server, so it is run deliberately with
     /// `cargo test -- --ignored microphone`.
@@ -202,7 +270,7 @@ mod tests {
     fn microphone_delivers_audio() {
         let count = Arc::new(AtomicUsize::new(0));
         let seen = count.clone();
-        let capture = start_capture(None, move |pcm: &[i16]| {
+        let capture = start_capture(None, move |pcm: &[f32]| {
             seen.fetch_add(pcm.len(), Ordering::Relaxed);
         })
         .expect("opening the default input");
@@ -220,5 +288,105 @@ mod tests {
         // Three seconds of wall clock should yield roughly three seconds of
         // audio; a badly wrong resample ratio shows up here.
         assert!(seconds > 1.5, "far less audio than elapsed time: {seconds:.2}s");
+    }
+}
+
+
+/// A live microphone presented as something Songbird can play.
+///
+/// Songbird reads an input the way it reads a file, but a microphone has no
+/// end and no length: reaching the end of the buffer means "nothing has been
+/// said yet", not "the track is over". Returning zero bytes would be read as
+/// end-of-stream and stop the track, so a read with nothing buffered waits
+/// briefly and then returns silence, which keeps the stream alive and the
+/// timing honest.
+pub struct MicSource {
+    buffer: Arc<Mutex<std::collections::VecDeque<u8>>>,
+    open: Arc<AtomicBool>,
+}
+
+/// Closes a `MicSource` when the thing feeding it goes away.
+///
+/// The sink is owned by the capture stream, so dropping the capture drops this
+/// too, and the source then reports end-of-stream instead of playing silence
+/// into a connection nobody is speaking on.
+struct SinkGuard(Arc<AtomicBool>);
+
+impl Drop for SinkGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+impl MicSource {
+    /// Returns the source and the sink that feeds it.
+    pub fn new() -> (Self, impl FnMut(&[f32]) + Send + 'static) {
+        let buffer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let open = Arc::new(AtomicBool::new(true));
+        let writer = buffer.clone();
+        let guard = SinkGuard(open.clone());
+        let sink = move |pcm: &[f32]| {
+            // Held solely so its drop closes the source.
+            let _ = &guard;
+            let mut buf = writer.lock().unwrap();
+            for sample in pcm {
+                buf.extend(sample.to_le_bytes());
+            }
+            // Cap the backlog: if the encoder ever stalls, the right thing is
+            // to drop old audio rather than grow without limit and then play
+            // out minutes of stale sound. Trimmed after writing, so the cap
+            // holds for what is actually buffered rather than for what was
+            // buffered one chunk ago.
+            const MAX_BYTES: usize = 48_000 * 2 * 4; // one second
+            let backlog = buf.len();
+            if backlog > MAX_BYTES {
+                buf.drain(..backlog - MAX_BYTES);
+            }
+        };
+        (Self { buffer, open }, sink)
+    }
+}
+
+impl std::io::Read for MicSource {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        for _ in 0..20 {
+            if !self.open.load(Ordering::Relaxed) {
+                return Ok(0);
+            }
+            {
+                let mut buf = self.buffer.lock().unwrap();
+                if !buf.is_empty() {
+                    let n = out.len().min(buf.len());
+                    for slot in out.iter_mut().take(n) {
+                        *slot = buf.pop_front().unwrap();
+                    }
+                    return Ok(n);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Still nothing, but the microphone is still open: hand back silence
+        // rather than end-of-stream, which would stop the track for good.
+        let n = out.len().min(1920 * 4);
+        out[..n].fill(0);
+        Ok(n)
+    }
+}
+
+impl std::io::Seek for MicSource {
+    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "a microphone cannot seek"))
+    }
+}
+
+// Songbird's own re-export rather than a direct symphonia dependency: the
+// trait has to be the one Songbird was built against, and naming it through
+// Songbird makes that true by construction instead of by matching versions.
+impl songbird::input::core::io::MediaSource for MicSource {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+    fn byte_len(&self) -> Option<u64> {
+        None
     }
 }

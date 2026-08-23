@@ -40,6 +40,29 @@ impl PendingHandshake {
     }
 }
 
+/// How a particular voice session is meant to behave.
+///
+/// Both of these are per-join rather than fixed policy. "Only empty channels"
+/// is the right default against a server full of strangers, but it is a rule
+/// about a place, not about voice: in a guild the user owns, being ejected the
+/// moment they join to listen makes testing impossible. Likewise a session
+/// that carries no audio should say so by being muted, and one that does
+/// should not.
+#[derive(Clone, Copy, Debug)]
+pub struct VoiceOptions {
+    /// Refuse an occupied channel, and leave if anyone arrives.
+    pub solo: bool,
+    /// Send microphone audio, rather than joining muted and deafened.
+    pub transmit: bool,
+}
+
+impl Default for VoiceOptions {
+    fn default() -> Self {
+        // The cautious pair: an empty channel, and silence.
+        Self { solo: true, transmit: false }
+    }
+}
+
 /// Live drivers and half-built handshakes, per account.
 ///
 /// A Driver owns its own tasks and is not cloneable, so it lives here rather
@@ -48,11 +71,32 @@ impl PendingHandshake {
 pub struct VoiceState {
     pending: Mutex<HashMap<String, PendingHandshake>>,
     drivers: Mutex<HashMap<String, Driver>>,
+    options: Mutex<HashMap<String, VoiceOptions>>,
+    /// The running microphone stream, held here because dropping it stops the
+    /// capture; the driver reads from the buffer it feeds.
+    captures: Mutex<HashMap<String, crate::backend::audio::Capture>>,
 }
 
 impl VoiceState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records how the next connection for this account should behave.
+    pub fn set_options(&self, account_id: &str, options: VoiceOptions) {
+        self.options.lock().unwrap().insert(account_id.to_string(), options);
+    }
+
+    /// The options in force, defaulting to the cautious pair if a session was
+    /// established by something other than an explicit join.
+    pub fn options(&self, account_id: &str) -> VoiceOptions {
+        self.options.lock().unwrap().get(account_id).copied().unwrap_or_default()
+    }
+
+    /// Peak microphone level of a transmitting session, for a level meter.
+    pub fn input_level(&self, account_id: &str) -> Option<f32> {
+        let captures = self.captures.lock().unwrap();
+        captures.get(account_id).map(|c| *c.level.lock().unwrap())
     }
 }
 
@@ -138,12 +182,45 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let mut driver = Driver::new(Config::default());
     driver.connect(connection).await.context("opening the voice connection")?;
+
+    if state.voice.options(account_id).transmit {
+        match start_transmitting(&mut driver) {
+            Ok(capture) => {
+                state.voice.captures.lock().unwrap().insert(account_id.to_string(), capture);
+                tracing::info!("discord[{account_id}]: transmitting microphone audio");
+            }
+            // A missing or busy microphone should not tear down a connection
+            // that is otherwise fine; the session simply carries no audio.
+            Err(e) => tracing::warn!("discord[{account_id}]: no microphone, joining silent: {e:#}"),
+        }
+    }
+
     state.voice.drivers.lock().unwrap().insert(account_id.to_string(), driver);
     Ok(())
 }
 
+/// Opens the microphone and hands it to the driver as a live track.
+///
+/// Songbird plays an input by reading from it, so the microphone is presented
+/// as a byte stream of interleaved f32 samples at the rate Discord expects
+/// (see `audio::MicSource`), which the raw adapter labels and the driver then
+/// encodes to Opus.
+fn start_transmitting(driver: &mut Driver) -> Result<crate::backend::audio::Capture> {
+    use crate::backend::audio::{self, MicSource, TARGET_CHANNELS, TARGET_RATE};
+
+    let (source, sink) = MicSource::new();
+    let capture = audio::start_capture(None, sink)?;
+    let input = songbird::input::RawAdapter::new(source, TARGET_RATE, TARGET_CHANNELS as u32);
+    let handle = driver.play_input(input.into());
+    // Looping is meaningless for a live source, but an explicit play makes the
+    // intent clear and surfaces a rejected track immediately.
+    let _ = handle.play();
+    Ok(capture)
+}
+
 /// Tears down a voice connection, if one is up.
 pub async fn disconnect(state: &AppState, account_id: &str) {
+    state.voice.captures.lock().unwrap().remove(account_id);
     let driver = state.voice.drivers.lock().unwrap().remove(account_id);
     if let Some(mut driver) = driver {
         driver.leave();
