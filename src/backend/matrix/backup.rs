@@ -212,6 +212,7 @@ mod tests {
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
         };
         let config = crate::accounts::MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

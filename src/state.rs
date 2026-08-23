@@ -25,4 +25,6 @@ pub struct AppState {
     /// the only way it can stop one it did not spawn - see main.rs, which
     /// waits on this alongside SIGTERM and runs the identical clean exit.
     pub shutdown: Arc<Notify>,
+    /// Live Discord voice connections and half-built handshakes.
+    pub voice: Arc<crate::backend::discord_voice::VoiceState>,
 }

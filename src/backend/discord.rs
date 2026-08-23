@@ -2112,6 +2112,14 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                     "sessionId": d["session_id"].as_str()
                                 }),
                             );
+                            super::discord_voice::note_voice_state(
+                                state,
+                                &account_id,
+                                d["guild_id"].as_str(),
+                                channel_id,
+                                d["session_id"].as_str(),
+                            )
+                            .await;
                         } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
                             // Somebody else arrived where we are. Leaving is
                             // the daemon's job rather than the caller's: by the
@@ -2146,6 +2154,14 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                     "sessionId": d["session_id"].as_str()
                                 }),
                             );
+                            super::discord_voice::note_voice_state(
+                                state,
+                                &account_id,
+                                d["guild_id"].as_str(),
+                                channel_id,
+                                d["session_id"].as_str(),
+                            )
+                            .await;
                         } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
                             // Somebody else arrived where we are. Leaving is
                             // the daemon's job rather than the caller's: by the
@@ -2175,6 +2191,14 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                 "hasToken": d["token"].as_str().is_some()
                             }),
                         );
+                        super::discord_voice::note_voice_server(
+                            state,
+                            &account_id,
+                            d["guild_id"].as_str(),
+                            d["endpoint"].as_str(),
+                            d["token"].as_str(),
+                        )
+                        .await;
                     }
 
                     "PRESENCE_UPDATE" => {

@@ -73,3 +73,8 @@ ruma-common = "=0.19.0"
 ruma-client-api = "=0.24.0"
 ruma-events = "=0.34.0"
 js_int = "=0.2.2"
+# Discord voice. Standalone: no serenity or twilight gateway, since nobilis
+# has its own - only the driver, which needs a websocket backend named
+# explicitly, and tungstenite is what the rest of this crate already speaks.
+# `receive` is what makes hearing anyone possible; it is off by default.
+songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite", "receive", "gateway"] }
