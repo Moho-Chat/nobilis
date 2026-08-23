@@ -351,6 +351,9 @@ async fn run_room_once(state: &AppState, transport: &Transport, session: &Sessio
     // quiet room would otherwise show no buffer/tab at all despite being
     // connected and joined.
     state.runtime.ensure_buffer(state, account_id, &buffer_name, "channel");
+    // The server follows a join with the room's whole roster, so anything left
+    // from a previous connection would only be stale.
+    state.runtime.set_presence(&crate::model::buffer_id(account_id, &buffer_name), serde_json::json!([]));
     tracing::info!("sockchat[{account_id}]: joined room {} ({})", room.id, room.name);
 
     loop {
@@ -383,6 +386,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, account_id: &str, buffer_name: &str, is_primary: bool, frame: &str) -> Result<()> {
     let resp = protocol::ServerResponse::parse(frame);
+
+    if !resp.users_joined.is_empty() || !resp.users_left.is_empty() {
+        update_roster(state, account_id, buffer_name, &resp.users_joined, &resp.users_left);
+    }
 
     if let Some(text) = &resp.plaintext {
         tracing::debug!("sockchat[{account_id}]: {text}");
@@ -1309,4 +1316,59 @@ mod live_probe {
         println!("authenticated. user id: {:?}", session.user_id());
         assert!(session.is_authenticated().await.expect("post-login check failed"), "session reports not authenticated right after logging in");
     }
+}
+
+/// Applies a roster delta to a room and republishes it.
+///
+/// The server sends the full roster on join and single entries afterwards,
+/// both under the same key and in the same shape, so both are simply merged -
+/// the roster is emptied when the room is joined, which is what makes that
+/// safe. Departures arrive separately, keyed by id with a presence flag.
+///
+/// Ordering is by name here rather than left to the client: every other
+/// backend hands over a sorted roster, and a five-hundred-name list arriving
+/// in map order would be unreadable.
+fn update_roster(
+    state: &AppState,
+    account_id: &str,
+    buffer_name: &str,
+    joined: &[protocol::WireUser],
+    left: &[String],
+) {
+    let buffer_id = crate::model::buffer_id(account_id, buffer_name);
+    let mut by_id: std::collections::BTreeMap<String, String> = state
+        .runtime
+        .get_presence(&buffer_id)
+        .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|m| {
+            let id = m.get("userId")?.as_str()?.to_string();
+            let nick = m.get("nick")?.as_str()?.to_string();
+            Some((id, nick))
+        })
+        .collect();
+
+    for user in joined {
+        by_id.insert(user.id.clone(), user.username.clone());
+    }
+    for id in left {
+        by_id.remove(id);
+    }
+
+    let mut members: Vec<(String, String)> = by_id.into_iter().collect();
+    members.sort_by(|(_, a), (_, b)| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+    let member_list = serde_json::json!(members
+        .into_iter()
+        .map(|(id, nick)| serde_json::json!({ "nick": nick, "userId": id, "prefix": "", "away": false }))
+        .collect::<Vec<_>>());
+
+    // Persisted as well as broadcast, so a client that subscribes later gets
+    // the roster from subscribe's replay rather than waiting for the next
+    // arrival or departure - which in a quiet room could be a long wait.
+    state.runtime.set_presence(&buffer_id, member_list.clone());
+    state.events.emit(
+        "presenceChange",
+        serde_json::json!({ "bufferId": buffer_id, "members": member_list }),
+    );
 }

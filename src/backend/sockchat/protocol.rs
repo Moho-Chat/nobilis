@@ -106,6 +106,50 @@ struct RawResponse {
     /// tagged on a message object's own `deleted`/`is_deleted` flag.
     #[serde(default)]
     delete: Vec<String>,
+    /// Who is in the room, keyed by user id. Sent in full on join - upwards of
+    /// five hundred entries for a busy room - and then one entry at a time as
+    /// people arrive. Both forms are the same shape, so both simply merge.
+    #[serde(default)]
+    users: std::collections::BTreeMap<String, WireUser>,
+    /// Departures, keyed by user id. The value is a presence flag rather than
+    /// a user object, which is why this is a separate key from `users`.
+    #[serde(default)]
+    user: std::collections::BTreeMap<String, bool>,
+    /// Whatever else the server sent. The protocol is undocumented, so this
+    /// is how a frame nobody has decoded yet becomes visible instead of being
+    /// silently dropped - `unhandled_shape` reports its outline at debug level
+    /// without printing anyone's messages.
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// A one-line outline of a JSON value: enough to write a parser against,
+/// without reproducing chat content in the log.
+fn outline(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) => {
+            // Field *names* of a nested object are protocol, not content, so
+            // they are safe to name - unlike the outer map's keys, which here
+            // are user ids.
+            let sample = match map.values().next() {
+                Some(serde_json::Value::Object(inner)) => {
+                    format!("{{{}}}", inner.keys().cloned().collect::<Vec<_>>().join(","))
+                }
+                Some(v) => outline(v),
+                None => "?".into(),
+            };
+            format!("object({} keys, values like {})", map.len(), sample)
+        }
+        serde_json::Value::Array(items) => {
+            let sample = items.first().map(outline).unwrap_or_else(|| "?".into());
+            format!("array({}, of {})", items.len(), sample)
+        }
+        // Field *names* only - the values are the user's chat data.
+        serde_json::Value::String(_) => "string".into(),
+        serde_json::Value::Number(_) => "number".into(),
+        serde_json::Value::Bool(_) => "bool".into(),
+        serde_json::Value::Null => "null".into(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -114,6 +158,10 @@ pub struct ServerResponse {
     pub whisper: Option<WireWhisper>,
     pub perms: Option<Perms>,
     pub deleted_uuids: Vec<String>,
+    /// Room members that arrived (or the whole roster, on join).
+    pub users_joined: Vec<WireUser>,
+    /// User ids that left.
+    pub users_left: Vec<String>,
     /// Non-JSON payload, if the frame wasn't an object.
     pub plaintext: Option<String>,
 }
@@ -157,7 +205,29 @@ impl ServerResponse {
             }
         });
 
-        ServerResponse { messages, whisper, perms: raw.permissions, deleted_uuids: raw.delete, plaintext: None }
+        // Key names and value shapes only - never the values, which are the
+        // user's chat. The protocol is undocumented, so this is how its frame
+        // vocabulary becomes knowable at all.
+        if !raw.extra.is_empty() {
+            let shape: Vec<String> = raw.extra.iter().map(|(k, v)| format!("{k}: {}", outline(v))).collect();
+            tracing::debug!("sockchat: frame carried undecoded keys - {}", shape.join(", "));
+        }
+
+        let users_joined: Vec<WireUser> = raw.users.into_values().collect();
+        // Only the false entries are departures; a true one carries no user
+        // object to add anyone with, and the matching `users` frame is what
+        // announces an arrival.
+        let users_left: Vec<String> = raw.user.into_iter().filter(|(_, present)| !present).map(|(id, _)| id).collect();
+
+        ServerResponse {
+            messages,
+            whisper,
+            perms: raw.permissions,
+            deleted_uuids: raw.delete,
+            users_joined,
+            users_left,
+            plaintext: None,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -165,6 +235,8 @@ impl ServerResponse {
             && self.whisper.is_none()
             && self.perms.is_none()
             && self.deleted_uuids.is_empty()
+            && self.users_joined.is_empty()
+            && self.users_left.is_empty()
             && self.plaintext.is_none()
     }
 }
