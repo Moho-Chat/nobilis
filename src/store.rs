@@ -283,7 +283,8 @@ impl Store {
             let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
             let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
             let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
-            let attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+            let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+            drop_missing_local_copies(&mut attachments);
             Ok(Message {
                 id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 buffer_id: buffer_id.to_string(),
@@ -307,7 +308,32 @@ impl Store {
         out.reverse();
         Ok(out)
     }
+}
 
+/// Forgets local copies that are no longer on disk.
+///
+/// The caches these paths point into are swept when they outgrow their size
+/// caps, and the message that named a file keeps naming it long after it was
+/// deleted. Handing a client a path to a file that is gone makes a perfectly
+/// good attachment look broken, and - worse - look expired, since a missing
+/// preview is indistinguishable from a lapsed link at the far end.
+fn drop_missing_local_copies(attachments: &mut [Attachment]) {
+    let gone = |p: &Option<String>| -> bool {
+        let Some(p) = p.as_deref() else { return false };
+        let Some(rest) = p.strip_prefix("file://") else { return false };
+        !std::path::Path::new(rest).exists()
+    };
+    for att in attachments.iter_mut() {
+        if gone(&att.thumbnail_path) {
+            att.thumbnail_path = None;
+        }
+        if gone(&att.path) {
+            att.path = None;
+        }
+    }
+}
+
+impl Store {
     /// A single message by id - used to build a ReplyPreview locally for
     /// protocols that (unlike Discord's `referenced_message`) only give a
     /// reply's target event id, not its content, inline with the reply
@@ -336,7 +362,8 @@ impl Store {
             let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
             let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
             let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
-            let attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+            let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+            drop_missing_local_copies(&mut attachments);
             Ok(Message {
                 id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 buffer_id: buffer_id.to_string(),
@@ -398,7 +425,8 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
+    use super::{drop_missing_local_copies, Store};
+    use crate::model::Attachment;
 
     fn store() -> (Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -415,6 +443,50 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None)
             .expect("appending");
+    }
+
+    #[test]
+    fn a_swept_thumbnail_is_not_reported_as_still_being_there() {
+        // The thumbnail cache is capped and sweeps its oldest files, while the
+        // message that named one goes on naming it. A client told about a file
+        // that is gone shows a broken picture and, worse, reports the link as
+        // expired - when the link is fine and the local copy simply aged out.
+        let dir = std::env::temp_dir().join(format!("nobilis-store-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("kept");
+        std::fs::write(&present, b"x").unwrap();
+
+        let mut attachments = vec![
+            Attachment {
+                thumbnail_path: Some(format!("file://{}", present.display())),
+                path: Some(format!("file://{}", dir.join("swept").display())),
+                ..Default::default()
+            },
+            Attachment {
+                thumbnail_path: Some(format!("file://{}", dir.join("also-swept").display())),
+                ..Default::default()
+            },
+        ];
+        drop_missing_local_copies(&mut attachments);
+
+        assert!(attachments[0].thumbnail_path.is_some(), "a file that exists was dropped");
+        assert!(attachments[0].path.is_none(), "a swept original was still advertised");
+        assert!(attachments[1].thumbnail_path.is_none(), "a swept thumbnail was still advertised");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_remote_url_is_left_alone() {
+        // Only local copies are checked; a https link is not this code's
+        // business and must survive untouched.
+        let mut attachments = vec![Attachment {
+            url: Some("https://cdn.discordapp.com/attachments/1/2/a.png".to_string()),
+            thumbnail_path: None,
+            ..Default::default()
+        }];
+        drop_missing_local_copies(&mut attachments);
+        assert_eq!(attachments[0].url.as_deref(), Some("https://cdn.discordapp.com/attachments/1/2/a.png"));
     }
 
     #[test]
