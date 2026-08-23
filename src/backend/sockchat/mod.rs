@@ -1328,6 +1328,15 @@ mod live_probe {
 /// Ordering is by name here rather than left to the client: every other
 /// backend hands over a sorted roster, and a five-hundred-name list arriving
 /// in map order would be unreadable.
+/// The site owner's forum account. SockChat carries no rank information at
+/// all - the roster's user objects are id, name, avatar and last activity, and
+/// the only `permissions` frame describes our *own* ability to view and send -
+/// so there is no wire signal to derive staff from. This one id is a fact
+/// about the site rather than something the protocol tells us, which is why it
+/// is the only such marking: guessing at moderators without data would be
+/// worse than showing everyone as an ordinary member.
+const SITE_OWNER_ID: &str = "1";
+
 fn update_roster(
     state: &AppState,
     account_id: &str,
@@ -1360,7 +1369,12 @@ fn update_roster(
     members.sort_by(|(_, a), (_, b)| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members
         .into_iter()
-        .map(|(id, nick)| serde_json::json!({ "nick": nick, "userId": id, "prefix": "", "away": false }))
+        .map(|(id, nick)| {
+            // "~" is the owner prefix the frontend already ranks by, shared
+            // with IRC rather than inventing a Sneedchat-only convention.
+            let prefix = if id == SITE_OWNER_ID { "~" } else { "" };
+            serde_json::json!({ "nick": nick, "userId": id, "prefix": prefix, "away": false })
+        })
         .collect::<Vec<_>>());
 
     // Persisted as well as broadcast, so a client that subscribes later gets
