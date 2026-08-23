@@ -823,6 +823,14 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     );
     cache_guild_icon(state.clone(), account_id.clone(), guild_id.to_string(), guild_name.clone(), guild["icon"].as_str().map(str::to_string), guild["position"].as_i64().unwrap_or(0));
 
+    // Type 4 is a category: not a channel anyone talks in, but the heading
+    // the others are filed under, and it carries its own ordering.
+    let categories: HashMap<&str, (&str, i64)> = channels
+        .iter()
+        .filter(|c| c["type"].as_i64() == Some(4))
+        .filter_map(|c| Some((c["id"].as_str()?, (c["name"].as_str().unwrap_or("category"), c["position"].as_i64().unwrap_or(0)))))
+        .collect();
+
     for ch in channels {
         // 0 = GUILD_TEXT, 5 = GUILD_ANNOUNCEMENT - the only channel types
         // this milestone renders as buffers (voice/category/forum/etc.
@@ -844,6 +852,18 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
         state.runtime.set_discord_channel(&buf.id, channel_id);
         state.runtime.set_discord_guild(&buf.id, guild_id);
         state.runtime.set_buffer_group(state, &buf.id, &group_id);
+
+        // Where Discord itself puts this channel. Uncategorised channels sit
+        // above every heading, which is where Discord shows them, so they take
+        // a category rank below any real one.
+        let parent = ch["parent_id"].as_str().and_then(|p| categories.get(p));
+        let channel_pos = ch["position"].as_i64().unwrap_or(0);
+        let sort = match parent {
+            Some((_, cat_pos)) => (cat_pos + 1) * 10_000 + channel_pos,
+            None => channel_pos,
+        };
+        state.runtime.set_buffer_category(state, &buf.id, parent.map(|(name, _)| *name), sort);
+
         // Custom emoji are per-guild, not per-channel, but buffers only
         // carry a channel id (see discord_channels) - simplest to just
         // hand each of the guild's channels its own copy of the same

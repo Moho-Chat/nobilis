@@ -486,6 +486,11 @@ impl Runtime {
             name: name.to_string(),
             last_activity_ts,
             avatar_url: None,
+            // Filled in by whichever backend knows: a Discord guild files its
+            // channels under the server's own headings, and everything else
+            // has none.
+            category: None,
+            position: 0,
             encrypted: None,
             group_id: Some(model::account_group_id(account_id)),
         };
@@ -1047,6 +1052,28 @@ impl Runtime {
             match buffers.get_mut(&buffer_id) {
                 Some(b) if b.avatar_url.as_deref() != Some(avatar_url) => {
                     b.avatar_url = Some(avatar_url.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Files a buffer under a heading, in the order the service puts it.
+    ///
+    /// Broadcast only when something changed: guild channels are re-registered
+    /// on every reconnect, and a client that redrew its whole list each time
+    /// would flicker.
+    pub fn set_buffer_category(&self, state: &AppState, buffer_id: &str, category: Option<&str>, position: i64) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.category.as_deref() != category || b.position != position => {
+                    b.category = category.map(String::from);
+                    b.position = position;
                     Some(b.clone())
                 }
                 _ => None,

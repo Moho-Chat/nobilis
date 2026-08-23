@@ -86,6 +86,19 @@ pub struct Buffer {
     /// set_buffer_avatar.
     #[serde(rename = "avatarUrl", skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// The heading this buffer sits under, where the service has such a thing
+    /// - a Discord category. Absent for everything else, and for channels the
+    /// server left uncategorised, which belong above the first heading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Where the service puts this buffer in its own ordering.
+    ///
+    /// One number rather than a category rank and a channel rank, because a
+    /// client only ever needs to sort by it: it is the category's position and
+    /// the channel's position folded together, so channels sort within their
+    /// heading and headings sort against each other.
+    #[serde(default)]
+    pub position: i64,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
     /// not `false`, for every other protocol, since "encrypted" isn't a
     /// meaningful concept for them at all). Drives the lock/unlock
