@@ -152,6 +152,12 @@ pub struct Runtime {
     /// event would risk silently fragmenting a room's messages across
     /// multiple wrongly-named buffers.
     matrix_room_names: Mutex<HashMap<(String, String), (String, String)>>,
+    /// Matrix-specific: (account id, child room id) -> the rail group of the
+    /// space listing it. Kept because a space and its children arrive in no
+    /// particular order - a child's buffer may exist before the space that
+    /// owns it has been seen, or the other way round - so both directions
+    /// consult this rather than depending on which came first.
+    matrix_space_parents: Mutex<HashMap<(String, String), String>>,
     /// Matrix-specific: account id -> the running OlmMachine wrapper (see
     /// backend/matrix/crypto.rs). Stored here, not just kept local to the
     /// sync-loop task, so sendMessage/toggleReaction RPC handlers - which
@@ -262,6 +268,7 @@ impl Runtime {
             sockchat_senders: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
+            matrix_space_parents: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
             matrix_encrypted_rooms: Mutex::new(HashSet::new()),
             matrix_own_reactions: Mutex::new(HashMap::new()),
@@ -838,6 +845,26 @@ impl Runtime {
     /// different field. A no-op broadcast-wise if the buffer doesn't exist
     /// yet (the avatar is still cached for whenever ensure_buffer creates
     /// it - see get_matrix_room_avatar, checked at that point).
+    pub fn has_buffer_group(&self, group_id: &str) -> bool {
+        self.buffer_groups.lock().unwrap().contains_key(group_id)
+    }
+
+    pub fn set_matrix_space_parent(&self, account_id: &str, child_room_id: &str, group_id: &str) {
+        self.matrix_space_parents
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), child_room_id.to_string()), group_id.to_string());
+    }
+
+    pub fn get_matrix_space_parent(&self, account_id: &str, child_room_id: &str) -> Option<String> {
+        self.matrix_space_parents.lock().unwrap().get(&(account_id.to_string(), child_room_id.to_string())).cloned()
+    }
+
+    /// The buffer showing a Matrix room, if one has been created for it.
+    pub fn matrix_buffer_for_room(&self, room_id: &str) -> Option<String> {
+        self.matrix_rooms.lock().unwrap().iter().find(|(_, r)| r.as_str() == room_id).map(|(b, _)| b.clone())
+    }
+
     pub fn set_matrix_room_avatar(&self, state: &AppState, account_id: &str, room_id: &str, avatar_url: &str) {
         self.matrix_room_avatars.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), avatar_url.to_string());
         let Some(buffer_id) = self.matrix_rooms.lock().unwrap().iter().find(|(_, r)| r.as_str() == room_id).map(|(b, _)| b.clone()) else { return };

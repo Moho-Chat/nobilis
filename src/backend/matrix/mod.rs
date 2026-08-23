@@ -304,11 +304,24 @@ async fn bootstrap_joined_rooms(state: &AppState, account_id: &str, own_user_id:
         let Some(events) = state_resp.as_array() else { continue };
         let event_refs: Vec<&Value> = events.iter().collect();
 
+        // A Space is a room too, so it arrives in joined_rooms alongside real
+        // ones. It gets a rail entry rather than a buffer - there is nothing
+        // to say in it.
+        if rooms::is_space(&event_refs) {
+            register_space(state, account_id, &room_id, homeserver_url, access_token, &event_refs).await;
+            continue;
+        }
+
         let info = rooms::derive_room_info(&room_id, own_user_id, &event_refs);
         state.runtime.set_matrix_room_name(account_id, &room_id, &info.name, &info.kind);
 
         let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
         state.runtime.set_matrix_room(&buffer.id, &room_id);
+        // The space that lists this room may already have been seen, or may
+        // turn up later - register_space back-fills the other order.
+        if let Some(group_id) = state.runtime.get_matrix_space_parent(account_id, &room_id) {
+            state.runtime.set_buffer_group(state, &buffer.id, &group_id);
+        }
 
         state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
 
@@ -357,6 +370,21 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
                 // this is deliberately *not* re-derived on later syncs.
                 let mut naming_events: Vec<&Value> = room["state"]["events"].as_array().into_iter().flatten().collect();
                 naming_events.extend(timeline_events.iter().filter(|e| e["state_key"].is_string()));
+
+                // A space joined mid-session arrives here exactly like a room
+                // would. It becomes a rail entry, not a buffer - without this
+                // it would appear in the room list as somewhere to talk.
+                // Bootstrap and this loop run concurrently, and a first
+                // sync does not always carry m.room.create - so a space can
+                // reach here looking like an ordinary room. Whichever side
+                // identified it first is the answer.
+                if rooms::is_space(&naming_events)
+                    || state.runtime.has_buffer_group(&space_group_id(account_id, room_id))
+                {
+                    register_space(state, account_id, room_id, homeserver_url, access_token, &naming_events).await;
+                    continue;
+                }
+
                 let info = rooms::derive_room_info(room_id, own_user_id, &naming_events);
                 state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
                 // Same full-state snapshot naming just derived from - also
@@ -371,6 +399,13 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
 
         let buffer = state.runtime.ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
         state.runtime.set_matrix_room(&buffer.id, room_id);
+
+        // A room can be added to a space at any time, and a space seen after
+        // this room was first synced only records the mapping - so this is
+        // checked every sync rather than only when the buffer is created.
+        if let Some(group_id) = state.runtime.get_matrix_space_parent(account_id, room_id) {
+            state.runtime.set_buffer_group(state, &buffer.id, &group_id);
+        }
 
         // A room avatar discovered above (in the first-seen branch, before
         // this buffer existed) never actually reached it - set_matrix_room_
@@ -2005,5 +2040,69 @@ mod tests {
         decryptor.read_to_end(&mut decrypted).expect("decrypting");
 
         assert_eq!(decrypted, plaintext, "decrypted bytes don't match the original plaintext");
+    }
+}
+
+/// The rail entry id for one Matrix space.
+fn space_group_id(account_id: &str, room_id: &str) -> String {
+    format!("{account_id}|space:{room_id}")
+}
+
+/// Turns a joined Space into a rail entry and files its rooms under it.
+///
+/// Spaces and their rooms arrive in whatever order joined_rooms happens to
+/// list them, so this works both ways: children seen already are moved now,
+/// and children seen later find the mapping waiting for them.
+///
+/// A room can be listed by more than one space; the last one processed wins,
+/// since a buffer belongs to exactly one rail entry. That is a real Matrix
+/// arrangement rather than an error, and picking one beats showing the room
+/// twice.
+async fn register_space(
+    state: &AppState,
+    account_id: &str,
+    room_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+    events: &[&Value],
+) {
+    let name = rooms::derive_room_info(room_id, "", events).name;
+    let group_id = space_group_id(account_id, room_id);
+
+    // Resolved to a local file for the same reason room avatars are: the mxc
+    // URI needs an access token no frontend holds.
+    let icon_url = match rooms::room_avatar_mxc(events) {
+        Some(mxc) => cached_media_path(homeserver_url, access_token, &mxc, "").await,
+        None => None,
+    };
+
+    state.runtime.upsert_buffer_group(
+        state,
+        crate::model::BufferGroup {
+            id: group_id.clone(),
+            account_id: account_id.to_string(),
+            service: "matrix".to_string(),
+            kind: "space".to_string(),
+            name,
+            icon_url,
+            // Matrix gives spaces no ordering of its own, so they sort by name
+            // among themselves - after Discord's guilds, which do carry one.
+            position: 500,
+        },
+    );
+
+    // If the other side got here first and made a buffer for this space,
+    // discard it: a space is not somewhere you talk, and leaving it in the
+    // room list is how spaces end up looking like empty chats.
+    if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(room_id) {
+        tracing::debug!("matrix[{account_id}]: {room_id} is a space, dropping the buffer made for it");
+        state.runtime.remove_buffer(state, &buffer_id);
+    }
+
+    for child in rooms::space_children(events) {
+        state.runtime.set_matrix_space_parent(account_id, &child, &group_id);
+        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(&child) {
+            state.runtime.set_buffer_group(state, &buffer_id, &group_id);
+        }
     }
 }
