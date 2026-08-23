@@ -161,6 +161,7 @@ pub struct Runtime {
     /// account id -> "online" | "idle". Absent means online, which is what
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
+    discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
     /// change can push a presence update on the existing connection instead of
     /// waiting for a reconnect.
@@ -277,6 +278,7 @@ impl Runtime {
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
+            discord_member_list_targets: Mutex::new(HashMap::new()),
             discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
             matrix_encrypted_rooms: Mutex::new(HashSet::new()),
@@ -624,6 +626,29 @@ impl Runtime {
 
     pub fn set_discord_channel(&self, buffer_id: &str, channel_id: &str) {
         self.discord_channels.lock().unwrap().insert(buffer_id.to_string(), channel_id.to_string());
+    }
+
+    /// The buffer showing a Discord channel, if one exists - the reverse of
+    /// discord_channels, needed because gateway dispatches are keyed by
+    /// channel id while everything else here is keyed by buffer.
+    /// (account, guild) -> the buffer whose member list was last asked for.
+    ///
+    /// GUILD_MEMBER_LIST_UPDATE identifies its list by guild and a
+    /// permissions-derived id rather than by channel, so the reply cannot be
+    /// matched back to a channel on its own - this remembers who asked.
+    pub fn set_discord_member_list_target(&self, account_id: &str, guild_id: &str, buffer_id: &str) {
+        self.discord_member_list_targets
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), guild_id.to_string()), buffer_id.to_string());
+    }
+
+    pub fn discord_member_list_target(&self, account_id: &str, guild_id: &str) -> Option<String> {
+        self.discord_member_list_targets.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned()
+    }
+
+    pub fn discord_buffer_for_channel(&self, channel_id: &str) -> Option<String> {
+        self.discord_channels.lock().unwrap().iter().find(|(_, c)| c.as_str() == channel_id).map(|(b, _)| b.clone())
     }
 
     pub fn get_discord_channel(&self, buffer_id: &str) -> Option<String> {

@@ -438,7 +438,7 @@ pub async fn dispatch(
             state.runtime.set_account_status(account_id, status);
 
             let applied = if state.accounts.get_discord(account_id).is_some() {
-                backend::discord::apply_status(state, account_id, status)
+                backend::discord::apply_status(state, account_id, status).await
             } else if let Some(config) = state.accounts.get_matrix(account_id) {
                 match backend::matrix::apply_status(state, &config, status).await {
                     Ok(()) => true,
@@ -457,6 +457,21 @@ pub async fn dispatch(
 
             (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
         }
+
+        /// Asks for a channel's member list.
+        ///
+        /// Separate from subscribe because a client subscribes to every buffer
+        /// it tracks unread counts for, while a member list belongs to the one
+        /// channel being looked at. Discord answers these per guild rather
+        /// than per channel, so asking for several at once makes the replies
+        /// ambiguous - and it is wasted traffic for channels nobody is reading.
+        "requestMemberList" => match p_str_opt(params, "bufferId") {
+            None => (None, Some("requestMemberList requires \"bufferId\"".to_string())),
+            Some(buffer_id) => {
+                let asked = backend::discord::request_member_list(state, buffer_id);
+                (Some(serde_json::json!({ "requested": asked })), None)
+            }
+        },
 
         "partBuffer" => match p_str_opt(params, "bufferId") {
             None => (None, Some("no such buffer".to_string())),

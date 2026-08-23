@@ -462,6 +462,9 @@ fn register_dm_channel(state: &AppState, account_id: &str, ch: &Value, channel_m
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(&buf.id, channel_id);
+    // A DM has no member list to subscribe to - the participants are right
+    // here in the channel object, and they are the whole roster.
+    set_dm_presence(state, &buf.id, ch);
     ensure_dm_group(state, account_id);
     state.runtime.set_buffer_group(state, &buf.id, &dm_group_id(account_id));
     channel_map.insert(channel_id.to_string(), (name, "dm".to_string()));
@@ -2060,6 +2063,12 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
                         state.runtime.update_reaction(state, &buffer_id, msg_id, &emoji_key, is_me, t == "MESSAGE_REACTION_ADD");
                     }
+                    "GUILD_MEMBER_LIST_UPDATE" => {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) else { continue };
+                        update_member_list(state, &buffer_id, d);
+                    }
+
                     "PRESENCE_UPDATE" => {
                         // Fires for guild members too, not just friends -
                         // update_discord_presence itself is the friends-only
@@ -2070,6 +2079,10 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         if state.runtime.update_discord_presence(&account_id, user_id, status) {
                             state.events.emit("discordPresenceUpdate", json!({ "accountId": account_id, "userId": user_id, "status": status }));
                         }
+                        // Also refresh any roster this person appears in, so
+                        // an open channel's list follows them going online or
+                        // away without waiting for a fresh subscription.
+                        update_presence_in_rosters(state, user_id, status);
                     }
                     _ => {}
                 }
@@ -2441,13 +2454,200 @@ fn presence_payload(status: &str) -> serde_json::Value {
     json!({ "status": discord_status, "since": 0, "activities": [], "afk": status == "idle" })
 }
 
-/// Pushes a status onto a live gateway connection.
+/// Sets an account's status.
 ///
-/// Returns false when the account is not currently connected - there is
-/// nothing to push to, and the status is still recorded, so the next
-/// IDENTIFY carries it.
-pub fn apply_status(state: &AppState, account_id: &str, status: &str) -> bool {
-    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
-    // Opcode 3 is presence update.
-    sender.send(json!({ "op": 3, "d": presence_payload(status) }).to_string()).is_ok()
+/// Two places have to agree. The gateway opcode changes how this *session*
+/// presents right now, which is what other people see immediately; the account
+/// setting is what Discord treats as the user's chosen status, and is what
+/// every new session starts from. Setting only the opcode leaves the account
+/// still holding its old choice - which is how an account left on "invisible"
+/// keeps reverting - and setting only the account is slow to show.
+pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> bool {
+    if let Some(sender) = state.runtime.discord_gateway_sender(account_id) {
+        // Opcode 3 is presence update.
+        let _ = sender.send(json!({ "op": 3, "d": presence_payload(status) }).to_string());
+    }
+
+    let Some(config) = state.accounts.get_discord(account_id) else { return false };
+    let discord_status = match status {
+        "idle" => "idle",
+        _ => "online",
+    };
+    match http_client()
+        .patch(format!("{API_BASE}/users/@me/settings"))
+        .header("Authorization", &config.token)
+        .json(&json!({ "status": discord_status }))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            tracing::debug!("discord: setting status returned HTTP {}", resp.status());
+            false
+        }
+        Err(e) => {
+            tracing::debug!("discord: setting status failed: {e}");
+            false
+        }
+    }
+}
+
+/// Asks Discord for a channel's member list.
+///
+/// A user token cannot use REQUEST_GUILD_MEMBERS the way a bot does - the
+/// member list is instead a "lazy guild" subscription (opcode 14) naming the
+/// channel and the ranges of the list to send, which the server answers with
+/// GUILD_MEMBER_LIST_UPDATE dispatches. This is what Discord's own client
+/// does when you open a channel, which is also why the roster only exists for
+/// channels somebody is actually looking at.
+pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return false };
+    let account_id = buffer.account_id;
+    let Some(sender) = state.runtime.discord_gateway_sender(&account_id) else { return false };
+    let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else { return false };
+    let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) else {
+        // A DM has no guild and no member list to subscribe to; its
+        // participants are already known from the channel itself.
+        return false;
+    };
+
+    // The reply names the guild and a permissions-derived list id, never the
+    // channel, so remember which buffer this was for.
+    state.runtime.set_discord_member_list_target(&account_id, &guild_id, buffer_id);
+
+    // Ranges are 100-member windows; one covers any channel we would show.
+    sender
+        .send(
+            json!({
+                "op": 14,
+                "d": {
+                    "guild_id": guild_id,
+                    "typing": true,
+                    "threads": false,
+                    "activities": true,
+                    "channels": { channel_id: [[0, 99]] }
+                }
+            })
+            .to_string(),
+        )
+        .is_ok()
+}
+
+/// Rebuilds a channel's roster from a GUILD_MEMBER_LIST_UPDATE.
+///
+/// The list arrives as a series of ops over a windowed view: SYNC carries a
+/// whole range of entries, while INSERT/UPDATE/DELETE adjust it as people come
+/// and go. Entries are either a group header - a role name, or the online and
+/// offline buckets - or a member.
+///
+/// Only SYNC is acted on. The incremental ops move members between roles and
+/// buckets by position within a list this client does not otherwise model, and
+/// applying them half-understood would corrupt the roster; re-opening the
+/// channel asks for a fresh SYNC, which is what Discord's own client does when
+/// its view changes.
+fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
+    let mut members: Vec<Value> = Vec::new();
+    let mut saw_sync = false;
+
+    for op in d["ops"].as_array().into_iter().flatten() {
+        if op["op"].as_str() != Some("SYNC") {
+            continue;
+        }
+        saw_sync = true;
+        for item in op["items"].as_array().into_iter().flatten() {
+            let Some(member) = item.get("member") else { continue };
+            let user = &member["user"];
+            let Some(user_id) = user["id"].as_str() else { continue };
+            // Server nickname first, then the account's chosen display name,
+            // then the raw username - the same order Discord itself shows.
+            let nick = member["nick"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| user["global_name"].as_str().filter(|s| !s.is_empty()))
+                .or_else(|| user["username"].as_str())
+                .unwrap_or("unknown");
+            let status = member["presence"]["status"].as_str().unwrap_or("offline");
+            members.push(json!({
+                "nick": nick,
+                "userId": user_id,
+                "prefix": "",
+                // Everything but "online" reads as away, so idle and dnd both
+                // sort with the offline group rather than pretending to be here.
+                "away": status != "online",
+                "status": status
+            }));
+        }
+    }
+
+    if !saw_sync {
+        return;
+    }
+
+    members.sort_by(|a, b| {
+        let (an, bn) = (a["nick"].as_str().unwrap_or(""), b["nick"].as_str().unwrap_or(""));
+        an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))
+    });
+    let member_list = json!(members);
+    state.runtime.set_presence(buffer_id, member_list.clone());
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
+}
+
+/// A DM's roster: whoever is in it.
+///
+/// Unlike a guild channel this needs no subscription - Discord hands the
+/// recipients over with the channel itself. Their status is not included
+/// there, so everyone starts unknown and PRESENCE_UPDATE fills it in; for a
+/// friend that is usually immediate, since READY already carried it.
+fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value) {
+    let mut members: Vec<Value> = channel["recipients"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| {
+            let user_id = r["id"].as_str()?;
+            let nick = r["global_name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| r["username"].as_str())
+                .unwrap_or("unknown");
+            Some(json!({ "nick": nick, "userId": user_id, "prefix": "", "away": true, "status": "offline" }))
+        })
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    members.sort_by(|a, b| a["nick"].as_str().unwrap_or("").to_lowercase().cmp(&b["nick"].as_str().unwrap_or("").to_lowercase()));
+    let member_list = json!(members);
+    state.runtime.set_presence(buffer_id, member_list.clone());
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
+}
+
+/// Updates one person's status wherever they are currently listed.
+///
+/// PRESENCE_UPDATE arrives for anyone the account can see, which is far more
+/// people than are in any open roster - so this only touches buffers that
+/// already list them, and says nothing otherwise.
+fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
+    for buffer in state.runtime.list_buffers() {
+        let Some(existing) = state.runtime.get_presence(&buffer.id) else { continue };
+        let Some(members) = existing.as_array() else { continue };
+        if !members.iter().any(|m| m["userId"].as_str() == Some(user_id)) {
+            continue;
+        }
+        let updated: Vec<Value> = members
+            .iter()
+            .map(|m| {
+                if m["userId"].as_str() != Some(user_id) {
+                    return m.clone();
+                }
+                let mut m = m.clone();
+                m["status"] = json!(status);
+                m["away"] = json!(status != "online");
+                m
+            })
+            .collect();
+        let member_list = json!(updated);
+        state.runtime.set_presence(&buffer.id, member_list.clone());
+        state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
+    }
 }
