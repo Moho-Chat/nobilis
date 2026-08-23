@@ -80,3 +80,4 @@ js_int = "=0.2.2"
 songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite", "receive", "gateway"] }
 cpal = "0.18.2"
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
+async-trait = "0.1.92"

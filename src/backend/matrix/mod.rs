@@ -1439,6 +1439,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -1552,6 +1553,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -1659,6 +1661,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
 
         let config_a = MatrixAccountConfig {
@@ -1811,6 +1814,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -1962,6 +1966,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
 
         let config = MatrixAccountConfig {

@@ -420,11 +420,11 @@ pub async fn dispatch(
             )
         }
 
-        /// Sets how this account presents itself: online or idle.
-        ///
-        /// Applied to whichever protocol the account belongs to, and recorded
-        /// either way so a reconnect carries it. Sneedchat has no presence
-        /// concept at all, so it reports that rather than silently accepting.
+        // Sets how this account presents itself: online or idle.
+        //
+        // Applied to whichever protocol the account belongs to, and recorded
+        // either way so a reconnect carries it. Sneedchat has no presence
+        // concept at all, so it reports that rather than silently accepting.
         "setAccountStatus" => {
             let (account_id, status) = match (p_str_opt(params, "accountId"), p_str_opt(params, "status")) {
                 (Some(a), Some(s)) => (a, s),
@@ -458,13 +458,13 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
         }
 
-        /// Asks for a channel's member list.
-        ///
-        /// Separate from subscribe because a client subscribes to every buffer
-        /// it tracks unread counts for, while a member list belongs to the one
-        /// channel being looked at. Discord answers these per guild rather
-        /// than per channel, so asking for several at once makes the replies
-        /// ambiguous - and it is wasted traffic for channels nobody is reading.
+        // Asks for a channel's member list.
+        //
+        // Separate from subscribe because a client subscribes to every buffer
+        // it tracks unread counts for, while a member list belongs to the one
+        // channel being looked at. Discord answers these per guild rather
+        // than per channel, so asking for several at once makes the replies
+        // ambiguous - and it is wasted traffic for channels nobody is reading.
         "requestMemberList" => match p_str_opt(params, "bufferId") {
             None => (None, Some("requestMemberList requires \"bufferId\"".to_string())),
             Some(buffer_id) => {
@@ -473,19 +473,81 @@ pub async fn dispatch(
             }
         },
 
-        /// A guild's voice channels, with how many people are in each.
-        ///
-        /// Occupancy is gateway-only - there is no endpoint that reports it -
-        /// so this reflects what has been seen since connecting.
-        /// The machine's sound devices.
-        ///
-        /// Reported from the daemon because that is where audio is handled -
-        /// the voice connection and its encoder live here, so the devices do
-        /// too.
+        // A guild's voice channels, with how many people are in each.
+        //
+        // Occupancy is gateway-only - there is no endpoint that reports it -
+        // so this reflects what has been seen since connecting.
+        // The machine's sound devices.
+        //
+        // Reported from the daemon because that is where audio is handled -
+        // the voice connection and its encoder live here, so the devices do
+        // too.
         "listAudioDevices" => match backend::audio::list_devices() {
             Ok(devices) => (Some(serde_json::to_value(devices).unwrap()), None),
             Err(e) => (None, Some(e.to_string())),
         },
+
+        // What voice is set to use, and whether it is silenced. Read back
+        // rather than assumed by a client, since a mute survives a restart and
+        // a second window has to agree with the first.
+        "getVoicePrefs" => (Some(serde_json::to_value(state.voice_prefs.get()).unwrap()), None),
+
+        // Choosing a device. An input choice takes effect on a call already in
+        // progress: the stream is moved rather than reopened, which is what
+        // the desktop's own mixer does.
+        "setVoiceDevice" => {
+            let Some(kind) = p_str_opt(params, "kind") else {
+                return (None, Some("setVoiceDevice requires \"kind\"".to_string()));
+            };
+            let device_id = p_str_opt(params, "deviceId").unwrap_or(backend::audio::DEFAULT_ID).to_string();
+            if kind != "input" && kind != "output" {
+                return (None, Some(format!("unknown device kind {kind:?}")));
+            }
+            if kind == "input" && !device_id.is_empty() {
+                if let Err(e) = backend::audio::route_input(&device_id) {
+                    return (None, Some(e.to_string()));
+                }
+            }
+            let prefs = state.voice_prefs.update(|p| {
+                if kind == "input" {
+                    p.input = Some(device_id.clone()).filter(|d| !d.is_empty());
+                } else {
+                    p.output = Some(device_id.clone()).filter(|d| !d.is_empty());
+                }
+            });
+            state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
+        // Muting the microphone, or the other people. Applied to every live
+        // session rather than to one account: these are the machine's speakers
+        // and microphone, and silencing them per-account would surprise anyone
+        // in two calls at once.
+        "setVoiceMuted" => {
+            let mic = params.get("micMuted").and_then(|v| v.as_bool());
+            let deaf = params.get("deafened").and_then(|v| v.as_bool());
+            if mic.is_none() && deaf.is_none() {
+                return (None, Some("setVoiceMuted requires \"micMuted\" or \"deafened\"".to_string()));
+            }
+            let prefs = state.voice_prefs.update(|p| {
+                if let Some(m) = mic {
+                    p.mic_muted = m;
+                }
+                if let Some(d) = deaf {
+                    p.deafened = d;
+                }
+            });
+            // Deafening implies not speaking either, which is what every other
+            // client does and what people expect of the button.
+            let mic_muted = prefs.mic_muted || prefs.deafened;
+            for account_id in state.voice.connected_accounts() {
+                state.voice.set_mic_muted(&account_id, mic_muted);
+                backend::audio::set_playback_muted(prefs.deafened);
+                backend::discord::announce_voice_flags(state, &account_id, mic_muted, prefs.deafened);
+            }
+            state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
 
         "listVoiceChannels" => {
             let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {

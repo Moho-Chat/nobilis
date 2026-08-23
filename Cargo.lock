@@ -3694,6 +3694,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arti-client",
+ "async-trait",
  "base32",
  "base64",
  "bytes",

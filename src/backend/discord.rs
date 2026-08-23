@@ -2839,6 +2839,31 @@ pub fn join_voice(
     Ok(())
 }
 
+/// Tells the server this account's microphone or output has been silenced.
+///
+/// Separate from actually stopping the audio, and both are needed: closing the
+/// microphone without saying so leaves everyone else looking at a live
+/// microphone icon wondering why you have gone quiet.
+pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, deafened: bool) -> bool {
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else { return false };
+    sender
+        .send(
+            json!({
+                "op": 4,
+                "d": {
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "self_mute": muted,
+                    "self_deaf": deafened,
+                    "self_video": false
+                }
+            })
+            .to_string(),
+        )
+        .is_ok()
+}
+
 /// Leaves whatever voice channel this account is in. Safe to call when in none.
 pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
     let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };

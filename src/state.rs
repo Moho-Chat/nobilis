@@ -27,4 +27,7 @@ pub struct AppState {
     pub shutdown: Arc<Notify>,
     /// Live Discord voice connections and half-built handshakes.
     pub voice: Arc<crate::backend::discord_voice::VoiceState>,
+    /// Which sound devices voice uses, and whether it is silenced. Persisted,
+    /// so a deliberate mute is still in force after a restart.
+    pub voice_prefs: Arc<crate::backend::audio::VoicePrefsStore>,
 }

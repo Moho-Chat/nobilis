@@ -369,6 +369,7 @@ mod tests {
             tor: Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             voice: Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
         let config = MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

@@ -213,6 +213,7 @@ mod tests {
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
         };
         let config = crate::accounts::MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

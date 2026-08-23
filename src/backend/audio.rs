@@ -7,6 +7,7 @@
 //! A frontend asks to join, leave, mute, or use a different device.
 
 use anyhow::{anyhow, Context, Result};
+use serde::Deserialize;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,76 +18,223 @@ use std::sync::{Arc, Mutex};
 pub const TARGET_RATE: u32 = 48_000;
 pub const TARGET_CHANNELS: u16 = 2;
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AudioDevice {
+    /// The sound server's own name for the device. Stable across reboots and
+    /// across renaming, which is what a stored preference must key on.
+    pub id: String,
+    /// What to show a person: "HyperX QuadCast S Analog Stereo", not
+    /// "alsa_input.usb-HP__Inc_HyperX_QuadCast_S-00.analog-stereo".
     pub name: String,
-    /// What the driver says this is - microphone, speaker, headset and so on.
-    /// Carried so a frontend can show something better than a bare string.
-    #[serde(rename = "deviceType")]
-    pub device_type: String,
-    /// Whether this is the host's current default. Named rather than assumed,
-    /// since "default" is a moving target the user changes outside this app.
+    /// "input" or "output".
+    pub kind: String,
+    /// Whether the sound server currently routes here by default. Named
+    /// rather than assumed: it is a moving target the user changes elsewhere.
     #[serde(rename = "isDefault")]
     pub is_default: bool,
-    pub kind: String,
+}
+
+/// Which devices voice should use, and whether it is currently silenced.
+///
+/// Kept apart from accounts.toml deliberately: that file holds credentials at
+/// mode 0600, and these are preferences that belong to the machine rather than
+/// to any account.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct VoicePrefs {
+    /// Device ids, or None for "whatever the sound server considers default",
+    /// which is the right behaviour for someone who has never chosen.
+    #[serde(default)]
+    pub input: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    /// Microphone closed. Persisted because arriving in a call unexpectedly
+    /// live, after having deliberately muted, is the failure people mind.
+    #[serde(default)]
+    pub mic_muted: bool,
+    /// Output silenced.
+    #[serde(default)]
+    pub deafened: bool,
+}
+
+/// The preferences file at ~/.config/nobilis/voice.toml.
+pub struct VoicePrefsStore {
+    path: std::path::PathBuf,
+    inner: Mutex<VoicePrefs>,
+}
+
+impl VoicePrefsStore {
+    pub fn open(path: std::path::PathBuf) -> Self {
+        let inner = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| toml::from_str(&t).ok())
+            // A corrupt or unreadable preferences file should not stop the
+            // daemon starting; defaults are a working configuration.
+            .unwrap_or_default();
+        Self { path, inner: Mutex::new(inner) }
+    }
+
+    pub fn get(&self) -> VoicePrefs {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// Applies `edit` and writes the result out.
+    pub fn update(&self, edit: impl FnOnce(&mut VoicePrefs)) -> VoicePrefs {
+        let mut prefs = self.inner.lock().unwrap();
+        edit(&mut prefs);
+        let out = prefs.clone();
+        if let Ok(text) = toml::to_string_pretty(&out) {
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let tmp = self.path.with_extension("toml.tmp");
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
+        }
+        out
+    }
 }
 
 /// The devices this machine offers.
 ///
-/// Failure here is reported rather than fatal: a machine with no sound card,
-/// or a session with no audio server running, is a perfectly ordinary thing
-/// for a chat client to encounter, and everything except voice still works.
-/// The devices worth offering.
+/// Asked of the sound server rather than of ALSA. On any current Linux desktop
+/// ALSA presents its whole plugin chain as devices - rate converters, channel
+/// mixers, a null sink, over a hundred entries here - and cpal reports them
+/// all classified "Unknown", giving real hardware the same treatment, so there
+/// is nothing in that data to pick out a microphone by. PipeWire and
+/// PulseAudio both answer `pactl` with the real devices and their human
+/// descriptions, which is what a person needs to choose between.
 ///
-/// On a PipeWire or PulseAudio system - which is to say almost any current
-/// Linux desktop - ALSA presents its whole plugin chain as devices: rate
-/// converters, channel mixers, a null sink, over a hundred entries on this
-/// machine alone. cpal reports them all, classifies every one of them
-/// "Unknown", and gives real hardware the same treatment, so there is nothing
-/// in the data to filter on and filtering by name would be guesswork.
-///
-/// So this offers the default and lets the sound server route it. That is not
-/// a workaround but the native arrangement: the app appears in pavucontrol as
-/// a stream, and its input is changed there, per application, while it runs.
-/// A genuine per-device picker needs PipeWire's own enumeration rather than
-/// ALSA's, which is worth doing when there is a settings page to hang it on.
+/// Where there is no sound server, this falls back to naming the defaults cpal
+/// reports. A machine with no sound card at all is a perfectly ordinary thing
+/// to run a chat client on, and everything except voice still works.
 pub fn list_devices() -> Result<Vec<AudioDevice>> {
-    let host = cpal::default_host();
     let mut out = Vec::new();
+    if let Ok(devices) = server_devices() {
+        if !devices.is_empty() {
+            return Ok(devices);
+        }
+    }
 
+    let host = cpal::default_host();
     if let Some(device) = host.default_input_device() {
-        out.push(AudioDevice {
-            name: device.to_string(),
-            device_type: "input".to_string(),
-            is_default: true,
-            kind: "input".to_string(),
-        });
+        out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "input".into(), is_default: true });
     }
     if let Some(device) = host.default_output_device() {
+        out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "output".into(), is_default: true });
+    }
+    Ok(out)
+}
+
+/// The id meaning "let the sound server decide".
+pub const DEFAULT_ID: &str = "";
+
+fn pactl(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("pactl")
+        .args(args)
+        .output()
+        .context("running pactl")?;
+    if !out.status.success() {
+        return Err(anyhow!("pactl {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn server_devices() -> Result<Vec<AudioDevice>> {
+    let mut out = parse_devices(&pactl(&["-f", "json", "list", "sources"])?, "input", pactl(&["get-default-source"]).unwrap_or_default().trim())?;
+    out.extend(parse_devices(&pactl(&["-f", "json", "list", "sinks"])?, "output", pactl(&["get-default-sink"]).unwrap_or_default().trim())?);
+    Ok(out)
+}
+
+/// Turns one `pactl -f json list` reply into devices worth offering.
+///
+/// Monitor sources are dropped: every output has one, they are loopbacks of
+/// what is already playing, and offering "Monitor of Headphones" as a
+/// microphone would mean transmitting your own audio back into a call.
+fn parse_devices(json: &str, kind: &str, default_name: &str) -> Result<Vec<AudioDevice>> {
+    let parsed: serde_json::Value = serde_json::from_str(json).context("parsing pactl output")?;
+    let entries = parsed.as_array().context("pactl did not return a list")?;
+    let mut out = Vec::new();
+    for entry in entries {
+        let Some(id) = entry["name"].as_str() else { continue };
+        if kind == "input" && (id.ends_with(".monitor") || entry["monitor_of_sink_name"].is_string()) {
+            continue;
+        }
+        let name = entry["description"].as_str().filter(|d| !d.is_empty()).unwrap_or(id);
         out.push(AudioDevice {
-            name: device.to_string(),
-            device_type: "output".to_string(),
-            is_default: true,
-            kind: "output".to_string(),
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            is_default: id == default_name,
         });
     }
     Ok(out)
 }
 
-fn input_device(preferred: Option<&str>) -> Result<cpal::Device> {
-    let host = cpal::default_host();
-    if let Some(want) = preferred {
-        for device in host.input_devices().context("listing input devices")? {
-            if device.to_string() == want {
-                return Ok(device);
-            }
+/// Points this process's capture stream at `device_id`.
+///
+/// Routing is done by moving the stream rather than by opening the device
+/// directly: on PipeWire an application is a stream the server routes, and
+/// moving it is both what the desktop's own mixer does and what survives the
+/// device disappearing. Matching on process id rather than on a name means a
+/// second copy of nobilis cannot have its microphone moved by this one.
+pub fn route_input(device_id: &str) -> Result<bool> {
+    route_stream(Stream::Input, device_id)
+}
+
+/// Which of this process's streams to move.
+#[derive(Clone, Copy)]
+enum Stream {
+    Input,
+    Output,
+}
+
+impl Stream {
+    fn list(self) -> &'static str {
+        match self {
+            Stream::Input => "source-outputs",
+            Stream::Output => "sink-inputs",
         }
-        // Deliberately an error rather than a silent fallback: someone who
-        // chose a device would rather be told it is gone than be recorded on
-        // a different one without knowing.
-        return Err(anyhow!("input device {want:?} is not available"));
     }
-    host.default_input_device().context("no default input device")
+
+    fn move_command(self) -> &'static str {
+        match self {
+            Stream::Input => "move-source-output",
+            Stream::Output => "move-sink-input",
+        }
+    }
+}
+
+fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
+    if device_id.is_empty() {
+        return Ok(false);
+    }
+    let json = pactl(&["-f", "json", "list", stream.list()])?;
+    let streams: serde_json::Value = serde_json::from_str(&json).context("parsing pactl output")?;
+    let pid = std::process::id().to_string();
+    let mine: Vec<String> = streams
+        .as_array()
+        .map(|s| s.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .filter(|s| s["properties"]["application.process.id"].as_str() == Some(pid.as_str()))
+        .filter_map(|s| s["index"].as_u64().map(|i| i.to_string()))
+        .collect();
+
+    let mut moved = false;
+    for index in mine {
+        pactl(&[stream.move_command(), &index, device_id])?;
+        moved = true;
+    }
+    Ok(moved)
+}
+
+fn input_device() -> Result<cpal::Device> {
+    // Always the default: a chosen device is honoured by moving the stream
+    // once it exists (see `route_input`), not by opening that device here.
+    // Opening directly would bypass the sound server's routing and lose the
+    // choice the moment the device is unplugged and returns.
+    cpal::default_host().default_input_device().context("no default input device")
 }
 
 /// A running microphone capture.
@@ -99,17 +247,20 @@ pub struct Capture {
     pub active: Arc<AtomicBool>,
 }
 
-/// Starts capturing from `device_name`, handing each converted chunk to `sink`.
+/// Starts capturing, handing each converted chunk to `sink`.
+///
+/// `device_id` names a device from `list_devices`, or is empty for the sound
+/// server's default.
 ///
 /// The conversion is deliberately simple: nearest-neighbour resampling and
 /// channel duplication. It is enough to carry speech correctly and keeps this
 /// dependency-free; anything better belongs behind a resampler crate if the
 /// difference ever proves audible.
-pub fn start_capture<F>(device_name: Option<&str>, mut sink: F) -> Result<Capture>
+pub fn start_capture<F>(device_id: Option<&str>, mut sink: F) -> Result<Capture>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
-    let device = input_device(device_name)?;
+    let device = input_device()?;
     let config = device.default_input_config().context("querying the input device")?;
     let rate = config.sample_rate();
     let channels = config.channels();
@@ -164,9 +315,184 @@ where
     .context("opening the input stream")?;
 
     stream.play().context("starting the input stream")?;
+
+    if let Some(want) = device_id.filter(|d| !d.is_empty()) {
+        // The stream only exists for the sound server to move once it is
+        // playing, and it appears a moment later, so this waits briefly
+        // rather than concluding it is missing.
+        let mut routed = Ok(false);
+        for _ in 0..20 {
+            routed = route_input(want);
+            if matches!(routed, Ok(true)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match routed {
+            Ok(true) => tracing::info!("audio: input routed to {want:?}"),
+            // Being recorded on a different microphone than the one chosen is
+            // worse than being told the choice did not take.
+            Ok(false) => return Err(anyhow!("could not route input to {want:?}: the capture stream never appeared")),
+            Err(e) => return Err(e.context(format!("routing input to {want:?}"))),
+        }
+    }
+
     Ok(Capture { _stream: stream, level, active })
 }
 
+impl Capture {
+    /// Closes or opens the microphone.
+    ///
+    /// The stream keeps running either way: stopping and restarting it would
+    /// make unmuting take as long as opening a device, and some hardware
+    /// clicks audibly when it does. A muted capture simply stops handing
+    /// anything on, so the source it feeds falls back to silence.
+    pub fn set_muted(&self, muted: bool) {
+        self.active.store(!muted, Ordering::Relaxed);
+    }
+
+    pub fn is_muted(&self) -> bool {
+        !self.active.load(Ordering::Relaxed)
+    }
+}
+
+
+/// Whether the speakers are silenced.
+///
+/// Process-wide rather than per-connection because there is one set of
+/// speakers: someone in two calls who presses deafen means both.
+static PLAYBACK_MUTED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_playback_muted(muted: bool) {
+    PLAYBACK_MUTED.store(muted, Ordering::Relaxed);
+}
+
+pub fn playback_muted() -> bool {
+    PLAYBACK_MUTED.load(Ordering::Relaxed)
+}
+
+/// Sound coming out of the machine.
+///
+/// Dropping it closes the output stream.
+pub struct Playback {
+    _stream: cpal::Stream,
+    buffer: Arc<Mutex<std::collections::VecDeque<i16>>>,
+}
+
+impl Playback {
+    /// Queues decoded audio for the speakers.
+    ///
+    /// Dropped while deafened rather than queued and skipped, so unmuting
+    /// resumes with what is being said then, not with a backlog of what was
+    /// said while silenced.
+    pub fn push(&self, pcm: &[i16]) {
+        if playback_muted() {
+            return;
+        }
+        let mut buf = self.buffer.lock().unwrap();
+        buf.extend(pcm.iter().copied());
+        // The same reasoning as the capture backlog: if the output device
+        // stalls, drop old audio rather than play a growing delay.
+        const MAX_SAMPLES: usize = TARGET_RATE as usize * TARGET_CHANNELS as usize / 2; // half a second
+        let backlog = buf.len();
+        if backlog > MAX_SAMPLES {
+            buf.drain(..backlog - MAX_SAMPLES);
+        }
+    }
+
+    /// How much audio is waiting, in samples. For tests and diagnostics.
+    pub fn queued(&self) -> usize {
+        self.buffer.lock().unwrap().len()
+    }
+}
+
+/// Opens the speakers, playing whatever is pushed into the returned handle.
+///
+/// As with capture, a chosen device is honoured by moving the stream once it
+/// exists rather than by opening that device directly.
+pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
+    let device = cpal::default_host().default_output_device().context("no default output device")?;
+    let config = device.default_output_config().context("querying the output device")?;
+    let rate = config.sample_rate();
+    let channels = config.channels();
+    tracing::info!("audio: playing to {:?} at {rate}Hz {channels}ch", device.to_string());
+
+    let buffer = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
+    let reader = buffer.clone();
+
+    // Voice arrives as 48kHz stereo; the device may want something else.
+    let fill = move |out_frames: usize, mut write: Box<dyn FnMut(usize, f32) + '_>| {
+        let mut buf = reader.lock().unwrap();
+        for frame in 0..out_frames {
+            // Nearest-neighbour again, and for the same reason: enough to
+            // carry speech, and no dependency to keep current.
+            let src_frame = (frame as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize;
+            let base = src_frame * TARGET_CHANNELS as usize;
+            for ch in 0..channels as usize {
+                // Mono output takes the left channel; anything wider than
+                // stereo repeats what there is rather than leaving silence in
+                // the surround channels.
+                let sample = buf.get(base + ch.min(TARGET_CHANNELS as usize - 1)).copied().unwrap_or(0);
+                write(frame * channels as usize + ch, sample as f32 / i16::MAX as f32);
+            }
+        }
+        let consumed = (out_frames as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize * TARGET_CHANNELS as usize;
+        let drop_n = consumed.min(buf.len());
+        buf.drain(..drop_n);
+    };
+
+    let err = |e| tracing::warn!("audio: output stream error: {e}");
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            config.clone().into(),
+            move |data: &mut [f32], _: &_| {
+                let frames = data.len() / channels.max(1) as usize;
+                fill(frames, Box::new(|i, v| data[i] = v));
+            },
+            err,
+            None,
+        ),
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            config.clone().into(),
+            move |data: &mut [i16], _: &_| {
+                let frames = data.len() / channels.max(1) as usize;
+                fill(frames, Box::new(|i, v| data[i] = (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16));
+            },
+            err,
+            None,
+        ),
+        other => return Err(anyhow!("unsupported output sample format {other:?}")),
+    }
+    .context("opening the output stream")?;
+
+    stream.play().context("starting the output stream")?;
+
+    if let Some(want) = device_id.filter(|d| !d.is_empty()) {
+        let mut routed = Ok(false);
+        for _ in 0..20 {
+            routed = route_output(want);
+            if matches!(routed, Ok(true)) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        match routed {
+            Ok(true) => tracing::info!("audio: output routed to {want:?}"),
+            // Unlike a misrouted microphone this is merely wrong rather than
+            // a privacy problem, so it is a warning: hearing the call from
+            // the wrong speakers beats not hearing it at all.
+            Ok(false) => tracing::warn!("audio: could not route output to {want:?}: the stream never appeared"),
+            Err(e) => tracing::warn!("audio: could not route output to {want:?}: {e:#}"),
+        }
+    }
+
+    Ok(Playback { _stream: stream, buffer })
+}
+
+/// Points this process's playback stream at `device_id`.
+pub fn route_output(device_id: &str) -> Result<bool> {
+    route_stream(Stream::Output, device_id)
+}
 
 #[cfg(test)]
 mod tests {
@@ -183,15 +509,87 @@ mod tests {
             assert!(!d.name.is_empty(), "a device with no name is not selectable");
             assert!(d.kind == "input" || d.kind == "output");
         }
-        assert!(devices.iter().filter(|d| d.kind == "input").count() <= 1);
+        // At most one default per direction, or a picker cannot show which
+        // one is in force.
+        for kind in ["input", "output"] {
+            let defaults = devices.iter().filter(|d| d.kind == kind && d.is_default).count();
+            assert!(defaults <= 1, "{defaults} devices claim to be the default {kind}");
+        }
     }
 
     #[test]
     fn a_missing_device_is_an_error_rather_than_a_substitution() {
         // Being recorded on a different microphone than the one chosen is
-        // worse than being told the choice is unavailable.
-        let err = input_device(Some("no such microphone")).unwrap_err();
-        assert!(err.to_string().contains("not available"), "unexpected: {err}");
+        // worse than being told the choice did not take, so routing to a
+        // device the server does not have must fail rather than fall back.
+        let text = match start_capture(Some("no such device"), |_| {}) {
+            Ok(_) => panic!("routing to a device that does not exist was accepted"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(text.contains("no such device"), "unexpected: {text}");
+    }
+
+    /// A capture of a real pactl reply, so the parser is tested against what
+    /// the sound server actually says rather than what it is assumed to say.
+    const SOURCES_JSON: &str = r#"[
+      {"index": 63, "name": "alsa_output.usb-HyperX.analog-stereo.monitor",
+       "description": "Monitor of HyperX QuadCast S Analog Stereo"},
+      {"index": 64, "name": "alsa_input.usb-HyperX.analog-stereo",
+       "description": "HyperX QuadCast S Analog Stereo"},
+      {"index": 68, "name": "alsa_input.usb-Generic_USB_Audio-00.HiFi__Mic__source",
+       "description": ""}
+    ]"#;
+
+    #[test]
+    fn monitors_are_not_offered_as_microphones() {
+        // Every output has a monitor source. Offering one as a microphone
+        // means transmitting your own audio back into the call.
+        let devices = parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
+        assert!(
+            !devices.iter().any(|d| d.id.ends_with(".monitor")),
+            "a monitor source was offered as an input: {devices:?}"
+        );
+        assert_eq!(devices.len(), 2);
+    }
+
+    #[test]
+    fn devices_are_named_for_people_and_keyed_for_machines() {
+        let devices = parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
+        let hyperx = &devices[0];
+        assert_eq!(hyperx.name, "HyperX QuadCast S Analog Stereo");
+        assert_eq!(hyperx.id, "alsa_input.usb-HyperX.analog-stereo");
+        assert!(hyperx.is_default, "the server's default device was not marked");
+
+        // A device with no description still has to be selectable, so it
+        // falls back to the only name there is rather than showing blank.
+        assert_eq!(devices[1].name, devices[1].id);
+        assert!(!devices[1].is_default);
+    }
+
+    #[test]
+    fn preferences_survive_a_restart_and_a_corrupt_file() {
+        let dir = std::env::temp_dir().join(format!("nobilis-voice-prefs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("voice.toml");
+
+        let store = VoicePrefsStore::open(path.clone());
+        assert_eq!(store.get(), VoicePrefs::default());
+        store.update(|p| {
+            p.input = Some("alsa_input.usb-HyperX.analog-stereo".into());
+            p.mic_muted = true;
+        });
+
+        // Muting and then finding yourself live on the next run is the
+        // failure this guards against.
+        let reopened = VoicePrefsStore::open(path.clone());
+        assert_eq!(reopened.get().input.as_deref(), Some("alsa_input.usb-HyperX.analog-stereo"));
+        assert!(reopened.get().mic_muted);
+
+        // Garbage on disk must not stop the daemon starting.
+        std::fs::write(&path, "this is not toml {{{").unwrap();
+        assert_eq!(VoicePrefsStore::open(path).get(), VoicePrefs::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

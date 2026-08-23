@@ -151,6 +151,7 @@ async fn main() -> Result<()> {
         tor: Arc::new(net::tor::TorManager::new(&opts.data_dir)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
         voice: Arc::new(backend::discord_voice::VoiceState::new()),
+        voice_prefs: Arc::new(backend::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
     };
 
     // Reconnect every saved account, same as
