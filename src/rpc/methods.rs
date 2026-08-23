@@ -1208,6 +1208,21 @@ pub async fn dispatch(
             }
         }
 
+        // Starting an IRC conversation. Unlike every other protocol here
+        // there is nothing to ask the server for - a query exists because a
+        // client says it does - so this only creates the buffer and checks
+        // whether the person is currently connected.
+        "openIrcQuery" => {
+            let (account_id, nick) = match (p_str_opt(params, "accountId"), p_str_opt(params, "nick")) {
+                (Some(a), Some(n)) => (a, n),
+                _ => return (None, Some("openIrcQuery requires \"accountId\" and \"nick\"".to_string())),
+            };
+            match backend::irc::open_query(state, account_id, nick) {
+                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "openMatrixDm" => {
             let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
                 (Some(a), Some(u)) => (a, u),

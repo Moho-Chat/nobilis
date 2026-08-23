@@ -166,9 +166,24 @@ async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<()> {
     // note on NickList polish being pre-existing follow-up work).
     let mut channels: HashMap<String, HashMap<String, MemberRank>> = HashMap::new();
 
-    while let Some(msg) = stream.next().await.transpose()? {
-        handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
+    // Whether the people we hold conversations with are actually connected.
+    //
+    // IRC has no presence: a message to someone who is offline is accepted by
+    // the server and silently discarded, so a client that says nothing leaves
+    // you talking to a wall. ISON is the universal way to ask - MONITOR is
+    // better where it exists, but not every server has it and this needs no
+    // capability negotiation to work anywhere.
+    let ison = tokio::spawn(poll_query_presence(state.clone(), account_id.clone(), sender.clone()));
+
+    let result = async {
+        while let Some(msg) = stream.next().await.transpose()? {
+            handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    ison.abort();
+    result?;
 
     Ok(())
 }
@@ -343,6 +358,78 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
     Ok(())
 }
 
+/// Starts a conversation with somebody.
+///
+/// IRC has no concept of opening one: a query is a client-side idea, and the
+/// server only learns of it when a message is actually sent. So this creates
+/// the buffer and asks once whether they are there, which is what a person
+/// wants to know before typing.
+pub fn open_query(state: &AppState, account_id: &str, nick: &str) -> Result<String> {
+    if nick.trim().is_empty() || is_channel(nick) {
+        bail!("{nick:?} is not a nickname");
+    }
+    let buffer = state.runtime.ensure_buffer(state, account_id, nick, "dm");
+    if let Some(sender) = state.runtime.irc_sender(account_id) {
+        let _ = sender.send(Command::Raw("ISON".to_string(), vec![nick.to_string()]));
+    }
+    Ok(buffer.id)
+}
+
+/// How often to ask the server who among our conversation partners is on.
+///
+/// Slow enough to be invisible traffic on any network, quick enough that the
+/// warning shown before sending is rarely stale. ERR_NOSUCHNICK covers the
+/// gap: it is the server's own answer at the moment of sending.
+const ISON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Asks, repeatedly, which of the people we have conversations with are online.
+async fn poll_query_presence(state: AppState, account_id: String, sender: irc::client::Sender) {
+    loop {
+        tokio::time::sleep(ISON_INTERVAL).await;
+
+        let nicks: Vec<String> = state
+            .runtime
+            .list_buffers()
+            .into_iter()
+            .filter(|b| b.account_id == account_id && b.kind == "dm")
+            .map(|b| b.name)
+            .collect();
+        if nicks.is_empty() {
+            continue;
+        }
+        // One request for everyone rather than one each: ISON takes a list,
+        // and a server will answer a line of them in a single reply.
+        for chunk in nicks.chunks(20) {
+            if sender.send(Command::Raw("ISON".to_string(), chunk.to_vec())).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// Records which conversation partners the server just said are online.
+///
+/// ISON answers with only the nicks that *are* on, so anyone asked about and
+/// missing from the reply is offline - which is the answer this exists to get.
+fn apply_ison(state: &AppState, account_id: &str, online: &str) {
+    let online: Vec<String> = online.split_whitespace().map(|n| n.to_lowercase()).collect();
+    for buffer in state.runtime.list_buffers() {
+        if buffer.account_id != account_id || buffer.kind != "dm" {
+            continue;
+        }
+        let here = online.contains(&buffer.name.to_lowercase());
+        let members = json!([{
+            "nick": buffer.name,
+            "userId": buffer.name,
+            "prefix": "",
+            "away": !here,
+            "status": if here { "online" } else { "offline" },
+        }]);
+        state.runtime.set_presence(&buffer.id, members.clone());
+        state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": members }));
+    }
+}
+
 async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<()> {
     let result = tokio::time::timeout(REGISTRATION_TIMEOUT, async {
         loop {
@@ -493,6 +580,43 @@ async fn handle_message(
                 if let Some(rank) = members.remove(&from) {
                     members.insert(new_nick.clone(), rank);
                     emit_presence(state, account_id, channel, members);
+                }
+            }
+        }
+
+        // args: [nick, "nick1 nick2 ..."] - only those who are on.
+        Command::Response(Response::RPL_ISON, args) => {
+            apply_ison(state, account_id, args.last().map(String::as_str).unwrap_or(""));
+        }
+
+        // The server's own answer that a message went nowhere. Authoritative
+        // where the poll above is merely recent: this arrives because of
+        // something just sent, so it also corrects the stored presence.
+        Command::Response(Response::ERR_NOSUCHNICK, args) => {
+            if let Some(nick) = args.get(1) {
+                let existing = state
+                    .runtime
+                    .list_buffers()
+                    .into_iter()
+                    .find(|b| b.account_id == account_id && b.kind == "dm" && b.name.eq_ignore_ascii_case(nick));
+                if let Some(buffer) = existing {
+                    let members = json!([{
+                        "nick": nick,
+                        "userId": nick,
+                        "prefix": "",
+                        "away": true,
+                        "status": "offline",
+                    }]);
+                    state.runtime.set_presence(&buffer.id, members.clone());
+                    state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": members }));
+                    state.events.emit(
+                        "deliveryFailed",
+                        json!({
+                            "bufferId": buffer.id,
+                            "reason": "offline",
+                            "text": format!("{nick} is not online. They will not receive this message."),
+                        }),
+                    );
                 }
             }
         }
