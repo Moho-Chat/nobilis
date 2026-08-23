@@ -2571,9 +2571,10 @@ fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
                 "nick": nick,
                 "userId": user_id,
                 "prefix": "",
-                // Everything but "online" reads as away, so idle and dnd both
-                // sort with the offline group rather than pretending to be here.
-                "away": status != "online",
+                // Only actually offline counts as away. Idle and do-not-disturb
+                // are still connected - Discord lists them with everyone else
+                // who is present, and their own status word says the rest.
+                "away": status == "offline",
                 "status": status
             }));
         }
@@ -2642,7 +2643,9 @@ fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
                 }
                 let mut m = m.clone();
                 m["status"] = json!(status);
-                m["away"] = json!(status != "online");
+                // Same rule the initial sync uses; the two disagreeing would
+                // move someone between groups on their next presence change.
+                m["away"] = json!(status == "offline");
                 m
             })
             .collect();
