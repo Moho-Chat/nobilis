@@ -201,7 +201,14 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
         // syncing, same order the crate's own tutorial documents.
         session.process_outgoing_requests(&config.homeserver_url, &access_token).await;
 
-        let url = sync_url(&config.homeserver_url, next_batch.as_deref());
+        // Re-read each poll rather than captured once: a status set
+        // mid-session has to take effect on the next sync, not the next
+        // reconnect.
+        let presence = match state.runtime.account_status(account_id).as_str() {
+            "idle" | "dnd" => "unavailable",
+            _ => "online",
+        };
+        let url = sync_url(&config.homeserver_url, next_batch.as_deref(), presence);
         let resp = match http::get_json(&url, &access_token).await {
             Ok(v) => v,
             Err(e) if is_auth_error(&e) => {
@@ -259,11 +266,15 @@ fn config_dir() -> std::path::PathBuf {
     dirs::home_dir().unwrap_or_default().join(".config").join("nobilis")
 }
 
-fn sync_url(homeserver_url: &str, since: Option<&str>) -> String {
+fn sync_url(homeserver_url: &str, since: Option<&str>, presence: &str) -> String {
     let mut url = format!(
-        "{}/_matrix/client/v3/sync?timeout={}&set_presence=online",
+        // Matrix ties presence to syncing, so the status has to ride along
+        // with every sync rather than being set once - "online" here would
+        // quietly undo an idle or DND setting on the next poll.
+        "{}/_matrix/client/v3/sync?timeout={}&set_presence={}",
         homeserver_url.trim_end_matches('/'),
-        if since.is_none() { 0 } else { SYNC_LONG_POLL_MS }
+        if since.is_none() { 0 } else { SYNC_LONG_POLL_MS },
+        presence
     );
     if let Some(since) = since {
         url.push_str("&since=");
@@ -2105,4 +2116,34 @@ async fn register_space(
             state.runtime.set_buffer_group(state, &buffer_id, &group_id);
         }
     }
+}
+
+/// Pushes a status to the homeserver.
+///
+/// Matrix has three presence values - online, unavailable, offline - and no
+/// concept of "do not disturb". Both idle and DND therefore map to
+/// unavailable: it is the honest answer to "am I here", and claiming online
+/// while refusing notifications would misrepresent us to everyone else.
+pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
+    // Re-read rather than trusting the config passed in: a re-login rotates
+    // the token, and a stale one fails with a bare 401.
+    let account = state
+        .accounts
+        .get_matrix(&config.account_id())
+        .context("account is no longer configured")?;
+    let access_token = account.access_token;
+    let presence = match status {
+        "idle" | "dnd" => "unavailable",
+        _ => "online",
+    };
+    let user = url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>();
+    let base = account.homeserver_url.trim_end_matches('/');
+    http::put_json(
+        &format!("{base}/_matrix/client/v3/presence/{user}/status"),
+        &access_token,
+        serde_json::json!({ "presence": presence }),
+    )
+    .await
+    .context("setting presence")?;
+    Ok(())
 }

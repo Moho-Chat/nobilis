@@ -548,6 +548,7 @@ impl AccountStore {
 pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
     let id = a.account_id();
     Account {
+        status: "online".to_string(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| id.clone()),
         id,
         service: "irc".to_string(),
@@ -574,6 +575,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
     Account {
         id: a.account_id(),
         service: "discord".to_string(),
+        status: "online".to_string(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
@@ -597,6 +599,7 @@ pub fn sockchat_account_to_json(a: &SockChatAccountConfig, state: &str) -> Accou
     Account {
         id: a.account_id(),
         service: "sockchat".to_string(),
+        status: "online".to_string(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
@@ -624,6 +627,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
     Account {
         id: a.account_id(),
         service: "matrix".to_string(),
+        status: "online".to_string(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.user_id.clone()),
         state: state.to_string(),
         autojoin: String::new(),

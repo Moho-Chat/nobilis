@@ -158,6 +158,13 @@ pub struct Runtime {
     /// owns it has been seen, or the other way round - so both directions
     /// consult this rather than depending on which came first.
     matrix_space_parents: Mutex<HashMap<(String, String), String>>,
+    /// account id -> "online" | "idle" | "dnd". Absent means online, which is
+    /// what every backend does on connect anyway.
+    account_status: Mutex<HashMap<String, String>>,
+    /// Discord-specific: account id -> its live gateway writer, so a status
+    /// change can push a presence update on the existing connection instead of
+    /// waiting for a reconnect.
+    discord_gateway_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
     /// Matrix-specific: account id -> the running OlmMachine wrapper (see
     /// backend/matrix/crypto.rs). Stored here, not just kept local to the
     /// sync-loop task, so sendMessage/toggleReaction RPC handlers - which
@@ -269,6 +276,8 @@ impl Runtime {
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
+            account_status: Mutex::new(HashMap::new()),
+            discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
             matrix_encrypted_rooms: Mutex::new(HashSet::new()),
             matrix_own_reactions: Mutex::new(HashMap::new()),
@@ -295,6 +304,16 @@ impl Runtime {
     }
 
     pub fn list_accounts(&self, state: &AppState) -> Vec<Account> {
+        let mut out = self.build_accounts(state);
+        // The constructors have no view of live state, so the status the
+        // runtime is actually holding is filled in here.
+        for account in &mut out {
+            account.status = self.account_status(&account.id);
+        }
+        out
+    }
+
+    fn build_accounts(&self, state: &AppState) -> Vec<Account> {
         let conn_states = self.conn_states.lock().unwrap();
         let mut out: Vec<Account> = state
             .accounts
@@ -845,6 +864,28 @@ impl Runtime {
     /// different field. A no-op broadcast-wise if the buffer doesn't exist
     /// yet (the avatar is still cached for whenever ensure_buffer creates
     /// it - see get_matrix_room_avatar, checked at that point).
+    pub fn set_account_status(&self, account_id: &str, status: &str) {
+        self.account_status.lock().unwrap().insert(account_id.to_string(), status.to_string());
+    }
+
+    /// Defaults to online: an account that has never been set is online, which
+    /// is what connecting does regardless.
+    pub fn account_status(&self, account_id: &str) -> String {
+        self.account_status.lock().unwrap().get(account_id).cloned().unwrap_or_else(|| "online".to_string())
+    }
+
+    pub fn set_discord_gateway_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.discord_gateway_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    }
+
+    pub fn clear_discord_gateway_sender(&self, account_id: &str) {
+        self.discord_gateway_senders.lock().unwrap().remove(account_id);
+    }
+
+    pub fn discord_gateway_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.discord_gateway_senders.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn has_buffer_group(&self, group_id: &str) -> bool {
         self.buffer_groups.lock().unwrap().contains_key(group_id)
     }

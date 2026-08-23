@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     pub id: String,
     pub service: String,
+    /// How the user is presenting themselves: "online", "idle" or "dnd".
+    /// Distinct from `state`, which is whether the connection is up - a
+    /// disconnected account still remembers the status it will reconnect with.
+    #[serde(default)]
+    pub status: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,

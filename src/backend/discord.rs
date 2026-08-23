@@ -1822,6 +1822,18 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
     // Deliberately minimal - no "intents" field (that's a bot-gateway-only
     // concept; a user token gets everything its own account can see
     // regardless), matching what working self-bot clients send.
+    // Exposed so setAccountStatus can push a presence update onto this
+    // connection rather than waiting for a reconnect to carry it.
+    let account_id = config.account_id();
+    state.runtime.set_discord_gateway_sender(&account_id, out_tx.clone());
+    struct ClearSenderOnDrop<'a>(&'a AppState, String);
+    impl Drop for ClearSenderOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.runtime.clear_discord_gateway_sender(&self.1);
+        }
+    }
+    let _sender_guard = ClearSenderOnDrop(state, account_id.clone());
+
     out_tx.send(
         json!({
             "op": 2,
@@ -1830,6 +1842,9 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                 "properties": { "os": "linux", "browser": "nobilis", "device": "nobilis" },
                 "compress": false,
                 "large_threshold": 50,
+                // Carried in IDENTIFY as well as pushed live, so a status set
+                // before a reconnect survives it.
+                "presence": presence_payload(&state.runtime.account_status(&account_id)),
             }
         })
         .to_string(),
@@ -2411,4 +2426,29 @@ mod tests {
     fn leaves_a_plain_unicode_emoji_unchanged() {
         assert_eq!(reaction_path_segment("🔥"), "🔥");
     }
+}
+
+/// Discord's presence shape for one of our statuses.
+///
+/// Discord's own vocabulary is "online" / "idle" / "dnd", which is why these
+/// pass through unchanged - the mapping only exists so an unrecognised value
+/// cannot put the account into some unintended state.
+fn presence_payload(status: &str) -> serde_json::Value {
+    let discord_status = match status {
+        "idle" => "idle",
+        "dnd" => "dnd",
+        _ => "online",
+    };
+    json!({ "status": discord_status, "since": 0, "activities": [], "afk": status == "idle" })
+}
+
+/// Pushes a status onto a live gateway connection.
+///
+/// Returns false when the account is not currently connected - there is
+/// nothing to push to, and the status is still recorded, so the next
+/// IDENTIFY carries it.
+pub fn apply_status(state: &AppState, account_id: &str, status: &str) -> bool {
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    // Opcode 3 is presence update.
+    sender.send(json!({ "op": 3, "d": presence_payload(status) }).to_string()).is_ok()
 }

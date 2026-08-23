@@ -420,6 +420,46 @@ pub async fn dispatch(
             )
         }
 
+        /// Sets how this account presents itself: online, idle, or dnd.
+        ///
+        /// Applied to whichever protocol the account belongs to, and recorded
+        /// either way so a reconnect carries it. Sneedchat has no presence
+        /// concept at all, so it reports that rather than silently accepting.
+        "setAccountStatus" => {
+            let (account_id, status) = match (p_str_opt(params, "accountId"), p_str_opt(params, "status")) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return (None, Some("setAccountStatus requires \"accountId\" and \"status\"".to_string())),
+            };
+            if !matches!(status, "online" | "idle" | "dnd") {
+                return (None, Some("status must be online, idle or dnd".to_string()));
+            }
+            // Recorded before it is applied: a status set while disconnected
+            // still has to survive to the next connection.
+            state.runtime.set_account_status(account_id, status);
+
+            let applied = if state.accounts.get_discord(account_id).is_some() {
+                backend::discord::apply_status(state, account_id, status)
+            } else if let Some(config) = state.accounts.get_matrix(account_id) {
+                match backend::matrix::apply_status(state, &config, status).await {
+                    Ok(()) => true,
+                    Err(e) => return (None, Some(e.to_string())),
+                }
+            } else if let Some(sender) = state.runtime.irc_sender(account_id) {
+                // IRC has only away/back, so idle and dnd are both away.
+                let result = match status {
+                    "online" => sender.send(irc::proto::Command::AWAY(None)),
+                    _ => sender.send(irc::proto::Command::AWAY(Some(
+                        if status == "dnd" { "Do not disturb".to_string() } else { "Idle".to_string() },
+                    ))),
+                };
+                result.is_ok()
+            } else {
+                false
+            };
+
+            (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
+        }
+
         "partBuffer" => match p_str_opt(params, "bufferId") {
             None => (None, Some("no such buffer".to_string())),
             Some(buffer_id) => {
