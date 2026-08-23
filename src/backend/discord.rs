@@ -454,7 +454,13 @@ fn write_qr_file(url: &str, path: &std::path::Path) -> Result<()> {
 /// this the exact same per-channel JSON shape. Returns the new (bufferId,
 /// channelId) pair when this channel is genuinely new (so the caller can
 /// queue it for history backfill), None if already known.
-fn register_dm_channel(state: &AppState, account_id: &str, ch: &Value, channel_map: &mut HashMap<String, (String, String)>) -> Option<(String, String)> {
+fn register_dm_channel(
+    state: &AppState,
+    account_id: &str,
+    ch: &Value,
+    channel_map: &mut HashMap<String, (String, String)>,
+    presences: &HashMap<&str, &str>,
+) -> Option<(String, String)> {
     let channel_id = ch["id"].as_str()?;
     if channel_map.contains_key(channel_id) {
         return None;
@@ -462,13 +468,47 @@ fn register_dm_channel(state: &AppState, account_id: &str, ch: &Value, channel_m
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(&buf.id, channel_id);
+    if let Some(avatar) = dm_avatar_url(ch) {
+        state.runtime.set_buffer_avatar(state, &buf.id, &avatar);
+    }
     // A DM has no member list to subscribe to - the participants are right
     // here in the channel object, and they are the whole roster.
-    set_dm_presence(state, &buf.id, ch);
+    set_dm_presence(state, &buf.id, ch, presences);
     ensure_dm_group(state, account_id);
     state.runtime.set_buffer_group(state, &buf.id, &dm_group_id(account_id));
     channel_map.insert(channel_id.to_string(), (name, "dm".to_string()));
     Some((buf.id, channel_id.to_string()))
+}
+
+/// The picture to show for a direct message: the other person's.
+///
+/// A DM's `recipients` array holds everyone except this account, so for a
+/// one-to-one conversation it is the one person there is. A group DM has
+/// several and no single face to show, which is why this takes the first only
+/// when there is exactly one.
+fn dm_avatar_url(ch: &Value) -> Option<String> {
+    let recipients = ch["recipients"].as_array()?;
+    if recipients.len() != 1 {
+        return None;
+    }
+    author_avatar_url(&recipients[0]).or_else(|| default_avatar_url(&recipients[0]))
+}
+
+/// The picture Discord serves for someone who has never set one.
+///
+/// Worth resolving rather than falling back to a coloured initial the way
+/// message avatars do: a conversation list is a list of faces, and the one
+/// entry showing a letter instead reads as broken rather than as a person
+/// with no picture. Which of the six is theirs depends on which username
+/// scheme they are on - the modern one has no discriminator and derives it
+/// from the account id instead.
+fn default_avatar_url(user: &Value) -> Option<String> {
+    let id = user["id"].as_str()?;
+    let index = match user["discriminator"].as_str() {
+        Some(d) if d != "0" => d.parse::<u64>().unwrap_or(0) % 5,
+        _ => (id.parse::<u64>().ok()? >> 22) % 6,
+    };
+    Some(format!("https://cdn.discordapp.com/embed/avatars/{index}.png"))
 }
 
 /// A DM channel's display name, derived from its `recipients` array (their
@@ -539,6 +579,12 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -
     let name = dm_channel_name(&ch);
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(&buffer.id, channel_id);
+    if let Some(avatar) = dm_avatar_url(&ch) {
+        state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
+    }
+    // Opened by hand rather than from READY, so there is no presence snapshot
+    // to seed from; their first status update fills it in.
+    set_dm_presence(state, &buffer.id, &ch, &HashMap::new());
     ensure_dm_group(state, account_id);
     state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
     Ok(buffer.id)
@@ -1935,13 +1981,20 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         // to "offline" until their first PRESENCE_UPDATE
                         // arrives, same as a real client briefly shows before
                         // its own presence subscription catches up.
+                        // Whatever READY already knows about who is around.
+                        // Used for the friends list and for direct message
+                        // rosters alike: without it every conversation opens
+                        // showing the other person offline until they happen
+                        // to change status, which for somebody idle all day
+                        // is never.
+                        let presences: HashMap<&str, &str> = d["presences"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|p| Some((p["user"]["id"].as_str()?, p["status"].as_str().unwrap_or("offline"))))
+                            .collect();
+
                         if let Some(relationships) = d["relationships"].as_array() {
-                            let presences: HashMap<&str, &str> = d["presences"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|p| Some((p["user"]["id"].as_str()?, p["status"].as_str().unwrap_or("offline"))))
-                                .collect();
                             let friends: Vec<Value> = relationships
                                 .iter()
                                 .filter(|r| r["type"].as_i64() == Some(1))
@@ -1963,7 +2016,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         let mut new_dm_buffers: Vec<(String, String)> = Vec::new();
                         if let Some(dms) = d["private_channels"].as_array() {
                             for ch in dms {
-                                if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map) {
+                                if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map, &presences) {
                                     new_dm_buffers.push(pair);
                                 }
                             }
@@ -2001,7 +2054,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                 match serde_json::from_str::<Vec<Value>>(&body) {
                                     Ok(channels) => {
                                         for ch in &channels {
-                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map) {
+                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map, &presences) {
                                                 new_dm_buffers.push(pair);
                                             }
                                         }
@@ -2401,8 +2454,8 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
 #[cfg(test)]
 mod tests {
     use super::{
-        attachment_expired, extract_attachments, extract_body, extract_embeds, is_empty_message,
-        reaction_path_segment, stale_message_ids, thumbnail_source,
+        attachment_expired, default_avatar_url, dm_avatar_url, extract_attachments, extract_body,
+        extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids, thumbnail_source,
     };
     use crate::model::{Attachment, Message};
     use serde_json::json;
@@ -2479,6 +2532,35 @@ mod tests {
         assert!(!attachment_expired(future));
         // An unsigned link has no expiry to read, so it is never "expired".
         assert!(!attachment_expired("https://example.com/a.png"));
+    }
+
+    #[test]
+    fn everyone_has_a_face_even_without_an_avatar() {
+        // A conversation list is a list of faces; one entry showing a letter
+        // instead reads as broken rather than as a person with no picture.
+        let modern = json!({ "id": "1339667204756475924", "discriminator": "0" });
+        let url = default_avatar_url(&modern).expect("a modern account still has a default");
+        assert!(url.starts_with("https://cdn.discordapp.com/embed/avatars/"), "unexpected: {url}");
+        let index: u64 = url.trim_start_matches("https://cdn.discordapp.com/embed/avatars/").trim_end_matches(".png").parse().unwrap();
+        assert!(index < 6, "modern accounts pick one of six, got {index}");
+
+        // The old scheme derives it from the discriminator instead.
+        let legacy = json!({ "id": "80351110224678912", "discriminator": "0007" });
+        let url = default_avatar_url(&legacy).unwrap();
+        assert!(url.ends_with("/2.png"), "0007 % 5 is 2, got {url}");
+    }
+
+    #[test]
+    fn a_direct_message_is_headed_by_the_other_person() {
+        // And a group has no single face, so it gets none rather than an
+        // arbitrary one of several.
+        let one = json!({ "recipients": [{ "id": "1", "avatar": "abc", "discriminator": "0" }] });
+        assert_eq!(
+            dm_avatar_url(&one).as_deref(),
+            Some("https://cdn.discordapp.com/avatars/1/abc.png")
+        );
+        let group = json!({ "recipients": [{ "id": "1", "avatar": "a" }, { "id": "2", "avatar": "b" }] });
+        assert!(dm_avatar_url(&group).is_none(), "a group DM was given one member's face");
     }
 
     #[test]
@@ -2755,7 +2837,7 @@ fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
 /// recipients over with the channel itself. Their status is not included
 /// there, so everyone starts unknown and PRESENCE_UPDATE fills it in; for a
 /// friend that is usually immediate, since READY already carried it.
-fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value) {
+fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value, presences: &HashMap<&str, &str>) {
     let mut members: Vec<Value> = channel["recipients"]
         .as_array()
         .into_iter()
@@ -2767,7 +2849,8 @@ fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value) {
                 .filter(|s| !s.is_empty())
                 .or_else(|| r["username"].as_str())
                 .unwrap_or("unknown");
-            Some(json!({ "nick": nick, "userId": user_id, "prefix": "", "away": true, "status": "offline" }))
+            let status = presences.get(user_id).copied().unwrap_or("offline");
+            Some(json!({ "nick": nick, "userId": user_id, "prefix": "", "away": status == "offline", "status": status }))
         })
         .collect();
     if members.is_empty() {

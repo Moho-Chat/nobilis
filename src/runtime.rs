@@ -1057,6 +1057,28 @@ impl Runtime {
         }
     }
 
+    /// Gives a buffer a picture, whatever protocol it came from.
+    ///
+    /// A room's avatar for Matrix, the other person's for a direct message.
+    /// Broadcast so a list already on screen redraws, and only when it
+    /// actually changed - a DM's avatar is set again on every reconnect, and
+    /// a client that redraws its whole buffer list each time would flicker.
+    pub fn set_buffer_avatar(&self, state: &AppState, buffer_id: &str, avatar_url: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.avatar_url.as_deref() != Some(avatar_url) => {
+                    b.avatar_url = Some(avatar_url.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn get_matrix_room_avatar(&self, account_id: &str, room_id: &str) -> Option<String> {
         self.matrix_room_avatars.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
     }

@@ -79,10 +79,11 @@ pub struct Buffer {
     /// recent activity without querying history itself.
     #[serde(rename = "lastActivityTs", default)]
     pub last_activity_ts: i64,
-    /// The room's own avatar (Matrix only - a resolved local file:// path,
-    /// same reasoning as Message::avatar_url; IRC/XMPP/Discord channels
-    /// have no per-channel avatar concept). See Runtime::
-    /// set_matrix_room_avatar.
+    /// The buffer's own picture: a room's avatar for Matrix (a resolved local
+    /// file:// path, same reasoning as Message::avatar_url), or for a direct
+    /// message the other person's. Absent for channels, which have no
+    /// per-channel avatar concept outside Matrix. See Runtime::
+    /// set_buffer_avatar.
     #[serde(rename = "avatarUrl", skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
