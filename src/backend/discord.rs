@@ -2857,7 +2857,7 @@ fn announce_voice_membership(state: &AppState, account_id: &str, guild_id: Optio
 pub fn join_voice(
     state: &AppState,
     account_id: &str,
-    guild_id: &str,
+    guild_id: Option<&str>,
     channel_id: &str,
     options: super::discord_voice::VoiceOptions,
 ) -> Result<()> {
@@ -2878,6 +2878,8 @@ pub fn join_voice(
         json!({
             "op": 4,
             "d": {
+                // Null for a one-to-one call: a DM belongs to no guild, and
+                // sending one anyway gets the frame ignored.
                 "guild_id": guild_id,
                 "channel_id": channel_id,
                 // A session that carries no audio joins muted and deafened:
@@ -2895,6 +2897,63 @@ pub fn join_voice(
     Ok(())
 }
 
+/// Calls someone directly, opening the conversation if there isn't one.
+///
+/// A one-to-one call is a voice connection to a DM channel, which is most of
+/// what makes it different: no guild, and nobody is in it until the other
+/// person picks up. Joining alone is silent, so the ring is a separate request
+/// - without it you are sitting in an empty channel they never hear about.
+pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Result<String> {
+    let buffer_id = open_dm(state, account_id, user_id).await?;
+    let channel_id = state.runtime.get_discord_channel(&buffer_id).context("the DM has no channel")?;
+    start_call(state, account_id, &channel_id).await?;
+    Ok(buffer_id)
+}
+
+/// Joins a DM's voice channel and rings whoever else is in it.
+pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    // Never solo-only: a call whose whole purpose is somebody else joining
+    // cannot also refuse to be joined.
+    let options = super::discord_voice::VoiceOptions { solo: false, transmit: true };
+    join_voice(state, account_id, None, channel_id, options)?;
+    ring(state, account_id, channel_id).await
+}
+
+/// Makes the other end's client ring.
+///
+/// Sent after joining rather than before: ringing a call you are not yet in is
+/// answered by Discord with a call that ends the moment they accept it.
+pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
+        .header("Authorization", &cfg.token)
+        // A null recipient list means everyone in the conversation, which for
+        // a one-to-one DM is the one person there is.
+        .json(&json!({ "recipients": Value::Null }))
+        .send()
+        .await
+        .context("ringing")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
+/// Stops a call ringing, for hanging up before it is answered.
+pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let _ = http_client()
+        .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({ "recipients": Value::Null }))
+        .send()
+        .await;
+    Ok(())
+}
+
 /// Tells the server this account's microphone or output has been silenced.
 ///
 /// Separate from actually stopping the audio, and both are needed: closing the
@@ -2908,6 +2967,7 @@ pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, dea
             json!({
                 "op": 4,
                 "d": {
+                    // Null on a one-to-one call, which belongs to no guild.
                     "guild_id": guild_id,
                     "channel_id": channel_id,
                     "self_mute": muted,
@@ -2923,6 +2983,16 @@ pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, dea
 /// Leaves whatever voice channel this account is in. Safe to call when in none.
 pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
     let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    // Hanging up before they answer has to stop the ringing too, or their
+    // phone goes on buzzing for a call that no longer exists.
+    if let Some((guild, channel)) = state.voice.current_channel(account_id) {
+        if guild.is_none() {
+            let (s2, a2, c2) = (state.clone(), account_id.to_string(), channel);
+            tokio::spawn(async move {
+                let _ = stop_ringing(&s2, &a2, &c2).await;
+            });
+        }
+    }
     state.runtime.set_discord_voice_self(account_id, None);
     sender
         .send(json!({ "op": 4, "d": { "guild_id": null, "channel_id": null, "self_mute": true, "self_deaf": true } }).to_string())

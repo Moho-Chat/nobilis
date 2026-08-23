@@ -260,6 +260,47 @@ impl Store {
 
     /// Oldest-first, matching store.c's getBacklog (query is DESC+LIMIT for
     /// "most recent N", then reversed before returning).
+    /// One row of the message columns, in the order every query selects them.
+    ///
+    /// Shared rather than inlined because a second reader would otherwise have
+    /// to repeat seventeen positional column indices, and the two would drift
+    /// the first time a column is added.
+    fn row_to_message(buffer_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
+        let reply_to_id: Option<String> = row.get(7)?;
+        let reply_to_from: Option<String> = row.get(8)?;
+        let reply_to_body: Option<String> = row.get(9)?;
+        let reply_to = reply_to_id.map(|id| ReplyPreview {
+            id,
+            from: reply_to_from.unwrap_or_default(),
+            body: reply_to_body.unwrap_or_default(),
+        });
+        let reactions_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".to_string());
+        let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
+        let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
+        let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
+        let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
+        let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+        drop_missing_local_copies(&mut attachments);
+        Ok(Message {
+            id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            buffer_id: buffer_id.to_string(),
+            from: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            body: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ts: row.get(3)?,
+            is_action: row.get::<_, i64>(4)? != 0,
+            is_highlight: row.get::<_, i64>(5)? != 0,
+            kind: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "chat".to_string()),
+            reply_to,
+            edited: row.get::<_, i64>(10)? != 0,
+            reactions,
+            is_own: row.get::<_, i64>(12)? != 0,
+            avatar_url: row.get(13)?,
+            embeds,
+            attachments,
+            sender_id: row.get(15)?,
+        })
+    }
+
     pub fn get_backlog(&self, buffer_id: &str, before: i64, limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
@@ -269,44 +310,38 @@ impl Store {
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![buffer_id, before, limit], |row| {
-            let reply_to_id: Option<String> = row.get(7)?;
-            let reply_to_from: Option<String> = row.get(8)?;
-            let reply_to_body: Option<String> = row.get(9)?;
-            let reply_to = reply_to_id.map(|id| ReplyPreview {
-                id,
-                from: reply_to_from.unwrap_or_default(),
-                body: reply_to_body.unwrap_or_default(),
-            });
-            let reactions_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".to_string());
-            let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
-            let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
-            let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
-            let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
-            let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
-            drop_missing_local_copies(&mut attachments);
-            Ok(Message {
-                id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                buffer_id: buffer_id.to_string(),
-                from: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                body: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                ts: row.get(3)?,
-                is_action: row.get::<_, i64>(4)? != 0,
-                is_highlight: row.get::<_, i64>(5)? != 0,
-                kind: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "chat".to_string()),
-                reply_to,
-                edited: row.get::<_, i64>(10)? != 0,
-                reactions,
-                is_own: row.get::<_, i64>(12)? != 0,
-                avatar_url: row.get(13)?,
-                embeds,
-                attachments,
-                sender_id: row.get(15)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![buffer_id, before, limit], |row| Self::row_to_message(buffer_id, row))?;
         let mut out: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
         out.reverse();
         Ok(out)
+    }
+}
+
+impl Store {
+    /// Messages in one buffer whose text contains `query`.
+    ///
+    /// Deliberately a substring match rather than a word index: scrollback
+    /// here is one SQLite table per client, the thing people search for is
+    /// usually a fragment they half-remember, and a full-text index would have
+    /// to be kept in step with every edit and deletion to earn its keep.
+    ///
+    /// Newest first, since a search for something said recently is the common
+    /// case and a caller showing ten results wants those ten.
+    pub fn search_messages(&self, buffer_id: &str, query: &str, limit: i64) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit > 0 { limit } else { 50 };
+        // LIKE's own wildcards have to be neutralised, or searching for "50%"
+        // silently matches everything beginning "50".
+        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
+             FROM messages
+             WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY ts DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, pattern, limit], |row| Self::row_to_message(buffer_id, row))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 }
 
@@ -443,6 +478,43 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None)
             .expect("appending");
+    }
+
+    /// Like `append`, but with text worth searching for.
+    fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
+        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None)
+            .expect("appending");
+    }
+
+    #[test]
+    fn search_finds_a_fragment_and_stays_inside_its_buffer() {
+        let (st, dir) = store();
+        append_saying(&st, "a", "1", "just need to broil some broc");
+        append_saying(&st, "a", "2", "unrelated chatter");
+        append_saying(&st, "b", "3", "broil something else entirely");
+
+        let hits = st.search_messages("a", "broil", 50).unwrap();
+        assert_eq!(hits.len(), 1, "expected one hit, got {hits:?}");
+        assert_eq!(hits[0].id, "1");
+
+        // A search is for a fragment, not a whole word.
+        assert_eq!(st.search_messages("a", "roil so", 50).unwrap().len(), 1);
+        // And it must not reach into another conversation.
+        assert_eq!(st.search_messages("b", "broil", 50).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_wildcard_in_the_query_is_not_a_wildcard() {
+        // Searching for "50%" must not match every message starting "50".
+        let (st, dir) = store();
+        append_saying(&st, "a", "1", "down 50% this quarter");
+        append_saying(&st, "a", "2", "50 people showed up");
+
+        let hits = st.search_messages("a", "50%", 50).unwrap();
+        assert_eq!(hits.len(), 1, "the percent sign was treated as a wildcard: {hits:?}");
+        assert_eq!(hits[0].id, "1");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

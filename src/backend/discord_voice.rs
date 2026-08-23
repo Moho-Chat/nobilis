@@ -33,12 +33,25 @@ pub struct PendingHandshake {
 
 impl PendingHandshake {
     /// Both dispatches have arrived and the connection can be attempted.
+    ///
+    /// A guild is deliberately not required. A one-to-one call happens in a DM
+    /// channel, which belongs to no guild at all, and Discord sends its voice
+    /// state and server update with `guild_id` absent.
     fn complete(&self) -> bool {
-        self.guild_id.is_some()
-            && self.channel_id.is_some()
+        self.channel_id.is_some()
             && self.session_id.is_some()
             && self.endpoint.is_some()
             && self.token.is_some()
+    }
+
+    /// What the voice websocket calls the server id.
+    ///
+    /// For a guild call it is the guild; for a DM call there is no guild and
+    /// the channel itself plays that part. Songbird's field is named after the
+    /// commoner case, but the protocol only cares that this matches what the
+    /// voice server was told.
+    fn server_id(&self) -> Option<&str> {
+        self.guild_id.as_deref().or(self.channel_id.as_deref())
     }
 }
 
@@ -139,11 +152,15 @@ impl VoiceState {
         self.options.lock().unwrap().get(account_id).copied().unwrap_or_default()
     }
 
-    /// The guild and channel this account is currently in voice in.
-    pub fn current_channel(&self, account_id: &str) -> Option<(String, String)> {
+    /// Where this account is in voice: its guild, if any, and its channel.
+    ///
+    /// The guild is optional because a one-to-one call has none - it happens
+    /// in a DM channel. Callers that need something to identify the session by
+    /// should use the channel, which every call has.
+    pub fn current_channel(&self, account_id: &str) -> Option<(Option<String>, String)> {
         let pending = self.pending.lock().unwrap();
         let entry = pending.get(account_id)?;
-        Some((entry.guild_id.clone()?, entry.channel_id.clone()?))
+        Some((entry.guild_id.clone(), entry.channel_id.clone()?))
     }
 
     /// Every account with a live voice connection.
@@ -253,7 +270,7 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let connection = ConnectionInfo {
         channel_id: ChannelId(parse(info.channel_id.as_ref().unwrap(), "channel id")?),
-        guild_id: GuildId(parse(info.guild_id.as_ref().unwrap(), "guild id")?),
+        guild_id: GuildId(parse(info.server_id().context("no channel to connect to")?, "server id")?),
         user_id: UserId(parse(&config.user_id, "user id")?),
         session_id: info.session_id.clone().unwrap(),
         token: info.token.clone().unwrap(),

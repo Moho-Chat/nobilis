@@ -487,6 +487,55 @@ pub async fn dispatch(
             Err(e) => (None, Some(e.to_string())),
         },
 
+        // Searching one conversation's scrollback. Scoped to a buffer rather
+        // than global because that is where the question is asked from - the
+        // header of the conversation you are reading.
+        "searchMessages" => {
+            let (buffer_id, query) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "query")) {
+                (Some(b), Some(q)) => (b, q),
+                _ => return (None, Some("searchMessages requires \"bufferId\" and \"query\"".to_string())),
+            };
+            if query.trim().is_empty() {
+                return (Some(serde_json::json!([])), None);
+            }
+            match state.store.search_messages(buffer_id, query.trim(), p_i64(params, "limit", 50)) {
+                Ok(messages) => (Some(serde_json::to_value(messages).unwrap()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Calling someone directly. Opens the conversation if there is not
+        // one yet, so calling from a member list works for somebody you have
+        // never messaged.
+        "callDiscordUser" => {
+            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
+                (Some(a), Some(u)) => (a, u),
+                _ => return (None, Some("callDiscordUser requires \"accountId\" and \"userId\"".to_string())),
+            };
+            match backend::discord::call_user(state, account_id, user_id).await {
+                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Starting a call in a conversation that already exists - the button
+        // at the head of a DM.
+        "startDiscordCall" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("startDiscordCall requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                return (None, Some("that conversation has no Discord channel".to_string()));
+            };
+            match backend::discord::start_call(state, &buffer.account_id, &channel_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // Where we are in voice, if anywhere. Reported per account because a
         // client showing a "connected" bar has to name the channel, and the
         // gateway is the only thing that knows.
@@ -497,18 +546,35 @@ pub async fn dispatch(
                 .iter()
                 .filter_map(|id| {
                     let (guild_id, channel_id) = state.voice.current_channel(id)?;
-                    let name = state
-                        .runtime
-                        .discord_voice_channels(id, &guild_id)
-                        .into_iter()
-                        .find(|(c, _, _)| *c == channel_id)
-                        .map(|(_, n, _)| n)
+                    // A DM call has no guild and so no voice channel list to
+                    // look a name up in; the conversation's own buffer is what
+                    // names it, which is also what a person would call it.
+                    let name = guild_id
+                        .as_deref()
+                        .and_then(|g| {
+                            state
+                                .runtime
+                                .discord_voice_channels(id, g)
+                                .into_iter()
+                                .find(|(c, _, _)| *c == channel_id)
+                                .map(|(_, n, _)| n)
+                        })
+                        .or_else(|| {
+                            state
+                                .runtime
+                                .discord_buffer_for_channel(&channel_id)
+                                .and_then(|b| state.runtime.get_buffer(&b))
+                                .map(|b| b.name)
+                        })
                         .unwrap_or_else(|| channel_id.clone());
                     Some(serde_json::json!({
                         "accountId": id,
                         "guildId": guild_id,
                         "channelId": channel_id,
                         "channelName": name,
+                        // A call with no guild is a one-to-one call, which a
+                        // client shows differently.
+                        "isDirect": guild_id.is_none(),
                     }))
                 })
                 .collect();
@@ -632,14 +698,13 @@ pub async fn dispatch(
         }
 
         "joinVoiceChannel" => {
-            let (account_id, guild_id, channel_id) = match (
-                p_str_opt(params, "accountId"),
-                p_str_opt(params, "guildId"),
-                p_str_opt(params, "channelId"),
-            ) {
-                (Some(a), Some(g), Some(c)) => (a, g, c),
-                _ => return (None, Some("joinVoiceChannel requires \"accountId\", \"guildId\" and \"channelId\"".to_string())),
+            // The guild is optional: a one-to-one call is a voice connection
+            // to a DM channel, which has none.
+            let (account_id, channel_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "channelId")) {
+                (Some(a), Some(c)) => (a, c),
+                _ => return (None, Some("joinVoiceChannel requires \"accountId\" and \"channelId\"".to_string())),
             };
+            let guild_id = p_str_opt(params, "guildId");
             // Both default to the cautious setting, so a caller that says
             // nothing gets an empty channel and a closed microphone.
             let options = backend::discord_voice::VoiceOptions {
