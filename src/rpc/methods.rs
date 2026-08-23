@@ -473,6 +473,54 @@ pub async fn dispatch(
             }
         },
 
+        /// A guild's voice channels, with how many people are in each.
+        ///
+        /// Occupancy is gateway-only - there is no endpoint that reports it -
+        /// so this reflects what has been seen since connecting.
+        "listVoiceChannels" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("listVoiceChannels requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            let own = state.accounts.get_discord(account_id).map(|c| c.user_id).unwrap_or_default();
+            let channels: Vec<Value> = state
+                .runtime
+                .discord_voice_channels(account_id, guild_id)
+                .into_iter()
+                .map(|(id, name, limit)| {
+                    let occupants = state.runtime.discord_voice_occupants(account_id, &id, &own);
+                    serde_json::json!({
+                        "id": id,
+                        "name": name,
+                        "userLimit": limit,
+                        "occupants": occupants.len(),
+                        "empty": occupants.is_empty()
+                    })
+                })
+                .collect();
+            (Some(serde_json::json!(channels)), None)
+        }
+
+        "joinVoiceChannel" => {
+            let (account_id, guild_id, channel_id) = match (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "guildId"),
+                p_str_opt(params, "channelId"),
+            ) {
+                (Some(a), Some(g), Some(c)) => (a, g, c),
+                _ => return (None, Some("joinVoiceChannel requires \"accountId\", \"guildId\" and \"channelId\"".to_string())),
+            };
+            match backend::discord::join_voice(state, account_id, guild_id, channel_id) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "leaveVoiceChannel" => match p_str_opt(params, "accountId") {
+            None => (None, Some("leaveVoiceChannel requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(serde_json::json!({ "left": backend::discord::leave_voice(state, account_id) })), None),
+        },
+
         "partBuffer" => match p_str_opt(params, "bufferId") {
             None => (None, Some("no such buffer".to_string())),
             Some(buffer_id) => {

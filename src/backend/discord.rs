@@ -716,6 +716,31 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     let account_id = config.account_id();
     let mut new_channels: Vec<(String, String)> = Vec::new();
 
+    // Type 2 is a voice channel. Recorded rather than made into a buffer -
+    // there is no conversation to show - so a client can list them and join.
+    let voice: Vec<(String, String, u64)> = channels
+        .iter()
+        .filter(|c| c["type"].as_i64() == Some(2))
+        .filter_map(|c| {
+            Some((
+                c["id"].as_str()?.to_string(),
+                c["name"].as_str().unwrap_or("voice").to_string(),
+                c["user_limit"].as_u64().unwrap_or(0),
+            ))
+        })
+        .collect();
+    if !voice.is_empty() {
+        state.runtime.set_discord_voice_channels(&account_id, guild_id, voice);
+    }
+
+    // Who is already in them. This arrives once, with the guild; everything
+    // after is VOICE_STATE_UPDATE.
+    for vs in guild["voice_states"].as_array().into_iter().flatten() {
+        if let (Some(user_id), Some(channel_id)) = (vs["user_id"].as_str(), vs["channel_id"].as_str()) {
+            state.runtime.set_discord_voice_state(&account_id, user_id, Some(channel_id));
+        }
+    }
+
     // The guild's own rail entry. Registered before its channels so a
     // frontend never briefly sees a buffer pointing at a group it has not
     // heard of. Discord's `position` is the order the user themselves put
@@ -2069,6 +2094,89 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         update_member_list(state, &buffer_id, d);
                     }
 
+                    "VOICE_STATE_UPDATE" => {
+                        let Some(user_id) = d["user_id"].as_str() else { continue };
+                        let channel_id = d["channel_id"].as_str();
+                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id);
+
+                        if user_id == config.user_id {
+                            // Our own move. The session id here is half of what
+                            // a voice connection needs; VOICE_SERVER_UPDATE
+                            // carries the other half.
+                            state.runtime.set_discord_voice_self(&account_id, channel_id);
+                            state.events.emit(
+                                "discordVoiceState",
+                                json!({
+                                    "accountId": account_id,
+                                    "channelId": channel_id,
+                                    "sessionId": d["session_id"].as_str()
+                                }),
+                            );
+                        } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
+                            // Somebody else arrived where we are. Leaving is
+                            // the daemon's job rather than the caller's: by the
+                            // time a client could react it would already have
+                            // been in a channel with a stranger.
+                            if ours == theirs {
+                                tracing::info!("discord[{account_id}]: leaving voice - another user joined");
+                                leave_voice(state, &account_id);
+                                state.events.emit(
+                                    "discordVoiceLeft",
+                                    json!({ "accountId": account_id, "reason": "someone else joined", "userId": user_id }),
+                                );
+                            }
+                        }
+                    }
+
+                    "VOICE_STATE_UPDATE_OLD" => {
+                        let Some(user_id) = d["user_id"].as_str() else { continue };
+                        let channel_id = d["channel_id"].as_str();
+                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id);
+
+                        if user_id == config.user_id {
+                            // Our own move. The session id here is half of what
+                            // a voice connection needs; VOICE_SERVER_UPDATE
+                            // carries the other half.
+                            state.runtime.set_discord_voice_self(&account_id, channel_id);
+                            state.events.emit(
+                                "discordVoiceState",
+                                json!({
+                                    "accountId": account_id,
+                                    "channelId": channel_id,
+                                    "sessionId": d["session_id"].as_str()
+                                }),
+                            );
+                        } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
+                            // Somebody else arrived where we are. Leaving is
+                            // the daemon's job rather than the caller's: by the
+                            // time a client could react it would already have
+                            // been in a channel with a stranger.
+                            if ours == theirs {
+                                tracing::info!("discord[{account_id}]: leaving voice - another user joined");
+                                leave_voice(state, &account_id);
+                                state.events.emit(
+                                    "discordVoiceLeft",
+                                    json!({ "accountId": account_id, "reason": "someone else joined", "userId": user_id }),
+                                );
+                            }
+                        }
+                    }
+
+                    "VOICE_SERVER_UPDATE" => {
+                        // The endpoint and token an audio implementation would
+                        // open its own connection to. Reported rather than
+                        // used: this build establishes the session only.
+                        state.events.emit(
+                            "discordVoiceServer",
+                            json!({
+                                "accountId": account_id,
+                                "guildId": d["guild_id"].as_str(),
+                                "endpoint": d["endpoint"].as_str(),
+                                "hasToken": d["token"].as_str().is_some()
+                            }),
+                        );
+                    }
+
                     "PRESENCE_UPDATE" => {
                         // Fires for guild members too, not just friends -
                         // update_discord_presence itself is the friends-only
@@ -2653,4 +2761,50 @@ fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
         state.runtime.set_presence(&buffer.id, member_list.clone());
         state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
     }
+}
+
+/// Joins a voice channel, or refuses if anyone is already in it.
+///
+/// The refusal is deliberate and lives here rather than in the caller: this is
+/// a real server full of real people, and "only empty channels" is a rule
+/// worth enforcing where it cannot be forgotten. Joining is opcode 4 on the
+/// main gateway, which the server answers with VOICE_STATE_UPDATE (our session
+/// id) and VOICE_SERVER_UPDATE (where to connect and with what token).
+pub fn join_voice(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str) -> Result<()> {
+    let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
+
+    let occupants = state.runtime.discord_voice_occupants(account_id, channel_id, &config.user_id);
+    if !occupants.is_empty() {
+        bail!("channel is not empty - {} already in it", occupants.len());
+    }
+
+    sender.send(
+        json!({
+            "op": 4,
+            "d": {
+                "guild_id": guild_id,
+                "channel_id": channel_id,
+                // Deafened and muted: this establishes a session, it does not
+                // carry audio, and announcing otherwise to a room would be a
+                // misrepresentation.
+                "self_mute": true,
+                "self_deaf": true,
+                // Discord's own client always sends this field; omitting it
+                // gets the frame accepted and then ignored, with no error.
+                "self_video": false
+            }
+        })
+        .to_string(),
+    )?;
+    Ok(())
+}
+
+/// Leaves whatever voice channel this account is in. Safe to call when in none.
+pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    state.runtime.set_discord_voice_self(account_id, None);
+    sender
+        .send(json!({ "op": 4, "d": { "guild_id": null, "channel_id": null, "self_mute": true, "self_deaf": true } }).to_string())
+        .is_ok()
 }

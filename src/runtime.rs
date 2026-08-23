@@ -162,6 +162,14 @@ pub struct Runtime {
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
     discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
+    /// (account, guild) -> that guild's voice channels, as (id, name, limit).
+    discord_voice_channels: Mutex<HashMap<(String, String), Vec<(String, String, u64)>>>,
+    /// (account, user) -> the voice channel they are in. Absent means not in
+    /// one; this is the only record of who is where, since Discord reports
+    /// voice membership solely over the gateway.
+    discord_voice_states: Mutex<HashMap<(String, String), String>>,
+    /// account -> the voice channel we are in, if any.
+    discord_voice_self: Mutex<HashMap<String, String>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
     /// change can push a presence update on the existing connection instead of
     /// waiting for a reconnect.
@@ -279,6 +287,9 @@ impl Runtime {
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
             discord_member_list_targets: Mutex::new(HashMap::new()),
+            discord_voice_channels: Mutex::new(HashMap::new()),
+            discord_voice_states: Mutex::new(HashMap::new()),
+            discord_voice_self: Mutex::new(HashMap::new()),
             discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
             matrix_encrypted_rooms: Mutex::new(HashSet::new()),
@@ -645,6 +656,48 @@ impl Runtime {
 
     pub fn discord_member_list_target(&self, account_id: &str, guild_id: &str) -> Option<String> {
         self.discord_member_list_targets.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned()
+    }
+
+    pub fn set_discord_voice_channels(&self, account_id: &str, guild_id: &str, channels: Vec<(String, String, u64)>) {
+        self.discord_voice_channels.lock().unwrap().insert((account_id.to_string(), guild_id.to_string()), channels);
+    }
+
+    pub fn discord_voice_channels(&self, account_id: &str, guild_id: &str) -> Vec<(String, String, u64)> {
+        self.discord_voice_channels.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default()
+    }
+
+    /// Records where someone is, or that they left. Returns the channel they
+    /// were in before, so a caller can tell a move from an arrival.
+    pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>) -> Option<String> {
+        let mut states = self.discord_voice_states.lock().unwrap();
+        let key = (account_id.to_string(), user_id.to_string());
+        match channel_id {
+            Some(c) => states.insert(key, c.to_string()),
+            None => states.remove(&key),
+        }
+    }
+
+    /// Everyone currently in a voice channel, excluding `except`.
+    pub fn discord_voice_occupants(&self, account_id: &str, channel_id: &str, except: &str) -> Vec<String> {
+        self.discord_voice_states
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((a, u), c)| a == account_id && c.as_str() == channel_id && u != except)
+            .map(|((_, u), _)| u.clone())
+            .collect()
+    }
+
+    pub fn set_discord_voice_self(&self, account_id: &str, channel_id: Option<&str>) {
+        let mut own = self.discord_voice_self.lock().unwrap();
+        match channel_id {
+            Some(c) => own.insert(account_id.to_string(), c.to_string()),
+            None => own.remove(account_id),
+        };
+    }
+
+    pub fn discord_voice_self(&self, account_id: &str) -> Option<String> {
+        self.discord_voice_self.lock().unwrap().get(account_id).cloned()
     }
 
     pub fn discord_buffer_for_channel(&self, channel_id: &str) -> Option<String> {
