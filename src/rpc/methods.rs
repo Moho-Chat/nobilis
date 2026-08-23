@@ -477,6 +477,16 @@ pub async fn dispatch(
         ///
         /// Occupancy is gateway-only - there is no endpoint that reports it -
         /// so this reflects what has been seen since connecting.
+        /// The machine's sound devices.
+        ///
+        /// Reported from the daemon because that is where audio is handled -
+        /// the voice connection and its encoder live here, so the devices do
+        /// too.
+        "listAudioDevices" => match backend::audio::list_devices() {
+            Ok(devices) => (Some(serde_json::to_value(devices).unwrap()), None),
+            Err(e) => (None, Some(e.to_string())),
+        },
+
         "listVoiceChannels" => {
             let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
                 (Some(a), Some(g)) => (a, g),

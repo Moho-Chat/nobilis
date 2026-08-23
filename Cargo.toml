@@ -78,3 +78,4 @@ js_int = "=0.2.2"
 # explicitly, and tungstenite is what the rest of this crate already speaks.
 # `receive` is what makes hearing anyone possible; it is off by default.
 songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite", "receive", "gateway"] }
+cpal = "0.18.2"
