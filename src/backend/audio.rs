@@ -211,6 +211,13 @@ impl Stream {
             Stream::Output => "alsa_playback",
         }
     }
+
+    fn default_query(self) -> &'static str {
+        match self {
+            Stream::Input => "get-default-source",
+            Stream::Output => "get-default-sink",
+        }
+    }
 }
 
 /// The name PipeWire gives this process's streams.
@@ -230,10 +237,25 @@ fn stream_node_name(stream: Stream) -> String {
     format!("{}.{binary}", stream.node_prefix())
 }
 
-fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
-    if device_id.is_empty() {
-        return Ok(false);
+/// The device the sound server currently routes to by default.
+fn default_device(stream: Stream) -> Result<String> {
+    let name = pactl(&[stream.default_query()])?.trim().to_string();
+    if name.is_empty() {
+        return Err(anyhow!("the sound server named no default device"));
     }
+    Ok(name)
+}
+
+/// Moves this process's stream to `device_id`, or to the current default when
+/// that is empty.
+///
+/// Routing to the default is deliberately an action rather than an absence of
+/// one. Doing nothing looks equivalent and is not: the sound server remembers
+/// the last device an application was moved to and puts it back there, so
+/// "system default" would silently mean "whatever was chosen last time",
+/// leaving audio playing into a device nobody is listening to.
+fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
+    let device_id = &if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
     let json = pactl(&["-f", "json", "list", stream.list()])?;
     let streams: serde_json::Value = serde_json::from_str(&json).context("parsing pactl output")?;
     let want = stream_node_name(stream);
@@ -341,25 +363,15 @@ where
 
     stream.play().context("starting the input stream")?;
 
-    if let Some(want) = device_id.filter(|d| !d.is_empty()) {
-        // The stream only exists for the sound server to move once it is
-        // playing, and it appears a moment later, so this waits briefly
-        // rather than concluding it is missing.
-        let mut routed = Ok(false);
-        for _ in 0..20 {
-            routed = route_input(want);
-            if matches!(routed, Ok(true)) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        match routed {
-            Ok(true) => tracing::info!("audio: input routed to {want:?}"),
-            // Being recorded on a different microphone than the one chosen is
-            // worse than being told the choice did not take.
-            Ok(false) => return Err(anyhow!("could not route input to {want:?}: the capture stream never appeared")),
-            Err(e) => return Err(e.context(format!("routing input to {want:?}"))),
-        }
+    let want = device_id.unwrap_or("");
+    match route_when_ready(Stream::Input, want) {
+        Ok(on) => tracing::info!("audio: input routed to {on:?}"),
+        // Being recorded on a different microphone than the one chosen is
+        // worse than being told the choice did not take - but only a choice
+        // can be betrayed. Failing to reach the default leaves the stream
+        // wherever the sound server put it, which is a working call.
+        Err(e) if !want.is_empty() => return Err(e.context(format!("routing input to {want:?}"))),
+        Err(e) => tracing::warn!("audio: could not route input to the default device: {e:#}"),
     }
 
     Ok(Capture { _stream: stream, level, active })
@@ -402,6 +414,11 @@ pub fn playback_muted() -> bool {
 pub struct Playback {
     _stream: cpal::Stream,
     buffer: Arc<Mutex<std::collections::VecDeque<i16>>>,
+    /// Loudest sample handed to the speakers since anyone last asked, and how
+    /// much has arrived in total. Enough to tell "nobody is talking" from
+    /// "their audio is not reaching us", which sound identical otherwise.
+    peak: Mutex<f32>,
+    received: std::sync::atomic::AtomicU64,
 }
 
 impl Playback {
@@ -414,6 +431,13 @@ impl Playback {
         if playback_muted() {
             return;
         }
+        let loudest = pcm.iter().fold(0i16, |m, s| m.max(s.saturating_abs()));
+        {
+            let mut peak = self.peak.lock().unwrap();
+            *peak = peak.max(loudest as f32 / i16::MAX as f32);
+        }
+        self.received.fetch_add(pcm.len() as u64, Ordering::Relaxed);
+
         let mut buf = self.buffer.lock().unwrap();
         buf.extend(pcm.iter().copied());
         // The same reasoning as the capture backlog: if the output device
@@ -428,6 +452,16 @@ impl Playback {
     /// How much audio is waiting, in samples. For tests and diagnostics.
     pub fn queued(&self) -> usize {
         self.buffer.lock().unwrap().len()
+    }
+
+    /// The loudest thing heard since this was last called, and the running
+    /// total of samples received. Reading resets the peak, so successive
+    /// readings describe successive intervals rather than the whole call.
+    pub fn take_level(&self) -> (f32, u64) {
+        let mut peak = self.peak.lock().unwrap();
+        let seen = *peak;
+        *peak = 0.0;
+        (seen, self.received.load(Ordering::Relaxed))
     }
 }
 
@@ -492,26 +526,36 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
 
     stream.play().context("starting the output stream")?;
 
-    if let Some(want) = device_id.filter(|d| !d.is_empty()) {
-        let mut routed = Ok(false);
-        for _ in 0..20 {
-            routed = route_output(want);
-            if matches!(routed, Ok(true)) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        match routed {
-            Ok(true) => tracing::info!("audio: output routed to {want:?}"),
-            // Unlike a misrouted microphone this is merely wrong rather than
-            // a privacy problem, so it is a warning: hearing the call from
-            // the wrong speakers beats not hearing it at all.
-            Ok(false) => tracing::warn!("audio: could not route output to {want:?}: the stream never appeared"),
-            Err(e) => tracing::warn!("audio: could not route output to {want:?}: {e:#}"),
-        }
+    // Unlike a misrouted microphone this is merely wrong rather than a privacy
+    // problem, so a failure here is a warning: hearing the call from the wrong
+    // speakers beats not hearing it at all.
+    match route_when_ready(Stream::Output, device_id.unwrap_or("")) {
+        Ok(on) => tracing::info!("audio: output routed to {on:?}"),
+        Err(e) => tracing::warn!("audio: could not route output: {e:#}"),
     }
 
-    Ok(Playback { _stream: stream, buffer })
+    Ok(Playback { _stream: stream, buffer, peak: Mutex::new(0.0), received: std::sync::atomic::AtomicU64::new(0) })
+}
+
+/// Routes a freshly opened stream, waiting for it to exist first.
+///
+/// A stream is only something the sound server can move once it is playing,
+/// and it takes a moment to appear - measured at 0.3 to 0.4 seconds here - so
+/// concluding it is missing straight away would fail every time.
+fn route_when_ready(stream: Stream, device_id: &str) -> Result<String> {
+    let target = if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
+    let mut last = Ok(false);
+    for _ in 0..40 {
+        last = route_stream(stream, &target);
+        if matches!(last, Ok(true)) {
+            return Ok(target);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    match last {
+        Ok(_) => Err(anyhow!("the stream never appeared to the sound server")),
+        Err(e) => Err(e),
+    }
 }
 
 /// Points this process's playback stream at `device_id`.
@@ -589,6 +633,21 @@ mod tests {
         // falls back to the only name there is rather than showing blank.
         assert_eq!(devices[1].name, devices[1].id);
         assert!(!devices[1].is_default);
+    }
+
+    #[test]
+    fn the_system_default_is_a_destination_rather_than_an_absence() {
+        // Choosing "system default" has to actively move the stream. The sound
+        // server puts an application back on the device it was last moved to,
+        // so treating the default as "do not route" silently means "keep
+        // whatever was chosen before" - which is how audio ends up playing
+        // into a device nobody is listening to.
+        let Ok(output) = default_device(Stream::Output) else {
+            return; // no sound server here; nothing to assert against
+        };
+        assert!(!output.is_empty(), "the default sink resolved to nothing");
+        let input = default_device(Stream::Input).expect("a server with a sink should name a source");
+        assert!(!input.is_empty(), "the default source resolved to nothing");
     }
 
     #[test]

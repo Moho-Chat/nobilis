@@ -487,6 +487,26 @@ pub async fn dispatch(
             Err(e) => (None, Some(e.to_string())),
         },
 
+        // What is actually going in and out, for a level meter - and for
+        // telling "nobody is talking" apart from "their audio never arrives",
+        // which are otherwise the same silence.
+        "getVoiceLevels" => {
+            let accounts = state.voice.connected_accounts();
+            let levels: Vec<Value> = accounts
+                .iter()
+                .map(|id| {
+                    let (heard, received) = state.voice.output_level(id).unwrap_or((0.0, 0));
+                    serde_json::json!({
+                        "accountId": id,
+                        "micPeak": state.voice.input_level(id).unwrap_or(0.0),
+                        "heardPeak": heard,
+                        "receivedSamples": received,
+                    })
+                })
+                .collect();
+            (Some(serde_json::json!(levels)), None)
+        }
+
         // What voice is set to use, and whether it is silenced. Read back
         // rather than assumed by a client, since a mute survives a restart and
         // a second window has to agree with the first.

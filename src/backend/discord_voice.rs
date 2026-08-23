@@ -172,6 +172,12 @@ impl VoiceState {
         let captures = self.captures.lock().unwrap();
         captures.get(account_id).map(|c| *c.level.lock().unwrap())
     }
+
+    /// What has been heard from everyone else since this was last asked.
+    pub fn output_level(&self, account_id: &str) -> Option<(f32, u64)> {
+        let playbacks = self.playbacks.lock().unwrap();
+        playbacks.get(account_id).map(|p| p.take_level())
+    }
 }
 
 /// Records the session id half of the handshake.
