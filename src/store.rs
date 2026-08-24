@@ -258,6 +258,16 @@ impl Store {
         Ok(id)
     }
 
+    /// The most recent message this buffer holds, for asking a service what
+    /// has happened since.
+    pub fn newest_msg_id(&self, buffer_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let id = conn
+            .query_row("SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts DESC LIMIT 1", params![buffer_id], |row| row.get(0))
+            .optional()?;
+        Ok(id)
+    }
+
     /// Oldest-first, matching store.c's getBacklog (query is DESC+LIMIT for
     /// "most recent N", then reversed before returning).
     /// One row of the message columns, in the order every query selects them.

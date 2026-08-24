@@ -100,12 +100,20 @@ pub async fn dispatch(
                 // initial fetch is already covered by the backfill that
                 // runs when the buffer is first discovered (see backend/
                 // discord.rs's backfill_channel_history).
-                if before > 0 {
-                    if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
-                        if let (Some(channel_id), Some(cfg)) =
-                            (state.runtime.get_discord_channel(buffer_id), state.accounts.get_discord(&buffer.account_id))
-                        {
+                if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                    if let (Some(channel_id), Some(cfg)) =
+                        (state.runtime.get_discord_channel(buffer_id), state.accounts.get_discord(&buffer.account_id))
+                    {
+                        if before > 0 {
                             backend::discord::extend_history(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
+                        } else {
+                            // Opening a conversation is the moment to find out
+                            // what was said while the client was closed. Done
+                            // here rather than for every channel at once on
+                            // connect: a few hundred channels would mean a few
+                            // hundred requests, most for conversations nobody
+                            // is about to read.
+                            backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
                         }
                     }
                 }

@@ -1707,6 +1707,78 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
     Ok(missing.len())
 }
 
+/// Asks every open conversation what it missed, one at a time.
+///
+/// Spaced out deliberately: this runs right after connecting, alongside
+/// everything else a fresh connection does, and a burst of requests is the
+/// quickest way to be rate-limited by a service that has just let us in.
+fn spawn_dm_catch_up(state: AppState, config: DiscordAccountConfig, channels: HashMap<String, (String, String)>) {
+    tokio::spawn(async move {
+        let account_id = config.account_id();
+        let dms: Vec<(String, String)> = channels
+            .iter()
+            .filter(|(_, (_, kind))| kind == "dm")
+            .filter_map(|(channel_id, (name, _))| {
+                let buffer = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && &b.name == name)?;
+                Some((buffer.id, channel_id.clone()))
+            })
+            .collect();
+
+        for (buffer_id, channel_id) in dms {
+            catch_up_channel(&state, &config.token, &config.user_id, config.display_name.as_deref(), &buffer_id, &channel_id).await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+    });
+}
+
+/// Fetches what was said in a channel while nobody was listening.
+///
+/// The daemon only runs while the client does, so every exit is a gap: the
+/// gateway replays nothing on reconnect, and the existing backfill deliberately
+/// skips any channel that already has scrollback. Without this, messages that
+/// arrived overnight simply never appeared - the channel looked exactly as it
+/// did when the app was closed.
+///
+/// Asks for what came *after* the newest message already stored, which is
+/// bounded by how long the gap was rather than by how much history exists.
+pub async fn catch_up_channel(
+    state: &AppState,
+    token: &str,
+    user_id: &str,
+    own_display_name: Option<&str>,
+    buffer_id: &str,
+    channel_id: &str,
+) {
+    if !state.runtime.try_start_discord_history_fetch(buffer_id) {
+        return;
+    }
+    let result: Result<()> = async {
+        // Nothing stored means this is a first sight, which the initial
+        // backfill already covers.
+        let Some(after_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
+        let resp = http_client()
+            .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+            .query(&[("limit", "50"), ("after", after_id.as_str())])
+            .header("Authorization", token)
+            .send()
+            .await
+            .context("fetching missed messages")?;
+        if resp.status().is_success() {
+            let messages: Vec<Value> = resp.json().await.context("parsing missed messages")?;
+            if !messages.is_empty() {
+                tracing::info!("discord: {} message(s) missed in {buffer_id}", messages.len());
+            }
+            store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!("discord: catching up {buffer_id}: {e}");
+    }
+    state.runtime.finish_discord_history_fetch(buffer_id);
+}
+
 pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
     if !state.runtime.try_start_discord_history_fetch(buffer_id) {
         return;
@@ -2041,6 +2113,13 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                 }
                             }
                         }
+                        // Conversations are the ones people notice a gap in,
+                        // and there are few enough of them to ask about
+                        // directly. Channels wait until opened - a few hundred
+                        // requests on every connect would be rate-limited and
+                        // mostly wasted.
+                        spawn_dm_catch_up(state.clone(), config.clone(), channel_map.clone());
+
                         state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
                         tracing::info!("discord[{account_id}]: ready as {username}");
 
