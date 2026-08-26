@@ -111,6 +111,17 @@ pub struct Buffer {
     /// Absent only while a backend has not yet placed it.
     #[serde(rename = "groupId", skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    /// The service's own identifier for this buffer - a Discord channel id.
+    ///
+    /// Every other field here is named the way a person would say it, which is
+    /// deliberate; this one is the exception because message bodies are not. A
+    /// Discord message linking a channel carries the raw `<#id>` token and
+    /// nothing else, so a frontend that wants to draw that as a channel name -
+    /// and open it when clicked - needs the id to match against. Kept as a
+    /// field rather than resolved on the way in so that scrollback stored
+    /// before the channel was ever seen still reads correctly once it is.
+    #[serde(rename = "remoteId", skip_serializing_if = "Option::is_none")]
+    pub remote_id: Option<String>,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -391,5 +402,39 @@ mod tests {
         let a = Attachment { kind: "file".into(), ..Default::default() };
         let v = serde_json::to_value(&a).unwrap();
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["kind"]);
+    }
+
+    fn a_buffer() -> Buffer {
+        Buffer {
+            id: "acct|Guild/#general".into(),
+            account_id: "acct".into(),
+            kind: "channel".into(),
+            name: "Guild/#general".into(),
+            last_activity_ts: 0,
+            avatar_url: None,
+            category: None,
+            position: 0,
+            encrypted: None,
+            group_id: None,
+            remote_id: None,
+        }
+    }
+
+    /// The channel id a frontend matches `<#id>` against. Under the wrong key
+    /// every channel link in every message silently renders as unknown, which
+    /// is precisely the symptom this field exists to fix.
+    #[test]
+    fn a_buffers_channel_id_goes_out_as_remote_id() {
+        let b = Buffer { remote_id: Some("1393001234568164748".into()), ..a_buffer() };
+        let v = serde_json::to_value(&b).unwrap();
+        assert_eq!(v["remoteId"], "1393001234568164748");
+    }
+
+    /// Only Discord channels have one. An IRC channel sending `remoteId: null`
+    /// would have a frontend indexing null as a channel id.
+    #[test]
+    fn a_buffer_with_no_channel_id_omits_the_key() {
+        let v = serde_json::to_value(a_buffer()).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("remoteId"));
     }
 }

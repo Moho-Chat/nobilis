@@ -493,6 +493,7 @@ impl Runtime {
             position: 0,
             encrypted: None,
             group_id: Some(model::account_group_id(account_id)),
+            remote_id: None,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -646,8 +647,30 @@ impl Runtime {
         self.own_identity.lock().unwrap().get(account_id).cloned()
     }
 
-    pub fn set_discord_channel(&self, buffer_id: &str, channel_id: &str) {
+    /// Remembers which Discord channel a buffer is showing.
+    ///
+    /// Also published on the buffer itself as `remoteId`. Both, rather than
+    /// one: the map is what the gateway dispatches are matched through and is
+    /// keyed the other way round, while the field is what a frontend needs to
+    /// turn a `<#id>` in a message body into the channel's name.
+    pub fn set_discord_channel(&self, state: &AppState, buffer_id: &str, channel_id: &str) {
         self.discord_channels.lock().unwrap().insert(buffer_id.to_string(), channel_id.to_string());
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.remote_id.as_deref() != Some(channel_id) => {
+                    b.remote_id = Some(channel_id.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        // Only on a real change: this is called again for every channel on
+        // every reconnect, and a frontend redrawing its whole list each time
+        // would flicker.
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
     }
 
     /// The buffer showing a Discord channel, if one exists - the reverse of

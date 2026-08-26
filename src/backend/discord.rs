@@ -467,7 +467,7 @@ fn register_dm_channel(
     }
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state.runtime.set_discord_channel(&buf.id, channel_id);
+    state.runtime.set_discord_channel(state, &buf.id, channel_id);
     if let Some(avatar) = dm_avatar_url(ch) {
         state.runtime.set_buffer_avatar(state, &buf.id, &avatar);
     }
@@ -578,7 +578,7 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -
     let channel_id = ch["id"].as_str().context("no channel id in response")?;
     let name = dm_channel_name(&ch);
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state.runtime.set_discord_channel(&buffer.id, channel_id);
+    state.runtime.set_discord_channel(state, &buffer.id, channel_id);
     if let Some(avatar) = dm_avatar_url(&ch) {
         state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
     }
@@ -849,7 +849,7 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
         let chan_name = ch["name"].as_str().unwrap_or("channel");
         let name = format!("{guild_name}/#{chan_name}");
         let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
-        state.runtime.set_discord_channel(&buf.id, channel_id);
+        state.runtime.set_discord_channel(state, &buf.id, channel_id);
         state.runtime.set_discord_guild(&buf.id, guild_id);
         state.runtime.set_buffer_group(state, &buf.id, &group_id);
 
