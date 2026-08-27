@@ -102,6 +102,14 @@ pub struct Runtime {
     /// this is the only place that mapping is kept (IRC has no equivalent
     /// need since its buffer name already *is* the protocol target).
     discord_channels: Mutex<HashMap<String, String>>,
+    /// Conversations currently ringing this machine, buffer id -> (account,
+    /// channel).
+    ///
+    /// Kept here rather than left to each frontend because a ring outlives
+    /// any one of them: the daemon stays connected while the window is shut,
+    /// so a client opening mid-ring has to be able to ask what is ringing
+    /// rather than having missed the event that said so.
+    ringing_calls: Mutex<HashMap<String, (String, String)>>,
     /// Discord-specific: buffer id -> guild snowflake, for a guild channel
     /// only (absent entirely for a DM buffer, which has no guild). Only
     /// consumer is message_link's "open this message in a real Discord
@@ -281,6 +289,7 @@ impl Runtime {
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
             discord_channels: Mutex::new(HashMap::new()),
+            ringing_calls: Mutex::new(HashMap::new()),
             buffer_groups: Mutex::new(HashMap::new()),
             discord_guild_id: Mutex::new(HashMap::new()),
             discord_history_inflight: Mutex::new(HashSet::new()),
@@ -781,6 +790,34 @@ impl Runtime {
 
     pub fn discord_voice_self(&self, account_id: &str) -> Option<String> {
         self.discord_voice_self.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Records that a conversation is ringing, or has stopped.
+    ///
+    /// Returns whether that was news. Discord repeats CALL_UPDATE for every
+    /// change to a call - somebody muting, somebody's video - and each one
+    /// carries the same ringing list, so without this a single call would
+    /// re-announce itself several times and a frontend would restart its
+    /// ringtone on each.
+    pub fn set_ringing(&self, buffer_id: &str, account_id: &str, channel_id: &str, ringing: bool) -> bool {
+        let mut calls = self.ringing_calls.lock().unwrap();
+        if ringing {
+            calls
+                .insert(buffer_id.to_string(), (account_id.to_string(), channel_id.to_string()))
+                .is_none()
+        } else {
+            calls.remove(buffer_id).is_some()
+        }
+    }
+
+    /// Everything ringing right now, for a frontend that has just connected.
+    pub fn ringing_calls(&self) -> Vec<(String, String, String)> {
+        self.ringing_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(buffer, (account, channel))| (buffer.clone(), account.clone(), channel.clone()))
+            .collect()
     }
 
     pub fn discord_buffer_for_channel(&self, channel_id: &str) -> Option<String> {
@@ -1453,5 +1490,58 @@ impl Runtime {
             Ok(None) => {}
             Err(e) => tracing::warn!("failed to update reaction: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Discord repeats CALL_UPDATE for every change to a live call - somebody
+    /// muting, somebody starting video - and each one carries the same ringing
+    /// list. Announcing all of them would restart a frontend's ringtone on
+    /// each, so only the change is news.
+    #[test]
+    fn a_call_is_announced_once_however_often_discord_repeats_itself() {
+        let runtime = Runtime::new();
+        assert!(runtime.set_ringing("acct|alex", "acct", "chan", true));
+        assert!(!runtime.set_ringing("acct|alex", "acct", "chan", true));
+        assert!(!runtime.set_ringing("acct|alex", "acct", "chan", true));
+    }
+
+    /// Stopping is news exactly once too - a caller hanging up produces both a
+    /// CALL_UPDATE with an empty ringing list and a CALL_DELETE.
+    #[test]
+    fn a_call_stops_ringing_once() {
+        let runtime = Runtime::new();
+        runtime.set_ringing("acct|alex", "acct", "chan", true);
+        assert!(runtime.set_ringing("acct|alex", "acct", "chan", false));
+        assert!(!runtime.set_ringing("acct|alex", "acct", "chan", false));
+    }
+
+    /// Nothing ringing is not the same as never having asked, and a frontend
+    /// opening mid-call reads this rather than the event it missed.
+    #[test]
+    fn what_is_ringing_can_be_asked_for_after_the_fact() {
+        let runtime = Runtime::new();
+        assert!(runtime.ringing_calls().is_empty());
+        runtime.set_ringing("acct|alex", "acct", "chan", true);
+        runtime.set_ringing("acct|sam", "acct", "chan2", true);
+        let mut ringing: Vec<String> = runtime.ringing_calls().into_iter().map(|(b, _, _)| b).collect();
+        ringing.sort();
+        assert_eq!(ringing, vec!["acct|alex", "acct|sam"]);
+
+        runtime.set_ringing("acct|alex", "acct", "chan", false);
+        assert_eq!(runtime.ringing_calls().len(), 1);
+    }
+
+    /// Two people calling at once are two calls, not one that overwrote the
+    /// other - the panel stacks them and each needs its own answer.
+    #[test]
+    fn two_callers_are_two_calls() {
+        let runtime = Runtime::new();
+        assert!(runtime.set_ringing("acct|alex", "acct", "chan", true));
+        assert!(runtime.set_ringing("other|sam", "other", "chan2", true));
+        assert_eq!(runtime.ringing_calls().len(), 2);
     }
 }

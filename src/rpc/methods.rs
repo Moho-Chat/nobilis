@@ -544,6 +544,50 @@ pub async fn dispatch(
             }
         }
 
+        // Answering a call that is ringing, and turning one down. Both take
+        // the conversation rather than the channel, because that is what a
+        // frontend has in its hand when somebody presses the button.
+        "acceptCall" | "declineCall" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                return (None, Some("that conversation has no Discord channel".to_string()));
+            };
+            let result = if method == "acceptCall" {
+                backend::discord::accept_call(state, &buffer.account_id, &channel_id)
+            } else {
+                backend::discord::decline_call(state, &buffer.account_id, &channel_id).await
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // What is ringing right now. The daemon outlives any one window, so a
+        // client that opens mid-call has missed the event that announced it
+        // and would otherwise show nothing while the phone is still going.
+        "getIncomingCalls" => {
+            let calls: Vec<Value> = state
+                .runtime
+                .ringing_calls()
+                .into_iter()
+                .map(|(buffer_id, account_id, channel_id)| {
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "bufferId": buffer_id,
+                        "channelId": channel_id,
+                        "ringing": true
+                    })
+                })
+                .collect();
+            (Some(Value::Array(calls)), None)
+        }
+
         // Where we are in voice, if anywhere. Reported per account because a
         // client showing a "connected" bar has to name the channel, and the
         // gateway is the only thing that knows.

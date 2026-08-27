@@ -2347,6 +2347,30 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         }
                     }
 
+                    // Somebody is calling this account, or has stopped.
+                    //
+                    // A call in a DM is announced with the set of people whose
+                    // clients should be ringing. Our own id being in it is the
+                    // whole signal: CALL_CREATE for a call we placed lists the
+                    // other person, not us. The set shrinks as people answer
+                    // or decline, so the same check on CALL_UPDATE is what
+                    // says the ringing has stopped - a caller who hangs up
+                    // before being answered produces exactly that and no
+                    // CALL_DELETE at all.
+                    "CALL_CREATE" | "CALL_UPDATE" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        let ringing = d["ringing"]
+                            .as_array()
+                            .map(|r| r.iter().any(|u| u.as_str() == Some(config.user_id.as_str())))
+                            .unwrap_or(false);
+                        announce_call(state, &account_id, channel_id, ringing);
+                    }
+
+                    "CALL_DELETE" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        announce_call(state, &account_id, channel_id, false);
+                    }
+
                     "VOICE_SERVER_UPDATE" => {
                         // The endpoint and token an audio implementation would
                         // open its own connection to. Reported rather than
@@ -3090,6 +3114,62 @@ pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Res
     let channel_id = state.runtime.get_discord_channel(&buffer_id).context("the DM has no channel")?;
     start_call(state, account_id, &channel_id).await?;
     Ok(buffer_id)
+}
+
+/// Tells frontends a conversation has started or stopped ringing.
+///
+/// Deliberately carries no name or picture. Which conversation it is, is the
+/// answer - every frontend already draws that person's name and avatar in its
+/// own list, and a second copy sourced from here would be the one that goes
+/// stale. A channel with no buffer yet is a DM this account has never opened;
+/// there is nothing to ring against, so it is dropped rather than invented.
+pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringing: bool) {
+    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(channel_id) else { return };
+    if !state.runtime.set_ringing(&buffer_id, account_id, channel_id, ringing) {
+        return;
+    }
+    state.events.emit(
+        "incomingCall",
+        json!({
+            "accountId": account_id,
+            "bufferId": buffer_id,
+            "channelId": channel_id,
+            "ringing": ringing
+        }),
+    );
+}
+
+/// Joins a call that is already ringing, which is what answering one is.
+///
+/// The same join as placing a call, minus the ring: the other end is already
+/// in the channel waiting, and ringing them back would make their client
+/// chime at a call they started.
+pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    let options = super::discord_voice::VoiceOptions { solo: false, transmit: true };
+    join_voice(state, account_id, None, channel_id, options)?;
+    // Answered, so it is no longer ringing - said here rather than waiting for
+    // Discord to say it, since the person who pressed the button should not
+    // watch it go on ringing for a round trip afterwards.
+    announce_call(state, account_id, channel_id, false);
+    Ok(())
+}
+
+/// Turns down a call without ending it for anyone else.
+///
+/// Names this account as the recipient to stop ringing rather than passing the
+/// null that means "everyone in the conversation": in a group DM, declining is
+/// a statement about yourself, and hanging up on the other four people is not
+/// what pressing it means.
+pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let _ = http_client()
+        .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({ "recipients": [&cfg.user_id] }))
+        .send()
+        .await;
+    announce_call(state, account_id, channel_id, false);
+    Ok(())
 }
 
 /// Joins a DM's voice channel and rings whoever else is in it.
