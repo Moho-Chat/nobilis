@@ -42,9 +42,27 @@ const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE: &str = "https://discord.com/api/v10";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Says who is calling, honestly.
+///
+/// reqwest sends no User-Agent whatsoever unless told to, and every request
+/// this backend made went out without one. That is worth fixing on its own
+/// terms - an API is entitled to know what is talking to it - and it is also
+/// the single worst thing a request can look like at a credential endpoint,
+/// where "no user agent" is the signature of a script trying passwords.
+///
+/// Deliberately names this client rather than claiming to be Discord's own.
+/// Being identifiable is the point; a request that lies about what it is has
+/// nothing to fall back on when the lie is spotted.
+const USER_AGENT: &str = concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)");
+
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Kicks off a QR login attempt in the background. Progress is reported
@@ -131,7 +149,18 @@ async fn run_password_login(
     state.events.emit("discordLoginStatus", json!({ "loginId": login_id, "detail": "signing in..." }));
     let resp: Value = http_client()
         .post(format!("{API_BASE}/auth/login"))
-        .json(&json!({ "login": login, "password": password, "undelete": false }))
+        // The full shape the endpoint declares, not the three fields that
+        // happen to be interesting. Both of the nulls are meaningful absences
+        // - no gift code was redeemed on the way in, and the sign-in came from
+        // nowhere in particular - and omitting a declared field entirely is
+        // one of the things answered with "Invalid Form Body".
+        .json(&json!({
+            "login": login,
+            "password": password,
+            "undelete": false,
+            "login_source": Value::Null,
+            "gift_code_sku_id": Value::Null
+        }))
         .send()
         .await
         .context("sending login request")?
@@ -140,6 +169,33 @@ async fn run_password_login(
         .context("parsing login response")?;
 
     handle_login_response(state, login_id, resp, reauth_account_id).await
+}
+
+/// Discord's per-field complaints, flattened into one line.
+///
+/// "Invalid Form Body" on its own says nothing a person can act on; the thing
+/// worth reading is the `errors` map underneath it, which names the field and
+/// says what was wrong with it.
+fn form_errors(resp: &Value) -> Option<String> {
+    let errors = resp.get("errors")?.as_object()?;
+    let mut parts: Vec<String> = Vec::new();
+    for (field, detail) in errors {
+        let messages: Vec<&str> = detail
+            .get("_errors")
+            .and_then(|e| e.as_array())
+            .map(|list| list.iter().filter_map(|e| e["message"].as_str()).collect())
+            .unwrap_or_default();
+        if messages.is_empty() {
+            parts.push(field.clone());
+        } else {
+            parts.push(format!("{field}: {}", messages.join("; ")));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
 }
 
 /// Both `/auth/login` and `/auth/mfa/totp` answer with the same shape, so one
@@ -190,6 +246,31 @@ async fn handle_login_response(
         .get("message")
         .and_then(|v| v.as_str())
         .unwrap_or("Discord rejected the login and gave no reason");
+
+    // "Invalid Form Body" with nothing wrong in the body is Discord declining
+    // to accept a password from a client it does not recognise, rather than a
+    // complaint about what was typed. Worth saying plainly and at length,
+    // because the obvious response to a vague rejection is to try again, and
+    // trying again is what actually costs something: each failed sign-in
+    // raises the account's risk score, which is where the warnings on the
+    // account come from. This is a dead end, so it says so instead of looking
+    // like a typo that another attempt might fix.
+    if resp.get("code").and_then(|c| c.as_u64()) == Some(50035) {
+        let detail = form_errors(&resp)
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
+        bail!(
+            "Discord refused the sign-in{detail}. It generally will not accept a password from a \
+             third-party client, and each attempt counts against the account - which is where the \
+             warnings on it are coming from. Use QR login instead: approving on a device already \
+             signed in is the proof Discord is actually asking for, and it does not put the \
+             account at risk."
+        );
+    }
+
+    if let Some(detail) = form_errors(&resp) {
+        bail!("{message} ({detail})");
+    }
     bail!("{message}")
 }
 
@@ -2572,6 +2653,39 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
         bail!("Discord API error {status}: {text}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::form_errors;
+    use serde_json::json;
+
+    /// "Invalid Form Body" alone is unactionable; the field underneath it is
+    /// the only part worth reading.
+    #[test]
+    fn a_field_complaint_is_pulled_out_of_the_rejection() {
+        let resp = json!({
+            "code": 50035,
+            "message": "Invalid Form Body",
+            "errors": { "login": { "_errors": [{ "code": "BASE_TYPE_REQUIRED", "message": "This field is required" }] } }
+        });
+        assert_eq!(form_errors(&resp).as_deref(), Some("login: This field is required"));
+    }
+
+    /// Discord answers some rejections with no `errors` map at all, and an
+    /// empty parenthetical appended to the message reads like a bug.
+    #[test]
+    fn a_rejection_with_no_field_detail_reports_nothing() {
+        assert!(form_errors(&json!({ "code": 50035, "message": "Invalid Form Body" })).is_none());
+        assert!(form_errors(&json!({ "message": "Login or password is invalid." })).is_none());
+    }
+
+    /// A field named with no reason given still names the field.
+    #[test]
+    fn a_field_with_no_message_is_still_named() {
+        let resp = json!({ "errors": { "password": {} } });
+        assert_eq!(form_errors(&resp).as_deref(), Some("password"));
+    }
 }
 
 #[cfg(test)]
