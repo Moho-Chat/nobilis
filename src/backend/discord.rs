@@ -471,6 +471,29 @@ async fn run_qr_login(state: &AppState, login_id: &str, reauth_account_id: Optio
 /// token - but logging into a *different* account from a re-auth prompt would
 /// silently add a second account instead of fixing the one the user asked
 /// about, so that mismatch is refused.
+/// Signs in with a token a frontend obtained from Discord's own login page.
+///
+/// The way in that actually works. Posting credentials at `/auth/login` is met
+/// with a captcha this cannot render, a device check it cannot answer, and a
+/// warning filed against the account for having tried - so a frontend that can
+/// open a browser window lets Discord's page handle all of it and brings back
+/// only the result.
+///
+/// Nothing is trusted about the token beyond its shape: `finish_login` spends
+/// it on a profile request straight away, and a token that is not one fails
+/// there rather than being written to the account file.
+pub async fn finish_token_login(
+    state: &AppState,
+    login_id: &str,
+    token: String,
+    reauth_account_id: Option<String>,
+) -> Result<()> {
+    if token.trim().is_empty() {
+        bail!("the sign-in window returned an empty token");
+    }
+    finish_login(state, login_id, token, reauth_account_id).await
+}
+
 async fn finish_login(
     state: &AppState,
     login_id: &str,

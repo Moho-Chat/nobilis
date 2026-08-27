@@ -985,6 +985,26 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // A token a frontend already obtained, by signing in on Discord's own
+        // login page in a real browser window.
+        //
+        // Synchronous where the other two are not, and that is the point of
+        // it: captcha, two-factor and device verification all happened in
+        // that window, on Discord's own page, so there is no challenge left
+        // to relay back and forth. All that remains is to check the token
+        // works and save the account.
+        "addDiscordAccountToken" => {
+            let Some(token) = p_str_opt(params, "token") else {
+                return (None, Some("addDiscordAccountToken requires \"token\"".to_string()));
+            };
+            let login_id = format!("discord-login-{}", crate::model::next_message_id());
+            let reauth = p_str_opt(params, "accountId").map(String::from);
+            match backend::discord::finish_token_login(state, &login_id, token.to_string(), reauth).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // The authenticator (or backup) code for a login that reported
         // discordLoginMfa. The ticket it needs is held against the loginId.
         "submitDiscordMfa" => {
