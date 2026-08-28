@@ -1094,6 +1094,20 @@ fn extract_body(d: &Value) -> Option<String> {
     }
     if let Some(embeds) = d["embeds"].as_array() {
         for embed in embeds {
+            // What Discord unfurled to get this embed. When that link is
+            // already in the message, adding the embed's own media URL says
+            // the same thing twice: a posted YouTube link arrives as the
+            // watch URL in the content and the /embed/ URL here, and a client
+            // that unfurls links sees two videos where a person posted one.
+            //
+            // Only skipped when the source link is actually present. An embed
+            // with no `url`, or one whose source is not in the text, is the
+            // only thing carrying that media and still has to be passed on.
+            if let Some(source) = embed["url"].as_str() {
+                if content.contains(source) {
+                    continue;
+                }
+            }
             if let Some(url) = embed["video"]["url"].as_str() {
                 parts.push(url.to_string());
             } else if let Some(url) = embed["image"]["url"].as_str() {
@@ -2676,6 +2690,53 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
         bail!("Discord API error {status}: {text}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod embed_body_tests {
+    use super::extract_body;
+    use serde_json::json;
+
+    /// A posted YouTube link comes back with an embed whose video URL is the
+    /// /embed/ form of the same video. Appending it puts the same video in the
+    /// message twice, and a client that unfurls links shows two of them.
+    #[test]
+    fn an_embed_for_a_link_already_in_the_message_adds_nothing() {
+        let msg = json!({
+            "content": "https://www.youtube.com/watch?v=g1Sq1Nr58hM",
+            "embeds": [{
+                "url": "https://www.youtube.com/watch?v=g1Sq1Nr58hM",
+                "video": { "url": "https://www.youtube.com/embed/g1Sq1Nr58hM" }
+            }]
+        });
+        assert_eq!(extract_body(&msg).as_deref(), Some("https://www.youtube.com/watch?v=g1Sq1Nr58hM"));
+    }
+
+    /// An embed nobody linked - Discord attaches these to its own system
+    /// messages - is the only thing carrying that media, so it still comes
+    /// through.
+    #[test]
+    fn an_embed_with_no_link_in_the_message_still_carries_its_media() {
+        let msg = json!({
+            "content": "look at this",
+            "embeds": [{ "image": { "url": "https://cdn.example/pic.png" } }]
+        });
+        assert_eq!(extract_body(&msg).as_deref(), Some("look at this\nhttps://cdn.example/pic.png"));
+    }
+
+    /// The source link being absent from the text is the same situation: the
+    /// embed is the only reference to it.
+    #[test]
+    fn an_embed_whose_source_is_not_in_the_text_is_kept() {
+        let msg = json!({
+            "content": "no links here",
+            "embeds": [{
+                "url": "https://example.com/article",
+                "image": { "url": "https://example.com/hero.png" }
+            }]
+        });
+        assert_eq!(extract_body(&msg).as_deref(), Some("no links here\nhttps://example.com/hero.png"));
+    }
 }
 
 #[cfg(test)]
