@@ -3314,6 +3314,28 @@ pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Res
     Ok(buffer_id)
 }
 
+/// Closes a direct message, the way pressing the x beside one does.
+///
+/// Only for a direct message. A guild's channel cannot be left on its own -
+/// you are in it because you are in the guild - so closing one of those is a
+/// local matter, and leaving the guild is a different action with much larger
+/// consequences.
+pub async fn close_dm(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .delete(format!("{API_BASE}/channels/{channel_id}"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("closing the conversation")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
 /// Tells frontends a conversation has started or stopped ringing.
 ///
 /// Deliberately carries no name or picture. Which conversation it is, is the

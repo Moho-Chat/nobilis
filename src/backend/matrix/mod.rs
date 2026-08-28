@@ -936,6 +936,35 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
     Ok(())
 }
 
+/// Leaves a room, for real, on the server.
+///
+/// Closing a conversation used to remove the buffer and nothing else, so it
+/// came back on the next sync and the account was still in the room as far as
+/// everyone else in it was concerned - the client had hidden it rather than
+/// left it. Also forgets the room afterwards: leaving alone keeps it in the
+/// account's `rooms.leave` forever, which every client shows as a room you
+/// have left rather than one that is gone. Forgetting is best-effort, since a
+/// server may refuse it and the leave is the part that matters.
+pub async fn leave_room(state: &AppState, account_id: &str, room_id: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded = url::form_urlencoded::byte_serialize(room_id.trim().as_bytes()).collect::<String>();
+    http::post_json(
+        &format!("{base}/_matrix/client/v3/rooms/{encoded}/leave"),
+        Some(&account.access_token),
+        serde_json::json!({}),
+    )
+    .await
+    .context("leaving room")?;
+    let _ = http::post_json(
+        &format!("{base}/_matrix/client/v3/rooms/{encoded}/forget"),
+        Some(&account.access_token),
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(())
+}
+
 /// Opens (creating if necessary) a 1:1 DM room with `target_user_id` -
 /// reuses an already-known DM room with them if one exists (see Runtime::
 /// find_matrix_dm_room), otherwise creates a fresh one via `createRoom`

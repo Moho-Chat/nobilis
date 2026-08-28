@@ -787,8 +787,33 @@ pub async fn dispatch(
                 match state.runtime.get_buffer(buffer_id) {
                     None => (None, Some("no such buffer".to_string())),
                     Some(buffer) => {
+                        // Closing a conversation should leave it, not merely
+                        // stop drawing it. Removing the buffer and nothing
+                        // else meant the account was still in the room as far
+                        // as everyone else in it was concerned, and the buffer
+                        // came back on the next sync.
+                        //
+                        // What "leaving" means is the protocol's business.
+                        // IRC parts a channel. Matrix leaves and forgets a
+                        // room. A Discord direct message is closed, but one of
+                        // a guild's channels cannot be left on its own - you
+                        // are in it because you are in the guild - so that
+                        // stays a local matter, as does Sneedchat, whose rooms
+                        // are a fixed list rather than something joined.
                         if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
                             let _ = sender.send_part(&buffer.name);
+                        } else if buffer.account_id.starts_with("matrix:") {
+                            if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
+                                if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
+                                    return (None, Some(e.to_string()));
+                                }
+                            }
+                        } else if buffer.kind == "dm" && buffer.account_id.starts_with("discord:") {
+                            if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {
+                                if let Err(e) = backend::discord::close_dm(state, &buffer.account_id, &channel_id).await {
+                                    return (None, Some(e.to_string()));
+                                }
+                            }
                         }
                         state.runtime.remove_buffer(state, buffer_id);
                         (Some(ok_node()), None)
