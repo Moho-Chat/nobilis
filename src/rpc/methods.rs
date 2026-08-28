@@ -822,6 +822,34 @@ pub async fn dispatch(
             }
         },
 
+        // Everything that mentioned this account, across every conversation.
+        //
+        // Asked of the daemon rather than assembled by a client from what it
+        // happens to have loaded: a mention worth an inbox is usually in a
+        // channel nobody has opened, so the client has never seen it.
+        "getMentions" => {
+            // Channels only, which is the same rule Discord's own mentions
+            // list follows. A direct message is addressed to you in its
+            // entirety, so "mentioned" adds nothing there - and it already has
+            // both its own page and its own tile in the column. Leaving them
+            // in also dragged along every service robot that talks in a query:
+            // on IRC, NickServ says your nickname in every line it sends, so
+            // the page filled with "You are now identified for" and buried
+            // the mentions it exists to collect.
+            let buffers: Vec<String> = state
+                .runtime
+                .list_buffers()
+                .into_iter()
+                .filter(|b| b.kind == "channel")
+                .map(|b| b.id)
+                .collect();
+            let limit = p_i64(params, "limit", 100);
+            match state.store.mentions(&buffers, limit) {
+                Ok(messages) => (Some(serde_json::to_value(messages).unwrap()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // Where a file can be put so it can be linked to, and doing it.
         //
         // Listed rather than hard-coded into each client: the choice of where

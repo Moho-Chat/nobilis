@@ -359,6 +359,41 @@ impl Store {
 }
 
 impl Store {
+    /// Every message that mentioned this account, newest first, across all of
+    /// its conversations.
+    ///
+    /// One query rather than a walk of every buffer: what makes an inbox worth
+    /// having is that it answers "what wanted me" in one place, and the
+    /// highlight flag is already recorded per message at the point it arrives
+    /// - by the backend that knows whether a mention is real, which for
+    /// Discord is its own resolved mentions array rather than a guess at the
+    /// nickname.
+    pub fn mentions(&self, buffer_ids: &[String], limit: i64) -> Result<Vec<Message>> {
+        if buffer_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit > 0 { limit } else { 100 };
+        let places = std::iter::repeat("?").take(buffer_ids.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, buffer_id
+             FROM messages
+             WHERE is_highlight = 1 AND is_own = 0 AND buffer_id IN ({places})
+             ORDER BY ts DESC LIMIT ?"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = buffer_ids.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        params.push(&limit);
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            // The buffer is read back per row rather than stamped from a
+            // parameter, since unlike every other query here this one spans
+            // conversations and each answer belongs to a different one.
+            let buffer_id: String = row.get(17)?;
+            Self::row_to_message(&buffer_id, row)
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     /// Messages in one buffer whose text contains `query`.
     ///
     /// Deliberately a substring match rather than a word index: scrollback
