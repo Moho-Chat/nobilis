@@ -822,6 +822,27 @@ pub async fn dispatch(
             }
         },
 
+        // Where a file can be put so it can be linked to, and doing it.
+        //
+        // Listed rather than hard-coded into each client: the choice of where
+        // somebody's files go is theirs, and a frontend drawing that menu
+        // should not have to know the answer separately from the daemon that
+        // performs it.
+        "listUploadHosts" => (Some(serde_json::Value::Array(crate::upload::hosts())), None),
+
+        "uploadFile" => {
+            let Some(path) = p_str_opt(params, "path") else {
+                return (None, Some("uploadFile requires \"path\"".to_string()));
+            };
+            let host = p_str_opt(params, "host")
+                .and_then(crate::upload::Host::parse)
+                .unwrap_or(crate::upload::Host::Catbox);
+            match crate::upload::upload(host, path, p_str_opt(params, "retention")).await {
+                Ok(url) => (Some(serde_json::json!({ "url": url })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // Leaving a whole guild or space, from its tile in the rail.
         //
         // The rail entry's own id carries everything needed - it is built as
@@ -907,12 +928,30 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e.to_string())),
                     },
                 },
-                Some(_) if attachment_path.is_some() => (None, Some("attachments aren't supported for this service".to_string())),
                 Some(_) if reply_to_id.is_some() => (None, Some("replies aren't supported for this service".to_string())),
                 Some(buffer) => match state.runtime.irc_sender(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(sender) => {
-                        match backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, body) {
+                        // IRC carries text and nothing else, so an attachment
+                        // is uploaded and the link sent - which is what a
+                        // person does by hand on IRC anyway. The caption goes
+                        // with it on the same line rather than as a second
+                        // message, so the two cannot arrive out of order or
+                        // be split by somebody else talking.
+                        let body = match attachment_path {
+                            None => body.to_string(),
+                            Some(path) => {
+                                let host = p_str_opt(params, "uploadHost")
+                                    .and_then(crate::upload::Host::parse)
+                                    .unwrap_or(crate::upload::Host::Catbox);
+                                match crate::upload::upload(host, path, p_str_opt(params, "uploadRetention")).await {
+                                    Ok(link) if body.is_empty() => link,
+                                    Ok(link) => format!("{body} {link}"),
+                                    Err(e) => return (None, Some(e.to_string())),
+                                }
+                            }
+                        };
+                        match backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body) {
                             Ok(()) => (Some(ok_node()), None),
                             Err(e) => (None, Some(e.to_string())),
                         }

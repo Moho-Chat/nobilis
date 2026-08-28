@@ -8,6 +8,7 @@ mod rpc;
 mod runtime;
 mod state;
 mod store;
+mod upload;
 
 use accounts::AccountStore;
 use anyhow::{bail, Context, Result};
