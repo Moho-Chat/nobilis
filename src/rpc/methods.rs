@@ -322,6 +322,57 @@ pub async fn dispatch(
             }
         }
 
+        // A conversation with several people at once. Separate from
+        // openDiscordDm rather than folded into it, because the two mean
+        // different things to Discord: one id reuses the DM you already have
+        // with that person, while a list always makes a new group. A caller
+        // that could not tell them apart would quietly create a duplicate
+        // conversation every time it opened a one-to-one.
+        "openDiscordGroupDm" => {
+            let account_id = match p_str_opt(params, "accountId") {
+                Some(a) => a,
+                None => return (None, Some("openDiscordGroupDm requires \"accountId\"".to_string())),
+            };
+            let user_ids: Vec<String> = params
+                .get("userIds")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::discord::open_dm_with(state, account_id, &user_ids).await {
+                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "addToDiscordGroupDm" | "removeFromDiscordGroupDm" => {
+            let (account_id, buffer_id, user_id) = match (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "userId"),
+            ) {
+                (Some(a), Some(b), Some(u)) => (a, b, u),
+                _ => {
+                    return (
+                        None,
+                        Some(format!("{method} requires \"accountId\", \"bufferId\" and \"userId\"")),
+                    )
+                }
+            };
+            let channel_id = match state.runtime.get_discord_channel(buffer_id) {
+                Some(c) => c,
+                None => return (None, Some("that conversation is not a Discord channel".to_string())),
+            };
+            let result = if method == "addToDiscordGroupDm" {
+                backend::discord::add_to_group_dm(state, account_id, &channel_id, user_id).await
+            } else {
+                backend::discord::remove_from_group_dm(state, account_id, &channel_id, user_id).await
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // Synchronous read of the in-memory snapshot built at READY and kept
         // current by PRESENCE_UPDATE (see backend/discord.rs) - no network
         // round trip needed here, unlike listMatrixDevices.

@@ -665,11 +665,45 @@ pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Res
 /// requires for a non-contact (right-click their profile -> Copy User ID,
 /// Developer Mode on) is unavoidable. Returns the resulting buffer id.
 pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -> Result<String> {
+    open_dm_with(state, account_id, &[target_user_id.to_string()]).await
+}
+
+/// Starts a conversation with one person or with several.
+///
+/// One endpoint answers both. With a single recipient Discord returns the
+/// existing one-to-one DM if there already is one, so opening a conversation
+/// you already have does not make a second. With more than one it always makes
+/// a new group - that is Discord's own behaviour rather than a choice here:
+/// two groups holding the same three people are different conversations, and
+/// the API offers no way to ask for "the" one.
+///
+/// The body differs by count and the two forms are not interchangeable.
+/// `recipient_id` takes a single id and yields a DM; `recipients` takes a list
+/// and yields a group. Sending a one-element list where the singular was meant
+/// creates a *group* of two rather than reusing the plain DM, which then sits
+/// beside it as a near-duplicate that behaves subtly differently.
+pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String]) -> Result<String> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    if user_ids.is_empty() {
+        bail!("a conversation needs at least one other person");
+    }
+    // Discord's own ceiling. Checked here so the answer is a sentence rather
+    // than an opaque 400 from the API.
+    if user_ids.len() > GROUP_DM_MAX_OTHERS {
+        bail!(
+            "a Discord group message holds ten people including you - that is {} too many",
+            user_ids.len() - GROUP_DM_MAX_OTHERS
+        );
+    }
+    let body = if user_ids.len() == 1 {
+        json!({ "recipient_id": user_ids[0] })
+    } else {
+        json!({ "recipients": user_ids })
+    };
     let resp = http_client()
         .post(format!("{API_BASE}/users/@me/channels"))
         .header("Authorization", &cfg.token)
-        .json(&json!({ "recipient_id": target_user_id }))
+        .json(&body)
         .send()
         .await
         .context("opening Discord DM")?;
@@ -692,6 +726,52 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -
     ensure_dm_group(state, account_id);
     state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
     Ok(buffer.id)
+}
+
+/// How many other people a Discord group message holds - ten including you.
+const GROUP_DM_MAX_OTHERS: usize = 9;
+
+/// Adds somebody to a group conversation already under way.
+///
+/// Only groups. Discord answers this on a one-to-one DM with a 403, because
+/// there is nothing there to add to: growing a two-person DM into a group
+/// means making a new group, which is `open_dm_with` with the whole list.
+pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .put(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .context("adding somebody to the group")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
+/// Removes somebody from a group conversation.
+///
+/// Removing yourself is how you leave one, and Discord treats it as the same
+/// call - which is why this does not refuse it. The caller decides what it
+/// means; `close_dm` is the one that says "leave" out loud.
+pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .delete(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("removing somebody from the group")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
 }
 
 /// Sends a friend request - a pending request the target still has to
