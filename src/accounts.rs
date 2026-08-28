@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -238,15 +237,17 @@ impl AccountStore {
         // accounts.xml flush - a crash mid-write can't corrupt the file.
         let tmp_path = self.path.with_extension("toml.tmp");
         {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
+            // Private from the moment it exists rather than tightened after -
+            // this file holds Discord tokens and IRC passwords, and a window
+            // in which it was readable is a window that counts.
+            let mut f = crate::secure::create_private_file(&tmp_path)?;
             f.write_all(text.as_bytes())?;
         }
         std::fs::rename(&tmp_path, &self.path)?;
+        // The rename carries the temporary file's permissions on Unix, but
+        // say so explicitly: an accounts.toml that predates this code, or one
+        // restored from a backup, would otherwise keep whatever it had.
+        crate::secure::restrict_file_to_owner(&self.path)?;
         Ok(())
     }
 

@@ -545,11 +545,7 @@ fn write_qr_file(url: &str, path: &std::path::Path) -> Result<()> {
     // Owner-only - the fingerprint it encodes is a short-lived credential
     // (whoever completes the scan-and-approve flow against it gets a login
     // ticket), same spirit as accounts.toml's 0600 permissions.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    let _ = crate::secure::restrict_file_to_owner(path);
     Ok(())
 }
 

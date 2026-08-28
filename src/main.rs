@@ -1,11 +1,13 @@
 mod accounts;
 mod backend;
 mod events;
+mod ipc;
 mod model;
 mod net;
 mod nickserv;
 mod rpc;
 mod runtime;
+mod secure;
 mod state;
 mod store;
 mod upload;

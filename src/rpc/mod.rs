@@ -4,31 +4,23 @@ pub mod wire;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 
-/// Starts the Unix-socket JSON-RPC server - tokio equivalent of
-/// daemon/nobilis/api.c's nobilis_api_start(). Same directory (0700), same
-/// stale-socket-unlink-on-start behavior.
+/// Starts the local JSON-RPC server.
+///
+/// What it listens on is the one operating-system-shaped decision in the
+/// daemon and lives entirely in `crate::ipc` - a Unix domain socket in a
+/// private directory, or a named pipe, depending. Nothing below this line
+/// knows or cares which.
 pub async fn start(state: AppState, socket_path: PathBuf) -> Result<()> {
-    if let Some(dir) = socket_path.parent() {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("creating {}", dir.display()))?;
-        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
-    }
-    if socket_path.exists() {
-        tokio::fs::remove_file(&socket_path).await.ok();
-    }
-
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("binding {}", socket_path.display()))?;
+    let mut listener = crate::ipc::listen(&socket_path)
+        .await
+        .with_context(|| format!("listening on {}", socket_path.display()))?;
     tracing::info!("listening on {}", socket_path.display());
 
     loop {
-        let (stream, _addr) = listener.accept().await?;
+        let stream = listener.accept().await?;
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(state, stream).await {
@@ -38,8 +30,8 @@ pub async fn start(state: AppState, socket_path: PathBuf) -> Result<()> {
     }
 }
 
-async fn handle_connection(state: AppState, stream: tokio::net::UnixStream) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+async fn handle_connection(state: AppState, stream: crate::ipc::Conn) -> Result<()> {
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
     let mut subscriptions: HashSet<String> = HashSet::new();
     let mut events = state.events.subscribe();
@@ -94,8 +86,5 @@ async fn handle_line(state: &AppState, line: &str, subscriptions: &mut HashSet<S
 }
 
 pub fn default_socket_path() -> PathBuf {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    runtime_dir.join("nobilis").join("nobilis.sock")
+    crate::ipc::default_endpoint()
 }
