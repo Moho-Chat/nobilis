@@ -24,6 +24,15 @@ pub struct Account {
     pub sasl_username: String,
     #[serde(rename = "allowPlaintextSasl")]
     pub allow_plaintext_sasl: bool,
+    /// Whether this account's connection is encrypted.
+    ///
+    /// Reported so a frontend can tell the truth about what sending
+    /// credentials over it would mean. SASL PLAIN on a cleartext link is the
+    /// password in the clear, and a settings pane that cannot see the
+    /// difference can only nag about it always or never mention it at all.
+    /// Every other service is encrypted by construction - they are all HTTPS
+    /// or WSS - so only IRC ever reports false.
+    pub ssl: bool,
     #[serde(rename = "hasPassword")]
     pub has_password: bool,
     /// A real avatar image URL (currently Discord's CDN only - IRC has no

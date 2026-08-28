@@ -257,8 +257,12 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
     let mut stream = client.stream()?;
     let sender = client.sender();
 
+    // Whether the account is authenticated by the time registration finishes.
+    // Ticking the SASL box is a request, not a guarantee: a server with no
+    // SASL registers us normally, and then NickServ is still the way in.
+    let mut authenticated = false;
     if config.sasl {
-        register_with_sasl(state, &account_id, &sender, &mut stream, config).await?;
+        authenticated = register_with_sasl(state, &account_id, &sender, &mut stream, config).await?;
     } else {
         // No CAP negotiation needed - straight NICK/USER (+ PASS if a
         // plain server password is set), same tail as the crate's own
@@ -291,7 +295,11 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
     state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
     state.runtime.ensure_buffer(state, &account_id, &config.host, "server");
 
-    let nickserv_wait = if !config.sasl {
+    // Keyed on whether SASL actually authenticated rather than on whether it
+    // was asked for. A server that turned out not to offer it leaves the
+    // account unidentified, and skipping NickServ there would silently drop
+    // the one credential that still works.
+    let nickserv_wait = if !authenticated {
         if let Some(pw) = &config.nickserv_password {
             // No report_progress here (unlike every earlier stage) -
             // ConnState is already Connected by this point (see just
@@ -315,11 +323,52 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
     Ok((sender, stream, nickserv_wait))
 }
 
-async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<()> {
+/// Registers with SASL, saying whether the account actually authenticated.
+///
+/// `false` means the server does not offer SASL and registration finished the
+/// ordinary way instead. It is not a failure: plenty of small networks have
+/// never implemented it, and refusing to connect to one because a checkbox was
+/// ticked would be worse than connecting the way every other client does. The
+/// caller uses the answer to decide whether NickServ still has a job to do.
+///
+/// A server that *does* offer SASL and then rejects the credentials is a real
+/// error and stays one. That is a wrong password, and quietly carrying on
+/// unauthenticated is how somebody ends up sitting in a channel under an
+/// unregistered nick believing they are identified.
+async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<bool> {
+    // SASL PLAIN is the password with base64 wrapped round it - an encoding,
+    // not a cipher. On a cleartext link it is the password in the clear to
+    // anything on the path, which is worse than NickServ only in that the
+    // person doing it believes "SASL" means it is protected.
+    if !sasl_transport_ok(config.ssl, config.allow_plaintext_sasl) {
+        bail!(
+            "refusing to send SASL credentials over an unencrypted connection to {} - \
+             turn on TLS, or allow plaintext SASL for this account if the network really has no TLS port",
+            config.host
+        );
+    }
+
     state.runtime.report_progress(state, account_id, "Requesting SASL capability...");
     sender.send_cap_req(&[Capability::Sasl])?;
-    wait_for(stream, |m| matches!(&m.command, Command::CAP(_, CapSubCommand::ACK, _, _))).await
-        .map_err(|_| anyhow!("server did not acknowledge SASL capability"))?;
+    // NAK and the timeout mean the same thing here - this server has no SASL -
+    // and both are answered by registering normally. Watching for NAK as well
+    // as ACK is what turns the common case from a 20-second stall into an
+    // immediate answer.
+    let offered = wait_for(stream, |m| {
+        matches!(
+            &m.command,
+            Command::CAP(_, CapSubCommand::ACK, _, _) | Command::CAP(_, CapSubCommand::NAK, _, _)
+        )
+    })
+    .await
+    .ok()
+    .is_some_and(|m| matches!(&m.command, Command::CAP(_, CapSubCommand::ACK, _, _)));
+
+    if !offered {
+        state.runtime.report_progress(state, account_id, "Server has no SASL; registering normally...");
+        end_cap_and_register(sender, config)?;
+        return Ok(false);
+    }
 
     state.runtime.report_progress(state, account_id, "Starting SASL PLAIN...");
     sender.send_sasl_plain()?;
@@ -345,9 +394,20 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
     .map_err(|_| anyhow!("timed out waiting for SASL result"))?;
 
     if !matches!(result.command, Command::Response(Response::RPL_SASLSUCCESS, _)) {
-        bail!("SASL authentication failed");
+        bail!("SASL authentication failed - check the SASL username and password for this account");
     }
 
+    end_cap_and_register(sender, config)?;
+    Ok(true)
+}
+
+/// Closes capability negotiation and sends the ordinary NICK/USER pair.
+///
+/// Shared by the authenticated path and the fell-back-to-nothing path because
+/// both owe the server a CAP END: having asked for capabilities, registration
+/// does not proceed until we say we are finished asking, and a server left
+/// waiting for that just sits there until the establish timeout fires.
+fn end_cap_and_register(sender: &Sender, config: &IrcAccountConfig) -> Result<()> {
     sender.send(Command::CAP(None, CapSubCommand::END, None, None))?;
     sender.send(Command::NICK(config.nick.clone()))?;
     sender.send(Command::USER(
@@ -858,4 +918,43 @@ fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str,
 
 fn buffer_kind_hint(target: &str) -> &'static str {
     if is_channel(target) { "channel" } else { "dm" }
+}
+
+/// Whether SASL credentials may be put on the wire for this connection.
+///
+/// TLS, or an explicit decision to do it anyway. Deliberately not satisfied by
+/// `use_tor`: a Tor circuit protects the traffic as far as the exit node, and
+/// the exit node is precisely where it turns back into cleartext IRC bound for
+/// a plaintext port. Treating that as encrypted would hand the password to a
+/// stranger's relay rather than to a stranger's ISP, which is not an
+/// improvement worth making silently.
+fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
+    ssl || allow_plaintext
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tls_carries_sasl_without_asking() {
+        assert!(sasl_transport_ok(true, false));
+    }
+
+    #[test]
+    fn cleartext_refuses_sasl_by_default() {
+        assert!(!sasl_transport_ok(false, false));
+    }
+
+    #[test]
+    fn cleartext_carries_sasl_when_allowed_on_purpose() {
+        assert!(sasl_transport_ok(false, true));
+    }
+
+    #[test]
+    fn allowing_plaintext_does_not_change_the_tls_case() {
+        // The allowance is a floor, not a mode: it only ever answers for the
+        // connection that had no encryption to begin with.
+        assert!(sasl_transport_ok(true, true));
+    }
 }
