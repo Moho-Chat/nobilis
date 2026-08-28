@@ -3314,6 +3314,29 @@ pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Res
     Ok(buffer_id)
 }
 
+/// Leaves a guild.
+///
+/// Not undoable from here: rejoining needs an invite, and for a guild you were
+/// invited to once, years ago, there may be nobody left to ask. A frontend
+/// offering this should say so before it happens rather than after.
+pub async fn leave_guild(state: &AppState, account_id: &str, guild_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .delete(format!("{API_BASE}/users/@me/guilds/{guild_id}"))
+        .header("Authorization", &cfg.token)
+        // Discord distinguishes leaving from being removed; this is a leave.
+        .json(&json!({ "lurking": false }))
+        .send()
+        .await
+        .context("leaving the server")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
 /// Closes a direct message, the way pressing the x beside one does.
 ///
 /// Only for a direct message. A guild's channel cannot be left on its own -

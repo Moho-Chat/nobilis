@@ -477,6 +477,27 @@ impl Runtime {
         state.events.emit("bufferListChange", json!({ "id": buffer_id, "removed": true }));
     }
 
+    /// Takes a rail entry and everything under it out of the client's view.
+    ///
+    /// For after leaving a guild or space for real: the server will stop
+    /// mentioning it, but nothing already registered goes away on its own, so
+    /// without this the entry sits in the column until the next restart.
+    pub fn remove_buffer_group(&self, state: &AppState, group_id: &str) {
+        let doomed: Vec<String> = self
+            .buffers
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.group_id.as_deref() == Some(group_id))
+            .map(|b| b.id.clone())
+            .collect();
+        for id in doomed {
+            self.remove_buffer(state, &id);
+        }
+        self.buffer_groups.lock().unwrap().remove(group_id);
+        state.events.emit("bufferGroupChange", json!({ "id": group_id, "removed": true }));
+    }
+
     /// Creates the buffer if it doesn't already exist and emits
     /// bufferListChange; no-ops (does not re-emit) if already present.
     pub fn ensure_buffer(&self, state: &AppState, account_id: &str, name: &str, kind: &str) -> Buffer {

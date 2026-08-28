@@ -822,6 +822,35 @@ pub async fn dispatch(
             }
         },
 
+        // Leaving a whole guild or space, from its tile in the rail.
+        //
+        // The rail entry's own id carries everything needed - it is built as
+        // "<accountId>|guild:<id>" or "<accountId>|space:<roomId>" - so there
+        // is no separate lookup to do. An id of neither shape is an account's
+        // own entry, which is not a thing that can be left.
+        "leaveGroup" => {
+            let Some(group_id) = p_str_opt(params, "groupId") else {
+                return (None, Some("leaveGroup requires \"groupId\"".to_string()));
+            };
+            let Some((account_id, rest)) = group_id.split_once('|') else {
+                return (None, Some("that is not something you can leave".to_string()));
+            };
+            let result = if let Some(guild_id) = rest.strip_prefix("guild:") {
+                backend::discord::leave_guild(state, account_id, guild_id).await
+            } else if let Some(room_id) = rest.strip_prefix("space:") {
+                backend::matrix::leave_room(state, account_id, room_id).await
+            } else {
+                return (None, Some("that is not something you can leave".to_string()));
+            };
+            match result {
+                Ok(()) => {
+                    state.runtime.remove_buffer_group(state, group_id);
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "sendMessage" => {
             let (buffer_id, body) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "body")) {
                 (Some(b), Some(m)) => (b, m),
