@@ -702,6 +702,15 @@ pub async fn dispatch(
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
                         "heardPeak": heard,
                         "receivedSamples": received,
+                        // Who is audible right now, so a call view can ring
+                        // the person talking rather than only showing that
+                        // somebody is. Loudest first.
+                        "speakers": state
+                            .voice
+                            .speakers(id)
+                            .into_iter()
+                            .map(|(user_id, peak)| serde_json::json!({ "userId": user_id, "peak": peak }))
+                            .collect::<Vec<_>>(),
                     })
                 })
                 .collect();
@@ -768,6 +777,27 @@ pub async fn dispatch(
             }
             state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
             (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
+        // Everyone in one voice channel, named.
+        //
+        // Separate from listVoiceChannels, which answers per guild and so has
+        // nothing to say about a one-to-one call: a DM call happens in a
+        // channel that belongs to no guild, and it is exactly the call a
+        // person is most likely to be looking at.
+        "listVoiceMembers" => {
+            let (account_id, channel_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "channelId")) {
+                (Some(a), Some(c)) => (a, c),
+                _ => return (None, Some("listVoiceMembers requires \"accountId\" and \"channelId\"".to_string())),
+            };
+            let own = state.accounts.get_discord(account_id).map(|c| c.user_id).unwrap_or_default();
+            let members: Vec<Value> = state
+                .runtime
+                .discord_voice_members(account_id, channel_id)
+                .into_iter()
+                .map(|(user_id, nick)| serde_json::json!({ "userId": user_id, "nick": nick, "isSelf": user_id == own }))
+                .collect();
+            (Some(serde_json::json!(members)), None)
         }
 
         "listVoiceChannels" => {

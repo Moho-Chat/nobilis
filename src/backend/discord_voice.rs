@@ -92,6 +92,138 @@ pub struct VoiceState {
     captures: Mutex<HashMap<String, crate::backend::audio::Capture>>,
     /// The speakers this session plays other people through.
     playbacks: Mutex<HashMap<String, Arc<crate::backend::audio::Playback>>>,
+    /// Who is talking right now, per account.
+    speaking: Mutex<HashMap<String, Arc<SpeakingTracker>>>,
+}
+
+/// Who is audible in one call, and how loudly.
+///
+/// Two maps rather than one, because Discord answers the question in two
+/// halves and at different times. Audio arrives keyed by SSRC - a number the
+/// voice server assigns to a stream, meaningless on its own - while who that
+/// SSRC belongs to arrives separately, once, when they first speak. So the
+/// identities are learned as they are announced and kept until the person
+/// disconnects, and every tick is looked up against them.
+///
+/// An SSRC whose owner has not been announced yet is heard but not named, and
+/// is deliberately not reported under a placeholder: a tile in the call view
+/// labelled "somebody" would be worse than the tile arriving a moment late,
+/// which is what happens instead.
+#[derive(Default)]
+pub struct SpeakingTracker {
+    /// SSRC to Discord user id, learned from SpeakingStateUpdate.
+    owners: Mutex<HashMap<u32, String>>,
+    /// User id to when they were last heard, and how loudly.
+    heard: Mutex<HashMap<String, (std::time::Instant, f32)>>,
+}
+
+/// How long after their last packet somebody still counts as talking.
+///
+/// Speech is not continuous - the gaps between words are real silence, and an
+/// indicator that tracked the audio exactly would flicker on every syllable.
+/// Long enough to bridge a pause, short enough to go out when they stop.
+const SPEAKING_HOLD: std::time::Duration = std::time::Duration::from_millis(400);
+
+impl SpeakingTracker {
+    fn learn(&self, ssrc: u32, user_id: String) {
+        self.owners.lock().unwrap().insert(ssrc, user_id);
+    }
+
+    fn forget(&self, ssrc: u32) {
+        if let Some(user) = self.owners.lock().unwrap().remove(&ssrc) {
+            self.heard.lock().unwrap().remove(&user);
+        }
+    }
+
+    fn heard_from(&self, ssrc: u32, peak: f32) {
+        let Some(user) = self.owners.lock().unwrap().get(&ssrc).cloned() else {
+            return;
+        };
+        self.heard.lock().unwrap().insert(user, (std::time::Instant::now(), peak));
+    }
+
+    /// Who is talking now, loudest first.
+    fn current(&self) -> Vec<(String, f32)> {
+        let now = std::time::Instant::now();
+        let mut out: Vec<(String, f32)> = self
+            .heard
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, (at, _))| now.duration_since(*at) < SPEAKING_HOLD)
+            .map(|(user, (_, peak))| (user.clone(), *peak))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1));
+        out
+    }
+}
+
+/// The loudest sample in a tick, as a fraction of full scale.
+///
+/// A peak rather than a mean: what this drives is a "somebody is talking"
+/// indicator, and the mean over 20ms of speech - which is mostly the quiet
+/// parts of a waveform - reads as near-silence even when it is not.
+fn peak_of(samples: &[i16]) -> f32 {
+    samples.iter().map(|s| (s.unsigned_abs() as f32) / 32768.0).fold(0.0, f32::max)
+}
+
+#[cfg(test)]
+mod speaking_tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_nobody_has_claimed_is_heard_but_not_named() {
+        let t = SpeakingTracker::default();
+        t.heard_from(1234, 0.9);
+        assert!(t.current().is_empty(), "an unowned SSRC must not invent a speaker");
+    }
+
+    #[test]
+    fn somebody_who_just_spoke_is_talking() {
+        let t = SpeakingTracker::default();
+        t.learn(7, "42".into());
+        t.heard_from(7, 0.5);
+        assert_eq!(t.current(), vec![("42".to_string(), 0.5)]);
+    }
+
+    #[test]
+    fn the_loudest_comes_first() {
+        let t = SpeakingTracker::default();
+        t.learn(1, "quiet".into());
+        t.learn(2, "loud".into());
+        t.heard_from(1, 0.1);
+        t.heard_from(2, 0.8);
+        assert_eq!(t.current().first().unwrap().0, "loud");
+    }
+
+    #[test]
+    fn leaving_stops_you_talking() {
+        let t = SpeakingTracker::default();
+        t.learn(7, "42".into());
+        t.heard_from(7, 0.5);
+        t.forget(7);
+        assert!(t.current().is_empty(), "a disconnect must not leave them stuck mid-word");
+    }
+
+    #[test]
+    fn silence_falls_out_of_the_hold() {
+        let t = SpeakingTracker::default();
+        t.learn(7, "42".into());
+        // Older than the hold, which is what a pause between words is not.
+        t.heard
+            .lock()
+            .unwrap()
+            .insert("42".into(), (std::time::Instant::now() - SPEAKING_HOLD * 2, 0.5));
+        assert!(t.current().is_empty());
+    }
+
+    #[test]
+    fn a_peak_is_the_loudest_sample_not_the_average() {
+        // One loud sample among quiet ones is somebody talking, and a mean
+        // would report it as near-silence.
+        assert!((peak_of(&[0, 0, 0, 16384]) - 0.5).abs() < 0.01);
+        assert_eq!(peak_of(&[]), 0.0);
+    }
 }
 
 /// Plays what everyone else says.
@@ -103,6 +235,48 @@ pub struct VoiceState {
 /// around into noise.
 struct Speakers {
     playback: Arc<crate::backend::audio::Playback>,
+    tracker: Arc<SpeakingTracker>,
+}
+
+/// Learns which stream belongs to whom, and forgets it when they leave.
+///
+/// A separate handler because these are separate events from the audio and
+/// arrive on their own schedule - the mapping is announced once, when someone
+/// first speaks, long before or after any particular tick.
+struct Identities {
+    tracker: Arc<SpeakingTracker>,
+}
+
+#[async_trait::async_trait]
+impl EventHandler for Identities {
+    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
+        match ctx {
+            EventContext::SpeakingStateUpdate(speaking) => {
+                if let Some(user) = speaking.user_id {
+                    self.tracker.learn(speaking.ssrc, user.0.to_string());
+                }
+            }
+            EventContext::ClientDisconnect(who) => {
+                // Keyed by user rather than SSRC here, so the whole entry goes
+                // rather than leaving them stuck mid-word in the view.
+                let user = who.user_id.0.to_string();
+                let ssrcs: Vec<u32> = self
+                    .tracker
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, u)| **u == user)
+                    .map(|(s, _)| *s)
+                    .collect();
+                for ssrc in ssrcs {
+                    self.tracker.forget(ssrc);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 /// Sums what several people are saying into one stream.
@@ -126,6 +300,15 @@ fn mix(voices: &[&[i16]]) -> Vec<i16> {
 impl EventHandler for Speakers {
     async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
         let EventContext::VoiceTick(tick) = ctx else { return None };
+
+        // Noted per speaker before the mix throws the identities away - which
+        // is the only place they exist, since what comes out of mix() is one
+        // stream that nobody in particular said.
+        for (ssrc, data) in &tick.speaking {
+            if let Some(voice) = data.decoded_voice.as_deref() {
+                self.tracker.heard_from(*ssrc, peak_of(voice));
+            }
+        }
 
         let voices: Vec<&[i16]> = tick.speaking.values().filter_map(|d| d.decoded_voice.as_deref()).collect();
         let mixed = mix(&voices);
@@ -194,6 +377,12 @@ impl VoiceState {
     pub fn output_level(&self, account_id: &str) -> Option<(f32, u64)> {
         let playbacks = self.playbacks.lock().unwrap();
         playbacks.get(account_id).map(|p| p.take_level())
+    }
+
+    /// Who is talking in this account's call right now, loudest first.
+    pub fn speakers(&self, account_id: &str) -> Vec<(String, f32)> {
+        let speaking = self.speaking.lock().unwrap();
+        speaking.get(account_id).map(|t| t.current()).unwrap_or_default()
     }
 }
 
@@ -283,6 +472,20 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
     let mut driver = Driver::new(config);
     driver.connect(connection).await.context("opening the voice connection")?;
 
+    // One tracker per session, registered whether or not there are speakers to
+    // play through: who is talking is worth knowing even on a machine with no
+    // audio output, and the call view is the only thing that shows it.
+    let tracker = Arc::new(SpeakingTracker::default());
+    state.voice.speaking.lock().unwrap().insert(account_id.to_string(), tracker.clone());
+    driver.add_global_event(
+        songbird::CoreEvent::SpeakingStateUpdate.into(),
+        Identities { tracker: tracker.clone() },
+    );
+    driver.add_global_event(
+        songbird::CoreEvent::ClientDisconnect.into(),
+        Identities { tracker: tracker.clone() },
+    );
+
     let prefs = state.voice_prefs.get();
     crate::backend::audio::set_playback_muted(prefs.deafened);
     match crate::backend::audio::start_playback(prefs.output.as_deref()) {
@@ -290,7 +493,7 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
             let playback = Arc::new(playback);
             driver.add_global_event(
                 songbird::CoreEvent::VoiceTick.into(),
-                Speakers { playback: playback.clone() },
+                Speakers { playback: playback.clone(), tracker: tracker.clone() },
             );
             state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback);
         }
