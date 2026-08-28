@@ -982,7 +982,13 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     // after is VOICE_STATE_UPDATE.
     for vs in guild["voice_states"].as_array().into_iter().flatten() {
         if let (Some(user_id), Some(channel_id)) = (vs["user_id"].as_str(), vs["channel_id"].as_str()) {
-            state.runtime.set_discord_voice_state(&account_id, user_id, Some(channel_id), voice_member_name(vs));
+            state.runtime.set_discord_voice_presence(
+                &account_id,
+                user_id,
+                Some(channel_id),
+                voice_member_name(vs),
+                crate::runtime::VoiceFlags::from_voice_state(vs),
+            );
         }
     }
 
@@ -2462,7 +2468,17 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                     "VOICE_STATE_UPDATE" => {
                         let Some(user_id) = d["user_id"].as_str() else { continue };
                         let channel_id = d["channel_id"].as_str();
-                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id, voice_member_name(d));
+                        // The flags ride on the voice state - there is no
+                        // separate dispatch for going live or turning a
+                        // camera on, so dropping them here would mean nobody
+                        // could ever be told a screen was being shared.
+                        state.runtime.set_discord_voice_presence(
+                            &account_id,
+                            user_id,
+                            channel_id,
+                            voice_member_name(d),
+                            crate::runtime::VoiceFlags::from_voice_state(d),
+                        );
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {
@@ -2505,7 +2521,17 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                     "VOICE_STATE_UPDATE_OLD" => {
                         let Some(user_id) = d["user_id"].as_str() else { continue };
                         let channel_id = d["channel_id"].as_str();
-                        state.runtime.set_discord_voice_state(&account_id, user_id, channel_id, voice_member_name(d));
+                        // The flags ride on the voice state - there is no
+                        // separate dispatch for going live or turning a
+                        // camera on, so dropping them here would mean nobody
+                        // could ever be told a screen was being shared.
+                        state.runtime.set_discord_voice_presence(
+                            &account_id,
+                            user_id,
+                            channel_id,
+                            voice_member_name(d),
+                            crate::runtime::VoiceFlags::from_voice_state(d),
+                        );
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {

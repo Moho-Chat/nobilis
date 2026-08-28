@@ -5,6 +5,46 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// What somebody is doing in a voice channel, beyond being in it.
+///
+/// All four ride on the voice state itself - Discord sends no separate
+/// dispatch for starting a screen share or turning a camera on, so a voice
+/// state that is thrown away except for its channel id is a screen share
+/// nobody can be told about.
+///
+/// `streaming` is Go Live, a screen or window shared into the channel.
+/// `video` is a camera. They are independent: somebody can do both, and the
+/// two look nothing alike to the person watching.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VoiceFlags {
+    pub streaming: bool,
+    pub video: bool,
+    pub muted: bool,
+    pub deafened: bool,
+}
+
+impl VoiceFlags {
+    /// Reads the four flags off a voice state as Discord sends it.
+    pub fn from_voice_state(d: &Value) -> Self {
+        Self {
+            streaming: d["self_stream"].as_bool().unwrap_or(false),
+            video: d["self_video"].as_bool().unwrap_or(false),
+            // Either kind of mute counts. A server mute and muting yourself
+            // are different in who can undo them and identical in whether
+            // anything is audible, and this says whether anything is audible.
+            muted: d["self_mute"].as_bool().unwrap_or(false) || d["mute"].as_bool().unwrap_or(false),
+            deafened: d["self_deaf"].as_bool().unwrap_or(false) || d["deaf"].as_bool().unwrap_or(false),
+        }
+    }
+}
+
+/// Where somebody is, and what they are doing there.
+#[derive(Clone, Debug)]
+struct VoicePresence {
+    channel_id: String,
+    flags: VoiceFlags,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConnState {
     Disconnected,
@@ -175,7 +215,7 @@ pub struct Runtime {
     /// (account, user) -> the voice channel they are in. Absent means not in
     /// one; this is the only record of who is where, since Discord reports
     /// voice membership solely over the gateway.
-    discord_voice_states: Mutex<HashMap<(String, String), String>>,
+    discord_voice_states: Mutex<HashMap<(String, String), VoicePresence>>,
     /// (account, user) -> what to call them. Filled from the member Discord
     /// attaches to a voice state, because someone in a voice channel is often
     /// in no loaded member list - a channel list showing raw snowflakes would
@@ -733,14 +773,32 @@ impl Runtime {
     /// Records where someone is, or that they left. Returns the channel they
     /// were in before, so a caller can tell a move from an arrival.
     pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>, name: Option<&str>) -> Option<String> {
+        self.set_discord_voice_presence(account_id, user_id, channel_id, name, VoiceFlags::default())
+    }
+
+    /// The same, carrying what they are doing in there.
+    ///
+    /// Discord puts these on every voice state it sends, and they are the only
+    /// notice anyone gets that a screen is being shared or a camera is on -
+    /// there is no separate dispatch for it.
+    pub fn set_discord_voice_presence(
+        &self,
+        account_id: &str,
+        user_id: &str,
+        channel_id: Option<&str>,
+        name: Option<&str>,
+        flags: VoiceFlags,
+    ) -> Option<String> {
         if let Some(name) = name.filter(|n| !n.is_empty()) {
             self.remember_discord_name(account_id, user_id, name);
         }
         let mut states = self.discord_voice_states.lock().unwrap();
         let key = (account_id.to_string(), user_id.to_string());
         match channel_id {
-            Some(c) => states.insert(key, c.to_string()),
-            None => states.remove(&key),
+            Some(c) => states
+                .insert(key, VoicePresence { channel_id: c.to_string(), flags })
+                .map(|p| p.channel_id),
+            None => states.remove(&key).map(|p| p.channel_id),
         }
     }
 
@@ -750,7 +808,7 @@ impl Runtime {
             .lock()
             .unwrap()
             .iter()
-            .filter(|((a, u), c)| a == account_id && c.as_str() == channel_id && u != except)
+            .filter(|((a, u), p)| a == account_id && p.channel_id == channel_id && u != except)
             .map(|((_, u), _)| u.clone())
             .collect()
     }
@@ -774,16 +832,24 @@ impl Runtime {
     /// Nobody is excluded here: a channel list has to show you your own
     /// presence, which is how you can tell you are in a call at all.
     pub fn discord_voice_members(&self, account_id: &str, channel_id: &str) -> Vec<(String, String)> {
+        self.discord_voice_roster(account_id, channel_id)
+            .into_iter()
+            .map(|(id, name, _)| (id, name))
+            .collect()
+    }
+
+    /// The same, with what each of them is doing.
+    pub fn discord_voice_roster(&self, account_id: &str, channel_id: &str) -> Vec<(String, String, VoiceFlags)> {
         let names = self.discord_voice_names.lock().unwrap();
-        let mut out: Vec<(String, String)> = self
+        let mut out: Vec<(String, String, VoiceFlags)> = self
             .discord_voice_states
             .lock()
             .unwrap()
             .iter()
-            .filter(|((a, _), c)| a == account_id && c.as_str() == channel_id)
-            .map(|((a, u), _)| {
+            .filter(|((a, _), p)| a == account_id && p.channel_id == channel_id)
+            .map(|((a, u), p)| {
                 let name = names.get(&(a.clone(), u.clone())).cloned().unwrap_or_else(|| u.clone());
-                (u.clone(), name)
+                (u.clone(), name, p.flags)
             })
             .collect();
         // Stable order, so a list does not reshuffle itself on every update.
@@ -1564,5 +1630,41 @@ mod tests {
         assert!(runtime.set_ringing("acct|alex", "acct", "chan", true));
         assert!(runtime.set_ringing("other|sam", "other", "chan2", true));
         assert_eq!(runtime.ringing_calls().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod voice_flag_tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_screen_is_read_off_the_voice_state() {
+        let d = json!({ "self_stream": true, "self_video": false });
+        let f = VoiceFlags::from_voice_state(&d);
+        assert!(f.streaming);
+        assert!(!f.video);
+    }
+
+    #[test]
+    fn a_camera_is_not_a_screen_share() {
+        // Independent, and they look nothing alike to whoever is watching.
+        let d = json!({ "self_video": true });
+        let f = VoiceFlags::from_voice_state(&d);
+        assert!(f.video);
+        assert!(!f.streaming);
+    }
+
+    #[test]
+    fn a_server_mute_counts_as_muted() {
+        // Who can undo it differs; whether anything is audible does not.
+        let f = VoiceFlags::from_voice_state(&json!({ "mute": true }));
+        assert!(f.muted);
+        let f = VoiceFlags::from_voice_state(&json!({ "self_mute": true }));
+        assert!(f.muted);
+    }
+
+    #[test]
+    fn a_state_that_says_nothing_claims_nothing() {
+        assert_eq!(VoiceFlags::from_voice_state(&json!({})), VoiceFlags::default());
     }
 }

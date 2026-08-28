@@ -793,9 +793,9 @@ pub async fn dispatch(
             let own = state.accounts.get_discord(account_id).map(|c| c.user_id).unwrap_or_default();
             let members: Vec<Value> = state
                 .runtime
-                .discord_voice_members(account_id, channel_id)
+                .discord_voice_roster(account_id, channel_id)
                 .into_iter()
-                .map(|(user_id, nick)| serde_json::json!({ "userId": user_id, "nick": nick, "isSelf": user_id == own }))
+                .map(|(user_id, nick, flags)| voice_member_json(&user_id, &nick, &own, flags))
                 .collect();
             (Some(serde_json::json!(members)), None)
         }
@@ -817,9 +817,9 @@ pub async fn dispatch(
                     // "nobody else", which is what the join rule tests.
                     let members: Vec<Value> = state
                         .runtime
-                        .discord_voice_members(account_id, &id)
+                        .discord_voice_roster(account_id, &id)
                         .into_iter()
-                        .map(|(user_id, nick)| serde_json::json!({ "userId": user_id, "nick": nick, "isSelf": user_id == own }))
+                        .map(|(user_id, nick, flags)| voice_member_json(&user_id, &nick, &own, flags))
                         .collect();
                     serde_json::json!({
                         "id": id,
@@ -1590,4 +1590,22 @@ fn account_mutation_result(result: anyhow::Result<bool>) -> (Option<Value>, Opti
         Ok(false) => (None, Some("no such account".to_string())),
         Err(e) => (None, Some(e.to_string())),
     }
+}
+
+/// One person in a voice channel, as a frontend sees them.
+///
+/// The flags are what make a call view more than a list of names: whether
+/// somebody is sharing a screen, has a camera on, or is silent. Discord sends
+/// all four on the voice state and nowhere else, so this is the only place a
+/// client can learn them.
+fn voice_member_json(user_id: &str, nick: &str, own: &str, flags: crate::runtime::VoiceFlags) -> Value {
+    serde_json::json!({
+        "userId": user_id,
+        "nick": nick,
+        "isSelf": user_id == own,
+        "streaming": flags.streaming,
+        "video": flags.video,
+        "muted": flags.muted,
+        "deafened": flags.deafened,
+    })
 }
