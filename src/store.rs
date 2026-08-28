@@ -53,6 +53,34 @@ impl Store {
         ] {
             let _ = conn.execute(stmt, []);
         }
+
+        // A message id identifies a message, so recording one twice is always
+        // a mistake - but nothing said so, and a backend that replays history
+        // on reconnect quietly stacked up copies. Sneedchat did: seven
+        // identical rows for the same id, one per reconnect.
+        //
+        // That was not merely wasted space. A frontend keys its rendered rows
+        // by message id, and duplicate keys leave a list that cannot be
+        // reconciled - rows from the last conversation survive being switched
+        // away from and sit above the new one's, which reads as one channel's
+        // history bleeding into another's.
+        //
+        // Deduplicated before the index is added, since it cannot be created
+        // while the rows it forbids are still there. The copies are identical
+        // and the oldest row of each set is kept, so nothing is lost. NULL
+        // msg_ids are left alone: SQLite treats them as distinct, which is
+        // right - a row with no id makes no claim about being the same
+        // message as any other.
+        let _ = conn.execute(
+            "DELETE FROM messages WHERE id NOT IN (
+                 SELECT MIN(id) FROM messages WHERE msg_id IS NOT NULL GROUP BY buffer_id, msg_id
+             ) AND msg_id IS NOT NULL",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique ON messages(buffer_id, msg_id)",
+            [],
+        );
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -84,7 +112,10 @@ impl Store {
         let embeds_json = if embeds.is_empty() { None } else { Some(serde_json::to_string(embeds)?) };
         let attachments_json = if attachments.is_empty() { None } else { Some(serde_json::to_string(attachments)?) };
         conn.execute(
-            "INSERT INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments)
+            // OR IGNORE against the (buffer_id, msg_id) index: recording the
+            // same message twice is a backend replaying history it already
+            // has, and the right answer is to keep the copy already stored.
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'))",
             params![
                 msg_id,
@@ -602,5 +633,52 @@ mod tests {
         let (s, dir) = store();
         assert!(s.existing_msg_ids("discord:a|#chan", &[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod dedupe_tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    fn put(s: &Store, buffer: &str, id: &str, body: &str) {
+        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None);
+    }
+
+    /// A backend replaying history it already has - Sneedchat does this on
+    /// every reconnect - must not stack up copies. Seven of them is what made
+    /// a frontend's keyed rows collide.
+    #[test]
+    fn recording_the_same_message_twice_stores_it_once() {
+        let s = store();
+        for _ in 0..7 {
+            put(&s, "acct|#room", "abc", "hello");
+        }
+        assert_eq!(s.get_backlog("acct|#room", 0, 100).unwrap().len(), 1);
+    }
+
+    /// The first copy wins, so a replay cannot rewrite what was said.
+    #[test]
+    fn a_replay_does_not_overwrite_the_stored_copy() {
+        let s = store();
+        put(&s, "acct|#room", "abc", "what was said");
+        put(&s, "acct|#room", "abc", "something else");
+        let rows = s.get_backlog("acct|#room", 0, 100).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body, "what was said");
+    }
+
+    /// Two conversations can hold the same id without either shadowing the
+    /// other - a bridged message legitimately exists in both.
+    #[test]
+    fn the_same_id_in_two_buffers_is_two_messages() {
+        let s = store();
+        put(&s, "acct|#one", "abc", "hello");
+        put(&s, "acct|#two", "abc", "hello");
+        assert_eq!(s.get_backlog("acct|#one", 0, 100).unwrap().len(), 1);
+        assert_eq!(s.get_backlog("acct|#two", 0, 100).unwrap().len(), 1);
     }
 }
