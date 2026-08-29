@@ -891,15 +891,25 @@ struct PostimgErrorBody {
 /// attachment picker would otherwise let through (see ATTACHMENT_EXTS)
 /// means "ask for an image instead" rather than guessing a content type
 /// postimg.cc would reject anyway.
-fn guess_postimg_content_type(file_name: &str) -> Option<&'static str> {
-    Some(match file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => return None,
-    })
+/// Every extension postimg.cc will take, and what to send it as.
+///
+/// One table rather than a match, because two things need it: this, to fill
+/// in the multipart content type, and the host listing a client draws its
+/// menu from. They were separate before, and disagreed - the listing counted
+/// avif an image while this refused it, so an .avif routed to postimg was
+/// accepted by the menu and rejected by the site.
+pub const POSTIMG_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("bmp", "image/bmp"),
+];
+
+pub fn guess_postimg_content_type(file_name: &str) -> Option<&'static str> {
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    POSTIMG_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t)
 }
 
 /// Matches the site's own `new Date().getTime()+Math.random().toString().

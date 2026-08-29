@@ -55,6 +55,31 @@ impl Host {
         !matches!(self, Host::Postimg)
     }
 
+    /// The file extensions this host accepts, or `None` for anything.
+    ///
+    /// postimg.cc's own list, from the table that also builds the multipart
+    /// content type - so what a menu offers and what the site will actually
+    /// take cannot drift apart. They did: "image" here once included avif,
+    /// which postimg refuses, so an .avif was routed there and rejected on
+    /// arrival.
+    pub fn accepted_extensions(self) -> Option<&'static [(&'static str, &'static str)]> {
+        match self {
+            Host::Postimg => Some(crate::backend::sockchat::POSTIMG_TYPES),
+            _ => None,
+        }
+    }
+
+    /// Whether this host will take this particular file.
+    pub fn accepts(self, file_name: &str) -> bool {
+        match self.accepted_extensions() {
+            None => true,
+            Some(table) => {
+                let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                table.iter().any(|(e, _)| *e == ext)
+            }
+        }
+    }
+
     pub fn max_bytes(self) -> usize {
         match self {
             Host::Catbox => 200 * 1024 * 1024,
@@ -74,17 +99,14 @@ pub fn hosts() -> Vec<serde_json::Value> {
                 "id": h.id(),
                 "label": h.label(),
                 "imagesOnly": !h.takes_any_file(),
+                // What it will actually take, so a client can send a file
+                // somewhere that will have it rather than somewhere that
+                // will refuse it.
+                "accepts": h.accepted_extensions().map(|t| t.iter().map(|(e, _)| *e).collect::<Vec<_>>()),
                 "maxBytes": h.max_bytes(),
             })
         })
         .collect()
-}
-
-fn is_image(file_name: &str) -> bool {
-    matches!(
-        file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str(),
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "avif"
-    )
 }
 
 /// Uploads a file and returns the URL to link to.
@@ -105,8 +127,12 @@ pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<S
         .and_then(|n| n.to_str())
         .unwrap_or("upload")
         .to_string();
-    if !host.takes_any_file() && !is_image(&file_name) {
-        bail!("{} only takes images - choose another host for \"{file_name}\"", host.id());
+    if !host.accepts(&file_name) {
+        let taken = host
+            .accepted_extensions()
+            .map(|t| t.iter().map(|(e, _)| *e).collect::<Vec<_>>().join("/"))
+            .unwrap_or_default();
+        bail!("{} does not take \"{file_name}\" - it accepts {taken}", host.id());
     }
 
     match host {
@@ -244,6 +270,31 @@ mod tests {
         assert_eq!(Host::parse("nowhere"), None);
     }
 
+    /// avif is the case that started this: it is an image by any ordinary
+    /// reading, and postimg does not take it. What a menu offers and what
+    /// the site accepts have to be the same answer.
+    #[test]
+    fn a_host_accepts_exactly_what_it_says_it_does() {
+        assert!(Host::Postimg.accepts("cat.png"));
+        assert!(Host::Postimg.accepts("cat.JPEG"));
+        assert!(!Host::Postimg.accepts("cat.avif"));
+        assert!(!Host::Postimg.accepts("clip.mp4"));
+        assert!(!Host::Postimg.accepts("noextension"));
+
+        // The general hosts take whatever they are given.
+        assert!(Host::Catbox.accepts("cat.avif"));
+        assert!(Host::Catbox.accepts("clip.mp4"));
+        assert_eq!(Host::Catbox.accepted_extensions(), None);
+
+        // And a client is told, so it can route round a refusal.
+        let listed = hosts();
+        let postimg = listed.iter().find(|h| h["id"] == "postimg").unwrap();
+        let accepts: Vec<&str> = postimg["accepts"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(accepts.contains(&"png"));
+        assert!(!accepts.contains(&"avif"));
+        assert!(listed.iter().find(|h| h["id"] == "catbox").unwrap()["accepts"].is_null());
+    }
+
     /// The images-only host has to refuse a video before it is uploaded, not
     /// after: the point of saying so is to send the person to another host.
     #[tokio::test]
@@ -253,7 +304,7 @@ mod tests {
         let file = dir.join("clip.mp4");
         std::fs::write(&file, b"not really a video").unwrap();
         let err = upload(Host::Postimg, file.to_str().unwrap(), None).await.unwrap_err().to_string();
-        assert!(err.contains("only takes images"), "got {err}");
+        assert!(err.contains("does not take"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
