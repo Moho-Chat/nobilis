@@ -24,12 +24,27 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 // that - the actual fix is not re-triggering it, by pacing out our own
 // attempts per account.
 const MIN_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+// Same shape the other three backends already use: start small so a blip
+// costs a couple of seconds, and give up ground quickly when a server is
+// genuinely down rather than hammering it.
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
-/// Spawns a background task that connects this account and runs its event
-/// loop for as long as the connection lasts. No auto-reconnect in this
-/// milestone (see project plan) - a failure just reports connectionState
-/// "disconnected" with an error and stops, same as killing/restarting the
-/// whole daemon would already require for other recovery paths.
+/// Spawns a background task that keeps this account connected: it runs the
+/// event loop, and when that ends it waits and connects again.
+///
+/// It used to stop instead, which made a momentary drop permanent - the one
+/// backend where that was true, since sockchat, Discord and Matrix have all
+/// had retry loops for a while. Recovering meant noticing and reconnecting
+/// by hand, and on a client left running all day the noticing is the part
+/// that does not happen.
+///
+/// Two things keep the loop from being a nuisance. Attempts back off 3s to
+/// 60s, on top of the existing per-account pacing, because a real network's
+/// anti-flood will silently drop connections from a source that retries too
+/// eagerly. And it stops when the account is switched off: disconnect()
+/// clears the intent flag before sending its QUIT, so an ending that was
+/// asked for is distinguishable from a link that died.
 ///
 /// The whole attempt is wrapped in catch_unwind - a bug anywhere in run()
 /// must still leave the account in a resolved (not stuck-"connecting")
@@ -53,6 +68,7 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
     // can never blow away a newer, already-successful connection's state
     // just because they happen to share an account_id.
     let generation = state.runtime.next_generation(&account_id);
+    state.runtime.set_wants_connected(&account_id, true);
     state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
     let delay = state.runtime.throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
     let join_handle = tokio::spawn({
@@ -63,18 +79,50 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 state.runtime.report_progress(&state, &account_id, &format!("Waiting {}s before connecting (reconnected too recently)...", delay.as_secs().max(1)));
                 tokio::time::sleep(delay).await;
             }
-            let result = std::panic::AssertUnwindSafe(run(&state, &config))
-                .catch_unwind()
-                .await;
-            match result {
-                Ok(Ok(())) => state.runtime.finish_connection(&state, &account_id, generation, ConnState::Disconnected, None),
-                Ok(Err(e)) => {
-                    tracing::warn!("irc[{account_id}]: {e}");
-                    state.runtime.finish_connection(&state, &account_id, generation, ConnState::Disconnected, Some(&e.to_string()));
+            let mut backoff = RECONNECT_INITIAL_DELAY;
+            loop {
+                let result = std::panic::AssertUnwindSafe(run(&state, &config))
+                    .catch_unwind()
+                    .await;
+                let detail = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => {
+                        tracing::warn!("irc[{account_id}]: {e}");
+                        Some(e.to_string())
+                    }
+                    Err(_) => {
+                        tracing::error!("irc[{account_id}]: connection task panicked");
+                        Some("internal error (see nobilis logs)".to_string())
+                    }
+                };
+
+                // Switched off while that session was running, or switched
+                // off *by* ending it - disconnect() sends QUIT, which is
+                // what brought us back here.
+                if !state.runtime.wants_connected(&account_id) {
+                    state.runtime.finish_connection(&state, &account_id, generation, ConnState::Disconnected, detail.as_deref());
+                    return;
                 }
-                Err(_) => {
-                    tracing::error!("irc[{account_id}]: connection task panicked");
-                    state.runtime.finish_connection(&state, &account_id, generation, ConnState::Disconnected, Some("internal error (see nobilis logs)"));
+
+                // A newer spawn for this account has taken over; that one
+                // owns the connection now and this loop must not race it.
+                if !state.runtime.is_current_generation(&account_id, generation) {
+                    return;
+                }
+
+                // The session is over, so the Sender that went with it is
+                // dead. Drop it before the wait, or a send during the gap
+                // goes into a socket nobody is reading.
+                state.runtime.remove_irc_handle(&account_id);
+                state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
+                let because = detail.unwrap_or_else(|| "Connection closed".to_string());
+                state.runtime.report_progress(&state, &account_id, &format!("{because} - reconnecting in {}s...", backoff.as_secs()));
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
+
+                let pace = state.runtime.throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
+                if !pace.is_zero() {
+                    tokio::time::sleep(pace).await;
                 }
             }
         }

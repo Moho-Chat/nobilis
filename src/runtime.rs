@@ -123,6 +123,15 @@ pub struct Runtime {
     /// new. Each spawn() takes a fresh generation number, and cleanup
     /// only actually applies if its generation is still the current one.
     connect_generation: Mutex<HashMap<String, u64>>,
+    /// Accounts that are meant to be connected right now.
+    ///
+    /// IRC reconnects on its own, and a retry loop needs to tell "the
+    /// connection dropped" from "somebody switched this account off" -
+    /// which look identical from inside the loop, because disconnect() on a
+    /// connected account only sends QUIT and returns. The session then ends
+    /// the same way a dead link does, and without this the account would
+    /// come straight back up seconds after being turned off.
+    wants_connected: Mutex<std::collections::HashSet<String>>,
     /// Last-known member list per buffer (the same JSON shape presenceChange
     /// events carry) - presenceChange itself is only ever *pushed* on a
     /// join/part/namreply, so a client subscribing afterward (reopening a
@@ -325,6 +334,7 @@ impl Runtime {
             task_handles: Mutex::new(HashMap::new()),
             last_connect_attempt: Mutex::new(HashMap::new()),
             connect_generation: Mutex::new(HashMap::new()),
+            wants_connected: Mutex::new(std::collections::HashSet::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
@@ -650,6 +660,15 @@ impl Runtime {
     /// connect_generation's doc comment). A no-op otherwise: some later
     /// spawn() has already superseded this attempt, and that attempt owns
     /// the account's state now, not this stale one.
+    /// Whether this attempt is still the one that owns the account.
+    ///
+    /// Same guard finish_connection applies, exposed so a retry loop can
+    /// stand down when a newer spawn has taken over rather than reconnecting
+    /// alongside it.
+    pub fn is_current_generation(&self, account_id: &str, generation: u64) -> bool {
+        self.connect_generation.lock().unwrap().get(account_id) == Some(&generation)
+    }
+
     pub fn finish_connection(&self, state: &AppState, account_id: &str, generation: u64, new_state: ConnState, error: Option<&str>) {
         if self.connect_generation.lock().unwrap().get(account_id) != Some(&generation) {
             return;
@@ -661,6 +680,21 @@ impl Runtime {
 
     pub fn remove_task_handle(&self, account_id: &str) {
         self.task_handles.lock().unwrap().remove(account_id);
+    }
+
+    /// Records that this account should be connected, and should come back
+    /// on its own if the link drops.
+    pub fn set_wants_connected(&self, account_id: &str, wants: bool) {
+        let mut w = self.wants_connected.lock().unwrap();
+        if wants {
+            w.insert(account_id.to_string());
+        } else {
+            w.remove(account_id);
+        }
+    }
+
+    pub fn wants_connected(&self, account_id: &str) -> bool {
+        self.wants_connected.lock().unwrap().contains(account_id)
     }
 
     /// Forcibly tears down any previous connection attempt/session for this
@@ -1363,6 +1397,11 @@ impl Runtime {
     /// live against Libera: this is exactly what caused a real reconnect
     /// failure - "Nickname is already in use" - after an abrupt kill).
     pub fn quit_all(&self, message: &str) {
+        // Nothing should try to come back up on the way out. IRC reconnects
+        // by itself now, and its loop reads this on the way out of a
+        // session - a QUIT sent here ends one, so without clearing the
+        // intent first the daemon would spend its shutdown reconnecting.
+        self.wants_connected.lock().unwrap().clear();
         let senders: Vec<_> = self.irc_handles.lock().unwrap().values().map(|h| h.sender.clone()).collect();
         for sender in senders {
             let _ = sender.send_quit(message);
@@ -1375,6 +1414,10 @@ impl Runtime {
     /// still stuck in DNS/TCP/TLS/registration, which has no Sender yet.
     /// Returns false if this account has neither (nothing to stop).
     pub fn disconnect(&self, state: &AppState, account_id: &str) -> bool {
+        // Before the QUIT, not after: the session ends as a result of it,
+        // and an IRC retry loop reading this flag on the way out must see
+        // that the ending was asked for.
+        self.set_wants_connected(account_id, false);
         if let Some(sender) = self.irc_sender(account_id) {
             let _ = sender.send_quit("");
             return true;
@@ -1583,6 +1626,48 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The flag that keeps IRC's retry loop from undoing a deliberate
+    /// disconnect. A session ending looks the same from inside the loop
+    /// whether the link died or somebody switched the account off, and only
+    /// this tells them apart.
+    #[test]
+    fn connection_intent_survives_until_it_is_cleared() {
+        let rt = Runtime::new();
+        assert!(!rt.wants_connected("irc:nick@example.org"), "nothing is wanted before a spawn");
+
+        rt.set_wants_connected("irc:nick@example.org", true);
+        assert!(rt.wants_connected("irc:nick@example.org"));
+        // One account being switched off must not stand the others down.
+        rt.set_wants_connected("irc:other@example.org", true);
+        rt.set_wants_connected("irc:nick@example.org", false);
+        assert!(!rt.wants_connected("irc:nick@example.org"));
+        assert!(rt.wants_connected("irc:other@example.org"));
+    }
+
+    /// Shutdown stands every account down at once, or the daemon would
+    /// spend its exit reconnecting the sessions quit_all just ended.
+    #[test]
+    fn quitting_everything_stands_every_account_down() {
+        let rt = Runtime::new();
+        rt.set_wants_connected("irc:a@example.org", true);
+        rt.set_wants_connected("irc:b@example.org", true);
+        rt.quit_all("bye");
+        assert!(!rt.wants_connected("irc:a@example.org"));
+        assert!(!rt.wants_connected("irc:b@example.org"));
+    }
+
+    /// A newer spawn owns the account; an older attempt still unwinding must
+    /// stand down rather than reconnect alongside it.
+    #[test]
+    fn only_the_newest_attempt_owns_the_account() {
+        let rt = Runtime::new();
+        let first = rt.next_generation("irc:nick@example.org");
+        assert!(rt.is_current_generation("irc:nick@example.org", first));
+        let second = rt.next_generation("irc:nick@example.org");
+        assert!(!rt.is_current_generation("irc:nick@example.org", first));
+        assert!(rt.is_current_generation("irc:nick@example.org", second));
+    }
 
     /// Discord repeats CALL_UPDATE for every change to a live call - somebody
     /// muting, somebody starting video - and each one carries the same ringing
