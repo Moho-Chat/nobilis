@@ -2123,11 +2123,37 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// Otherwise only stops when this task itself is aborted from outside: an
 /// explicit disconnect, account removal, or a newer spawn() superseding it
 /// via reset_connection().
+/// What survives a dropped gateway connection.
+///
+/// Two things live here for the same reason. Discord can *resume* a session
+/// rather than starting a new one, which replays what was missed instead of
+/// re-sending the whole account - but a resumed connection sends no READY
+/// and no GUILD_CREATE, so the channel and guild maps those normally build
+/// have to come across too or every message would arrive for a channel this
+/// connection has never heard of.
+#[derive(Default)]
+struct GatewaySession {
+    resume: Option<Resume>,
+    /// channel_id -> (buffer name, buffer kind).
+    channel_map: HashMap<String, (String, String)>,
+    /// Each guild's payload as GUILD_CREATE delivered it.
+    guild_context: HashMap<String, Value>,
+}
+
+/// Enough to pick a session back up: what it was called, where to reconnect,
+/// and how far through its event stream we got.
+struct Resume {
+    session_id: String,
+    url: String,
+    seq: u64,
+}
+
 async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
+    let mut session = GatewaySession::default();
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
-        let result = std::panic::AssertUnwindSafe(run_gateway(state, config)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session)).catch_unwind().await;
         let detail = match result {
             Ok(Ok(())) => "gateway session ended".to_string(),
             Ok(Err(e)) => {
@@ -2155,9 +2181,15 @@ async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig,
     }
 }
 
-async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<()> {
+async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &mut GatewaySession) -> Result<()> {
+    // Disjoint borrows, so the resume state can be updated while the maps
+    // are being passed around mutably.
+    let GatewaySession { resume, channel_map, guild_context } = session;
     let account_id = config.account_id();
-    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(GATEWAY_URL))
+    // Discord asks that a resume go to the url it handed out with the
+    // session rather than to the front door.
+    let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());
+    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(connect_url.as_str()))
         .await
         .map_err(|_| anyhow!("timed out connecting to Discord's gateway"))?
         .context("connecting to Discord's gateway")?;
@@ -2229,6 +2261,12 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
     }
     let _sender_guard = ClearSenderOnDrop(state, account_id.clone());
 
+    // A resume replays what was missed instead of re-sending the whole
+    // account; an identify starts fresh. Either way the server decides -
+    // op 9 below says a resume was refused.
+    if let Some(r) = resume.as_ref() {
+        out_tx.send(json!({ "op": 6, "d": { "token": config.token, "session_id": r.session_id, "seq": r.seq } }).to_string())?;
+    } else {
     out_tx.send(
         json!({
             "op": 2,
@@ -2244,15 +2282,15 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
         })
         .to_string(),
     )?;
+    }
 
     // channel_id -> (buffer name, buffer kind), rebuilt fresh from READY/
     // GUILD_CREATE each connection - see runtime.rs's discord_channels for
     // the reverse (persistent) mapping sendMessage needs.
-    let mut channel_map: HashMap<String, (String, String)> = HashMap::new();
-    // Each guild's payload as GUILD_CREATE delivered it. A channel created
-    // later needs the guild's name, roles and our own membership to be named
-    // and permission-checked, and nothing else carries them.
-    let mut guild_context: HashMap<String, Value> = HashMap::new();
+    // channel_map and guild_context are carried in from GatewaySession above:
+    // a resumed connection is sent neither READY nor GUILD_CREATE, so
+    // rebuilding them here would leave every incoming message addressed to a
+    // channel this connection had never heard of.
 
     loop {
         let msg = tokio::select! {
@@ -2260,6 +2298,13 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
             _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
         };
         let op = msg.get("op").and_then(|v| v.as_i64()).unwrap_or(-1);
+        // Every dispatch is numbered, and a resume says how far it got.
+        // Tracked before the match so it counts events this client chose
+        // not to handle - the server's count includes them either way, and
+        // resuming from a lower number would replay what was already seen.
+        if let (Some(seq), Some(r)) = (msg.get("s").and_then(|v| v.as_u64()), resume.as_mut()) {
+            r.seq = seq;
+        }
         match op {
             0 => {
                 let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -2273,6 +2318,18 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             .unwrap_or("me")
                             .to_string();
                         state.runtime.set_own_identity(&account_id, &username);
+                        // What a later reconnect needs to pick this session
+                        // back up rather than starting over.
+                        if let Some(session_id) = d["session_id"].as_str() {
+                            *resume = Some(Resume {
+                                session_id: session_id.to_string(),
+                                url: d["resume_gateway_url"]
+                                    .as_str()
+                                    .map(|u| format!("{u}/?v=10&encoding=json"))
+                                    .unwrap_or_else(|| GATEWAY_URL.to_string()),
+                                seq: msg.get("s").and_then(|v| v.as_u64()).unwrap_or(0),
+                            });
+                        }
                         if let Some(hash) = d["user"]["avatar"].as_str() {
                             let url = format!("https://cdn.discordapp.com/avatars/{}/{hash}.png", config.user_id);
                             if state.accounts.set_discord_avatar_url(&account_id, &url).unwrap_or(false) {
@@ -2326,7 +2383,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         let mut new_dm_buffers: Vec<(String, String)> = Vec::new();
                         if let Some(dms) = d["private_channels"].as_array() {
                             for ch in dms {
-                                if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map, &presences) {
+                                if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
                                     new_dm_buffers.push(pair);
                                 }
                             }
@@ -2355,7 +2412,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         // path (channel_map dedup).
                         if let Some(guilds) = d["guilds"].as_array() {
                             for g in guilds {
-                                register_guild_channels(state, config, g, &mut channel_map).await;
+                                register_guild_channels(state, config, g, channel_map).await;
                             }
                         }
 
@@ -2371,7 +2428,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                 match serde_json::from_str::<Vec<Value>>(&body) {
                                     Ok(channels) => {
                                         for ch in &channels {
-                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, &mut channel_map, &presences) {
+                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
                                                 new_dm_buffers.push(pair);
                                             }
                                         }
@@ -2385,7 +2442,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_dm_buffers);
                     }
                     "GUILD_CREATE" => {
-                        register_guild_channels(state, config, d, &mut channel_map).await;
+                        register_guild_channels(state, config, d, channel_map).await;
                         // Kept so a channel created later can be placed
                         // without re-fetching the guild: naming it and
                         // deciding whether this account may see it both
@@ -2425,7 +2482,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                                 }
                                 let mut one = guild.clone();
                                 one["channels"] = serde_json::Value::Array(vec![d.clone()]);
-                                register_guild_channels(state, config, &one, &mut channel_map).await;
+                                register_guild_channels(state, config, &one, channel_map).await;
                             }
                             // A DM or group DM opened from another client.
                             // No presence snapshot to seed it with - that
@@ -2433,7 +2490,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                             // PRESENCE_UPDATE fills it in from here on.
                             None => {
                                 let presences: HashMap<&str, &str> = HashMap::new();
-                                register_dm_channel(state, &account_id, d, &mut channel_map, &presences);
+                                register_dm_channel(state, &account_id, d, channel_map, &presences);
                             }
                         }
                     }
@@ -2720,7 +2777,16 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                 }
             }
             7 => bail!("gateway requested a reconnect"),
-            9 => bail!("session invalidated by gateway"),
+            // The resume was refused, or the session is gone. Everything
+            // carried across goes with it: the next connection gets a fresh
+            // READY and GUILD_CREATE, and keeping stale maps would mean
+            // holding buffers for channels this account may no longer be in.
+            9 => {
+                *resume = None;
+                channel_map.clear();
+                guild_context.clear();
+                bail!("session invalidated by gateway")
+            }
             // Heartbeat ack - clears the flag heartbeat_task checks before
             // sending the *next* one, so a real ack landing between ticks
             // is exactly what keeps this connection from ever being
@@ -3017,9 +3083,57 @@ mod login_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only SYNC was ever applied, so a roster froze the moment a channel
+    /// was opened. The index-addressed ops are why the window is held in
+    /// Discord's order rather than the sorted one that gets shown.
+    #[test]
+    fn a_member_window_follows_inserts_updates_and_deletes() {
+        let runtime = crate::runtime::Runtime::new();
+        let member = |id: &str, nick: &str, status: &str| {
+            json!({ "member": { "nick": nick, "user": { "id": id, "username": nick }, "presence": { "status": status } } })
+        };
+        let mut window: Vec<serde_json::Value> = Vec::new();
+
+        let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [member("1", "anna", "online"), member("2", "bob", "idle")] });
+        assert!(apply_member_op(&runtime, "discord:me", &mut window, &sync));
+        assert_eq!(window.len(), 2);
+        assert_eq!(window[0]["nick"], "anna");
+
+        let insert = json!({ "op": "INSERT", "index": 1, "item": member("3", "carol", "online") });
+        assert!(apply_member_op(&runtime, "discord:me", &mut window, &insert));
+        assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "carol", "bob"]);
+
+        let update = json!({ "op": "UPDATE", "index": 0, "item": member("1", "anna", "offline") });
+        assert!(apply_member_op(&runtime, "discord:me", &mut window, &update));
+        assert_eq!(window[0]["away"], true);
+
+        let delete = json!({ "op": "DELETE", "index": 1 });
+        assert!(apply_member_op(&runtime, "discord:me", &mut window, &delete));
+        assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "bob"]);
+    }
+
+    /// An op that cannot be applied cleanly - a role header with no member,
+    /// an index past the end - reports no change rather than corrupting the
+    /// window, leaving the next SYNC to put it right.
+    #[test]
+    fn an_op_that_does_not_fit_changes_nothing() {
+        let runtime = crate::runtime::Runtime::new();
+        let mut window: Vec<serde_json::Value> = Vec::new();
+
+        let header = json!({ "op": "INSERT", "index": 0, "item": { "group": { "id": "online", "count": 4 } } });
+        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &header));
+        assert!(window.is_empty());
+
+        let past_end = json!({ "op": "DELETE", "index": 7 });
+        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &past_end));
+
+        let invalidate = json!({ "op": "INVALIDATE", "range": [0, 99] });
+        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &invalidate));
+    }
     use super::{
         attachment_expired, default_avatar_url, dm_avatar_url, extract_attachments, extract_body,
-        extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids, thumbnail_source,
+        apply_member_op, extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids, thumbnail_source,
     };
     use crate::model::{Attachment, Message};
     use serde_json::json;
@@ -3340,52 +3454,113 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// applying them half-understood would corrupt the roster; re-opening the
 /// channel asks for a fresh SYNC, which is what Discord's own client does when
 /// its view changes.
+/// One entry of Discord's member window, or nothing if the item is a role
+/// header rather than a person.
+fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, item: &Value) -> Option<Value> {
+    let member = item.get("member")?;
+    let user = &member["user"];
+    let user_id = user["id"].as_str()?;
+    // Server nickname first, then the account's chosen display name, then
+    // the raw username - the same order Discord itself shows.
+    let nick = member["nick"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| user["global_name"].as_str().filter(|s| !s.is_empty()))
+        .or_else(|| user["username"].as_str())
+        .unwrap_or("unknown");
+    let status = member["presence"]["status"].as_str().unwrap_or("offline");
+    // Names are learned here and remembered for anywhere they are needed.
+    // Voice is the case that matters: Discord attaches a member to a voice
+    // state only when someone moves, so anyone already sitting in a channel
+    // when we connect would otherwise be shown as a raw snowflake forever.
+    runtime.remember_discord_name(account_id, user_id, nick);
+    Some(json!({
+        "nick": nick,
+        "userId": user_id,
+        "prefix": "",
+        // Only actually offline counts as away. Idle and do-not-disturb are
+        // still connected - Discord lists them with everyone else who is
+        // present, and their own status word says the rest.
+        "away": status == "offline",
+        "status": status
+    }))
+}
+
+/// Applies one of Discord's lazy member-list operations.
+///
+/// Only SYNC was applied before, so a roster was correct at the moment a
+/// channel was opened and then stood still: somebody joining, leaving, or
+/// going offline changed nothing until the channel was reopened.
+///
+/// INSERT, UPDATE and DELETE address the window by index, which is why the
+/// list they are applied to is held in Discord's order rather than the
+/// sorted one that gets displayed.
+fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, window: &mut Vec<Value>, op: &Value) -> bool {
+    let index = |op: &Value| op["index"].as_u64().map(|i| i as usize);
+    match op["op"].as_str().unwrap_or("") {
+        "SYNC" => {
+            let items: Vec<Value> = op["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| member_entry(runtime, account_id, item))
+                .collect();
+            // The range is the slice of the window this SYNC describes.
+            // Only ever [0, 99] is asked for, so this replaces the lot -
+            // but honouring the range keeps it right if that ever changes.
+            let start = op["range"][0].as_u64().unwrap_or(0) as usize;
+            if start == 0 {
+                *window = items;
+            } else {
+                window.truncate(start);
+                window.extend(items);
+            }
+            true
+        }
+        "INSERT" => match (index(op), member_entry(runtime, account_id, &op["item"])) {
+            (Some(i), Some(entry)) if i <= window.len() => {
+                window.insert(i, entry);
+                true
+            }
+            // A role header being inserted shifts everyone below it, and
+            // there is nothing to show for it - so the window is refreshed
+            // by the next SYNC rather than being left subtly misaligned.
+            _ => false,
+        },
+        "UPDATE" => match (index(op), member_entry(runtime, account_id, &op["item"])) {
+            (Some(i), Some(entry)) if i < window.len() => {
+                window[i] = entry;
+                true
+            }
+            _ => false,
+        },
+        "DELETE" => match index(op) {
+            Some(i) if i < window.len() => {
+                window.remove(i);
+                true
+            }
+            _ => false,
+        },
+        // INVALIDATE says a range is stale; the next SYNC replaces it.
+        _ => false,
+    }
+}
+
 fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
-    let mut members: Vec<Value> = Vec::new();
-    let mut saw_sync = false;
+    let mut window = state.runtime.discord_member_window(buffer_id);
+    let mut changed = false;
 
     for op in d["ops"].as_array().into_iter().flatten() {
-        if op["op"].as_str() != Some("SYNC") {
-            continue;
-        }
-        saw_sync = true;
-        for item in op["items"].as_array().into_iter().flatten() {
-            let Some(member) = item.get("member") else { continue };
-            let user = &member["user"];
-            let Some(user_id) = user["id"].as_str() else { continue };
-            // Server nickname first, then the account's chosen display name,
-            // then the raw username - the same order Discord itself shows.
-            let nick = member["nick"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| user["global_name"].as_str().filter(|s| !s.is_empty()))
-                .or_else(|| user["username"].as_str())
-                .unwrap_or("unknown");
-            let status = member["presence"]["status"].as_str().unwrap_or("offline");
-            // Names are learned here and remembered for anywhere they are
-            // needed. Voice is the case that matters: Discord attaches a
-            // member to a voice state only when someone moves, so anyone
-            // already sitting in a channel when we connect would otherwise be
-            // shown as a raw snowflake forever.
-            state.runtime.remember_discord_name(&account_id, user_id, nick);
-            members.push(json!({
-                "nick": nick,
-                "userId": user_id,
-                "prefix": "",
-                // Only actually offline counts as away. Idle and do-not-disturb
-                // are still connected - Discord lists them with everyone else
-                // who is present, and their own status word says the rest.
-                "away": status == "offline",
-                "status": status
-            }));
-        }
+        changed |= apply_member_op(&state.runtime, &account_id, &mut window, op);
     }
 
-    if !saw_sync {
+    if !changed {
         return;
     }
+    state.runtime.set_discord_member_window(buffer_id, window.clone());
 
+    let mut members = window;
     members.sort_by(|a, b| {
         let (an, bn) = (a["nick"].as_str().unwrap_or(""), b["nick"].as_str().unwrap_or(""));
         an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))

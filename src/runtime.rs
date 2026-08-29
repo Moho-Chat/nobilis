@@ -139,6 +139,14 @@ pub struct Runtime {
     matrix_invites: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Per (account, room) pagination token for reading older history.
     matrix_back_tokens: Mutex<HashMap<(String, String), String>>,
+    /// A guild channel's member window in Discord's own order, by buffer.
+    ///
+    /// Kept beside the presence snapshot rather than instead of it because
+    /// the two are ordered differently on purpose: the snapshot is sorted
+    /// for reading, and Discord's incremental ops address this one by index,
+    /// so sorting it would make every INSERT and DELETE land on the wrong
+    /// person.
+    discord_member_windows: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Last-known member list per buffer (the same JSON shape presenceChange
     /// events carry) - presenceChange itself is only ever *pushed* on a
     /// join/part/namreply, so a client subscribing afterward (reopening a
@@ -344,6 +352,7 @@ impl Runtime {
             wants_connected: Mutex::new(std::collections::HashSet::new()),
             matrix_invites: Mutex::new(HashMap::new()),
             matrix_back_tokens: Mutex::new(HashMap::new()),
+            discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
@@ -757,6 +766,14 @@ impl Runtime {
         if let Some(handle) = self.task_handles.lock().unwrap().remove(account_id) {
             handle.abort();
         }
+    }
+
+    pub fn discord_member_window(&self, buffer_id: &str) -> Vec<serde_json::Value> {
+        self.discord_member_windows.lock().unwrap().get(buffer_id).cloned().unwrap_or_default()
+    }
+
+    pub fn set_discord_member_window(&self, buffer_id: &str, members: Vec<serde_json::Value>) {
+        self.discord_member_windows.lock().unwrap().insert(buffer_id.to_string(), members);
     }
 
     pub fn set_presence(&self, buffer_id: &str, members: serde_json::Value) {
