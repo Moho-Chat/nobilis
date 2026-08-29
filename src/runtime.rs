@@ -132,6 +132,11 @@ pub struct Runtime {
     /// the same way a dead link does, and without this the account would
     /// come straight back up seconds after being turned off.
     wants_connected: Mutex<std::collections::HashSet<String>>,
+    /// Rooms this account has been invited to and not yet answered, by
+    /// account id. Held rather than turned straight into buffers: an invite
+    /// is not a room you are in, has none of its history, and answering it
+    /// is a decision somebody has to make.
+    matrix_invites: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Last-known member list per buffer (the same JSON shape presenceChange
     /// events carry) - presenceChange itself is only ever *pushed* on a
     /// join/part/namreply, so a client subscribing afterward (reopening a
@@ -335,6 +340,7 @@ impl Runtime {
             last_connect_attempt: Mutex::new(HashMap::new()),
             connect_generation: Mutex::new(HashMap::new()),
             wants_connected: Mutex::new(std::collections::HashSet::new()),
+            matrix_invites: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
@@ -695,6 +701,29 @@ impl Runtime {
 
     pub fn wants_connected(&self, account_id: &str) -> bool {
         self.wants_connected.lock().unwrap().contains(account_id)
+    }
+
+    /// Replaces this account's pending invitations, and says whether that
+    /// changed anything.
+    ///
+    /// Every sync carries the full invite set, so this is a replace rather
+    /// than a merge - an invite answered from another client simply stops
+    /// being listed, and that is how it disappears here too. The changed
+    /// answer is what keeps an event from being emitted on every sync tick
+    /// for a set nobody has touched.
+    pub fn set_matrix_invites(&self, account_id: &str, invites: Vec<serde_json::Value>) -> bool {
+        let mut all = self.matrix_invites.lock().unwrap();
+        match all.get(account_id) {
+            Some(existing) if *existing == invites => false,
+            _ => {
+                all.insert(account_id.to_string(), invites);
+                true
+            }
+        }
+    }
+
+    pub fn matrix_invites(&self, account_id: &str) -> Vec<serde_json::Value> {
+        self.matrix_invites.lock().unwrap().get(account_id).cloned().unwrap_or_default()
     }
 
     /// Forcibly tears down any previous connection attempt/session for this

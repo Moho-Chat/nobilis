@@ -367,6 +367,41 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
         }
     }
 
+    // Invitations, which are not rooms you are in. Read before the joined
+    // pass because that one returns early when there is nothing joined -
+    // and an account whose only news this cycle is an invite has exactly
+    // that shape.
+    //
+    // Until this existed, being invited to a room was something the client
+    // could not perceive at all: rooms.invite was never read, so the invite
+    // never appeared, and there was no way to accept or decline one.
+    let invites: Vec<serde_json::Value> = resp["rooms"]["invite"]
+        .as_object()
+        .map(|rooms| {
+            rooms
+                .iter()
+                .map(|(room_id, room)| {
+                    let events: Vec<&Value> = room["invite_state"]["events"].as_array().into_iter().flatten().collect();
+                    rooms::invite_summary(room_id, own_user_id, &events)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if state.runtime.set_matrix_invites(account_id, invites.clone()) {
+        state.events.emit("matrixInvites", serde_json::json!({ "accountId": account_id, "invites": invites }));
+    }
+
+    // Rooms this account is no longer in - left from another client, or
+    // kicked. Their buffers would otherwise sit there looking joined.
+    if let Some(left) = resp["rooms"]["leave"].as_object() {
+        for room_id in left.keys() {
+            if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
+                let buffer_id = crate::model::buffer_id(account_id, &buffer_name);
+                state.runtime.remove_buffer(state, &buffer_id);
+            }
+        }
+    }
+
     let Some(joined) = resp["rooms"]["join"].as_object() else { return };
     for (room_id, room) in joined {
         let timeline_events: Vec<&Value> = room["timeline"]["events"].as_array().into_iter().flatten().collect();

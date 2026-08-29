@@ -110,13 +110,116 @@ pub fn room_avatar_mxc(events: &[&Value]) -> Option<String> {
         .map(String::from)
 }
 
+/// What a pending invitation looks like, out of the stripped state Matrix
+/// sends with it.
+///
+/// An invite is not a joined room and has none of its history: the server
+/// hands over a handful of state events chosen to be enough to decide with -
+/// usually the room's name and avatar, and the membership event naming who
+/// invited you. Everything here is best-effort for that reason, and the
+/// room id is the only field guaranteed to exist.
+///
+/// The inviter matters more than it looks. A room with no name shows as its
+/// own id, which tells nobody anything; "Salastil invited you" is the part
+/// that makes the decision answerable.
+pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> serde_json::Value {
+    let mut name: Option<String> = None;
+    let mut alias: Option<String> = None;
+    let mut avatar: Option<String> = None;
+    let mut inviter: Option<String> = None;
+    let mut is_direct = false;
+
+    for event in events {
+        match event["type"].as_str().unwrap_or("") {
+            "m.room.name" => {
+                if let Some(n) = event["content"]["name"].as_str().filter(|n| !n.is_empty()) {
+                    name = Some(n.to_string());
+                }
+            }
+            "m.room.canonical_alias" => {
+                if let Some(a) = event["content"]["alias"].as_str().filter(|a| !a.is_empty()) {
+                    alias = Some(a.to_string());
+                }
+            }
+            "m.room.avatar" => {
+                if let Some(u) = event["content"]["url"].as_str().filter(|u| !u.is_empty()) {
+                    avatar = Some(u.to_string());
+                }
+            }
+            // Ours is the one that says we were invited; its sender is who
+            // did the inviting. Other members' events ride along in the same
+            // list, so the state_key has to be checked.
+            "m.room.member" => {
+                if event["state_key"].as_str() == Some(own_user_id)
+                    && event["content"]["membership"].as_str() == Some("invite")
+                {
+                    inviter = event["sender"].as_str().map(str::to_string);
+                    is_direct = event["content"]["is_direct"].as_bool().unwrap_or(false);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let display = name.or(alias).unwrap_or_else(|| room_id.to_string());
+    serde_json::json!({
+        "roomId": room_id,
+        "name": display,
+        "inviter": inviter,
+        "avatarUrl": avatar,
+        "isDirect": is_direct,
+    })
+}
+
 #[cfg(test)]
 mod space_tests {
-    use super::{is_space, room_avatar_mxc, space_children};
+    use super::{invite_summary, is_space, room_avatar_mxc, space_children};
     use serde_json::{json, Value};
 
     fn refs(events: &[Value]) -> Vec<&Value> {
         events.iter().collect()
+    }
+
+    /// The inviter is the part that makes an unnamed room answerable, and it
+    /// comes off our *own* membership event - other members' events ride
+    /// along in the same stripped-state list.
+    #[test]
+    fn an_invite_names_the_room_and_who_sent_it() {
+        let events = vec![
+            json!({ "type": "m.room.name", "content": { "name": "Book club" } }),
+            json!({ "type": "m.room.member", "state_key": "@someone:else.org", "sender": "@someone:else.org", "content": { "membership": "join" } }),
+            json!({ "type": "m.room.member", "state_key": "@me:poa.st", "sender": "@salastil:poa.st", "content": { "membership": "invite" } }),
+        ];
+        let got = invite_summary("!abc:poa.st", "@me:poa.st", &refs(&events));
+        assert_eq!(got["roomId"], "!abc:poa.st");
+        assert_eq!(got["name"], "Book club");
+        assert_eq!(got["inviter"], "@salastil:poa.st");
+        assert_eq!(got["isDirect"], false);
+    }
+
+    /// A room with no name falls back to its alias, then to the id - which
+    /// tells nobody anything on its own, which is exactly why the inviter is
+    /// carried alongside it.
+    #[test]
+    fn an_unnamed_invite_falls_back_through_alias_to_the_id() {
+        let aliased = vec![json!({ "type": "m.room.canonical_alias", "content": { "alias": "#books:poa.st" } })];
+        assert_eq!(invite_summary("!abc:poa.st", "@me:poa.st", &refs(&aliased))["name"], "#books:poa.st");
+
+        let bare: Vec<Value> = vec![];
+        assert_eq!(invite_summary("!abc:poa.st", "@me:poa.st", &refs(&bare))["name"], "!abc:poa.st");
+    }
+
+    /// A direct-message invite says so, so it can be shown as a person
+    /// rather than as a room.
+    #[test]
+    fn a_direct_invite_is_marked_as_one() {
+        let events = vec![json!({
+            "type": "m.room.member", "state_key": "@me:poa.st", "sender": "@friend:poa.st",
+            "content": { "membership": "invite", "is_direct": true }
+        })];
+        let got = invite_summary("!dm:poa.st", "@me:poa.st", &refs(&events));
+        assert_eq!(got["isDirect"], true);
+        assert_eq!(got["inviter"], "@friend:poa.st");
     }
 
     #[test]

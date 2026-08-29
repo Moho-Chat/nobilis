@@ -1493,6 +1493,35 @@ pub async fn dispatch(
             }
         }
 
+        // Invitations. Listed rather than turned into buffers: an invite is
+        // not a room you are in, and answering it is a decision somebody has
+        // to make. The set also arrives unprompted as a "matrixInvites"
+        // event on every change, so this is for a client that has just
+        // opened and missed the last one.
+        "listMatrixInvites" => match p_str_opt(params, "accountId") {
+            None => (None, Some("listMatrixInvites requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(serde_json::Value::Array(state.runtime.matrix_invites(account_id))), None),
+        },
+
+        // Accepting is an ordinary join, and declining is an ordinary leave;
+        // the server drops the invitation either way and stops listing it,
+        // which is how it disappears from the pending set on the next sync.
+        "acceptMatrixInvite" | "declineMatrixInvite" => {
+            let (account_id, room_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomId")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some(format!("{method} requires \"accountId\" and \"roomId\""))),
+            };
+            let result = if method == "acceptMatrixInvite" {
+                backend::matrix::join_room(state, account_id, room_id).await
+            } else {
+                backend::matrix::leave_room(state, account_id, room_id).await
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "joinMatrixRoom" => {
             let (account_id, room) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomIdOrAlias")) {
                 (Some(a), Some(r)) => (a, r),
