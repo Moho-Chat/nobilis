@@ -25,6 +25,7 @@ pub mod auth;
 pub mod backup;
 pub mod crypto;
 pub mod http;
+pub mod markup;
 pub mod moderation;
 pub mod protocol;
 pub mod roomstate;
@@ -1255,7 +1256,27 @@ pub async fn send_message(
             upload_media_message(base, access_token, path, body).await?
         }
     } else {
-        serde_json::json!({ "msgtype": "m.text", "body": body })
+        // "/me waves" is an action, the same convention IRC uses and the one
+        // Matrix spells m.emote. Inbound emotes were already understood;
+        // typing one here sent the literal text. "//" escapes a leading
+        // slash, matching how the IRC backend reads the same box.
+        let (msgtype, body) = match body.strip_prefix('/') {
+            Some(literal) if literal.starts_with('/') => ("m.text", literal),
+            Some(rest) => match rest.strip_prefix("me ") {
+                Some(action) => ("m.emote", action),
+                None => ("m.text", body),
+            },
+            None => ("m.text", body),
+        };
+        let mut content = serde_json::json!({ "msgtype": msgtype, "body": body });
+        // The formatting somebody typed, where they typed any. Sent
+        // alongside the plain text rather than instead of it: body stays the
+        // fallback for a client that will not render HTML.
+        if let Some(html) = markup::to_html(body) {
+            content["format"] = serde_json::json!("org.matrix.custom.html");
+            content["formatted_body"] = serde_json::json!(html);
+        }
+        content
     };
     if let Some(target) = reply_to_id {
         plain_content["m.relates_to"] = serde_json::json!({ "m.in_reply_to": { "event_id": target } });
@@ -1395,28 +1416,47 @@ async fn http_client_post_bytes(url: &str, access_token: &str, content_type: &st
     Ok(body)
 }
 
+/// The `m.replace` an edit is sent as.
+///
+/// The replacement carries the sender's formatting the same way a new
+/// message does - editing a formatted message should not quietly flatten it
+/// - while the outer body keeps the plain "* text" form that clients without
+/// edit support fall back to showing.
+fn edit_content(target_event_id: &str, body: &str) -> serde_json::Value {
+    let mut new_content = serde_json::json!({ "msgtype": "m.text", "body": body });
+    if let Some(html) = markup::to_html(body) {
+        new_content["format"] = serde_json::json!("org.matrix.custom.html");
+        new_content["formatted_body"] = serde_json::json!(html);
+    }
+    serde_json::json!({
+        "msgtype": "m.text",
+        "body": format!("* {body}"),
+        "m.new_content": new_content,
+        "m.relates_to": { "rel_type": "m.replace", "event_id": target_event_id },
+    })
+}
+
 /// Applies a real edit. `buffer_id` must already have a known room id.
 pub async fn edit_message(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str, body: &str) -> Result<()> {
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
+    // Built once for both kinds of room. An edit reads the same either way,
+    // and building it twice is how a formatted body would reach one and not
+    // the other.
+    let content = edit_content(msg_id, body);
+
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
         let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let content = session
-            .share_and_encrypt_edit(&account.homeserver_url, access_token, &room_id_ruma, member_ids, msg_id, body)
+            .share_and_encrypt_edit(&account.homeserver_url, access_token, &room_id_ruma, member_ids, content)
             .await
             .context("encrypting edit")?;
         (protocol::EVENT_ROOM_ENCRYPTED, content)
     } else {
-        let content = serde_json::json!({
-            "msgtype": "m.text",
-            "body": format!("* {body}"),
-            "m.new_content": { "msgtype": "m.text", "body": body },
-            "m.relates_to": { "rel_type": "m.replace", "event_id": msg_id },
-        });
         (protocol::EVENT_ROOM_MESSAGE, content)
     };
 
@@ -1595,6 +1635,30 @@ async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, usern
 
 #[cfg(test)]
 mod tests {
+
+    /// An edit carries the sender's formatting the same way a new message
+    /// does. Building this in two places is how a formatted body reached
+    /// unencrypted rooms and not encrypted ones.
+    #[test]
+    fn an_edit_keeps_the_formatting_it_was_given() {
+        let c = super::edit_content("$abc", "**bold** now");
+        assert_eq!(c["m.relates_to"]["rel_type"], "m.replace");
+        assert_eq!(c["m.relates_to"]["event_id"], "$abc");
+        // The outer body is the fallback a client without edit support shows.
+        assert_eq!(c["body"], "* **bold** now");
+        assert_eq!(c["m.new_content"]["body"], "**bold** now");
+        assert_eq!(c["m.new_content"]["format"], "org.matrix.custom.html");
+        assert_eq!(c["m.new_content"]["formatted_body"], "<strong>bold</strong> now");
+    }
+
+    /// A plain edit stays plain - no format keys at all, rather than a
+    /// formatted body restating the text.
+    #[test]
+    fn a_plain_edit_carries_no_format() {
+        let c = super::edit_content("$abc", "just words");
+        assert!(c["m.new_content"].get("format").is_none());
+        assert!(c["m.new_content"].get("formatted_body").is_none());
+    }
     use super::*;
     use crate::state::AppState;
 

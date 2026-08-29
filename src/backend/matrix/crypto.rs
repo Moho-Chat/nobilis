@@ -354,14 +354,11 @@ impl CryptoSession {
     /// `m.room.message` content under `m.new_content`, with a plain-text
     /// fallback body (`* body`) for clients that don't understand edits,
     /// matching the wire shape every other Matrix client sends.
-    pub async fn share_and_encrypt_edit(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, target_event_id: &str, body: &str) -> Result<Value> {
+    /// Takes the content ready-made, like share_and_encrypt_content does.
+    /// An edit's shape is the same encrypted or not, and building it twice
+    /// meant a formatted body reaching one kind of room and not the other.
+    pub async fn share_and_encrypt_edit(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, content: Value) -> Result<Value> {
         self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids).await?;
-        let content = serde_json::json!({
-            "msgtype": "m.text",
-            "body": format!("* {body}"),
-            "m.new_content": { "msgtype": "m.text", "body": body },
-            "m.relates_to": { "rel_type": "m.replace", "event_id": target_event_id },
-        });
         self.encrypt_raw(room_id, "m.room.message", content).await
     }
 
