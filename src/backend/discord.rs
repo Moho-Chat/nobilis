@@ -2507,10 +2507,16 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             continue;
                         }
                         let Some((name, _)) = channel_map.get(channel_id) else { continue };
+                        // A guild event carries the member; a DM carries no
+                        // member object at all, which is why the remembered
+                        // name matters rather than being a nicety. Empty
+                        // strings are skipped so a blank nickname does not
+                        // win over a name we actually know.
                         let nick = d["member"]["nick"]
                             .as_str()
-                            .or_else(|| d["member"]["user"]["global_name"].as_str())
-                            .or_else(|| d["member"]["user"]["username"].as_str())
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| d["member"]["user"]["global_name"].as_str().filter(|s| !s.is_empty()))
+                            .or_else(|| d["member"]["user"]["username"].as_str().filter(|s| !s.is_empty()))
                             .map(str::to_string)
                             .or_else(|| state.runtime.discord_known_name(&account_id, user_id))
                             .unwrap_or_else(|| "Someone".to_string());
@@ -3578,6 +3584,7 @@ fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
 /// there, so everyone starts unknown and PRESENCE_UPDATE fills it in; for a
 /// friend that is usually immediate, since READY already carried it.
 fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value, presences: &HashMap<&str, &str>) {
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let mut members: Vec<Value> = channel["recipients"]
         .as_array()
         .into_iter()
@@ -3589,6 +3596,12 @@ fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value, presences
                 .filter(|s| !s.is_empty())
                 .or_else(|| r["username"].as_str())
                 .unwrap_or("unknown");
+            // Learned here as well as shown, the same as the guild member
+            // list does. A DM is the only place some people are ever seen,
+            // and an event that names them by id alone - a typing notice
+            // carries no member object outside a guild - had nothing to look
+            // them up in and fell back to calling them "Someone".
+            state.runtime.remember_discord_name(&account_id, user_id, nick);
             let status = presences.get(user_id).copied().unwrap_or("offline");
             Some(json!({ "nick": nick, "userId": user_id, "prefix": "", "away": status == "offline", "status": status }))
         })
