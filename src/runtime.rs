@@ -890,6 +890,19 @@ impl Runtime {
             .insert((account_id.to_string(), user_id.to_string()), name.to_string());
     }
 
+    /// What this account has previously learned to call somebody.
+    ///
+    /// A typing notice from a DM carries no member object to read a name
+    /// out of, and "Someone is typing" is worse than the name we already
+    /// saw on their last message.
+    pub fn discord_known_name(&self, account_id: &str, user_id: &str) -> Option<String> {
+        self.discord_voice_names
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), user_id.to_string()))
+            .cloned()
+    }
+
     /// Everyone in a voice channel, as (user id, what to call them).
     ///
     /// Nobody is excluded here: a channel list has to show you your own

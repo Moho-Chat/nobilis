@@ -307,6 +307,42 @@ pub async fn dispatch(
             }
         }
 
+        // "I am writing something." Discord and Matrix both carry it; IRC
+        // and Sneedchat have no such notion, so this is quietly a no-op
+        // there for the same reason markBufferRead is.
+        //
+        // Failure is swallowed rather than reported. A typing indicator that
+        // did not arrive is not worth interrupting somebody mid-sentence
+        // over, and this is called repeatedly while they write.
+        "sendTyping" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("sendTyping requires \"bufferId\"".to_string()));
+            };
+            // Matrix can say "stopped", Discord cannot - it only expires.
+            let typing = params.get("typing").and_then(|v| v.as_bool()).unwrap_or(true);
+            match state.runtime.get_buffer(buffer_id) {
+                Some(buffer) if buffer.account_id.starts_with("discord:") => {
+                    if typing {
+                        if let Some(cfg) = state.accounts.get_discord(&buffer.account_id) {
+                            if let Err(e) = backend::discord::send_typing(state, buffer_id, &cfg.token).await {
+                                tracing::debug!("sendTyping: {e}");
+                            }
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
+                Some(buffer) if buffer.account_id.starts_with("matrix:") => {
+                    if let Some(room_id) = state.runtime.get_matrix_room(&buffer.id) {
+                        if let Err(e) = backend::matrix::send_typing(state, &buffer.account_id, &room_id, typing).await {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
+                _ => (Some(ok_node()), None),
+            }
+        }
+
         // "I have read this." Only Discord has anywhere to put it - IRC and
         // Sneedchat have no read state at all, and Matrix's receipts are
         // their own piece of work - so this is quietly a no-op elsewhere

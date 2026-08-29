@@ -40,6 +40,14 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 const REMOTE_AUTH_URL: &str = "wss://remote-auth-gateway.discord.gg/?v=2";
 const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 const API_BASE: &str = "https://discord.com/api/v10";
+
+/// How long a "typing" notice stands before it should be forgotten.
+///
+/// Discord sends no "stopped typing" event and its own client expires the
+/// indicator after ten seconds, so this is that convention rather than a
+/// number from the protocol. Matrix does carry a timeout of its own, and
+/// uses this as what to ask for.
+pub const TYPING_TTL_MS: u64 = 10_000;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Says who is calling, honestly.
@@ -2430,6 +2438,36 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         }
                     }
 
+                    // Somebody started typing. Discord sends no matching
+                    // "stopped" event - a client is expected to forget after
+                    // about ten seconds, or when a message from that person
+                    // arrives - so the expiry is carried rather than left for
+                    // each frontend to invent its own.
+                    "TYPING_START" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        let Some(user_id) = d["user_id"].as_str() else { continue };
+                        if user_id == config.user_id {
+                            continue;
+                        }
+                        let Some((name, _)) = channel_map.get(channel_id) else { continue };
+                        let nick = d["member"]["nick"]
+                            .as_str()
+                            .or_else(|| d["member"]["user"]["global_name"].as_str())
+                            .or_else(|| d["member"]["user"]["username"].as_str())
+                            .map(str::to_string)
+                            .or_else(|| state.runtime.discord_known_name(&account_id, user_id))
+                            .unwrap_or_else(|| "Someone".to_string());
+                        state.events.emit(
+                            "typing",
+                            json!({
+                                "accountId": account_id,
+                                "bufferId": crate::model::buffer_id(&account_id, name),
+                                "nick": nick,
+                                "expiresInMs": TYPING_TTL_MS,
+                            }),
+                        );
+                    }
+
                     // Read somewhere else. Discord sends this to every one
                     // of an account's sessions, including the one that did
                     // the acking, so a client acting on it also settles its
@@ -2787,6 +2825,27 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
 /// DELETE .../messages/{id} - deleting your own message. Same
 /// author-only enforcement as edit; also works for a moderator with
 /// MANAGE_MESSAGES, which Discord itself decides, not this code.
+/// Says that this account is composing something.
+///
+/// One POST covers about ten seconds, so a caller repeats it while somebody
+/// keeps typing rather than sending one per keystroke. Failure is not worth
+/// reporting: a missing typing indicator is not something to interrupt
+/// somebody mid-sentence about.
+pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Result<()> {
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    http_client()
+        .post(format!("{API_BASE}/channels/{channel_id}/typing"))
+        .header("Authorization", token)
+        .header("Content-Length", "0")
+        .send()
+        .await
+        .context("sending a Discord typing notice")?;
+    Ok(())
+}
+
 /// Tells Discord this conversation has been read up to its newest message.
 ///
 /// Unread was purely local before this, so reading a channel here did not

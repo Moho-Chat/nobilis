@@ -404,6 +404,36 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
 
     let Some(joined) = resp["rooms"]["join"].as_object() else { return };
     for (room_id, room) in joined {
+        // Who is composing in this room, if anybody. Matrix sends the whole
+        // set each time rather than one event per person, and an empty list
+        // is how it says everybody stopped - so this is a replace, and the
+        // empty case has to be emitted rather than skipped or the last
+        // indicator would never clear.
+        if let Some(events) = room["ephemeral"]["events"].as_array() {
+            for event in events.iter().filter(|e| e["type"].as_str() == Some("m.typing")) {
+                let members = state.runtime.get_matrix_room_members(account_id, room_id);
+                let nicks: Vec<String> = event["content"]["user_ids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|u| u.as_str())
+                    .filter(|u| *u != own_user_id)
+                    .map(|u| members.get(u).cloned().unwrap_or_else(|| u.to_string()))
+                    .collect();
+                if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
+                    state.events.emit(
+                        "typing",
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "bufferId": crate::model::buffer_id(account_id, &buffer_name),
+                            "nicks": nicks,
+                            "expiresInMs": crate::backend::discord::TYPING_TTL_MS,
+                        }),
+                    );
+                }
+            }
+        }
+
         let timeline_events: Vec<&Value> = room["timeline"]["events"].as_array().into_iter().flatten().collect();
 
         let (buffer_name, buffer_kind) = match state.runtime.get_matrix_room_name(account_id, room_id) {
@@ -983,6 +1013,25 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
 /// account's `rooms.leave` forever, which every client shows as a room you
 /// have left rather than one that is gone. Forgetting is best-effort, since a
 /// server may refuse it and the leave is the part that matters.
+/// Says that this account is composing something in a room.
+///
+/// Matrix wants a timeout with the notice and cancels with `typing: false`,
+/// unlike Discord's single fire-and-expire - so a caller that stops typing
+/// can actually say so rather than waiting the notice out.
+pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typing: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let room = url::form_urlencoded::byte_serialize(room_id.trim().as_bytes()).collect::<String>();
+    let user = url::form_urlencoded::byte_serialize(account.user_id.trim().as_bytes()).collect::<String>();
+    let body = if typing {
+        serde_json::json!({ "typing": true, "timeout": crate::backend::discord::TYPING_TTL_MS })
+    } else {
+        serde_json::json!({ "typing": false })
+    };
+    http::put_json(&format!("{base}/_matrix/client/v3/rooms/{room}/typing/{user}"), &account.access_token, body).await?;
+    Ok(())
+}
+
 pub async fn leave_room(state: &AppState, account_id: &str, room_id: &str) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
