@@ -117,6 +117,25 @@ pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<S
     }
 }
 
+/// The client these hosts are talked to over.
+///
+/// HTTP/2 deliberately, and it is not a preference: catbox.moe's HTTP/1.1
+/// path is broken. Over 1.1 it answers a completed upload with a chunked 500
+/// and then drops the TLS connection without a close_notify, which rustls
+/// correctly reports as a truncated stream - so the reply is never read at
+/// all and every attachment sent to IRC failed. The same request over HTTP/2
+/// gets a clean 200 with the link in it. Negotiated by ALPN, so a host that
+/// only speaks 1.1 still works.
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)"))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 /// catbox.moe and its temporary sibling share one API: a multipart form with a
 /// `reqtype`, and the finished URL as the whole of the response body.
 async fn catbox_family(host: Host, file_name: String, bytes: Vec<u8>, retention: Option<&str>) -> Result<String> {
@@ -130,12 +149,17 @@ async fn catbox_family(host: Host, file_name: String, bytes: Vec<u8>, retention:
         form = form.text("time", retention.unwrap_or("72h").to_string());
     }
 
-    let resp = reqwest::Client::new()
+    let resp = http_client()
         .post(url)
         .multipart(form)
         .send()
         .await
-        .with_context(|| format!("uploading to {}", host.id()))?;
+        // The cause, not just the intent: "uploading to catbox" on its own
+        // leaves somebody staring at a failure that could equally be a dead
+        // network, a proxy, or the host being down. reqwest keeps the actual
+        // reason in the error's source chain rather than its Display, so
+        // without walking it every transport failure reads identically.
+        .map_err(|e| anyhow!("couldn't reach {}: {}", host.id(), with_causes(&e)))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     link_from_response(host, status, &body)
@@ -162,6 +186,20 @@ fn link_from_response(host: Host, status: reqwest::StatusCode, body: &str) -> Re
         bail!("{} refused the upload: HTTP {status}", host.id());
     }
     bail!("{} did not return a link: {}", host.id(), snippet(link));
+}
+
+/// An error together with everything underneath it.
+///
+/// The interesting half of a failed request - the DNS answer, the refused
+/// connection, the certificate - is never in the top error's own message.
+fn with_causes(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cause = err.source();
+    while let Some(c) = cause {
+        out.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    out
 }
 
 /// The first part of a reply, for an error message.

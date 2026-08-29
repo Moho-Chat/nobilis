@@ -9,7 +9,14 @@ use serde_json::Value;
 
 pub fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    CLIENT.get_or_init(|| {
+        // Pinned to HTTP/1.1. Enabling reqwest's http2 feature (which the
+        // file-upload path needs - see upload::http_client) would otherwise
+        // let every client here negotiate h2 as a side effect, changing the
+        // transport under a backend that works and is tested as it stands.
+        // Nothing here wants h2; if it ever does, that is its own change.
+        reqwest::Client::builder().http1_only().build().unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// The Matrix C-S API's standard error body shape (`{"errcode": "M_...",

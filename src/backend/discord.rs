@@ -60,6 +60,12 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .user_agent(USER_AGENT)
+        // Pinned to HTTP/1.1. Enabling reqwest's http2 feature (which the
+        // file-upload path needs - see upload::http_client) would otherwise
+        // let every client here negotiate h2 as a side effect, changing the
+        // transport under a backend that works and is tested as it stands.
+        // Nothing here wants h2; if it ever does, that is its own change.
+            .http1_only()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })

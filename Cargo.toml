@@ -28,7 +28,7 @@ futures = "0.3"
 
 # Discord backend (QR remote-auth login + gateway client)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2"] }
 # Pulled in transitively by both of the above, but with conflicting default
 # crypto-provider features (ring vs aws-lc-rs) - direct so main.rs can pin
 # one explicitly at startup (see rustls::crypto::ring::default_provider()
