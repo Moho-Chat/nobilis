@@ -50,6 +50,10 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN embeds TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN sender_id TEXT",
+            // Matrix sends a formatted body alongside the plain one. Kept
+            // separate rather than replacing body: the plain text is the
+            // fallback every other protocol uses and the one search reads.
+            "ALTER TABLE messages ADD COLUMN html TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -102,6 +106,7 @@ impl Store {
         embeds: &[Embed],
         attachments: &[Attachment],
         sender_id: Option<&str>,
+        html: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         // Live messages are always freshly created with no reactions yet
@@ -115,8 +120,8 @@ impl Store {
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
-            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'))",
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18)",
             params![
                 msg_id,
                 buffer_id,
@@ -135,6 +140,7 @@ impl Store {
                 embeds_json,
                 sender_id,
                 attachments_json,
+                html,
             ],
         )?;
         Ok(())
@@ -339,6 +345,7 @@ impl Store {
             embeds,
             attachments,
             sender_id: row.get(15)?,
+            html: row.get(17)?,
         })
     }
 
@@ -346,7 +353,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -376,7 +383,7 @@ impl Store {
         let limit = if limit > 0 { limit } else { 100 };
         let places = std::iter::repeat("?").take(buffer_ids.len()).collect::<Vec<_>>().join(",");
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND buffer_id IN ({places})
              ORDER BY ts DESC LIMIT ?"
@@ -411,7 +418,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -455,7 +462,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
@@ -492,6 +499,7 @@ impl Store {
                 embeds,
                 attachments,
                 sender_id: row.get(15)?,
+                html: row.get(17)?,
             })
         })?;
         match rows.next() {
@@ -552,13 +560,13 @@ mod tests {
     }
 
     fn append(s: &Store, buffer: &str, id: &str) {
-        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None)
+        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
             .expect("appending");
     }
 
     /// Like `append`, but with text worth searching for.
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
-        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None)
+        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
             .expect("appending");
     }
 
@@ -680,7 +688,7 @@ mod dedupe_tests {
     }
 
     fn put(s: &Store, buffer: &str, id: &str, body: &str) {
-        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None);
+        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None);
     }
 
     /// A backend replaying history it already has - Sneedchat does this on

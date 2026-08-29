@@ -663,9 +663,9 @@ async fn handle_message(
                 (from.clone(), "dm")
             };
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             }
         }
 

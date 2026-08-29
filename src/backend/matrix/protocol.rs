@@ -60,6 +60,19 @@ pub fn message_body(content: &Value) -> (String, bool) {
 /// both real message deletes and reaction removal (Matrix has no
 /// dedicated "remove reaction" event; un-reacting is redacting the
 /// `m.reaction` event you sent - see Runtime::take_matrix_reaction_target).
+/// The sender's formatted version of the body, if there is one.
+///
+/// Only `org.matrix.custom.html` counts: the spec allows other formats and a
+/// client that rendered an unknown one as HTML would be trusting markup it
+/// has no reason to believe is HTML at all. Still untrusted either way -
+/// this is somebody else's markup, and the frontend sanitises it.
+pub fn formatted_body(content: &Value) -> Option<&str> {
+    if content["format"].as_str() != Some("org.matrix.custom.html") {
+        return None;
+    }
+    content["formatted_body"].as_str().filter(|h| !h.is_empty())
+}
+
 pub fn redaction_target(event: &Value) -> Option<&str> {
     event["redacts"].as_str().or_else(|| event["content"]["redacts"].as_str())
 }
@@ -119,4 +132,26 @@ pub fn encrypted_media_file(content: &Value) -> Option<&Value> {
         return None;
     }
     content["file"].is_object().then(|| &content["file"])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::formatted_body;
+    use serde_json::json;
+
+    /// Only Matrix's own HTML format counts. A client that rendered an
+    /// unknown format as HTML would be trusting markup it has no reason to
+    /// believe is HTML at all.
+    #[test]
+    fn only_the_html_format_is_treated_as_html() {
+        let html = json!({ "format": "org.matrix.custom.html", "formatted_body": "<b>hi</b>", "body": "hi" });
+        assert_eq!(formatted_body(&html), Some("<b>hi</b>"));
+
+        let other = json!({ "format": "org.example.markdown", "formatted_body": "**hi**", "body": "hi" });
+        assert_eq!(formatted_body(&other), None);
+
+        // A plain message, and an empty formatted body, both fall back.
+        assert_eq!(formatted_body(&json!({ "body": "hi" })), None);
+        assert_eq!(formatted_body(&json!({ "format": "org.matrix.custom.html", "formatted_body": "" })), None);
+    }
 }

@@ -715,6 +715,10 @@ async fn handle_timeline_event(
         attachments,
         Some(sender.to_string()),
         sent_at,
+        // The sender's own formatting, where they sent any. Passed on rather
+        // than rendered here: it is somebody else's markup and the frontend
+        // is where the sanitiser lives.
+        protocol::formatted_body(&content).map(str::to_string),
     );
 }
 
@@ -1092,6 +1096,7 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
         if body.is_empty() {
             continue;
         }
+        let html = protocol::formatted_body(content).map(str::to_string);
         let from = protocol::short_sender(event);
         let sender_mxid = protocol::sender(event);
         let is_own = sender_mxid == account.user_id;
@@ -1102,7 +1107,7 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
         let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
         if let Err(e) = state.store.append_message(
             buffer_id, event_id, &from, &body, ts, is_action, false, "message", None, &[], is_own,
-            avatar.as_deref(), &[], &[], Some(sender_mxid),
+            avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
         ) {
             tracing::warn!("matrix: storing history message: {e}");
             continue;

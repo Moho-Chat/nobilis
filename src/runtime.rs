@@ -1570,7 +1570,7 @@ impl Runtime {
     ) {
         self.record_message_at(
             state, account_id, buffer_name, buffer_kind, from, body, is_action, kind, reply_to,
-            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None,
+            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None, None,
         )
     }
 
@@ -1600,6 +1600,7 @@ impl Runtime {
         attachments: Vec<Attachment>,
         sender_id: Option<String>,
         sent_at: Option<i64>,
+        html: Option<String>,
     ) {
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
         let own_nick = self
@@ -1634,7 +1635,7 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        if let Err(e) = state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref()) {
+        if let Err(e) = state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref()) {
             tracing::warn!("failed to persist message: {e}");
         }
 
@@ -1657,6 +1658,7 @@ impl Runtime {
         }
 
         let message = Message {
+            html: html.clone(),
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),

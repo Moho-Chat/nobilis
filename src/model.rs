@@ -335,6 +335,14 @@ pub struct Message {
     /// showing.
     #[serde(rename = "senderId", skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
+    /// The sender's own formatted version of `body`, where the protocol
+    /// carries one (Matrix's `formatted_body`). Restricted HTML, and still
+    /// untrusted - a frontend must put it through the same sanitiser it
+    /// uses for everything else rather than treating it as safe because it
+    /// arrived structured. `body` stays the plain-text fallback, and is
+    /// what search reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
 }
 
 pub fn buffer_id(account_id: &str, name: &str) -> String {

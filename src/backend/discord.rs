@@ -1824,7 +1824,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, None) {
+        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, None, None) {
             tracing::warn!("discord: storing history message: {e}");
             continue;
         }
@@ -3142,6 +3142,7 @@ mod tests {
         Message {
             id: id.into(),
             buffer_id: "b".into(),
+            html: None,
             from: "x".into(),
             body: String::new(),
             ts: 0,
