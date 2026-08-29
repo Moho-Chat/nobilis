@@ -2520,59 +2520,6 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         }
                     }
 
-                    "VOICE_STATE_UPDATE_OLD" => {
-                        let Some(user_id) = d["user_id"].as_str() else { continue };
-                        let channel_id = d["channel_id"].as_str();
-                        // The flags ride on the voice state - there is no
-                        // separate dispatch for going live or turning a
-                        // camera on, so dropping them here would mean nobody
-                        // could ever be told a screen was being shared.
-                        state.runtime.set_discord_voice_presence(
-                            &account_id,
-                            user_id,
-                            channel_id,
-                            voice_member_name(d),
-                            crate::runtime::VoiceFlags::from_voice_state(d),
-                        );
-                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
-
-                        if user_id == config.user_id {
-                            // Our own move. The session id here is half of what
-                            // a voice connection needs; VOICE_SERVER_UPDATE
-                            // carries the other half.
-                            state.runtime.set_discord_voice_self(&account_id, channel_id);
-                            state.events.emit(
-                                "discordVoiceState",
-                                json!({
-                                    "accountId": account_id,
-                                    "channelId": channel_id,
-                                    "sessionId": d["session_id"].as_str()
-                                }),
-                            );
-                            super::discord_voice::note_voice_state(
-                                state,
-                                &account_id,
-                                d["guild_id"].as_str(),
-                                channel_id,
-                                d["session_id"].as_str(),
-                            )
-                            .await;
-                        } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
-                            // Somebody else arrived where we are. Leaving is
-                            // the daemon's job rather than the caller's: by the
-                            // time a client could react it would already have
-                            // been in a channel with a stranger.
-                            if ours == theirs && state.voice.options(&account_id).solo {
-                                tracing::info!("discord[{account_id}]: leaving voice - another user joined");
-                                leave_voice(state, &account_id);
-                                state.events.emit(
-                                    "discordVoiceLeft",
-                                    json!({ "accountId": account_id, "reason": "someone else joined", "userId": user_id }),
-                                );
-                            }
-                        }
-                    }
-
                     // Somebody is calling this account, or has stopped.
                     //
                     // A call in a DM is announced with the set of people whose
