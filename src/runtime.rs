@@ -986,6 +986,21 @@ impl Runtime {
         self.discord_guild_id.lock().unwrap().get(buffer_id).cloned()
     }
 
+    /// Every buffer belonging to a guild.
+    ///
+    /// For a guild that has gone away: leaving one from another client, or
+    /// it being deleted, has to take its channels with it rather than
+    /// leaving them sitting there looking joinable.
+    pub fn discord_buffers_in_guild(&self, guild_id: &str) -> Vec<String> {
+        self.discord_guild_id
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, g)| g.as_str() == guild_id)
+            .map(|(buffer_id, _)| buffer_id.clone())
+            .collect()
+    }
+
     /// Replaces this account's whole friends snapshot - called once from
     /// READY (see backend/discord.rs), never incrementally, since that's
     /// the only point a full, authoritative relationships list exists.

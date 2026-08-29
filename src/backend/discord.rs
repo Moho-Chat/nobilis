@@ -2241,6 +2241,10 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
     // GUILD_CREATE each connection - see runtime.rs's discord_channels for
     // the reverse (persistent) mapping sendMessage needs.
     let mut channel_map: HashMap<String, (String, String)> = HashMap::new();
+    // Each guild's payload as GUILD_CREATE delivered it. A channel created
+    // later needs the guild's name, roles and our own membership to be named
+    // and permission-checked, and nothing else carries them.
+    let mut guild_context: HashMap<String, Value> = HashMap::new();
 
     loop {
         let msg = tokio::select! {
@@ -2374,6 +2378,82 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                     }
                     "GUILD_CREATE" => {
                         register_guild_channels(state, config, d, &mut channel_map).await;
+                        // Kept so a channel created later can be placed
+                        // without re-fetching the guild: naming it and
+                        // deciding whether this account may see it both
+                        // need the guild's roles and our own membership,
+                        // which arrive only here.
+                        if let Some(guild_id) = d["id"].as_str() {
+                            guild_context.insert(guild_id.to_string(), d.clone());
+                        }
+                    }
+
+                    // A channel appearing, being renamed, or going away
+                    // while connected. Without these the channel list was
+                    // whatever it had been at connect: a new channel never
+                    // showed, a deleted one stayed, and a rename never
+                    // landed - all of it only fixed by restarting.
+                    "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
+                        let Some(channel_id) = d["channel_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
+                        match d["guild_id"].as_str() {
+                            // A guild channel is placed by re-running the
+                            // guild's own registration with this one channel
+                            // in it, so naming, category ordering and the
+                            // permission check are the same code that ran at
+                            // connect rather than a second copy of it.
+                            Some(guild_id) => {
+                                let Some(guild) = guild_context.get(guild_id).cloned() else { continue };
+                                // A rename has to drop the old buffer first:
+                                // the buffer's identity is its name, so the
+                                // new one would otherwise appear alongside
+                                // the old rather than replace it.
+                                if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
+                                    let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
+                                    if new_name.as_deref() == Some(old_name.as_str()) {
+                                        continue;
+                                    }
+                                    state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
+                                    channel_map.remove(channel_id);
+                                }
+                                let mut one = guild.clone();
+                                one["channels"] = serde_json::Value::Array(vec![d.clone()]);
+                                register_guild_channels(state, config, &one, &mut channel_map).await;
+                            }
+                            // A DM or group DM opened from another client.
+                            // No presence snapshot to seed it with - that
+                            // only exists in READY - and none is needed:
+                            // PRESENCE_UPDATE fills it in from here on.
+                            None => {
+                                let presences: HashMap<&str, &str> = HashMap::new();
+                                register_dm_channel(state, &account_id, d, &mut channel_map, &presences);
+                            }
+                        }
+                    }
+
+                    "CHANNEL_DELETE" => {
+                        let Some(channel_id) = d["id"].as_str() else { continue };
+                        if let Some((name, _)) = channel_map.remove(channel_id) {
+                            state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
+                        }
+                    }
+
+                    // Left from another client, kicked, or the guild itself
+                    // deleted. The "unavailable" form is an outage rather
+                    // than a departure, and taking the channels away for
+                    // one would look identical to being removed.
+                    "GUILD_DELETE" => {
+                        let Some(guild_id) = d["id"].as_str() else { continue };
+                        if d["unavailable"].as_bool() == Some(true) {
+                            continue;
+                        }
+                        guild_context.remove(guild_id);
+                        for buffer_id in state.runtime.discord_buffers_in_guild(guild_id) {
+                            if let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) {
+                                channel_map.remove(&channel_id);
+                            }
+                            state.runtime.remove_buffer(state, &buffer_id);
+                        }
+                        state.runtime.remove_buffer_group(state, &guild_group_id(&account_id, guild_id));
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
