@@ -117,6 +117,23 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
         }
     }
 
+    // Off Linux there is no sound server to ask, and that is the ordinary
+    // case rather than a degraded one: WASAPI and CoreAudio both enumerate
+    // real hardware with real names, so cpal's own list is the right answer.
+    //
+    // Not on Linux, even when pactl is missing. ALSA presents its whole
+    // plugin chain here - rate converters, mixers, a null sink, over a
+    // hundred entries - all reported "Unknown", so listing them would bury
+    // the microphone rather than offer it. A machine there with no sound
+    // server keeps the two defaults below.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let listed = host_devices();
+        if !listed.is_empty() {
+            return Ok(listed);
+        }
+    }
+
     let host = cpal::default_host();
     if let Some(device) = host.default_input_device() {
         out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "input".into(), is_default: true });
@@ -125,6 +142,51 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
         out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "output".into(), is_default: true });
     }
     Ok(out)
+}
+
+/// Everything the audio host itself reports.
+///
+/// The device's name doubles as its id, because cpal has no stable
+/// identifier to offer. Renaming a device in the OS therefore loses a stored
+/// choice, which is worth the trade for being able to make one at all -
+/// before this there was no way to pick anything off Linux, since the only
+/// enumeration was pactl and the only fallback was the two defaults.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn host_devices() -> Vec<AudioDevice> {
+    let host = cpal::default_host();
+    // cpal 0.18 has no name() - a Device is Display, and that is the name.
+    let default_in = host.default_input_device().map(|d| d.to_string());
+    let default_out = host.default_output_device().map(|d| d.to_string());
+    let mut out = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for name in devices.map(|d| d.to_string()) {
+            let is_default = Some(&name) == default_in.as_ref();
+            out.push(AudioDevice { id: name.clone(), name, kind: "input".into(), is_default });
+        }
+    }
+    if let Ok(devices) = host.output_devices() {
+        for name in devices.map(|d| d.to_string()) {
+            let is_default = Some(&name) == default_out.as_ref();
+            out.push(AudioDevice { id: name.clone(), name, kind: "output".into(), is_default });
+        }
+    }
+    out
+}
+
+/// The host device with this name, if there is one.
+///
+/// A pactl id ("alsa_input.usb-...") never matches a cpal device name, so on
+/// Linux this finds nothing and the caller falls back to the default - which
+/// is correct there, because the choice is applied by moving the stream
+/// afterwards instead. It matches only where the ids came from cpal in the
+/// first place, which is exactly where moving is not possible.
+fn host_device_named(id: &str, kind: &str) -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    let devices: Box<dyn Iterator<Item = cpal::Device>> = match kind {
+        "input" => Box::new(host.input_devices().ok()?),
+        _ => Box::new(host.output_devices().ok()?),
+    };
+    devices.into_iter().find(|d| d.to_string() == id)
 }
 
 /// The id meaning "let the sound server decide".
@@ -276,11 +338,19 @@ fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
     Ok(moved)
 }
 
-fn input_device() -> Result<cpal::Device> {
-    // Always the default: a chosen device is honoured by moving the stream
-    // once it exists (see `route_input`), not by opening that device here.
-    // Opening directly would bypass the sound server's routing and lose the
-    // choice the moment the device is unplugged and returns.
+fn input_device(device_id: Option<&str>) -> Result<cpal::Device> {
+    // Where there is a sound server, the default: a chosen device is
+    // honoured by moving the stream once it exists (see `route_input`), not
+    // by opening that device here. Opening directly would bypass the
+    // server's routing and lose the choice the moment the device is
+    // unplugged and returns.
+    //
+    // Where there is not, moving is not on offer, and opening the device is
+    // the only way a choice means anything. host_device_named only matches
+    // ids that came from cpal, so this cannot fire on the pactl path.
+    if let Some(found) = device_id.filter(|d| !d.is_empty()).and_then(|id| host_device_named(id, "input")) {
+        return Ok(found);
+    }
     cpal::default_host().default_input_device().context("no default input device")
 }
 
@@ -307,7 +377,7 @@ pub fn start_capture<F>(device_id: Option<&str>, mut sink: F) -> Result<Capture>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
-    let device = input_device()?;
+    let device = input_device(device_id)?;
     let config = device.default_input_config().context("querying the input device")?;
     let rate = config.sample_rate();
     let channels = config.channels();
@@ -470,7 +540,10 @@ impl Playback {
 /// As with capture, a chosen device is honoured by moving the stream once it
 /// exists rather than by opening that device directly.
 pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
-    let device = cpal::default_host().default_output_device().context("no default output device")?;
+    let device = match device_id.filter(|d| !d.is_empty()).and_then(|id| host_device_named(id, "output")) {
+        Some(found) => found,
+        None => cpal::default_host().default_output_device().context("no default output device")?,
+    };
     let config = device.default_output_config().context("querying the output device")?;
     let rate = config.sample_rate();
     let channels = config.channels();
