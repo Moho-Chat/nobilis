@@ -76,14 +76,21 @@ pub async fn dispatch(
             (Some(ok_node()), None)
         }
 
+        // Every protocol says whether an account can actually be added for
+        // it. Listing the planned ones without that flag was a promise the
+        // daemon could not keep: a client drawing this list offered Slack,
+        // and the add call came back "unknown method" because no such arm
+        // exists. Dropping them instead would lose the fact that they are
+        // planned, which is worth telling a client that wants to grey them
+        // out - the settings pane already does exactly that.
         "listProtocols" => (
             Some(serde_json::json!([
-                { "id": "irc", "name": "IRC" },
-                { "id": "jabber", "name": "XMPP" },
-                { "id": "matrix", "name": "Matrix" },
-                { "id": "discord", "name": "Discord" },
-                { "id": "slack", "name": "Slack" },
-                { "id": "sockchat", "name": "Sneedchat" },
+                { "id": "irc", "name": "IRC", "available": true },
+                { "id": "matrix", "name": "Matrix", "available": true },
+                { "id": "discord", "name": "Discord", "available": true },
+                { "id": "sockchat", "name": "Sneedchat", "available": true },
+                { "id": "jabber", "name": "XMPP", "available": false },
+                { "id": "slack", "name": "Slack", "available": false },
             ])),
             None,
         ),
@@ -1345,7 +1352,11 @@ pub async fn dispatch(
 
         // Net-new protocols land in their own milestones (see project
         // plan) - not implemented yet.
-        "addXmppAccount" => (None, Some(format!("{method}: not implemented yet"))),
+        //
+        // Slack answers here too. It was advertised by listProtocols with no
+        // arm of its own, so asking for it fell through to "unknown method",
+        // which reads as a client bug rather than as work not yet done.
+        "addXmppAccount" | "addSlackAccount" => (None, Some(format!("{method}: not implemented yet"))),
 
         // Login (homeserver reachability + m.login.password) can take a
         // moment - same async-kickoff shape as addSockChatAccount, with
