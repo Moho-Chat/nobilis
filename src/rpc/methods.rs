@@ -83,6 +83,18 @@ pub async fn dispatch(
         // exists. Dropping them instead would lose the fact that they are
         // planned, which is worth telling a client that wants to grey them
         // out - the settings pane already does exactly that.
+        // What this daemon actually is. Asked because it is not otherwise
+        // answerable from inside a running client: a frontend and the daemon
+        // it adopted are built and deployed separately, and either can be
+        // older than the other without anything looking wrong.
+        "version" => (
+            Some(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "commit": env!("NOBILIS_BUILD_COMMIT"),
+            })),
+            None,
+        ),
+
         "listProtocols" => (
             Some(serde_json::json!([
                 { "id": "irc", "name": "IRC", "available": true },
