@@ -190,6 +190,35 @@ async fn run_password_login(
 /// "Invalid Form Body" on its own says nothing a person can act on; the thing
 /// worth reading is the `errors` map underneath it, which names the field and
 /// says what was wrong with it.
+/// Turns a failed Discord reply into something worth showing somebody.
+///
+/// The raw body is JSON and reaches a toast verbatim otherwise, so a refusal
+/// that Discord states perfectly clearly - "No users with that username were
+/// found" - arrived as a brace-laden dump with the sentence buried in it.
+///
+/// The captcha case is called out because it is not a failure that trying
+/// again fixes. Discord asks for one on actions it treats as abusable, adding
+/// a friend among them, and answering it here is precisely the automated
+/// circumvention it exists to stop. Saying so, and where it can be done
+/// instead, is the only honest response.
+fn discord_error_text(status: reqwest::StatusCode, body: &str, doing: &str) -> String {
+    let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if parsed.get("captcha_key").is_some() {
+        return format!(
+            "Discord asked for a captcha before {doing}. That cannot be answered from here - \
+             do it in Discord's own app or on discord.com, and it will work here afterwards."
+        );
+    }
+    if let Some(message) = parsed.get("message").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) {
+        return message.to_string();
+    }
+    if let Some(fields) = form_errors(&parsed) {
+        return fields;
+    }
+    let snippet: String = body.chars().take(200).collect();
+    format!("Discord API error {status}: {snippet}")
+}
+
 fn form_errors(resp: &Value) -> Option<String> {
     let errors = resp.get("errors")?.as_object()?;
     let mut parts: Vec<String> = Vec::new();
@@ -661,7 +690,7 @@ pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Res
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "joining that server"));
     }
     Ok(())
 }
@@ -720,7 +749,7 @@ pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "opening that conversation"));
     }
     let ch: Value = resp.json().await.context("invalid JSON response")?;
     let channel_id = ch["id"].as_str().context("no channel id in response")?;
@@ -758,7 +787,7 @@ pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &st
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "adding somebody to the group"));
     }
     Ok(())
 }
@@ -779,7 +808,7 @@ pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "removing somebody from the group"));
     }
     Ok(())
 }
@@ -806,7 +835,7 @@ pub async fn add_friend(state: &AppState, account_id: &str, username: &str) -> R
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "adding a friend"));
     }
     Ok(())
 }
@@ -828,7 +857,7 @@ pub async fn create_guild(state: &AppState, account_id: &str, name: &str) -> Res
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", discord_error_text(status, &text, "creating that server"));
     }
     Ok(())
 }
@@ -3090,6 +3119,45 @@ mod login_tests {
 #[cfg(test)]
 mod tests {
 
+    /// A captcha is not a failure that retrying fixes, and it is the one
+    /// answer that has to say what to do instead.
+    #[test]
+    fn a_captcha_is_explained_rather_than_dumped() {
+        let body = r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"abc","captcha_service":"hcaptcha"}"#;
+        let text = discord_error_text(reqwest::StatusCode::BAD_REQUEST, body, "adding a friend");
+        assert!(text.contains("captcha"), "got {text}");
+        assert!(text.contains("adding a friend"), "got {text}");
+        assert!(text.contains("discord.com"), "should say where it can be done: {text}");
+        // The raw body is not what somebody reads.
+        assert!(!text.contains("captcha_sitekey"), "got {text}");
+    }
+
+    /// Discord often states the reason perfectly clearly; it was arriving
+    /// buried in JSON.
+    #[test]
+    fn discord_own_words_are_used_when_it_gives_them() {
+        let body = r#"{"message":"No users with that username were found.","code":80004}"#;
+        assert_eq!(
+            discord_error_text(reqwest::StatusCode::BAD_REQUEST, body, "adding a friend"),
+            "No users with that username were found."
+        );
+    }
+
+    /// Per-field complaints, and a reply that is not JSON at all, both still
+    /// have to produce something rather than panicking or saying nothing.
+    #[test]
+    fn other_shapes_still_say_something() {
+        let fields = r#"{"errors":{"username":{"_errors":[{"message":"Too short"}]}}}"#;
+        assert_eq!(
+            discord_error_text(reqwest::StatusCode::BAD_REQUEST, fields, "adding a friend"),
+            "username: Too short"
+        );
+
+        let junk = "<html>gateway timeout</html>";
+        let text = discord_error_text(reqwest::StatusCode::BAD_GATEWAY, junk, "adding a friend");
+        assert!(text.contains("502"), "got {text}");
+    }
+
     /// Only SYNC was ever applied, so a roster froze the moment a channel
     /// was opened. The index-addressed ops are why the window is held in
     /// Discord's order rather than the sorted one that gets shown.
@@ -3139,7 +3207,8 @@ mod tests {
     }
     use super::{
         attachment_expired, default_avatar_url, dm_avatar_url, extract_attachments, extract_body,
-        apply_member_op, extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids, thumbnail_source,
+        apply_member_op, discord_error_text, extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids,
+        thumbnail_source,
     };
     use crate::model::{Attachment, Message};
     use serde_json::json;
