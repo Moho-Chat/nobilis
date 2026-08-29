@@ -404,6 +404,13 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
 
     let Some(joined) = resp["rooms"]["join"].as_object() else { return };
     for (room_id, room) in joined {
+        // The anchor for reading older history. Only the first one seen is
+        // kept: every later sync's prev_batch points at newer history, and
+        // taking one would skip everything between.
+        if let Some(token) = room["timeline"]["prev_batch"].as_str() {
+            state.runtime.set_matrix_back_token(account_id, room_id, token, true);
+        }
+
         // Who is composing in this room, if anybody. Matrix sends the whole
         // set each time rather than one event per person, and an empty list
         // is how it says everybody stopped - so this is a replace, and the
@@ -684,7 +691,14 @@ async fn handle_timeline_event(
 
     let sender_avatar_url = state.runtime.get_matrix_member_avatar(account_id, sender);
 
-    state.runtime.record_message(
+    // The time the server recorded, not the time this arrived. They are the
+    // same thing for a message read as it is said and very different for one
+    // that arrives in the burst after a reconnect, which would otherwise all
+    // land at the reconnect. It also keeps live messages and backfilled ones
+    // on the same clock, so scrollback does not step sideways at the join.
+    let sent_at = event["origin_server_ts"].as_i64().map(|ms| ms / 1000);
+
+    state.runtime.record_message_at(
         state,
         account_id,
         buffer_name,
@@ -700,6 +714,7 @@ async fn handle_timeline_event(
         Vec::new(),
         attachments,
         Some(sender.to_string()),
+        sent_at,
     );
 }
 
@@ -1013,6 +1028,97 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
 /// account's `rooms.leave` forever, which every client shows as a room you
 /// have left rather than one that is gone. Forgetting is best-effort, since a
 /// server may refuse it and the leave is the part that matters.
+/// Reads a page of older history and writes it into local scrollback.
+///
+/// Before this there was no `/messages` call at all, so scrollback was only
+/// ever what the daemon had watched happen live: joining a room with years
+/// behind it showed nothing above the first sync.
+///
+/// Returns how many messages were added. Zero means the room has been read
+/// back to its beginning, or as far as the server will serve.
+///
+/// Written straight to the store rather than through record_message: these
+/// are old, and the notification path would announce every one of them.
+pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<usize> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let Some(from) = state.runtime.matrix_back_token(account_id, &room_id) else { return Ok(0) };
+
+    let base = account.homeserver_url.trim_end_matches('/');
+    let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let from_enc = url::form_urlencoded::byte_serialize(from.as_bytes()).collect::<String>();
+    let url = format!("{base}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit={limit}&from={from_enc}");
+    let resp = http::get_json(&url, &account.access_token).await?;
+
+    // The sync loop's own session, not a second one: opening the crypto
+    // store twice would mean two writers to the same SQLite file for no
+    // gain. Absent only when the account is not connected, in which case
+    // encrypted history is skipped rather than waited for.
+    let session = state.runtime.get_matrix_machine(account_id);
+    let mut added = 0usize;
+    // dir=b returns newest first; stored oldest first so scrollback reads in
+    // the order it was said.
+    let chunk: Vec<Value> = resp["chunk"].as_array().cloned().unwrap_or_default();
+    for event in chunk.iter().rev() {
+        let decrypted;
+        let event = if protocol::event_type(event) == "m.room.encrypted" {
+            let plain = match session.as_ref() {
+                Some(session) => decrypt_event(session, event, &room_id).await.ok(),
+                None => None,
+            };
+            match plain {
+                Some(plain) => {
+                    decrypted = plain;
+                    &decrypted
+                }
+                // Undecryptable history is skipped rather than stored as a
+                // placeholder: a screenful of "unable to decrypt" is worse
+                // than a shorter page of what can be read.
+                None => continue,
+            }
+        } else {
+            event
+        };
+        if protocol::event_type(event) != "m.room.message" {
+            continue;
+        }
+        let Some(event_id) = protocol::event_id(event) else { continue };
+        let content = &event["content"];
+        // An edit carries the replacement rather than a message of its own.
+        if protocol::edit_target(content).is_some() {
+            continue;
+        }
+        let (body, is_action) = protocol::message_body(content);
+        if body.is_empty() {
+            continue;
+        }
+        let from = protocol::short_sender(event);
+        let sender_mxid = protocol::sender(event);
+        let is_own = sender_mxid == account.user_id;
+        // Real send time, unlike live messages before server-time existed
+        // elsewhere: history dated to the moment it was fetched would put
+        // years-old conversation at today.
+        let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
+        let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
+        if let Err(e) = state.store.append_message(
+            buffer_id, event_id, &from, &body, ts, is_action, false, "message", None, &[], is_own,
+            avatar.as_deref(), &[], &[], Some(sender_mxid),
+        ) {
+            tracing::warn!("matrix: storing history message: {e}");
+            continue;
+        }
+        added += 1;
+    }
+
+    // Where the next page starts. Absent means the room has been read to its
+    // beginning, and the token is left alone so a later call does not loop
+    // over the same page forever.
+    if let Some(end) = resp["end"].as_str() {
+        state.runtime.set_matrix_back_token(account_id, &room_id, end, false);
+    }
+    Ok(added)
+}
+
 /// Says that this account is composing something in a room.
 ///
 /// Matrix wants a timeout with the notice and cancels with `typing: false`,

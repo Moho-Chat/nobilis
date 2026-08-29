@@ -123,6 +123,16 @@ pub async fn dispatch(
                             backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
                         }
                     }
+                    // Matrix pages back through /messages the same way, and
+                    // only when paginating: the initial open is served from
+                    // what sync already delivered, and fetching history for
+                    // every buffer somebody merely clicks on would be a
+                    // request per glance.
+                    if before > 0 && buffer.account_id.starts_with("matrix:") {
+                        if let Err(e) = backend::matrix::backfill(state, &buffer.account_id, buffer_id, 50).await {
+                            tracing::debug!("matrix backfill: {e}");
+                        }
+                    }
                 }
                 match state.store.get_backlog(buffer_id, before, limit) {
                     Ok(messages) => {

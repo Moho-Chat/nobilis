@@ -137,6 +137,8 @@ pub struct Runtime {
     /// is not a room you are in, has none of its history, and answering it
     /// is a decision somebody has to make.
     matrix_invites: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Per (account, room) pagination token for reading older history.
+    matrix_back_tokens: Mutex<HashMap<(String, String), String>>,
     /// Last-known member list per buffer (the same JSON shape presenceChange
     /// events carry) - presenceChange itself is only ever *pushed* on a
     /// join/part/namreply, so a client subscribing afterward (reopening a
@@ -341,6 +343,7 @@ impl Runtime {
             connect_generation: Mutex::new(HashMap::new()),
             wants_connected: Mutex::new(std::collections::HashSet::new()),
             matrix_invites: Mutex::new(HashMap::new()),
+            matrix_back_tokens: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
@@ -1361,6 +1364,25 @@ impl Runtime {
     /// "join"`; anything else (leave/ban/invite) goes through
     /// remove_matrix_member instead, since only actual joins belong in a
     /// userlist.
+    /// Where to carry on reading a room's history backwards from.
+    ///
+    /// Set once from the first sync that mentions the room and then moved by
+    /// each page fetched, so it always means "older than everything already
+    /// held". Set-if-absent on the sync side matters: a later sync's token
+    /// points at newer history, and taking it would skip everything between.
+    pub fn set_matrix_back_token(&self, account_id: &str, room_id: &str, token: &str, only_if_absent: bool) {
+        let mut all = self.matrix_back_tokens.lock().unwrap();
+        let key = (account_id.to_string(), room_id.to_string());
+        if only_if_absent && all.contains_key(&key) {
+            return;
+        }
+        all.insert(key, token.to_string());
+    }
+
+    pub fn matrix_back_token(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_back_tokens.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+    }
+
     pub fn set_matrix_member(&self, account_id: &str, room_id: &str, user_id: &str, display_name: &str) {
         self.matrix_room_members
             .lock()
