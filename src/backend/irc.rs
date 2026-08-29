@@ -627,6 +627,78 @@ async fn handle_message(
             }
         }
 
+        // A rank given or taken after the join.
+        //
+        // Without this the member list is only ever as accurate as the
+        // moment RPL_NAMREPLY arrived: an op handed out afterwards never
+        // showed, and one taken away never went, so the list quietly drifted
+        // and stayed wrong until the channel was rejoined.
+        //
+        // Losing a rank sets the member back to none rather than to whatever
+        // they held underneath it. IRC sends one prefix per user unless
+        // multi-prefix is negotiated, so there is genuinely no way to know
+        // from here that somebody who just lost +o still holds +v - the
+        // capability that would say so is its own piece of work.
+        Command::ChannelMODE(channel, modes) => {
+            if let Some(members) = channels.get_mut(&channel) {
+                let mut changed = false;
+                for m in &modes {
+                    let (mode, target, granting) = match m {
+                        Mode::Plus(mode, Some(target)) => (mode, target, true),
+                        Mode::Minus(mode, Some(target)) => (mode, target, false),
+                        // Channel modes proper (+m, +t, bans) carry no nick
+                        // to re-rank, and belong to the channel rather than
+                        // to anybody in it.
+                        _ => continue,
+                    };
+                    let Some(rank) = rank_from_mode(mode) else { continue };
+                    let Some(slot) = members.get_mut(target.as_str()) else { continue };
+                    *slot = if granting { rank } else { MemberRank::None };
+                    changed = true;
+                    let body = format!(
+                        "{from} {} {} {} {target}",
+                        if granting { "gives" } else { "takes" },
+                        rank_word(rank),
+                        if granting { "to" } else { "from" },
+                    );
+                    state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                }
+                if changed {
+                    emit_presence(state, account_id, &channel, members);
+                }
+            }
+        }
+
+        // Being removed from a channel by somebody else.
+        //
+        // Previously silent: no message, and the buffer sat there looking
+        // joined until the next attempt to speak into it failed.
+        Command::KICK(channel, target, reason) => {
+            let reason = reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+            if target == own_nick {
+                // Said in the server buffer rather than the channel: the
+                // channel buffer is about to be removed, so anything written
+                // there goes to something nobody can open.
+                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+                let body = match reason {
+                    Some(r) => format!("Kicked from {channel} by {from} ({r})"),
+                    None => format!("Kicked from {channel} by {from}"),
+                };
+                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                let buffer_id = crate::model::buffer_id(account_id, &channel);
+                state.runtime.remove_buffer(state, &buffer_id);
+                channels.remove(&channel);
+            } else if let Some(members) = channels.get_mut(&channel) {
+                members.remove(&target);
+                let body = match reason {
+                    Some(r) => format!("{target} was kicked by {from} ({r})"),
+                    None => format!("{target} was kicked by {from}"),
+                };
+                state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                emit_presence(state, account_id, &channel, members);
+            }
+        }
+
         Command::QUIT(_) => {
             for (channel, members) in channels.iter_mut() {
                 if members.remove(&from).is_some() {
@@ -806,6 +878,32 @@ fn channel_error_text(args: &[String]) -> Option<String> {
     Some(format!("{target}: {reason}"))
 }
 
+/// The rank a channel mode letter grants, or None for a mode that is about
+/// the channel rather than about a person in it.
+///
+/// Admin (+a) folds into Founder: it outranks op, and the member model has
+/// no separate step for it.
+fn rank_from_mode(mode: &ChannelMode) -> Option<MemberRank> {
+    match mode {
+        ChannelMode::Founder | ChannelMode::Admin => Some(MemberRank::Founder),
+        ChannelMode::Oper => Some(MemberRank::Op),
+        ChannelMode::Halfop => Some(MemberRank::HalfOp),
+        ChannelMode::Voice => Some(MemberRank::Voice),
+        _ => None,
+    }
+}
+
+/// What to call a rank in a sentence.
+fn rank_word(rank: MemberRank) -> &'static str {
+    match rank {
+        MemberRank::Founder => "founder status",
+        MemberRank::Op => "operator status",
+        MemberRank::HalfOp => "half-operator status",
+        MemberRank::Voice => "voice",
+        MemberRank::None => "nothing",
+    }
+}
+
 fn parse_prefixed_nick(raw: &str) -> (MemberRank, &str) {
     match raw.as_bytes().first() {
         Some(b'~') => (MemberRank::Founder, &raw[1..]),
@@ -935,6 +1033,36 @@ fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the modes that rank a person move the member list; the ones
+    /// that configure the channel must not be mistaken for one.
+    #[test]
+    fn only_person_modes_carry_a_rank() {
+        assert_eq!(rank_from_mode(&ChannelMode::Oper), Some(MemberRank::Op));
+        assert_eq!(rank_from_mode(&ChannelMode::Voice), Some(MemberRank::Voice));
+        assert_eq!(rank_from_mode(&ChannelMode::Halfop), Some(MemberRank::HalfOp));
+        assert_eq!(rank_from_mode(&ChannelMode::Founder), Some(MemberRank::Founder));
+        // +a outranks op and the member model has no separate step for it.
+        assert_eq!(rank_from_mode(&ChannelMode::Admin), Some(MemberRank::Founder));
+
+        for mode in [ChannelMode::Ban, ChannelMode::Moderated, ChannelMode::InviteOnly, ChannelMode::Key, ChannelMode::Limit, ChannelMode::Secret] {
+            assert_eq!(rank_from_mode(&mode), None, "{mode:?} is about the channel, not a person in it");
+        }
+    }
+
+    /// The sentence has to read correctly in both directions, since the same
+    /// words are used for granting and for taking away.
+    #[test]
+    fn a_rank_change_reads_as_a_sentence() {
+        assert_eq!(
+            format!("bob {} {} {} carol", "gives", rank_word(MemberRank::Op), "to"),
+            "bob gives operator status to carol"
+        );
+        assert_eq!(
+            format!("bob {} {} {} carol", "takes", rank_word(MemberRank::Voice), "from"),
+            "bob takes voice from carol"
+        );
+    }
 
     #[test]
     fn tls_carries_sasl_without_asking() {
