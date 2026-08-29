@@ -64,6 +64,22 @@ impl Host {
     }
 }
 
+impl Host {
+    /// The one service this host can be reached from, if it is not general.
+    ///
+    /// postimg.cc is posted through Sneedchat's own transport, with the
+    /// headers and the second page-scrape that path carries - the shared
+    /// uploader here has no way to reach it. A client offering it for IRC
+    /// would be offering a choice that fails at send time, which is why this
+    /// is answered here rather than guessed at by each menu.
+    pub fn only_for(self) -> Option<&'static str> {
+        match self {
+            Host::Postimg => Some("sockchat"),
+            _ => None,
+        }
+    }
+}
+
 /// Every host a frontend can offer, so the list of choices lives in one place
 /// rather than being spelled out again in each client that draws a menu.
 pub fn hosts() -> Vec<serde_json::Value> {
@@ -74,6 +90,7 @@ pub fn hosts() -> Vec<serde_json::Value> {
                 "id": h.id(),
                 "label": h.label(),
                 "imagesOnly": !h.takes_any_file(),
+                "onlyFor": h.only_for(),
                 "maxBytes": h.max_bytes(),
             })
         })
@@ -219,6 +236,24 @@ fn snippet(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A menu that offered postimg for IRC would be offering a choice that
+    /// fails at send time - the shared uploader cannot reach it, only
+    /// Sneedchat's own transport can.
+    #[test]
+    fn a_host_says_which_service_it_belongs_to() {
+        assert_eq!(Host::Postimg.only_for(), Some("sockchat"));
+        assert_eq!(Host::Catbox.only_for(), None);
+        assert_eq!(Host::Litterbox.only_for(), None);
+
+        // And it reaches a client, since that is the point of saying it.
+        let listed = hosts();
+        let postimg = listed.iter().find(|h| h["id"] == "postimg").expect("postimg listed");
+        assert_eq!(postimg["onlyFor"], "sockchat");
+        assert_eq!(postimg["imagesOnly"], true);
+        let catbox = listed.iter().find(|h| h["id"] == "catbox").expect("catbox listed");
+        assert!(catbox["onlyFor"].is_null());
+    }
 
     #[test]
     fn host_names_round_trip() {
