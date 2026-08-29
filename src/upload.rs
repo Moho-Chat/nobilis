@@ -138,16 +138,44 @@ async fn catbox_family(host: Host, file_name: String, bytes: Vec<u8>, retention:
         .with_context(|| format!("uploading to {}", host.id()))?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
+    link_from_response(host, status, &body)
+}
+
+/// Reads the outcome out of what the host actually sent back.
+///
+/// The body is the finished URL and nothing else, and that - not the status
+/// line - is what says whether the upload worked. catbox.moe answers a
+/// completed upload with HTTP 500 while storing and serving the file
+/// perfectly well, so checking the status first refuses uploads that in fact
+/// succeeded: the file is sitting on the host and the link is in our hand,
+/// and we throw both away. Both of these hosts also serve error pages with a
+/// 200, so neither half is trustworthy alone.
+///
+/// So: believe a link wherever one came back, and fall back to the status
+/// only to explain a reply that carried none.
+fn link_from_response(host: Host, status: reqwest::StatusCode, body: &str) -> Result<String> {
+    let link = body.trim();
+    if link.starts_with("https://") {
+        return Ok(link.to_string());
+    }
     if !status.is_success() {
         bail!("{} refused the upload: HTTP {status}", host.id());
     }
-    let link = body.trim();
-    // The body is the URL, and only the URL. Anything else is an error page
-    // served with a 200, which these hosts do.
-    if !link.starts_with("https://") {
-        bail!("{} did not return a link: {}", host.id(), &link[..link.len().min(200)]);
+    bail!("{} did not return a link: {}", host.id(), snippet(link));
+}
+
+/// The first part of a reply, for an error message.
+///
+/// Cut on a character boundary rather than a byte one: these are error pages
+/// rather than the URL we expected, and one containing any non-ASCII - a
+/// typographic quote in a maintenance notice is enough - would panic the
+/// daemon on a plain byte slice.
+fn snippet(text: &str) -> String {
+    const LIMIT: usize = 200;
+    match text.char_indices().nth(LIMIT) {
+        None => text.to_string(),
+        Some((end, _)) => format!("{}...", &text[..end]),
     }
-    Ok(link.to_string())
 }
 
 #[cfg(test)]
@@ -173,6 +201,45 @@ mod tests {
         let err = upload(Host::Postimg, file.to_str().unwrap(), None).await.unwrap_err().to_string();
         assert!(err.contains("only takes images"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The one that broke sending files on IRC: catbox.moe returns the
+    /// finished URL with a 500 on it, and the upload really did work.
+    #[test]
+    fn a_link_is_believed_even_under_a_failing_status() {
+        let link = link_from_response(
+            Host::Catbox,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "https://files.catbox.moe/n8zh4g.png\n",
+        )
+        .unwrap();
+        assert_eq!(link, "https://files.catbox.moe/n8zh4g.png");
+    }
+
+    /// The other half: these hosts serve error pages with a 200, so a reply
+    /// that is not a link is still a failure however cheerful its status.
+    #[test]
+    fn a_reply_that_is_not_a_link_still_fails() {
+        let err = link_from_response(Host::Catbox, reqwest::StatusCode::OK, "<html>go away</html>")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did not return a link"), "got {err}");
+
+        let err = link_from_response(Host::Litterbox, reqwest::StatusCode::BAD_GATEWAY, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HTTP 502"), "got {err}");
+    }
+
+    /// A long error page full of non-ASCII must not take the daemon with it.
+    #[test]
+    fn a_long_reply_is_cut_on_a_character_boundary() {
+        let page = "\u{201c}down for maintenance\u{201d} ".repeat(40);
+        let err = link_from_response(Host::Catbox, reqwest::StatusCode::OK, &page).unwrap_err().to_string();
+        assert!(err.ends_with("..."), "got {err}");
+        assert!(snippet(&page).chars().count() <= 203);
+        // Short replies are shown whole, with nothing appended.
+        assert_eq!(snippet("nope"), "nope");
     }
 
     /// An empty file is a mistake worth catching here rather than sending a
