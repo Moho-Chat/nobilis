@@ -1070,6 +1070,22 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
         state.events.emit("sockChatLoginStatus", serde_json::json!({ "loginId": login_id, "detail": msg }));
     };
 
+    // Saved before anything can fail, not after everything has succeeded.
+    //
+    // This used to persist only on the far side of a successful login, so a
+    // wrong password - or a Tor bootstrap that never completed - threw the
+    // account away along with everything typed into the form. The next
+    // attempt started from an empty form, which is the worst moment to ask
+    // somebody to retype a password: they have just been told it might be
+    // wrong.
+    //
+    // The account id is derived from the username, so re-adding the same
+    // account updates it in place rather than accumulating duplicates, and a
+    // corrected password simply overwrites the stored one. What lands here is
+    // an account that exists, holds what was entered, and is disconnected -
+    // which is exactly the state Connect knows how to retry.
+    state.accounts.add_sockchat(config.clone())?;
+
     let transport = match config.tor_mode.as_str() {
         "proxy" => {
             let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;

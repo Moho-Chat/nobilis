@@ -1346,6 +1346,27 @@ pub fn start_login(state: AppState, login_id: String, homeserver_url: String, us
 async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str) -> Result<()> {
     state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "logging in..." }));
 
+    // Saved before the login is attempted, so a failure leaves an account to
+    // correct and retry rather than an empty form. Same reasoning as the
+    // Sneedchat path: the moment somebody is told their password might be
+    // wrong is the worst moment to also make them retype the server address.
+    //
+    // An empty access token is already a state this backend understands -
+    // ensure_login treats it as "never successfully logged in" and
+    // authenticates from the stored password - so a retry needs nothing that
+    // is not here, and a corrected password overwrites in place because the
+    // account id comes from the user id.
+    let pending = MatrixAccountConfig {
+        homeserver_url: homeserver_url.to_string(),
+        user_id: username.to_string(),
+        password: password.to_string(),
+        access_token: String::new(),
+        device_id: String::new(),
+        next_batch: None,
+        display_name: None,
+    };
+    state.accounts.add_matrix(pending.clone())?;
+
     let login = auth::login(homeserver_url, username, password, None).await.context("logging in")?;
 
     let config = MatrixAccountConfig {
@@ -1358,6 +1379,18 @@ async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, usern
         display_name: None,
     };
     let saved = state.accounts.add_matrix(config)?;
+    // The placeholder above was keyed on whatever was typed, and the server
+    // answers with the canonical user id - "salastil" against "@salastil:
+    // poa.st". When they differ, the placeholder is a second account for the
+    // same person, so it goes now that the real one exists.
+    let pending_id = pending.account_id();
+    if pending_id != saved.account_id() {
+        // No event: removeAccount does not emit one either, and the frontend
+        // re-reads the account list when the login result arrives a few lines
+        // below. Inventing a name nothing listens for would only look like it
+        // did something.
+        let _ = state.accounts.remove(&pending_id);
+    }
     let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
 
