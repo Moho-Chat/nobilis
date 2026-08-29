@@ -949,6 +949,77 @@ fn extract_postimg_thumb_name(html: &str) -> Option<(String, String)> {
     None
 }
 
+/// Both links postimg.cc gives back for one upload.
+pub struct PostimgLinks {
+    /// The page about the image, for a click-through.
+    pub page: String,
+    /// The image itself, for anywhere that renders a bare URL.
+    pub direct: String,
+}
+
+/// Puts an image on postimg.cc and returns where it landed.
+///
+/// Shared rather than private to Sneedchat, because the two callers want
+/// different halves of the same answer: Sneedchat wraps both in the BBCode
+/// the site renders, and IRC sends the direct link on its own, having no
+/// markup to wrap anything in. The mechanics below are the same either way
+/// and were hard enough won that a second copy of them would be a liability.
+pub async fn upload_to_postimg(file_path: &str) -> Result<PostimgLinks> {
+    let bytes = tokio::fs::read(file_path).await.with_context(|| format!("reading {file_path}"))?;
+    if bytes.is_empty() {
+        bail!("file is empty");
+    }
+    if bytes.len() > POSTIMG_MAX_UPLOAD_BYTES {
+        bail!("file is over postimg.cc's {}MB upload limit", POSTIMG_MAX_UPLOAD_BYTES / 1024 / 1024);
+    }
+
+    let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
+    let Some(content_type) = guess_postimg_content_type(&file_name) else {
+        bail!("postimg.cc only accepts images (png/jpg/gif/webp/bmp), not \"{file_name}\"");
+    };
+
+    let http = http::HttpClient::new(Transport::Direct, http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
+    let session = postimg_upload_session();
+    let bytes = Bytes::from(bytes);
+    let fields = [
+        http::MultipartField::Text { name: "gallery", value: "" },
+        http::MultipartField::Text { name: "optsize", value: "0" },
+        http::MultipartField::Text { name: "expire", value: "604800" },
+        http::MultipartField::Text { name: "numfiles", value: "1" },
+        http::MultipartField::Text { name: "upload_session", value: &session },
+        http::MultipartField::File { name: "file", file_name: &file_name, content_type, bytes: &bytes },
+    ];
+    let extra_headers = [("Origin", POSTIMG_ORIGIN), ("Referer", &format!("{POSTIMG_ORIGIN}/"))];
+
+    let (status, resp_bytes) = http.post_multipart(POSTIMG_UPLOAD_URL, &fields, &extra_headers).await.context("uploading to postimg.cc")?;
+    if !(200..300).contains(&status) {
+        let snippet = String::from_utf8_lossy(&resp_bytes[..resp_bytes.len().min(300)]);
+        bail!("postimg.cc upload failed with HTTP {status}: {snippet}");
+    }
+    let parsed: PostimgUploadResponse = serde_json::from_slice(&resp_bytes).context("parsing postimg.cc response")?;
+    if let Some(err) = parsed.error {
+        bail!("postimg.cc upload failed: {}", err.message);
+    }
+    // The upload response's own url carries a delete-hash suffix
+    // (`https://postimg.cc/<slug>/<hash>`) that the result page needs to
+    // actually render (the bare `/<slug>` alone serves something else -
+    // confirmed live, scraping came back empty without it). The outer
+    // `[url=]` wrapper below uses the slug-only form instead, matching
+    // postimg.cc's own "Thumbnail for forums" BBCode preset shown on that
+    // page - the hash is a one-time delete credential, not part of the
+    // link anyone else needs to view the image.
+    let full_page_url = parsed.url.ok_or_else(|| anyhow!("postimg.cc response had no url"))?;
+    let slug = full_page_url.strip_prefix("https://postimg.cc/").and_then(|rest| rest.split('/').next()).ok_or_else(|| anyhow!("unexpected postimg.cc url shape: {full_page_url}"))?;
+    let short_page_url = format!("https://postimg.cc/{slug}");
+
+    let page = http.get(&full_page_url).await.context("fetching postimg.cc result page")?;
+    let (name, ext) = extract_postimg_thumb_name(&page.body).ok_or_else(|| anyhow!("couldn't find the uploaded image's filename on {full_page_url}"))?;
+    let direct_url = format!("https://i.postimg.cc/{slug}/{name}.{ext}");
+
+
+    Ok(PostimgLinks { page: short_page_url, direct: direct_url })
+}
+
 /// The "+" attachment button's SockChat backend. Unlike Discord (whose API
 /// natively accepts a file alongside a message), Sneedchat's own chat
 /// protocol is text-only - there's no upload endpoint on the site itself.
@@ -1011,58 +1082,9 @@ pub async fn send_attachment(
         Some(host) => return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host).await,
     }
 
-    let bytes = tokio::fs::read(file_path).await.with_context(|| format!("reading {file_path}"))?;
-    if bytes.is_empty() {
-        bail!("file is empty");
-    }
-    if bytes.len() > POSTIMG_MAX_UPLOAD_BYTES {
-        bail!("file is over postimg.cc's {}MB upload limit", POSTIMG_MAX_UPLOAD_BYTES / 1024 / 1024);
-    }
+    let links = upload_to_postimg(file_path).await?;
 
-    let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
-    let Some(content_type) = guess_postimg_content_type(&file_name) else {
-        bail!("postimg.cc only accepts images (png/jpg/gif/webp/bmp), not \"{file_name}\"");
-    };
-
-    let http = http::HttpClient::new(Transport::Direct, http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
-    let session = postimg_upload_session();
-    let bytes = Bytes::from(bytes);
-    let fields = [
-        http::MultipartField::Text { name: "gallery", value: "" },
-        http::MultipartField::Text { name: "optsize", value: "0" },
-        http::MultipartField::Text { name: "expire", value: "604800" },
-        http::MultipartField::Text { name: "numfiles", value: "1" },
-        http::MultipartField::Text { name: "upload_session", value: &session },
-        http::MultipartField::File { name: "file", file_name: &file_name, content_type, bytes: &bytes },
-    ];
-    let extra_headers = [("Origin", POSTIMG_ORIGIN), ("Referer", &format!("{POSTIMG_ORIGIN}/"))];
-
-    let (status, resp_bytes) = http.post_multipart(POSTIMG_UPLOAD_URL, &fields, &extra_headers).await.context("uploading to postimg.cc")?;
-    if !(200..300).contains(&status) {
-        let snippet = String::from_utf8_lossy(&resp_bytes[..resp_bytes.len().min(300)]);
-        bail!("postimg.cc upload failed with HTTP {status}: {snippet}");
-    }
-    let parsed: PostimgUploadResponse = serde_json::from_slice(&resp_bytes).context("parsing postimg.cc response")?;
-    if let Some(err) = parsed.error {
-        bail!("postimg.cc upload failed: {}", err.message);
-    }
-    // The upload response's own url carries a delete-hash suffix
-    // (`https://postimg.cc/<slug>/<hash>`) that the result page needs to
-    // actually render (the bare `/<slug>` alone serves something else -
-    // confirmed live, scraping came back empty without it). The outer
-    // `[url=]` wrapper below uses the slug-only form instead, matching
-    // postimg.cc's own "Thumbnail for forums" BBCode preset shown on that
-    // page - the hash is a one-time delete credential, not part of the
-    // link anyone else needs to view the image.
-    let full_page_url = parsed.url.ok_or_else(|| anyhow!("postimg.cc response had no url"))?;
-    let slug = full_page_url.strip_prefix("https://postimg.cc/").and_then(|rest| rest.split('/').next()).ok_or_else(|| anyhow!("unexpected postimg.cc url shape: {full_page_url}"))?;
-    let short_page_url = format!("https://postimg.cc/{slug}");
-
-    let page = http.get(&full_page_url).await.context("fetching postimg.cc result page")?;
-    let (name, ext) = extract_postimg_thumb_name(&page.body).ok_or_else(|| anyhow!("couldn't find the uploaded image's filename on {full_page_url}"))?;
-    let direct_url = format!("https://i.postimg.cc/{slug}/{name}.{ext}");
-
-    let wrapped = format!("[url={short_page_url}][img]{direct_url}[/img][/url]");
+    let wrapped = format!("[url={}][img]{}[/img][/url]", links.page, links.direct);
     let text = if caption.trim().is_empty() { wrapped } else { format!("{caption}\n{wrapped}") };
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.

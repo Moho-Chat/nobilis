@@ -64,22 +64,6 @@ impl Host {
     }
 }
 
-impl Host {
-    /// The one service this host can be reached from, if it is not general.
-    ///
-    /// postimg.cc is posted through Sneedchat's own transport, with the
-    /// headers and the second page-scrape that path carries - the shared
-    /// uploader here has no way to reach it. A client offering it for IRC
-    /// would be offering a choice that fails at send time, which is why this
-    /// is answered here rather than guessed at by each menu.
-    pub fn only_for(self) -> Option<&'static str> {
-        match self {
-            Host::Postimg => Some("sockchat"),
-            _ => None,
-        }
-    }
-}
-
 /// Every host a frontend can offer, so the list of choices lives in one place
 /// rather than being spelled out again in each client that draws a menu.
 pub fn hosts() -> Vec<serde_json::Value> {
@@ -90,7 +74,6 @@ pub fn hosts() -> Vec<serde_json::Value> {
                 "id": h.id(),
                 "label": h.label(),
                 "imagesOnly": !h.takes_any_file(),
-                "onlyFor": h.only_for(),
                 "maxBytes": h.max_bytes(),
             })
         })
@@ -128,9 +111,11 @@ pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<S
 
     match host {
         Host::Catbox | Host::Litterbox => catbox_family(host, file_name, bytes, retention).await,
-        Host::Postimg => Err(anyhow!(
-            "postimg.cc uploads go through the Sneedchat transport; pick catbox or litterbox here"
-        )),
+        // The direct image link, not the page about it. Sneedchat wraps both
+        // in BBCode because it renders markup; a caller reaching this has
+        // none, so what it wants is the URL that ends in a file extension -
+        // it is what makes a link unfurl into a picture at the far end.
+        Host::Postimg => Ok(crate::backend::sockchat::upload_to_postimg(path).await?.direct),
     }
 }
 
@@ -237,22 +222,18 @@ fn snippet(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A menu that offered postimg for IRC would be offering a choice that
-    /// fails at send time - the shared uploader cannot reach it, only
-    /// Sneedchat's own transport can.
+    /// postimg takes images and nothing else, and a client's menu has to
+    /// know that - it is the difference between not offering it for a video
+    /// and having the upload refused after the fact.
     #[test]
-    fn a_host_says_which_service_it_belongs_to() {
-        assert_eq!(Host::Postimg.only_for(), Some("sockchat"));
-        assert_eq!(Host::Catbox.only_for(), None);
-        assert_eq!(Host::Litterbox.only_for(), None);
-
-        // And it reaches a client, since that is the point of saying it.
+    fn the_listing_says_what_each_host_will_take() {
         let listed = hosts();
         let postimg = listed.iter().find(|h| h["id"] == "postimg").expect("postimg listed");
-        assert_eq!(postimg["onlyFor"], "sockchat");
         assert_eq!(postimg["imagesOnly"], true);
         let catbox = listed.iter().find(|h| h["id"] == "catbox").expect("catbox listed");
-        assert!(catbox["onlyFor"].is_null());
+        assert_eq!(catbox["imagesOnly"], false);
+        // Every host is offered to every service; none is one service's own.
+        assert_eq!(listed.len(), 3);
     }
 
     #[test]
