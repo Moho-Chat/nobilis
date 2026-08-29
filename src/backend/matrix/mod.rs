@@ -263,7 +263,10 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
 }
 
 fn config_dir() -> std::path::PathBuf {
-    dirs::home_dir().unwrap_or_default().join(".config").join("nobilis")
+    // The one the daemon actually runs out of, rather than a second guess at
+    // it - these disagreed on Windows, where the hardcoded XDG shape put the
+    // crypto store somewhere the rest of the daemon was not looking.
+    crate::default_data_dir()
 }
 
 fn sync_url(homeserver_url: &str, since: Option<&str>, presence: &str) -> String {

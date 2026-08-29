@@ -27,11 +27,29 @@ struct Options {
     socket_path: Option<PathBuf>,
 }
 
+/// Where this daemon keeps accounts, keys and its lock.
+///
+/// `dirs::config_dir` rather than a hardcoded `~/.config`, which is an XDG
+/// convention and not a universal one: on Windows it produced a dotfile
+/// directory in the profile root, which works but is not where anything else
+/// on that system looks. Confirmed against a real Windows 11 guest, which put
+/// the lock in C:\Users\John\.config rather than in AppData.
+///
+/// An existing `~/.config/nobilis` still wins, so nobody's accounts move out
+/// from under them. That matters on Linux beyond the obvious: the old path
+/// ignored XDG_CONFIG_HOME, so a machine that sets it would otherwise find a
+/// different directory than the one it has been using all along.
+pub fn default_data_dir() -> PathBuf {
+    let home = dirs::home_dir().expect("no home directory");
+    let legacy = home.join(".config").join("nobilis");
+    if legacy.is_dir() {
+        return legacy;
+    }
+    dirs::config_dir().unwrap_or_else(|| home.join(".config")).join("nobilis")
+}
+
 fn parse_args() -> Options {
-    let mut data_dir = dirs::home_dir()
-        .expect("no home directory")
-        .join(".config")
-        .join("nobilis");
+    let mut data_dir = default_data_dir();
     let mut socket_path = None;
 
     let mut args = std::env::args().skip(1);

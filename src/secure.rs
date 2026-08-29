@@ -19,13 +19,14 @@
 //! says, and a permissive umask is common enough that relying on it would be
 //! relying on luck.
 //!
-//! **Windows** inherits the ACL of the containing directory, and the directory
-//! nobilis writes into is under `%APPDATA%`, inside the user's own profile.
-//! That profile's ACL grants the user, SYSTEM and Administrators, and denies
-//! other non-administrative users - so a file created there is already private
-//! to the user in the sense 0600 means, without this code doing anything. That
-//! is a genuine platform guarantee rather than an assumption made to avoid the
-//! work, and it is why this is not a silent no-op: it is a documented one.
+//! **Windows** inherits the ACL of the containing directory, and everything
+//! nobilis writes lives under the user's own profile. Verified on a real
+//! Windows 11 guest rather than taken from documentation: the config directory
+//! came back as SYSTEM, Administrators and the user, all inherited, and
+//! nothing else. So a file created there is already private in the sense 0600
+//! means, without this code doing anything - a genuine platform guarantee
+//! rather than an assumption made to avoid the work, and why this is not a
+//! silent no-op but a documented one.
 //!
 //! What Windows does *not* get from that is protection from an administrator
 //! or from another program running as the same user - and neither does Unix,
