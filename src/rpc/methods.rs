@@ -1027,9 +1027,15 @@ pub async fn dispatch(
                     // Unlike Discord, Sneedchat's own chat protocol has no
                     // upload endpoint at all - see backend::sockchat::
                     // send_attachment's own doc comment for how this
-                    // still ends up posting a real image.
+                    // still ends up posting a real image. The host choice
+                    // reaches it the same way it reaches IRC below; without
+                    // that it always went to postimg.cc, which takes images
+                    // and nothing else.
                     let result = match attachment_path {
-                        Some(path) => backend::sockchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path).await,
+                        Some(path) => {
+                            let host = p_str_opt(params, "uploadHost").and_then(crate::upload::Host::parse);
+                            backend::sockchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host).await
+                        }
                         None => backend::sockchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
                     };
                     match result {

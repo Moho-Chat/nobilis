@@ -985,10 +985,31 @@ fn extract_postimg_thumb_name(html: &str) -> Option<(String, String)> {
 /// upload, so there's nothing to gain from reusing the Sneedchat session's
 /// cookies, and building a new client here means this doesn't need any new
 /// account-level state threaded through Runtime just for this one feature.
-pub async fn send_attachment(state: &AppState, account_id: &str, buffer_name: &str, caption: &str, file_path: &str) -> Result<()> {
+/// Which host to put it on. `None` keeps postimg.cc, which is what this
+/// always did and what the site's own regulars use.
+///
+/// Honouring the caller's choice is the whole point: the uploads setting
+/// promised it covered "anything Sneedchat's own uploader refuses", and it
+/// reached IRC only - a Sneedchat send called straight into the postimg path
+/// below, whose signature had nowhere to put a host. Attaching a video there
+/// failed with "postimg.cc only accepts images" and no way to pick something
+/// that would take it.
+pub async fn send_attachment(
+    state: &AppState,
+    account_id: &str,
+    buffer_name: &str,
+    caption: &str,
+    file_path: &str,
+    host: Option<crate::upload::Host>,
+) -> Result<()> {
     // Only used to confirm the account is real before spending any time on
     // the upload - the transport below is deliberately unrelated to it.
     state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+
+    match host {
+        None | Some(crate::upload::Host::Postimg) => {}
+        Some(host) => return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host).await,
+    }
 
     let bytes = tokio::fs::read(file_path).await.with_context(|| format!("reading {file_path}"))?;
     if bytes.is_empty() {
@@ -1046,6 +1067,41 @@ pub async fn send_attachment(state: &AppState, account_id: &str, buffer_name: &s
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.
     send_message(state, account_id, buffer_name, &text, None)
+}
+
+/// Posting a file that went to one of the shared upload hosts.
+///
+/// The link still has to be wrapped in `[img]` for a picture to render
+/// rather than sit there as a URL - that is the site's own markup, and what
+/// find_attachment_url already unwraps on the way back in. Anything that is
+/// not a picture goes as a bare link, because `[img]` around a video would
+/// render as a broken image instead of something clickable.
+///
+/// No `[url=]` wrapper here, unlike the postimg path: these hosts serve the
+/// file itself rather than a page about it, so there is nothing to click
+/// through to that the image is not already showing.
+async fn send_via_upload_host(
+    state: &AppState,
+    account_id: &str,
+    buffer_name: &str,
+    caption: &str,
+    file_path: &str,
+    host: crate::upload::Host,
+) -> Result<()> {
+    let link = crate::upload::upload(host, file_path, None).await?;
+    let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let posted = posted_markup(file_name, &link);
+    let text = if caption.trim().is_empty() { posted } else { format!("{caption}\n{posted}") };
+    send_message(state, account_id, buffer_name, &text, None)
+}
+
+/// How a finished upload is written into a message.
+fn posted_markup(file_name: &str, link: &str) -> String {
+    if guess_postimg_content_type(file_name).is_some() {
+        format!("[img]{link}[/img]")
+    } else {
+        link.to_string()
+    }
 }
 
 /// `editMessage`'s SockChat branch (see rpc/methods.rs). The server has no
@@ -1142,6 +1198,19 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
 
 #[cfg(test)]
 mod tests {
+
+    /// A picture has to be wrapped for the site to render it; a video must
+    /// not be, because [img] around an .mp4 draws a broken image instead of
+    /// something you can click.
+    #[test]
+    fn only_pictures_are_wrapped_for_display() {
+        assert_eq!(posted_markup("cat.png", "https://files.catbox.moe/a.png"), "[img]https://files.catbox.moe/a.png[/img]");
+        assert_eq!(posted_markup("cat.JPEG", "https://x/a.jpeg"), "[img]https://x/a.jpeg[/img]");
+        assert_eq!(posted_markup("clip.mp4", "https://files.catbox.moe/b.mp4"), "https://files.catbox.moe/b.mp4");
+        assert_eq!(posted_markup("notes.pdf", "https://x/c.pdf"), "https://x/c.pdf");
+        // No extension at all is not a picture.
+        assert_eq!(posted_markup("README", "https://x/d"), "https://x/d");
+    }
     #[test]
     fn a_reply_opens_with_the_mention_sneedchat_understands() {
         // Sneedchat has no reply field; answering somebody by name is what
@@ -1166,7 +1235,7 @@ mod tests {
         assert_eq!(super::as_reply("plain", Some("")), "plain");
     }
 
-    use super::{cached_avatar_file, find_attachment_url, sniff_image_ext};
+    use super::{cached_avatar_file, find_attachment_url, posted_markup, sniff_image_ext};
 
     #[test]
     fn matches_the_real_reported_url() {
