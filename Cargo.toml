@@ -81,3 +81,18 @@ songbird = { version = "0.6", default-features = false, features = ["driver", "r
 cpal = "0.18.2"
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
 async-trait = "0.1.92"
+
+# Tor's certificate validation hangs on Windows without this.
+#
+# saturating-time 0.4.0 finds a type's limit by halving a step until the
+# arithmetic fails, and only shrinks that step when it sees None. On Windows a
+# SystemTime is a FILETIME with 100ns granularity, so subtracting 1ns returns
+# Some(unchanged) rather than None - the None branch becomes unreachable at
+# step==1ns and the search spins on one core forever. Measured: the consensus
+# downloads, tor-cert goes to check the authority certificates, and the
+# bootstrap never advances past 15% while burning 96% of a core.
+#
+# The patch treats "succeeded but did not move" as having found the limit,
+# which it has. Reported upstream; drop this once a release carries the fix.
+[patch.crates-io]
+saturating-time = { path = "vendor/saturating-time" }
