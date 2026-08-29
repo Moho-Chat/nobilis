@@ -207,7 +207,7 @@ async fn run(state: &AppState, config: &SockChatAccountConfig, account_id: &str)
     state.runtime.set_own_identity(account_id, &config.username);
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
-    let rooms = if config.rooms.is_empty() { vec![SockChatRoom { id: 1, name: "general".to_string() }] } else { config.rooms.clone() };
+    let rooms = effective_rooms(config);
     tracing::info!("sockchat[{account_id}]: authenticated, connecting {} room(s)", rooms.len());
 
     // Only the first room's connection stores whispers - every room's
@@ -803,8 +803,30 @@ fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, buffer_id: 
 fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
     let cfg = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let room_name = buffer_name.strip_prefix('#').unwrap_or(buffer_name);
-    let room = cfg.rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
+    let rooms = effective_rooms(&cfg);
+    let room = rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
+}
+
+/// The rooms this account actually talks in.
+///
+/// An account with none configured still connects - to #general, which is
+/// where a Sneedchat session lands by default and what makes a freshly added
+/// account usable before anybody has been to Settings to choose rooms.
+///
+/// Shared with the send path deliberately. The connect side had this fallback
+/// and the send side read the stored list directly, so an account with no
+/// rooms configured connected to #general, received messages there, and then
+/// refused to send with "#general isn't one of this account's configured
+/// rooms" - true of the stored config and plainly untrue of the connection
+/// the user was looking at. One definition of "which rooms" means the two
+/// cannot disagree again.
+fn effective_rooms(config: &SockChatAccountConfig) -> Vec<SockChatRoom> {
+    if config.rooms.is_empty() {
+        vec![SockChatRoom { id: 1, name: "general".to_string() }]
+    } else {
+        config.rooms.clone()
+    }
 }
 
 /// Sends a message, optionally as a reply to someone.
