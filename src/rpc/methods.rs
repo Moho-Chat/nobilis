@@ -307,6 +307,27 @@ pub async fn dispatch(
             }
         }
 
+        // "I have read this." Only Discord has anywhere to put it - IRC and
+        // Sneedchat have no read state at all, and Matrix's receipts are
+        // their own piece of work - so this is quietly a no-op elsewhere
+        // rather than an error, letting a client call it on every buffer it
+        // opens without first asking what protocol it is.
+        "markBufferRead" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("markBufferRead requires \"bufferId\"".to_string()));
+            };
+            match state.runtime.get_buffer(buffer_id) {
+                Some(buffer) if buffer.account_id.starts_with("discord:") => match state.accounts.get_discord(&buffer.account_id) {
+                    None => (None, Some("account not connected".to_string())),
+                    Some(cfg) => match backend::discord::ack_read(state, buffer_id, &cfg.token).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e.to_string())),
+                    },
+                },
+                _ => (Some(ok_node()), None),
+            }
+        }
+
         "joinDiscordGuild" => {
             let (account_id, invite) = match (p_str_opt(params, "accountId"), p_str_opt(params, "invite")) {
                 (Some(a), Some(i)) => (a, i),

@@ -2430,6 +2430,22 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig) -> Result<
                         }
                     }
 
+                    // Read somewhere else. Discord sends this to every one
+                    // of an account's sessions, including the one that did
+                    // the acking, so a client acting on it also settles its
+                    // own state rather than needing to guess.
+                    "MESSAGE_ACK" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        let Some((name, _)) = channel_map.get(channel_id) else { continue };
+                        state.events.emit(
+                            "bufferRead",
+                            json!({
+                                "accountId": account_id,
+                                "bufferId": crate::model::buffer_id(&account_id, name),
+                            }),
+                        );
+                    }
+
                     "CHANNEL_DELETE" => {
                         let Some(channel_id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(channel_id) {
@@ -2771,6 +2787,39 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
 /// DELETE .../messages/{id} - deleting your own message. Same
 /// author-only enforcement as edit; also works for a moderator with
 /// MANAGE_MESSAGES, which Discord itself decides, not this code.
+/// Tells Discord this conversation has been read up to its newest message.
+///
+/// Unread was purely local before this, so reading a channel here did not
+/// clear it on a phone and reading it there did not clear it here - the gap
+/// most visible to anyone who uses Discord on more than one device.
+///
+/// The newest message this client actually holds is what gets acked, not the
+/// newest that exists: acking past something never seen would mark it read
+/// on every device on the strength of a message this one never showed.
+///
+/// Quietly does nothing for a buffer with no messages, which is an ordinary
+/// state for a channel opened and never scrolled.
+pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<()> {
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
+    let resp = http_client()
+        .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
+        .header("Authorization", token)
+        .json(&json!({ "token": serde_json::Value::Null }))
+        .send()
+        .await
+        .context("acking Discord read state")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
 pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_id: &str) -> Result<()> {
     let channel_id = state
         .runtime
