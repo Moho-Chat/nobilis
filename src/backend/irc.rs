@@ -312,11 +312,12 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
     if config.sasl {
         authenticated = register_with_sasl(state, &account_id, &sender, &mut stream, config).await?;
     } else {
-        // No CAP negotiation needed - straight NICK/USER (+ PASS if a
-        // plain server password is set), same tail as the crate's own
-        // identify().
+        // Same tail as the crate's own identify(), by way of the shared
+        // helper: there is no SASL to negotiate here, but the capabilities
+        // above are still worth asking for, and they have to be requested
+        // before CAP END like any other.
         state.runtime.report_progress(state, &account_id, "Registering (NICK/USER)...");
-        client.identify()?;
+        end_cap_and_register(&sender, config)?;
     }
 
     state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
@@ -449,6 +450,18 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
     Ok(true)
 }
 
+/// Capabilities asked for on every connection, whatever else is going on.
+///
+/// `server-time` is the one that matters: without it a message is stamped
+/// with the local clock at the moment it is read, so anything the server
+/// replays - and anything that arrives in a burst after a reconnect - dates
+/// itself to now rather than to when it was said.
+///
+/// `multi-prefix` makes RPL_NAMREPLY carry every rank a person holds ("@+nick")
+/// instead of only the highest, which is what lets a rank being taken away
+/// leave the one underneath it intact.
+const WANTED_CAPS: &[&str] = &["server-time", "multi-prefix"];
+
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
 /// Shared by the authenticated path and the fell-back-to-nothing path because
@@ -456,7 +469,28 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
 /// does not proceed until we say we are finished asking, and a server left
 /// waiting for that just sits there until the establish timeout fires.
 fn end_cap_and_register(sender: &Sender, config: &IrcAccountConfig) -> Result<()> {
+    // One REQ per capability, and no waiting on the replies.
+    //
+    // Separate lines because a CAP REQ is atomic: a server that does not
+    // know one name in the list refuses the whole line, so bundling these
+    // with sasl would mean an old server dropping SASL over multi-prefix.
+    // And no waiting because there is nothing to decide - a granted
+    // capability changes what arrives, which is visible in what arrives.
+    // Sent here rather than earlier so they cannot be confused with the
+    // ACK/NAK the SASL exchange above is watching for.
+    for cap in WANTED_CAPS {
+        sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some((*cap).to_string())))?;
+    }
     sender.send(Command::CAP(None, CapSubCommand::END, None, None))?;
+    // A server password is not a SASL credential: it goes in PASS, before
+    // NICK, and only where SASL is not the thing authenticating us. This
+    // matches what the crate's own identify() sends, which is what the
+    // non-SASL path used before it came through here.
+    if !config.sasl {
+        if let Some(pw) = config.password.as_deref().filter(|p| !p.is_empty()) {
+            sender.send(Command::PASS(pw.to_string()))?;
+        }
+    }
     sender.send(Command::NICK(config.nick.clone()))?;
     sender.send(Command::USER(
         config.username.clone().unwrap_or_else(|| config.nick.clone()),
@@ -615,6 +649,11 @@ async fn handle_message(
     channels: &mut HashMap<String, HashMap<String, MemberRank>>,
 ) {
     let from = msg.source_nickname().unwrap_or("").to_string();
+    // Only for what somebody actually said. The rest of what arrives here
+    // is this client's own narration - join lines, topic notices, error
+    // text - which belongs at the moment it is shown rather than at
+    // whatever the server stamped the triggering event with.
+    let sent_at = server_time(&msg);
 
     match msg.command {
         Command::PRIVMSG(target, body) => {
@@ -624,9 +663,9 @@ async fn handle_message(
                 (from.clone(), "dm")
             };
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at);
             } else {
-                state.runtime.record_message(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at);
             }
         }
 
@@ -952,14 +991,44 @@ fn rank_word(rank: MemberRank) -> &'static str {
     }
 }
 
+/// When the server says this message was sent, if it says at all.
+///
+/// The server-time tag is RFC3339 in UTC to millisecond precision
+/// ("2026-08-29T12:34:56.789Z"). Absent unless the capability was granted,
+/// which is the ordinary case on an older server - hence an Option rather
+/// than a default, so the caller can fall back to the clock rather than to
+/// the epoch.
+fn server_time(msg: &Message) -> Option<i64> {
+    let tags = msg.tags.as_ref()?;
+    // Tag is a tuple struct of (name, value); matched by field rather than
+    // by pattern to save importing it for one line.
+    let raw = tags.iter().find(|tag| tag.0 == "time")?.1.as_deref()?;
+    Some(chrono::DateTime::parse_from_rfc3339(raw).ok()?.timestamp())
+}
+
+/// Splits "@+nick" into the rank it carries and the nick itself.
+///
+/// Every prefix is consumed, not just the first. With multi-prefix granted a
+/// server lists all of them, highest first - so the first is the rank, and
+/// leaving the rest attached would make "+nick" the person's name.
 fn parse_prefixed_nick(raw: &str) -> (MemberRank, &str) {
-    match raw.as_bytes().first() {
-        Some(b'~') => (MemberRank::Founder, &raw[1..]),
-        Some(b'@') => (MemberRank::Op, &raw[1..]),
-        Some(b'%') => (MemberRank::HalfOp, &raw[1..]),
-        Some(b'+') => (MemberRank::Voice, &raw[1..]),
-        _ => (MemberRank::None, raw),
+    let mut rest = raw;
+    let mut rank = MemberRank::None;
+    while let Some(byte) = rest.as_bytes().first() {
+        let this = match byte {
+            b'~' => MemberRank::Founder,
+            b'@' => MemberRank::Op,
+            b'%' => MemberRank::HalfOp,
+            b'+' => MemberRank::Voice,
+            _ => break,
+        };
+        // The highest is listed first, so only the first one read counts.
+        if rank == MemberRank::None {
+            rank = this;
+        }
+        rest = &rest[1..];
     }
+    (rank, rest)
 }
 
 fn emit_presence(state: &AppState, account_id: &str, channel: &str, members: &HashMap<String, MemberRank>) {
@@ -1081,6 +1150,34 @@ fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// multi-prefix lists every rank a person holds, highest first. Reading
+    /// only the first byte left the rest stuck to the front of the nick.
+    #[test]
+    fn every_prefix_is_stripped_and_the_highest_wins() {
+        assert_eq!(parse_prefixed_nick("@+bob"), (MemberRank::Op, "bob"));
+        assert_eq!(parse_prefixed_nick("~@%+bob"), (MemberRank::Founder, "bob"));
+        assert_eq!(parse_prefixed_nick("+bob"), (MemberRank::Voice, "bob"));
+        assert_eq!(parse_prefixed_nick("bob"), (MemberRank::None, "bob"));
+        // A nick is never only prefixes, but it must not panic if it is.
+        assert_eq!(parse_prefixed_nick("@"), (MemberRank::Op, ""));
+        assert_eq!(parse_prefixed_nick(""), (MemberRank::None, ""));
+    }
+
+    /// server-time is what stops replayed history dating itself to the
+    /// moment it was read.
+    #[test]
+    fn a_server_timestamp_is_read_when_the_server_sends_one() {
+        let msg = "@time=2026-08-29T12:34:56.789Z :bob!b@h PRIVMSG #chan :hi"
+            .parse::<irc::proto::Message>()
+            .unwrap();
+        assert_eq!(server_time(&msg), Some(1788006896));
+
+        // No tag at all is the ordinary case on a server without the
+        // capability, and must fall back rather than resolve to the epoch.
+        let bare = ":bob!b@h PRIVMSG #chan :hi".parse::<irc::proto::Message>().unwrap();
+        assert_eq!(server_time(&bare), None);
+    }
 
     /// Only the modes that rank a person move the member list; the ones
     /// that configure the channel must not be mistaken for one.

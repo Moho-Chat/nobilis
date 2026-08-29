@@ -1482,6 +1482,7 @@ impl Runtime {
     /// plan's "Architecture" section on why this lives in the daemon core,
     /// not per-backend).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_message(
         &self,
         state: &AppState,
@@ -1500,6 +1501,39 @@ impl Runtime {
         attachments: Vec<Attachment>,
         sender_id: Option<String>,
     ) {
+        self.record_message_at(
+            state, account_id, buffer_name, buffer_kind, from, body, is_action, kind, reply_to,
+            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None,
+        )
+    }
+
+    /// As `record_message`, for a protocol that knows when the message was
+    /// actually sent.
+    ///
+    /// `sent_at` is unix seconds from the wire. Without one the clock at the
+    /// moment of reading stands in, which is right for something just said
+    /// and wrong for anything replayed - a burst arriving after a reconnect
+    /// otherwise dates itself to the reconnect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_message_at(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        buffer_name: &str,
+        buffer_kind: &str,
+        from: &str,
+        body: &str,
+        is_action: bool,
+        kind: &str,
+        reply_to: Option<ReplyPreview>,
+        msg_id_override: Option<String>,
+        force_highlight: bool,
+        avatar_url: Option<String>,
+        embeds: Vec<Embed>,
+        attachments: Vec<Attachment>,
+        sender_id: Option<String>,
+        sent_at: Option<i64>,
+    ) {
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
         let own_nick = self
             .irc_current_nick(account_id)
@@ -1517,10 +1551,12 @@ impl Runtime {
                 && body.to_lowercase().contains(&own_nick.to_lowercase()));
         let is_own = !own_nick.is_empty() && from == own_nick;
         let is_dm = buffer_kind == "dm";
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let ts = sent_at.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
         // IRC has no native per-message id (a PRIVMSG carries none), so it
         // always falls back to nobilis's own generated one - but Discord's
         // MESSAGE_UPDATE/DELETE/REACTION_ADD/REMOVE dispatches reference
