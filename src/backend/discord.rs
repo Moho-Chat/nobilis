@@ -1177,7 +1177,11 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     // guild, owned or not, so this no longer skips the fetch for an owner
     // the way the roles-only version could.
     let me = own_member(config, guild).await;
-    let member_role_ids = if is_owner { Vec::new() } else { member_role_ids(me.as_ref()) };
+    let own_roles = member_role_ids(me.as_ref());
+    // An owner sees everything regardless, so the permission check is handed
+    // an empty list rather than spending the lookup - but the baseline above
+    // wants the real ones either way.
+    let member_role_ids = if is_owner { Vec::new() } else { own_roles.clone() };
     let is_pending = member_is_pending(me.as_ref());
     let account_id = config.account_id();
     let mut new_channels: Vec<(String, String)> = Vec::new();
@@ -1237,6 +1241,12 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     // show: this is what says the channel list will need rebuilding when the
     // gate lifts, and it has to outlive the flag being cleared.
     state.runtime.note_discord_gated(&group_id, is_pending);
+    // The roles we have right now, as the baseline a later change is judged
+    // against. Set here because this is where they are known: leaving the
+    // first member update to establish it meant that update - which is very
+    // often the role grant somebody has just gone and earned - was read as
+    // "nothing to compare with" and swallowed.
+    state.runtime.set_discord_own_roles(&group_id, own_roles.clone());
     state.runtime.upsert_buffer_group(
         state,
         crate::model::BufferGroup {
@@ -3392,22 +3402,26 @@ mod login_tests {
 mod tests {
 
     /// A member update arrives for a nickname as readily as for a role, and
-    /// only one of those changes what may be read. The first sighting is the
-    /// baseline rather than a change, or every guild would be re-read on the
-    /// first such event after connecting.
+    /// only one of those changes what may be read.
+    ///
+    /// Connecting sets the baseline, so the first change after it counts.
+    /// Leaving the first update to establish it meant that update - very
+    /// often the role grant somebody has just gone and earned - was read as
+    /// "nothing to compare with" and swallowed.
     #[test]
     fn only_a_real_role_change_counts() {
         let rt = crate::runtime::Runtime::new();
         let g = "discord:me|guild:1";
 
-        assert!(!rt.set_discord_own_roles(g, vec!["a".into()]), "first sighting is a baseline");
-        assert!(!rt.set_discord_own_roles(g, vec!["a".into()]), "same roles, no change");
-        assert!(rt.set_discord_own_roles(g, vec!["a".into(), "b".into()]), "gained a role");
-        assert!(rt.set_discord_own_roles(g, vec!["b".into()]), "lost one");
+        // What connecting does.
+        assert!(!rt.set_discord_own_roles(g, vec!["a".into()]), "the baseline is not a change");
+        // And the grant that follows it is.
+        assert!(rt.set_discord_own_roles(g, vec!["a".into(), "member".into()]), "gained a role");
+        assert!(!rt.set_discord_own_roles(g, vec!["a".into(), "member".into()]), "same roles again");
+        assert!(rt.set_discord_own_roles(g, vec!["a".into()]), "lost one");
         // Order is Discord's business, not a change.
-        assert!(!rt.set_discord_own_roles(g, vec!["b".into()]));
-        assert!(rt.set_discord_own_roles(g, vec!["b".into(), "c".into()]));
-        assert!(!rt.set_discord_own_roles(g, vec!["c".into(), "b".into()]), "reordered is unchanged");
+        assert!(rt.set_discord_own_roles(g, vec!["a".into(), "b".into()]));
+        assert!(!rt.set_discord_own_roles(g, vec!["b".into(), "a".into()]), "reordered is unchanged");
     }
 
     /// A burst of role edits collapses into one pass and a single follow-up
