@@ -958,20 +958,42 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
     Ok(())
 }
 
-/// Reads a guild again from scratch and re-registers what it holds.
+/// Reads a guild again and makes the channel list match what it says.
 ///
-/// Needed when what this account may see inside a guild changes after
-/// connecting - agreeing to a server's rules is the case that prompted it,
-/// where every channel appears at once for somebody who a moment ago could
-/// see none. The channel list is otherwise whatever it was at connect,
-/// because that is the only time it is built.
+/// The list is otherwise built once, at connect, and never revisited - so it
+/// drifted from reality in every direction. A channel added by an operator
+/// never appeared; one deleted stayed; agreeing to a server's rules opened
+/// everything at once and showed none of it; and a permission change that
+/// took access away left the channel sitting there until the next restart,
+/// which is the worst of the four, since it looks like a channel you can
+/// read and cannot.
 ///
-/// Two requests: the guild for its roles and ownership, and its channels,
-/// which the guild object does not carry. The position comes from the entry
-/// already in the rail rather than from either - it is the order somebody
+/// Authoritative in both directions, which is the point: what the guild now
+/// says is visible is added, and anything held for this guild that it no
+/// longer lists - deleted, or no longer permitted - is taken away.
+///
+/// Two requests, since a guild's channels do not come with it. The position
+/// comes from the rail entry rather than either: it is the order somebody
 /// dragged their servers into, which REST does not know and which would
-/// silently reshuffle if rebuilt as zero.
+/// silently reshuffle the column if rebuilt as zero.
 async fn resync_guild(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+    let account_id = config.account_id();
+    let group_id = guild_group_id(&account_id, guild_id);
+    // A burst - one event per channel while a server is rearranged - becomes
+    // one pass and at most one more that sees the settled result.
+    if !state.runtime.try_start_guild_resync(&group_id) {
+        return;
+    }
+    loop {
+        resync_guild_once(state, config, guild_id, channel_map).await;
+        if !state.runtime.finish_guild_resync(&group_id) {
+            return;
+        }
+    }
+}
+
+async fn resync_guild_once(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+    let account_id = config.account_id();
     let fetch = |path: String| async move {
         http_client()
             .get(format!("{API_BASE}/{path}"))
@@ -990,15 +1012,32 @@ async fn resync_guild(state: &AppState, config: &DiscordAccountConfig, guild_id:
         tracing::debug!("discord: could not re-read guild {guild_id}");
         return;
     };
-    if !channels.is_array() {
+    let Some(list) = channels.as_array().cloned() else {
         tracing::debug!("discord: guild {guild_id} returned no channel list");
         return;
-    }
-    guild["channels"] = channels;
-    if let Some(group) = state.runtime.get_buffer_group(&guild_group_id(&config.account_id(), guild_id)) {
+    };
+    guild["channels"] = Value::Array(list.clone());
+    if let Some(group) = state.runtime.get_buffer_group(&guild_group_id(&account_id, guild_id)) {
         guild["position"] = serde_json::json!(group.position);
     }
-    register_guild_channels(state, config, &guild, channel_map).await;
+
+    // Adds whatever is newly visible and reports everything it judged
+    // visible - which is what tells a channel still ours to read from one
+    // that merely used to be, a difference channel_map cannot make since it
+    // remembers what was registered rather than what is permitted.
+    let visible = register_guild_channels(state, config, &guild, channel_map).await;
+
+    // Anything this guild used to have and no longer offers. Deleted, or
+    // still there and no longer ours to read - which look the same from
+    // here and want the same answer.
+    for buffer_id in state.runtime.discord_buffers_in_guild(guild_id) {
+        let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) else { continue };
+        if visible.contains(&channel_id) {
+            continue;
+        }
+        channel_map.remove(&channel_id);
+        state.runtime.remove_buffer(state, &buffer_id);
+    }
 }
 
 /// This account's own membership of a guild.
@@ -1123,9 +1162,13 @@ fn can_view_channel(is_owner: bool, guild_id: &str, roles: &[Value], member_role
 /// includes every channel in the guild regardless of the requester's
 /// access, so without this check, private/role-gated channels the account
 /// has no business seeing would show up right alongside ones it can.
-async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig, guild: &Value, channel_map: &mut HashMap<String, (String, String)>) {
-    let Some(channels) = guild["channels"].as_array() else { return };
-    let Some(guild_id) = guild["id"].as_str() else { return };
+/// Returns the channels this account may currently see, so a caller
+/// rebuilding a guild can tell "still there" from "no longer ours to read"
+/// without repeating the permission reasoning that happens here.
+async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig, guild: &Value, channel_map: &mut HashMap<String, (String, String)>) -> std::collections::HashSet<String> {
+    let mut visible = std::collections::HashSet::new();
+    let Some(channels) = guild["channels"].as_array() else { return visible };
+    let Some(guild_id) = guild["id"].as_str() else { return visible };
     let guild_name = guild["name"].as_str().unwrap_or("guild").to_string();
     let roles = guild["roles"].as_array().cloned().unwrap_or_default();
     let is_owner = guild["owner_id"].as_str() == Some(config.user_id.as_str());
@@ -1239,10 +1282,11 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
             continue;
         }
         let Some(channel_id) = ch["id"].as_str() else { continue };
-        if channel_map.contains_key(channel_id) {
+        if !can_view_channel(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch) {
             continue;
         }
-        if !can_view_channel(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch) {
+        visible.insert(channel_id.to_string());
+        if channel_map.contains_key(channel_id) {
             continue;
         }
         let chan_name = ch["name"].as_str().unwrap_or("channel");
@@ -1288,6 +1332,7 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     }
 
     spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_channels);
+    visible
 }
 
 /// Fires off history backfill for a batch of newly-registered buffers as a
@@ -2690,6 +2735,14 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                                 let mut one = guild.clone();
                                 one["channels"] = serde_json::Value::Array(vec![d.clone()]);
                                 register_guild_channels(state, config, &one, channel_map).await;
+                                // An update can also be a permission change,
+                                // which can take access away as easily as
+                                // give it - and taking it away means removing
+                                // a channel, which the single-channel path
+                                // above cannot do.
+                                if t == "CHANNEL_UPDATE" {
+                                    resync_guild(state, config, guild_id, channel_map).await;
+                                }
                             }
                             // A DM or group DM opened from another client.
                             // No presence snapshot to seed it with - that
@@ -2765,6 +2818,17 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                     // deleted. The "unavailable" form is an outage rather
                     // than a departure, and taking the channels away for
                     // one would look identical to being removed.
+                    // A role's permissions changed, or a role appeared or
+                    // went away. Any of those can change which channels this
+                    // account may read, and the list is otherwise whatever
+                    // it was at connect.
+                    "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" => {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        if guild_context.contains_key(guild_id) {
+                            resync_guild(state, config, guild_id, channel_map).await;
+                        }
+                    }
+
                     // What this account may see inside a guild has changed.
                     // Agreeing to a server's rules is the case that matters:
                     // every channel becomes visible at once, and the list
@@ -2782,11 +2846,15 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             continue;
                         }
                         state.runtime.clear_discord_guild_pending(state, &account_id, guild_id);
-                        // Only for a guild that was actually gated, and only
-                        // once: an ordinary member update - a nickname, a
-                        // role - arrives here too and is no reason to re-read
-                        // a whole guild.
-                        if state.runtime.take_discord_gated(&guild_group_id(&account_id, guild_id)) {
+                        // The gate lifting is one reason to re-read; our own
+                        // roles changing is the other, since that is what
+                        // decides which channels are permitted. A nickname
+                        // change arrives here too and is no reason at all,
+                        // so the roles are compared rather than assumed.
+                        let was_gated = state.runtime.take_discord_gated(&guild_group_id(&account_id, guild_id));
+                        let roles_now: Vec<String> = d["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(String::from)).collect();
+                        let roles_changed = state.runtime.set_discord_own_roles(&guild_group_id(&account_id, guild_id), roles_now);
+                        if was_gated || roles_changed {
                             resync_guild(state, config, guild_id, channel_map).await;
                         }
                     }
@@ -3322,6 +3390,42 @@ mod login_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// A member update arrives for a nickname as readily as for a role, and
+    /// only one of those changes what may be read. The first sighting is the
+    /// baseline rather than a change, or every guild would be re-read on the
+    /// first such event after connecting.
+    #[test]
+    fn only_a_real_role_change_counts() {
+        let rt = crate::runtime::Runtime::new();
+        let g = "discord:me|guild:1";
+
+        assert!(!rt.set_discord_own_roles(g, vec!["a".into()]), "first sighting is a baseline");
+        assert!(!rt.set_discord_own_roles(g, vec!["a".into()]), "same roles, no change");
+        assert!(rt.set_discord_own_roles(g, vec!["a".into(), "b".into()]), "gained a role");
+        assert!(rt.set_discord_own_roles(g, vec!["b".into()]), "lost one");
+        // Order is Discord's business, not a change.
+        assert!(!rt.set_discord_own_roles(g, vec!["b".into()]));
+        assert!(rt.set_discord_own_roles(g, vec!["b".into(), "c".into()]));
+        assert!(!rt.set_discord_own_roles(g, vec!["c".into(), "b".into()]), "reordered is unchanged");
+    }
+
+    /// A burst of role edits collapses into one pass and a single follow-up
+    /// that sees the settled result, rather than one two-request re-read per
+    /// event while a server is being rearranged.
+    #[test]
+    fn a_burst_of_changes_collapses() {
+        let rt = crate::runtime::Runtime::new();
+        let g = "discord:me|guild:1";
+
+        assert!(rt.try_start_guild_resync(g), "first claim runs");
+        assert!(!rt.try_start_guild_resync(g), "second is folded into the first");
+        assert!(!rt.try_start_guild_resync(g), "and so is the third");
+        assert!(rt.finish_guild_resync(g), "something arrived while it ran, so run once more");
+        assert!(!rt.finish_guild_resync(g), "and nothing since, so stop");
+        // Free again afterwards.
+        assert!(rt.try_start_guild_resync(g));
+    }
 
     /// The rebuild is owed once and only for a guild that was actually
     /// gated. Ordinary member updates - a nickname, a role - arrive on the

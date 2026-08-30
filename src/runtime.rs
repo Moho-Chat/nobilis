@@ -145,6 +145,18 @@ pub struct Runtime {
     /// which is rebuilt when Discord confirms the change - would have nothing
     /// left to tell it the rebuild was owed.
     discord_gated: Mutex<std::collections::HashSet<String>>,
+    /// Guilds whose channel list is being re-read, and whether another
+    /// change arrived while it was. Role edits and permission changes come
+    /// in bursts - a server being rearranged emits one event per channel -
+    /// and each is two requests, so they collapse into one pass and a single
+    /// follow-up that sees the settled result.
+    discord_resync: Mutex<HashMap<String, bool>>,
+    /// This account's own roles per guild, as last seen.
+    ///
+    /// Kept only to tell a member update that matters from one that does
+    /// not: roles decide which channels are permitted, and a nickname change
+    /// arrives on the same event and decides nothing.
+    discord_own_roles: Mutex<HashMap<String, Vec<String>>>,
     /// Per (account, room) pagination token for reading older history.
     matrix_back_tokens: Mutex<HashMap<(String, String), String>>,
     /// A guild channel's member window in Discord's own order, by buffer.
@@ -360,6 +372,8 @@ impl Runtime {
             wants_connected: Mutex::new(std::collections::HashSet::new()),
             matrix_invites: Mutex::new(HashMap::new()),
             discord_gated: Mutex::new(std::collections::HashSet::new()),
+            discord_resync: Mutex::new(HashMap::new()),
+            discord_own_roles: Mutex::new(HashMap::new()),
             matrix_back_tokens: Mutex::new(HashMap::new()),
             discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -1312,6 +1326,44 @@ impl Runtime {
 
     pub fn discord_gateway_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
         self.discord_gateway_senders.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Records this account's roles in a guild, answering whether they
+    /// differ from what was there before.
+    ///
+    /// The first sighting is not a change: it is the baseline, and treating
+    /// it as one would re-read every guild on the first member update after
+    /// connecting.
+    pub fn set_discord_own_roles(&self, group_id: &str, roles: Vec<String>) -> bool {
+        let mut sorted = roles;
+        sorted.sort();
+        let mut all = self.discord_own_roles.lock().unwrap();
+        match all.insert(group_id.to_string(), sorted.clone()) {
+            Some(before) => before != sorted,
+            None => false,
+        }
+    }
+
+    /// Claims the right to re-read a guild, or notes that one more change
+    /// arrived while somebody else is already doing it.
+    pub fn try_start_guild_resync(&self, group_id: &str) -> bool {
+        let mut running = self.discord_resync.lock().unwrap();
+        match running.get_mut(group_id) {
+            Some(again) => {
+                *again = true;
+                false
+            }
+            None => {
+                running.insert(group_id.to_string(), false);
+                true
+            }
+        }
+    }
+
+    /// Finishes a pass, answering whether anything changed while it ran and
+    /// so whether the result it just wrote may already be out of date.
+    pub fn finish_guild_resync(&self, group_id: &str) -> bool {
+        self.discord_resync.lock().unwrap().remove(group_id).unwrap_or(false)
     }
 
     /// Records that a guild's channel list will need rebuilding once its
