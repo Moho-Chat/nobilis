@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Stamps the build with the commit it came from.
@@ -18,15 +18,45 @@ fn main() {
     let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty());
     let stamp = if dirty { format!("{commit}-modified") } else { commit };
     println!("cargo:rustc-env=NOBILIS_BUILD_COMMIT={stamp}");
+    watch_head();
+}
 
-    // Rebuild when the checkout moves. HEAD is a file in an ordinary clone
-    // and lives under the parent's modules directory in a submodule, so
-    // whichever is actually there is the one to watch.
-    for path in [".git/HEAD", "../.git/modules/nobilis/HEAD"] {
-        if Path::new(path).exists() {
-            println!("cargo:rerun-if-changed={path}");
-        }
+/// Asks cargo to run this again when the checkout moves.
+///
+/// Watching HEAD alone is not enough, and quietly so: on a branch its content
+/// is "ref: refs/heads/master", which does not change when commits land - the
+/// ref file does. Naming only HEAD also *replaces* cargo's default of
+/// rebuilding when any file in the package changes, so the stamp froze
+/// completely: the code kept updating and the commit it claimed did not.
+///
+/// So both are named, plus packed-refs, where a ref lives once git has packed
+/// it away and the loose file no longer exists.
+fn watch_head() {
+    let Some(git_dir) = git_dir() else { return };
+    let head = git_dir.join("HEAD");
+    if !head.exists() {
+        return;
     }
+    println!("cargo:rerun-if-changed={}", head.display());
+    println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+    if let Some(reference) = std::fs::read_to_string(&head).ok().and_then(|h| h.strip_prefix("ref: ").map(|r| r.trim().to_string())) {
+        println!("cargo:rerun-if-changed={}", git_dir.join(reference).display());
+    }
+}
+
+/// Where this package's git data actually lives.
+///
+/// A submodule's `.git` is a file holding "gitdir: <path>" rather than a
+/// directory, and this crate is built both ways - standalone, and as moho's
+/// submodule, which is the copy that gets packaged.
+fn git_dir() -> Option<PathBuf> {
+    let dot_git = Path::new(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git.to_path_buf());
+    }
+    let pointer = std::fs::read_to_string(dot_git).ok()?;
+    let path = pointer.strip_prefix("gitdir:")?.trim();
+    Some(PathBuf::from(path))
 }
 
 fn git(args: &[&str]) -> Option<String> {
