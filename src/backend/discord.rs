@@ -3313,7 +3313,11 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        // Reactions are rate-limited tightly, and clicking again is exactly
+        // what somebody does when one appears not to have worked - so this
+        // is a refusal people meet, and "You are being rate limited" is a
+        // great deal more use than the object carrying it.
+        bail!("{}", discord_error_text(status, &text, "reacting"));
     }
     Ok(())
 }
