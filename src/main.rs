@@ -234,6 +234,11 @@ async fn main() -> Result<()> {
 async fn run_housekeeping(state: AppState) {
     const SCROLLBACK_KEEP_PER_BUFFER: i64 = 5000;
 
+    // Ahead of the wait: this is a one-time local correction, and holding it
+    // back a minute would only mean a minute of pictures that should move
+    // sitting still.
+    backend::discord::retire_still_thumbnails().await;
+
     // Let the initial reconnect burst above settle before the first pass.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     loop {

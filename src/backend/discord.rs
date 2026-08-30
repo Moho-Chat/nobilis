@@ -1522,12 +1522,6 @@ async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String> {
     // refresh, so including it would cache the same picture repeatedly.
     let stable = cache_key.split('?').next().unwrap_or(cache_key);
     let mut hasher = Sha256::new();
-    // Bumped when what gets fetched changes rather than which file it is.
-    // The key is the attachment's path, so a thumbnail already on disk is
-    // reused forever - and every one cached before animation was asked for
-    // is a still. Without this the fix would take effect only for pictures
-    // nobody had looked at yet.
-    hasher.update(b"v2-animated:");
     hasher.update(stable.as_bytes());
     let path = dir.join(format!("{:x}", hasher.finalize()));
 
@@ -1883,6 +1877,50 @@ const THUMBNAIL_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 pub async fn sweep_thumbnail_cache() {
     super::sockchat::sweep_cache_dir(&thumbnail_cache_dir(), THUMBNAIL_CACHE_MAX_BYTES, "discord thumbnail").await;
+}
+
+/// Throw away the previews taken before animation was asked for.
+///
+/// Every one of them is a still, and nothing would otherwise replace it: a
+/// message keeps the path it was given, and a preview is only taken for an
+/// attachment that has none. Deleting the files is what retires them - a path
+/// to a file that is gone is dropped when the message is read, which puts the
+/// picture back to its original until a fresh preview is taken.
+///
+/// Once, marked by a file in the directory it clears. A preview costs a
+/// round-trip, so throwing away good ones on every start would be a poor trade
+/// for a one-time correction.
+pub async fn retire_still_thumbnails() {
+    let dir = thumbnail_cache_dir();
+    if !tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+        return;
+    }
+    let marker = dir.join(".animated");
+    if tokio::fs::try_exists(&marker).await.unwrap_or(false) {
+        return;
+    }
+
+    let mut cleared = 0usize;
+    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path == marker {
+                continue;
+            }
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                cleared += 1;
+            }
+        }
+    }
+    // The marker goes down even if nothing was there to clear, so an empty
+    // cache is not re-examined on every start.
+    if let Err(e) = tokio::fs::write(&marker, b"").await {
+        tracing::debug!("discord: marking thumbnails retired: {e}");
+        return;
+    }
+    if cleared > 0 {
+        tracing::info!("discord: retired {cleared} still thumbnail(s); they will be taken again animated");
+    }
 }
 
 /// The width to ask Discord's media proxy for. Big enough to look right in a
