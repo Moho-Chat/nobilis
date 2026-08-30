@@ -974,13 +974,23 @@ async fn own_member(config: &DiscordAccountConfig, guild: &Value) -> Option<Valu
             return Some(me.clone());
         }
     }
+    // /users/@me/guilds/{id}/member, not /guilds/{id}/members/@me. The
+    // latter is a bot endpoint: given a user token it reads "@me" as a
+    // literal id and answers 400 every time, so the fallback here silently
+    // never worked - which is why a gated server reported as ungated even
+    // after the lookup was added. Confirmed against both endpoints with a
+    // live account behind a gate.
     let guild_id = guild["id"].as_str()?;
     let resp = http_client()
-        .get(format!("{API_BASE}/guilds/{guild_id}/members/@me"))
+        .get(format!("{API_BASE}/users/@me/guilds/{guild_id}/member"))
         .header("Authorization", &config.token)
         .send()
         .await
         .ok()?;
+    if !resp.status().is_success() {
+        tracing::debug!("discord: no member object for guild {guild_id}: HTTP {}", resp.status());
+        return None;
+    }
     resp.json::<Value>().await.ok()
 }
 
