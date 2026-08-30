@@ -1522,6 +1522,12 @@ async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String> {
     // refresh, so including it would cache the same picture repeatedly.
     let stable = cache_key.split('?').next().unwrap_or(cache_key);
     let mut hasher = Sha256::new();
+    // Bumped when what gets fetched changes rather than which file it is.
+    // The key is the attachment's path, so a thumbnail already on disk is
+    // reused forever - and every one cached before animation was asked for
+    // is a still. Without this the fix would take effect only for pictures
+    // nobody had looked at yet.
+    hasher.update(b"v2-animated:");
     hasher.update(stable.as_bytes());
     let path = dir.join(format!("{:x}", hasher.finalize()));
 
@@ -1900,8 +1906,18 @@ fn thumbnail_source(url: &str, width: u32, height: u32) -> Option<String> {
     } else {
         ((width * THUMBNAIL_WIDTH / height).max(1), THUMBNAIL_WIDTH)
     };
+    // animated=true, or the proxy hands back a still. Resizing flattens
+    // animation by default, which is why an animated webp sat motionless
+    // inline and only moved once the expanded view loaded the original -
+    // that view asks for the file itself and so never lost the animation.
+    //
+    // Costs nothing on a picture that does not move: measured against this
+    // proxy, a static png came back byte-for-byte identical with and without
+    // it, while an animated webp went from 10KB to 800KB - which is the
+    // animation, and still a good deal less than the 1.3MB original the
+    // expanded view pulls.
     let sep = if proxied.contains('?') { '&' } else { '?' };
-    Some(format!("{proxied}{sep}width={w}&height={h}"))
+    Some(format!("{proxied}{sep}width={w}&height={h}&animated=true"))
 }
 
 /// The `ex=` query parameter is the link's expiry, as a hex unix timestamp.
@@ -3694,6 +3710,9 @@ mod tests {
         assert!(src.contains("height=240"), "{src}");
         // The existing query string is kept, not replaced.
         assert!(src.contains("ex=1"), "{src}");
+        // Without this the proxy flattens the animation while resizing, so
+        // anything that moves sat still inline and only moved when expanded.
+        assert!(src.contains("animated=true"), "{src}");
     }
 
     #[test]
