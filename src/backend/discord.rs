@@ -958,6 +958,32 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
     Ok(())
 }
 
+/// This account's own membership of a guild.
+///
+/// From the payload when it is there, and asked for when it is not. The
+/// gateway does not promise our own member object in GUILD_CREATE - which is
+/// exactly what made the first attempt at reading the screening flag below
+/// report every server as ungated: it read the payload only, found nothing,
+/// and took nothing to mean no.
+///
+/// Fetched once and read twice, since roles and the screening flag both live
+/// here and asking separately would be two round trips for one answer.
+async fn own_member(config: &DiscordAccountConfig, guild: &Value) -> Option<Value> {
+    if let Some(members) = guild["members"].as_array() {
+        if let Some(me) = members.iter().find(|m| m["user"]["id"].as_str() == Some(config.user_id.as_str())) {
+            return Some(me.clone());
+        }
+    }
+    let guild_id = guild["id"].as_str()?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/guilds/{guild_id}/members/@me"))
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .ok()?;
+    resp.json::<Value>().await.ok()
+}
+
 /// Whether this account has joined the guild but cannot speak in it yet.
 ///
 /// Discord calls it membership screening: a server can require agreement to
@@ -966,33 +992,20 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
 /// into it - the send simply fails, with an error about permissions that
 /// names no cause.
 ///
-/// Read from the guild payload only, unlike roles below, which fall back to a
-/// REST call. Absent means not pending, which is the ordinary case and the
-/// safe assumption: claiming a gate that is not there would hide the box for
-/// no reason.
-fn own_member_is_pending(config: &DiscordAccountConfig, guild: &Value) -> bool {
-    guild["members"]
-        .as_array()
-        .and_then(|members| members.iter().find(|m| m["user"]["id"].as_str() == Some(config.user_id.as_str())))
-        .and_then(|me| me["pending"].as_bool())
-        .unwrap_or(false)
+/// Absent means not pending, which is the ordinary case and the safe
+/// assumption: claiming a gate that is not there would put a notice above
+/// every composer for no reason.
+fn member_is_pending(member: Option<&Value>) -> bool {
+    member.and_then(|m| m["pending"].as_bool()).unwrap_or(false)
 }
 
-async fn own_guild_role_ids(config: &DiscordAccountConfig, guild: &Value) -> Vec<String> {
-    if let Some(members) = guild["members"].as_array() {
-        if let Some(me) = members.iter().find(|m| m["user"]["id"].as_str() == Some(config.user_id.as_str())) {
-            return me["roles"].as_array().map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
-        }
-    }
-    let Some(guild_id) = guild["id"].as_str() else { return Vec::new() };
-    match http_client().get(format!("{API_BASE}/guilds/{guild_id}/members/@me")).header("Authorization", &config.token).send().await {
-        Ok(resp) => match resp.json::<Value>().await {
-            Ok(member) => member["roles"].as_array().map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-    }
+fn member_role_ids(member: Option<&Value>) -> Vec<String> {
+    member
+        .and_then(|m| m["roles"].as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default()
 }
+
 
 /// Discord's documented permission-overwrite algorithm: base permissions
 /// (bitwise OR of @everyone's permissions and every role the member has),
@@ -1064,7 +1077,12 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     let roles = guild["roles"].as_array().cloned().unwrap_or_default();
     let is_owner = guild["owner_id"].as_str() == Some(config.user_id.as_str());
     // Only worth the (possible REST) round-trip if it'll actually be used.
-    let member_role_ids = if is_owner { Vec::new() } else { own_guild_role_ids(config, guild).await };
+    // One lookup for both facts. The screening flag is wanted for every
+    // guild, owned or not, so this no longer skips the fetch for an owner
+    // the way the roles-only version could.
+    let me = own_member(config, guild).await;
+    let member_role_ids = if is_owner { Vec::new() } else { member_role_ids(me.as_ref()) };
+    let is_pending = member_is_pending(me.as_ref());
     let account_id = config.account_id();
     let mut new_channels: Vec<(String, String)> = Vec::new();
 
@@ -1134,7 +1152,7 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
             // Joined, but not yet able to speak: a server with membership
             // screening turned on leaves a new member pending until they
             // agree to its rules.
-            pending: own_member_is_pending(config, guild),
+            pending: is_pending,
         },
     );
     cache_guild_icon(state.clone(), account_id.clone(), guild_id.to_string(), guild_name.clone(), guild["icon"].as_str().map(str::to_string), guild["position"].as_i64().unwrap_or(0));
@@ -3208,6 +3226,29 @@ mod login_tests {
 #[cfg(test)]
 mod tests {
 
+    /// The first attempt at this read the gateway payload only, found no
+    /// member object for us, and reported every server as ungated. Absent
+    /// still has to mean "no gate" - it is the ordinary case - which is
+    /// exactly why the caller has to look somewhere else before deciding.
+    #[test]
+    fn a_missing_member_is_not_a_gate() {
+        assert!(!member_is_pending(None));
+        assert!(!member_is_pending(Some(&json!({ "roles": [] }))));
+        assert!(!member_is_pending(Some(&json!({ "pending": false }))));
+        assert!(member_is_pending(Some(&json!({ "pending": true }))));
+    }
+
+    #[test]
+    fn roles_come_off_the_same_member_object() {
+        assert_eq!(member_role_ids(None), Vec::<String>::new());
+        assert_eq!(
+            member_role_ids(Some(&json!({ "roles": ["1", "2"] }))),
+            vec!["1".to_string(), "2".to_string()]
+        );
+        // A member object with no roles at all is ordinary, not an error.
+        assert_eq!(member_role_ids(Some(&json!({ "pending": true }))), Vec::<String>::new());
+    }
+
     /// A captcha is not a failure that retrying fixes, and it is the one
     /// answer that has to say what to do instead.
     #[test]
@@ -3296,7 +3337,8 @@ mod tests {
     }
     use super::{
         attachment_expired, default_avatar_url, dm_avatar_url, extract_attachments, extract_body,
-        apply_member_op, discord_error_text, extract_embeds, is_empty_message, reaction_path_segment, stale_message_ids,
+        apply_member_op, discord_error_text, extract_embeds, is_empty_message, member_is_pending, member_role_ids,
+        reaction_path_segment, stale_message_ids,
         thumbnail_source,
     };
     use crate::model::{Attachment, Message};
