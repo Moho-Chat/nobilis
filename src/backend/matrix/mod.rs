@@ -2433,6 +2433,7 @@ async fn register_space(
             // Matrix gives spaces no ordering of its own, so they sort by name
             // among themselves - after Discord's guilds, which do carry one.
             position: 500,
+            pending: false,
         },
     );
 

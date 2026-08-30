@@ -895,6 +895,89 @@ fn parse_perm(v: &Value) -> u64 {
 /// containing exactly our own entry). The REST fallback covers whatever
 /// case that isn't true for (large guilds are the only documented one,
 /// though not one observed during development).
+/// The rules a server wants agreed to before letting somebody speak.
+///
+/// Returned as Discord gives it - a version, a description, and the fields of
+/// the form, of which the one that matters is the TERMS field carrying the
+/// rules themselves. Handed over rather than interpreted here, so what is
+/// shown is what the server actually wrote.
+pub async fn member_verification(state: &AppState, account_id: &str, guild_id: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/guilds/{guild_id}/member-verification"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("asking Discord for this server's rules")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("{}", discord_error_text(status, &text, "reading this server's rules"));
+    }
+    serde_json::from_str(&text).context("parsing this server's rules")
+}
+
+/// Agrees to them, which is what lifts the gate.
+///
+/// The form is fetched again rather than taken from the caller: what is
+/// agreed to has to be what the server is currently asking, and a version
+/// captured when the dialog opened may not still be it. Every field is
+/// returned as sent with its response set - Discord rejects a form that has
+/// been reshaped, and it is the server's form, not ours to edit.
+pub async fn accept_member_verification(state: &AppState, account_id: &str, guild_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let form = member_verification(state, account_id, guild_id).await?;
+    let version = form["version"].clone();
+    let fields: Vec<Value> = form["form_fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| {
+            let mut field = f.clone();
+            field["response"] = Value::Bool(true);
+            field
+        })
+        .collect();
+
+    let resp = http_client()
+        .put(format!("{API_BASE}/guilds/{guild_id}/requests/@me"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({ "version": version, "form_fields": fields }))
+        .send()
+        .await
+        .context("agreeing to this server's rules")?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("{}", discord_error_text(status, &text, "agreeing to this server's rules"));
+    }
+    // Discord announces the lifted gate with GUILD_MEMBER_UPDATE, which this
+    // client does not listen for - so the group is corrected here instead,
+    // otherwise the notice would sit there until the next connection.
+    state.runtime.clear_discord_guild_pending(state, account_id, guild_id);
+    Ok(())
+}
+
+/// Whether this account has joined the guild but cannot speak in it yet.
+///
+/// Discord calls it membership screening: a server can require agreement to
+/// its rules first, and a member sits `pending` until they give it. Without
+/// reading this the client has no idea why a channel refuses everything typed
+/// into it - the send simply fails, with an error about permissions that
+/// names no cause.
+///
+/// Read from the guild payload only, unlike roles below, which fall back to a
+/// REST call. Absent means not pending, which is the ordinary case and the
+/// safe assumption: claiming a gate that is not there would hide the box for
+/// no reason.
+fn own_member_is_pending(config: &DiscordAccountConfig, guild: &Value) -> bool {
+    guild["members"]
+        .as_array()
+        .and_then(|members| members.iter().find(|m| m["user"]["id"].as_str() == Some(config.user_id.as_str())))
+        .and_then(|me| me["pending"].as_bool())
+        .unwrap_or(false)
+}
+
 async fn own_guild_role_ids(config: &DiscordAccountConfig, guild: &Value) -> Vec<String> {
     if let Some(members) = guild["members"].as_array() {
         if let Some(me) = members.iter().find(|m| m["user"]["id"].as_str() == Some(config.user_id.as_str())) {
@@ -1048,6 +1131,10 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
             // shows initials until then rather than waiting on the network.
             icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
             position: guild["position"].as_i64().unwrap_or(0),
+            // Joined, but not yet able to speak: a server with membership
+            // screening turned on leaves a new member pending until they
+            // agree to its rules.
+            pending: own_member_is_pending(config, guild),
         },
     );
     cache_guild_icon(state.clone(), account_id.clone(), guild_id.to_string(), guild_name.clone(), guild["icon"].as_str().map(str::to_string), guild["position"].as_i64().unwrap_or(0));
@@ -1552,6 +1639,7 @@ fn ensure_dm_group(state: &AppState, account_id: &str) {
             icon_url: None,
             // Above the guilds, where Discord puts it.
             position: -1,
+            pending: false,
         },
     );
 }
@@ -1621,7 +1709,8 @@ fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name:
                 name,
                 icon_url: Some(format!("file://{}", path.display())),
                 position,
-            },
+                pending: false,
+        },
         );
     });
 }

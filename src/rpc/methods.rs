@@ -41,7 +41,8 @@ pub async fn dispatch(
                     // After the guilds, which are the entries a user picks
                     // between most often.
                     position: 1000,
-                });
+                    pending: false,
+        });
             }
             groups.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
             (Some(serde_json::to_value(groups).unwrap()), None)
@@ -383,6 +384,28 @@ pub async fn dispatch(
                     },
                 },
                 _ => (Some(ok_node()), None),
+            }
+        }
+
+        // What a server wants agreed to before it will let this account
+        // speak, and agreeing to it. Two calls rather than one so the rules
+        // can be read before they are accepted - agreeing to something
+        // unseen is not agreement.
+        "getDiscordMemberVerification" | "acceptDiscordMemberVerification" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some(format!("{method} requires \"accountId\" and \"guildId\""))),
+            };
+            if method == "getDiscordMemberVerification" {
+                match backend::discord::member_verification(state, account_id, guild_id).await {
+                    Ok(form) => (Some(form), None),
+                    Err(e) => (None, Some(e.to_string())),
+                }
+            } else {
+                match backend::discord::accept_member_verification(state, account_id, guild_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e.to_string())),
+                }
             }
         }
 

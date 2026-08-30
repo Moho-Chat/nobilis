@@ -470,6 +470,29 @@ impl Runtime {
         state.events.emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
     }
 
+    /// Lifts the "you cannot speak here yet" flag on a guild.
+    ///
+    /// Called after agreeing to a server's rules. Discord announces the
+    /// change with GUILD_MEMBER_UPDATE, which this client does not listen
+    /// for, so the group is corrected directly - otherwise the notice would
+    /// sit there claiming a gate that is no longer closed.
+    pub fn clear_discord_guild_pending(&self, state: &AppState, account_id: &str, guild_id: &str) {
+        let group_id = crate::backend::discord::guild_group_id(account_id, guild_id);
+        let updated = {
+            let mut groups = self.buffer_groups.lock().unwrap();
+            match groups.get_mut(&group_id) {
+                Some(group) if group.pending => {
+                    group.pending = false;
+                    Some(group.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(group) = updated {
+            state.events.emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
+        }
+    }
+
     /// Files a buffer under a rail entry. Idempotent, and re-broadcasts the
     /// buffer so a frontend that already listed it moves it into place.
     pub fn set_buffer_group(&self, state: &AppState, buffer_id: &str, group_id: &str) {

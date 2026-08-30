@@ -173,6 +173,13 @@ pub struct BufferGroup {
     /// whatever the gateway happened to send.
     #[serde(default)]
     pub position: i64,
+    /// Set while this account has joined but cannot yet speak - Discord's
+    /// membership screening, where a server makes you agree to its rules
+    /// first. Carried on the group rather than fetched per guild because a
+    /// client needs it to say why the box is refusing, and the group is
+    /// already the thing it has in hand.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pending: bool,
 }
 
 /// A cached snapshot of the message being replied to, taken at receive
