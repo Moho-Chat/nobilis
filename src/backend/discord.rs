@@ -1165,7 +1165,15 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
             pending: is_pending,
         },
     );
-    cache_guild_icon(state.clone(), account_id.clone(), guild_id.to_string(), guild_name.clone(), guild["icon"].as_str().map(str::to_string), guild["position"].as_i64().unwrap_or(0));
+    cache_guild_icon(
+        state.clone(),
+        account_id.clone(),
+        guild_id.to_string(),
+        guild_name.clone(),
+        guild["icon"].as_str().map(str::to_string),
+        guild["position"].as_i64().unwrap_or(0),
+        is_pending,
+    );
 
     // Type 4 is a category: not a channel anyone talks in, but the heading
     // the others are filed under, and it carries its own ordering.
@@ -1704,7 +1712,13 @@ async fn cached_guild_icon(guild_id: &str, icon_hash: Option<&str>) -> Option<St
 /// thirty servers should not wait on thirty image fetches before any of their
 /// channels appear. A guild with no icon set is not an error - the rail draws
 /// initials for it, the same as Discord does.
-fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name: String, icon_hash: Option<String>, position: i64) {
+/// `pending` is carried through rather than defaulted. This rebuilds the
+/// whole rail entry once the picture lands, so anything it does not know is
+/// silently reset - which is exactly what happened to the membership flag:
+/// it was set correctly on connect and wiped moments later by the icon
+/// arriving.
+#[allow(clippy::too_many_arguments)]
+fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name: String, icon_hash: Option<String>, position: i64, pending: bool) {
     let Some(hash) = icon_hash else { return };
     tokio::spawn(async move {
         let dir = guild_icon_cache_dir();
@@ -1737,8 +1751,8 @@ fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name:
                 name,
                 icon_url: Some(format!("file://{}", path.display())),
                 position,
-                pending: false,
-        },
+                pending,
+            },
         );
     });
 }
