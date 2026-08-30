@@ -38,6 +38,20 @@ impl VoiceFlags {
     }
 }
 
+/// Somebody in a voice channel, as a call view needs them.
+///
+/// A struct rather than the tuple this used to be: it grew a picture, and a
+/// four-field tuple whose third element is an optional URL is the kind of
+/// thing that gets passed in the wrong order once and then silently shows
+/// everyone the same face.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceRosterEntry {
+    pub user_id: String,
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub flags: VoiceFlags,
+}
+
 /// Where somebody is, and what they are doing there.
 #[derive(Clone, Debug)]
 struct VoicePresence {
@@ -265,6 +279,11 @@ pub struct Runtime {
     /// in no loaded member list - a channel list showing raw snowflakes would
     /// be useless.
     discord_voice_names: Mutex<HashMap<(String, String), String>>,
+    /// (account, user) -> their picture. Alongside the names and filled from
+    /// the same places, because a call view is mostly faces: a row of coloured
+    /// initials is legible but it is not who is in the room, and the member
+    /// lists that would otherwise carry a picture do not cover a voice channel.
+    discord_voice_avatars: Mutex<HashMap<(String, String), String>>,
     /// account -> the voice channel we are in, if any.
     discord_voice_self: Mutex<HashMap<String, String>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
@@ -395,6 +414,7 @@ impl Runtime {
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
             discord_voice_names: Mutex::new(HashMap::new()),
+            discord_voice_avatars: Mutex::new(HashMap::new()),
             discord_voice_self: Mutex::new(HashMap::new()),
             discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
@@ -902,7 +922,7 @@ impl Runtime {
     /// Records where someone is, or that they left. Returns the channel they
     /// were in before, so a caller can tell a move from an arrival.
     pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>, name: Option<&str>) -> Option<String> {
-        self.set_discord_voice_presence(account_id, user_id, channel_id, name, VoiceFlags::default())
+        self.set_discord_voice_presence(account_id, user_id, channel_id, name, None, VoiceFlags::default())
     }
 
     /// The same, carrying what they are doing in there.
@@ -916,10 +936,14 @@ impl Runtime {
         user_id: &str,
         channel_id: Option<&str>,
         name: Option<&str>,
+        avatar_url: Option<&str>,
         flags: VoiceFlags,
     ) -> Option<String> {
         if let Some(name) = name.filter(|n| !n.is_empty()) {
             self.remember_discord_name(account_id, user_id, name);
+        }
+        if let Some(url) = avatar_url.filter(|u| !u.is_empty()) {
+            self.remember_discord_avatar(account_id, user_id, url);
         }
         let mut states = self.discord_voice_states.lock().unwrap();
         let key = (account_id.to_string(), user_id.to_string());
@@ -956,6 +980,29 @@ impl Runtime {
             .insert((account_id.to_string(), user_id.to_string()), name.to_string());
     }
 
+    /// Records somebody's picture, from wherever it was seen.
+    ///
+    /// Kept like the name is, and for a better reason: a voice state in a
+    /// direct call carries no member object at all, so the only chance to
+    /// learn a face there is a message they sent earlier.
+    pub fn remember_discord_avatar(&self, account_id: &str, user_id: &str, url: &str) {
+        if url.is_empty() {
+            return;
+        }
+        self.discord_voice_avatars
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), user_id.to_string()), url.to_string());
+    }
+
+    pub fn discord_known_avatar(&self, account_id: &str, user_id: &str) -> Option<String> {
+        self.discord_voice_avatars
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), user_id.to_string()))
+            .cloned()
+    }
+
     /// What this account has previously learned to call somebody.
     ///
     /// A typing notice from a DM carries no member object to read a name
@@ -976,26 +1023,32 @@ impl Runtime {
     pub fn discord_voice_members(&self, account_id: &str, channel_id: &str) -> Vec<(String, String)> {
         self.discord_voice_roster(account_id, channel_id)
             .into_iter()
-            .map(|(id, name, _)| (id, name))
+            .map(|m| (m.user_id, m.name))
             .collect()
     }
 
     /// The same, with what each of them is doing.
-    pub fn discord_voice_roster(&self, account_id: &str, channel_id: &str) -> Vec<(String, String, VoiceFlags)> {
+    pub fn discord_voice_roster(&self, account_id: &str, channel_id: &str) -> Vec<VoiceRosterEntry> {
         let names = self.discord_voice_names.lock().unwrap();
-        let mut out: Vec<(String, String, VoiceFlags)> = self
+        let avatars = self.discord_voice_avatars.lock().unwrap();
+        let mut out: Vec<VoiceRosterEntry> = self
             .discord_voice_states
             .lock()
             .unwrap()
             .iter()
             .filter(|((a, _), p)| a == account_id && p.channel_id == channel_id)
             .map(|((a, u), p)| {
-                let name = names.get(&(a.clone(), u.clone())).cloned().unwrap_or_else(|| u.clone());
-                (u.clone(), name, p.flags)
+                let key = (a.clone(), u.clone());
+                VoiceRosterEntry {
+                    user_id: u.clone(),
+                    name: names.get(&key).cloned().unwrap_or_else(|| u.clone()),
+                    avatar_url: avatars.get(&key).cloned(),
+                    flags: p.flags,
+                }
             })
             .collect();
         // Stable order, so a list does not reshuffle itself on every update.
-        out.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         out
     }
 

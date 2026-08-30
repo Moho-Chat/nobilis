@@ -18,7 +18,7 @@ use songbird::id::{ChannelId, GuildId, UserId};
 use songbird::driver::{DecodeMode, DecodeConfig};
 use songbird::{Config, ConnectionInfo, Driver, Event, EventContext, EventHandler};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 /// What has been learned about a pending voice connection so far.
@@ -113,8 +113,15 @@ pub struct VoiceState {
 pub struct SpeakingTracker {
     /// SSRC to Discord user id, learned from SpeakingStateUpdate.
     owners: Mutex<HashMap<u32, String>>,
-    /// User id to when they were last heard, and how loudly.
-    heard: Mutex<HashMap<String, (std::time::Instant, f32)>>,
+    /// SSRC to when it was last heard, and how loudly.
+    ///
+    /// Kept against the stream rather than the person, so audio that arrives
+    /// before its announcement is not thrown away. Discord only names a
+    /// stream when its owner starts speaking, and the announcement can be
+    /// missed outright - by joining a call already in progress, or by
+    /// registering for it a moment after connecting - which used to mean the
+    /// audio was heard, discarded, and nobody ever lit up.
+    heard: Mutex<HashMap<u32, (std::time::Instant, f32)>>,
 }
 
 /// How long after their last packet somebody still counts as talking.
@@ -126,33 +133,61 @@ const SPEAKING_HOLD: std::time::Duration = std::time::Duration::from_millis(400)
 
 impl SpeakingTracker {
     fn learn(&self, ssrc: u32, user_id: String) {
-        self.owners.lock().unwrap().insert(ssrc, user_id);
-    }
-
-    fn forget(&self, ssrc: u32) {
-        if let Some(user) = self.owners.lock().unwrap().remove(&ssrc) {
-            self.heard.lock().unwrap().remove(&user);
+        // Once per speaker per call, and the only evidence that Discord is
+        // announcing these at all - which is otherwise invisible from the
+        // outside, since a missing announcement and a silent room look
+        // identical in the call view.
+        if self.owners.lock().unwrap().insert(ssrc, user_id.clone()) != Some(user_id.clone()) {
+            tracing::debug!("discord voice: stream {ssrc} is user {user_id}");
         }
     }
 
+    fn forget(&self, ssrc: u32) {
+        self.owners.lock().unwrap().remove(&ssrc);
+        self.heard.lock().unwrap().remove(&ssrc);
+    }
+
     fn heard_from(&self, ssrc: u32, peak: f32) {
-        let Some(user) = self.owners.lock().unwrap().get(&ssrc).cloned() else {
-            return;
-        };
-        self.heard.lock().unwrap().insert(user, (std::time::Instant::now(), peak));
+        self.heard.lock().unwrap().insert(ssrc, (std::time::Instant::now(), peak));
     }
 
     /// Who is talking now, loudest first.
-    fn current(&self) -> Vec<(String, f32)> {
+    ///
+    /// `participants` is everyone else in the call. It is what lets a stream
+    /// nobody has claimed still be attributed: if exactly one stream is
+    /// unnamed and exactly one participant is unaccounted for, there is only
+    /// one person it can be, and that is a deduction rather than a guess.
+    /// Any less certain and it is left out, because a ring around the wrong
+    /// person is worse than a ring around nobody.
+    fn current(&self, participants: &[String]) -> Vec<(String, f32)> {
         let now = std::time::Instant::now();
-        let mut out: Vec<(String, f32)> = self
+        let owners = self.owners.lock().unwrap();
+        let live: Vec<(u32, f32)> = self
             .heard
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, (at, _))| now.duration_since(*at) < SPEAKING_HOLD)
-            .map(|(user, (_, peak))| (user.clone(), *peak))
+            .map(|(ssrc, (_, peak))| (*ssrc, *peak))
             .collect();
+
+        let mut out: Vec<(String, f32)> = Vec::new();
+        let mut unclaimed: Vec<f32> = Vec::new();
+        for (ssrc, peak) in live {
+            match owners.get(&ssrc) {
+                Some(user) => out.push((user.clone(), peak)),
+                None => unclaimed.push(peak),
+            }
+        }
+
+        if unclaimed.len() == 1 {
+            let named: HashSet<&String> = owners.values().collect();
+            let mut candidates = participants.iter().filter(|p| !named.contains(p));
+            if let (Some(only), None) = (candidates.next(), candidates.next()) {
+                out.push((only.clone(), unclaimed[0]));
+            }
+        }
+
         out.sort_by(|a, b| b.1.total_cmp(&a.1));
         out
     }
@@ -171,11 +206,18 @@ fn peak_of(samples: &[i16]) -> f32 {
 mod speaking_tests {
     use super::*;
 
+    /// Nobody else in the call, so nothing can be deduced.
+    const ALONE: &[String] = &[];
+
+    fn who(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn a_stream_nobody_has_claimed_is_heard_but_not_named() {
+    fn a_stream_nobody_has_claimed_names_nobody_on_its_own() {
         let t = SpeakingTracker::default();
         t.heard_from(1234, 0.9);
-        assert!(t.current().is_empty(), "an unowned SSRC must not invent a speaker");
+        assert!(t.current(ALONE).is_empty(), "an unowned SSRC must not invent a speaker");
     }
 
     #[test]
@@ -183,7 +225,7 @@ mod speaking_tests {
         let t = SpeakingTracker::default();
         t.learn(7, "42".into());
         t.heard_from(7, 0.5);
-        assert_eq!(t.current(), vec![("42".to_string(), 0.5)]);
+        assert_eq!(t.current(ALONE), vec![("42".to_string(), 0.5)]);
     }
 
     #[test]
@@ -193,7 +235,7 @@ mod speaking_tests {
         t.learn(2, "loud".into());
         t.heard_from(1, 0.1);
         t.heard_from(2, 0.8);
-        assert_eq!(t.current().first().unwrap().0, "loud");
+        assert_eq!(t.current(ALONE).first().unwrap().0, "loud");
     }
 
     #[test]
@@ -202,7 +244,7 @@ mod speaking_tests {
         t.learn(7, "42".into());
         t.heard_from(7, 0.5);
         t.forget(7);
-        assert!(t.current().is_empty(), "a disconnect must not leave them stuck mid-word");
+        assert!(t.current(ALONE).is_empty(), "a disconnect must not leave them stuck mid-word");
     }
 
     #[test]
@@ -213,8 +255,61 @@ mod speaking_tests {
         t.heard
             .lock()
             .unwrap()
-            .insert("42".into(), (std::time::Instant::now() - SPEAKING_HOLD * 2, 0.5));
-        assert!(t.current().is_empty());
+            .insert(7, (std::time::Instant::now() - SPEAKING_HOLD * 2, 0.5));
+        assert!(t.current(ALONE).is_empty());
+    }
+
+    #[test]
+    fn the_only_person_it_could_be_is_named_without_an_announcement() {
+        // The whole point: a two-person call where Discord never said whose
+        // stream this is. There is one other person in the room.
+        let t = SpeakingTracker::default();
+        t.heard_from(1234, 0.9);
+        assert_eq!(t.current(&who(&["them"])), vec![("them".to_string(), 0.9)]);
+    }
+
+    #[test]
+    fn two_could_be_either_so_neither_is_named() {
+        let t = SpeakingTracker::default();
+        t.heard_from(1234, 0.9);
+        assert!(
+            t.current(&who(&["one", "other"])).is_empty(),
+            "a ring on the wrong person is worse than a ring on nobody"
+        );
+    }
+
+    #[test]
+    fn two_unclaimed_streams_name_nobody_even_with_one_candidate() {
+        // Two people talking and only one unaccounted for: whichever way it
+        // is paired, one of them would be wrong.
+        let t = SpeakingTracker::default();
+        t.heard_from(1, 0.9);
+        t.heard_from(2, 0.4);
+        assert!(t.current(&who(&["them"])).is_empty());
+    }
+
+    #[test]
+    fn deduction_only_considers_people_not_already_spoken_for() {
+        // Three in the room, two of them announced - so the unclaimed stream
+        // belongs to the third, and saying so is forced rather than guessed.
+        let t = SpeakingTracker::default();
+        t.learn(1, "known".into());
+        t.learn(2, "also-known".into());
+        t.heard_from(9, 0.7);
+        assert_eq!(
+            t.current(&who(&["known", "also-known", "silent-until-now"])),
+            vec![("silent-until-now".to_string(), 0.7)]
+        );
+    }
+
+    #[test]
+    fn an_announcement_that_arrives_late_still_names_the_audio() {
+        // Audio first, name second - the order that used to lose the stream
+        // entirely, because it was discarded before anyone claimed it.
+        let t = SpeakingTracker::default();
+        t.heard_from(7, 0.6);
+        t.learn(7, "42".into());
+        assert_eq!(t.current(ALONE), vec![("42".to_string(), 0.6)]);
     }
 
     #[test]
@@ -234,7 +329,9 @@ mod speaking_tests {
 /// dropped. Saturating addition means a loud room clips rather than wrapping
 /// around into noise.
 struct Speakers {
-    playback: Arc<crate::backend::audio::Playback>,
+    /// None on a machine whose audio output would not open. The call still
+    /// runs - you can talk, and you can see who else is - it is just silent.
+    playback: Option<Arc<crate::backend::audio::Playback>>,
     tracker: Arc<SpeakingTracker>,
 }
 
@@ -269,6 +366,9 @@ impl EventHandler for Identities {
                     .filter(|(_, u)| **u == user)
                     .map(|(s, _)| *s)
                     .collect();
+                // Nothing to forget by SSRC if they never spoke - which is
+                // exactly when the deduction above was covering for them, and
+                // it stops on its own once they are out of the roster.
                 for ssrc in ssrcs {
                     self.tracker.forget(ssrc);
                 }
@@ -310,10 +410,11 @@ impl EventHandler for Speakers {
             }
         }
 
+        let Some(playback) = self.playback.as_ref() else { return None };
         let voices: Vec<&[i16]> = tick.speaking.values().filter_map(|d| d.decoded_voice.as_deref()).collect();
         let mixed = mix(&voices);
         if !mixed.is_empty() {
-            self.playback.push(&mixed);
+            playback.push(&mixed);
         }
         None
     }
@@ -380,9 +481,9 @@ impl VoiceState {
     }
 
     /// Who is talking in this account's call right now, loudest first.
-    pub fn speakers(&self, account_id: &str) -> Vec<(String, f32)> {
+    pub fn speakers(&self, account_id: &str, participants: &[String]) -> Vec<(String, f32)> {
         let speaking = self.speaking.lock().unwrap();
-        speaking.get(account_id).map(|t| t.current()).unwrap_or_default()
+        speaking.get(account_id).map(|t| t.current(participants)).unwrap_or_default()
     }
 }
 
@@ -488,19 +589,25 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let prefs = state.voice_prefs.get();
     crate::backend::audio::set_playback_muted(prefs.deafened);
-    match crate::backend::audio::start_playback(prefs.output.as_deref()) {
+    let playback = match crate::backend::audio::start_playback(prefs.output.as_deref()) {
         Ok(playback) => {
             let playback = Arc::new(playback);
-            driver.add_global_event(
-                songbird::CoreEvent::VoiceTick.into(),
-                Speakers { playback: playback.clone(), tracker: tracker.clone() },
-            );
-            state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback);
+            state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback.clone());
+            Some(playback)
         }
         // No speakers is a worse call, not a failed one - and someone who
         // only wants to talk should still be able to.
-        Err(e) => tracing::warn!("discord[{account_id}]: no audio output, joining deaf: {e:#}"),
-    }
+        Err(e) => {
+            tracing::warn!("discord[{account_id}]: no audio output, joining deaf: {e:#}");
+            None
+        }
+    };
+    // Registered whether or not there is anywhere to play the audio, which is
+    // what the tracker above promises. It used to sit inside the branch that
+    // opened the speakers, so on a machine with no working output nobody ever
+    // lit up as talking - and every tick is also where a stream is noticed at
+    // all, not only where it is heard.
+    driver.add_global_event(songbird::CoreEvent::VoiceTick.into(), Speakers { playback, tracker: tracker.clone() });
 
     if state.voice.options(account_id).transmit {
         match start_transmitting(&mut driver, prefs.input.as_deref(), prefs.mic_muted || prefs.deafened) {

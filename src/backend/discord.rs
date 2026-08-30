@@ -1227,6 +1227,7 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
                 user_id,
                 Some(channel_id),
                 voice_member_name(vs),
+                voice_member_avatar(vs).as_deref(),
                 crate::runtime::VoiceFlags::from_voice_state(vs),
             );
         }
@@ -2958,6 +2959,13 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let reply_to = extract_reply(d);
                         let real_msg_id = d["id"].as_str().map(|s| s.to_string());
                         let avatar_url = author_avatar_url(author);
+                        // Kept against their id as well as put on the message.
+                        // A direct call's voice states carry no member object,
+                        // so a face seen here is the only one its call view
+                        // will ever have to show.
+                        if let (Some(id), Some(url)) = (author["id"].as_str(), avatar_url.as_deref()) {
+                            state.runtime.remember_discord_avatar(&account_id, id, url);
+                        }
                         // Discord's gateway echoes a user's own sent messages
                         // back through this same dispatch (that's how its
                         // official multi-device sync works) - unlike IRC,
@@ -3041,6 +3049,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             user_id,
                             channel_id,
                             voice_member_name(d),
+                            voice_member_avatar(d).as_deref(),
                             crate::runtime::VoiceFlags::from_voice_state(d),
                         );
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
@@ -4152,6 +4161,30 @@ fn voice_member_name(vs: &Value) -> Option<&str> {
         .or_else(|| vs["member"]["user"]["global_name"].as_str())
         .or_else(|| vs["member"]["user"]["username"].as_str())
         .filter(|n| !n.is_empty())
+}
+
+/// Their picture, off the member Discord attaches to a voice state.
+///
+/// A guild avatar wins over the account's own where one is set: it is the
+/// face that server knows them by, and showing the other one in that server's
+/// call is the same mistake as showing their global name over their nickname.
+///
+/// `None` for a direct call, whose voice states carry no member at all - the
+/// roster falls back to whatever a message of theirs already taught us.
+fn voice_member_avatar(vs: &Value) -> Option<String> {
+    let member = &vs["member"];
+    let user_id = vs["user_id"].as_str()?;
+    if let Some(hash) = member["avatar"].as_str() {
+        // The per-guild avatar lives under the guild, not the user.
+        if let Some(guild_id) = vs["guild_id"].as_str() {
+            let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+            return Some(format!(
+                "https://cdn.discordapp.com/guilds/{guild_id}/users/{user_id}/avatars/{hash}.{ext}"
+            ));
+        }
+    }
+    let user = &member["user"];
+    author_avatar_url(user).or_else(|| default_avatar_url(user))
 }
 
 /// Tells clients that a voice channel's membership changed.

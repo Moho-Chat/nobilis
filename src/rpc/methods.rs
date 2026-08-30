@@ -806,6 +806,24 @@ pub async fn dispatch(
                 .iter()
                 .map(|id| {
                     let (heard, received) = state.voice.output_level(id).unwrap_or((0.0, 0));
+                    // Everyone else in the call. Discord names a stream only
+                    // when its owner starts speaking, so where that has not
+                    // arrived the roster is what says who the audio can
+                    // possibly be from.
+                    let own = state.accounts.get_discord(id).map(|c| c.user_id).unwrap_or_default();
+                    let others: Vec<String> = state
+                        .runtime
+                        .discord_voice_self(id)
+                        .map(|channel| {
+                            state
+                                .runtime
+                                .discord_voice_roster(id, &channel)
+                                .into_iter()
+                                .map(|m| m.user_id)
+                                .filter(|u| *u != own)
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     serde_json::json!({
                         "accountId": id,
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
@@ -816,7 +834,7 @@ pub async fn dispatch(
                         // somebody is. Loudest first.
                         "speakers": state
                             .voice
-                            .speakers(id)
+                            .speakers(id, &others)
                             .into_iter()
                             .map(|(user_id, peak)| serde_json::json!({ "userId": user_id, "peak": peak }))
                             .collect::<Vec<_>>(),
@@ -904,7 +922,7 @@ pub async fn dispatch(
                 .runtime
                 .discord_voice_roster(account_id, channel_id)
                 .into_iter()
-                .map(|(user_id, nick, flags)| voice_member_json(&user_id, &nick, &own, flags))
+                .map(|m| voice_member_json(&m, &own))
                 .collect();
             (Some(serde_json::json!(members)), None)
         }
@@ -928,7 +946,7 @@ pub async fn dispatch(
                         .runtime
                         .discord_voice_roster(account_id, &id)
                         .into_iter()
-                        .map(|(user_id, nick, flags)| voice_member_json(&user_id, &nick, &own, flags))
+                        .map(|m| voice_member_json(&m, &own))
                         .collect();
                     serde_json::json!({
                         "id": id,
@@ -1746,14 +1764,17 @@ fn account_mutation_result(result: anyhow::Result<bool>) -> (Option<Value>, Opti
 /// somebody is sharing a screen, has a camera on, or is silent. Discord sends
 /// all four on the voice state and nowhere else, so this is the only place a
 /// client can learn them.
-fn voice_member_json(user_id: &str, nick: &str, own: &str, flags: crate::runtime::VoiceFlags) -> Value {
+fn voice_member_json(m: &crate::runtime::VoiceRosterEntry, own: &str) -> Value {
     serde_json::json!({
-        "userId": user_id,
-        "nick": nick,
-        "isSelf": user_id == own,
-        "streaming": flags.streaming,
-        "video": flags.video,
-        "muted": flags.muted,
-        "deafened": flags.deafened,
+        "userId": m.user_id,
+        "nick": m.name,
+        "isSelf": m.user_id == own,
+        // Absent rather than null when we have never seen their face, which
+        // is what the frontend already falls back on for everyone else.
+        "avatarUrl": m.avatar_url,
+        "streaming": m.flags.streaming,
+        "video": m.flags.video,
+        "muted": m.flags.muted,
+        "deafened": m.flags.deafened,
     })
 }
