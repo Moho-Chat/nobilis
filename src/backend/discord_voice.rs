@@ -133,12 +133,13 @@ const SPEAKING_HOLD: std::time::Duration = std::time::Duration::from_millis(400)
 
 impl SpeakingTracker {
     fn learn(&self, ssrc: u32, user_id: String) {
-        // Once per speaker per call, and the only evidence that Discord is
-        // announcing these at all - which is otherwise invisible from the
-        // outside, since a missing announcement and a silent room look
-        // identical in the call view.
+        // Once per speaker per call, and at info because it is the only
+        // evidence that Discord is announcing these at all - which is
+        // otherwise invisible from outside, since a missing announcement and
+        // a quiet room look identical in the call view. Too cheap to hide
+        // behind a log level nobody runs with.
         if self.owners.lock().unwrap().insert(ssrc, user_id.clone()) != Some(user_id.clone()) {
-            tracing::debug!("discord voice: stream {ssrc} is user {user_id}");
+            tracing::info!("discord voice: stream {ssrc} is user {user_id}");
         }
     }
 
