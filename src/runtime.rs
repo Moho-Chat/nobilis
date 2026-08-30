@@ -137,6 +137,14 @@ pub struct Runtime {
     /// is not a room you are in, has none of its history, and answering it
     /// is a decision somebody has to make.
     matrix_invites: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Guilds this account could not speak in when it connected, by group id.
+    ///
+    /// Kept apart from the flag on the rail entry, which is about what to
+    /// show. This is about what still needs doing: the entry's flag is
+    /// cleared the moment the rules are agreed to, so the channel list -
+    /// which is rebuilt when Discord confirms the change - would have nothing
+    /// left to tell it the rebuild was owed.
+    discord_gated: Mutex<std::collections::HashSet<String>>,
     /// Per (account, room) pagination token for reading older history.
     matrix_back_tokens: Mutex<HashMap<(String, String), String>>,
     /// A guild channel's member window in Discord's own order, by buffer.
@@ -351,6 +359,7 @@ impl Runtime {
             connect_generation: Mutex::new(HashMap::new()),
             wants_connected: Mutex::new(std::collections::HashSet::new()),
             matrix_invites: Mutex::new(HashMap::new()),
+            discord_gated: Mutex::new(std::collections::HashSet::new()),
             matrix_back_tokens: Mutex::new(HashMap::new()),
             discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -1303,6 +1312,31 @@ impl Runtime {
 
     pub fn discord_gateway_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
         self.discord_gateway_senders.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Records that a guild's channel list will need rebuilding once its
+    /// gate lifts, and answers whether it still does.
+    pub fn note_discord_gated(&self, group_id: &str, gated: bool) {
+        let mut set = self.discord_gated.lock().unwrap();
+        if gated {
+            set.insert(group_id.to_string());
+        } else {
+            set.remove(group_id);
+        }
+    }
+
+    pub fn take_discord_gated(&self, group_id: &str) -> bool {
+        self.discord_gated.lock().unwrap().remove(group_id)
+    }
+
+    /// A rail entry as it currently stands, for a caller rebuilding one.
+    ///
+    /// Rebuilding from a REST fetch loses whatever the gateway alone knew -
+    /// a guild's position is the order somebody dragged their servers into
+    /// and is not in the REST guild object at all, so re-registering without
+    /// it would silently reshuffle the rail.
+    pub fn get_buffer_group(&self, group_id: &str) -> Option<crate::model::BufferGroup> {
+        self.buffer_groups.lock().unwrap().get(group_id).cloned()
     }
 
     pub fn has_buffer_group(&self, group_id: &str) -> bool {

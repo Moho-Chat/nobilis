@@ -958,6 +958,49 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
     Ok(())
 }
 
+/// Reads a guild again from scratch and re-registers what it holds.
+///
+/// Needed when what this account may see inside a guild changes after
+/// connecting - agreeing to a server's rules is the case that prompted it,
+/// where every channel appears at once for somebody who a moment ago could
+/// see none. The channel list is otherwise whatever it was at connect,
+/// because that is the only time it is built.
+///
+/// Two requests: the guild for its roles and ownership, and its channels,
+/// which the guild object does not carry. The position comes from the entry
+/// already in the rail rather than from either - it is the order somebody
+/// dragged their servers into, which REST does not know and which would
+/// silently reshuffle if rebuilt as zero.
+async fn resync_guild(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+    let fetch = |path: String| async move {
+        http_client()
+            .get(format!("{API_BASE}/{path}"))
+            .header("Authorization", &config.token)
+            .send()
+            .await
+            .ok()?
+            .json::<Value>()
+            .await
+            .ok()
+    };
+    let (Some(mut guild), Some(channels)) = (
+        fetch(format!("guilds/{guild_id}")).await,
+        fetch(format!("guilds/{guild_id}/channels")).await,
+    ) else {
+        tracing::debug!("discord: could not re-read guild {guild_id}");
+        return;
+    };
+    if !channels.is_array() {
+        tracing::debug!("discord: guild {guild_id} returned no channel list");
+        return;
+    }
+    guild["channels"] = channels;
+    if let Some(group) = state.runtime.get_buffer_group(&guild_group_id(&config.account_id(), guild_id)) {
+        guild["position"] = serde_json::json!(group.position);
+    }
+    register_guild_channels(state, config, &guild, channel_map).await;
+}
+
 /// This account's own membership of a guild.
 ///
 /// From the payload when it is there, and asked for when it is not. The
@@ -1147,6 +1190,10 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     // heard of. Discord's `position` is the order the user themselves put
     // their servers in, which is worth preserving.
     let group_id = guild_group_id(&account_id, guild_id);
+    // Remembered separately from the flag below, which is about what to
+    // show: this is what says the channel list will need rebuilding when the
+    // gate lifts, and it has to outlive the flag being cleared.
+    state.runtime.note_discord_gated(&group_id, is_pending);
     state.runtime.upsert_buffer_group(
         state,
         crate::model::BufferGroup {
@@ -2718,6 +2765,32 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                     // deleted. The "unavailable" form is an outage rather
                     // than a departure, and taking the channels away for
                     // one would look identical to being removed.
+                    // What this account may see inside a guild has changed.
+                    // Agreeing to a server's rules is the case that matters:
+                    // every channel becomes visible at once, and the list
+                    // here was built at connect and never revisited.
+                    //
+                    // Handled as an event rather than after our own accept
+                    // call, so it also covers the rules being agreed to in
+                    // Discord's own client while this one is running.
+                    "GUILD_MEMBER_UPDATE" => {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        if d["user"]["id"].as_str() != Some(config.user_id.as_str()) {
+                            continue;
+                        }
+                        if d["pending"].as_bool().unwrap_or(false) {
+                            continue;
+                        }
+                        state.runtime.clear_discord_guild_pending(state, &account_id, guild_id);
+                        // Only for a guild that was actually gated, and only
+                        // once: an ordinary member update - a nickname, a
+                        // role - arrives here too and is no reason to re-read
+                        // a whole guild.
+                        if state.runtime.take_discord_gated(&guild_group_id(&account_id, guild_id)) {
+                            resync_guild(state, config, guild_id, channel_map).await;
+                        }
+                    }
+
                     "GUILD_DELETE" => {
                         let Some(guild_id) = d["id"].as_str() else { continue };
                         if d["unavailable"].as_bool() == Some(true) {
@@ -3249,6 +3322,23 @@ mod login_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rebuild is owed once and only for a guild that was actually
+    /// gated. Ordinary member updates - a nickname, a role - arrive on the
+    /// same event and are no reason to re-read a whole guild.
+    #[test]
+    fn a_rebuild_is_owed_once_and_only_where_it_was_gated() {
+        let rt = crate::runtime::Runtime::new();
+        let gated = "discord:me|guild:1";
+        let plain = "discord:me|guild:2";
+
+        rt.note_discord_gated(gated, true);
+        rt.note_discord_gated(plain, false);
+
+        assert!(rt.take_discord_gated(gated), "a gated guild owes a rebuild");
+        assert!(!rt.take_discord_gated(gated), "and owes it only once");
+        assert!(!rt.take_discord_gated(plain), "an ungated one never did");
+    }
 
     /// The first attempt at this read the gateway payload only, found no
     /// member object for us, and reported every server as ungated. Absent
