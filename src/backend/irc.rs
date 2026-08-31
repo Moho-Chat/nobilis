@@ -1,5 +1,5 @@
 use crate::accounts::IrcAccountConfig;
-use crate::model::MemberRank;
+use crate::model::{self, MemberRank};
 use crate::nickserv::NickservWait;
 use crate::runtime::{ConnState, IrcHandle};
 use crate::state::AppState;
@@ -647,6 +647,55 @@ fn is_channel(target: &str) -> bool {
     target.starts_with(['#', '&', '+', '!'])
 }
 
+/// Whether a notice sent straight to us is the network talking rather than a
+/// person.
+///
+/// NOTICE is what RFC1459 means for status announcements, and the server and
+/// its services use it that way: connection banners, NickServ's "you are now
+/// identified", ChanServ refusing something. Those belong in the server tab,
+/// which is where nobody is expecting a conversation.
+///
+/// Everything else is somebody talking, whether or not it is a person. An
+/// XDCC bot conducts its whole side of a transfer in notices, and those have
+/// to land in the conversation that asked for it.
+///
+/// Where the two are hard to tell apart the answer leans towards a
+/// conversation, because the costs are not symmetrical: a service that gets a
+/// query window is a minor untidiness - you talk to services by messaging
+/// them anyway - while a bot's reply filed under the server tab is a reply
+/// nobody finds.
+fn notice_is_administrative(prefix: Option<&Prefix>, body: &str) -> bool {
+    // The server itself, which is not somebody you can reply to. Its prefix
+    // is a bare hostname with no nick attached.
+    let Some(Prefix::Nickname(nick, _, host)) = prefix else { return true };
+    // A reply to a CTCP query - VERSION, PING, TIME - which travels as a
+    // notice but is protocol chatter rather than anything anybody said.
+    if body.starts_with('\u{1}') {
+        return true;
+    }
+    is_service(nick, host)
+}
+
+/// A network service rather than somebody using the network.
+///
+/// Almost every network names them the same way, and where the name does not
+/// give it away the host usually does. Deliberately not exhaustive:
+/// QuakeNet's `Q` and Undernet's `X` are services with names a person could
+/// just as easily have, and guessing at those would misfile a real
+/// conversation to save a service from having a window.
+fn is_service(nick: &str, host: &str) -> bool {
+    let nick = nick.to_ascii_lowercase();
+    // NickServ, ChanServ, MemoServ, HostServ, OperServ, SaslServ, BotServ...
+    if nick.ends_with("serv") {
+        return true;
+    }
+    // Network-wide announcements, and the odd network that spells it out.
+    if matches!(nick.as_str(), "global" | "services") {
+        return true;
+    }
+    host.to_ascii_lowercase().contains("services")
+}
+
 fn strip_action(body: &str) -> Option<&str> {
     body.strip_prefix('\u{1}')
         .and_then(|s| s.strip_prefix("ACTION "))
@@ -663,6 +712,9 @@ async fn handle_message(
     channels: &mut HashMap<String, HashMap<String, MemberRank>>,
 ) {
     let from = msg.source_nickname().unwrap_or("").to_string();
+    // Kept because the match below moves `msg.command`, and telling a service
+    // apart from a person needs what sent this rather than what it said.
+    let prefix = msg.prefix.clone();
     // Only for what somebody actually said. The rest of what arrives here
     // is this client's own narration - join lines, topic notices, error
     // text - which belongs at the moment it is shown rather than at
@@ -709,9 +761,17 @@ async fn handle_message(
             }
             if is_channel(&target) {
                 state.runtime.record_message(state, account_id, &target, "channel", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
-            } else {
+            } else if notice_is_administrative(prefix.as_ref(), &body) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
                 state.runtime.record_message(state, account_id, host, "server", &from, &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            } else {
+                // Somebody talking, so it goes where talking goes - opening the
+                // conversation if there is not one yet. An XDCC bot answers a
+                // request entirely in notices: what it is sending, where you
+                // are in its queue, why it refused. In the server tab those sit
+                // a long way from the request they answer, and the conversation
+                // that asked shows nothing but your own message.
+                state.runtime.record_message_at(state, account_id, &from, "dm", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             }
         }
 
@@ -1171,6 +1231,55 @@ fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn person(nick: &str, host: &str) -> Prefix {
+        Prefix::Nickname(nick.to_string(), "u".to_string(), host.to_string())
+    }
+
+    #[test]
+    fn the_server_and_its_services_stay_in_the_server_tab() {
+        // The server itself, whose prefix carries no nick at all.
+        assert!(notice_is_administrative(Some(&Prefix::ServerName("irc.example.net".into())), "*** Looking up your hostname"));
+        // And a notice with no prefix, which is the same thing.
+        assert!(notice_is_administrative(None, "anything"));
+
+        for (nick, host) in [
+            ("NickServ", "services.libera.chat"),
+            ("nickserv", "services."),
+            ("ChanServ", "services.rizon.net"),
+            ("MemoServ", "x"),
+            ("SaslServ", "x"),
+            ("Global", "x"),
+            // Named like a person, but on a services host.
+            ("Alis", "services.libera.chat"),
+        ] {
+            assert!(notice_is_administrative(Some(&person(nick, host)), "hello"), "{nick} should be a service");
+        }
+    }
+
+    #[test]
+    fn a_bot_or_a_person_gets_a_conversation() {
+        // The case this exists for: an XDCC bot conducts its whole side of a
+        // transfer in notices, and in the server tab they sit nowhere near the
+        // request they answer.
+        for (nick, host) in [
+            ("AxA-TV2", "bot.example.net"),
+            ("Ginpachi-Sensei", "user/ginpachi"),
+            ("someone", "example.com"),
+            // Ends in "server", not "serv" - a real word, not a service.
+            ("Observer", "example.com"),
+        ] {
+            assert!(!notice_is_administrative(Some(&person(nick, host)), "** Sending you pack #5"), "{nick} should get a DM");
+        }
+    }
+
+    #[test]
+    fn a_ctcp_reply_is_not_a_conversation() {
+        // VERSION and PING answers come back as notices. They are protocol
+        // chatter, and opening a window full of control characters for them
+        // would be worse than not showing them at all.
+        assert!(notice_is_administrative(Some(&person("someone", "example.com")), "\u{1}VERSION HexChat 2.16\u{1}"));
+    }
 
     /// multi-prefix lists every rank a person holds, highest first. Reading
     /// only the first byte left the rest stuck to the front of the nick.
