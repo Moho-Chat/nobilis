@@ -38,6 +38,73 @@ impl VoiceFlags {
     }
 }
 
+/// A file somebody has offered, from the moment it is offered to the moment
+/// it is on disk or has failed.
+#[derive(Clone, Debug)]
+pub struct DccTransfer {
+    pub id: String,
+    pub account_id: String,
+    /// Who offered it.
+    pub from: String,
+    /// What we would call it on disk - already made safe.
+    pub file_name: String,
+    /// What they called it. Shown alongside where the two differ, so a name
+    /// that had to be changed is visible rather than silently substituted.
+    pub raw_name: String,
+    pub size: u64,
+    pub received: u64,
+    pub state: DccState,
+    /// Set once it is on disk.
+    pub path: Option<String>,
+    /// Why it failed, or why it was refused.
+    pub error: Option<String>,
+    /// Raised to stop a transfer that is already running.
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The offer itself, kept so accepting does not have to read anything
+    /// off the network a second time. Dropped once it is settled.
+    pub offer: Option<crate::backend::irc_dcc::DccSend>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DccState {
+    /// Waiting on an answer.
+    Offered,
+    Receiving,
+    Done,
+    Declined,
+    Failed,
+}
+
+impl DccState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DccState::Offered => "offered",
+            DccState::Receiving => "receiving",
+            DccState::Done => "done",
+            DccState::Declined => "declined",
+            DccState::Failed => "failed",
+        }
+    }
+
+    /// Still going, so it counts against the concurrency limit.
+    pub fn active(self) -> bool {
+        matches!(self, DccState::Offered | DccState::Receiving)
+    }
+}
+
+/// How many transfers are remembered at once.
+///
+/// The finished ones are kept only so the list has some history in it; a
+/// person who wants the file wants the file, not a ledger.
+const DCC_KEEP: usize = 100;
+
+/// How many unanswered offers one person may have outstanding.
+///
+/// Without this, anybody who can message you can put an unbounded queue of
+/// prompts on your screen, which is a nuisance at best and a way to hide a
+/// real prompt among fifty fake ones at worst.
+const DCC_PENDING_PER_NICK: usize = 3;
+
 /// Somebody in a voice channel, as a call view needs them.
 ///
 /// A struct rather than the tuple this used to be: it grew a picture, and a
@@ -286,6 +353,19 @@ pub struct Runtime {
     discord_voice_avatars: Mutex<HashMap<(String, String), String>>,
     /// account -> the voice channel we are in, if any.
     discord_voice_self: Mutex<HashMap<String, String>>,
+    /// Offered files waiting on an answer, and transfers already running,
+    /// newest first. One list rather than two: a person watching this is
+    /// watching one thing happen - a file arriving - and an offer is its
+    /// first state, not a different kind of object.
+    dcc_transfers: Mutex<Vec<DccTransfer>>,
+    /// account -> the route its live IRC connection is using.
+    ///
+    /// Kept rather than rebuilt from the account config when a transfer is
+    /// accepted, because the two can disagree: turning Tor off in settings
+    /// does not move a connection that is already up, and rebuilding would
+    /// then dial a transfer directly while its connection was still proxied.
+    /// No entry means no live connection, and so nothing to transfer over.
+    irc_transports: Mutex<HashMap<String, crate::net::tor::Transport>>,
     /// Discord-specific: account id -> its live gateway writer, so a status
     /// change can push a presence update on the existing connection instead of
     /// waiting for a reconnect.
@@ -416,6 +496,8 @@ impl Runtime {
             discord_voice_names: Mutex::new(HashMap::new()),
             discord_voice_avatars: Mutex::new(HashMap::new()),
             discord_voice_self: Mutex::new(HashMap::new()),
+            dcc_transfers: Mutex::new(Vec::new()),
+            irc_transports: Mutex::new(HashMap::new()),
             discord_gateway_senders: Mutex::new(HashMap::new()),
             matrix_machines: Mutex::new(HashMap::new()),
             matrix_encrypted_rooms: Mutex::new(HashSet::new()),
@@ -1028,6 +1110,77 @@ impl Runtime {
     }
 
     /// The same, with what each of them is doing.
+    /// Records a new offer, unless this person already has too many waiting.
+    ///
+    /// Returns None when the offer was dropped, so the caller can say so in
+    /// the log rather than the offer vanishing without explanation.
+    pub fn add_dcc_offer(&self, transfer: DccTransfer) -> Option<DccTransfer> {
+        let mut list = self.dcc_transfers.lock().unwrap();
+        let waiting = list
+            .iter()
+            .filter(|t| t.account_id == transfer.account_id && t.from == transfer.from && t.state == DccState::Offered)
+            .count();
+        if waiting >= DCC_PENDING_PER_NICK {
+            return None;
+        }
+        list.insert(0, transfer.clone());
+        list.truncate(DCC_KEEP);
+        Some(transfer)
+    }
+
+    pub fn set_irc_transport(&self, account_id: &str, transport: Option<crate::net::tor::Transport>) {
+        let mut map = self.irc_transports.lock().unwrap();
+        match transport {
+            Some(t) => {
+                map.insert(account_id.to_string(), t);
+            }
+            None => {
+                map.remove(account_id);
+            }
+        }
+    }
+
+    pub fn irc_transport(&self, account_id: &str) -> Option<crate::net::tor::Transport> {
+        self.irc_transports.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn dcc_transfers(&self) -> Vec<DccTransfer> {
+        self.dcc_transfers.lock().unwrap().clone()
+    }
+
+    pub fn dcc_transfer(&self, id: &str) -> Option<DccTransfer> {
+        self.dcc_transfers.lock().unwrap().iter().find(|t| t.id == id).cloned()
+    }
+
+    /// How many are offered or running, against the concurrency limit.
+    pub fn dcc_active_count(&self) -> usize {
+        self.dcc_transfers.lock().unwrap().iter().filter(|t| t.state.active()).count()
+    }
+
+    /// Applies `edit` to one transfer and hands back what it became.
+    pub fn update_dcc(&self, id: &str, edit: impl FnOnce(&mut DccTransfer)) -> Option<DccTransfer> {
+        let mut list = self.dcc_transfers.lock().unwrap();
+        let t = list.iter_mut().find(|t| t.id == id)?;
+        edit(t);
+        Some(t.clone())
+    }
+
+    /// Stops everything belonging to an account that is going away.
+    ///
+    /// A transfer outliving the connection that carried its offer would be a
+    /// socket nobody is watching any more.
+    pub fn cancel_dcc_for_account(&self, account_id: &str) {
+        for t in self.dcc_transfers.lock().unwrap().iter_mut() {
+            if t.account_id == account_id && t.state.active() {
+                t.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                if t.state == DccState::Offered {
+                    t.state = DccState::Declined;
+                    t.error = Some("disconnected before it was answered".to_string());
+                }
+            }
+        }
+    }
+
     pub fn discord_voice_roster(&self, account_id: &str, channel_id: &str) -> Vec<VoiceRosterEntry> {
         let names = self.discord_voice_names.lock().unwrap();
         let avatars = self.discord_voice_avatars.lock().unwrap();

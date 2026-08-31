@@ -173,6 +173,7 @@ async fn main() -> Result<()> {
         shutdown: Arc::new(tokio::sync::Notify::new()),
         voice: Arc::new(backend::discord_voice::VoiceState::new()),
         voice_prefs: Arc::new(backend::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
+        dcc_prefs: Arc::new(backend::irc_dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
     };
 
     // Reconnect every saved account, same as

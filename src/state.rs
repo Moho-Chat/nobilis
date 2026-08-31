@@ -30,4 +30,5 @@ pub struct AppState {
     /// Which sound devices voice uses, and whether it is silenced. Persisted,
     /// so a deliberate mute is still in force after a restart.
     pub voice_prefs: Arc<crate::backend::audio::VoicePrefsStore>,
+    pub dcc_prefs: Arc<crate::backend::irc_dcc::DccPrefsStore>,
 }

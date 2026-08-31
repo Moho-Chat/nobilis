@@ -214,6 +214,7 @@ mod tests {
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
+            dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
         };
         let config = crate::accounts::MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

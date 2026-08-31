@@ -223,6 +223,13 @@ async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<()> {
     // capability negotiation to work anywhere.
     let ison = tokio::spawn(poll_query_presence(state.clone(), account_id.clone(), sender.clone()));
 
+    // Published for as long as this connection is up, so a file offered over
+    // it is fetched back the same way. Registered rather than rebuilt when a
+    // transfer starts: turning Tor off in settings does not move a connection
+    // that is already established, and a transfer must follow the connection
+    // rather than the setting.
+    state.runtime.set_irc_transport(&account_id, Some(super::irc_dcc::transport_for(config)));
+
     let result = async {
         while let Some(msg) = stream.next().await.transpose()? {
             handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
@@ -231,6 +238,13 @@ async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<()> {
     }
     .await;
     ison.abort();
+    // The route goes with the connection, and so does anything running over
+    // it: a transfer that outlived its connection would be a socket nobody
+    // is watching, and an unanswered offer would be a prompt for a file that
+    // can no longer arrive. `result?` below returns on error, so this has to
+    // come first.
+    state.runtime.set_irc_transport(&account_id, None);
+    state.runtime.cancel_dcc_for_account(&account_id);
     result?;
 
     Ok(())
@@ -662,6 +676,13 @@ async fn handle_message(
             } else {
                 (from.clone(), "dm")
             };
+            // Before it is treated as something somebody said. A file offer
+            // is CTCP, and recording it as a message put a line of control
+            // characters in the log where the offer should have been.
+            if let Some(dcc) = super::irc_dcc::parse_dcc(&body) {
+                super::irc_dcc::incoming(state, account_id, &from, &buffer_name, kind, dcc).await;
+                return;
+            }
             if let Some(action_body) = strip_action(&body) {
                 state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             } else {

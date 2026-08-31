@@ -849,6 +849,67 @@ pub async fn dispatch(
         // a second window has to agree with the first.
         "getVoicePrefs" => (Some(serde_json::to_value(state.voice_prefs.get()).unwrap()), None),
 
+        // Files offered over IRC. Offers and transfers are one list: what a
+        // person is watching is a file arriving, and being offered is its
+        // first state rather than a different kind of thing.
+        "listTransfers" => {
+            let rows: Vec<Value> =
+                state.runtime.dcc_transfers().iter().map(backend::irc_dcc::transfer_json).collect();
+            (Some(serde_json::json!(rows)), None)
+        }
+
+        "acceptTransfer" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("acceptTransfer requires \"id\"".to_string()));
+            };
+            backend::irc_dcc::accept(state, id);
+            (Some(Value::Bool(true)), None)
+        }
+
+        // Turning down an offer and stopping one already running are the same
+        // request from where the person is sitting - they want it to stop.
+        "cancelTransfer" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("cancelTransfer requires \"id\"".to_string()));
+            };
+            backend::irc_dcc::cancel(state, id, "declined");
+            (Some(Value::Bool(true)), None)
+        }
+
+        // The resolved directory goes out alongside the setting, so a window
+        // can show where files will actually land rather than an empty box
+        // that means "wherever the platform puts them".
+        "getDccPrefs" => {
+            let prefs = state.dcc_prefs.get();
+            let mut out = serde_json::to_value(&prefs).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("resolvedDirectory".into(), Value::String(prefs.download_dir().display().to_string()));
+            }
+            (Some(out), None)
+        }
+
+        "setDccPrefs" => {
+            let prefs = state.dcc_prefs.update(|p| {
+                if let Some(dir) = p_str_opt(params, "directory") {
+                    p.directory = (!dir.is_empty()).then(|| dir.to_string());
+                }
+                if let Some(n) = params.get("maxBytes").and_then(|v| v.as_u64()) {
+                    p.max_bytes = n;
+                }
+                if let Some(n) = params.get("maxTransfers").and_then(|v| v.as_u64()) {
+                    // One is the smallest useful answer; zero would mean
+                    // nothing could ever be accepted, which the auto-accept
+                    // toggle already expresses better.
+                    p.max_transfers = (n as usize).max(1);
+                }
+                if let Some(b) = params.get("autoAccept").and_then(|v| v.as_bool()) {
+                    p.auto_accept = b;
+                }
+            });
+            state.events.emit("dccPrefsChanged", serde_json::to_value(&prefs).unwrap_or_default());
+            (Some(serde_json::to_value(&prefs).unwrap_or_default()), None)
+        }
+
         // Choosing a device. An input choice takes effect on a call already in
         // progress: the stream is moved rather than reopened, which is what
         // the desktop's own mixer does.
