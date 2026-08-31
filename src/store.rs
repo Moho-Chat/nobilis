@@ -107,7 +107,7 @@ impl Store {
         attachments: &[Attachment],
         sender_id: Option<&str>,
         html: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         // Live messages are always freshly created with no reactions yet
         // (the column's own schema default, '[]', already covers that) -
@@ -116,7 +116,7 @@ impl Store {
         let reactions_json = if initial_reactions.is_empty() { None } else { Some(serde_json::to_string(initial_reactions)?) };
         let embeds_json = if embeds.is_empty() { None } else { Some(serde_json::to_string(embeds)?) };
         let attachments_json = if attachments.is_empty() { None } else { Some(serde_json::to_string(attachments)?) };
-        conn.execute(
+        let inserted = conn.execute(
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
@@ -143,7 +143,11 @@ impl Store {
                 html,
             ],
         )?;
-        Ok(())
+        // Whether this was actually new. The insert has always ignored a
+        // repeat; saying so is what lets a caller tell "stored" from "already
+        // had it", which is the difference between announcing a message once
+        // and announcing it again every time a backend replays its history.
+        Ok(inserted > 0)
     }
 
     /// A live edit (Discord's MESSAGE_UPDATE) - updates the body of an
@@ -568,6 +572,41 @@ mod tests {
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
         s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
             .expect("appending");
+    }
+
+    #[test]
+    fn a_message_stored_twice_is_only_new_once() {
+        // What a reconnect looks like: the backend replays a room's recent
+        // history, and every message in it arrives again. Saying so is what
+        // stops a mention in that history notifying on every reconnect - the
+        // same one, over and over, for a message read hours ago.
+        let (st, dir) = store();
+        let first = st
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None)
+            .expect("appending");
+        let again = st
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None)
+            .expect("appending again");
+
+        assert!(first, "the first time is new");
+        assert!(!again, "the second time is a replay, not a message");
+        assert_eq!(st.get_backlog("room", i64::MAX, 50).unwrap().len(), 1, "and only one was kept");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_same_id_in_two_rooms_is_two_messages() {
+        // The index is on the pair, not the id: a whisper and a room message
+        // can carry the same uuid, and treating the second as a replay would
+        // silently drop it.
+        let (st, dir) = store();
+        assert!(st
+            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
+            .unwrap());
+        assert!(st
+            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None)
+            .unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1884,7 +1884,7 @@ impl Runtime {
         embeds: Vec<Embed>,
         attachments: Vec<Attachment>,
         sender_id: Option<String>,
-    ) {
+    ) -> bool {
         self.record_message_at(
             state, account_id, buffer_name, buffer_kind, from, body, is_action, kind, reply_to,
             msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None, None,
@@ -1918,7 +1918,7 @@ impl Runtime {
         sender_id: Option<String>,
         sent_at: Option<i64>,
         html: Option<String>,
-    ) {
+    ) -> bool {
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
         let own_nick = self
             .irc_current_nick(account_id)
@@ -1952,8 +1952,20 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        if let Err(e) = state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref()) {
-            tracing::warn!("failed to persist message: {e}");
+        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref()) {
+            // Already had it, so there is nothing to announce. Sneedchat
+            // replays a room's recent history whenever its connection comes
+            // back, and every backend that carries real message ids can
+            // repeat itself the same way after an outage. Without this, a
+            // mention in that history is a fresh notification on every
+            // reconnect - the same one, over and over, for a message that was
+            // read hours ago.
+            Ok(false) => return false,
+            Ok(true) => {}
+            // A message that could not be stored is still shown. Losing it
+            // outright would be the worse failure, and a duplicate line is
+            // recoverable by scrolling.
+            Err(e) => tracing::warn!("failed to persist message: {e}"),
         }
 
         // Bump the buffer's own activity timestamp and re-broadcast it as a
@@ -2010,6 +2022,7 @@ impl Runtime {
                 }),
             );
         }
+        true
     }
 
     /// A live edit (Discord's MESSAGE_UPDATE) - a no-op broadcast-wise if
