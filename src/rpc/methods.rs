@@ -1721,6 +1721,58 @@ pub async fn dispatch(
         // there is nothing to ask the server for - a query exists because a
         // client says it does - so this only creates the buffer and checks
         // whether the person is currently connected.
+        // One way in for every service that has one-to-one conversations,
+        // rather than a caller that has to know which method each of them
+        // wants. What identifies somebody differs - IRC has only a nick,
+        // Discord and Matrix have real ids - so both are taken and each
+        // backend uses the one it can.
+        //
+        // The per-service methods below remain: they are what this dispatches
+        // to, and they are still the right call where the caller already knows
+        // which service it is talking about.
+        "openDirectMessage" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("openDirectMessage requires \"accountId\"".to_string()));
+            };
+            let user_id = p_str_opt(params, "userId").unwrap_or("");
+            let nick = p_str_opt(params, "nick").unwrap_or("");
+            let Some(account) = state.runtime.list_accounts(state).into_iter().find(|a| a.id == account_id) else {
+                return (None, Some(format!("no account {account_id}")));
+            };
+
+            let opened = match account.service.as_str() {
+                // A query is local: IRC has no server-side notion of opening
+                // one, so the nick is all there is and all that is needed.
+                "irc" => {
+                    let who = if nick.is_empty() { user_id } else { nick };
+                    if who.is_empty() {
+                        Err(anyhow::anyhow!("no nick to open a conversation with"))
+                    } else {
+                        backend::irc::open_query(state, account_id, who)
+                    }
+                }
+                "discord" => {
+                    if user_id.is_empty() {
+                        Err(anyhow::anyhow!("Discord needs the person's id, not their name"))
+                    } else {
+                        backend::discord::open_dm(state, account_id, user_id).await
+                    }
+                }
+                "matrix" => {
+                    if user_id.is_empty() {
+                        Err(anyhow::anyhow!("Matrix needs the person's id, not their name"))
+                    } else {
+                        backend::matrix::open_dm(state, account_id, user_id, nick).await
+                    }
+                }
+                other => Err(anyhow::anyhow!("{other} has no direct messages")),
+            };
+            match opened {
+                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "openIrcQuery" => {
             let (account_id, nick) = match (p_str_opt(params, "accountId"), p_str_opt(params, "nick")) {
                 (Some(a), Some(n)) => (a, n),
