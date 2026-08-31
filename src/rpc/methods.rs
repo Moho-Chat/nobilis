@@ -205,7 +205,9 @@ pub async fn dispatch(
                 username: p_str_opt(params, "username").map(String::from),
                 quit_message: p_str_opt(params, "quitMessage").map(String::from),
                 allow_plaintext_sasl: p_bool(params, "allowPlaintextSasl", false),
-                autojoin: String::new(),
+                // A link can name channels, so a new account can arrive with
+                // somewhere to be rather than connecting to nothing.
+                autojoin: p_str_opt(params, "autojoin").unwrap_or("").to_string(),
                 nickserv_password: None,
                 display_name: None,
                 use_tor: false,
