@@ -902,6 +902,9 @@ pub async fn dispatch(
                     // toggle already expresses better.
                     p.max_transfers = (n as usize).max(1);
                 }
+                if let Some(n) = params.get("maxRate").and_then(|v| v.as_u64()) {
+                    p.max_rate = n;
+                }
                 if let Some(b) = params.get("autoAccept").and_then(|v| v.as_bool()) {
                     p.auto_accept = b;
                 }

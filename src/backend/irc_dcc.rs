@@ -298,6 +298,10 @@ pub fn assert_inside(dir: &Path, target: &Path) -> Result<()> {
 /// point of keeping it here is that there is only one answer and it is not
 /// reachable from a message.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+// Matching VoicePrefs beside it: these go to a frontend as they are, so they
+// are named the way the frontend names things rather than being translated at
+// every boundary.
+#[serde(rename_all = "camelCase")]
 pub struct DccPrefs {
     /// None means the platform's own downloads folder, which is what somebody
     /// who has never chosen wants.
@@ -309,6 +313,12 @@ pub struct DccPrefs {
     pub max_bytes: u64,
     #[serde(default = "default_max_transfers")]
     pub max_transfers: usize,
+    /// Bytes a second, across all transfers at once. Zero means as fast as it
+    /// comes, which is the right default: somebody who needs a limit knows
+    /// they need one, and somebody who does not should not be throttled by a
+    /// guess about their connection.
+    #[serde(default)]
+    pub max_rate: u64,
     /// Take offers without asking. Off, and worth keeping off: an offer is a
     /// stranger putting a file on your disk.
     #[serde(default)]
@@ -329,6 +339,7 @@ impl Default for DccPrefs {
             directory: None,
             max_bytes: default_max_bytes(),
             max_transfers: default_max_transfers(),
+            max_rate: 0,
             auto_accept: false,
         }
     }
@@ -394,16 +405,69 @@ impl DccPrefsStore {
 /// enough that cancelling is felt immediately.
 const CHUNK: usize = 64 * 1024;
 
-/// How often to report progress, in bytes moved.
+/// How often to report progress.
 ///
-/// Every chunk would be several hundred events a second on a fast transfer,
-/// all of them redrawing one progress bar.
-const PROGRESS_EVERY: u64 = 512 * 1024;
+/// Timed rather than counted in bytes: a byte interval reports constantly on
+/// a fast transfer and almost never on a slow one, which is backwards - the
+/// slow one is the one somebody is watching to see whether it is moving at
+/// all. It also makes the rate below a measurement over a known interval
+/// rather than over however long the last half megabyte happened to take.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// What a transfer tells the world as it runs.
 pub struct Progress {
     pub received: u64,
     pub total: u64,
+    /// Bytes a second, over the last interval rather than the whole transfer:
+    /// an average since the start keeps showing a healthy rate for a transfer
+    /// that stalled a minute ago.
+    pub rate: u64,
+}
+
+/// Holds a transfer to a set number of bytes a second.
+///
+/// Averaged over a window that restarts rather than over the whole transfer,
+/// so a slow start cannot bank credit and then be spent as a burst - which is
+/// the failure people notice, because the burst is what saturates the line
+/// they set the limit to protect.
+struct RateLimiter {
+    rate: u64,
+    window_start: std::time::Instant,
+    window_bytes: u64,
+}
+
+impl RateLimiter {
+    fn new(rate: u64) -> Self {
+        Self { rate, window_start: std::time::Instant::now(), window_bytes: 0 }
+    }
+
+    /// How much to ask for at once.
+    ///
+    /// Small enough under a limit that the waits between reads stay short:
+    /// one 64KB read at 32KB/s would be a two second sleep, and a cancel
+    /// pressed during it would appear to do nothing.
+    fn read_size(&self) -> usize {
+        if self.rate == 0 {
+            return CHUNK;
+        }
+        (self.rate / 8).clamp(4096, CHUNK as u64) as usize
+    }
+
+    async fn take(&mut self, n: u64) {
+        if self.rate == 0 {
+            return;
+        }
+        self.window_bytes += n;
+        let owed = std::time::Duration::from_secs_f64(self.window_bytes as f64 / self.rate as f64);
+        let spent = self.window_start.elapsed();
+        if owed > spent {
+            tokio::time::sleep(owed - spent).await;
+        }
+        if self.window_start.elapsed() >= std::time::Duration::from_secs(1) {
+            self.window_start = std::time::Instant::now();
+            self.window_bytes = 0;
+        }
+    }
 }
 
 /// Receives one offered file.
@@ -422,6 +486,7 @@ pub async fn receive(
     transport: &crate::net::tor::Transport,
     dir: &Path,
     max_bytes: u64,
+    max_rate: u64,
     cancel: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<PathBuf> {
@@ -441,7 +506,7 @@ pub async fn receive(
     assert_inside(dir, &target)?;
     let part = part_path(&target);
 
-    let result = stream_to(offer, transport, &part, cancel, &mut on_progress).await;
+    let result = stream_to(offer, transport, &part, max_rate, cancel, &mut on_progress).await;
     match result {
         Ok(()) => {
             tokio::fs::rename(&part, &target)
@@ -462,6 +527,7 @@ async fn stream_to(
     offer: &DccSend,
     transport: &crate::net::tor::Transport,
     part: &Path,
+    max_rate: u64,
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: &mut impl FnMut(Progress),
 ) -> Result<()> {
@@ -479,9 +545,12 @@ async fn stream_to(
         .await
         .with_context(|| format!("creating {}", part.display()))?;
 
+    let mut limiter = RateLimiter::new(max_rate);
     let mut buf = vec![0u8; CHUNK];
     let mut received: u64 = 0;
-    let mut last_reported: u64 = 0;
+    // Where the last progress report was taken from, which is what makes the
+    // rate a measurement over an interval rather than a running average.
+    let mut mark = (std::time::Instant::now(), 0u64);
     // Acknowledgements are advisory, and a sender that has stopped reading
     // them must not be written to again: on a socket the far end has closed,
     // writing provokes a reset, and a reset throws away whatever this side
@@ -493,7 +562,8 @@ async fn stream_to(
         if cancel.load(std::sync::atomic::Ordering::Relaxed) {
             bail!("cancelled");
         }
-        let n = stream.read(&mut buf).await.context("reading from the sender")?;
+        let want = limiter.read_size();
+        let n = stream.read(&mut buf[..want]).await.context("reading from the sender")?;
         if n == 0 {
             break;
         }
@@ -516,10 +586,17 @@ async fn stream_to(
             }
         }
 
-        if received - last_reported >= PROGRESS_EVERY || received == offer.size {
-            last_reported = received;
-            on_progress(Progress { received, total: offer.size });
+        let since = mark.0.elapsed();
+        if since >= PROGRESS_EVERY || received == offer.size {
+            let moved = received - mark.1;
+            let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
+            mark = (std::time::Instant::now(), received);
+            on_progress(Progress { received, total: offer.size, rate });
         }
+
+        // After the accounting, so a limited transfer still reports what it
+        // moved before it waits.
+        limiter.take(n as u64).await;
 
         // Done when what was offered has arrived, rather than when the sender
         // gets around to closing. Waiting for the close would hang against a
@@ -632,6 +709,7 @@ pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &s
         raw_name: offer.raw_name.clone(),
         size: offer.size,
         received: 0,
+        rate: 0,
         state: crate::runtime::DccState::Offered,
         path: None,
         error: None,
@@ -690,8 +768,11 @@ pub fn accept(state: &AppState, id: &str) {
         let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
         let progress_state = state.clone();
         let progress_id = id.clone();
-        let result = receive(&offer, &transport, &dir, prefs.max_bytes, &cancel, |p| {
-            if let Some(t) = progress_state.runtime.update_dcc(&progress_id, |t| t.received = p.received) {
+        let result = receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, &cancel, |p| {
+            if let Some(t) = progress_state.runtime.update_dcc(&progress_id, |t| {
+                t.received = p.received;
+                t.rate = p.rate;
+            }) {
                 announce(&progress_state, &t);
             }
         })
@@ -703,6 +784,7 @@ pub fn accept(state: &AppState, id: &str) {
                 if let Some(t) = state.runtime.update_dcc(&id, |t| {
                     t.state = crate::runtime::DccState::Done;
                     t.received = t.size;
+                    t.rate = 0;
                     t.path = Some(path.display().to_string());
                 }) {
                     announce(&state, &t);
@@ -740,6 +822,7 @@ fn fail(state: &AppState, id: &str, why: &str) {
     if let Some(t) = state.runtime.update_dcc(id, |t| {
         t.state = crate::runtime::DccState::Failed;
         t.error = Some(why.to_string());
+        t.rate = 0;
     }) {
         announce(state, &t);
     }
@@ -759,6 +842,7 @@ pub fn transfer_json(t: &crate::runtime::DccTransfer) -> serde_json::Value {
         "rawName": t.raw_name,
         "size": t.size,
         "received": t.received,
+        "rate": t.rate,
         "state": t.state.as_str(),
         "path": t.path,
         "error": t.error,
@@ -948,7 +1032,7 @@ mod transfer_tests {
 
     async fn run(dir: &Path, offer: &DccSend, max: u64) -> Result<PathBuf> {
         let cancel = AtomicBool::new(false);
-        receive(offer, &crate::net::tor::Transport::Direct, dir, max, &cancel, |_| {}).await
+        receive(offer, &crate::net::tor::Transport::Direct, dir, max, 0, &cancel, |_| {}).await
     }
 
     #[tokio::test]
@@ -1005,6 +1089,50 @@ mod transfer_tests {
         offer.token = Some("123".into());
         let err = run(&dir, &offer, 0).await.unwrap_err();
         assert!(format!("{err:#}").contains("reverse"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_actually_slows_it_down() {
+        let dir = temp_dir("rate");
+        // 40KB at 20KB/s is about two seconds; unlimited it is instant over
+        // loopback. Asserting only the floor, because a machine under load
+        // can always be slower and a test that fails for that is worthless.
+        let body = vec![4u8; 40 * 1024];
+        let port = serve(body.clone()).await;
+        let cancel = AtomicBool::new(false);
+
+        let began = std::time::Instant::now();
+        let offer = offer_of(port, "slow.bin", body.len() as u64);
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 20 * 1024, &cancel, |_| {})
+            .await
+            .expect("should still arrive");
+        let took = began.elapsed();
+
+        assert!(took >= std::time::Duration::from_millis(900), "took {took:?}, so the limit did nothing");
+        assert_eq!(std::fs::read(dir.join("slow.bin")).unwrap().len(), body.len());
+    }
+
+    #[tokio::test]
+    async fn progress_reports_a_rate() {
+        let dir = temp_dir("progress");
+        let body = vec![5u8; 60 * 1024];
+        let port = serve(body.clone()).await;
+        let cancel = AtomicBool::new(false);
+        let seen = std::sync::Mutex::new(Vec::new());
+
+        let offer = offer_of(port, "measured.bin", body.len() as u64);
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 16 * 1024, &cancel, |p| {
+            seen.lock().unwrap().push((p.received, p.rate));
+        })
+        .await
+        .unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "a transfer should report progress at least once");
+        // The last report is the whole file, which is what a finished bar
+        // needs in order to reach the end.
+        assert_eq!(seen.last().unwrap().0, body.len() as u64);
+        assert!(seen.iter().any(|(_, rate)| *rate > 0), "no report carried a rate: {seen:?}");
     }
 
     #[tokio::test]

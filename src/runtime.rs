@@ -53,6 +53,8 @@ pub struct DccTransfer {
     pub raw_name: String,
     pub size: u64,
     pub received: u64,
+    /// Bytes a second over the last interval, while it is running.
+    pub rate: u64,
     pub state: DccState,
     /// Set once it is on disk.
     pub path: Option<String>,
