@@ -11,6 +11,27 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// A transfer as it is kept on disk.
+///
+/// Deliberately not `runtime::DccTransfer`: that one carries a cancel flag and
+/// the offer it came from, which are about a transfer that is happening rather
+/// than one that happened, and have no meaning once it is written down.
+#[derive(Clone, Debug)]
+pub struct TransferRow {
+    pub id: String,
+    pub account_id: String,
+    pub outgoing: bool,
+    pub peer: String,
+    pub file_name: String,
+    pub raw_name: String,
+    pub size: u64,
+    pub received: u64,
+    pub state: String,
+    pub path: Option<String>,
+    pub error: Option<String>,
+    pub ts: i64,
+}
+
 impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)
@@ -34,7 +55,22 @@ impl Store {
                 is_highlight INTEGER NOT NULL DEFAULT 0,
                 kind TEXT NOT NULL DEFAULT 'chat'
             );
-            CREATE INDEX IF NOT EXISTS idx_messages_buffer_ts ON messages(buffer_id, ts);",
+            CREATE INDEX IF NOT EXISTS idx_messages_buffer_ts ON messages(buffer_id, ts);
+            CREATE TABLE IF NOT EXISTS transfers (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                outgoing INTEGER NOT NULL DEFAULT 0,
+                peer TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                raw_name TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                received INTEGER NOT NULL DEFAULT 0,
+                state TEXT NOT NULL,
+                path TEXT,
+                error TEXT,
+                ts INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_transfers_ts ON transfers(ts);",
         )?;
         // Defensive no-ops for a scrollback.db predating these columns,
         // same as store.c's post-hoc ALTER TABLE. Ignore "duplicate column".
@@ -54,6 +90,15 @@ impl Store {
             // separate rather than replacing body: the plain text is the
             // fallback every other protocol uses and the one search reads.
             "ALTER TABLE messages ADD COLUMN html TEXT",
+            // Which kind of conversation this was said in.
+            //
+            // Buffers live only as long as the daemon does - they are rebuilt
+            // as connections come back and rejoin - so a query that scoped
+            // itself to the ones currently known could not see anything said
+            // in a channel not yet rejoined. That is why mentions appeared to
+            // vanish over a restart: the messages were here all along, and
+            // nothing could name the conversations they belonged to.
+            "ALTER TABLE messages ADD COLUMN buffer_kind TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -107,6 +152,7 @@ impl Store {
         attachments: &[Attachment],
         sender_id: Option<&str>,
         html: Option<&str>,
+        buffer_kind: &str,
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         // Live messages are always freshly created with no reactions yet
@@ -120,8 +166,8 @@ impl Store {
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
-            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18)",
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19)",
             params![
                 msg_id,
                 buffer_id,
@@ -141,6 +187,7 @@ impl Store {
                 sender_id,
                 attachments_json,
                 html,
+                buffer_kind,
             ],
         )?;
         // Whether this was actually new. The insert has always ignored a
@@ -379,30 +426,111 @@ impl Store {
     /// - by the backend that knows whether a mention is real, which for
     /// Discord is its own resolved mentions array rather than a guess at the
     /// nickname.
-    pub fn mentions(&self, buffer_ids: &[String], limit: i64) -> Result<Vec<Message>> {
-        if buffer_ids.is_empty() {
-            return Ok(Vec::new());
-        }
+    /// Mentions, from the messages themselves rather than from whatever
+    /// conversations happen to be open.
+    ///
+    /// `known_channels` covers the rows written before messages recorded which
+    /// kind of conversation they were said in - those have no `buffer_kind`,
+    /// so the only thing that can vouch for them is the live buffer list, as
+    /// this always used to do. Everything written since stands on its own and
+    /// survives a restart, which is the point.
+    pub fn mentions(&self, known_channels: &[String], limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 100 };
-        let places = std::iter::repeat("?").take(buffer_ids.len()).collect::<Vec<_>>().join(",");
+        let places = std::iter::repeat("?").take(known_channels.len()).collect::<Vec<_>>().join(",");
+        let legacy = if known_channels.is_empty() {
+            String::new()
+        } else {
+            format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
+        };
         let sql = format!(
             "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_id
              FROM messages
-             WHERE is_highlight = 1 AND is_own = 0 AND buffer_id IN ({places})
+             WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::ToSql> = buffer_ids.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        let mut params: Vec<&dyn rusqlite::ToSql> = known_channels.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
         params.push(&limit);
         let rows = stmt.query_map(params.as_slice(), |row| {
             // The buffer is read back per row rather than stamped from a
             // parameter, since unlike every other query here this one spans
             // conversations and each answer belongs to a different one.
-            let buffer_id: String = row.get(17)?;
+            //
+            // Index 18, after the eighteen columns row_to_message reads. It
+            // used to say 17, which is `html` - so every mention on a service
+            // that sends no HTML, meaning all of them but Matrix, failed the
+            // whole query with "Invalid column type Null". Nothing showed that:
+            // the page fills from live messages as well, so mentions appeared
+            // to work and then to vanish whenever the daemon restarted.
+            let buffer_id: String = row.get(18)?;
             Self::row_to_message(&buffer_id, row)
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Writes a transfer down, or updates the one already there.
+    ///
+    /// Every state it passes through, not only the end: a transfer interrupted
+    /// by the daemon stopping should still be in the list afterwards, saying
+    /// what happened to it, rather than having never existed.
+    pub fn record_transfer(&self, t: &TransferRow) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO transfers (id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET received = ?8, state = ?9, path = ?10, error = ?11",
+            params![
+                t.id,
+                t.account_id,
+                t.outgoing as i32,
+                t.peer,
+                t.file_name,
+                t.raw_name,
+                t.size as i64,
+                t.received as i64,
+                t.state,
+                t.path,
+                t.error,
+                t.ts,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The transfers worth remembering, newest first.
+    pub fn recent_transfers(&self, limit: i64) -> Result<Vec<TransferRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts
+             FROM transfers ORDER BY ts DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(TransferRow {
+                id: row.get(0)?,
+                account_id: row.get(1)?,
+                outgoing: row.get::<_, i32>(2)? != 0,
+                peer: row.get(3)?,
+                file_name: row.get(4)?,
+                raw_name: row.get(5)?,
+                size: row.get::<_, i64>(6)? as u64,
+                received: row.get::<_, i64>(7)? as u64,
+                state: row.get(8)?,
+                path: row.get(9)?,
+                error: row.get(10)?,
+                ts: row.get(11)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
+    /// Drops the oldest transfers beyond `keep`.
+    pub fn prune_transfers(&self, keep: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM transfers WHERE id NOT IN (SELECT id FROM transfers ORDER BY ts DESC LIMIT ?1)",
+            params![keep],
+        )?)
     }
 
     /// Messages in one buffer whose text contains `query`.
@@ -564,14 +692,90 @@ mod tests {
     }
 
     fn append(s: &Store, buffer: &str, id: &str) {
-        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
+        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
             .expect("appending");
     }
 
     /// Like `append`, but with text worth searching for.
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
-        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
+        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
             .expect("appending");
+    }
+
+    fn mention(s: &Store, buffer: &str, id: &str, kind: &str) {
+        s.append_message(buffer, id, "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, kind)
+            .expect("appending");
+    }
+
+    #[test]
+    fn a_mention_is_found_without_the_conversation_being_open() {
+        // The whole point: buffers live only as long as the daemon, so a
+        // mention that could only be found by naming a live one disappeared
+        // over a restart even though it was on disk the whole time.
+        let (st, dir) = store();
+        mention(&st, "irc|#chan", "1", "channel");
+
+        let found = st.mentions(&[], 50).unwrap();
+        assert_eq!(found.len(), 1, "a mention must not need its channel to be open");
+        assert_eq!(found[0].buffer_id, "irc|#chan");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_direct_message_is_not_a_mention() {
+        // It already has its own conversation and its own row in the list;
+        // collecting it here would also drag in every service robot that says
+        // your name in a query.
+        let (st, dir) = store();
+        mention(&st, "irc|NickServ", "1", "dm");
+        assert!(st.mentions(&[], 50).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_mention_written_before_this_change_still_needs_its_channel_named() {
+        // Rows from before messages recorded which kind of conversation they
+        // were in have nothing to vouch for them but the live buffer list,
+        // which is exactly what this used to rely on.
+        let (st, dir) = store();
+        st.append_message("irc|#old", "1", "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+            .unwrap();
+        st.conn.lock().unwrap().execute("UPDATE messages SET buffer_kind = NULL", []).unwrap();
+
+        assert!(st.mentions(&[], 50).unwrap().is_empty(), "nothing vouches for it");
+        assert_eq!(st.mentions(&["irc|#old".to_string()], 50).unwrap().len(), 1, "the live list still does");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_transfer_is_remembered_and_updated_in_place() {
+        let (st, dir) = store();
+        let mut row = super::TransferRow {
+            id: "t1".into(),
+            account_id: "irc|a".into(),
+            outgoing: false,
+            peer: "someone".into(),
+            file_name: "film.mkv".into(),
+            raw_name: "film.mkv".into(),
+            size: 100,
+            received: 0,
+            state: "receiving".into(),
+            path: None,
+            error: None,
+            ts: 42,
+        };
+        st.record_transfer(&row).unwrap();
+        row.received = 100;
+        row.state = "done".into();
+        row.path = Some("/tmp/film.mkv".into());
+        st.record_transfer(&row).unwrap();
+
+        let back = st.recent_transfers(50).unwrap();
+        assert_eq!(back.len(), 1, "the same transfer must not become two");
+        assert_eq!(back[0].state, "done");
+        assert_eq!(back[0].received, 100);
+        assert_eq!(back[0].path.as_deref(), Some("/tmp/film.mkv"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -582,10 +786,10 @@ mod tests {
         // same one, over and over, for a message read hours ago.
         let (st, dir) = store();
         let first = st
-            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None)
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
             .expect("appending");
         let again = st
-            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None)
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
             .expect("appending again");
 
         assert!(first, "the first time is new");
@@ -601,10 +805,10 @@ mod tests {
         // silently drop it.
         let (st, dir) = store();
         assert!(st
-            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None)
+            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
             .unwrap());
         assert!(st
-            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None)
+            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None, "channel")
             .unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -727,7 +931,7 @@ mod dedupe_tests {
     }
 
     fn put(s: &Store, buffer: &str, id: &str, body: &str) {
-        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None);
+        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel");
     }
 
     /// A backend replaying history it already has - Sneedchat does this on

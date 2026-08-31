@@ -69,6 +69,10 @@ pub struct DccTransfer {
     /// The offer itself, kept so accepting does not have to read anything
     /// off the network a second time. Dropped once it is settled.
     pub offer: Option<crate::backend::irc_dcc::DccSend>,
+    /// When it started, so the order survives being written down and read
+    /// back - a list kept only in memory can rely on its own order, and one
+    /// that outlives the process cannot.
+    pub started_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +87,19 @@ pub enum DccState {
 }
 
 impl DccState {
+    /// The inverse of `as_str`, for a transfer read back from disk.
+    ///
+    /// Anything unrecognised is treated as failed rather than as still
+    /// running: a state this version does not know about came from another
+    /// one, and a row that cannot be acted on should not look live.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "done" => DccState::Done,
+            "declined" => DccState::Declined,
+            _ => DccState::Failed,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             DccState::Offered => "offered",
@@ -104,7 +121,7 @@ impl DccState {
 ///
 /// The finished ones are kept only so the list has some history in it; a
 /// person who wants the file wants the file, not a ledger.
-const DCC_KEEP: usize = 100;
+pub const DCC_KEEP: usize = 100;
 
 /// How many unanswered offers one person may have outstanding.
 ///
@@ -574,6 +591,17 @@ impl Runtime {
 
     pub fn list_buffers(&self) -> Vec<Buffer> {
         self.buffers.lock().unwrap().values().cloned().collect()
+    }
+
+    /// What kind of conversation a buffer is, for a caller writing history
+    /// into it directly.
+    ///
+    /// Falls back to "channel" rather than to nothing: history is only ever
+    /// backfilled into a conversation that is open, so an absent answer means
+    /// something has gone wrong upstream, and the fallback is the kind that
+    /// makes a mention in it findable rather than invisible.
+    pub fn buffer_kind_of(&self, buffer_id: &str) -> String {
+        self.get_buffer(buffer_id).map(|b| b.kind).unwrap_or_else(|| "channel".to_string())
     }
 
     pub fn get_buffer(&self, buffer_id: &str) -> Option<Buffer> {
@@ -1150,6 +1178,20 @@ impl Runtime {
 
     pub fn irc_transport(&self, account_id: &str) -> Option<crate::net::tor::Transport> {
         self.irc_transports.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Puts a transfer back, without the checks a new offer goes through.
+    ///
+    /// For history read off disk: it has already happened, so there is nothing
+    /// to rate-limit and nobody to refuse.
+    pub fn push_dcc_transfer(&self, transfer: DccTransfer) {
+        let mut list = self.dcc_transfers.lock().unwrap();
+        if list.iter().any(|t| t.id == transfer.id) {
+            return;
+        }
+        list.push(transfer);
+        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        list.truncate(DCC_KEEP);
     }
 
     pub fn dcc_transfers(&self) -> Vec<DccTransfer> {
@@ -1958,7 +2000,7 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref()) {
+        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref(), buffer_kind) {
             // Already had it, so there is nothing to announce. Sneedchat
             // replays a room's recent history whenever its connection comes
             // back, and every backend that carries real message ids can

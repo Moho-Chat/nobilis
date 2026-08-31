@@ -732,6 +732,7 @@ pub async fn offer_file(state: &AppState, account_id: &str, nick: &str, path: &s
         error: None,
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offer: None,
+        started_at: now_seconds(),
     };
     let Some(transfer) = state.runtime.add_dcc_offer(transfer) else {
         bail!("too many transfers are already going");
@@ -1010,6 +1011,7 @@ pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &s
         error: None,
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offer: Some(offer),
+        started_at: now_seconds(),
     };
     let Some(transfer) = state.runtime.add_dcc_offer(transfer) else {
         note(state, account_id, buffer, kind, &format!("{from} is offering more files than moho will queue up."));
@@ -1123,9 +1125,72 @@ fn fail(state: &AppState, id: &str, why: &str) {
     }
 }
 
-/// Tells every window what a transfer looks like now.
+/// Tells every window what a transfer looks like now, and writes it down.
+///
+/// The same call for both because they answer the same question - what this
+/// transfer looks like - and separating them is how a list ends up disagreeing
+/// with itself over a restart. Written on every step rather than only at the
+/// end, so a transfer interrupted by the daemon stopping is still in the list
+/// afterwards saying what happened, rather than having never existed.
 pub fn announce(state: &AppState, t: &crate::runtime::DccTransfer) {
+    if let Err(e) = state.store.record_transfer(&crate::store::TransferRow {
+        id: t.id.clone(),
+        account_id: t.account_id.clone(),
+        outgoing: t.outgoing,
+        peer: t.from.clone(),
+        file_name: t.file_name.clone(),
+        raw_name: t.raw_name.clone(),
+        size: t.size,
+        received: t.received,
+        state: t.state.as_str().to_string(),
+        path: t.path.clone(),
+        error: t.error.clone(),
+        ts: t.started_at,
+    }) {
+        tracing::debug!("dcc: remembering a transfer: {e}");
+    }
     state.events.emit("dccTransfer", transfer_json(t));
+}
+
+/// Brings back what was going on before the daemon stopped.
+///
+/// Anything that was still moving is recorded as failed rather than restored:
+/// its socket died with the process, and a row claiming to be in progress
+/// would sit at whatever fraction it reached forever, with a cancel button
+/// that does nothing.
+pub fn restore_transfers(state: &AppState) {
+    let rows = match state.store.recent_transfers(crate::runtime::DCC_KEEP as i64) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!("dcc: reading past transfers: {e}");
+            return;
+        }
+    };
+    let mut restored = 0usize;
+    for row in rows {
+        let interrupted = matches!(row.state.as_str(), "offered" | "receiving" | "sending");
+        state.runtime.push_dcc_transfer(crate::runtime::DccTransfer {
+            id: row.id,
+            account_id: row.account_id,
+            outgoing: row.outgoing,
+            from: row.peer,
+            file_name: row.file_name,
+            raw_name: row.raw_name,
+            size: row.size,
+            received: row.received,
+            rate: 0,
+            state: if interrupted { crate::runtime::DccState::Failed } else { crate::runtime::DccState::from_str(&row.state) },
+            path: row.path,
+            error: if interrupted { Some("interrupted when moho was last closed".to_string()) } else { row.error },
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            offer: None,
+            started_at: row.ts,
+        });
+        restored += 1;
+    }
+    if restored > 0 {
+        tracing::info!("dcc: {restored} past transfer(s) remembered");
+    }
 }
 
 pub fn transfer_json(t: &crate::runtime::DccTransfer) -> serde_json::Value {
@@ -1164,6 +1229,10 @@ fn note(state: &AppState, account_id: &str, buffer: &str, kind: &str, text: &str
         Vec::new(),
         None,
     );
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
 /// Sizes as a person reads them.

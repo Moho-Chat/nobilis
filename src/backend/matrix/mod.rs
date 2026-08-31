@@ -1109,6 +1109,7 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
         if let Err(e) = state.store.append_message(
             buffer_id, event_id, &from, &body, ts, is_action, false, "message", None, &[], is_own,
             avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
+            &state.runtime.buffer_kind_of(buffer_id),
         ) {
             tracing::warn!("matrix: storing history message: {e}");
             continue;

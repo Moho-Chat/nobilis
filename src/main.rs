@@ -193,6 +193,10 @@ async fn main() -> Result<()> {
         backend::matrix::spawn(state.clone(), cfg);
     }
 
+    // What was going on last time, before anything is served: a window that
+    // connects immediately should see the same list it was looking at.
+    backend::irc_dcc::restore_transfers(&state);
+
     tokio::spawn(run_housekeeping(state.clone()));
 
     let socket_path = opts.socket_path.unwrap_or_else(rpc::default_socket_path);
@@ -252,6 +256,13 @@ async fn run_housekeeping(state: AppState) {
                 }
             }
             Err(e) => tracing::warn!("scrollback: pruning failed: {e}"),
+        }
+
+        // Kept to the same number the runtime holds, so the list does not
+        // grow without bound across restarts while showing only the newest.
+        match state.store.prune_transfers(crate::runtime::DCC_KEEP as i64) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => tracing::info!("transfers: forgot {n} old record(s)"),
         }
 
         backend::sockchat::sweep_avatar_cache().await;
