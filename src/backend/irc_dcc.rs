@@ -573,10 +573,11 @@ async fn stream_to(
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: &mut impl FnMut(Progress),
 ) -> Result<()> {
-    let mut stream = transport
-        .connect(&offer.addr.to_string(), offer.port, false)
-        .await
-        .with_context(|| format!("connecting to {}:{}", offer.addr, offer.port))?;
+    // No context added here: Transport::connect already names the address and
+    // the route it tried, so wrapping it printed the address twice in one
+    // sentence - which is what a failed transfer showed on the downloads
+    // screen, in a line too long to fit because half of it was a repeat.
+    let mut stream = transport.connect(&offer.addr.to_string(), offer.port, false).await?;
 
     // create_new, so if the check above raced with another transfer this is
     // an error rather than two writers sharing a file.

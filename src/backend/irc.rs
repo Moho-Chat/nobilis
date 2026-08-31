@@ -1,5 +1,5 @@
 use crate::accounts::IrcAccountConfig;
-use crate::model::{self, MemberRank};
+use crate::model::MemberRank;
 use crate::nickserv::NickservWait;
 use crate::runtime::{ConnState, IrcHandle};
 use crate::state::AppState;
