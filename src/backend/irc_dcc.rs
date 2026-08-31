@@ -347,17 +347,59 @@ impl Default for DccPrefs {
 
 impl DccPrefs {
     /// Where files land, resolved.
-    ///
-    /// `dirs` answers per platform, so this is the real Downloads folder on
-    /// Windows rather than an XDG path nothing there writes to.
     pub fn download_dir(&self) -> PathBuf {
-        self.directory
-            .as_ref()
-            .filter(|d| !d.is_empty())
-            .map(PathBuf::from)
-            .or_else(dirs::download_dir)
-            .or_else(dirs::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
+        resolve_download_dir(self.directory.as_deref(), dirs::download_dir(), dirs::home_dir())
+    }
+}
+
+/// The download folder, in the order the answer should be looked for.
+///
+/// Whatever the platform says first: `XDG_DOWNLOAD_DIR` from user-dirs on
+/// Linux, `FOLDERID_Downloads` on Windows. Somewhere of one's own only when
+/// somebody has actually named one.
+///
+/// The last resort is the interesting part. On Linux `dirs` reports nothing at
+/// all when user-dirs has no `XDG_DOWNLOAD_DIR` line, which is an ordinary
+/// state for a machine that has never run a desktop's first-run setup - and
+/// this one is such a machine. Falling through to the home directory there
+/// drops downloaded files loose in it. The XDG user-dirs spec gives
+/// `$HOME/Downloads` as the default for that entry when it is unset, so that
+/// is what is used, which is also what Chromium does for the same question
+/// and so what the rest of moho already resolves to.
+fn resolve_download_dir(configured: Option<&str>, platform: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    configured
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or(platform)
+        .or_else(|| home.map(|h| h.join("Downloads")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod download_dir_tests {
+    use super::*;
+
+    fn p(s: &str) -> Option<PathBuf> {
+        Some(PathBuf::from(s))
+    }
+
+    #[test]
+    fn somewhere_chosen_wins() {
+        assert_eq!(resolve_download_dir(Some("/srv/files"), p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/srv/files"));
+    }
+
+    #[test]
+    fn otherwise_the_platform_answers() {
+        assert_eq!(resolve_download_dir(None, p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/home/a/Downloads"));
+        // An empty setting is not a choice; it is the absence of one.
+        assert_eq!(resolve_download_dir(Some(""), p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/home/a/Downloads"));
+    }
+
+    #[test]
+    fn a_machine_with_no_user_dirs_still_uses_a_downloads_folder() {
+        // The case this exists for: no XDG_DOWNLOAD_DIR, so `dirs` says
+        // nothing. Files must not end up loose in the home directory.
+        assert_eq!(resolve_download_dir(None, None, p("/home/a")), PathBuf::from("/home/a/Downloads"));
     }
 }
 
