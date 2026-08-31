@@ -860,6 +860,20 @@ pub async fn dispatch(
             (Some(serde_json::json!(rows)), None)
         }
 
+        // Offering somebody a file. The listening half of DCC, so it is also
+        // the half with conditions on it - see offer_file.
+        "sendFile" => {
+            let (account_id, nick, path) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "nick"), p_str_opt(params, "path")) {
+                    (Some(a), Some(n), Some(p)) => (a, n, p),
+                    _ => return (None, Some("sendFile requires \"accountId\", \"nick\" and \"path\"".to_string())),
+                };
+            match backend::irc_dcc::offer_file(state, account_id, nick, path).await {
+                Ok(id) => (Some(serde_json::json!({ "id": id })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "acceptTransfer" => {
             let Some(id) = p_str_opt(params, "id") else {
                 return (None, Some("acceptTransfer requires \"id\"".to_string()));
@@ -909,6 +923,9 @@ pub async fn dispatch(
                 }
                 if let Some(b) = params.get("autoAccept").and_then(|v| v.as_bool()) {
                     p.auto_accept = b;
+                }
+                if let Some(ip) = p_str_opt(params, "advertisedIp") {
+                    p.advertised_ip = (!ip.is_empty()).then(|| ip.to_string());
                 }
             });
             state.events.emit("dccPrefsChanged", serde_json::to_value(&prefs).unwrap_or_default());

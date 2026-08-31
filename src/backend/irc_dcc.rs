@@ -16,11 +16,17 @@
 //! 3. The route is inherited from the connection that carried the offer. An
 //!    account reached through Tor transfers through Tor, and a proxy that will
 //!    not carry it is an error rather than a reason to dial direct.
+//!
+//! Sending is the other direction and a different shape. Receiving only ever
+//! dials out; sending has to listen and publish an address, which is why it is
+//! the half with conditions on it - refused outright on a connection through a
+//! proxy, since the address it would have to give out is the one the proxy
+//! exists to keep quiet.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use crate::state::AppState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -323,6 +329,11 @@ pub struct DccPrefs {
     /// stranger putting a file on your disk.
     #[serde(default)]
     pub auto_accept: bool,
+    /// The address to publish when sending a file, where the machine cannot
+    /// work it out for itself. Behind a router it never can: it knows its own
+    /// side of the network and not the one the other person has to reach.
+    #[serde(default)]
+    pub advertised_ip: Option<String>,
 }
 
 fn default_max_bytes() -> u64 {
@@ -341,6 +352,7 @@ impl Default for DccPrefs {
             max_transfers: default_max_transfers(),
             max_rate: 0,
             auto_accept: false,
+            advertised_ip: None,
         }
     }
 }
@@ -657,6 +669,245 @@ async fn stream_to(
     Ok(())
 }
 
+// --- offering a file -----------------------------------------------------
+
+/// How long an offer waits for them to accept before giving up.
+///
+/// Long enough for somebody to be away from the keyboard when it arrives,
+/// short enough that a socket is not left open all day for an offer nobody
+/// saw.
+const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Sends somebody a file.
+///
+/// This is the half that listens, which is why it is the half with conditions
+/// on it. We open a port, tell them where to find it, and they connect; there
+/// is no way to do that without publishing an address, which is why it is
+/// refused outright on a connection routed through a proxy. Sending from
+/// behind one needs the reverse form of this, where the receiver listens and
+/// we dial - and that is a different thing to build, not a flag to flip.
+pub async fn offer_file(state: &AppState, account_id: &str, nick: &str, path: &str) -> Result<String> {
+    if nick.trim().is_empty() {
+        bail!("no one to send it to");
+    }
+    let transport = state.runtime.irc_transport(account_id).context("that connection is no longer up")?;
+    if !matches!(transport, crate::net::tor::Transport::Direct) {
+        bail!("this connection goes through a proxy, and sending a file means opening a port on it - which would give away the address the proxy is there to hide");
+    }
+    let sender = state.runtime.irc_sender(account_id).context("that connection is no longer up")?;
+
+    let meta = tokio::fs::metadata(path).await.with_context(|| format!("reading {path}"))?;
+    if !meta.is_file() {
+        bail!("only a file can be sent");
+    }
+    let size = meta.len();
+    if size == 0 {
+        bail!("that file is empty");
+    }
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(safe_file_name)
+        .filter(|n| !n.is_empty())
+        .context("that file has no usable name")?;
+
+    // Port 0 asks the system for a free one, which is what every client does:
+    // a fixed port would collide with the second transfer.
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.context("opening a port to send from")?;
+    let port = listener.local_addr().context("reading the port")?.port();
+    let advertise = advertised_address(state, account_id).await?;
+
+    let transfer = crate::runtime::DccTransfer {
+        id: format!("dcc-{}", crate::model::next_message_id()),
+        account_id: account_id.to_string(),
+        outgoing: true,
+        from: nick.to_string(),
+        file_name: name.clone(),
+        raw_name: name.clone(),
+        size,
+        received: 0,
+        rate: 0,
+        state: crate::runtime::DccState::Offered,
+        path: Some(path.to_string()),
+        error: None,
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        offer: None,
+    };
+    let Some(transfer) = state.runtime.add_dcc_offer(transfer) else {
+        bail!("too many transfers are already going");
+    };
+    announce(state, &transfer);
+
+    // A name with a space in it has to be quoted or the receiver reads the
+    // rest of it as the address.
+    let advertised_name = if name.contains(' ') { format!("\"{name}\"") } else { name.clone() };
+    let ip_number = u32::from(advertise);
+    let ctcp = format!("\u{1}DCC SEND {advertised_name} {ip_number} {port} {size}\u{1}");
+    sender
+        .send(irc::proto::Command::PRIVMSG(nick.to_string(), ctcp))
+        .map_err(|e| anyhow!("telling {nick} about it: {e}"))?;
+    tracing::info!("dcc: offering \"{name}\" ({size} bytes) to {nick} on {advertise}:{port}");
+
+    let prefs_rate = state.dcc_prefs.get().max_rate;
+    let id = transfer.id.clone();
+    // The caller gets the id back so it can follow this transfer; the task
+    // needs its own copy, since it outlives this function.
+    let task_id = id.clone();
+    let state = state.clone();
+    let path = path.to_string();
+    tokio::spawn(async move {
+        let id = task_id;
+        let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
+        let accepted_state = state.clone();
+        let accepted_id = id.clone();
+        let progress_state = state.clone();
+        let progress_id = id.clone();
+        let result = serve_file(
+            listener,
+            &path,
+            size,
+            prefs_rate,
+            &cancel,
+            || {
+                if let Some(t) =
+                    accepted_state.runtime.update_dcc(&accepted_id, |t| t.state = crate::runtime::DccState::Sending)
+                {
+                    announce(&accepted_state, &t);
+                }
+            },
+            |p| {
+                if let Some(t) = progress_state.runtime.update_dcc(&progress_id, |t| {
+                    t.received = p.received;
+                    t.rate = p.rate;
+                }) {
+                    announce(&progress_state, &t);
+                }
+            },
+        )
+        .await;
+        match result {
+            Ok(()) => {
+                if let Some(t) = state.runtime.update_dcc(&id, |t| {
+                    t.state = crate::runtime::DccState::Done;
+                    t.received = t.size;
+                    t.rate = 0;
+                }) {
+                    announce(&state, &t);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("dcc: sending failed: {e:#}");
+                fail(&state, &id, &format!("{e:#}"));
+            }
+        }
+    });
+
+    Ok(id)
+}
+
+/// Waits for them to connect, then hands the file over.
+///
+/// Takes what to do about progress rather than the state to do it to, the same
+/// way receiving does - which is also what lets the interesting half of this
+/// be tested against a real socket without a running daemon around it.
+async fn serve_file(
+    listener: tokio::net::TcpListener,
+    path: &str,
+    size: u64,
+    max_rate: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_accepted: impl FnOnce(),
+    mut on_progress: impl FnMut(Progress),
+) -> Result<()> {
+    let accepted = tokio::time::timeout(OFFER_TIMEOUT, listener.accept()).await;
+    // The listener is dropped either way once this returns, so an offer that
+    // nobody took does not leave a port open behind it.
+    let (mut sock, peer) = match accepted {
+        Err(_) => bail!("they did not accept it within {} seconds", OFFER_TIMEOUT.as_secs()),
+        Ok(Err(e)) => return Err(anyhow!("waiting for them to connect: {e}")),
+        Ok(Ok(pair)) => pair,
+    };
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        bail!("cancelled");
+    }
+    tracing::info!("dcc: {peer} is taking the file");
+    on_accepted();
+
+    let mut file = tokio::fs::File::open(path).await.with_context(|| format!("opening {path}"))?;
+    // The same limit as receiving, and for a better reason: an upload at full
+    // speed is what makes the rest of a home connection unusable, since the
+    // line is the narrow way round.
+    let mut limiter = RateLimiter::new(max_rate);
+    let mut buf = vec![0u8; CHUNK];
+    let mut sent: u64 = 0;
+    let mut mark = (std::time::Instant::now(), 0u64);
+
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        let want = limiter.read_size();
+        let n = file.read(&mut buf[..want]).await.context("reading the file")?;
+        if n == 0 {
+            break;
+        }
+        sock.write_all(&buf[..n]).await.context("sending")?;
+        sent += n as u64;
+
+        let since = mark.0.elapsed();
+        if since >= PROGRESS_EVERY || sent == size {
+            let moved = sent - mark.1;
+            let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
+            mark = (std::time::Instant::now(), sent);
+            on_progress(Progress { received: sent, total: size, rate });
+        }
+        limiter.take(n as u64).await;
+    }
+
+    // Their acknowledgements are not waited on. Every byte is already in the
+    // kernel's hands, and a receiver that stops acknowledging - plenty ignore
+    // them entirely - would otherwise hold this open until it timed out.
+    sock.flush().await.context("finishing the send")?;
+    if sent != size {
+        bail!("only {sent} of {size} bytes went");
+    }
+    Ok(())
+}
+
+/// The address to tell them to connect to.
+///
+/// Whatever has been set by hand wins, because nothing else can be right
+/// behind a router: the machine only knows its own side of it, and the address
+/// worth publishing is the one the router answers on.
+///
+/// Otherwise it is the address this machine uses to reach the IRC server,
+/// found by asking the system which one it would use rather than by sending
+/// anything. That is right on a machine facing the internet directly and
+/// wrong behind NAT, which is why the setting exists.
+async fn advertised_address(state: &AppState, account_id: &str) -> Result<std::net::Ipv4Addr> {
+    let prefs = state.dcc_prefs.get();
+    if let Some(set) = prefs.advertised_ip.as_deref().filter(|s| !s.is_empty()) {
+        return set
+            .parse::<std::net::Ipv4Addr>()
+            .with_context(|| format!("the address set for sending files, {set:?}, is not an IPv4 address"));
+    }
+
+    let config = state.accounts.get_irc(account_id).context("account not connected")?;
+    let port = config.port.unwrap_or(if config.ssl { 6697 } else { 6667 });
+    // A connected UDP socket picks a route and a source address without
+    // sending a packet, which is the portable way to ask "which of my
+    // addresses would reach that host".
+    let probe = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.context("finding this machine's address")?;
+    probe
+        .connect((config.host.as_str(), port))
+        .await
+        .with_context(|| format!("finding the address that reaches {}", config.host))?;
+    match probe.local_addr().context("reading this machine's address")?.ip() {
+        std::net::IpAddr::V4(v4) => Ok(v4),
+        std::net::IpAddr::V6(_) => bail!("this connection is IPv6, which the DCC address field cannot carry - set an address by hand in settings"),
+    }
+}
+
 // --- wiring it to a connection -------------------------------------------
 
 /// The route a transfer for this account must take.
@@ -751,6 +1002,7 @@ pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &s
         file_name: offer.file_name.clone(),
         raw_name: offer.raw_name.clone(),
         size: offer.size,
+        outgoing: false,
         received: 0,
         rate: 0,
         state: crate::runtime::DccState::Offered,
@@ -880,6 +1132,7 @@ pub fn transfer_json(t: &crate::runtime::DccTransfer) -> serde_json::Value {
     serde_json::json!({
         "id": t.id,
         "accountId": t.account_id,
+        "outgoing": t.outgoing,
         "from": t.from,
         "fileName": t.file_name,
         "rawName": t.raw_name,
@@ -1033,8 +1286,8 @@ mod transfer_tests {
 
     /// A sender that hands over exactly these bytes and then closes.
     ///
-    /// The only `TcpListener` in this module, and deliberately: receiving
-    /// never listens, so testing it needs something that does.
+    /// Receiving never listens - that is the sending half's job - so testing
+    /// it needs something that does.
     async fn serve(bytes: Vec<u8>) -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1132,6 +1385,61 @@ mod transfer_tests {
         offer.token = Some("123".into());
         let err = run(&dir, &offer, 0).await.unwrap_err();
         assert!(format!("{err:#}").contains("reverse"), "{err:#}");
+    }
+
+    /// The sending half, driven directly: offer_file needs a live IRC
+    /// connection to announce itself over, but what it announces is only
+    /// useful if this part works.
+    #[tokio::test]
+    async fn a_file_goes_out_whole_to_whoever_connects() {
+        let dir = temp_dir("serve");
+        let path = dir.join("outgoing.bin");
+        let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // The receiving side, which is what a real client would be.
+        let got = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let mut out = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = sock.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        });
+
+        let cancel = AtomicBool::new(false);
+        serve_file(listener, path.to_str().unwrap(), body.len() as u64, 0, &cancel, || {}, |_| {})
+            .await
+            .expect("should send");
+
+        assert_eq!(got.await.unwrap(), body, "what arrived is not what was sent");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn an_offer_nobody_takes_gives_up_rather_than_waiting_forever() {
+        let dir = temp_dir("nobody");
+        let path = dir.join("ignored.bin");
+        std::fs::write(&path, b"x").unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+
+        let cancel = AtomicBool::new(true);
+        // Cancelled before anyone connects stands in for the timeout, which
+        // is three minutes and not worth a test's patience.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            serve_file(listener, path.to_str().unwrap(), 1, 0, &cancel, || {}, |_| {}),
+        )
+        .await;
+        assert!(err.is_err() || err.unwrap().is_err(), "an offer nobody takes must not succeed");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

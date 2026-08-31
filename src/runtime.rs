@@ -44,7 +44,11 @@ impl VoiceFlags {
 pub struct DccTransfer {
     pub id: String,
     pub account_id: String,
-    /// Who offered it.
+    /// Which way it is going. Sending and receiving share everything except
+    /// this and who the other person is, so they share a list too - what
+    /// somebody wants to see is "my transfers", not two of them.
+    pub outgoing: bool,
+    /// Who offered it, or who it is being sent to.
     pub from: String,
     /// What we would call it on disk - already made safe.
     pub file_name: String,
@@ -69,9 +73,10 @@ pub struct DccTransfer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DccState {
-    /// Waiting on an answer.
+    /// Waiting on an answer - or, when sending, waiting for them to accept.
     Offered,
     Receiving,
+    Sending,
     Done,
     Declined,
     Failed,
@@ -82,6 +87,7 @@ impl DccState {
         match self {
             DccState::Offered => "offered",
             DccState::Receiving => "receiving",
+            DccState::Sending => "sending",
             DccState::Done => "done",
             DccState::Declined => "declined",
             DccState::Failed => "failed",
@@ -90,7 +96,7 @@ impl DccState {
 
     /// Still going, so it counts against the concurrency limit.
     pub fn active(self) -> bool {
-        matches!(self, DccState::Offered | DccState::Receiving)
+        matches!(self, DccState::Offered | DccState::Receiving | DccState::Sending)
     }
 }
 
