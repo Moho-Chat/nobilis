@@ -469,7 +469,11 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
                     None => None,
                 };
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                state.runtime.record_message(state, account_id, "Whispers", "dm", &w.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), Vec::new(), None);
+                // Marked as a whisper rather than an ordinary message, and
+                // highlighted like a mention: somebody has spoken to you
+                // directly and privately, which is at least as worth noticing
+                // as being named in a room.
+                state.runtime.record_message(state, account_id, "Whispers", "dm", &w.author.username, &body, false, "whisper", None, msg_id, true, avatar_url, Vec::new(), Vec::new(), None);
                 if !w.message_uuid.is_empty() {
                     spawn_attachment_resolve(state.clone(), http.clone(), crate::model::buffer_id(account_id, "Whispers"), w.message_uuid.clone(), body);
                 }
@@ -808,6 +812,19 @@ fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str)
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
+/// Any live room connection for this account.
+///
+/// A whisper belongs to no room, so it does not matter which carries it - but
+/// there has to be one, since the only way to say anything at all is over a
+/// room's socket.
+fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
+    let cfg = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    effective_rooms(&cfg)
+        .iter()
+        .find_map(|r| state.runtime.sockchat_sender(account_id, r.id))
+        .ok_or_else(|| anyhow!("not connected to Sneedchat"))
+}
+
 /// The rooms this account actually talks in.
 ///
 /// An account with none configured still connects - to #general, which is
@@ -842,6 +859,45 @@ pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body:
     let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
     sender.send(text).map_err(|_| anyhow!("chat socket closed"))?;
+    Ok(())
+}
+
+/// Sends a private message to one person.
+///
+/// Goes out on whichever room connection is to hand: a whisper is not part of
+/// any room's conversation - which is also why the replies arrive in their own
+/// buffer rather than wherever you were - so any open socket carries it.
+///
+/// Recorded locally as well as sent. Unlike a room message, the site does not
+/// echo a whisper back to whoever sent it, so without this a conversation
+/// would show only one side of itself.
+pub fn send_whisper(state: &AppState, account_id: &str, target: &str, body: &str) -> Result<()> {
+    if target.trim().is_empty() {
+        bail!("no one to whisper to");
+    }
+    let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
+    let sender = any_room_sender(state, account_id)?;
+    sender
+        .send(protocol::prepare_whisper(target.trim(), &text))
+        .map_err(|_| anyhow!("chat socket closed"))?;
+
+    state.runtime.record_message(
+        state,
+        account_id,
+        "Whispers",
+        "dm",
+        target.trim(),
+        &text,
+        false,
+        "whisper",
+        None,
+        None,
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
     Ok(())
 }
 

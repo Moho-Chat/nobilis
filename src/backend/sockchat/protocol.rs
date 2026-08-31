@@ -313,6 +313,31 @@ pub fn prepare_edit(uuid: &str, new_body: &str) -> String {
     format!("/edit {payload}")
 }
 
+/// How a whisper is addressed on the wire.
+///
+/// The one thing about it that had to be confirmed rather than derived: the
+/// site's own client is what defines this, and sending the wrong word does not
+/// fail quietly - an unrecognised command is posted as ordinary text, which
+/// puts a message meant for one person in front of the whole room.
+pub const WHISPER_COMMAND: &str = "/whisper";
+
+/// `/whisper @username <message>`.
+///
+/// The `@` is part of the address, not decoration: the site reads the target
+/// as a mention. Added here rather than expected from the caller, since every
+/// place a name comes from - a message's author, a row in the member list -
+/// holds it without one, and a name that already has one is left alone rather
+/// than given a second.
+///
+/// The username goes through unquoted because that is what the site accepts;
+/// a name with a space in it cannot be whispered, which is a limit of the
+/// protocol rather than of this.
+pub fn prepare_whisper(target: &str, body: &str) -> String {
+    let target = target.trim();
+    let at = if target.starts_with('@') { "" } else { "@" };
+    format!("{WHISPER_COMMAND} {at}{target} {body}")
+}
+
 /// `/delete <uuid>` - unlike `/edit`, just the bare uuid, no JSON.
 pub fn prepare_delete(uuid: &str) -> String {
     format!("/delete {uuid}")
@@ -454,5 +479,11 @@ mod tests {
     fn builds_the_edit_and_delete_commands() {
         assert_eq!(prepare_edit("abc-123", "new text"), r#"/edit {"message":"new text","uuid":"abc-123"}"#);
         assert_eq!(prepare_delete("abc-123"), "/delete abc-123");
+        // The site reads the target as a mention, so the @ is part of
+        // addressing it rather than something a caller has to remember.
+        assert_eq!(prepare_whisper("Someone", "hello there"), "/whisper @Someone hello there");
+        // A name that already carries one does not get a second.
+        assert_eq!(prepare_whisper("@Someone", "hi"), "/whisper @Someone hi");
+        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/whisper @Spaced hi");
     }
 }

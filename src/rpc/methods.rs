@@ -1775,6 +1775,21 @@ pub async fn dispatch(
             }
         }
 
+        // A private message on Sneedchat, which has no direct-message
+        // conversations of its own - whispers arrive in one shared buffer and
+        // are addressed by name rather than by opening anything.
+        "sendWhisper" => {
+            let (account_id, target, body) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "target"), p_str_opt(params, "body")) {
+                    (Some(a), Some(t), Some(b)) => (a, t, b),
+                    _ => return (None, Some("sendWhisper requires \"accountId\", \"target\" and \"body\"".to_string())),
+                };
+            match backend::sockchat::send_whisper(state, account_id, target, body) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         "openIrcQuery" => {
             let (account_id, nick) = match (p_str_opt(params, "accountId"), p_str_opt(params, "nick")) {
                 (Some(a), Some(n)) => (a, n),
