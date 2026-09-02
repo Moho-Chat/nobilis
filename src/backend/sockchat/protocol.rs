@@ -43,8 +43,14 @@ pub struct WireMessage {
     pub deleted: bool,
     #[serde(default)]
     pub is_deleted: bool,
-    /// The room the message was posted in. The server always sends this for
-    /// a room message; its absence is what marks a whisper instead.
+    /// The room the message was posted in.
+    ///
+    /// Not read for routing - a connection sees only its own room's traffic,
+    /// so the room is already known. This once carried a note saying its
+    /// absence marked a whisper, which was a guess: whispers arrive under
+    /// their own `whisper` key, and every message observed on the wire carries
+    /// a room. Acting on that guess would have painted ordinary messages as
+    /// private ones.
     #[serde(default)]
     pub room_id: Option<u32>,
 }
@@ -97,7 +103,16 @@ fn id_as_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Err
 struct RawResponse {
     #[serde(default)]
     messages: Option<Vec<serde_json::Value>>,
-    #[serde(rename = "Whisper", default)]
+    /// Lowercase on the wire. This asked for `Whisper`, and serde's rename is
+    /// case-sensitive, so every whisper this account ever received fell
+    /// straight through into `extra` - decoded by nothing, reported by a log
+    /// line that was switched off. That is the whole of "whispers are not
+    /// received at all".
+    ///
+    /// The alias keeps the capitalised spelling working. It has never been
+    /// observed, but it was in here for a reason nobody wrote down, and
+    /// accepting both costs a word.
+    #[serde(rename = "whisper", alias = "Whisper", default)]
     whisper: Option<serde_json::Value>,
     #[serde(default)]
     permissions: Option<Perms>,
@@ -199,8 +214,11 @@ impl ServerResponse {
 
         let whisper = raw.whisper.and_then(|v| match serde_json::from_value(v) {
             Ok(w) => Some(w),
+            // Warn, not debug. A whisper that cannot be decoded is a private
+            // message silently dropped, which is the failure this backend has
+            // already had once and could not see.
             Err(e) => {
-                tracing::debug!("skipping undecodable whisper: {e}");
+                tracing::warn!("dropping a whisper this could not decode: {e}");
                 None
             }
         });
@@ -208,6 +226,10 @@ impl ServerResponse {
         // Key names and value shapes only - never the values, which are the
         // user's chat. The protocol is undocumented, so this is how its frame
         // vocabulary becomes knowable at all.
+        //
+        // This is what finally answered "why are whispers not arriving": the
+        // key was in here, spelled `whisper`, while the field asking for it
+        // said `Whisper`. Worth keeping for the next such question.
         if !raw.extra.is_empty() {
             let shape: Vec<String> = raw.extra.iter().map(|(k, v)| format!("{k}: {}", outline(v))).collect();
             tracing::debug!("sockchat: frame carried undecoded keys - {}", shape.join(", "));
@@ -433,8 +455,34 @@ mod tests {
     }
 
     #[test]
+    fn accepts_either_spelling_of_the_whisper_key() {
+        for frame in [
+            r#"{"whisper":{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u"}}"#,
+            r#"{"Whisper":{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u"}}"#,
+        ] {
+            let r = ServerResponse::parse(frame);
+            assert!(r.whisper.is_some(), "for {frame}");
+        }
+    }
+
+    #[test]
+    fn a_whisper_carrying_more_than_we_read_still_decodes() {
+        // Five keys on the wire; three are read. A whisper dropped for
+        // carrying a field nobody asked about would be a private message lost
+        // to tidiness.
+        let r = ServerResponse::parse(
+            r#"{"whisper":{"author":{"id":9,"username":"w","avatar_url":"/a.jpg"},"message_raw":"psst","message_uuid":"u9","message_date":123,"message_id":7}}"#,
+        );
+        let w = r.whisper.expect("decodes despite the extra fields");
+        assert_eq!(w.author.username, "w");
+        assert_eq!(w.message_raw, "psst");
+    }
+
+    #[test]
     fn parses_whispers_and_perms() {
-        let r = ServerResponse::parse(r#"{"Whisper":{"author":{"id":9,"username":"w"},"message_raw":"psst","message_uuid":"u9"}}"#);
+        // Lowercase, which is what the site actually sends - the capitalised
+        // spelling this used to require is why none were ever received.
+        let r = ServerResponse::parse(r#"{"whisper":{"author":{"id":9,"username":"w"},"message_raw":"psst","message_uuid":"u9"}}"#);
         let w = r.whisper.unwrap();
         assert_eq!(w.author.id, "9");
         assert_eq!(w.message_raw, "psst");

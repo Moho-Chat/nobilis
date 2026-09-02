@@ -440,29 +440,6 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
             None => None,
         };
 
-        // A message belonging to no room is not a room's message. The site
-        // delivers a whisper down the same channel as everything else and
-        // marks it only by that absence - which is why whispers arrived as
-        // nothing at all: the separate `Whisper` frame this used to wait for
-        // is not how they come.
-        //
-        // Handled here rather than only in that frame, and both are kept,
-        // because one of them is known to work and the other is what the
-        // protocol notes have always said. Every room's socket sees the same
-        // whisper, so only one connection records it.
-        if m.room_id.is_none() {
-            if !is_primary {
-                continue;
-            }
-            tracing::debug!("sockchat[{account_id}]: whisper from {} (no room_id)", m.author.username);
-            let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
-            for buffer in record_whisper(state, account_id, &m.author.username, &body, msg_id, avatar_url, true, None) {
-                if !m.message_uuid.is_empty() {
-                    spawn_attachment_resolve(state.clone(), http.clone(), buffer, m.message_uuid.clone(), body.clone());
-                }
-            }
-            continue;
-        }
         // There's no separate "edit" event on this wire - the server just
         // re-sends the same message_uuid with a bumped edit date. Try to
         // update an already-stored row first; only if that uuid was never
@@ -1014,9 +991,14 @@ pub fn send_whisper(
     }
     let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
     let sender = any_room_sender(state, account_id)?;
-    sender
-        .send(protocol::prepare_whisper(target, &text))
-        .map_err(|_| anyhow!("chat socket closed"))?;
+    let wire = protocol::prepare_whisper(target, &text);
+    // The addressing, not the message: enough to tell a wrong command from a
+    // wrong target without putting somebody's private message in a log.
+    tracing::debug!(
+        "sockchat[{account_id}]: sending whisper addressed {:?}",
+        protocol::prepare_whisper(target, "")
+    );
+    sender.send(wire).map_err(|_| anyhow!("chat socket closed"))?;
 
     let me = state
         .accounts
