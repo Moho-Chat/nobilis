@@ -467,7 +467,19 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
     if is_primary {
         if let Some(w) = &resp.whisper {
             let body = protocol::unescape_html(&w.message_raw);
-            if !body.is_empty() {
+            // The site echoes our own whisper back to us, which is worth
+            // knowing rather than working around: it means a whisper we sent
+            // arrives twice, once from `send_whisper` recording it locally and
+            // once from here.
+            //
+            // The local one is kept and this one dropped, because the echo has
+            // lost the only thing that made the line useful - who it went to.
+            // Its author is us, so it reads as us saying something to nobody
+            // in particular, while the one we wrote says "@name, ...".
+            //
+            // Not deduplicated by id, because they have none in common: ours
+            // is recorded as it is sent, before the site has given it one.
+            if !body.is_empty() && !is_own_name(state, account_id, &w.author.username) {
                 let avatar_url = match &w.author.avatar_url {
                     Some(raw) => cached_avatar_path(http, host, &w.author.id, raw).await,
                     None => None,
@@ -811,6 +823,30 @@ fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str)
     let rooms = effective_rooms(&cfg);
     let room = rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
+}
+
+/// Whether a name on the wire is this account's own.
+///
+/// Both the display name and the login name, because a whisper's author is
+/// whichever the site is showing and an account can have set either. Compared
+/// loosely - trimmed and case-insensitive - since the cost of being wrong is
+/// asymmetric: missing a match shows a duplicate line, and a false match
+/// would silently drop a real whisper from somebody whose name happened to
+/// differ only in case, which cannot happen because the site's names are
+/// unique without it.
+fn is_own_name(state: &AppState, account_id: &str, name: &str) -> bool {
+    let Some(cfg) = state.accounts.get_sockchat(account_id) else { return false };
+    name_matches(cfg.display_name.as_deref().unwrap_or_default(), &cfg.username, name)
+}
+
+fn name_matches(display_name: &str, username: &str, candidate: &str) -> bool {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return false;
+    }
+    [display_name, username]
+        .iter()
+        .any(|mine| !mine.trim().is_empty() && mine.trim().eq_ignore_ascii_case(candidate))
 }
 
 /// What a room's buffer is called.
@@ -1740,6 +1776,23 @@ fn update_roster(
 #[cfg(test)]
 mod buffer_name_tests {
     use super::*;
+
+    #[test]
+    fn knows_its_own_name_either_way_round() {
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "Ancient Pioneer"));
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "ancientpioneer"));
+        // Trimmed and case-insensitive, because the echo is matched against
+        // whichever name the site happened to be showing.
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "  ancient pioneer  "));
+        // Somebody else, which must never match - a false match drops a real
+        // whisper instead of a duplicate line.
+        assert!(!name_matches("Ancient Pioneer", "ancientpioneer", "no-exit"));
+        // An account with no display name set still matches on its login name,
+        // and an empty candidate matches nothing.
+        assert!(name_matches("", "ancientpioneer", "AncientPioneer"));
+        assert!(!name_matches("", "ancientpioneer", ""));
+        assert!(!name_matches("", "", "anyone"));
+    }
 
     #[test]
     fn a_room_and_its_buffer_name_are_one_pairing() {
