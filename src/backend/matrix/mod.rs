@@ -1584,6 +1584,14 @@ pub fn start_login(state: AppState, login_id: String, homeserver_url: String, us
 }
 
 async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str) -> Result<()> {
+    // Where the client API actually is, before anything is stored or tried.
+    //
+    // Resolved here rather than at every call site, and the *resolved* address
+    // is what gets saved - so a delegated server is asked once at sign-in
+    // rather than on every request forever, and an account that works keeps
+    // working if the well-known later goes away.
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
+    let homeserver_url = &http::resolve_homeserver(homeserver_url).await?;
     state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "logging in..." }));
 
     // Saved before the login is attempted, so a failure leaves an account to
