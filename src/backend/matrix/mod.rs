@@ -1153,7 +1153,18 @@ pub async fn search_public_rooms(
                 "alias": room["canonical_alias"].as_str().unwrap_or(""),
                 "topic": room["topic"].as_str().unwrap_or(""),
                 "members": room["num_joined_members"].as_i64().unwrap_or(0),
-                "avatarUrl": room["avatar_url"].as_str(),
+                // Deliberately no icon. A directory hands back `mxc://` URIs,
+                // which name media on a homeserver and are not URLs anything
+                // can load - fetching one needs the access token. Passing them
+                // through drew a broken image against every room that had an
+                // icon and the coloured initial only against the rooms that
+                // had none, which is precisely the wrong way round.
+                //
+                // Downloading them here was tried and measured: fifty rooms
+                // spread across as many media servers did not finish inside a
+                // six second budget, so a search that was fast became one that
+                // was slow *and* still showed no icons. A room's initial costs
+                // nothing and is what every room without an icon shows anyway.
                 // Which directory answered. Shown, because in one merged list
                 // the server a room lives on is the thing that says what kind
                 // of place it is - and it is the routing hint a room with no
