@@ -116,6 +116,11 @@ pub async fn get_json(url: &str, token: &str) -> Result<Value> {
     handle_response(resp).await
 }
 
+pub async fn delete_json(url: &str, token: &str) -> Result<Value> {
+    let resp = http_client().delete(url).bearer_auth(token).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
 pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
     let resp = http_client().put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
     handle_response(resp).await

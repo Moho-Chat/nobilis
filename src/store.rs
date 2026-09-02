@@ -610,6 +610,20 @@ impl Store {
     /// both when the buffer/id genuinely doesn't exist and when it's
     /// aged out of local scrollback (prune_old_messages) - either way,
     /// callers fall back to a minimal reply preview with no body/from.
+    /// The id of the newest message stored for a buffer.
+    ///
+    /// Used to say how far a room has been read, which is a claim about a
+    /// specific message rather than about a time - so it has to be the id the
+    /// service itself gave, not one generated here.
+    pub fn newest_message_id(&self, buffer_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![buffer_id], |row| row.get::<_, Option<String>>(0))?;
+        Ok(rows.next().transpose()?.flatten())
+    }
+
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -728,6 +742,28 @@ mod tests {
     fn mention(s: &Store, buffer: &str, id: &str, kind: &str) {
         s.append_message(buffer, id, "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, kind, None, &[])
             .expect("appending");
+    }
+
+    /// Like `append`, but at a time - so "newest" can be checked.
+    fn append_at(s: &Store, buffer: &str, id: &str, ts: i64) {
+        s.append_message(buffer, id, "someone", "hi", ts, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
+            .expect("appending");
+    }
+
+    #[test]
+    fn finds_the_newest_message_to_mark_a_room_read_up_to() {
+        let (s, _dir) = store();
+        assert_eq!(s.newest_message_id("b").unwrap(), None, "an empty room has nothing to have read");
+
+        append_at(&s, "b", "$one", 100);
+        append_at(&s, "b", "$two", 300);
+        append_at(&s, "b", "$mid", 200);
+        // Newest by time, not by arrival: history arriving after a live
+        // message must not move the marker backwards.
+        assert_eq!(s.newest_message_id("b").unwrap().as_deref(), Some("$two"));
+        // And it is that room's newest, not the store's.
+        append_at(&s, "other", "$elsewhere", 999);
+        assert_eq!(s.newest_message_id("b").unwrap().as_deref(), Some("$two"));
     }
 
     #[test]

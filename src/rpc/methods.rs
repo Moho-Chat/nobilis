@@ -503,6 +503,16 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e.to_string())),
                     },
                 },
+                // Matrix has read markers and they were never sent, so a room
+                // read here stayed bold everywhere else. Best-effort: failing
+                // to say a room has been read must not make reading it look
+                // like an error.
+                Some(buffer) if buffer.account_id.starts_with("matrix:") => {
+                    if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id).await {
+                        tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 _ => (Some(ok_node()), None),
             }
         }

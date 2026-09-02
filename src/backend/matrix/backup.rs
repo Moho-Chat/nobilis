@@ -79,15 +79,45 @@ pub async fn reactivate_on_connect(state: &AppState, account_id: &str, session: 
 /// piggybacks on the sync loop's existing per-cycle dispatch - see
 /// crypto.rs's run_pending_backup, called from mod.rs's run_sync.
 ///
-/// v1 limitation: always creates a brand new backup version rather than
-/// checking for/reusing an existing one. Calling this twice for the same
-/// account leaves the older backup version on the server, still valid
-/// under the *old* recovery key but no longer receiving this device's
-/// future keys - deleting old versions explicitly is a follow-up, not
-/// handled here.
+/// Making a new key replaces the old backup rather than leaving it behind.
+///
+/// The previous version is deleted after the new one is registered, and in
+/// that order deliberately: a delete that ran first would leave an account
+/// with no backup at all if registering the replacement then failed, which is
+/// the one outcome worse than having two.
+///
+/// It used to leave the old version in place - still valid under the *old*
+/// recovery key, still holding keys the new one cannot read, and no longer
+/// receiving anything. Somebody with the previous key written down would find
+/// it restored a partial history and stopped, with nothing saying why.
+///
+/// Failing to delete is not failure. The new backup works; a stale version is
+/// untidy, and refusing to hand over a working recovery key over untidiness
+/// would be the wrong trade.
+/// The backup version the server currently holds, if it holds one.
+///
+/// Absent is the ordinary answer for an account that has never had a backup,
+/// so it is not an error - and neither is a server that will not say, since
+/// the only thing this is used for is tidying up afterwards.
+async fn current_version(base: &str, access_token: &str) -> Option<String> {
+    let resp = http::get_json(&format!("{base}/_matrix/client/v3/room_keys/version"), access_token).await.ok()?;
+    resp["version"].as_str().map(str::to_string)
+}
+
+async fn delete_version(base: &str, access_token: &str, version: &str) -> Result<()> {
+    let url = format!(
+        "{base}/_matrix/client/v3/room_keys/version/{}",
+        url::form_urlencoded::byte_serialize(version.as_bytes()).collect::<String>()
+    );
+    http::delete_json(&url, access_token).await.map(|_| ()).context("deleting the previous backup version")
+}
+
 pub async fn setup_recovery_key(state: &AppState, account_id: &str) -> Result<String> {
     let (config, session) = account_session(state, account_id).await?;
     let base = config.homeserver_url.trim_end_matches('/');
+    // Read before anything is changed, so what is replaced is the version that
+    // existed when the request was made.
+    let previous = current_version(base, &config.access_token).await;
 
     let key = BackupDecryptionKey::new();
     let recovery_key = key.to_base58();
@@ -104,8 +134,17 @@ pub async fn setup_recovery_key(state: &AppState, account_id: &str) -> Result<St
     let backup_key: MegolmV1BackupKey = key.megolm_v1_public_key();
     backup_key.set_version(version.clone());
     backup_machine.enable_backup_v1(backup_key).await.context("enable_backup_v1")?;
-    backup_machine.save_decryption_key(Some(key), Some(version)).await.context("save_decryption_key")?;
+    backup_machine.save_decryption_key(Some(key), Some(version.clone())).await.context("save_decryption_key")?;
     state.runtime.mark_matrix_backup_enabled(account_id);
+
+    if let Some(previous) = previous.filter(|p| *p != version) {
+        match delete_version(base, &config.access_token, &previous).await {
+            Ok(()) => tracing::info!("matrix[{account_id}]: replaced backup version {previous} with {version}"),
+            // Said out loud rather than swallowed: the new key works, and
+            // somebody may still find an orphan on the server later.
+            Err(e) => tracing::warn!("matrix[{account_id}]: new backup is {version}, but the old {previous} could not be removed: {e:#}"),
+        }
+    }
 
     Ok(recovery_key)
 }

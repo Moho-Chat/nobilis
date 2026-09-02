@@ -1135,6 +1135,42 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
 /// Matrix wants a timeout with the notice and cancels with `typing: false`,
 /// unlike Discord's single fire-and-expire - so a caller that stops typing
 /// can actually say so rather than waiting the notice out.
+/// Says this room has been read, as far as its newest message.
+///
+/// Two markers, because Matrix has two and they answer different questions.
+/// `m.read` is public - it is what puts your avatar against a message in
+/// somebody else's client - and `m.fully_read` is private, and is what your
+/// own other clients use to stop showing the room as unread.
+///
+/// Sent together through the one endpoint that takes both, so reading a room
+/// here stops it being bold on your phone. Before this, `markBufferRead` was
+/// a no-op for Matrix and the two never agreed.
+pub async fn mark_read(state: &AppState, account_id: &str, buffer_id: &str) -> Result<()> {
+    let Some(config) = state.accounts.get_matrix(account_id) else { anyhow::bail!("no such account") };
+    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+        anyhow::bail!("no known Matrix room for this buffer")
+    };
+    // The newest message this client actually holds. Nothing to say if the
+    // room has never had one - and claiming to have read a room that is empty
+    // would be a receipt pointing at nothing.
+    let Some(event_id) = state.store.newest_message_id(buffer_id).ok().flatten().filter(|id| id.starts_with('$')) else {
+        return Ok(());
+    };
+    let base = config.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/read_markers",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
+    );
+    http::post_json(
+        &url,
+        Some(&config.access_token),
+        serde_json::json!({ "m.fully_read": event_id, "m.read": event_id }),
+    )
+    .await
+    .context("sending read markers")?;
+    Ok(())
+}
+
 pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typing: bool) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
