@@ -346,7 +346,7 @@ async fn run_room_once(state: &AppState, transport: &Transport, session: &Sessio
     let _sender_guard = RemoveSenderOnDrop { state, account_id, room: room.id, sender: out_tx.clone() };
 
     out_tx.send(format!("/join {}", room.id)).map_err(|_| anyhow!("chat socket closed before joining"))?;
-    let buffer_name = format!("#{}", room.name);
+    let buffer_name = room_buffer_name(&room.name);
     // Created eagerly rather than waiting for the first live message - a
     // quiet room would otherwise show no buffer/tab at all despite being
     // connected and joined.
@@ -456,7 +456,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
             }
             tracing::debug!("sockchat[{account_id}]: whisper from {} (no room_id)", m.author.username);
             let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
-            for buffer in record_whisper(state, account_id, &m.author.username, &body, msg_id, avatar_url, true) {
+            for buffer in record_whisper(state, account_id, &m.author.username, &body, msg_id, avatar_url, true, None) {
                 if !m.message_uuid.is_empty() {
                     spawn_attachment_resolve(state.clone(), http.clone(), buffer, m.message_uuid.clone(), body.clone());
                 }
@@ -496,7 +496,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
                     None => None,
                 };
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true) {
+                for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true, None) {
                     if !w.message_uuid.is_empty() {
                         spawn_attachment_resolve(state.clone(), http.clone(), buffer, w.message_uuid.clone(), body.clone());
                     }
@@ -830,10 +830,27 @@ fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, buffer_id: 
 /// connected simultaneously.
 fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
     let cfg = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
-    let room_name = buffer_name.strip_prefix('#').unwrap_or(buffer_name);
+    let room_name = room_name_of(buffer_name);
     let rooms = effective_rooms(&cfg);
     let room = rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
+}
+
+/// What a room's buffer is called.
+///
+/// The `#` is not decoration - it is part of the name every other part of this
+/// daemon and every frontend knows the room by. Writing whispers into
+/// `room.name` instead of this made a second, empty buffer per room named
+/// without it, which is the "new chat buffer" that opened when one was sent:
+/// not a window being opened, but a conversation being written somewhere
+/// nobody was looking. One definition so the two cannot disagree again.
+fn room_buffer_name(room_name: &str) -> String {
+    format!("#{room_name}")
+}
+
+/// And the room behind a buffer's name - the same pairing read backwards.
+fn room_name_of(buffer_name: &str) -> &str {
+    buffer_name.strip_prefix('#').unwrap_or(buffer_name)
 }
 
 /// Puts a whisper in front of whoever is reading, whichever room that is.
@@ -862,10 +879,22 @@ fn record_whisper(
     // `notify`: whether this one should raise an alert. True for a whisper
     // somebody sent us; false for one we sent, which needs no telling.
     notify: bool,
+    // `only`: the one buffer this belongs in, for a whisper we sent - it
+    // belongs in the conversation it was sent from, not in every room at
+    // once. Absent for an inbound one, which arrives from nowhere in
+    // particular and has to be visible wherever the reader is.
+    only: Option<&str>,
 ) -> Vec<String> {
     let Some(cfg) = state.accounts.get_sockchat(account_id) else { return Vec::new() };
     let mut fresh = Vec::new();
-    for (index, room) in effective_rooms(&cfg).into_iter().enumerate() {
+    let rooms: Vec<SockChatRoom> = match only {
+        Some(buffer_name) => {
+            let wanted = room_name_of(buffer_name);
+            effective_rooms(&cfg).into_iter().filter(|r| r.name == wanted).collect()
+        }
+        None => effective_rooms(&cfg),
+    };
+    for (index, room) in rooms.into_iter().enumerate() {
         // Highlighted in the first room only, and highlighting is what raises
         // an alert - so one whisper is one notification however many rooms it
         // is written into. The copies are still whispers and are still drawn
@@ -873,10 +902,11 @@ fn record_whisper(
         // highlight; what they are not is a second time somebody's desktop
         // says the same thing.
         let alert = notify && index == 0;
+        let name = room_buffer_name(&room.name);
         let is_new = state.runtime.record_message(
             state,
             account_id,
-            &room.name,
+            &name,
             "channel",
             from,
             body,
@@ -891,7 +921,7 @@ fn record_whisper(
             None,
         );
         if is_new {
-            fresh.push(crate::model::buffer_id(account_id, &room.name));
+            fresh.push(crate::model::buffer_id(account_id, &name));
         }
     }
     fresh
@@ -945,7 +975,7 @@ pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body:
     // as a whisper here too - passed straight through it would be a real
     // whisper that this client never saw, since the site echoes none back.
     if let Some((target, text)) = protocol::parse_whisper_command(body) {
-        return send_whisper(state, account_id, &target, &text);
+        return send_whisper(state, account_id, &target, &text, Some(buffer_name));
     }
     let body = as_reply(body, reply_to);
     let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
@@ -968,7 +998,16 @@ pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body:
 /// under the recipient's name reads as something they said - which is what it
 /// used to do. The `@name` is what the site puts there too, so the line reads
 /// the way the same whisper reads on the site.
-pub fn send_whisper(state: &AppState, account_id: &str, target: &str, body: &str) -> Result<()> {
+pub fn send_whisper(
+    state: &AppState,
+    account_id: &str,
+    target: &str,
+    body: &str,
+    // `from_buffer`: the conversation it was sent from, so it appears there
+    // rather than in every room. None falls back to all of them, which is
+    // right for a caller that has no room in mind.
+    from_buffer: Option<&str>,
+) -> Result<()> {
     let target = target.trim();
     if target.is_empty() {
         bail!("no one to whisper to");
@@ -986,7 +1025,7 @@ pub fn send_whisper(state: &AppState, account_id: &str, target: &str, body: &str
         .unwrap_or_default();
     let at = if target.starts_with('@') { "" } else { "@" };
     let named = target.trim_end_matches(',');
-    record_whisper(state, account_id, &me, &format!("{at}{named}, {text}"), None, None, false);
+    record_whisper(state, account_id, &me, &format!("{at}{named}, {text}"), None, None, false, from_buffer);
     Ok(())
 }
 
@@ -1714,4 +1753,24 @@ fn update_roster(
         "presenceChange",
         serde_json::json!({ "bufferId": buffer_id, "members": member_list }),
     );
+}
+
+#[cfg(test)]
+mod buffer_name_tests {
+    use super::*;
+
+    #[test]
+    fn a_room_and_its_buffer_name_are_one_pairing() {
+        // The bug this exists to prevent: whispers were written to
+        // `room.name`, while every room's buffer is named with a "#" in front.
+        // That is not a typo with no consequence - it made a second, empty
+        // buffer per room, which is the "new chat buffer" that opened when a
+        // whisper was sent.
+        assert_eq!(room_buffer_name("general"), "#general");
+        assert_eq!(room_name_of(&room_buffer_name("general")), "general");
+        assert_eq!(room_name_of("#fishtank"), "fishtank");
+        // Tolerant read-back: a caller that already stripped it gets the same
+        // answer rather than a different one.
+        assert_eq!(room_name_of("fishtank"), "fishtank");
+    }
 }
