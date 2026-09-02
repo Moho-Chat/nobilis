@@ -404,6 +404,13 @@ async fn prepare(
         },
     );
 
+    // The streamer's own picture on the channel. Parsed since the first
+    // version of this backend and used by nothing, so every Kick channel drew
+    // as a bare "#" among rows that all had faces.
+    if let Some(avatar) = channel.avatar_url.as_deref().filter(|a| !a.is_empty()) {
+        state.runtime.set_buffer_avatar(state, &buffer.id, avatar);
+    }
+
     // How the chat is restricted, said before anybody tries to speak into it.
     // Both values were already being parsed and then read by nothing, so moho
     // knew a channel was subscribers-only and let somebody type into it
@@ -644,12 +651,12 @@ async fn handle_frame(
         // handful of streamers is largely watching for this.
         e if e.ends_with("StreamerIsLive") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "went live", "system");
+                system_line(state, account_id, &slug, "went live", "stream");
             }
         }
         e if e.ends_with("StopStreamBroadcast") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "ended the stream", "system");
+                system_line(state, account_id, &slug, "ended the stream", "stream");
             }
         }
         // A message taken down, by its author or by a moderator. Removed here
@@ -689,18 +696,29 @@ async fn handle_frame(
             );
         }
 
+        // A poll running on stream. Announced rather than made interactive:
+        // voting goes through the player, and a chat client showing the
+        // question and the options is the part somebody reading chat is
+        // missing - a running poll is otherwise invisible here.
+        e if e.ends_with("PollUpdateEvent") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            if let Some(line) = describe_poll(&payload) {
+                system_line(state, account_id, &slug, &line, "poll");
+            }
+        }
+
         // A moderator emptying the room.
         e if e.ends_with("ChatroomClearEvent") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "a moderator cleared the chat", "system");
+                system_line(state, account_id, &slug, "a moderator cleared the chat", "moderation");
             }
         }
 
         // The things people do rather than say.
         e => {
-            if let Some(line) = describe_action(e, &payload) {
+            if let Some((kind, line)) = describe_action(e, &payload) {
                 if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                    system_line(state, account_id, &slug, &line, "reward");
+                    system_line(state, account_id, &slug, &line, kind);
                 }
             }
         }
@@ -773,6 +791,39 @@ fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crat
     reply_preview(Some(&parsed))
 }
 
+/// A poll, as one readable line.
+///
+/// Tolerant about where the fields sit: Kick nests this under `poll` on the
+/// update event and has sent it flat, and an event whose shape has moved on
+/// should cost the line rather than the connection.
+fn describe_poll(payload: &serde_json::Value) -> Option<String> {
+    let poll = payload.get("poll").unwrap_or(payload);
+    let title = poll.get("title").and_then(|v| v.as_str()).filter(|t| !t.is_empty())?;
+    let options: Vec<String> = poll
+        .get("options")
+        .and_then(|v| v.as_array())
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|o| {
+                    let label = o.get("label").and_then(|v| v.as_str())?;
+                    // The running tally where there is one, since a poll with
+                    // no numbers is only half the thing being watched.
+                    Some(match o.get("votes").and_then(|v| v.as_u64()) {
+                        Some(votes) => format!("{label} ({votes})"),
+                        None => label.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(if options.is_empty() {
+        format!("poll: {title}")
+    } else {
+        format!("poll: {title} — {}", options.join(", "))
+    })
+}
+
 /// The one badge worth marking somebody with in a list.
 ///
 /// A name can carry four; a list showing all of them is a list of badges with
@@ -836,7 +887,7 @@ fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::Reply
 /// used: `username` and `sender.username` both appear across these events, and
 /// an event whose shape has moved on should degrade to being skipped rather
 /// than to a line with "unknown" in it.
-fn describe_action(event: &str, p: &serde_json::Value) -> Option<String> {
+fn describe_action(event: &str, p: &serde_json::Value) -> Option<(&'static str, String)> {
     // Matched exactly, on the last segment, rather than by suffix. Kick sends
     // one real subscription as three events on three subscriptions - measured
     // on a live subathon: `SubscriptionEvent`, `ChannelSubscriptionEvent` and
@@ -859,10 +910,10 @@ fn describe_action(event: &str, p: &serde_json::Value) -> Option<String> {
             let reward = text("reward_title").or_else(|| text("title"))?;
             // What they typed with it, where the reward takes input - it is
             // the half that says what they actually asked for.
-            Some(match text("user_input") {
+            Some(("reward", match text("user_input") {
                 Some(input) => format!("{who} redeemed {reward}: {input}"),
                 None => format!("{who} redeemed {reward}"),
-            })
+            }))
         }
 
         "GiftedSubscriptionsEvent" => {
@@ -873,28 +924,28 @@ fn describe_action(event: &str, p: &serde_json::Value) -> Option<String> {
                 .map(|a| a.len())
                 .or_else(|| p.get("gifted_total").and_then(|v| v.as_u64()).map(|n| n as usize))
                 .unwrap_or(1);
-            Some(match count {
+            Some(("sub", match count {
                 0 | 1 => format!("{gifter} gifted a subscription"),
                 n => format!("{gifter} gifted {n} subscriptions"),
-            })
+            }))
         }
 
         // The one of the three that carries how long they have been
         // subscribed, which is the part worth saying.
         "SubscriptionEvent" => {
             let who = who()?;
-            Some(match p.get("months").and_then(|v| v.as_u64()) {
+            Some(("sub", match p.get("months").and_then(|v| v.as_u64()) {
                 Some(n) if n > 1 => format!("{who} subscribed - {n} months"),
                 _ => format!("{who} subscribed"),
-            })
+            }))
         }
 
         "StreamHostEvent" | "StreamHostedEvent" => {
             let who = text("host_username").or_else(who)?;
-            Some(match p.get("number_viewers").and_then(|v| v.as_u64()) {
+            Some(("raid", match p.get("number_viewers").and_then(|v| v.as_u64()) {
                 Some(n) if n > 0 => format!("{who} raided with {n} viewers"),
                 _ => format!("{who} raided the channel"),
-            })
+            }))
         }
 
         // Somebody timed out or banned. Said in the channel, because it is
@@ -909,14 +960,14 @@ fn describe_action(event: &str, p: &serde_json::Value) -> Option<String> {
                 .unwrap_or_default();
             // A ban carries no expiry and a timeout does, which is the whole
             // of what a reader wants to know from the line.
-            Some(match p.get("expires_at").and_then(|v| v.as_str()) {
+            Some(("moderation", match p.get("expires_at").and_then(|v| v.as_str()) {
                 Some(_) => format!("{who} was timed out{by}"),
                 None => format!("{who} was banned{by}"),
-            })
+            }))
         }
         "UserUnbannedEvent" => {
             let who = p.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str())?;
-            Some(format!("{who} is allowed back"))
+            Some(("moderation", format!("{who} is allowed back")))
         }
 
         // Deliberately nothing. Both are the same subscription reported again
@@ -1055,6 +1106,45 @@ mod tests {
         }
         // A channel this account is not watching is not ours to report.
         assert_eq!(channel_of(&w, &None, &serde_json::json!({ "channel_id": 1 })), None);
+    }
+
+    #[test]
+    fn each_event_says_what_kind_of_thing_it_is() {
+        // So a reader can turn off raids without losing redemptions. One kind
+        // for all of them made the settings a single on-or-off switch.
+        let kind = |event: &str, p: serde_json::Value| describe_action(event, &p).map(|(k, _)| k);
+        assert_eq!(kind("RewardRedeemedEvent", serde_json::json!({ "username": "a", "reward_title": "x" })), Some("reward"));
+        assert_eq!(kind("SubscriptionEvent", serde_json::json!({ "username": "a" })), Some("sub"));
+        assert_eq!(kind("GiftedSubscriptionsEvent", serde_json::json!({ "gifter_username": "a" })), Some("sub"));
+        assert_eq!(kind("StreamHostEvent", serde_json::json!({ "host_username": "a" })), Some("raid"));
+        assert_eq!(kind("UserBannedEvent", serde_json::json!({ "user": { "username": "a" } })), Some("moderation"));
+    }
+
+    #[test]
+    fn reads_a_poll_wherever_kick_puts_it() {
+        let nested = serde_json::json!({
+            "poll": {
+                "title": "what next",
+                "options": [
+                    { "label": "keep going", "votes": 12 },
+                    { "label": "stop", "votes": 3 }
+                ]
+            }
+        });
+        assert_eq!(
+            describe_poll(&nested).as_deref(),
+            Some("poll: what next — keep going (12), stop (3)")
+        );
+
+        // Flat, which Kick has also sent.
+        let flat = serde_json::json!({ "title": "yes or no", "options": [{ "label": "yes" }] });
+        assert_eq!(describe_poll(&flat).as_deref(), Some("poll: yes or no — yes"));
+
+        // A poll with no options is still worth announcing; one with no title
+        // is not a poll anybody can read.
+        assert_eq!(describe_poll(&serde_json::json!({ "title": "hm" })).as_deref(), Some("poll: hm"));
+        assert_eq!(describe_poll(&serde_json::json!({ "options": [] })), None);
+        assert_eq!(describe_poll(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -1225,7 +1315,7 @@ mod tests {
     fn reads_a_redemption() {
         let p = serde_json::json!({ "username": "GayHayride", "reward_title": "CAT PATS", "user_input": "" });
         assert_eq!(
-            describe_action("App\\Events\\RewardRedeemedEvent", &p).as_deref(),
+            describe_action("App\\Events\\RewardRedeemedEvent", &p).map(|(_, line)| line).as_deref(),
             Some("GayHayride redeemed CAT PATS")
         );
     }
@@ -1236,7 +1326,7 @@ mod tests {
         // takes input at all.
         let p = serde_json::json!({ "username": "Hecklephish", "reward_title": "CAT TREATS", "user_input": "for Mittens" });
         assert_eq!(
-            describe_action("App\\Events\\RewardRedeemedEvent", &p).as_deref(),
+            describe_action("App\\Events\\RewardRedeemedEvent", &p).map(|(_, line)| line).as_deref(),
             Some("Hecklephish redeemed CAT TREATS: for Mittens")
         );
     }
@@ -1244,16 +1334,16 @@ mod tests {
     #[test]
     fn reads_subscriptions_and_gifts_and_raids() {
         let subbed = serde_json::json!({ "username": "someone", "months": 1 });
-        assert_eq!(describe_action("SubscriptionEvent", &subbed).as_deref(), Some("someone subscribed"));
+        assert_eq!(describe_action("SubscriptionEvent", &subbed).map(|(_, l)| l).as_deref(), Some("someone subscribed"));
 
         let resub = serde_json::json!({ "username": "someone", "months": 7 });
-        assert_eq!(describe_action("SubscriptionEvent", &resub).as_deref(), Some("someone subscribed - 7 months"));
+        assert_eq!(describe_action("SubscriptionEvent", &resub).map(|(_, l)| l).as_deref(), Some("someone subscribed - 7 months"));
 
         let gifts = serde_json::json!({ "gifter_username": "big", "gifted_usernames": ["a", "b", "c"] });
-        assert_eq!(describe_action("GiftedSubscriptionsEvent", &gifts).as_deref(), Some("big gifted 3 subscriptions"));
+        assert_eq!(describe_action("GiftedSubscriptionsEvent", &gifts).map(|(_, l)| l).as_deref(), Some("big gifted 3 subscriptions"));
 
         let raid = serde_json::json!({ "host_username": "friend", "number_viewers": 42 });
-        assert_eq!(describe_action("StreamHostEvent", &raid).as_deref(), Some("friend raided with 42 viewers"));
+        assert_eq!(describe_action("StreamHostEvent", &raid).map(|(_, l)| l).as_deref(), Some("friend raided with 42 viewers"));
     }
 
     #[test]
@@ -1262,7 +1352,7 @@ mod tests {
         // whose shape has moved on should be skipped rather than reported with
         // a hole in it.
         let nested = serde_json::json!({ "sender": { "username": "nested" }, "reward_title": "X" });
-        assert_eq!(describe_action("RewardRedeemedEvent", &nested).as_deref(), Some("nested redeemed X"));
+        assert_eq!(describe_action("RewardRedeemedEvent", &nested).map(|(_, l)| l).as_deref(), Some("nested redeemed X"));
 
         let nameless = serde_json::json!({ "reward_title": "X" });
         assert_eq!(describe_action("RewardRedeemedEvent", &nameless), None);
@@ -1287,7 +1377,7 @@ mod tests {
         // what reported the same person subscribing twice.
         let sub = serde_json::json!({ "chatroom_id": 2393554, "username": "doni433", "months": 1 });
         assert_eq!(
-            describe_action("App\\Events\\SubscriptionEvent", &sub).as_deref(),
+            describe_action("App\\Events\\SubscriptionEvent", &sub).map(|(_, line)| line).as_deref(),
             Some("doni433 subscribed")
         );
         let same = serde_json::json!({ "user_ids": [584331], "username": "doni433", "channel_id": 2401072 });
@@ -1304,23 +1394,23 @@ mod tests {
             "expires_at": "2026-09-02T04:00:00Z"
         });
         assert_eq!(
-            describe_action("App\\Events\\UserBannedEvent", &timeout).as_deref(),
+            describe_action("App\\Events\\UserBannedEvent", &timeout).map(|(_, line)| line).as_deref(),
             Some("someone was timed out by amod")
         );
 
         // No expiry is a ban, which is the difference worth reporting.
         let ban = serde_json::json!({ "user": { "username": "someone" }, "banned_by": { "username": "amod" } });
         assert_eq!(
-            describe_action("App\\Events\\UserBannedEvent", &ban).as_deref(),
+            describe_action("App\\Events\\UserBannedEvent", &ban).map(|(_, line)| line).as_deref(),
             Some("someone was banned by amod")
         );
 
         // A moderator who did not name themselves still produces a line.
         let anonymous = serde_json::json!({ "user": { "username": "someone" } });
-        assert_eq!(describe_action("UserBannedEvent", &anonymous).as_deref(), Some("someone was banned"));
+        assert_eq!(describe_action("UserBannedEvent", &anonymous).map(|(_, l)| l).as_deref(), Some("someone was banned"));
 
         assert_eq!(
-            describe_action("App\\Events\\UserUnbannedEvent", &serde_json::json!({ "user": { "username": "someone" } })).as_deref(),
+            describe_action("App\\Events\\UserUnbannedEvent", &serde_json::json!({ "user": { "username": "someone" } })).map(|(_, l)| l).as_deref(),
             Some("someone is allowed back")
         );
     }
@@ -1337,7 +1427,7 @@ mod tests {
             "gifted_total": 5
         });
         assert_eq!(
-            describe_action("GiftedSubscriptionsEvent", &p).as_deref(),
+            describe_action("GiftedSubscriptionsEvent", &p).map(|(_, line)| line).as_deref(),
             Some("ItsDez gifted 5 subscriptions")
         );
     }

@@ -33,8 +33,14 @@ pub struct Offered {
     /// hidden: knowing what subscribing would get you is most of the reason
     /// the tier exists.
     pub locked: bool,
-    /// Kick emotes are static PNGs. Present so the field means the same thing
-    /// here as it does for Discord's, whose client does need it.
+    /// Always false, and not for want of asking: Kick's emote objects carry
+    /// `id`, `channel_id`, `name` and `subscribers_only` and nothing else -
+    /// there is no flag to read.
+    ///
+    /// It costs nothing to be wrong. Discord needs the flag because it picks
+    /// a file extension from it; Kick serves one URL per emote and the browser
+    /// animates whatever arrives. The field is here so it means the same thing
+    /// on both services rather than being absent on one.
     pub animated: bool,
 }
 
