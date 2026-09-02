@@ -174,6 +174,33 @@ impl MatrixAccountConfig {
     }
 }
 
+/// Kick account shape.
+///
+/// The token is optional, which is the unusual part and is deliberate: Kick's
+/// chat is public, so an account with no credential is a working reader of
+/// every channel it is pointed at. Signing in adds sending and the
+/// subscription check, and nothing else - see backend/kick's module doc.
+///
+/// `channels` holds handles (the part after kick.com/), not ids. A streamer's
+/// numeric ids are Kick's business and are looked up fresh on every connect;
+/// the handle is what somebody typed and what they would recognise if they
+/// ever opened this file.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct KickAccountConfig {
+    /// Who this is on Kick, or a placeholder for a signed-out reader.
+    pub username: String,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub channels: Vec<String>,
+}
+
+impl KickAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("kick:{}", self.username)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -184,6 +211,8 @@ struct AccountsFile {
     sockchat: Vec<SockChatAccountConfig>,
     #[serde(default, rename = "matrix_account")]
     matrix: Vec<MatrixAccountConfig>,
+    #[serde(default, rename = "kick_account")]
+    kick: Vec<KickAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -196,11 +225,12 @@ pub struct AccountStore {
     discord: Mutex<HashMap<String, DiscordAccountConfig>>,
     sockchat: Mutex<HashMap<String, SockChatAccountConfig>>,
     matrix: Mutex<HashMap<String, MatrixAccountConfig>>,
+    kick: Mutex<HashMap<String, KickAccountConfig>>,
 }
 
 impl AccountStore {
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sockchat, matrix) = if path.exists() {
+        let (irc, discord, sockchat, matrix, kick) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -209,11 +239,12 @@ impl AccountStore {
             let discord = file.discord.into_iter().map(|a| (a.account_id(), a)).collect();
             let sockchat = file.sockchat.into_iter().map(|a| (a.account_id(), a)).collect();
             let matrix = file.matrix.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sockchat, matrix)
+            let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sockchat, matrix, kick)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
-        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sockchat: Mutex::new(sockchat), matrix: Mutex::new(matrix) })
+        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sockchat: Mutex::new(sockchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick) })
     }
 
     /// Callers already hold whichever map they just mutated - the others
@@ -225,12 +256,14 @@ impl AccountStore {
         discord: &HashMap<String, DiscordAccountConfig>,
         sockchat: &HashMap<String, SockChatAccountConfig>,
         matrix: &HashMap<String, MatrixAccountConfig>,
+        kick: &HashMap<String, KickAccountConfig>,
     ) -> Result<()> {
         let file = AccountsFile {
             irc: irc.values().cloned().collect(),
             discord: discord.values().cloned().collect(),
             sockchat: sockchat.values().cloned().collect(),
             matrix: matrix.values().cloned().collect(),
+            kick: kick.values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -268,7 +301,7 @@ impl AccountStore {
             return Ok(None);
         }
         irc.insert(id, config.clone());
-        self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+        self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(Some(config))
     }
 
@@ -289,7 +322,7 @@ impl AccountStore {
         let id = config.account_id();
         let mut discord = self.discord.lock().unwrap();
         discord.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+        self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -307,7 +340,7 @@ impl AccountStore {
         let id = config.account_id();
         let mut sockchat = self.sockchat.lock().unwrap();
         sockchat.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap())?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -326,8 +359,42 @@ impl AccountStore {
         let id = config.account_id();
         let mut matrix = self.matrix.lock().unwrap();
         matrix.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix)?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(config)
+    }
+
+    pub fn get_kick(&self, account_id: &str) -> Option<KickAccountConfig> {
+        self.kick.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_kick(&self) -> Vec<KickAccountConfig> {
+        self.kick.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts, like the others: signing in to Kick again with the same
+    /// username is how a rejected token gets replaced.
+    pub fn add_kick(&self, config: KickAccountConfig) -> Result<KickAccountConfig> {
+        let id = config.account_id();
+        let mut kick = self.kick.lock().unwrap();
+        kick.insert(id, config.clone());
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        Ok(config)
+    }
+
+    /// Remembers which streamers this account watches.
+    ///
+    /// Persisted rather than rebuilt from open buffers, for the same reason
+    /// an IRC autojoin list is: a channel you went and found should still be
+    /// there tomorrow, and nothing else in the daemon knows you wanted it.
+    pub fn set_kick_channels(&self, account_id: &str, channels: Vec<String>) -> Result<bool> {
+        let mut kick = self.kick.lock().unwrap();
+        let Some(config) = kick.get_mut(account_id) else { return Ok(false) };
+        if config.channels == channels {
+            return Ok(false);
+        }
+        config.channels = channels;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        Ok(true)
     }
 
     /// Called after a re-login (expired/rejected access_token) refreshes
@@ -342,7 +409,7 @@ impl AccountStore {
             Some(a) => {
                 a.access_token = access_token.to_string();
                 a.device_id = device_id.to_string();
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix)?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -356,7 +423,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.next_batch = Some(next_batch.to_string());
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix)?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -372,7 +439,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.rooms = rooms;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -390,7 +457,7 @@ impl AccountStore {
             Some(a) => {
                 a.tor_mode = tor_mode;
                 a.proxy = proxy;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -405,7 +472,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.user_id = Some(user_id);
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -415,27 +482,34 @@ impl AccountStore {
         {
             let mut irc = self.irc.lock().unwrap();
             if irc.remove(account_id).is_some() {
-                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut discord = self.discord.lock().unwrap();
             if discord.remove(account_id).is_some() {
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut sockchat = self.sockchat.lock().unwrap();
             if sockchat.remove(account_id).is_some() {
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
-        let mut matrix = self.matrix.lock().unwrap();
-        if matrix.remove(account_id).is_some() {
-            self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix)?;
+        {
+            let mut matrix = self.matrix.lock().unwrap();
+            if matrix.remove(account_id).is_some() {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        let mut kick = self.kick.lock().unwrap();
+        if kick.remove(account_id).is_some() {
+            self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
             return Ok(true);
         }
         Ok(false)
@@ -478,7 +552,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.avatar_url = Some(url.to_string());
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -503,7 +577,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.display_name = if name.is_empty() { None } else { Some(name.to_string()) };
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -536,7 +610,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 f(a);
-                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap())?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -616,6 +690,40 @@ pub fn sockchat_account_to_json(a: &SockChatAccountConfig, state: &str) -> Accou
         sockchat_rooms: a.rooms.iter().map(|r| crate::model::SockChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
+        use_tor: false,
+        has_key_backup: false,
+    }
+}
+
+/// Kick, like the others, has none of IRC's autojoin/SASL/NickServ concepts.
+///
+/// `has_password` is the one field carrying real information here, and it is
+/// the answer to a question a Kick account genuinely has both answers to:
+/// whether this one is signed in. A signed-out account is not broken or
+/// half-configured - it reads every channel it watches - so the client shows
+/// it as an ordinary connected account and only sending says otherwise.
+pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "kick".to_string(),
+        status: "online".to_string(),
+        display_name: a.username.clone(),
+        state: state.to_string(),
+        // The watched channels are deliberately not reported as `autojoin`.
+        // That field is IRC's comma-separated string with IRC's meaning, and
+        // the client offers an edit box for it; a Kick channel list is added
+        // to by watching a streamer and taken from by closing the buffer.
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        ssl: true,
+        has_password: a.token.as_deref().is_some_and(|t| !t.is_empty()),
+        avatar_url: None,
+        sockchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
         use_tor: false,
         has_key_backup: false,
     }

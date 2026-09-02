@@ -48,8 +48,21 @@ pub async fn dispatch(
             (Some(serde_json::to_value(groups).unwrap()), None)
         }
 
+        // Whatever this conversation lets you put in a message that is not
+        // text. Two services answer it and they answer differently - Discord's
+        // emoji carry their picture in the token, while Kick's have to be
+        // named alongside a URL and a verdict on whether this account may send
+        // them - but the question the client is asking is the same one, so it
+        // stays one method rather than becoming one per protocol.
         "listBufferEmoji" => match p_str_opt(params, "bufferId") {
             None => (None, Some("listBufferEmoji requires \"bufferId\"".to_string())),
+            Some(buffer_id) if buffer_id.starts_with("kick:") => match state.runtime.kick_channel(buffer_id) {
+                None => (Some(serde_json::json!([])), None),
+                Some(channel) => (
+                    Some(serde_json::json!(backend::kick::emotes::offer(&channel.emotes, channel.subscribed))),
+                    None,
+                ),
+            },
             Some(buffer_id) => (Some(serde_json::json!(state.runtime.get_discord_buffer_emojis(buffer_id))), None),
         },
 
@@ -102,6 +115,7 @@ pub async fn dispatch(
                 { "id": "matrix", "name": "Matrix", "available": true },
                 { "id": "discord", "name": "Discord", "available": true },
                 { "id": "sockchat", "name": "Sneedchat", "available": true },
+                { "id": "kick", "name": "Kick", "available": true },
                 { "id": "jabber", "name": "XMPP", "available": false },
                 { "id": "slack", "name": "Slack", "available": false },
             ])),
@@ -275,6 +289,14 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("kick:") {
+                        match state.accounts.get_kick(id) {
+                            Some(cfg) => {
+                                backend::kick::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else {
                         match state.accounts.get_irc(id) {
                             Some(cfg) => {
@@ -323,6 +345,29 @@ pub async fn dispatch(
                 (Some(a), Some(n)) => (a, n),
                 _ => return (None, Some("joinBuffer requires a known \"accountId\" and \"name\"".to_string())),
             };
+            // Kick has no join to perform: a channel is a streamer, and naming
+            // one is the whole of it. So this is "start watching", which the
+            // connection does by subscribing its existing socket - and the
+            // handle is remembered, so it comes back tomorrow.
+            if id.starts_with("kick:") {
+                let slug = backend::kick::api::normalise_slug(name);
+                if slug.is_empty() {
+                    return (None, Some(format!("\"{name}\" is not a Kick handle")));
+                }
+                let Some(sender) = state.runtime.kick_sender(id) else {
+                    return (None, Some("that Kick account is not connected".to_string()));
+                };
+                if sender.send(backend::kick::Command::Join(slug.clone())).is_err() {
+                    return (None, Some("that Kick account is not connected".to_string()));
+                }
+                if let Some(mut cfg) = state.accounts.get_kick(id) {
+                    if !cfg.channels.contains(&slug) {
+                        cfg.channels.push(slug);
+                        let _ = state.accounts.set_kick_channels(id, cfg.channels);
+                    }
+                }
+                return (Some(ok_node()), None);
+            }
             match state.runtime.irc_sender(id) {
                 None => (None, Some("join failed (account not connected?)".to_string())),
                 Some(sender) => match sender.send_join(name) {
@@ -1093,6 +1138,18 @@ pub async fn dispatch(
                         // are a fixed list rather than something joined.
                         if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
                             let _ = sender.send_part(&buffer.name);
+                        } else if buffer.account_id.starts_with("kick:") {
+                            // Nothing to leave - watching a streamer is not a
+                            // membership - so this unsubscribes the socket and
+                            // forgets the handle, which is all "closing" can
+                            // mean here.
+                            if let Some(sender) = state.runtime.kick_sender(&buffer.account_id) {
+                                let _ = sender.send(backend::kick::Command::Part(buffer.name.clone()));
+                            }
+                            if let Some(cfg) = state.accounts.get_kick(&buffer.account_id) {
+                                let left: Vec<String> = cfg.channels.into_iter().filter(|c| *c != buffer.name).collect();
+                                let _ = state.accounts.set_kick_channels(&buffer.account_id, left);
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -1218,6 +1275,31 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("kick:") => {
+                    let Some(cfg) = state.accounts.get_kick(&buffer.account_id) else {
+                        return (None, Some("account not connected".to_string()));
+                    };
+                    // The one thing a signed-out Kick account cannot do. Said
+                    // plainly, because "not connected" would be a lie - it is
+                    // connected, and reading fine.
+                    let Some(token) = cfg.token.as_deref().filter(|t| !t.is_empty()) else {
+                        return (None, Some("sign in to Kick from Accounts to talk in chat".to_string()));
+                    };
+                    let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                        return (None, Some("that channel is not being watched".to_string()));
+                    };
+                    // Kick has no attachments in chat and no threaded replies;
+                    // both are ignored rather than refused, the same way every
+                    // other protocol-specific field is where it does not apply.
+                    let http = match backend::kick::api::client() {
+                        Ok(c) => c,
+                        Err(e) => return (None, Some(e.to_string())),
+                    };
+                    match backend::kick::api::send_message(&http, token, channel.chatroom_id, body).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("sockchat:") => {
                     // Sneedchat answers somebody by name rather than by
                     // message id, so a reply needs whoever wrote the message
@@ -1579,6 +1661,53 @@ pub async fn dispatch(
             let login_id = format!("matrix-login-{}", crate::model::next_message_id());
             backend::matrix::start_login(state.clone(), login_id.clone(), homeserver_url, username, password);
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Adds a Kick account, signed in or not.
+        //
+        // The token is optional and that is the interesting part: Kick's chat
+        // is public, so an account with no credential reads every channel it
+        // is pointed at. Somebody who only wants to watch never has to sign in
+        // at all, and one who does gets sending and their subscriber emotes.
+        //
+        // Synchronous, unlike Discord's and Matrix's logins: there is nothing
+        // to wait for. The browser window already did the signing in (see
+        // moho's browser-login), so all this does is check who the token
+        // belongs to and start the connection.
+        "addKickAccount" => {
+            let token = p_str_opt(params, "token")
+                .map(backend::kick::api::bare_token)
+                .filter(|t| !t.is_empty());
+            let http = match backend::kick::api::client() {
+                Ok(c) => c,
+                Err(e) => return (None, Some(e.to_string())),
+            };
+            let username = match &token {
+                Some(token) => match backend::kick::api::identity(&http, token).await {
+                    Ok(who) => who.username.unwrap_or_default(),
+                    Err(e) => return (None, Some(format!("{e:#}"))),
+                },
+                // A name rather than an empty one, because it becomes half the
+                // account id and shows in the client as who this account is.
+                None => "viewer".to_string(),
+            };
+            let existing = state.accounts.get_kick(&format!("kick:{username}"));
+            let config = crate::accounts::KickAccountConfig {
+                username,
+                token,
+                // Signing in again keeps what was being watched. Losing a
+                // channel list to a re-login would be a poor trade for a
+                // refreshed token.
+                channels: existing.map(|e| e.channels).unwrap_or_default(),
+            };
+            match state.accounts.add_kick(config) {
+                Ok(saved) => {
+                    let id = saved.account_id();
+                    backend::kick::spawn(state.clone(), saved);
+                    (Some(serde_json::json!({ "accountId": id })), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
+            }
         }
 
         // Session verification (SAS - "compare emoji") + recovery key -

@@ -130,6 +130,18 @@ pub const DCC_KEEP: usize = 100;
 /// real prompt among fifty fake ones at worst.
 const DCC_PENDING_PER_NICK: usize = 3;
 
+/// One Kick channel this daemon is watching.
+#[derive(Clone, Debug)]
+pub struct KickChannel {
+    pub slug: String,
+    /// The room the websocket subscribed to and messages are posted to.
+    pub chatroom_id: u64,
+    /// Whether this account is subscribed to this streamer, which decides
+    /// only which emotes the picker offers - see backend::kick::emotes.
+    pub subscribed: bool,
+    pub emotes: Vec<crate::backend::kick::api::Emote>,
+}
+
 /// Somebody in a voice channel, as a call view needs them.
 ///
 /// A struct rather than the tuple this used to be: it grew a picture, and a
@@ -334,6 +346,11 @@ pub struct Runtime {
     /// sending has to target the specific room's own socket rather than
     /// one shared per-account sender.
     sockchat_senders: Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
+    /// One per connected Kick account, since one websocket carries every
+    /// channel that account watches - see backend::kick's module doc.
+    kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
+    /// What is known about each watched Kick channel, by buffer id.
+    kick_channels: Mutex<HashMap<String, KickChannel>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
     /// human-friendly (see backend/matrix/rooms.rs's naming fallback
     /// chain), but sending/reacting/etc. needs the real `!opaque:server`
@@ -511,6 +528,8 @@ impl Runtime {
             discord_buffer_emojis: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
             sockchat_senders: Mutex::new(HashMap::new()),
+            kick_senders: Mutex::new(HashMap::new()),
+            kick_channels: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -585,6 +604,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::matrix_account_to_json(cfg, conn, self.has_matrix_backup(&id))
+        }));
+        out.extend(state.accounts.all_kick().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::kick_account_to_json(cfg, conn)
         }));
         out
     }
@@ -1842,6 +1866,36 @@ impl Runtime {
     /// account-level connection is being rebuilt from scratch (see
     /// backend::sockchat::run_with_retry), so a stale sender from a
     /// pre-restart room task can't be mistaken for a live one.
+    /// What this daemon knows about one watched Kick channel.
+    ///
+    /// Held rather than re-fetched because all three parts are answers to
+    /// questions asked constantly and changing rarely: which room to post to,
+    /// what the emote picker should show, and whether this account may use the
+    /// subscriber half of it.
+    pub fn set_kick_channel(&self, buffer_id: &str, channel: KickChannel) {
+        self.kick_channels.lock().unwrap().insert(buffer_id.to_string(), channel);
+    }
+
+    pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {
+        self.kick_channels.lock().unwrap().get(buffer_id).cloned()
+    }
+
+    pub fn forget_kick_channel(&self, buffer_id: &str) {
+        self.kick_channels.lock().unwrap().remove(buffer_id);
+    }
+
+    pub fn set_kick_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>) {
+        self.kick_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    }
+
+    pub fn kick_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
+        self.kick_senders.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn clear_kick_sender(&self, account_id: &str) {
+        self.kick_senders.lock().unwrap().remove(account_id);
+    }
+
     pub fn clear_sockchat_senders(&self, account_id: &str) {
         self.sockchat_senders.lock().unwrap().remove(account_id);
     }
