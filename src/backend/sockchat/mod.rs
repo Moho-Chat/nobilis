@@ -985,7 +985,8 @@ pub fn send_whisper(state: &AppState, account_id: &str, target: &str, body: &str
         .map(|c| c.display_name.filter(|n| !n.is_empty()).unwrap_or(c.username))
         .unwrap_or_default();
     let at = if target.starts_with('@') { "" } else { "@" };
-    record_whisper(state, account_id, &me, &format!("{at}{target} {text}"), None, None, false);
+    let named = target.trim_end_matches(',');
+    record_whisper(state, account_id, &me, &format!("{at}{named}, {text}"), None, None, false);
     Ok(())
 }
 

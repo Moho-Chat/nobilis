@@ -326,7 +326,7 @@ pub fn prepare_edit(uuid: &str, new_body: &str) -> String {
 /// plausible about, and it is confirmed against the site rather than derived.
 pub const WHISPER_COMMAND: &str = "/w";
 
-/// `/w @username <message>`.
+/// `/w @username, <message>`.
 ///
 /// The `@` is part of the address, not decoration: the site reads the target
 /// as a mention. Added here rather than expected from the caller, since every
@@ -334,10 +334,21 @@ pub const WHISPER_COMMAND: &str = "/w";
 /// holds it without one, and a name that already has one is left alone rather
 /// than given a second.
 ///
-/// The username goes through unquoted because that is what the site accepts;
-/// a name with a space in it cannot be whispered, which is a limit of the
-/// protocol rather than of this.
-/// Reads a whisper somebody typed themselves, as `/w @name message`.
+/// The comma is what ends the name, and it is required rather than tidy.
+/// Sneedchat names contain spaces - "Fishtank Observer" is one - so without it
+/// the site has no way to tell where the name stops and the message starts,
+/// and takes only the first word as the target. This module already knew that
+/// convention and used it for replies (`as_reply` writes `@Name,`); the
+/// whisper path was written as though a name were one word, and the note here
+/// claiming a name with a space "cannot be whispered" was wrong about the
+/// protocol rather than describing it.
+pub fn prepare_whisper(target: &str, body: &str) -> String {
+    let target = target.trim().trim_end_matches(',').trim();
+    let at = if target.starts_with('@') { "" } else { "@" };
+    format!("{WHISPER_COMMAND} {at}{target}, {body}")
+}
+
+/// Reads a whisper somebody typed themselves, as `/w @name, message`.
 ///
 /// Supported because it is what the site's own users type, and because
 /// handing it straight through would send a real whisper that this client
@@ -353,21 +364,26 @@ pub fn parse_whisper_command(text: &str) -> Option<(String, String)> {
     let rest = text
         .strip_prefix("/w ")
         .or_else(|| text.strip_prefix("/whisper "))
-        .or_else(|| text.strip_prefix("/W "))?;
-    let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
-    let target = parts.next()?.trim_start_matches('@').trim();
-    let body = parts.next().unwrap_or("").trim();
+        .or_else(|| text.strip_prefix("/W "))?
+        .trim_start();
+
+    // The comma first, because that is what actually ends a name here and
+    // names contain spaces. Splitting on whitespace would read "Fishtank
+    // Observer" as a whisper to "Fishtank" about "Observer, ...".
+    let (target, body) = match rest.split_once(',') {
+        Some((target, body)) => (target, body),
+        // No comma, so the name has to be one word - which is the form
+        // somebody types for a single-word name, and is unambiguous.
+        None => rest.split_once(char::is_whitespace)?,
+    };
+    let target = target.trim().trim_start_matches('@').trim();
+    let body = body.trim();
     if target.is_empty() || body.is_empty() {
         return None;
     }
     Some((target.to_string(), body.to_string()))
 }
 
-pub fn prepare_whisper(target: &str, body: &str) -> String {
-    let target = target.trim();
-    let at = if target.starts_with('@') { "" } else { "@" };
-    format!("{WHISPER_COMMAND} {at}{target} {body}")
-}
 
 /// `/delete <uuid>` - unlike `/edit`, just the bare uuid, no JSON.
 pub fn prepare_delete(uuid: &str) -> String {
@@ -512,10 +528,18 @@ mod tests {
         assert_eq!(prepare_delete("abc-123"), "/delete abc-123");
         // The site reads the target as a mention, so the @ is part of
         // addressing it rather than something a caller has to remember.
-        assert_eq!(prepare_whisper("Someone", "hello there"), "/w @Someone hello there");
+        assert_eq!(prepare_whisper("Someone", "hello there"), "/w @Someone, hello there");
         // A name that already carries one does not get a second.
-        assert_eq!(prepare_whisper("@Someone", "hi"), "/w @Someone hi");
-        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/w @Spaced hi");
+        assert_eq!(prepare_whisper("@Someone", "hi"), "/w @Someone, hi");
+        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/w @Spaced, hi");
+        // The comma ends the name, so a name with a space in it works - which
+        // is most of why it is there. Sneedchat names are display names.
+        assert_eq!(
+            prepare_whisper("Fishtank Observer", "aaa"),
+            "/w @Fishtank Observer, aaa"
+        );
+        // And a caller that supplied the comma does not get two.
+        assert_eq!(prepare_whisper("Fishtank Observer,", "aaa"), "/w @Fishtank Observer, aaa");
         // The command itself, spelled out rather than built from the constant:
         // a test that reads the constant back cannot notice it changing, and
         // the wrong word here is not a failed send - it is the message posted
@@ -526,13 +550,27 @@ mod tests {
     #[test]
     fn reads_a_whisper_somebody_typed() {
         assert_eq!(
-            parse_whisper_command("/w @Someone hello there"),
+            parse_whisper_command("/w @Someone, hello there"),
             Some(("Someone".into(), "hello there".into()))
         );
         // Without the @, which the site accepts and people leave off.
-        assert_eq!(parse_whisper_command("/w Someone hi"), Some(("Someone".into(), "hi".into())));
+        assert_eq!(parse_whisper_command("/w Someone, hi"), Some(("Someone".into(), "hi".into())));
         // The word somebody will type having read about this anywhere else.
-        assert_eq!(parse_whisper_command("/whisper @Someone hi"), Some(("Someone".into(), "hi".into())));
+        assert_eq!(parse_whisper_command("/whisper @Someone, hi"), Some(("Someone".into(), "hi".into())));
+        // The case the comma exists for: splitting on whitespace would read
+        // this as a whisper to "Fishtank" beginning "Observer, aaa".
+        assert_eq!(
+            parse_whisper_command("/w @Fishtank Observer, aaa"),
+            Some(("Fishtank Observer".into(), "aaa".into()))
+        );
+        // A single-word name with no comma still works, because there is
+        // nowhere else the name could end.
+        assert_eq!(parse_whisper_command("/w @Someone hi"), Some(("Someone".into(), "hi".into())));
+        // A comma inside the message is not a second delimiter.
+        assert_eq!(
+            parse_whisper_command("/w @Someone, hi, how are you"),
+            Some(("Someone".into(), "hi, how are you".into()))
+        );
     }
 
     #[test]
@@ -541,6 +579,8 @@ mod tests {
         // with an empty body would be a whisper nobody wrote, and passing it
         // through as ordinary text is what the site does with it anyway.
         assert_eq!(parse_whisper_command("/w @Someone"), None);
+        assert_eq!(parse_whisper_command("/w @Someone,"), None);
+        assert_eq!(parse_whisper_command("/w , body"), None);
         assert_eq!(parse_whisper_command("/w "), None);
         assert_eq!(parse_whisper_command("/w"), None);
         // A word that merely starts the same way. The trailing space in the
