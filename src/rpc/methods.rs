@@ -8,6 +8,21 @@ use std::collections::HashSet;
 /// One handler per JSON-RPC method (daemon/nobilis/api.c's handle_request,
 /// split out of the socket-framing code). Returns (result, error) - exactly
 /// one is Some, matching the wire contract's response shape.
+/// An HTTP client and a token for a signed-in Kick account.
+///
+/// One place, because every moderation call needs both and the signed-out
+/// case needs saying rather than reporting as "not connected" - the account
+/// is connected and reading fine, it simply cannot act.
+fn kick_credential(state: &AppState, account_id: &str) -> std::result::Result<(reqwest::Client, String), String> {
+    let cfg = state.accounts.get_kick(account_id).ok_or_else(|| "no such account".to_string())?;
+    let token = cfg
+        .token
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "sign in to Kick from Accounts to moderate".to_string())?;
+    let http = backend::kick::api::client().map_err(|e| e.to_string())?;
+    Ok((http, token))
+}
+
 pub async fn dispatch(
     state: &AppState,
     method: &str,
@@ -1512,6 +1527,18 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e.to_string())),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("kick:") => {
+                    match (kick_credential(state, &buffer.account_id), state.runtime.kick_channel(buffer_id)) {
+                        (Err(e), _) => (None, Some(e)),
+                        (_, None) => (None, Some("that channel is not being watched".to_string())),
+                        (Ok((http, token)), Some(channel)) => {
+                            match backend::kick::api::delete_message(&http, &token, channel.chatroom_id, msg_id).await {
+                                Ok(()) => (Some(ok_node()), None),
+                                Err(e) => (None, Some(format!("{e:#}"))),
+                            }
+                        }
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("sockchat:") => match backend::sockchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e.to_string())),
@@ -1783,6 +1810,82 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "accountId": id })), None)
                 }
                 Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Moderation, for a Kick account that is a moderator of the channel.
+        //
+        // Kick is the authority and re-checks every one of these; what it
+        // refuses comes back in its own words, which say far more than a
+        // status code - not a moderator, no longer signed in, no such person.
+        "moderateKickUser" => {
+            let (account_id, buffer_id, username, action) = match (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "username"),
+                p_str_opt(params, "action"),
+            ) {
+                (Some(a), Some(b), Some(u), Some(action)) => (a, b, u, action),
+                _ => {
+                    return (
+                        None,
+                        Some("moderateKickUser requires \"accountId\", \"bufferId\", \"username\" and \"action\"".to_string()),
+                    )
+                }
+            };
+            let (http, token) = match kick_credential(state, account_id) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that channel is not being watched".to_string()));
+            };
+            // A timeout is a ban with an end on it, which is Kick's own model
+            // and the distinction a moderator actually means.
+            let minutes = params.get("minutes").and_then(|v| v.as_u64()).map(|m| m as u32);
+            let result = match action {
+                "ban" => backend::kick::api::ban(&http, &token, &channel.slug, username, None).await,
+                "timeout" => {
+                    backend::kick::api::ban(&http, &token, &channel.slug, username, Some(minutes.unwrap_or(10))).await
+                }
+                "unban" => backend::kick::api::unban(&http, &token, &channel.slug, username).await,
+                other => return (None, Some(format!("moderateKickUser does not know \"{other}\""))),
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Who may talk in a channel: followers only, subscribers only, and
+        // how long between messages.
+        //
+        // Sent whole because that is what the endpoint takes, so the values
+        // not being changed are read back from what the channel already is
+        // rather than guessed - a caller turning on slow mode must not
+        // silently turn off followers-only on the way.
+        "setKickChatMode" => {
+            let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return (None, Some("setKickChatMode requires \"accountId\" and \"bufferId\"".to_string())),
+            };
+            let (http, token) = match kick_credential(state, account_id) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that channel is not being watched".to_string()));
+            };
+            let followers = p_bool(params, "followersOnly", channel.followers_only);
+            let subscribers = p_bool(params, "subscribersOnly", channel.subscribers_only);
+            let slow = match params.get("slowSeconds") {
+                Some(serde_json::Value::Null) => None,
+                Some(v) => v.as_u64().map(|s| s as u32).filter(|s| *s > 0),
+                None => channel.slow_seconds,
+            };
+            match backend::kick::api::set_chat_mode(&http, &token, &channel.slug, followers, subscribers, slow).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 

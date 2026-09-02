@@ -571,6 +571,107 @@ pub struct ReplyTo {
     pub sender_name: String,
 }
 
+/// Times somebody out, or bans them outright.
+///
+/// `minutes` of None is a ban with no end. Kick treats the two as one endpoint
+/// with a flag, and the difference is the whole of what the moderator meant.
+pub async fn ban(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    username: &str,
+    minutes: Option<u32>,
+) -> Result<()> {
+    let body = match minutes {
+        Some(duration) => serde_json::json!({ "banned_username": username, "duration": duration, "permanent": false }),
+        None => serde_json::json!({ "banned_username": username, "permanent": true }),
+    };
+    moderate(http, token, reqwest::Method::POST, &format!("/api/v2/channels/{slug}/bans"), Some(body)).await
+}
+
+pub async fn unban(http: &reqwest::Client, token: &str, slug: &str, username: &str) -> Result<()> {
+    moderate(http, token, reqwest::Method::DELETE, &format!("/api/v2/channels/{slug}/bans/{username}"), None).await
+}
+
+/// Takes one message down.
+///
+/// Keyed by the chatroom rather than the channel, which is the same split the
+/// websocket uses: messages belong to the room, bans belong to the channel.
+pub async fn delete_message(http: &reqwest::Client, token: &str, chatroom_id: u64, message_id: &str) -> Result<()> {
+    moderate(
+        http,
+        token,
+        reqwest::Method::DELETE,
+        &format!("/api/v2/chatrooms/{chatroom_id}/messages/{message_id}"),
+        None,
+    )
+    .await
+}
+
+/// How the chat is restricted: followers only, subscribers only, slow mode.
+///
+/// Sent whole rather than as a patch, because that is what the endpoint takes
+/// - so a caller changing one setting must pass the others as they are, and
+/// the RPC reads the current values before sending.
+pub async fn set_chat_mode(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    followers_only: bool,
+    subscribers_only: bool,
+    slow_seconds: Option<u32>,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "followers_mode": followers_only,
+        "subscribers_mode": subscribers_only,
+        "slow_mode": slow_seconds.is_some(),
+        "message_interval": slow_seconds.unwrap_or(0),
+    });
+    moderate(http, token, reqwest::Method::PUT, &format!("/api/v2/channels/{slug}/chatroom"), Some(body)).await
+}
+
+/// One moderation request, with the CSRF token and Kick's own refusal.
+///
+/// Shared because every one of these fails the same interesting ways - not a
+/// moderator, not signed in any more, the person is not there - and Kick
+/// explains each of them better than a status code can.
+async fn moderate(
+    http: &reqwest::Client,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<()> {
+    let mut req = http
+        .request(method, format!("{API_ROOT}{path}"))
+        .header("Accept", "application/json")
+        .bearer_auth(token);
+    if let Some(xsrf) = xsrf_token(http, token).await {
+        req = req.header("X-XSRF-TOKEN", xsrf);
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let res = req.send().await.context("asking Kick to do that")?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let detail = res
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .filter(|s| !s.is_empty());
+    match detail {
+        Some(message) => Err(anyhow!("{message}")),
+        None if status == reqwest::StatusCode::FORBIDDEN => {
+            Err(anyhow!("Kick refused - this account is not a moderator of that channel"))
+        }
+        None => Err(anyhow!("Kick refused ({status})")),
+    }
+}
+
 /// Posts a line to a channel's chat.
 ///
 /// The CSRF token is asked for at send time rather than stored. Kick's API is

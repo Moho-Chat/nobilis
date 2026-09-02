@@ -397,8 +397,23 @@ async fn prepare(
             history_cursor: None,
             chatroom_id: channel.chatroom_id,
             subscribed: false,
+            followers_only: channel.followers_only,
+            subscribers_only: channel.subscribers_only,
+            slow_seconds: None,
             emotes: Vec::new(),
         },
+    );
+
+    // How the chat is restricted, said before anybody tries to speak into it.
+    // Both values were already being parsed and then read by nothing, so moho
+    // knew a channel was subscribers-only and let somebody type into it
+    // anyway, learning otherwise from a refused send.
+    state.runtime.set_kick_chat_mode(
+        state,
+        &buffer.id,
+        channel.followers_only,
+        channel.subscribers_only,
+        None,
     );
 
     // The past, before the present starts arriving. Backgrounded with the
@@ -653,6 +668,25 @@ async fn handle_frame(
             if let Some(id) = id {
                 state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &slug), id);
             }
+        }
+
+        // The chat's rules changing under everybody - followers-only going
+        // on mid-stream is the usual reason a message stops sending.
+        e if e.ends_with("ChatroomUpdatedEvent") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let flag = |name: &str| payload.get(name).and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
+            let slow = payload
+                .get("slow_mode")
+                .filter(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                .and_then(|m| m.get("message_interval").and_then(|v| v.as_u64()))
+                .map(|s| s as u32);
+            state.runtime.set_kick_chat_mode(
+                state,
+                &crate::model::buffer_id(account_id, &slug),
+                flag("followers_mode"),
+                flag("subscribers_mode"),
+                slow,
+            );
         }
 
         // A moderator emptying the room.

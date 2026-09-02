@@ -153,6 +153,13 @@ pub struct KickChannel {
     /// Whether this account is subscribed to this streamer, which decides
     /// only which emotes the picker offers - see backend::kick::emotes.
     pub subscribed: bool,
+    /// How the chat is restricted right now. Parsed from the channel on join
+    /// and kept current by the chatroom-updated event, so a refused message
+    /// can be explained before it is written rather than after.
+    pub followers_only: bool,
+    pub subscribers_only: bool,
+    /// Seconds somebody must wait between messages, where slow mode is on.
+    pub slow_seconds: Option<u32>,
     pub emotes: Vec<crate::backend::kick::api::Emote>,
 }
 
@@ -1932,6 +1939,47 @@ impl Runtime {
 
     pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {
         self.kick_channels.lock().unwrap().get(buffer_id).cloned()
+    }
+
+    /// Records how a channel's chat is currently restricted, and says so on
+    /// the buffer where a client can show it.
+    pub fn set_kick_chat_mode(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        followers_only: bool,
+        subscribers_only: bool,
+        slow_seconds: Option<u32>,
+    ) {
+        if let Some(channel) = self.kick_channels.lock().unwrap().get_mut(buffer_id) {
+            channel.followers_only = followers_only;
+            channel.subscribers_only = subscribers_only;
+            channel.slow_seconds = slow_seconds;
+        }
+        // Worded rather than lettered. IRC writes its modes as "+mnt" because
+        // that is what its server says; Kick has no such spelling, and
+        // inventing one would be a code only this client knew.
+        let mut said: Vec<String> = Vec::new();
+        if subscribers_only {
+            said.push("subscribers only".into());
+        } else if followers_only {
+            said.push("followers only".into());
+        }
+        if let Some(seconds) = slow_seconds {
+            said.push(format!("slow mode {seconds}s"));
+        }
+        let modes = (!said.is_empty()).then(|| said.join(", "));
+
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.channel_modes == modes {
+                return;
+            }
+            buffer.channel_modes = modes;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn set_kick_history_cursor(&self, buffer_id: &str, cursor: Option<String>) {
