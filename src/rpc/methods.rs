@@ -2233,6 +2233,82 @@ pub async fn dispatch(
             }
         }
 
+        // Making a room, or a space - which is a room with a different
+        // creation type and nothing else different, so it is one call.
+        "createMatrixRoom" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("createMatrixRoom requires \"accountId\"".to_string()));
+            };
+            let name = p_str(params, "name", "").trim().to_string();
+            if name.is_empty() {
+                return (None, Some("a room needs a name".to_string()));
+            }
+            match backend::matrix::create_room(
+                state,
+                account_id,
+                &name,
+                p_str(params, "topic", ""),
+                p_bool(params, "isSpace", false),
+                p_bool(params, "isPublic", false),
+                p_bool(params, "encrypted", false),
+            )
+            .await
+            {
+                Ok(room_id) => (Some(serde_json::json!({ "roomId": room_id })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A room's own name and topic. Two state events with one shape, which
+        // is why they share a method rather than having one each.
+        "setMatrixRoomState" => {
+            let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return (None, Some("setMatrixRoomState requires \"accountId\" and \"bufferId\"".to_string())),
+            };
+            let mut done = false;
+            if let Some(name) = p_str_opt(params, "name") {
+                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.name", serde_json::json!({ "name": name })).await {
+                    return (None, Some(format!("{e:#}")));
+                }
+                done = true;
+            }
+            if let Some(topic) = p_str_opt(params, "topic") {
+                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.topic", serde_json::json!({ "topic": topic })).await {
+                    return (None, Some(format!("{e:#}")));
+                }
+                done = true;
+            }
+            if done {
+                (Some(ok_node()), None)
+            } else {
+                (None, Some("setMatrixRoomState needs a \"name\" or a \"topic\"".to_string()))
+            }
+        }
+
+        // Promoting or demoting somebody. Power levels were readable and
+        // movable only downwards, through mute - so nobody could be made an
+        // operator of a room from here.
+        "setMatrixPowerLevel" => {
+            let (account_id, buffer_id, user_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId"), p_str_opt(params, "userId")) {
+                    (Some(a), Some(b), Some(u)) => (a, b, u),
+                    _ => {
+                        return (
+                            None,
+                            Some("setMatrixPowerLevel requires \"accountId\", \"bufferId\" and \"userId\"".to_string()),
+                        )
+                    }
+                };
+            let Some(level) = params.get("level").and_then(|v| v.as_i64()) else {
+                return (None, Some("setMatrixPowerLevel requires a numeric \"level\"".to_string()));
+            };
+            match backend::matrix::moderation::set_power_level(state, account_id, buffer_id, user_id, level).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Asking somebody into a room. Its absence was the odd one out: this
         // client could accept an invitation and decline one, and never send
         // one - so a room created here could never gain a second member here.

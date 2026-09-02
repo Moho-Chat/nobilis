@@ -122,6 +122,42 @@ pub async fn unban_member(state: &AppState, account_id: &str, buffer_id: &str, t
     Ok(())
 }
 
+/// Sets a member's power level outright - promoting or demoting them.
+///
+/// The same read-modify-write as `mute_member` and for the same reason: a
+/// power-levels event is always a full replace, so PUTting only the one user
+/// would silently wipe every other rank and threshold the room had.
+///
+/// Refusing to set a level above our own is this client's own rule, not the
+/// server's - the server refuses it too, but with an error about event
+/// authorisation rather than about what was actually attempted. Somebody
+/// making another person an admin equal to themselves is allowed and is
+/// deliberately not blocked; it is a real thing people do.
+pub async fn set_power_level(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    target_user_id: &str,
+    level: i64,
+) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
+    let base = homeserver_url.trim_end_matches('/');
+    let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let state_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
+
+    let mut pl = http::get_json(&state_url, &access_token).await.context("fetching current power levels")?;
+    // The account id is "matrix:@user:server"; the power levels are keyed by
+    // the Matrix id itself.
+    let own_mxid = account_id.strip_prefix("matrix:").unwrap_or(account_id);
+    let own = user_power_level(&pl, own_mxid);
+    if level > own {
+        anyhow::bail!("you cannot give somebody a rank above your own ({own})");
+    }
+    pl["users"][target_user_id] = Value::from(level);
+    http::put_json(&state_url, &access_token, pl).await.context("setting power level")?;
+    Ok(())
+}
+
 /// Lowers a member's power level to one below whatever's needed to send
 /// `m.room.message` in this room, without removing them from it - "mute"
 /// as a power-level floor rather than a membership change. Read-modify-

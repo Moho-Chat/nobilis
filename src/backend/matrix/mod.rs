@@ -1223,6 +1223,86 @@ pub async fn leave_room(state: &AppState, account_id: &str, room_id: &str) -> Re
 /// creates is reconciled the normal way once the room's own first real
 /// `/sync` response arrives (process_sync_response's cached-name check
 /// already no-ops once a name/kind is set, same as any other room).
+/// Makes a room, or a space.
+///
+/// A space is a room with `m.space` as its creation type and nothing else
+/// different, which is why one call makes both - inventing a second path for
+/// it would be inventing a distinction the protocol does not have.
+///
+/// Encryption is offered and is off by default. Turning it on afterwards is
+/// possible and turning it off never is, so the default is the one that can
+/// still be changed - and a room somebody meant to be private is a room they
+/// will say so about.
+///
+/// The buffer is not created here. The room arrives through the next sync
+/// like any other, with the name and kind the server settled on, and creating
+/// one now would mean guessing at both and reconciling later.
+pub async fn create_room(
+    state: &AppState,
+    account_id: &str,
+    name: &str,
+    topic: &str,
+    is_space: bool,
+    is_public: bool,
+    encrypted: bool,
+) -> Result<String> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+
+    let mut body = serde_json::json!({
+        "name": name,
+        // A public room is one anybody can find and join; a private one is
+        // invite-only. Both are ordinary presets rather than a pile of state
+        // events, which is what every other client sends too.
+        "preset": if is_public { "public_chat" } else { "private_chat" },
+        "visibility": if is_public { "public" } else { "private" },
+    });
+    if !topic.trim().is_empty() {
+        body["topic"] = serde_json::Value::String(topic.trim().to_string());
+    }
+    if is_space {
+        body["creation_content"] = serde_json::json!({ "type": "m.space" });
+    }
+    if encrypted {
+        // The one piece of initial state worth sending: a room encrypted from
+        // its first message has no plaintext history to leak, and one turned
+        // on later always does.
+        body["initial_state"] = serde_json::json!([{
+            "type": "m.room.encryption",
+            "state_key": "",
+            "content": { "algorithm": "m.megolm.v1.aes-sha2" }
+        }]);
+    }
+
+    let resp = http::post_json(&format!("{base}/_matrix/client/v3/createRoom"), Some(&account.access_token), body)
+        .await
+        .context("creating room")?;
+    resp["room_id"].as_str().map(str::to_string).context("createRoom response missing room_id")
+}
+
+/// Changes one of a room's own state events - its name or its topic.
+///
+/// Both are the same shape of call with a different type, and both are
+/// refused by the server if this account's power level is too low, which is
+/// where that question belongs.
+pub async fn set_room_state(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    event_type: &str,
+    content: serde_json::Value,
+) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/state/{event_type}/",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
+    );
+    http::put_json(&url, &account.access_token, content).await.context("setting room state")?;
+    Ok(())
+}
+
 pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, target_display_name: &str) -> Result<String> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
