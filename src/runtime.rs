@@ -852,6 +852,7 @@ impl Runtime {
             // has none.
             category: None,
             position: 0,
+            syncing: false,
             encrypted: None,
             channel_modes: None,
             group_id: Some(model::account_group_id(account_id)),
@@ -1464,6 +1465,25 @@ impl Runtime {
             .filter(|(buffer_id, _)| buffer_id.starts_with(&prefix))
             .map(|(_, room_id)| room_id.clone())
             .collect()
+    }
+
+    /// Marks a buffer as waiting for the service to say what is in it, and
+    /// tells everybody. Emitting from here rather than leaving it to callers
+    /// is what makes the room appear in the list the moment it is set.
+    pub fn set_buffer_syncing(&self, state: &AppState, buffer_id: &str, syncing: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(buffer) if buffer.syncing != syncing => {
+                    buffer.syncing = syncing;
+                    Some(buffer.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(buffer) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
+        }
     }
 
     pub fn get_matrix_room(&self, buffer_id: &str) -> Option<String> {

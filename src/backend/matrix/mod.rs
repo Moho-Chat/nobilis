@@ -312,48 +312,103 @@ async fn bootstrap_joined_rooms(state: &AppState, account_id: &str, own_user_id:
         if state.runtime.get_matrix_room_name(account_id, &room_id).is_some() {
             continue;
         }
-
-        let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-        let state_resp = match http::get_json(&format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/state"), access_token).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("matrix[{account_id}]: fetching state for room {room_id} failed: {e:#}");
-                continue;
-            }
-        };
-        let Some(events) = state_resp.as_array() else { continue };
-        let event_refs: Vec<&Value> = events.iter().collect();
-
-        // A Space is a room too, so it arrives in joined_rooms alongside real
-        // ones. It gets a rail entry rather than a buffer - there is nothing
-        // to say in it.
-        if rooms::is_space(&event_refs) {
-            register_space(state, account_id, &room_id, homeserver_url, access_token, &event_refs).await;
-            continue;
-        }
-
-        let info = rooms::derive_room_info(&room_id, own_user_id, &event_refs);
-        state.runtime.set_matrix_room_name(account_id, &room_id, &info.name, &info.kind);
-
-        let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
-        state.runtime.set_matrix_room(&buffer.id, &room_id);
-        // The space that lists this room may already have been seen, or may
-        // turn up later - register_space back-fills the other order.
-        if let Some(group_id) = state.runtime.get_matrix_space_parent(account_id, &room_id) {
-            state.runtime.set_buffer_group(state, &buffer.id, &group_id);
-        }
-
-        state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
-
-        roomstate::process_state_events(state, account_id, &room_id, homeserver_url, access_token, &event_refs).await;
-        // No presence data available at bootstrap time (that's /sync-only
-        // - there's no bulk "current presence for all these users"
-        // endpoint) - the roster/power-level part of the userlist is
-        // correct immediately, everyone just starts as offline until a
-        // real presence.events update arrives post-connect.
-        roomstate::emit_matrix_presence(state, account_id, &room_id, own_user_id);
+        register_room(state, account_id, own_user_id, homeserver_url, access_token, &room_id, false).await;
     }
     Ok(())
+}
+
+/// Gives a room a buffer, named and furnished, without waiting for a sync to
+/// mention it.
+///
+/// The room's own `/state` is everything needed to name it, know whether it is
+/// encrypted, and build its member list - which is why both the reconnect
+/// bootstrap and joining a room can use it. A sync will say all of this again
+/// later; this only means the room is *there* in the meantime.
+///
+/// `syncing` marks the buffer as still filling in. Joining sets it, because a
+/// room joined and then silent for several seconds looks like a button that
+/// did nothing; the bootstrap does not, since those rooms are being restored
+/// rather than waited for.
+async fn register_room(
+    state: &AppState,
+    account_id: &str,
+    own_user_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+    room_id: &str,
+    syncing: bool,
+) {
+    let base = homeserver_url.trim_end_matches('/');
+    let already_known = state.runtime.get_matrix_room_name(account_id, room_id).is_some();
+    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let state_resp = match http::get_json(&format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/state"), access_token).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("matrix[{account_id}]: fetching state for room {room_id} failed: {e:#}");
+            return;
+        }
+    };
+    let Some(events) = state_resp.as_array() else { return };
+    let event_refs: Vec<&Value> = events.iter().collect();
+
+    // A Space is a room too, so it arrives in joined_rooms alongside real
+    // ones. It gets a rail entry rather than a buffer - there is nothing
+    // to say in it.
+    if rooms::is_space(&event_refs) {
+        register_space(state, account_id, room_id, homeserver_url, access_token, &event_refs).await;
+        return;
+    }
+
+    let info = rooms::derive_room_info(room_id, own_user_id, &event_refs);
+    state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
+
+    let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
+    state.runtime.set_matrix_room(&buffer.id, room_id);
+    // Only for a room this is the first sight of. A sync that has already
+    // carried the room has already said what is in it, and marking it as
+    // waiting afterwards would leave a spinner turning against a room that
+    // arrived while we were asking - until the next thing anybody said in it.
+    if syncing && !already_known {
+        state.runtime.set_buffer_syncing(state, &buffer.id, true);
+        stop_waiting_eventually(state.clone(), buffer.id.clone());
+    }
+    // The space that lists this room may already have been seen, or may
+    // turn up later - register_space back-fills the other order.
+    if let Some(group_id) = state.runtime.get_matrix_space_parent(account_id, room_id) {
+        state.runtime.set_buffer_group(state, &buffer.id, &group_id);
+    }
+
+    state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
+
+    roomstate::process_state_events(state, account_id, room_id, homeserver_url, access_token, &event_refs).await;
+    // No presence data available at bootstrap time (that's /sync-only
+    // - there's no bulk "current presence for all these users"
+    // endpoint) - the roster/power-level part of the userlist is
+    // correct immediately, everyone just starts as offline until a
+    // real presence.events update arrives post-connect.
+    roomstate::emit_matrix_presence(state, account_id, room_id, own_user_id);
+}
+
+/// How long a freshly joined room is allowed to be "still arriving" before we
+/// stop saying so.
+const SYNC_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Gives up waiting, after a while.
+///
+/// Normally the next sync carries the room and clears this - joining produces
+/// a membership event, so there is always something to carry. But a room that
+/// was joined from somewhere else in the same breath, or one whose join event
+/// arrived in a sync processed before the buffer existed, has nothing left to
+/// announce it: the room is fine and the spinner would turn forever.
+///
+/// A room silent for half a minute is not still arriving, it is quiet - and
+/// "quiet" and "still loading" look identical to somebody waiting, so the
+/// wrong one of the two must not be the one that lasts.
+fn stop_waiting_eventually(state: AppState, buffer_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SYNC_WAIT_LIMIT).await;
+        state.runtime.set_buffer_syncing(&state, &buffer_id, false);
+    });
 }
 
 async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: &str, homeserver_url: &str, access_token: &str, resp: &Value, session: &crypto::CryptoSession) {
@@ -448,6 +503,13 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
                     );
                 }
             }
+        }
+
+        // The room has been heard from, so it is no longer waiting to be. Set
+        // on join and cleared here, which is the first moment there is
+        // anything true to say about what is in it.
+        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(room_id) {
+            state.runtime.set_buffer_syncing(state, &buffer_id, false);
         }
 
         let timeline_events: Vec<&Value> = room["timeline"]["events"].as_array().into_iter().flatten().collect();
@@ -1060,7 +1122,20 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
         url.push_str("server_name=");
         url.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
     }
-    http::post_json(&url, Some(&account.access_token), serde_json::json!({})).await.context("joining room")?;
+    let resp = http::post_json(&url, Some(&account.access_token), serde_json::json!({})).await.context("joining room")?;
+
+    // Give the room a buffer now rather than when the next sync happens to
+    // mention it. A join is somebody waiting: on a large room the server can
+    // take many seconds to say anything about it, and until it did there was
+    // no sign anywhere in the client that anything had happened at all.
+    //
+    // Marked as still syncing, which is what the list draws a spinner against
+    // and what the empty room says instead of looking like a room with nothing
+    // in it. Cleared by the first sync that carries the room - see
+    // process_sync_response.
+    if let Some(room_id) = resp["room_id"].as_str() {
+        register_room(state, account_id, &account.user_id, &account.homeserver_url, &account.access_token, room_id, true).await;
+    }
     Ok(())
 }
 

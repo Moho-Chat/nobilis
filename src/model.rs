@@ -127,6 +127,14 @@ pub struct Buffer {
     /// heading and headings sort against each other.
     #[serde(default)]
     pub position: i64,
+    /// Set while this buffer exists but the service has not yet told us what
+    /// is in it - a Matrix room between joining it and its first sync.
+    ///
+    /// Carried so a room can appear the moment somebody joins rather than
+    /// whenever the server gets round to mentioning it, which on a large room
+    /// is many seconds later and reads as the join having done nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub syncing: bool,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
     /// not `false`, for every other protocol, since "encrypted" isn't a
     /// meaningful concept for them at all). Drives the lock/unlock
@@ -499,6 +507,7 @@ mod tests {
             avatar_url: None,
             category: None,
             position: 0,
+            syncing: false,
             encrypted: None,
             channel_modes: None,
             group_id: None,
