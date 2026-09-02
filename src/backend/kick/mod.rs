@@ -76,7 +76,7 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
 /// each one costs a buffer, four subscriptions and its own emote table. Fifty
 /// is more channels than anyone watches at once and still opens quickly; the
 /// rest are a handle away in the "+" box.
-const MAX_FOLLOWED: usize = 50;
+pub const MAX_FOLLOWED: usize = 50;
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);

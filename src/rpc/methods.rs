@@ -1728,6 +1728,69 @@ pub async fn dispatch(
             }
         }
 
+        // Reads this account's Kick follows again, and starts watching any
+        // that are new.
+        //
+        // Needed because the automatic one deliberately happens once. That
+        // flag exists so closing a channel sticks, and the cost of it is that
+        // a streamer followed later never appears - so this is the way to ask
+        // for them, rather than the sync being made to run on every connect
+        // and quietly undoing every channel somebody had closed.
+        //
+        // Adds only. Un-following on Kick does not close the buffer here: by
+        // this point the list is the person's own, and a sync that removed
+        // things would be the same overreach as one that put them back.
+        "syncKickFollows" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("syncKickFollows requires \"accountId\"".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_kick(account_id) else {
+                return (None, Some("no such account".to_string()));
+            };
+            let Some(token) = cfg.token.as_deref().filter(|t| !t.is_empty()) else {
+                return (None, Some("sign in to Kick from Accounts to read your follows".to_string()));
+            };
+            let http = match backend::kick::api::client() {
+                Ok(c) => c,
+                Err(e) => return (None, Some(e.to_string())),
+            };
+            let followed = match backend::kick::api::followed(&http, token).await {
+                Ok(f) => f,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+
+            let mut channels = cfg.channels.clone();
+            let mut added: Vec<String> = Vec::new();
+            for slug in followed {
+                if added.len() >= backend::kick::MAX_FOLLOWED {
+                    break;
+                }
+                if !channels.contains(&slug) {
+                    channels.push(slug.clone());
+                    added.push(slug);
+                }
+            }
+
+            if !added.is_empty() {
+                if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
+                    return (None, Some(e.to_string()));
+                }
+            }
+            // Told to the live connection so they open now rather than at the
+            // next restart. A disconnected account keeps them anyway - they
+            // are persisted above - which is why this is not an error.
+            let connected = match state.runtime.kick_sender(account_id) {
+                Some(sender) => {
+                    for slug in &added {
+                        let _ = sender.send(backend::kick::Command::Join(slug.clone()));
+                    }
+                    true
+                }
+                None => false,
+            };
+            (Some(serde_json::json!({ "added": added.len(), "channels": added, "connected": connected })), None)
+        }
+
         // Session verification (SAS - "compare emoji") + recovery key -
         // see backend/matrix/verification.rs's module doc for the flow.
         // Self-verification only: accountId always names *our own* Matrix
