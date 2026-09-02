@@ -507,10 +507,20 @@ pub async fn dispatch(
                 return (None, Some("searchMatrixRooms requires \"accountId\"".to_string()));
             };
             let query = p_str_opt(params, "query").unwrap_or("");
-            let server = p_str_opt(params, "server").unwrap_or("");
-            let since = p_str_opt(params, "since").unwrap_or("");
+            // Extra homeservers to ask beyond the ones the daemon works out
+            // for itself. A list, because the whole point is that the answers
+            // are merged rather than looked at one server at a time.
+            let servers: Vec<String> = params
+                .get("servers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            // Paging is per server: each has its own place in its own
+            // directory, so one token could not describe where the merged
+            // list had got to.
+            let since = params.get("since").and_then(|v| v.as_object()).cloned().unwrap_or_default();
             let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
-            match backend::matrix::search_public_rooms(state, account_id, query, server, since, limit).await {
+            match backend::matrix::search_public_rooms(state, account_id, query, &servers, &since, limit).await {
                 Ok(result) => (Some(result), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -2141,7 +2151,7 @@ pub async fn dispatch(
                 _ => return (None, Some(format!("{method} requires \"accountId\" and \"roomId\""))),
             };
             let result = if method == "acceptMatrixInvite" {
-                backend::matrix::join_room(state, account_id, room_id).await
+                backend::matrix::join_room(state, account_id, room_id, &[]).await
             } else {
                 backend::matrix::leave_room(state, account_id, room_id).await
             };
@@ -2156,7 +2166,12 @@ pub async fn dispatch(
                 (Some(a), Some(r)) => (a, r),
                 _ => return (None, Some("joinMatrixRoom requires \"accountId\" and \"roomIdOrAlias\"".to_string())),
             };
-            match backend::matrix::join_room(state, account_id, room).await {
+            let via: Vec<String> = params
+                .get("via")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::matrix::join_room(state, account_id, room, &via).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e.to_string())),
             }

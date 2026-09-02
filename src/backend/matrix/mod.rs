@@ -1045,11 +1045,21 @@ pub async fn sweep_media_cache() {
 /// buffer the normal way once the next `/sync` poll sees it in
 /// `rooms.join` for the first time (process_sync_response's own first-
 /// seen-room handling) - nothing extra needed here.
-pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &str) -> Result<()> {
+pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &str, via: &[String]) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes()).collect::<String>();
-    let url = format!("{base}/_matrix/client/v3/join/{encoded}");
+    let mut url = format!("{base}/_matrix/client/v3/join/{encoded}");
+    // Where to ask. A room id names a room and says nothing about who has it,
+    // so joining one by id needs somebody already in it to route through -
+    // which is why a room found in another server's directory could be listed
+    // and not joinable. An alias carries its server in itself and needs none
+    // of this.
+    for (i, server) in via.iter().filter(|s| !s.trim().is_empty()).enumerate() {
+        url.push(if i == 0 { '?' } else { '&' });
+        url.push_str("server_name=");
+        url.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
+    }
     http::post_json(&url, Some(&account.access_token), serde_json::json!({})).await.context("joining room")?;
     Ok(())
 }
@@ -1074,35 +1084,109 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
 ///
 /// Written straight to the store rather than through record_message: these
 /// are old, and the notification path would announce every one of them.
-/// Searches the public room directory, the way Element's room explorer does.
+/// Searches the public room directories, the way Element's room explorer does
+/// - except across every homeserver at once rather than one at a time.
 ///
-/// `server` asks another homeserver's directory rather than our own - which is
-/// the only way to find rooms on a server this account has never spoken to,
-/// and how somebody finds a community they were told about by name. Empty
-/// means our own server, which is also what happens when a remote directory
-/// refuses.
+/// A directory is per homeserver: ours lists what our server has been told
+/// about, and finding a room on a server we have never spoken to means asking
+/// that server directly. Element makes you pick one from a dropdown and shows
+/// its results alone, so finding something means knowing where to look first.
+/// Here every server is asked together and the answers become one list, which
+/// is what somebody searching for a room by name actually wants.
 ///
-/// `since` pages: the directory is thousands of rooms on a busy server, and
-/// what comes back first is the largest, not the closest match.
+/// Which servers: ours, wherever this account already has rooms, and anything
+/// the caller names. The middle one is what makes this useful without being
+/// told anything - the servers somebody's rooms are on are the servers their
+/// community lives on.
+///
+/// One server being slow, dead, or refusing federation does not fail the
+/// search: each is a separate request and the answers are merged from
+/// whichever came back, because a partial list is worth having and a failed
+/// search is not.
 pub async fn search_public_rooms(
     state: &AppState,
     account_id: &str,
     query: &str,
-    server: &str,
-    since: &str,
+    servers: &[String],
+    since: &serde_json::Map<String, Value>,
     limit: u32,
 ) -> Result<Value> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
-    let base = account.homeserver_url.trim_end_matches('/');
+    let base = account.homeserver_url.trim_end_matches('/').to_string();
+    let token = account.access_token.clone();
+
+    let targets = directory_targets(state, account_id, &account.user_id, servers);
+    let requests = targets.iter().map(|server| {
+        let base = base.clone();
+        let token = token.clone();
+        let since = since.get(server).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        async move { (server.clone(), directory_page(&base, &token, server, query, &since, limit).await) }
+    });
+    let answers = futures::future::join_all(requests).await;
+
+    let joined = state.runtime.matrix_joined_rooms(account_id);
+    let mut rooms: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut next = serde_json::Map::new();
+    let mut refused: Vec<String> = Vec::new();
+
+    for (server, answer) in answers {
+        let Ok(resp) = answer else {
+            refused.push(server);
+            continue;
+        };
+        if let Some(token) = resp["next_batch"].as_str() {
+            next.insert(server.clone(), Value::String(token.to_string()));
+        }
+        for room in resp["chunk"].as_array().into_iter().flatten() {
+            let room_id = room["room_id"].as_str().unwrap_or("").to_string();
+            // The same room is listed by every server that knows it. Whoever
+            // answered first keeps it, which is arbitrary and does not matter:
+            // the entries describe one room and differ only in how stale each
+            // server's copy of its member count is.
+            if room_id.is_empty() || !seen.insert(room_id.clone()) {
+                continue;
+            }
+            rooms.push(serde_json::json!({
+                "roomId": room_id,
+                "name": room["name"].as_str().unwrap_or(""),
+                "alias": room["canonical_alias"].as_str().unwrap_or(""),
+                "topic": room["topic"].as_str().unwrap_or(""),
+                "members": room["num_joined_members"].as_i64().unwrap_or(0),
+                "avatarUrl": room["avatar_url"].as_str(),
+                // Which directory answered. Shown, because in one merged list
+                // the server a room lives on is the thing that says what kind
+                // of place it is - and it is the routing hint a room with no
+                // published alias needs to be joined at all.
+                "via": server,
+                "joined": joined.contains(&room_id),
+            }));
+        }
+    }
+
+    // Busiest first, across all of them. Each server returns its own list in
+    // its own order, so concatenating without this would sort by which server
+    // happened to answer rather than by anything about the rooms.
+    rooms.sort_by(|a, b| b["members"].as_i64().unwrap_or(0).cmp(&a["members"].as_i64().unwrap_or(0)));
+
+    Ok(serde_json::json!({
+        "rooms": rooms,
+        "next": next,
+        "servers": targets,
+        // Named rather than swallowed: a server that will not answer is why a
+        // room somebody expected is missing, and silence there reads as the
+        // room not existing.
+        "refused": refused,
+    }))
+}
+
+/// One homeserver's directory page, or an error that only costs that server.
+async fn directory_page(base: &str, token: &str, server: &str, query: &str, since: &str, limit: u32) -> Result<Value> {
     let mut url = format!("{base}/_matrix/client/v3/publicRooms");
-    if !server.trim().is_empty() {
-        // A bare hostname, not a URL: this names a homeserver in the Matrix
-        // sense, and one typed with a scheme would be rejected by ours.
-        let server = server.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+    if !server.is_empty() {
         url.push_str("?server=");
         url.push_str(&url::form_urlencoded::byte_serialize(server.as_bytes()).collect::<String>());
     }
-
     let mut body = serde_json::json!({ "limit": limit });
     if !query.trim().is_empty() {
         body["filter"] = serde_json::json!({ "generic_search_term": query.trim() });
@@ -1113,37 +1197,50 @@ pub async fn search_public_rooms(
     // POST rather than GET: only the POST form takes a search term at all, and
     // the GET form's absence of one is why a directory browser without this
     // could only ever show the first page of the whole server.
-    let resp = http::post_json(&url, Some(&account.access_token), body).await.context("searching the room directory")?;
+    http::post_json(&url, Some(token), body).await.context("searching the room directory")
+}
 
-    let joined: std::collections::HashSet<String> = state.runtime.matrix_joined_rooms(account_id);
-    let rooms: Vec<Value> = resp["chunk"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|room| {
-            let room_id = room["room_id"].as_str().unwrap_or("");
-            serde_json::json!({
-                "roomId": room_id,
-                "name": room["name"].as_str().unwrap_or(""),
-                "alias": room["canonical_alias"].as_str().unwrap_or(""),
-                "topic": room["topic"].as_str().unwrap_or(""),
-                "members": room["num_joined_members"].as_i64().unwrap_or(0),
-                "avatarUrl": room["avatar_url"].as_str(),
-                // Said plainly, because "you are already in this" is the
-                // difference between a join button that works and one that
-                // appears to do nothing.
-                "joined": joined.contains(room_id),
-                "worldReadable": room["world_readable"].as_bool().unwrap_or(false),
-                "guestCanJoin": room["guest_can_join"].as_bool().unwrap_or(false),
-            })
-        })
-        .collect();
+/// Which homeservers to ask: ours, the ones this account already has rooms
+/// on, and whatever the caller added - deduplicated, and with our own written
+/// as the empty string because that is how the spec spells "no server
+/// parameter, ask locally".
+fn directory_targets(state: &AppState, account_id: &str, own_user_id: &str, extra: &[String]) -> Vec<String> {
+    let mut targets: Vec<String> = vec![String::new()];
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Our own server by name as well as locally would ask the same directory
+    // twice and list every one of its rooms twice with it.
+    if let Some(own) = own_user_id.rsplit(':').next() {
+        seen.insert(own.to_string());
+    }
 
-    Ok(serde_json::json!({
-        "rooms": rooms,
-        "next": resp["next_batch"].as_str().unwrap_or(""),
-        "total": resp["total_room_count_estimate"].as_i64(),
-    }))
+    let from_rooms = state.runtime.matrix_joined_rooms(account_id);
+    let named = from_rooms.iter().filter_map(|id| id.rsplit(':').next().map(str::to_string));
+    for server in named.chain(extra.iter().map(|s| server_name(s))) {
+        if !server.is_empty() && seen.insert(server.clone()) {
+            targets.push(server);
+        }
+    }
+    targets
+}
+
+/// A homeserver's name, from whatever somebody typed. A bare hostname, not a
+/// URL: this names a server in the Matrix sense, and one typed with a scheme
+/// would be rejected by ours.
+fn server_name(typed: &str) -> String {
+    typed.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::server_name;
+
+    #[test]
+    fn a_server_is_named_however_somebody_typed_it() {
+        assert_eq!(server_name("matrix.org"), "matrix.org");
+        assert_eq!(server_name("  https://matrix.org/  "), "matrix.org");
+        assert_eq!(server_name("http://glowers.club"), "glowers.club");
+        assert_eq!(server_name(""), "");
+    }
 }
 
 /// Reads a thread from the server, then hands back everything known about it.
