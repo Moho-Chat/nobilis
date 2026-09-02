@@ -124,6 +124,15 @@ pub struct Buffer {
     /// mark_matrix_room_encrypted.
     #[serde(rename = "encrypted", skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
+    /// The channel's own modes, as the letters the server writes them with -
+    /// "+mnt". IRC only, and absent until the server has said, which it does
+    /// on join and whenever they change.
+    ///
+    /// Carried so a client can say why a message will not send. A moderated
+    /// channel refuses one with an error that names a numeric, and "you cannot
+    /// speak here" is a better thing to have known beforehand.
+    #[serde(rename = "channelModes", skip_serializing_if = "Option::is_none")]
+    pub channel_modes: Option<String>,
     /// Which BufferGroup this buffer belongs to - a Discord guild, a Matrix
     /// space, or the account itself for protocols with no such concept.
     /// Absent only while a backend has not yet placed it.
@@ -448,6 +457,7 @@ mod tests {
             category: None,
             position: 0,
             encrypted: None,
+            channel_modes: None,
             group_id: None,
             remote_id: None,
         }

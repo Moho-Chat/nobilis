@@ -1035,11 +1035,32 @@ async fn handle_message(
                     let (mode, target, granting) = match m {
                         Mode::Plus(mode, Some(target)) => (mode, target, true),
                         Mode::Minus(mode, Some(target)) => (mode, target, false),
-                        // Channel modes proper (+m, +t, bans) carry no nick
-                        // to re-rank, and belong to the channel rather than
-                        // to anybody in it.
+                        // A mode with no nick belongs to the channel rather
+                        // than to anybody in it - +m, +t, +i, +k, +l. Those
+                        // used to be dropped on the floor, so a channel going
+                        // moderated was invisible until a message bounced.
+                        Mode::Plus(mode, None) | Mode::Minus(mode, None) => {
+                            let adding = matches!(m, Mode::Plus(_, None));
+                            let letter = mode_letter(mode);
+                            state.runtime.set_irc_channel_mode(state, account_id, &channel, letter, adding);
+                            let body = format!("{from} sets {}{letter} on {channel}", if adding { "+" } else { "-" });
+                            state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                            continue;
+                        }
                         _ => continue,
                     };
+                    // A ban or an exception carries a mask, not a nick, so it
+                    // re-ranks nobody - but it is the channel changing and is
+                    // worth saying out loud.
+                    if matches!(mode, ChannelMode::Ban | ChannelMode::Exception | ChannelMode::InviteException) {
+                        let body = format!(
+                            "{from} {} {} {target}",
+                            if granting { "adds" } else { "removes" },
+                            mode_word(mode),
+                        );
+                        state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                        continue;
+                    }
                     let Some(rank) = rank_from_mode(mode) else { continue };
                     let Some(slot) = members.get_mut(target.as_str()) else { continue };
                     *slot = if granting { rank } else { MemberRank::None };
@@ -1190,6 +1211,72 @@ async fn handle_message(
         // when there's no channel buffer to show them in (the join never
         // succeeded), so the always-present server buffer is the only
         // reliable place - same as HexChat's server tab.
+        // What modes a channel currently has, in answer to a bare /mode.
+        Command::Response(Response::RPL_CHANNELMODEIS, args) => {
+            if let Some(channel) = args.get(1) {
+                let modes = args.get(2).map(String::as_str).unwrap_or("");
+                state.runtime.set_irc_channel_modes(state, account_id, channel, modes);
+                let body = if modes.trim_matches('+').is_empty() {
+                    format!("{channel} has no modes set")
+                } else {
+                    format!("{channel} is {modes}")
+                };
+                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+        }
+
+        // The ban list, an entry at a time, in answer to "/mode #chan b".
+        // Rendered in the channel rather than gathered into a panel: a ban
+        // list is short, it is read once, and it belongs beside the channel
+        // it governs.
+        Command::Response(code @ (Response::RPL_BANLIST | Response::RPL_EXCEPTLIST | Response::RPL_INVITELIST), args) => {
+            if let (Some(channel), Some(mask)) = (args.get(1), args.get(2)) {
+                let kind = match code {
+                    Response::RPL_BANLIST => "banned",
+                    Response::RPL_EXCEPTLIST => "ban exception",
+                    _ => "invite exception",
+                };
+                // Who set it and when, where the server says.
+                let by = args.get(3).map(|who| format!(" by {who}")).unwrap_or_default();
+                let body = format!("{kind}: {mask}{by}");
+                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+        }
+        Command::Response(Response::RPL_ENDOFBANLIST, args) => {
+            if let Some(channel) = args.get(1) {
+                state.runtime.record_message(state, account_id, channel, "channel", "*", "end of ban list", false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+        }
+
+        // Somebody asked us to join something.
+        Command::INVITE(_, channel) => {
+            let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+            let body = format!("{from} invites you to {channel}");
+            state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, true, None, Vec::new(), Vec::new(), None);
+        }
+        // Confirmation that ours went out.
+        Command::Response(Response::RPL_INVITING, args) => {
+            if let (Some(nick), Some(channel)) = (args.get(1), args.get(2)) {
+                // The server answers with the pair either way round depending
+                // on how old it is, and both readings say the same thing.
+                let body = format!("invited {nick} to {channel}");
+                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+        }
+
+        // The channel directory, gathered rather than printed: a network's
+        // list runs to tens of thousands of entries, which is something to
+        // search rather than a wall of chat.
+        Command::Response(Response::RPL_LISTSTART, _) => state.runtime.begin_irc_channel_list(account_id),
+        Command::Response(Response::RPL_LIST, args) => {
+            if let Some(channel) = args.get(1) {
+                let users = args.get(2).and_then(|u| u.parse::<u32>().ok()).unwrap_or(0);
+                let topic = args.get(3).cloned().unwrap_or_default();
+                state.runtime.push_irc_channel_list(account_id, channel, users, &topic);
+            }
+        }
+        Command::Response(Response::RPL_LISTEND, _) => state.runtime.finish_irc_channel_list(state, account_id),
+
         Command::Response(code, args) if is_channel_error(code) => {
             if let Some(text) = channel_error_text(&args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
@@ -1393,8 +1480,53 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
                 if arg.is_empty() {
                     bail!("/ban requires a nick");
                 }
-                let mask = format!("{arg}!*@*");
-                sender.send(Command::ChannelMODE(target_buffer.to_string(), vec![Mode::Plus(ChannelMode::Ban, Some(mask))])).map_err(|e| anyhow!(e))
+                sender
+                    .send(Command::ChannelMODE(target_buffer.to_string(), vec![Mode::Plus(ChannelMode::Ban, Some(ban_mask(arg)))]))
+                    .map_err(|e| anyhow!(e))
+            }
+            // Raw, deliberately. Channel modes are a small language of their
+            // own with per-network extensions, and a client that only passes
+            // through the ones it recognises is a client that cannot set the
+            // one this network has. The server is the authority on what is
+            // valid and says so itself when it is not.
+            //
+            // With no argument this asks rather than sets, which is how every
+            // other client spells "what modes does this channel have" - and
+            // "/mode #chan b" is how you read the ban list.
+            "mode" => {
+                let (target, rest) = split_mode_target(target_buffer, arg);
+                if target.is_empty() {
+                    bail!("/mode needs a channel or nick");
+                }
+                let raw = if rest.is_empty() { format!("MODE {target}") } else { format!("MODE {target} {rest}") };
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
+            }
+            "unban" => {
+                if arg.is_empty() {
+                    bail!("/unban requires a nick or mask");
+                }
+                sender
+                    .send(Command::ChannelMODE(target_buffer.to_string(), vec![Mode::Minus(ChannelMode::Ban, Some(ban_mask(arg)))]))
+                    .map_err(|e| anyhow!(e))
+            }
+            "invite" => {
+                let mut invite_parts = arg.split_whitespace();
+                let nick = invite_parts.next().unwrap_or("");
+                if nick.is_empty() {
+                    bail!("/invite requires a nick");
+                }
+                // The channel may be named, or taken from where the command
+                // was typed - which is what somebody means nine times in ten.
+                let channel = invite_parts.next().unwrap_or(target_buffer);
+                sender.send(Command::INVITE(nick.to_string(), channel.to_string())).map_err(|e| anyhow!(e))
+            }
+            // Asks the server for its channel list. The answer arrives as
+            // numerics and is gathered up rather than printed line by line -
+            // a network's list runs to tens of thousands of channels, which
+            // is a directory to search rather than a wall of chat.
+            "list" => {
+                let raw = if arg.is_empty() { "LIST".to_string() } else { format!("LIST {arg}") };
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
             }
             "op" => set_channel_mode(sender, target_buffer, ChannelMode::Oper, true, arg),
             "deop" => set_channel_mode(sender, target_buffer, ChannelMode::Oper, false, arg),
@@ -1413,6 +1545,75 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
         };
     }
     send_plain(state, account_id, sender, target_buffer, body)
+}
+
+/// A ban mask from whatever was typed.
+///
+/// A bare nick becomes `nick!*@*`, which is what somebody means by "ban them".
+/// Anything already carrying a `!` or `@` is a mask and is left exactly as
+/// written - turning `*!*@example.com` into `*!*@example.com!*@*` would ban
+/// nobody while appearing to work.
+fn ban_mask(target: &str) -> String {
+    let target = target.trim();
+    if target.contains('!') || target.contains('@') {
+        target.to_string()
+    } else {
+        format!("{target}!*@*")
+    }
+}
+
+/// Splits `/mode` into what it acts on and what it does.
+///
+/// `/mode +o someone` in a channel means that channel; `/mode #other +o me`
+/// names one. The difference is whether the first word looks like a target
+/// rather than a mode string, and a mode string is the thing starting with
+/// `+` or `-`.
+fn split_mode_target<'a>(current: &'a str, arg: &'a str) -> (&'a str, &'a str) {
+    let arg = arg.trim();
+    let first = arg.split_whitespace().next().unwrap_or("");
+    if !first.is_empty() && !first.starts_with('+') && !first.starts_with('-') {
+        let rest = arg[first.len()..].trim_start();
+        return (first, rest);
+    }
+    (current, arg)
+}
+
+/// The letter a channel mode is written with.
+///
+/// `ChannelMode` carries the ones the crate knows and `Unknown(c)` the rest,
+/// which is most of them on a real network - so the letter is what gets stored
+/// rather than the enum.
+fn mode_letter(mode: &ChannelMode) -> char {
+    match mode {
+        ChannelMode::Ban => 'b',
+        ChannelMode::Exception => 'e',
+        ChannelMode::InviteException => 'I',
+        ChannelMode::InviteOnly => 'i',
+        ChannelMode::Key => 'k',
+        ChannelMode::Limit => 'l',
+        ChannelMode::Moderated => 'm',
+        ChannelMode::NoExternalMessages => 'n',
+        ChannelMode::RegisteredOnly => 'r',
+        ChannelMode::Secret => 's',
+        ChannelMode::ProtectedTopic => 't',
+        ChannelMode::Oper => 'o',
+        ChannelMode::Voice => 'v',
+        ChannelMode::Founder => 'q',
+        ChannelMode::Admin => 'a',
+        ChannelMode::Halfop => 'h',
+        ChannelMode::Unknown(c) => *c,
+        // The crate may grow variants; a letter nobody here knows is still
+        // better shown than swallowed.
+        _ => '?',
+    }
+}
+
+fn mode_word(mode: &ChannelMode) -> &'static str {
+    match mode {
+        ChannelMode::Ban => "a ban on",
+        ChannelMode::Exception => "a ban exception for",
+        _ => "an invite exception for",
+    }
 }
 
 fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode, add: bool, nick: &str) -> Result<()> {
@@ -1455,6 +1656,39 @@ mod quit_tests {
 
     fn config(message: Option<&str>) -> IrcAccountConfig {
         IrcAccountConfig { quit_message: message.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn a_bare_nick_becomes_a_mask_and_a_mask_is_left_alone() {
+        assert_eq!(ban_mask("someone"), "someone!*@*");
+        assert_eq!(ban_mask("  someone  "), "someone!*@*");
+        // Wrapping a mask again would ban nobody while appearing to work.
+        assert_eq!(ban_mask("*!*@example.com"), "*!*@example.com");
+        assert_eq!(ban_mask("someone!user@host"), "someone!user@host");
+        assert_eq!(ban_mask("*@example.com"), "*@example.com");
+    }
+
+    #[test]
+    fn mode_acts_on_the_channel_it_was_typed_in_unless_told_otherwise() {
+        // The common case: no target named, so it is this channel.
+        assert_eq!(split_mode_target("#here", "+o someone"), ("#here", "+o someone"));
+        assert_eq!(split_mode_target("#here", "-m"), ("#here", "-m"));
+        // Asking rather than setting.
+        assert_eq!(split_mode_target("#here", ""), ("#here", ""));
+        assert_eq!(split_mode_target("#here", "b"), ("b", ""));
+        // A target named explicitly.
+        assert_eq!(split_mode_target("#here", "#other +o someone"), ("#other", "+o someone"));
+        assert_eq!(split_mode_target("#here", "somenick +i"), ("somenick", "+i"));
+    }
+
+    #[test]
+    fn every_mode_has_a_letter() {
+        assert_eq!(mode_letter(&ChannelMode::Moderated), 'm');
+        assert_eq!(mode_letter(&ChannelMode::InviteOnly), 'i');
+        assert_eq!(mode_letter(&ChannelMode::Key), 'k');
+        assert_eq!(mode_letter(&ChannelMode::ProtectedTopic), 't');
+        // The ones a network invented, which is most of them in practice.
+        assert_eq!(mode_letter(&ChannelMode::Unknown('C')), 'C');
     }
 
     #[test]

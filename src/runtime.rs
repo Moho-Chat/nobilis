@@ -130,6 +130,14 @@ pub const DCC_KEEP: usize = 100;
 /// real prompt among fifty fake ones at worst.
 const DCC_PENDING_PER_NICK: usize = 3;
 
+/// A channel the server has told us about, for the directory `/list` builds.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct IrcChannelListing {
+    pub name: String,
+    pub users: u32,
+    pub topic: String,
+}
+
 /// One Kick channel this daemon is watching.
 #[derive(Clone, Debug)]
 pub struct KickChannel {
@@ -359,6 +367,9 @@ pub struct Runtime {
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
     /// What is known about each watched Kick channel, by buffer id.
     kick_channels: Mutex<HashMap<String, KickChannel>>,
+    /// A `/list` in progress, by account. Gathered rather than announced a
+    /// line at a time - a network answers with tens of thousands of channels.
+    irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
     /// human-friendly (see backend/matrix/rooms.rs's naming fallback
     /// chain), but sending/reacting/etc. needs the real `!opaque:server`
@@ -538,6 +549,7 @@ impl Runtime {
             sockchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
+            irc_channel_lists: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -806,6 +818,7 @@ impl Runtime {
             category: None,
             position: 0,
             encrypted: None,
+            channel_modes: None,
             group_id: Some(model::account_group_id(account_id)),
             remote_id: None,
         };
@@ -1912,6 +1925,89 @@ impl Runtime {
 
     pub fn kick_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
         self.kick_senders.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Records one of a channel's own modes, as the server announced it.
+    ///
+    /// Letter by letter, because that is how a MODE change arrives: a channel
+    /// going moderated says `+m` and nothing about the modes it already had.
+    pub fn set_irc_channel_mode(&self, state: &AppState, account_id: &str, channel: &str, letter: char, adding: bool) {
+        // A mode that takes an argument - a key, a limit, a ban - is not part
+        // of the channel's mode string in any useful sense here: `+k` without
+        // the key says nothing a reader can act on, and bans have their own
+        // list.
+        if matches!(letter, 'b' | 'e' | 'I' | 'o' | 'v' | 'q' | 'a' | 'h') {
+            return;
+        }
+        let buffer_id = crate::model::buffer_id(account_id, channel);
+        let mut letters: Vec<char> = self
+            .buffers
+            .lock()
+            .unwrap()
+            .get(&buffer_id)
+            .and_then(|b| b.channel_modes.clone())
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        letters.retain(|c| *c != letter);
+        if adding {
+            letters.push(letter);
+        }
+        letters.sort_unstable();
+        self.publish_channel_modes(state, &buffer_id, &letters);
+    }
+
+    /// Replaces the whole set, for the server's answer to a bare `MODE`.
+    pub fn set_irc_channel_modes(&self, state: &AppState, account_id: &str, channel: &str, modes: &str) {
+        let mut letters: Vec<char> = modes.chars().filter(|c| c.is_ascii_alphabetic()).collect();
+        letters.sort_unstable();
+        letters.dedup();
+        self.publish_channel_modes(state, &crate::model::buffer_id(account_id, channel), &letters);
+    }
+
+    fn publish_channel_modes(&self, state: &AppState, buffer_id: &str, letters: &[char]) {
+        let modes = if letters.is_empty() { String::new() } else { format!("+{}", letters.iter().collect::<String>()) };
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let next = (!modes.is_empty()).then_some(modes);
+            if buffer.channel_modes == next {
+                return;
+            }
+            buffer.channel_modes = next;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    pub fn begin_irc_channel_list(&self, account_id: &str) {
+        self.irc_channel_lists.lock().unwrap().insert(account_id.to_string(), Vec::new());
+    }
+
+    pub fn push_irc_channel_list(&self, account_id: &str, name: &str, users: u32, topic: &str) {
+        // Started implicitly if the server sent no 321, which many do not.
+        self.irc_channel_lists
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_default()
+            .push(IrcChannelListing { name: name.to_string(), users, topic: topic.to_string() });
+    }
+
+    /// Announces the finished directory, busiest first.
+    ///
+    /// Sorted here rather than in the client because every client would want
+    /// the same order, and because "which of these has anybody in it" is the
+    /// only question somebody scrolling a list of forty thousand channels is
+    /// actually asking.
+    pub fn finish_irc_channel_list(&self, state: &AppState, account_id: &str) {
+        let mut channels = self.irc_channel_lists.lock().unwrap().remove(account_id).unwrap_or_default();
+        channels.sort_by(|a, b| b.users.cmp(&a.users).then_with(|| a.name.cmp(&b.name)));
+        state.events.emit(
+            "ircChannelList",
+            json!({ "accountId": account_id, "channels": channels }),
+        );
     }
 
     pub fn clear_kick_sender(&self, account_id: &str) {
