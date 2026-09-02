@@ -320,6 +320,20 @@ pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result
     })
 }
 
+/// What a message is answering, as Kick's send endpoint wants it.
+///
+/// The original's text travels with the reply rather than only its id, which
+/// is Kick's design and not this client's choice: it is what makes a reply
+/// quotable in everybody's chat window without each of them looking the
+/// original up, including people who joined after it was said.
+#[derive(Debug, Clone)]
+pub struct ReplyTo {
+    pub message_id: String,
+    pub body: String,
+    pub sender_id: Option<u64>,
+    pub sender_name: String,
+}
+
 /// Posts a line to a channel's chat.
 ///
 /// The CSRF token is asked for at send time rather than stored. Kick's API is
@@ -327,12 +341,32 @@ pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result
 /// POST; fetching it immediately before means it cannot be stale, and means
 /// the sign-in window has only one thing to capture rather than two that could
 /// expire independently.
-pub async fn send_message(http: &reqwest::Client, token: &str, chatroom_id: u64, body: &str) -> Result<()> {
+pub async fn send_message(
+    http: &reqwest::Client,
+    token: &str,
+    chatroom_id: u64,
+    body: &str,
+    reply_to: Option<&ReplyTo>,
+) -> Result<()> {
+    // A reply is its own message type carrying the original, not a mention
+    // pasted on the front. Sent as Kick's own client sends it, so it threads
+    // in everybody's chat window rather than only reading like a reply here.
+    let payload = match reply_to {
+        None => serde_json::json!({ "content": body, "type": "message" }),
+        Some(r) => serde_json::json!({
+            "content": body,
+            "type": "reply",
+            "metadata": {
+                "original_message": { "id": r.message_id, "content": r.body },
+                "original_sender": { "id": r.sender_id, "username": r.sender_name }
+            }
+        }),
+    };
     let mut req = http
         .post(format!("{API_ROOT}/api/v2/messages/send/{chatroom_id}"))
         .header("Accept", "application/json")
         .bearer_auth(token)
-        .json(&serde_json::json!({ "content": body, "type": "message" }));
+        .json(&payload);
     if let Some(xsrf) = xsrf_token(http, token).await {
         req = req.header("X-XSRF-TOKEN", xsrf);
     }

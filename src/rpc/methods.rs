@@ -1288,14 +1288,29 @@ pub async fn dispatch(
                     let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                         return (None, Some("that channel is not being watched".to_string()));
                     };
-                    // Kick has no attachments in chat and no threaded replies;
-                    // both are ignored rather than refused, the same way every
-                    // other protocol-specific field is where it does not apply.
+                    // A reply needs the whole of what it answers, not just an
+                    // id: Kick carries the original's text and author in the
+                    // message so it quotes in everybody's window. All of it is
+                    // in scrollback already, so this is a lookup rather than a
+                    // round trip - and a reply to something that has scrolled
+                    // out of the cap still sends, as an ordinary message,
+                    // because losing the message would be the worse trade.
+                    let reply_to = reply_to_id
+                        .and_then(|id| state.store.get_message(buffer_id, id).ok().flatten())
+                        .map(|m| backend::kick::api::ReplyTo {
+                            message_id: m.id,
+                            body: m.body,
+                            sender_id: m.sender_id.as_deref().and_then(|s| s.parse().ok()),
+                            sender_name: m.from,
+                        });
+                    // Kick chat has no attachments, so one is ignored rather
+                    // than refused - the same way every other protocol-specific
+                    // field is where it does not apply.
                     let http = match backend::kick::api::client() {
                         Ok(c) => c,
                         Err(e) => return (None, Some(e.to_string())),
                     };
-                    match backend::kick::api::send_message(&http, token, channel.chatroom_id, body).await {
+                    match backend::kick::api::send_message(&http, token, channel.chatroom_id, body, reply_to.as_ref()).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     }

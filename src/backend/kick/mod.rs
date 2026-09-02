@@ -360,6 +360,29 @@ struct ChatMessage {
     #[serde(default)]
     created_at: Option<String>,
     sender: Sender,
+    /// Present on a reply, carrying the whole of what was replied to.
+    ///
+    /// Kick sends the original's text along with its id, which is worth more
+    /// than it sounds: every other protocol here has to look the original up
+    /// in scrollback and shows a bare "in reply to" when it has scrolled past
+    /// the cap. Kick's replies are quotable however old the original is.
+    #[serde(default)]
+    metadata: Option<ReplyMetadata>,
+}
+
+#[derive(Deserialize)]
+struct ReplyMetadata {
+    #[serde(default)]
+    original_sender: Option<Sender>,
+    #[serde(default)]
+    original_message: Option<OriginalMessage>,
+}
+
+#[derive(Deserialize)]
+struct OriginalMessage {
+    id: String,
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -401,6 +424,7 @@ async fn handle_frame(
             let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else { return Ok(()) };
             let Some(slug) = watched.chatroom(msg.chatroom_id) else { return Ok(()) };
             let from = msg.sender.username.unwrap_or_else(|| "someone".to_string());
+            let reply_to = reply_preview(msg.metadata.as_ref());
             state.runtime.record_message_at(
                 state,
                 account_id,
@@ -410,7 +434,7 @@ async fn handle_frame(
                 &msg.content,
                 false,
                 "chat",
-                None,
+                reply_to,
                 // Kick's own message id, so the same message replayed after a
                 // reconnect is recognised rather than shown twice.
                 Some(msg.id),
@@ -445,6 +469,23 @@ async fn handle_frame(
         }
     }
     Ok(())
+}
+
+/// What a reply was replying to, out of the metadata Kick attaches to it.
+///
+/// Both halves are required rather than filled in with blanks: a preview with
+/// no author and no text is drawn as an empty quote above the message, which
+/// reads as something failing to load rather than as a reply. Better to show
+/// the message plainly than to show a hole above it.
+fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::ReplyPreview> {
+    let metadata = metadata?;
+    let original = metadata.original_message.as_ref()?;
+    let from = metadata.original_sender.as_ref()?.username.clone()?;
+    Some(crate::model::ReplyPreview {
+        id: original.id.clone(),
+        from,
+        body: original.content.clone().unwrap_or_default(),
+    })
 }
 
 /// One line for something somebody did in a channel, or None if this event is
@@ -692,6 +733,81 @@ mod tests {
         // land rather than reopening the buffer that was just closed.
         assert_eq!(channel_of(&w, &Some("chatrooms.2393554".into()), &serde_json::json!({})), None);
         assert!(w.remove("odablock").is_empty());
+    }
+
+    #[test]
+    fn reads_what_a_reply_was_answering() {
+        // Copied from the wire. Kick sends the original's text alongside its
+        // id, so a reply quotes properly however long ago the original was
+        // said - unlike every other protocol here, which has to find it in
+        // scrollback and comes up empty once it has scrolled past the cap.
+        let metadata: ReplyMetadata = serde_json::from_value(serde_json::json!({
+            "original_sender": { "id": 1150141, "username": "Greg" },
+            "original_message": { "id": "ddeccb11-29bc-4cf1-ab2a-9b409293de76", "content": "L0L0WERFLGEWRUGHBER" }
+        }))
+        .unwrap();
+        let preview = reply_preview(Some(&metadata)).unwrap();
+        assert_eq!(preview.from, "Greg");
+        assert_eq!(preview.id, "ddeccb11-29bc-4cf1-ab2a-9b409293de76");
+        assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
+    }
+
+    #[test]
+    fn a_whole_reply_frame_off_the_wire_parses() {
+        // The exact payload Kick sent, badges and all - not a hand-written
+        // subset. The parse is the part that can silently stop working when
+        // Kick adds a field, and the reply half is nested three deep inside a
+        // message whose other half is decoration.
+        // r##, not r#: the colour in the payload is `"#75FD46"`, and `"#`
+        // closes a single-hash raw string right in the middle of the JSON.
+        let raw = r##"{
+          "id": "026bd0f5-085c-4571-962e-556371b63ded",
+          "chatroom_id": 2393554,
+          "content": "[emote:37226:KEKW]",
+          "type": "reply",
+          "created_at": "2026-09-02T00:16:25+00:00",
+          "sender": { "id": 15383321, "username": "L3galizeWee", "slug": "l3galizewee",
+            "identity": { "color": "#75FD46",
+              "badges": [{ "type": "subscriber", "text": "Subscriber", "count": 11, "sort_order": 9 }],
+              "badges_v2": [{ "name": "level", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/x.png",
+                "metadata": { "level": 47 }, "selected": true, "sort_order": 1 }] } },
+          "metadata": {
+            "original_sender": { "id": 1150141, "username": "Greg" },
+            "original_message": { "id": "ddeccb11-29bc-4cf1-ab2a-9b409293de76", "content": "L0L0WERFLGEWRUGHBER" } }
+        }"##;
+        let msg: ChatMessage = serde_json::from_str(raw).expect("a real reply frame must parse");
+        assert_eq!(msg.chatroom_id, 2393554);
+        assert_eq!(msg.sender.username.as_deref(), Some("L3galizeWee"));
+        let preview = reply_preview(msg.metadata.as_ref()).expect("and carry what it answered");
+        assert_eq!(preview.from, "Greg");
+        assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
+    }
+
+    #[test]
+    fn an_ordinary_messages_metadata_is_not_mistaken_for_a_reply() {
+        // Plain messages carry metadata too - a `message_ref` and nothing
+        // else - so "has metadata" is not the same question as "is a reply".
+        let raw = r#"{ "id": "x", "chatroom_id": 1, "content": "hi", "type": "message",
+          "sender": { "id": 2, "username": "someone" }, "metadata": { "message_ref": "1788305786864" } }"#;
+        let msg: ChatMessage = serde_json::from_str(raw).unwrap();
+        assert!(reply_preview(msg.metadata.as_ref()).is_none());
+    }
+
+    #[test]
+    fn an_ordinary_message_is_not_a_reply() {
+        assert!(reply_preview(None).is_none());
+    }
+
+    #[test]
+    fn half_a_reply_is_no_reply() {
+        // An empty quote above a message reads as something failing to load,
+        // which is worse than showing the message plainly.
+        let no_sender: ReplyMetadata =
+            serde_json::from_value(serde_json::json!({ "original_message": { "id": "x", "content": "y" } })).unwrap();
+        assert!(reply_preview(Some(&no_sender)).is_none());
+        let no_message: ReplyMetadata =
+            serde_json::from_value(serde_json::json!({ "original_sender": { "username": "Greg" } })).unwrap();
+        assert!(reply_preview(Some(&no_message)).is_none());
     }
 
     #[test]
