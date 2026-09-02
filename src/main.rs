@@ -138,9 +138,44 @@ fn acquire_singleton_lock(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Logging, at a level somebody can actually see.
+///
+/// `fmt::init()` on its own filtered almost everything out, so the daemon's
+/// own account of what it was doing - which room it joined, why a connection
+/// dropped, what a backend made of a frame it did not understand - went
+/// nowhere, in a process whose output a frontend already pipes somewhere
+/// useful. Two protocol bugs were reasoned about from first principles and got
+/// wrong because the thing that would have answered them was switched off.
+///
+/// So: info by default, and RUST_LOG still wins where somebody sets it.
+/// Parsed here rather than through tracing-subscriber's env-filter, which is
+/// not one of its default features and is not worth a dependency change to
+/// read one word.
+fn init_logging() {
+    let level = match std::env::var("RUST_LOG").unwrap_or_default().to_lowercase().as_str() {
+        "" | "info" => tracing::Level::INFO,
+        "trace" => tracing::Level::TRACE,
+        "debug" => tracing::Level::DEBUG,
+        "warn" => tracing::Level::WARN,
+        "error" => tracing::Level::ERROR,
+        // A per-target directive ("nobilis=debug"), which this does not parse.
+        // The most useful reading of "somebody asked for more" is more.
+        other => {
+            if other.contains("trace") {
+                tracing::Level::TRACE
+            } else if other.contains("debug") {
+                tracing::Level::DEBUG
+            } else {
+                tracing::Level::INFO
+            }
+        }
+    };
+    tracing_subscriber::fmt().with_max_level(level).init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     // Both the `irc` crate's tls-rust feature and the Discord backend's
     // websocket/HTTP clients pull in rustls, but via different transitive
