@@ -85,6 +85,23 @@ pub async fn kick_member(state: &AppState, account_id: &str, buffer_id: &str, ta
     Ok(())
 }
 
+/// Asks somebody into a room.
+///
+/// Lives here beside kick and ban because it is the same shape of call and
+/// the same authority decides it - a room's power levels say who may invite
+/// exactly as they say who may remove. It is the opposite action, which is
+/// why its absence was odd: a room made here could gain no second member
+/// from here.
+pub async fn invite_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
+    let base = homeserver_url.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/invite", url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>());
+    http::post_json(&url, Some(&access_token), serde_json::json!({ "user_id": target_user_id }))
+        .await
+        .context("inviting member")?;
+    Ok(())
+}
+
 pub async fn ban_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str, reason: Option<&str>) -> Result<()> {
     let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');

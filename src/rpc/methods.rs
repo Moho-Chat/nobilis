@@ -2223,6 +2223,32 @@ pub async fn dispatch(
             }
         }
 
+        // Asking somebody into a room. Its absence was the odd one out: this
+        // client could accept an invitation and decline one, and never send
+        // one - so a room created here could never gain a second member here.
+        "inviteMatrixMember" => {
+            let (account_id, buffer_id, user_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId"), p_str_opt(params, "userId")) {
+                    (Some(a), Some(b), Some(u)) => (a, b, u),
+                    _ => {
+                        return (
+                            None,
+                            Some("inviteMatrixMember requires \"accountId\", \"bufferId\" and \"userId\"".to_string()),
+                        )
+                    }
+                };
+            // A Matrix id or nothing. The server would refuse anything else
+            // anyway, but its error names an endpoint rather than the thing
+            // that was typed.
+            if !user_id.starts_with('@') || !user_id.contains(':') {
+                return (None, Some(format!("\"{user_id}\" is not a Matrix address - they look like @someone:server")));
+            }
+            match backend::matrix::moderation::invite_member(state, account_id, buffer_id, user_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "banMatrixMember" => {
             let (account_id, buffer_id, user_id) =
                 match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId"), p_str_opt(params, "userId")) {
