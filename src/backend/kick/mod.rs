@@ -241,7 +241,7 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
             frame = socket.next() => match frame {
                 None => anyhow::bail!("Kick closed the chat connection"),
                 Some(Err(e)) => return Err(e).context("reading from Kick's chat"),
-                Some(Ok(WsMessage::Text(text))) => handle_frame(state, account_id, &watched, &text, &mut socket).await?,
+                Some(Ok(WsMessage::Text(text))) => handle_frame(state, account_id, &mut watched, &text, &mut socket).await?,
                 Some(Ok(WsMessage::Close(_))) => anyhow::bail!("Kick closed the chat connection"),
                 Some(Ok(_)) => {}
             },
@@ -261,9 +261,72 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
 struct Watched {
     by_chatroom: HashMap<u64, String>,
     by_channel: HashMap<u64, String>,
+    /// Who has spoken in each channel, most recent first.
+    ///
+    /// Not a viewer list, and the client says so. Kick has no endpoint for
+    /// one - every plausible path answers 404, and Kick's own page shows none
+    /// either, because a livestream chat has no roster the way a channel does.
+    /// What it does have is people talking, which is what somebody actually
+    /// wants the panel for: to mention them, whisper them, or see who the
+    /// moderators are.
+    speakers: HashMap<String, Vec<Speaker>>,
 }
 
+/// Somebody who has said something, and how they looked saying it.
+#[derive(Clone, Debug)]
+struct Speaker {
+    nick: String,
+    user_id: Option<String>,
+    /// The strongest badge they carry, which is what the list marks them
+    /// with - a moderator is worth finding in a list of two hundred names.
+    badge: Option<String>,
+}
+
+/// How many to remember per channel.
+///
+/// A busy stream produces hundreds of distinct names an hour, and a list
+/// nobody can scan is no better than an empty one. This is the last two
+/// hundred to have spoken, which is the window somebody is actually reading.
+const SPEAKERS_REMEMBERED: usize = 200;
+
 impl Watched {
+    /// Records that somebody spoke, and answers whether the list changed
+    /// enough to be worth re-announcing.
+    ///
+    /// Somebody already in the list is not a change: a busy channel would
+    /// otherwise emit a roster every few hundred milliseconds, all of them
+    /// nearly identical. Their badges changing is - somebody subscribes, or
+    /// is given moderator, and the list should follow.
+    fn heard(&mut self, slug: &str, speaker: Speaker) -> bool {
+        let list = self.speakers.entry(slug.to_string()).or_default();
+        if let Some(existing) = list.iter_mut().find(|s| s.nick == speaker.nick) {
+            let changed = existing.badge != speaker.badge;
+            existing.badge = speaker.badge;
+            return changed;
+        }
+        list.insert(0, speaker);
+        list.truncate(SPEAKERS_REMEMBERED);
+        true
+    }
+
+    fn roster(&self, slug: &str) -> Vec<serde_json::Value> {
+        self.speakers
+            .get(slug)
+            .map(|list| {
+                list.iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "nick": s.nick,
+                            "userId": s.user_id.clone().unwrap_or_default(),
+                            "prefix": s.badge.clone().unwrap_or_default(),
+                            "away": false,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn add(&mut self, channel: &api::Channel) {
         self.by_chatroom.insert(channel.chatroom_id, channel.slug.clone());
         self.by_channel.insert(channel.id, channel.slug.clone());
@@ -273,6 +336,7 @@ impl Watched {
     /// caller can cancel each one. All four, or the socket keeps delivering
     /// events for a conversation that has been closed.
     fn remove(&mut self, slug: &str) -> Vec<String> {
+        self.speakers.remove(slug);
         let mut names = Vec::new();
         if let Some(room) = self.by_chatroom.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
             self.by_chatroom.remove(&room);
@@ -488,7 +552,7 @@ struct Sender {
 async fn handle_frame(
     state: &AppState,
     account_id: &str,
-    watched: &Watched,
+    watched: &mut Watched,
     text: &str,
     socket: &mut Socket,
 ) -> Result<()> {
@@ -514,13 +578,30 @@ async fn handle_frame(
         }
         e if e.ends_with("ChatMessageEvent") => {
             let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else { return Ok(()) };
-            let Some(slug) = watched.chatroom(msg.chatroom_id) else { return Ok(()) };
-            let from = msg.sender.username.unwrap_or_else(|| "someone".to_string());
+            let Some(slug) = watched.chatroom(msg.chatroom_id).cloned() else { return Ok(()) };
+            let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
             let reply_to = reply_preview(msg.metadata.as_ref());
+            let style = style_of(msg.sender.identity.as_ref());
+            // Kick has no viewer list to ask for, so the panel is built from
+            // who is talking - which is who somebody wants to reach anyway.
+            let slug = slug.clone();
+            if watched.heard(
+                &slug,
+                Speaker {
+                    nick: from.clone(),
+                    user_id: msg.sender.id.map(|i| i.to_string()),
+                    badge: strongest_badge(&style.badges),
+                },
+            ) {
+                let buffer_id = crate::model::buffer_id(account_id, &slug);
+                let roster = serde_json::json!(watched.roster(&slug));
+                state.runtime.set_presence(&buffer_id, roster.clone());
+                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster }));
+            }
             state.runtime.record_message_at(
                 state,
                 account_id,
-                slug,
+                &slug,
                 "channel",
                 &from,
                 &msg.content,
@@ -541,7 +622,7 @@ async fn handle_frame(
                 // have earned. Both arrive on every message and were both
                 // being dropped at the struct boundary, which is why every
                 // line looked the same.
-                Some(style_of(msg.sender.identity.as_ref())),
+                Some(style),
             );
         }
         // Worth a line in the channel it happened in: somebody watching a
@@ -656,6 +737,20 @@ pub async fn backfill(
 fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
     let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
     reply_preview(Some(&parsed))
+}
+
+/// The one badge worth marking somebody with in a list.
+///
+/// A name can carry four; a list showing all of them is a list of badges with
+/// names attached. Ranked by what a reader is scanning for - who runs the
+/// channel, who moderates it - rather than by what is rarest.
+fn strongest_badge(badges: &[api::Badge]) -> Option<String> {
+    for wanted in ["broadcaster", "moderator", "vip", "og", "founder", "subscriber"] {
+        if badges.iter().any(|b| b.kind == wanted) {
+            return Some(wanted.to_string());
+        }
+    }
+    None
 }
 
 /// How a sender should be drawn, out of what Kick sent with the message.
@@ -926,6 +1021,60 @@ mod tests {
         }
         // A channel this account is not watching is not ours to report.
         assert_eq!(channel_of(&w, &None, &serde_json::json!({ "channel_id": 1 })), None);
+    }
+
+    #[test]
+    fn remembers_who_spoke_without_announcing_every_line() {
+        let mut w = Watched::default();
+        let speaker = |nick: &str, badge: Option<&str>| Speaker {
+            nick: nick.into(),
+            user_id: None,
+            badge: badge.map(str::to_string),
+        };
+
+        assert!(w.heard("chan", speaker("first", None)), "a new name is worth announcing");
+        assert!(!w.heard("chan", speaker("first", None)), "the same name saying more is not");
+        assert!(w.heard("chan", speaker("first", Some("moderator"))), "but their badges changing is");
+        assert!(w.heard("chan", speaker("second", None)));
+
+        // Most recent first, so the newest arrival is at the top.
+        let roster = w.roster("chan");
+        assert_eq!(roster.len(), 2);
+        assert_eq!(roster[0]["nick"], "second");
+        assert_eq!(roster[1]["prefix"], "moderator");
+    }
+
+    #[test]
+    fn forgets_the_oldest_rather_than_growing_without_end() {
+        let mut w = Watched::default();
+        for i in 0..(SPEAKERS_REMEMBERED + 50) {
+            w.heard("chan", Speaker { nick: format!("nick{i}"), user_id: None, badge: None });
+        }
+        assert_eq!(w.roster("chan").len(), SPEAKERS_REMEMBERED);
+        // The most recent survive; a list nobody can scan is no better than
+        // an empty one, and the newest names are the ones being read.
+        assert_eq!(w.roster("chan")[0]["nick"], format!("nick{}", SPEAKERS_REMEMBERED + 49));
+    }
+
+    #[test]
+    fn marks_somebody_by_the_badge_worth_finding_them_by() {
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        // Ranked by what a reader is scanning for, not by what is rarest: a
+        // moderator who is also a subscriber shows as a moderator.
+        assert_eq!(strongest_badge(&[badge("subscriber"), badge("moderator")]).as_deref(), Some("moderator"));
+        assert_eq!(strongest_badge(&[badge("subscriber")]).as_deref(), Some("subscriber"));
+        assert_eq!(strongest_badge(&[badge("broadcaster"), badge("moderator")]).as_deref(), Some("broadcaster"));
+        assert_eq!(strongest_badge(&[]), None);
+        // A badge nobody ranks marks nobody, rather than marking everybody.
+        assert_eq!(strongest_badge(&[badge("verified")]), None);
+    }
+
+    #[test]
+    fn closing_a_channel_forgets_who_was_talking_in_it() {
+        let mut w = watching_odablock();
+        w.heard("odablock", Speaker { nick: "someone".into(), user_id: None, badge: None });
+        w.remove("odablock");
+        assert!(w.roster("odablock").is_empty());
     }
 
     #[test]
