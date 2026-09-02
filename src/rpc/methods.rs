@@ -150,6 +150,33 @@ pub async fn dispatch(
                             backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
                         }
                     }
+                    // IRC pages back through CHATHISTORY, where the server
+                    // has it. Unlike the other two this is not a request with
+                    // a reply - the history arrives as ordinary messages on
+                    // the same connection - so there is nothing to await, and
+                    // the store is watched instead until the page lands or it
+                    // becomes clear nothing is coming.
+                    //
+                    // Crude, and the honest shape of the problem: a batch
+                    // ending is not something this call can be handed. What it
+                    // buys is that the page returned below already contains
+                    // the history, rather than the history arriving afterwards
+                    // as live messages and being appended to the bottom of a
+                    // conversation it belongs at the top of.
+                    if before > 0
+                        && buffer.kind == "channel"
+                        && state.runtime.irc_has_chathistory(&buffer.account_id)
+                    {
+                        if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
+                            if let Some(request) = backend::irc::chathistory_before(&buffer.name, before) {
+                                let had = state.store.get_backlog(buffer_id, before, limit).map(|m| m.len()).unwrap_or(0);
+                                if sender.send(request).is_ok() {
+                                    backend::irc::await_history(state, buffer_id, before, limit, had).await;
+                                }
+                            }
+                        }
+                    }
+
                     // Matrix pages back through /messages the same way, and
                     // only when paginating: the initial open is served from
                     // what sync already delivered, and fetching history for

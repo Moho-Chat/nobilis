@@ -114,6 +114,11 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 // dead. Drop it before the wait, or a send during the gap
                 // goes into a socket nobody is reading.
                 state.runtime.remove_irc_handle(&account_id);
+                // The next connection negotiates its own. A server that
+                // granted history last time is not promising to this time,
+                // and asking on the strength of a stale answer is a command
+                // answered with an error.
+                state.runtime.clear_irc_caps(&account_id);
                 state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
                 let because = detail.unwrap_or_else(|| "Connection closed".to_string());
                 state.runtime.report_progress(&state, &account_id, &format!("{because} - reconnecting in {}s...", backoff.as_secs()));
@@ -695,7 +700,24 @@ fn quit_message(config: &IrcAccountConfig) -> String {
 
 pub const DEFAULT_QUIT_MESSAGE: &str = "moho";
 
-const WANTED_CAPS: &[&str] = &["server-time", "multi-prefix"];
+const WANTED_CAPS: &[&str] = &[
+    "server-time",
+    "multi-prefix",
+    // A message's own id, which is what makes replayed history recognisable
+    // as history rather than as new. Without it every backfill would arrive
+    // as a fresh copy of everything already on screen: IRC has no id of its
+    // own, so this daemon generates one, and a generated id can never match
+    // the message it is a second copy of.
+    "message-tags",
+    // How a server frames a replay. Not read for its own sake - the messages
+    // inside a batch are ordinary ones - but a server will not send
+    // chathistory to a client that cannot be told where a batch begins.
+    "batch",
+    // The history itself. Ergo and a few others have it; the ones that do not
+    // simply NAK it, which costs nothing.
+    "draft/chathistory",
+    "chathistory",
+];
 
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
@@ -941,6 +963,9 @@ async fn handle_message(
     // text - which belongs at the moment it is shown rather than at
     // whatever the server stamped the triggering event with.
     let sent_at = server_time(&msg);
+    // Carried alongside, because everything below matches on `msg.command`
+    // and would otherwise have moved the message out from under it.
+    let msg_id = message_id(&msg);
 
     match msg.command {
         Command::PRIVMSG(target, body) => {
@@ -957,9 +982,9 @@ async fn handle_message(
                 return;
             }
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None);
             }
         }
 
@@ -1001,6 +1026,26 @@ async fn handle_message(
             members.insert(from.clone(), MemberRank::None);
             if from == own_nick {
                 state.runtime.ensure_buffer(state, account_id, &channel, "channel");
+                // What was said before we arrived. Asked for on join rather
+                // than on connect, because a channel nobody opens is a request
+                // for history nobody reads - and asked for at all only where
+                // the server granted the capability, since otherwise it is a
+                // command answered with an error in the server tab.
+                //
+                // The messages come back as ordinary ones carrying their own
+                // ids, so anything already stored is recognised and stored
+                // once. That is what `message-tags` is for.
+                if let Some(sender) = state.runtime.irc_sender(account_id) {
+                    // What the channel is set to. Servers announce a change
+                    // but not the state, so a client that never asks shows
+                    // nothing until somebody happens to alter it - which is
+                    // why the header sat empty on every channel already
+                    // joined.
+                    let _ = sender.send(Command::ChannelMODE(channel.clone(), Vec::new()));
+                    if state.runtime.irc_has_chathistory(account_id) {
+                        let _ = sender.send(chathistory_latest(&channel));
+                    }
+                }
             }
             emit_presence(state, account_id, &channel, members);
         }
@@ -1211,6 +1256,13 @@ async fn handle_message(
         // when there's no channel buffer to show them in (the join never
         // succeeded), so the always-present server buffer is the only
         // reliable place - same as HexChat's server tab.
+        // Which capabilities the server actually granted. Requested without
+        // waiting for the answer, so this is where we find out - and asking a
+        // server for history it never offered is an error in the server tab.
+        Command::CAP(_, CapSubCommand::ACK, _, Some(caps)) => {
+            state.runtime.grant_irc_caps(account_id, &caps);
+        }
+
         // What modes a channel currently has, in answer to a bare /mode.
         Command::Response(Response::RPL_CHANNELMODEIS, args) => {
             if let Some(channel) = args.get(1) {
@@ -1387,6 +1439,68 @@ fn rank_word(rank: MemberRank) -> &'static str {
 /// which is the ordinary case on an older server - hence an Option rather
 /// than a default, so the caller can fall back to the clock rather than to
 /// the epoch.
+/// How many messages to ask for at a time.
+///
+/// Enough to fill a screen and then some, and small enough that a server
+/// which caps the request silently truncates rather than refuses. Servers
+/// commonly limit this to 100 anyway.
+pub const CHATHISTORY_PAGE: u32 = 100;
+
+/// `CHATHISTORY LATEST <target> * <n>` - the most recent messages there are.
+///
+/// Built as a raw message because the crate has no command for it: this is an
+/// IRCv3 extension rather than part of the protocol the crate models.
+pub fn chathistory_latest(target: &str) -> Message {
+    format!("CHATHISTORY LATEST {target} * {CHATHISTORY_PAGE}")
+        .parse()
+        .expect("a CHATHISTORY line built from a channel name is well formed")
+}
+
+/// `CHATHISTORY BEFORE <target> timestamp=<t> <n>` - what came before a point.
+///
+/// The timestamp is the server's own format, which is RFC 3339 with
+/// milliseconds. Built from a unix second, which is what the store keeps.
+pub fn chathistory_before(target: &str, before_unix: i64) -> Option<Message> {
+    let at = chrono::DateTime::from_timestamp(before_unix, 0)?.format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    format!("CHATHISTORY BEFORE {target} timestamp={at} {CHATHISTORY_PAGE}").parse().ok()
+}
+
+/// Waits for a CHATHISTORY page to land, or gives up.
+///
+/// Polled rather than signalled. The alternative is threading a one-shot
+/// channel from this call into the connection task so a batch ending can wake
+/// it, which is more machinery than the problem deserves: the wait is bounded,
+/// it ends the moment anything arrives, and the cost of being wrong is a page
+/// that fills in a moment later as live messages rather than a page that is
+/// missing.
+pub async fn await_history(state: &AppState, buffer_id: &str, before: i64, limit: i64, had: usize) {
+    const PATIENCE: Duration = Duration::from_secs(3);
+    const CHECK: Duration = Duration::from_millis(100);
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(CHECK).await;
+        if state.store.get_backlog(buffer_id, before, limit).map(|m| m.len()).unwrap_or(0) > had {
+            return;
+        }
+    }
+}
+
+/// A message's own id, where the server gives one.
+///
+/// Used as the message id rather than a generated one, so a message seen twice
+/// - replayed history, a reconnect, a batch that overlaps what is already
+/// stored - is stored once. That dedup already exists for every other protocol
+/// here; IRC could not use it because it had no id to dedup on.
+fn message_id(msg: &Message) -> Option<String> {
+    let tags = msg.tags.as_ref()?;
+    tags.iter()
+        .find(|tag| tag.0 == "msgid")?
+        .1
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
 fn server_time(msg: &Message) -> Option<i64> {
     let tags = msg.tags.as_ref()?;
     // Tag is a tuple struct of (name, value); matched by field rather than
@@ -1656,6 +1770,33 @@ mod quit_tests {
 
     fn config(message: Option<&str>) -> IrcAccountConfig {
         IrcAccountConfig { quit_message: message.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn builds_the_history_requests_the_spec_defines() {
+        assert_eq!(chathistory_latest("#channel").to_string().trim_end(), "CHATHISTORY LATEST #channel * 100");
+        let before = chathistory_before("#channel", 1_767_915_177).unwrap();
+        assert_eq!(
+            before.to_string().trim_end(),
+            "CHATHISTORY BEFORE #channel timestamp=2026-01-08T23:32:57.000Z 100"
+        );
+    }
+
+    #[test]
+    fn a_msgid_is_used_where_the_server_gives_one() {
+        // Without this every replayed message is a fresh copy of one already
+        // on screen: IRC has no id of its own, so the daemon generates one,
+        // and a generated id can never match the message it duplicates.
+        let with_id: Message = "@msgid=abc123 :nick!u@h PRIVMSG #chan :hello".parse().unwrap();
+        assert_eq!(message_id(&with_id).as_deref(), Some("abc123"));
+
+        let without: Message = ":nick!u@h PRIVMSG #chan :hello".parse().unwrap();
+        assert_eq!(message_id(&without), None);
+
+        // An empty tag is not an id, and using one would collapse every such
+        // message into a single row.
+        let empty: Message = "@msgid= :nick!u@h PRIVMSG #chan :hello".parse().unwrap();
+        assert_eq!(message_id(&empty), None);
     }
 
     #[test]

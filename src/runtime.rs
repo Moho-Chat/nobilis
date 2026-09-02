@@ -370,6 +370,13 @@ pub struct Runtime {
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
+    /// Which capabilities each IRC connection was actually granted.
+    ///
+    /// Asked for is not the same as given: capabilities are requested without
+    /// waiting for the answer, and a server that does not know one simply
+    /// refuses that line. Asking for history from a server that never granted
+    /// it is a command it will answer with an error in the server tab.
+    irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
     /// human-friendly (see backend/matrix/rooms.rs's naming fallback
     /// chain), but sending/reacting/etc. needs the real `!opaque:server`
@@ -550,6 +557,7 @@ impl Runtime {
             kick_senders: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
+            irc_caps: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -1984,6 +1992,32 @@ impl Runtime {
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    pub fn grant_irc_caps(&self, account_id: &str, caps: &str) {
+        let mut all = self.irc_caps.lock().unwrap();
+        let granted = all.entry(account_id.to_string()).or_default();
+        for cap in caps.split_whitespace() {
+            // A server may answer with `cap=value`; the name is what matters.
+            granted.insert(cap.split('=').next().unwrap_or(cap).to_string());
+        }
+    }
+
+    pub fn clear_irc_caps(&self, account_id: &str) {
+        self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    /// Whether this connection may be asked for history.
+    ///
+    /// Either spelling counts: the capability was `draft/chathistory` for
+    /// years and is `chathistory` now, and a server offering one and not the
+    /// other is the ordinary case rather than an edge one.
+    pub fn irc_has_chathistory(&self, account_id: &str) -> bool {
+        self.irc_caps
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|caps| caps.contains("draft/chathistory") || caps.contains("chathistory"))
     }
 
     pub fn begin_irc_channel_list(&self, account_id: &str) {
