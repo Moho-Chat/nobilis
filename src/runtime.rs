@@ -529,6 +529,14 @@ pub struct Runtime {
     /// matrix_presence (for the online/offline split) - see emit_matrix_
     /// presence.
     matrix_room_members: Mutex<HashMap<(String, String), HashMap<String, String>>>,
+    /// Matrix-specific: (account id, room id) -> {user id -> the newest
+    /// event id they have a public read receipt against}. Only one entry per
+    /// person: a receipt supersedes their previous one, and keeping the older
+    /// ones would draw the same person against several messages at once.
+    ///
+    /// Receipts people send privately (`m.read.private`) never reach anybody
+    /// else's sync, so this only ever holds what its senders chose to publish.
+    matrix_read_receipts: Mutex<HashMap<(String, String), HashMap<String, String>>>,
     /// Matrix-specific: (account id, user id) -> whether /sync's top-level
     /// presence.events last reported them as "online". Absent (never seen
     /// a presence event for them) is treated as offline - Matrix has no
@@ -594,6 +602,7 @@ impl Runtime {
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
+            matrix_read_receipts: Mutex::new(HashMap::new()),
             matrix_presence: Mutex::new(HashMap::new()),
         }
     }
@@ -1849,6 +1858,32 @@ impl Runtime {
         if let Some(members) = self.matrix_room_members.lock().unwrap().get_mut(&(account_id.to_string(), room_id.to_string())) {
             members.remove(user_id);
         }
+    }
+
+    /// Records where somebody has read up to, and says whether that was news.
+    ///
+    /// A room's own sync repeats receipts that have not moved, so a caller
+    /// that emitted on every one would redraw the whole room's markers
+    /// whenever anything at all happened in it.
+    pub fn set_matrix_read_receipt(&self, account_id: &str, room_id: &str, user_id: &str, event_id: &str) -> bool {
+        let mut all = self.matrix_read_receipts.lock().unwrap();
+        let room = all.entry((account_id.to_string(), room_id.to_string())).or_default();
+        match room.get(user_id) {
+            Some(existing) if existing == event_id => false,
+            _ => {
+                room.insert(user_id.to_string(), event_id.to_string());
+                true
+            }
+        }
+    }
+
+    pub fn get_matrix_read_receipts(&self, account_id: &str, room_id: &str) -> HashMap<String, String> {
+        self.matrix_read_receipts
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn get_matrix_room_members(&self, account_id: &str, room_id: &str) -> HashMap<String, String> {

@@ -258,6 +258,11 @@ pub async fn dispatch(
                 if let Some(members) = state.runtime.get_presence(buffer_id) {
                     state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": members }));
                 }
+                // Read markers are replayed for the same reason: they arrive
+                // on sync and are not repeated once they stop moving, so a
+                // window opened afterwards would show none until somebody
+                // read something new.
+                backend::matrix::replay_read_receipts(state, buffer_id);
                 (Some(ok_node()), None)
             }
         },
@@ -508,7 +513,11 @@ pub async fn dispatch(
                 // to say a room has been read must not make reading it look
                 // like an error.
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => {
-                    if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id).await {
+                    // Absent means yes: a client that has not been taught
+                    // about the privacy toggle should behave as it did
+                    // before there was one.
+                    let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
+                    if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
                     }
                     (Some(ok_node()), None)
