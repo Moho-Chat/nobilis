@@ -56,10 +56,6 @@ pub fn message_body(content: &Value) -> (String, bool) {
     (body, is_action)
 }
 
-/// `redacts`, the target event id of an `m.room.redaction` - used for
-/// both real message deletes and reaction removal (Matrix has no
-/// dedicated "remove reaction" event; un-reacting is redacting the
-/// `m.reaction` event you sent - see Runtime::take_matrix_reaction_target).
 /// The sender's formatted version of the body, if there is one.
 ///
 /// Only `org.matrix.custom.html` counts: the spec allows other formats and a
@@ -73,6 +69,10 @@ pub fn formatted_body(content: &Value) -> Option<&str> {
     content["formatted_body"].as_str().filter(|h| !h.is_empty())
 }
 
+/// `redacts`, the target event id of an `m.room.redaction` - used for both
+/// real message deletes and reaction removal (Matrix has no dedicated "remove
+/// reaction" event; un-reacting is redacting the `m.reaction` event you sent -
+/// see Runtime::take_matrix_reaction_target).
 pub fn redaction_target(event: &Value) -> Option<&str> {
     event["redacts"].as_str().or_else(|| event["content"]["redacts"].as_str())
 }
@@ -97,6 +97,26 @@ pub fn reply_target(content: &Value) -> Option<&str> {
     content["m.relates_to"]["m.in_reply_to"]["event_id"].as_str()
 }
 
+/// The thread a message belongs to, if it is in one.
+///
+/// A threaded message carries `rel_type: m.thread` and the id of the message
+/// the thread grew from. It usually *also* carries an `m.in_reply_to`, which
+/// is a fallback for clients that do not understand threads and which points
+/// at the previous message in the thread rather than at the thread itself -
+/// so reading only that answers a different question and gets a chain of
+/// one-line replies where a conversation was.
+///
+/// Threads are not buffers here. What this buys is that a threaded message
+/// says which conversation it belongs to instead of arriving in the timeline
+/// with no context at all, which is what a flat client shows today.
+pub fn thread_root(content: &Value) -> Option<&str> {
+    let relates_to = &content["m.relates_to"];
+    if relates_to["rel_type"].as_str() != Some("m.thread") {
+        return None;
+    }
+    relates_to["event_id"].as_str()
+}
+
 /// The target event id + emoji key of an `m.reaction` event
 /// (`m.relates_to.rel_type == "m.annotation"`).
 pub fn reaction_target(content: &Value) -> Option<(&str, &str)> {
@@ -105,6 +125,47 @@ pub fn reaction_target(content: &Value) -> Option<(&str, &str)> {
         return None;
     }
     Some((relates_to["event_id"].as_str()?, relates_to["key"].as_str()?))
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+
+    #[test]
+    fn finds_the_thread_a_message_belongs_to() {
+        let threaded = serde_json::json!({
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                // The fallback for clients that do not understand threads.
+                // It names the previous message in the thread, not the thread,
+                // which is why reading it instead would give a chain of
+                // one-line replies where a conversation was.
+                "m.in_reply_to": { "event_id": "$previous" },
+                "is_falling_back": true
+            }
+        });
+        assert_eq!(thread_root(&threaded), Some("$root"));
+        assert_eq!(reply_target(&threaded), Some("$previous"));
+    }
+
+    #[test]
+    fn an_ordinary_reply_is_not_a_thread() {
+        let reply = serde_json::json!({ "m.relates_to": { "m.in_reply_to": { "event_id": "$x" } } });
+        assert_eq!(thread_root(&reply), None);
+        assert_eq!(reply_target(&reply), Some("$x"));
+    }
+
+    #[test]
+    fn an_edit_is_not_a_thread_either() {
+        let edit = serde_json::json!({ "m.relates_to": { "rel_type": "m.replace", "event_id": "$x" } });
+        assert_eq!(thread_root(&edit), None);
+    }
+
+    #[test]
+    fn a_plain_message_relates_to_nothing() {
+        assert_eq!(thread_root(&serde_json::json!({ "body": "hi" })), None);
+    }
 }
 
 const MEDIA_MSGTYPES: &[&str] = &["m.image", "m.video", "m.audio", "m.file"];

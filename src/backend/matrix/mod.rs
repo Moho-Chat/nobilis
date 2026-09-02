@@ -667,7 +667,16 @@ async fn handle_timeline_event(
         return;
     }
 
-    let reply_to = match protocol::reply_target(&content) {
+    // What this message is answering. A threaded message names its thread
+    // rather than the message before it: Matrix sends both, and the second is
+    // a fallback for clients that cannot read threads, so following it gives a
+    // chain of one-line replies where a conversation was.
+    //
+    // Threads are not their own buffers here, and this does not make them one.
+    // It is the difference between a threaded message arriving with no context
+    // at all and one that says which conversation it belongs to.
+    let relation = protocol::thread_root(&content).or_else(|| protocol::reply_target(&content));
+    let reply_to = match relation {
         Some(target_event) => match state.store.get_message(buffer_id, target_event) {
             Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target_event.to_string(), from: m.from, body: m.body }),
             // Not (or no longer) in local scrollback - still record that
