@@ -271,36 +271,112 @@ pub async fn identity(http: &reqwest::Client, token: &str) -> Result<Identity> {
     Ok(who)
 }
 
-/// The channels this account follows, as handles.
+/// The channels this account follows, as handles, the live ones first.
 ///
-/// `/api/v2/channels/followed`, which is the only one of these that is what it
-/// looks like. `/api/v1/channels/followed` answers 200 to an anonymous request
-/// and looks like it works - it is a *channel* lookup, and there is a real
-/// streamer whose handle is literally "followed", so the v1 path quietly
-/// returns one stranger's channel instead of anybody's follow list. That is
-/// the kind of wrong answer that survives testing.
+/// Two endpoints, because Kick's own site uses two and they answer different
+/// questions - taken from its own frontend rather than guessed:
 ///
-/// Tolerant about the wrapper because this list is only ever read: Kick has
-/// shipped it bare, under `data`, and under `channels`, and each item names its
-/// slug either directly or one level down. Anything that does not yield a
-/// handle is skipped rather than failing the whole list - one unfamiliar entry
-/// should cost that entry, not the other forty.
+///   - `/api/v2/channels/followed` is what the sidebar shows: the follows that
+///     are **live right now**, and nothing else. Asking only this is why a
+///     first connect brought in four channels for an account following
+///     twenty-nine, and it looked correct because four channels did appear.
+///   - `/api/v2/channels/followed-page` is the Following page: all of them.
+///
+/// Both are cursor-paginated. Live first and then the rest, deduplicated, so
+/// the channels worth opening first are the ones with something happening in
+/// them - which is also the order they appear in.
+///
+/// A third path, `/api/v1/channels/followed`, is a trap: it answers 200 to an
+/// anonymous request because there is a real streamer whose handle is literally
+/// "followed", so it returns one stranger's channel object instead of anybody's
+/// follows.
 pub async fn followed(http: &reqwest::Client, token: &str) -> Result<Vec<String>> {
-    let res = http
-        .get(format!("{API_ROOT}/api/v2/channels/followed?page=1&limit=100"))
-        .header("Accept", "application/json")
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("asking Kick which channels this account follows")?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-        bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
+    let mut out = Vec::new();
+    // The live list first, and its failure is survivable: the full list below
+    // contains these too, so losing it costs the ordering rather than the
+    // channels.
+    let live = collect_follows(http, token, "/api/v2/channels/followed", &mut out).await;
+    let all = collect_follows(http, token, "/api/v2/channels/followed-page", &mut out).await;
+    // Only a complete failure is an error. Having one of the two is a usable
+    // answer, and reporting it as a failure would throw away what was fetched.
+    match (live, all) {
+        (Err(e), Err(_)) => Err(e),
+        _ => Ok(out),
     }
-    if !res.status().is_success() {
-        bail!("Kick answered {} for this account's follows", res.status());
+}
+
+/// How many pages to walk before stopping.
+///
+/// A cursor that never changes, or a list longer than anybody's attention,
+/// should end the walk rather than spin - and fifty channels is the cap
+/// upstream anyway.
+const MAX_FOLLOW_PAGES: usize = 10;
+
+/// Walks one paginated follow list, appending handles not already collected.
+async fn collect_follows(
+    http: &reqwest::Client,
+    token: &str,
+    path: &str,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_FOLLOW_PAGES {
+        let url = match &cursor {
+            Some(c) => format!("{API_ROOT}{path}?cursor={}", urlencode(c)),
+            None => format!("{API_ROOT}{path}"),
+        };
+        let res = http
+            .get(&url)
+            .header("Accept", "application/json")
+            .bearer_auth(token)
+            .send()
+            .await
+            .context("asking Kick which channels this account follows")?;
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
+        }
+        if !res.status().is_success() {
+            bail!("Kick answered {} for this account's follows", res.status());
+        }
+        let body: serde_json::Value = res.json().await.context("reading this account's follows")?;
+        for slug in slugs_in(&body) {
+            if !out.contains(&slug) {
+                out.push(slug);
+            }
+        }
+        match next_cursor(&body) {
+            // A cursor that has not moved would walk the same page forever.
+            Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
+            _ => return Ok(()),
+        }
     }
-    let body: serde_json::Value = res.json().await.context("reading this account's follows")?;
-    Ok(slugs_in(&body))
+    Ok(())
+}
+
+/// Where the next page starts, if there is one.
+fn next_cursor(body: &serde_json::Value) -> Option<String> {
+    let value = body.get("nextCursor").or_else(|| body.get("next_cursor"))?;
+    match value {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Enough escaping for a cursor in a query string.
+///
+/// Kick's cursors have been plain so far, but this one is handed straight back
+/// from a response into a URL, and "it has always been alphanumeric" is not a
+/// property of somebody else's API.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
 }
 
 /// Every handle in a follow list, whatever shape the list arrived in.
@@ -565,6 +641,25 @@ mod tests {
         // The handle one level down, which is how a list of livestreams reads.
         let nested = serde_json::json!({ "data": [{ "channel": { "slug": "odablock" } }] });
         assert_eq!(slugs_in(&nested), vec!["odablock"]);
+    }
+
+    #[test]
+    fn finds_where_the_next_page_starts() {
+        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": "abc" })).as_deref(), Some("abc"));
+        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": 20 })).as_deref(), Some("20"));
+        assert_eq!(next_cursor(&serde_json::json!({ "next_cursor": "abc" })).as_deref(), Some("abc"));
+        // The end of the list, in each of the ways it is said.
+        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": null })), None);
+        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": "" })), None);
+        assert_eq!(next_cursor(&serde_json::json!({ "channels": [] })), None);
+    }
+
+    #[test]
+    fn escapes_a_cursor_before_putting_it_in_a_url() {
+        assert_eq!(urlencode("abc123"), "abc123");
+        assert_eq!(urlencode("a b"), "a%20b");
+        assert_eq!(urlencode("a&b=c"), "a%26b%3Dc");
+        assert_eq!(urlencode("eyJ0eXAiOiJKV1Qi"), "eyJ0eXAiOiJKV1Qi");
     }
 
     #[test]
