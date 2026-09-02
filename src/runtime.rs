@@ -198,6 +198,14 @@ impl ConnState {
 pub struct IrcHandle {
     pub sender: irc::client::Sender,
     pub nick: String,
+    /// What to say on the way out.
+    ///
+    /// Carried on the handle rather than looked up when the connection is
+    /// torn down, because the two places that end one - `disconnect` and
+    /// `reset_connection` - have an account id and no view of its config, and
+    /// both used to send an empty QUIT. The account's own message was stored,
+    /// settable from two places, and never reached the wire.
+    pub quit_message: String,
 }
 
 /// Live, in-memory state that sits alongside the persisted AccountStore:
@@ -969,7 +977,7 @@ impl Runtime {
     /// really needs cancelling.
     pub fn reset_connection(&self, account_id: &str) {
         if let Some(handle) = self.irc_handles.lock().unwrap().remove(account_id) {
-            let _ = handle.sender.send_quit("");
+            let _ = handle.sender.send_quit(&handle.quit_message);
         }
         if let Some(handle) = self.task_handles.lock().unwrap().remove(account_id) {
             handle.abort();
@@ -1925,15 +1933,25 @@ impl Runtime {
     /// the network's own ping-timeout notices the dead peer (confirmed
     /// live against Libera: this is exactly what caused a real reconnect
     /// failure - "Nickname is already in use" - after an abrupt kill).
-    pub fn quit_all(&self, message: &str) {
+    /// `fallback` is used only for an account that set no message of its own:
+    /// the account's is its own whatever ends the connection, and the daemon
+    /// shutting down is not a reason to say something different to the
+    /// channel than a disconnect would.
+    pub fn quit_all(&self, fallback: &str) {
         // Nothing should try to come back up on the way out. IRC reconnects
         // by itself now, and its loop reads this on the way out of a
         // session - a QUIT sent here ends one, so without clearing the
         // intent first the daemon would spend its shutdown reconnecting.
         self.wants_connected.lock().unwrap().clear();
-        let senders: Vec<_> = self.irc_handles.lock().unwrap().values().map(|h| h.sender.clone()).collect();
-        for sender in senders {
-            let _ = sender.send_quit(message);
+        let farewells: Vec<_> = self
+            .irc_handles
+            .lock()
+            .unwrap()
+            .values()
+            .map(|h| (h.sender.clone(), h.quit_message.clone()))
+            .collect();
+        for (sender, message) in farewells {
+            let _ = sender.send_quit(if message.is_empty() { fallback } else { &message });
         }
     }
 
@@ -1947,8 +1965,8 @@ impl Runtime {
         // and an IRC retry loop reading this flag on the way out must see
         // that the ending was asked for.
         self.set_wants_connected(account_id, false);
-        if let Some(sender) = self.irc_sender(account_id) {
-            let _ = sender.send_quit("");
+        if let Some((sender, quit_message)) = self.irc_farewell(account_id) {
+            let _ = sender.send_quit(&quit_message);
             return true;
         }
         let handle = self.task_handles.lock().unwrap().remove(account_id);
@@ -1964,6 +1982,19 @@ impl Runtime {
             }
             None => false,
         }
+    }
+
+    /// The sender for this account and the message to sign off with.
+    ///
+    /// One lookup rather than two, so the pair cannot come from different
+    /// moments - and so nobody has to remember that ending a connection means
+    /// asking about the message as well.
+    fn irc_farewell(&self, account_id: &str) -> Option<(irc::client::Sender, String)> {
+        self.irc_handles
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|h| (h.sender.clone(), h.quit_message.clone()))
     }
 
     pub fn irc_sender(&self, account_id: &str) -> Option<irc::client::Sender> {

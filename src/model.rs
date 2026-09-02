@@ -24,6 +24,15 @@ pub struct Account {
     pub sasl_username: String,
     #[serde(rename = "allowPlaintextSasl")]
     pub allow_plaintext_sasl: bool,
+    /// Which SASL mechanism this account is pinned to, or empty for the
+    /// default. IRC-only; empty everywhere else.
+    #[serde(rename = "saslMechanism")]
+    pub sasl_mechanism: String,
+    /// Whether a TLS client certificate is configured for SASL EXTERNAL. The
+    /// path itself is not reported - a frontend never needs it, and it names a
+    /// file on the machine the daemon is running on rather than this one.
+    #[serde(rename = "hasSaslCertificate")]
+    pub has_sasl_certificate: bool,
     /// Whether this account's connection is encrypted.
     ///
     /// Reported so a frontend can tell the truth about what sending

@@ -297,6 +297,12 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
         realname: Some(config.realname.clone().unwrap_or_else(|| config.nick.clone())),
         // SASL uses AUTHENTICATE, not the server PASS field.
         password: if config.sasl { None } else { config.password.clone() },
+        // The certificate SASL EXTERNAL authenticates with. Set on the
+        // connection rather than sent in a message: EXTERNAL means "whoever
+        // this TLS session already proved me to be", so without it here there
+        // is nothing for the server to check.
+        client_cert_path: config.sasl_cert_path.clone().filter(|p| !p.is_empty()),
+        client_cert_pass: config.sasl_cert_pass.clone().filter(|p| !p.is_empty()),
         proxy_type: config.use_tor.then_some(ProxyType::Socks5),
         proxy_server: config.use_tor.then(|| proxy_host(config).to_string()),
         proxy_port: config.use_tor.then(|| proxy_port(config)),
@@ -354,7 +360,14 @@ async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sende
         }
     }
 
-    state.runtime.insert_irc_handle(&account_id, IrcHandle { sender: sender.clone(), nick: config.nick.clone() });
+    state.runtime.insert_irc_handle(
+        &account_id,
+        IrcHandle {
+            sender: sender.clone(),
+            nick: config.nick.clone(),
+            quit_message: quit_message(config),
+        },
+    );
     state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
     state.runtime.ensure_buffer(state, &account_id, &config.host, "server");
 
@@ -433,16 +446,159 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
         return Ok(false);
     }
 
-    state.runtime.report_progress(state, account_id, "Starting SASL PLAIN...");
-    sender.send_sasl_plain()?;
-    wait_for(stream, |m| matches!(&m.command, Command::AUTHENTICATE(s) if s == "+")).await
-        .map_err(|_| anyhow!("server did not respond to AUTHENTICATE PLAIN"))?;
+    // Strongest first. A server that will not take the one we chose says so
+    // with 908 and lists what it does take, so the fallback is the server's
+    // own answer rather than a guess made here.
+    let mut tried: Vec<SaslMechanism> = Vec::new();
+    let mut next = Some(preferred_mechanism(config));
+    while let Some(mechanism) = next {
+        tried.push(mechanism);
+        match attempt_sasl(state, account_id, sender, stream, config, mechanism).await {
+            Ok(()) => {
+                end_cap_and_register(sender, config)?;
+                return Ok(true);
+            }
+            Err(SaslRefusal::Fatal(e)) => return Err(e),
+            Err(SaslRefusal::TryAnother(offered)) => {
+                // Only what the server named, only what we can actually do,
+                // and never one already tried - or a server that keeps
+                // offering the same mechanism would loop forever.
+                next = offered
+                    .iter()
+                    .filter_map(|name| SaslMechanism::parse(name))
+                    .find(|m| !tried.contains(m));
+                if next.is_none() {
+                    bail!(
+                        "SASL authentication failed - the server accepts {}, and this account is set up for {}",
+                        if offered.is_empty() { "nothing this client speaks".to_string() } else { offered.join(", ") },
+                        tried.iter().map(|m| m.name()).collect::<Vec<_>>().join(", ")
+                    );
+                }
+                state.runtime.report_progress(
+                    state,
+                    account_id,
+                    &format!("Server refused {}; trying {}...", tried.last().unwrap().name(), next.unwrap().name()),
+                );
+            }
+        }
+    }
+    bail!("SASL authentication failed - check the SASL username and password for this account")
+}
 
-    state.runtime.report_progress(state, account_id, "Sending SASL credentials...");
+/// Which mechanism this account should lead with.
+///
+/// A certificate is a deliberate act, so its presence is taken as meaning it:
+/// somebody who went and configured one wants EXTERNAL, and falling back to
+/// sending the password would defeat the point of having set it up.
+///
+/// Otherwise PLAIN, which is not the strongest and is the right default
+/// anyway. SCRAM-SHA-256 is barely deployed on IRC - Ergo has it; Libera,
+/// Rizon and most of the rest offer PLAIN and EXTERNAL and nothing else - and
+/// the spec only *recommends* that a server answer an unknown mechanism with
+/// the list of ones it has. Leading with SCRAM would therefore break SASL
+/// outright on the networks people actually use, on servers that decline to
+/// say why. So SCRAM is there for whoever names it, and the 908 fallback picks
+/// it up automatically on servers that do advertise properly.
+fn preferred_mechanism(config: &IrcAccountConfig) -> SaslMechanism {
+    if let Some(named) = config.sasl_mechanism.as_deref().and_then(SaslMechanism::parse) {
+        return named;
+    }
+    if config.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        return SaslMechanism::External;
+    }
+    SaslMechanism::Plain
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaslMechanism {
+    External,
+    ScramSha256,
+    Plain,
+}
+
+impl SaslMechanism {
+    fn name(self) -> &'static str {
+        match self {
+            Self::External => "EXTERNAL",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::Plain => "PLAIN",
+        }
+    }
+
+    fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "EXTERNAL" => Some(Self::External),
+            "SCRAM-SHA-256" | "SCRAM_SHA_256" | "SCRAM-SHA256" => Some(Self::ScramSha256),
+            "PLAIN" => Some(Self::Plain),
+            _ => None,
+        }
+    }
+}
+
+/// Why one mechanism did not work.
+///
+/// The distinction is the whole point: a refusal that names other mechanisms
+/// is worth answering with one of them, while a wrong password is not - and
+/// retrying PLAIN after SCRAM already established the password is wrong would
+/// send that password in the clear for no reason.
+enum SaslRefusal {
+    Fatal(anyhow::Error),
+    TryAnother(Vec<String>),
+}
+
+impl From<anyhow::Error> for SaslRefusal {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+async fn attempt_sasl(
+    state: &AppState,
+    account_id: &str,
+    sender: &Sender,
+    stream: &mut ClientStream,
+    config: &IrcAccountConfig,
+    mechanism: SaslMechanism,
+) -> std::result::Result<(), SaslRefusal> {
+    state.runtime.report_progress(state, account_id, &format!("Starting SASL {}...", mechanism.name()));
+    sender.send(Command::AUTHENTICATE(mechanism.name().to_string())).map_err(anyhow::Error::from)?;
+
     let user = config.sasl_user.clone().unwrap_or_else(|| config.nick.clone());
     let pass = config.password.clone().unwrap_or_default();
-    let payload = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
-    sender.send_sasl(payload)?;
+
+    match mechanism {
+        // Nothing to send but the authorisation identity, and an empty one
+        // means "whoever the certificate says".
+        SaslMechanism::External => {
+            expect_challenge(stream, "+").await?;
+            sender.send_sasl("+").map_err(anyhow::Error::from)?;
+        }
+        SaslMechanism::Plain => {
+            expect_challenge(stream, "+").await?;
+            let payload = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
+            sender.send_sasl(payload).map_err(anyhow::Error::from)?;
+        }
+        SaslMechanism::ScramSha256 => {
+            let mut scram = crate::backend::irc_sasl::Scram::new(&user, &pass, &crate::backend::irc_sasl::nonce());
+            expect_challenge(stream, "+").await?;
+            sender
+                .send_sasl(base64::engine::general_purpose::STANDARD.encode(scram.client_first()))
+                .map_err(anyhow::Error::from)?;
+
+            let server_first = read_challenge(stream).await?;
+            let client_final = scram.client_final(&server_first).map_err(SaslRefusal::Fatal)?;
+            sender
+                .send_sasl(base64::engine::general_purpose::STANDARD.encode(client_final))
+                .map_err(anyhow::Error::from)?;
+
+            let server_final = read_challenge(stream).await?;
+            // Checked before the success numeric is believed: a server that
+            // cannot prove it knew the password is not one to be logged in to,
+            // whatever it says next.
+            scram.verify(&server_final).map_err(SaslRefusal::Fatal)?;
+            sender.send_sasl("+").map_err(anyhow::Error::from)?;
+        }
+    }
 
     let result = wait_for(stream, |m| {
         matches!(
@@ -451,18 +607,69 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
                 | Command::Response(Response::ERR_SASLFAIL, _)
                 | Command::Response(Response::ERR_SASLTOOLONG, _)
                 | Command::Response(Response::ERR_SASLABORT, _)
+                | Command::Response(Response::RPL_SASLMECHS, _)
         )
     })
     .await
-    .map_err(|_| anyhow!("timed out waiting for SASL result"))?;
+    .map_err(|_| SaslRefusal::Fatal(anyhow!("timed out waiting for SASL result")))?;
 
-    if !matches!(result.command, Command::Response(Response::RPL_SASLSUCCESS, _)) {
-        bail!("SASL authentication failed - check the SASL username and password for this account");
+    match &result.command {
+        Command::Response(Response::RPL_SASLSUCCESS, _) => Ok(()),
+        // The server listing what it does take, which is the one refusal
+        // worth answering with a different mechanism.
+        Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
+            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+        )),
+        _ => Err(SaslRefusal::Fatal(anyhow!(
+            "SASL {} was refused - check the SASL username and password for this account",
+            mechanism.name()
+        ))),
     }
-
-    end_cap_and_register(sender, config)?;
-    Ok(true)
 }
+
+/// Waits for the server's `AUTHENTICATE` and insists it is what was expected.
+async fn expect_challenge(stream: &mut ClientStream, wanted: &str) -> std::result::Result<(), SaslRefusal> {
+    let got = read_challenge(stream).await?;
+    if got != wanted {
+        return Err(SaslRefusal::Fatal(anyhow!("server answered AUTHENTICATE with {got:?} rather than {wanted:?}")));
+    }
+    Ok(())
+}
+
+/// The server's next `AUTHENTICATE` payload, decoded.
+///
+/// A bare `+` means "nothing", and is passed through as itself rather than
+/// decoded - it is not base64 for an empty string, it is the protocol's way of
+/// writing one.
+async fn read_challenge(stream: &mut ClientStream) -> std::result::Result<String, SaslRefusal> {
+    let message = wait_for(stream, |m| {
+        matches!(
+            &m.command,
+            Command::AUTHENTICATE(_)
+                | Command::Response(Response::ERR_SASLFAIL, _)
+                | Command::Response(Response::RPL_SASLMECHS, _)
+        )
+    })
+    .await
+    .map_err(|_| SaslRefusal::Fatal(anyhow!("server stopped answering during SASL")))?;
+
+    match &message.command {
+        Command::AUTHENTICATE(payload) if payload == "+" => Ok("+".to_string()),
+        Command::AUTHENTICATE(payload) => base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not base64: {e}")))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not text: {e}")))
+            }),
+        Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
+            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+        )),
+        _ => Err(SaslRefusal::Fatal(anyhow!("SASL was refused before it finished"))),
+    }
+}
+
+
 
 /// Capabilities asked for on every connection, whatever else is going on.
 ///
@@ -474,6 +681,20 @@ async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender,
 /// `multi-prefix` makes RPL_NAMREPLY carry every rank a person holds ("@+nick")
 /// instead of only the highest, which is what lets a rank being taken away
 /// leave the one underneath it intact.
+/// What this account says when it leaves.
+///
+/// A default rather than nothing, because an empty QUIT is what a dropped
+/// connection looks like and a deliberate one should not. Trimmed, since a
+/// message of only spaces is the same as none.
+fn quit_message(config: &IrcAccountConfig) -> String {
+    match config.quit_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        Some(message) => message.to_string(),
+        None => DEFAULT_QUIT_MESSAGE.to_string(),
+    }
+}
+
+pub const DEFAULT_QUIT_MESSAGE: &str = "moho";
+
 const WANTED_CAPS: &[&str] = &["server-time", "multi-prefix"];
 
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
@@ -1226,6 +1447,79 @@ fn buffer_kind_hint(target: &str) -> &'static str {
 /// improvement worth making silently.
 fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
     ssl || allow_plaintext
+}
+
+#[cfg(test)]
+mod quit_tests {
+    use super::*;
+
+    fn config(message: Option<&str>) -> IrcAccountConfig {
+        IrcAccountConfig { quit_message: message.map(String::from), ..Default::default() }
+    }
+
+    #[test]
+    fn reads_every_spelling_of_a_mechanism() {
+        assert_eq!(SaslMechanism::parse("external"), Some(SaslMechanism::External));
+        assert_eq!(SaslMechanism::parse(" PLAIN "), Some(SaslMechanism::Plain));
+        for spelling in ["SCRAM-SHA-256", "scram-sha256", "SCRAM_SHA_256"] {
+            assert_eq!(SaslMechanism::parse(spelling), Some(SaslMechanism::ScramSha256), "for {spelling}");
+        }
+        // Something we cannot do is not silently treated as something we can.
+        assert_eq!(SaslMechanism::parse("SCRAM-SHA-1"), None);
+        assert_eq!(SaslMechanism::parse("ECDSA-NIST256P-CHALLENGE"), None);
+    }
+
+    #[test]
+    fn leads_with_the_strongest_this_account_is_equipped_for() {
+        // PLAIN, deliberately. SCRAM is stronger and almost nothing on IRC
+        // implements it, and a server refusing an unknown mechanism is only
+        // *recommended* to say which ones it has - so leading with SCRAM
+        // would break SASL on Libera and Rizon rather than upgrade it.
+        let bare = IrcAccountConfig::default();
+        assert_eq!(preferred_mechanism(&bare), SaslMechanism::Plain);
+
+        let with_cert = IrcAccountConfig { sasl_cert_path: Some("/keys/libera.pem".into()), ..Default::default() };
+        assert_eq!(preferred_mechanism(&with_cert), SaslMechanism::External);
+
+        // Configuring a certificate and then naming a mechanism means the
+        // name: somebody pinning PLAIN has a reason, usually a server that
+        // advertises what it will not accept.
+        let pinned = IrcAccountConfig {
+            sasl_cert_path: Some("/keys/libera.pem".into()),
+            sasl_mechanism: Some("plain".into()),
+            ..Default::default()
+        };
+        assert_eq!(preferred_mechanism(&pinned), SaslMechanism::Plain);
+
+        // A mechanism nobody here speaks falls back rather than failing the
+        // connection over a typo in a config file.
+        let nonsense = IrcAccountConfig { sasl_mechanism: Some("magic".into()), ..Default::default() };
+        assert_eq!(preferred_mechanism(&nonsense), SaslMechanism::Plain);
+
+        assert_eq!(
+            preferred_mechanism(&IrcAccountConfig { sasl_mechanism: Some("scram-sha-256".into()), ..Default::default() }),
+            SaslMechanism::ScramSha256
+        );
+    }
+
+    #[test]
+    fn says_what_the_account_says() {
+        assert_eq!(quit_message(&config(Some("gone fishing"))), "gone fishing");
+    }
+
+    #[test]
+    fn an_account_with_nothing_to_say_still_says_something() {
+        // An empty QUIT is what a dropped connection looks like, and leaving
+        // deliberately should not look like falling over.
+        assert_eq!(quit_message(&config(None)), DEFAULT_QUIT_MESSAGE);
+        assert_eq!(quit_message(&config(Some(""))), DEFAULT_QUIT_MESSAGE);
+        assert_eq!(quit_message(&config(Some("   "))), DEFAULT_QUIT_MESSAGE);
+    }
+
+    #[test]
+    fn trims_what_it_is_given() {
+        assert_eq!(quit_message(&config(Some("  bye  "))), "bye");
+    }
 }
 
 #[cfg(test)]

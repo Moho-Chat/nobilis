@@ -29,6 +29,22 @@ pub struct IrcAccountConfig {
     pub username: Option<String>,
     #[serde(default)]
     pub quit_message: Option<String>,
+    /// Which SASL mechanism to use: `external`, `scram-sha-256` or `plain`.
+    ///
+    /// Absent means "the strongest this account is equipped for" - EXTERNAL if
+    /// a certificate is configured, then SCRAM-SHA-256, then PLAIN. Naming one
+    /// pins it, which is what somebody wants when a network advertises a
+    /// mechanism it does not actually accept.
+    #[serde(default)]
+    pub sasl_mechanism: Option<String>,
+    /// A TLS client certificate, for SASL EXTERNAL.
+    ///
+    /// The point of EXTERNAL is that no password is sent at all: the
+    /// certificate already proving the connection also proves the account.
+    #[serde(default)]
+    pub sasl_cert_path: Option<String>,
+    #[serde(default)]
+    pub sasl_cert_pass: Option<String>,
     #[serde(default)]
     pub allow_plaintext_sasl: bool,
     #[serde(default)]
@@ -607,6 +623,7 @@ impl AccountStore {
     /// Empty password means "leave whatever's stored untouched" - same
     /// convention nobilis_set_account_sasl() uses (the frontend never reads
     /// the password back, see hasPassword/hasNickservPassword instead).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_sasl(
         &self,
         account_id: &str,
@@ -614,6 +631,9 @@ impl AccountStore {
         sasl_user: &str,
         password: &str,
         allow_plaintext: bool,
+        mechanism: Option<&str>,
+        cert_path: Option<&str>,
+        cert_pass: Option<&str>,
     ) -> Result<bool> {
         self.mutate(account_id, |a| {
             a.sasl = enabled;
@@ -621,6 +641,18 @@ impl AccountStore {
             a.allow_plaintext_sasl = allow_plaintext;
             if !password.is_empty() {
                 a.password = Some(password.to_string());
+            }
+            // Absent means "leave it alone" and empty means "clear it", so a
+            // caller that knows nothing about mechanisms cannot wipe one
+            // somebody set.
+            if let Some(mechanism) = mechanism {
+                a.sasl_mechanism = (!mechanism.is_empty()).then(|| mechanism.to_string());
+            }
+            if let Some(path) = cert_path {
+                a.sasl_cert_path = (!path.is_empty()).then(|| path.to_string());
+            }
+            if let Some(pass) = cert_pass {
+                a.sasl_cert_pass = (!pass.is_empty()).then(|| pass.to_string());
             }
         })
     }
@@ -654,6 +686,8 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         sasl_enabled: a.sasl,
         sasl_username: a.sasl_user.clone().unwrap_or_default(),
         allow_plaintext_sasl: a.allow_plaintext_sasl,
+        sasl_mechanism: a.sasl_mechanism.clone().unwrap_or_default(),
+        has_sasl_certificate: a.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()),
         ssl: a.ssl,
         has_password: a.password.as_deref().is_some_and(|p| !p.is_empty()),
         avatar_url: None,
@@ -680,6 +714,8 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
         ssl: true,
         has_password: !a.token.is_empty(),
         avatar_url: a.avatar_url.clone(),
@@ -705,6 +741,8 @@ pub fn sockchat_account_to_json(a: &SockChatAccountConfig, state: &str) -> Accou
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
@@ -739,6 +777,8 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
         ssl: true,
         has_password: a.token.as_deref().is_some_and(|t| !t.is_empty()),
         avatar_url: None,
@@ -768,6 +808,8 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,

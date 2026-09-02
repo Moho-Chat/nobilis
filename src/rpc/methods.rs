@@ -219,6 +219,9 @@ pub async fn dispatch(
                 username: p_str_opt(params, "username").map(String::from),
                 quit_message: p_str_opt(params, "quitMessage").map(String::from),
                 allow_plaintext_sasl: p_bool(params, "allowPlaintextSasl", false),
+                sasl_mechanism: p_str_opt(params, "saslMechanism").map(String::from),
+                sasl_cert_path: p_str_opt(params, "saslCertPath").map(String::from),
+                sasl_cert_pass: p_str_opt(params, "saslCertPass").map(String::from),
                 // A link can name channels, so a new account can arrive with
                 // somewhere to be rather than connecting to nothing.
                 autojoin: p_str_opt(params, "autojoin").unwrap_or("").to_string(),
@@ -337,6 +340,9 @@ pub async fn dispatch(
                 p_str(params, "saslUser", ""),
                 p_str(params, "password", ""),
                 p_bool(params, "allowPlaintextSasl", false),
+                p_str_opt(params, "saslMechanism"),
+                p_str_opt(params, "saslCertPath"),
+                p_str_opt(params, "saslCertPass"),
             )),
         },
 
