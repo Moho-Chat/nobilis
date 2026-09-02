@@ -176,11 +176,34 @@ impl CryptoSession {
         let base = homeserver_url.trim_end_matches('/');
         match request.request() {
             AnyOutgoingRequest::KeysUpload(req) => {
-                let body = serde_json::json!({
-                    "device_keys": req.device_keys,
-                    "one_time_keys": req.one_time_keys,
-                    "fallback_keys": req.fallback_keys,
-                });
+                // Built field by field rather than as one literal, because a
+                // literal turns an absent value into an explicit `null` and
+                // the specification says these fields are *absent* when there
+                // is nothing to send.
+                //
+                // Not a nicety. Synapse accepts `"device_keys": null` and
+                // ignores it; a stricter homeserver validates the body and
+                // refuses the whole request - poast.org answers
+                // `M_INVALID_PARAM: device_keys must not be null`, on every
+                // sync cycle, forever, because the retry never changes. The
+                // consequence is that this device's identity is never
+                // published at all: nobody else can start an Olm session with
+                // it, so messages encrypted to it may be undecryptable and the
+                // device is not properly announced to any room it is in.
+                let mut body = serde_json::Map::new();
+                if let Some(device_keys) = &req.device_keys {
+                    body.insert("device_keys".into(), serde_json::to_value(device_keys)?);
+                }
+                // Empty maps are omitted for the same reason: "here are no
+                // keys" and "I am not uploading keys" are different requests,
+                // and only the second one is what an empty upload means.
+                if !req.one_time_keys.is_empty() {
+                    body.insert("one_time_keys".into(), serde_json::to_value(&req.one_time_keys)?);
+                }
+                if !req.fallback_keys.is_empty() {
+                    body.insert("fallback_keys".into(), serde_json::to_value(&req.fallback_keys)?);
+                }
+                let body = serde_json::Value::Object(body);
                 let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/upload"), Some(access_token), body).await.context("keys/upload")?;
                 let mut one_time_key_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = BTreeMap::new();
                 if let Some(obj) = resp["one_time_key_counts"].as_object() {
