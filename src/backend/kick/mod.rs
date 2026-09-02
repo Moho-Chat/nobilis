@@ -70,6 +70,14 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
+/// How many followed channels to open on a first connect.
+///
+/// A cap rather than all of them, because somebody can follow hundreds and
+/// each one costs a buffer, four subscriptions and its own emote table. Fifty
+/// is more channels than anyone watches at once and still opens quickly; the
+/// rest are a handle away in the "+" box.
+const MAX_FOLLOWED: usize = 50;
+
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
@@ -126,6 +134,39 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
         }
     }
 
+    // What this account already follows on Kick, the first time it connects.
+    //
+    // Once, and never again - the flag is persisted. A follow list re-read on
+    // every connect would put back every channel the person had closed, which
+    // is the one thing closing a channel is supposed to mean; after this, the
+    // list is theirs.
+    let mut channels = config.channels.clone();
+    if let Some(token) = config.token.as_deref().filter(|t| !t.is_empty()) {
+        if !config.followed_synced {
+            match api::followed(&http, token).await {
+                Ok(followed) => {
+                    let before = channels.len();
+                    for slug in followed.into_iter().take(MAX_FOLLOWED) {
+                        if !channels.contains(&slug) {
+                            channels.push(slug);
+                        }
+                    }
+                    let added = channels.len() - before;
+                    let _ = state.accounts.set_kick_channels(account_id, channels.clone());
+                    let _ = state.accounts.mark_kick_follows_synced(account_id);
+                    if added > 0 {
+                        state.runtime.report_progress(state, account_id, &format!("following {added} channels you already follow on Kick"));
+                    }
+                }
+                // Not fatal, and not retried on the next connect either -
+                // marking it done anyway would be worse, since a person who
+                // has since closed those channels would get them all back.
+                // Reported, so a failure is visible rather than silent.
+                Err(e) => state.runtime.report_progress(state, account_id, &format!("could not read your Kick follows: {e:#}")),
+            }
+        }
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
     state.runtime.set_kick_sender(account_id, tx);
 
@@ -140,7 +181,7 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
     // makes one map look like it works.
     let mut watched = Watched::default();
 
-    for slug in &config.channels {
+    for slug in &channels {
         match prepare(state, &http, config, account_id, slug).await {
             Ok(channel) => {
                 subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
@@ -276,6 +317,7 @@ async fn prepare(
     handle: &str,
 ) -> Result<api::Channel> {
     let channel = api::channel(http, handle).await?;
+
     // No set_buffer_group here. ensure_buffer already files a new buffer under
     // its own account's rail entry, which is exactly where a Kick channel
     // belongs - there is no guild or space above it. Saying so again with the
@@ -283,19 +325,43 @@ async fn prepare(
     // group with no rail tile is a conversation with no way to reach it:
     // receiving fine, listed by the daemon, and invisible.
     let buffer = state.runtime.ensure_buffer(state, account_id, &channel.slug, "channel");
-
-    // Whether this account may *use* the streamer's subscriber emotes. Asked
-    // once here rather than per message, and treated as "no" if Kick will not
-    // say - which costs a greyed-out emote, not a conversation.
-    let subscribed = match config.token.as_deref().filter(|t| !t.is_empty()) {
-        None => false,
-        Some(token) => api::standing(http, token, &channel.slug).await.map(|s| s.subscribed).unwrap_or(false),
-    };
-    let emotes = api::emotes(http, &channel.slug).await.unwrap_or_default();
     state.runtime.set_kick_channel(
         &buffer.id,
-        crate::runtime::KickChannel { slug: channel.slug.clone(), chatroom_id: channel.chatroom_id, subscribed, emotes },
+        crate::runtime::KickChannel {
+            slug: channel.slug.clone(),
+            chatroom_id: channel.chatroom_id,
+            subscribed: false,
+            emotes: Vec::new(),
+        },
     );
+
+    // The emote table and this account's standing in the channel are fetched
+    // in the background rather than before the subscription.
+    //
+    // They are two more round trips per channel, and connecting can open fifty
+    // at once now that a first connect brings in what the account follows -
+    // which made "connecting" take as long as a hundred and fifty requests
+    // while no messages arrived at all. Nothing needs them to be there yet:
+    // the room id above is what a message needs to land, and the emote picker
+    // is opened seconds later at the earliest.
+    tokio::spawn({
+        let state = state.clone();
+        let http = http.clone();
+        let token = config.token.clone().filter(|t| !t.is_empty());
+        let slug = channel.slug.clone();
+        let buffer_id = buffer.id.clone();
+        async move {
+            // Whether this account may *use* the streamer's subscriber emotes.
+            // Treated as "no" if Kick will not say, which costs a greyed-out
+            // emote rather than a conversation.
+            let subscribed = match token.as_deref() {
+                None => false,
+                Some(token) => api::standing(&http, token, &slug).await.map(|s| s.subscribed).unwrap_or(false),
+            };
+            let emotes = api::emotes(&http, &slug).await.unwrap_or_default();
+            state.runtime.set_kick_emotes(&buffer_id, emotes, subscribed);
+        }
+    });
 
     Ok(channel)
 }

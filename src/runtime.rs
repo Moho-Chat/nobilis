@@ -1876,6 +1876,20 @@ impl Runtime {
         self.kick_channels.lock().unwrap().insert(buffer_id.to_string(), channel);
     }
 
+    /// Fills in a channel's emote table once it has been fetched.
+    ///
+    /// Separate from `set_kick_channel` because the two are known at different
+    /// times on purpose: the room id is needed before the first message can
+    /// land, while the emotes are only needed when somebody opens the picker.
+    /// Matched on the buffer rather than replacing it wholesale, so a channel
+    /// closed while its emotes were in flight stays closed.
+    pub fn set_kick_emotes(&self, buffer_id: &str, emotes: Vec<crate::backend::kick::api::Emote>, subscribed: bool) {
+        if let Some(channel) = self.kick_channels.lock().unwrap().get_mut(buffer_id) {
+            channel.emotes = emotes;
+            channel.subscribed = subscribed;
+        }
+    }
+
     pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {
         self.kick_channels.lock().unwrap().get(buffer_id).cloned()
     }

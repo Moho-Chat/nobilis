@@ -1710,9 +1710,12 @@ pub async fn dispatch(
             let config = crate::accounts::KickAccountConfig {
                 username,
                 token,
-                // Signing in again keeps what was being watched. Losing a
-                // channel list to a re-login would be a poor trade for a
-                // refreshed token.
+                // Signing in again keeps what was being watched, and keeps
+                // knowing that the follows have already been read in. Losing
+                // either to a re-login would be a poor trade for a refreshed
+                // token - the second one would put back every channel the
+                // person had closed.
+                followed_synced: existing.as_ref().is_some_and(|e| e.followed_synced),
                 channels: existing.map(|e| e.channels).unwrap_or_default(),
             };
             match state.accounts.add_kick(config) {

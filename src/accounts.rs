@@ -193,6 +193,14 @@ pub struct KickAccountConfig {
     pub token: Option<String>,
     #[serde(default)]
     pub channels: Vec<String>,
+    /// Whether this account's follows have been read into `channels` yet.
+    ///
+    /// Once, not on every connect, and that is the whole point of the flag: a
+    /// follow list seeded repeatedly would undo closing a channel, which is
+    /// the one thing closing it is supposed to mean. After the first sync the
+    /// list belongs to whoever is using it.
+    #[serde(default)]
+    pub followed_synced: bool,
 }
 
 impl KickAccountConfig {
@@ -379,6 +387,19 @@ impl AccountStore {
         kick.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(config)
+    }
+
+    /// Records that this account's follows have been read in, so they are not
+    /// read in again - see `KickAccountConfig::followed_synced`.
+    pub fn mark_kick_follows_synced(&self, account_id: &str) -> Result<bool> {
+        let mut kick = self.kick.lock().unwrap();
+        let Some(config) = kick.get_mut(account_id) else { return Ok(false) };
+        if config.followed_synced {
+            return Ok(false);
+        }
+        config.followed_synced = true;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        Ok(true)
     }
 
     /// Remembers which streamers this account watches.

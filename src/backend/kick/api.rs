@@ -271,6 +271,65 @@ pub async fn identity(http: &reqwest::Client, token: &str) -> Result<Identity> {
     Ok(who)
 }
 
+/// The channels this account follows, as handles.
+///
+/// `/api/v2/channels/followed`, which is the only one of these that is what it
+/// looks like. `/api/v1/channels/followed` answers 200 to an anonymous request
+/// and looks like it works - it is a *channel* lookup, and there is a real
+/// streamer whose handle is literally "followed", so the v1 path quietly
+/// returns one stranger's channel instead of anybody's follow list. That is
+/// the kind of wrong answer that survives testing.
+///
+/// Tolerant about the wrapper because this list is only ever read: Kick has
+/// shipped it bare, under `data`, and under `channels`, and each item names its
+/// slug either directly or one level down. Anything that does not yield a
+/// handle is skipped rather than failing the whole list - one unfamiliar entry
+/// should cost that entry, not the other forty.
+pub async fn followed(http: &reqwest::Client, token: &str) -> Result<Vec<String>> {
+    let res = http
+        .get(format!("{API_ROOT}/api/v2/channels/followed?page=1&limit=100"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("asking Kick which channels this account follows")?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
+    }
+    if !res.status().is_success() {
+        bail!("Kick answered {} for this account's follows", res.status());
+    }
+    let body: serde_json::Value = res.json().await.context("reading this account's follows")?;
+    Ok(slugs_in(&body))
+}
+
+/// Every handle in a follow list, whatever shape the list arrived in.
+fn slugs_in(body: &serde_json::Value) -> Vec<String> {
+    let items = body
+        .as_array()
+        .or_else(|| body.get("data").and_then(|v| v.as_array()))
+        .or_else(|| body.get("channels").and_then(|v| v.as_array()))
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for item in items {
+        let raw = item
+            .get("slug")
+            .or_else(|| item.get("channel").and_then(|c| c.get("slug")))
+            .or_else(|| item.get("channel_slug"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Through the same gate a typed handle goes through, so nothing from
+        // the network reaches a URL without being a handle first.
+        let slug = normalise_slug(raw);
+        if !slug.is_empty() && !out.contains(&slug) {
+            out.push(slug);
+        }
+    }
+    out
+}
+
 /// What this account is to one channel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Standing {
@@ -490,6 +549,43 @@ mod tests {
         assert_eq!(bare_token("abc123"), "abc123");
         // A token that merely starts with those letters is not a scheme.
         assert_eq!(bare_token("bearerish"), "bearerish");
+    }
+
+    #[test]
+    fn reads_a_follow_list_in_any_of_its_shapes() {
+        let bare = serde_json::json!([{ "slug": "tayl31gh" }, { "slug": "odablock" }]);
+        assert_eq!(slugs_in(&bare), vec!["tayl31gh", "odablock"]);
+
+        let wrapped = serde_json::json!({ "data": [{ "slug": "tayl31gh" }] });
+        assert_eq!(slugs_in(&wrapped), vec!["tayl31gh"]);
+
+        let named = serde_json::json!({ "channels": [{ "slug": "tayl31gh" }] });
+        assert_eq!(slugs_in(&named), vec!["tayl31gh"]);
+
+        // The handle one level down, which is how a list of livestreams reads.
+        let nested = serde_json::json!({ "data": [{ "channel": { "slug": "odablock" } }] });
+        assert_eq!(slugs_in(&nested), vec!["odablock"]);
+    }
+
+    #[test]
+    fn a_follow_list_that_is_not_one_yields_nothing() {
+        assert!(slugs_in(&serde_json::json!({ "message": "Unauthenticated." })).is_empty());
+        assert!(slugs_in(&serde_json::json!(null)).is_empty());
+    }
+
+    #[test]
+    fn one_unusable_entry_does_not_cost_the_others() {
+        let mixed = serde_json::json!([
+            { "slug": "good" },
+            { "nothing": "here" },
+            { "slug": "../admin" },
+            { "slug": "also_good" },
+            { "slug": "good" }
+        ]);
+        // Skipped, deduplicated, and every survivor is a real handle - the
+        // same gate a typed one goes through, so nothing off the network
+        // reaches a URL unchecked.
+        assert_eq!(slugs_in(&mixed), vec!["good", "also_good"]);
     }
 
     #[test]
