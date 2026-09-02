@@ -439,6 +439,30 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
             Some(raw) => cached_avatar_path(http, host, &m.author.id, raw).await,
             None => None,
         };
+
+        // A message belonging to no room is not a room's message. The site
+        // delivers a whisper down the same channel as everything else and
+        // marks it only by that absence - which is why whispers arrived as
+        // nothing at all: the separate `Whisper` frame this used to wait for
+        // is not how they come.
+        //
+        // Handled here rather than only in that frame, and both are kept,
+        // because one of them is known to work and the other is what the
+        // protocol notes have always said. Every room's socket sees the same
+        // whisper, so only one connection records it.
+        if m.room_id.is_none() {
+            if !is_primary {
+                continue;
+            }
+            tracing::debug!("sockchat[{account_id}]: whisper from {} (no room_id)", m.author.username);
+            let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
+            for buffer in record_whisper(state, account_id, &m.author.username, &body, msg_id, avatar_url, true) {
+                if !m.message_uuid.is_empty() {
+                    spawn_attachment_resolve(state.clone(), http.clone(), buffer, m.message_uuid.clone(), body.clone());
+                }
+            }
+            continue;
+        }
         // There's no separate "edit" event on this wire - the server just
         // re-sends the same message_uuid with a bumped edit date. Try to
         // update an already-stored row first; only if that uuid was never
@@ -472,13 +496,10 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
                     None => None,
                 };
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                // Marked as a whisper rather than an ordinary message, and
-                // highlighted like a mention: somebody has spoken to you
-                // directly and privately, which is at least as worth noticing
-                // as being named in a room.
-                let is_new = state.runtime.record_message(state, account_id, "Whispers", "dm", &w.author.username, &body, false, "whisper", None, msg_id, true, avatar_url, Vec::new(), Vec::new(), None);
-                if is_new && !w.message_uuid.is_empty() {
-                    spawn_attachment_resolve(state.clone(), http.clone(), crate::model::buffer_id(account_id, "Whispers"), w.message_uuid.clone(), body);
+                for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true) {
+                    if !w.message_uuid.is_empty() {
+                        spawn_attachment_resolve(state.clone(), http.clone(), buffer, w.message_uuid.clone(), body.clone());
+                    }
                 }
             }
         }
@@ -815,6 +836,67 @@ fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str)
     state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
+/// Puts a whisper in front of whoever is reading, whichever room that is.
+///
+/// A whisper belongs to no room, and the site shows it wherever you happen to
+/// be looking. Nothing here can know which room a frontend has open, so it is
+/// recorded in every room this account is in rather than one being picked and
+/// hoped for.
+///
+/// That replaces a buffer of its own, which is what the report called "a DM
+/// window". The separate buffer was the same mistake in a worse form: a
+/// private message you only see by going somewhere else to look, and a
+/// conversation that pulled you out of the room you were in to have it.
+///
+/// Storing the same message under several buffers is fine and not a
+/// duplicate - the store keys on (buffer, id), so each room holds it once and
+/// none of them holds it twice however many sockets saw it.
+#[allow(clippy::too_many_arguments)]
+fn record_whisper(
+    state: &AppState,
+    account_id: &str,
+    from: &str,
+    body: &str,
+    msg_id: Option<String>,
+    avatar_url: Option<String>,
+    // `notify`: whether this one should raise an alert. True for a whisper
+    // somebody sent us; false for one we sent, which needs no telling.
+    notify: bool,
+) -> Vec<String> {
+    let Some(cfg) = state.accounts.get_sockchat(account_id) else { return Vec::new() };
+    let mut fresh = Vec::new();
+    for (index, room) in effective_rooms(&cfg).into_iter().enumerate() {
+        // Highlighted in the first room only, and highlighting is what raises
+        // an alert - so one whisper is one notification however many rooms it
+        // is written into. The copies are still whispers and are still drawn
+        // as whispers, because the client colours them by kind rather than by
+        // highlight; what they are not is a second time somebody's desktop
+        // says the same thing.
+        let alert = notify && index == 0;
+        let is_new = state.runtime.record_message(
+            state,
+            account_id,
+            &room.name,
+            "channel",
+            from,
+            body,
+            false,
+            "whisper",
+            None,
+            msg_id.clone(),
+            alert,
+            avatar_url.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+        if is_new {
+            fresh.push(crate::model::buffer_id(account_id, &room.name));
+        }
+    }
+    fresh
+}
+
 /// Any live room connection for this account.
 ///
 /// A whisper belongs to no room, so it does not matter which carries it - but
@@ -858,6 +940,13 @@ fn effective_rooms(config: &SockChatAccountConfig) -> Vec<SockChatRoom> {
 /// know the convention - and skipped when the message already opens with it,
 /// so replying twice to the same person does not stack them up.
 pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<&str>) -> Result<()> {
+    // Typed rather than chosen from a menu, which is what somebody used to the
+    // site will do. Routed through the same path either way, so it is recorded
+    // as a whisper here too - passed straight through it would be a real
+    // whisper that this client never saw, since the site echoes none back.
+    if let Some((target, text)) = protocol::parse_whisper_command(body) {
+        return send_whisper(state, account_id, &target, &text);
+    }
     let body = as_reply(body, reply_to);
     let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
@@ -868,39 +957,35 @@ pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body:
 /// Sends a private message to one person.
 ///
 /// Goes out on whichever room connection is to hand: a whisper is not part of
-/// any room's conversation - which is also why the replies arrive in their own
-/// buffer rather than wherever you were - so any open socket carries it.
+/// any room's conversation, so any open socket carries it.
 ///
 /// Recorded locally as well as sent. Unlike a room message, the site does not
-/// echo a whisper back to whoever sent it, so without this a conversation
-/// would show only one side of itself.
+/// echo a whisper back to whoever sent it, so without this you would see only
+/// one side of your own conversation.
+///
+/// Recorded from *us*, with the target written into the line. There is no
+/// field on a message for "and this went to Someone", and a whisper filed
+/// under the recipient's name reads as something they said - which is what it
+/// used to do. The `@name` is what the site puts there too, so the line reads
+/// the way the same whisper reads on the site.
 pub fn send_whisper(state: &AppState, account_id: &str, target: &str, body: &str) -> Result<()> {
-    if target.trim().is_empty() {
+    let target = target.trim();
+    if target.is_empty() {
         bail!("no one to whisper to");
     }
     let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
     let sender = any_room_sender(state, account_id)?;
     sender
-        .send(protocol::prepare_whisper(target.trim(), &text))
+        .send(protocol::prepare_whisper(target, &text))
         .map_err(|_| anyhow!("chat socket closed"))?;
 
-    state.runtime.record_message(
-        state,
-        account_id,
-        "Whispers",
-        "dm",
-        target.trim(),
-        &text,
-        false,
-        "whisper",
-        None,
-        None,
-        false,
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    );
+    let me = state
+        .accounts
+        .get_sockchat(account_id)
+        .map(|c| c.display_name.filter(|n| !n.is_empty()).unwrap_or(c.username))
+        .unwrap_or_default();
+    let at = if target.starts_with('@') { "" } else { "@" };
+    record_whisper(state, account_id, &me, &format!("{at}{target} {text}"), None, None, false);
     Ok(())
 }
 

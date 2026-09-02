@@ -315,13 +315,18 @@ pub fn prepare_edit(uuid: &str, new_body: &str) -> String {
 
 /// How a whisper is addressed on the wire.
 ///
-/// The one thing about it that had to be confirmed rather than derived: the
-/// site's own client is what defines this, and sending the wrong word does not
-/// fail quietly - an unrecognised command is posted as ordinary text, which
-/// puts a message meant for one person in front of the whole room.
-pub const WHISPER_COMMAND: &str = "/whisper";
+/// `/w`, which is what the site's own client sends. This said `/whisper` and
+/// that is not a command the site knows - and the failure is the bad kind,
+/// exactly as the line below this one has always warned: an unrecognised
+/// command is not rejected, it is posted as ordinary text. Every whisper sent
+/// from here went to the whole room with `/whisper @name` written in front of
+/// it.
+///
+/// So this is the one constant here worth being certain of rather than
+/// plausible about, and it is confirmed against the site rather than derived.
+pub const WHISPER_COMMAND: &str = "/w";
 
-/// `/whisper @username <message>`.
+/// `/w @username <message>`.
 ///
 /// The `@` is part of the address, not decoration: the site reads the target
 /// as a mention. Added here rather than expected from the caller, since every
@@ -332,6 +337,32 @@ pub const WHISPER_COMMAND: &str = "/whisper";
 /// The username goes through unquoted because that is what the site accepts;
 /// a name with a space in it cannot be whispered, which is a limit of the
 /// protocol rather than of this.
+/// Reads a whisper somebody typed themselves, as `/w @name message`.
+///
+/// Supported because it is what the site's own users type, and because
+/// handing it straight through would send a real whisper that this client
+/// then knew nothing about - the site does not echo one back, so the line
+/// would vanish as it was sent. Recognising it means the same text does the
+/// same thing whether it was typed or chosen from a menu.
+///
+/// `/whisper` is accepted here too. It is not a command the site knows, but it
+/// is the one somebody will type after reading about this feature anywhere
+/// else, and taking it means a message meant for one person cannot go to the
+/// room because of the word chosen for it.
+pub fn parse_whisper_command(text: &str) -> Option<(String, String)> {
+    let rest = text
+        .strip_prefix("/w ")
+        .or_else(|| text.strip_prefix("/whisper "))
+        .or_else(|| text.strip_prefix("/W "))?;
+    let mut parts = rest.trim_start().splitn(2, char::is_whitespace);
+    let target = parts.next()?.trim_start_matches('@').trim();
+    let body = parts.next().unwrap_or("").trim();
+    if target.is_empty() || body.is_empty() {
+        return None;
+    }
+    Some((target.to_string(), body.to_string()))
+}
+
 pub fn prepare_whisper(target: &str, body: &str) -> String {
     let target = target.trim();
     let at = if target.starts_with('@') { "" } else { "@" };
@@ -481,9 +512,41 @@ mod tests {
         assert_eq!(prepare_delete("abc-123"), "/delete abc-123");
         // The site reads the target as a mention, so the @ is part of
         // addressing it rather than something a caller has to remember.
-        assert_eq!(prepare_whisper("Someone", "hello there"), "/whisper @Someone hello there");
+        assert_eq!(prepare_whisper("Someone", "hello there"), "/w @Someone hello there");
         // A name that already carries one does not get a second.
-        assert_eq!(prepare_whisper("@Someone", "hi"), "/whisper @Someone hi");
-        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/whisper @Spaced hi");
+        assert_eq!(prepare_whisper("@Someone", "hi"), "/w @Someone hi");
+        assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/w @Spaced hi");
+        // The command itself, spelled out rather than built from the constant:
+        // a test that reads the constant back cannot notice it changing, and
+        // the wrong word here is not a failed send - it is the message posted
+        // to the whole room as ordinary text.
+        assert!(prepare_whisper("Someone", "hi").starts_with("/w "));
+    }
+
+    #[test]
+    fn reads_a_whisper_somebody_typed() {
+        assert_eq!(
+            parse_whisper_command("/w @Someone hello there"),
+            Some(("Someone".into(), "hello there".into()))
+        );
+        // Without the @, which the site accepts and people leave off.
+        assert_eq!(parse_whisper_command("/w Someone hi"), Some(("Someone".into(), "hi".into())));
+        // The word somebody will type having read about this anywhere else.
+        assert_eq!(parse_whisper_command("/whisper @Someone hi"), Some(("Someone".into(), "hi".into())));
+    }
+
+    #[test]
+    fn leaves_alone_what_is_not_one() {
+        // Half a command is not a command: sending "/w @Someone" as a whisper
+        // with an empty body would be a whisper nobody wrote, and passing it
+        // through as ordinary text is what the site does with it anyway.
+        assert_eq!(parse_whisper_command("/w @Someone"), None);
+        assert_eq!(parse_whisper_command("/w "), None);
+        assert_eq!(parse_whisper_command("/w"), None);
+        // A word that merely starts the same way. The trailing space in the
+        // prefix is what makes this safe, and is the reason it is tested.
+        assert_eq!(parse_whisper_command("/wait for it"), None);
+        assert_eq!(parse_whisper_command("just talking"), None);
+        assert_eq!(parse_whisper_command("/me waves"), None);
     }
 }
