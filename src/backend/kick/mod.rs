@@ -329,11 +329,32 @@ async fn prepare(
         &buffer.id,
         crate::runtime::KickChannel {
             slug: channel.slug.clone(),
+            channel_id: channel.id,
+            history_cursor: None,
             chatroom_id: channel.chatroom_id,
             subscribed: false,
             emotes: Vec::new(),
         },
     );
+
+    // The past, before the present starts arriving. Backgrounded with the
+    // rest so a channel's first messages are not held up by it, and recorded
+    // with their own timestamps so they sort into place whichever lands first.
+    //
+    // The cursor is kept so scrolling up continues where this stopped rather
+    // than fetching the same page again.
+    {
+        let state = state.clone();
+        let http = http.clone();
+        let slug = channel.slug.clone();
+        let buffer_id = buffer.id.clone();
+        let account_id = account_id.to_string();
+        let channel_id = channel.id;
+        tokio::spawn(async move {
+            let next = backfill(&state, &http, &account_id, &slug, channel_id, None).await;
+            state.runtime.set_kick_history_cursor(&buffer_id, next);
+        });
+    }
 
     // The emote table and this account's standing in the channel are fetched
     // in the background rather than before the subscription.
@@ -457,6 +478,11 @@ struct Sender {
     username: Option<String>,
     #[serde(default)]
     id: Option<u64>,
+    /// Their colour and badges. Present on every message and previously read
+    /// by nothing, so a moderator, a two-year subscriber and a stranger all
+    /// drew identically.
+    #[serde(default)]
+    identity: Option<api::ChatIdentity>,
 }
 
 async fn handle_frame(
@@ -511,6 +537,11 @@ async fn handle_frame(
                 msg.sender.id.map(|i| i.to_string()),
                 msg.created_at.as_deref().and_then(parse_timestamp),
                 None,
+                // How Kick says this person looks: their colour and what they
+                // have earned. Both arrive on every message and were both
+                // being dropped at the struct boundary, which is why every
+                // line looked the same.
+                Some(style_of(msg.sender.identity.as_ref())),
             );
         }
         // Worth a line in the channel it happened in: somebody watching a
@@ -525,6 +556,31 @@ async fn handle_frame(
                 system_line(state, account_id, &slug, "ended the stream", "system");
             }
         }
+        // A message taken down, by its author or by a moderator. Removed here
+        // too, or moho shows a different chat from the one everybody else is
+        // looking at - which on a stream where moderation is public is the
+        // wrong way round entirely.
+        e if e.ends_with("MessageDeletedEvent") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            // The id is nested under `message` on this event and flat on
+            // others Kick has sent; both name the same thing.
+            let id = payload
+                .get("message")
+                .and_then(|m| m.get("id"))
+                .or_else(|| payload.get("id"))
+                .and_then(|v| v.as_str());
+            if let Some(id) = id {
+                state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &slug), id);
+            }
+        }
+
+        // A moderator emptying the room.
+        e if e.ends_with("ChatroomClearEvent") => {
+            if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
+                system_line(state, account_id, &slug, "a moderator cleared the chat", "system");
+            }
+        }
+
         // The things people do rather than say.
         e => {
             if let Some(line) = describe_action(e, &payload) {
@@ -535,6 +591,90 @@ async fn handle_frame(
         }
     }
     Ok(())
+}
+
+/// Fills a channel's scrollback from what was said before we arrived.
+///
+/// Kick's chat is a live stream and nothing else - a channel opened for the
+/// first time showed an empty log until somebody spoke, which on a quiet
+/// stream is a conversation that appears not to exist.
+///
+/// Recorded oldest-first so the log reads in order, and with Kick's own ids so
+/// anything already stored is recognised rather than duplicated. That matters
+/// more here than elsewhere: this runs on every join, and a reconnect joins
+/// again.
+pub async fn backfill(
+    state: &AppState,
+    http: &reqwest::Client,
+    account_id: &str,
+    slug: &str,
+    channel_id: u64,
+    cursor: Option<&str>,
+) -> Option<String> {
+    let (messages, next) = match api::history(http, channel_id, cursor).await {
+        Ok(page) => page,
+        // Not fatal and not worth interrupting anybody over: the channel still
+        // works, it just starts empty, which is what it did before.
+        Err(e) => {
+            tracing::debug!("kick[{account_id}]: history for {slug}: {e:#}");
+            return None;
+        }
+    };
+    for msg in messages.iter().rev() {
+        if msg.content.is_empty() {
+            continue;
+        }
+        let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
+        state.runtime.record_message_at(
+            state,
+            account_id,
+            slug,
+            "channel",
+            &from,
+            &msg.content,
+            false,
+            "chat",
+            reply_preview_from_value(msg.metadata.as_ref()),
+            Some(msg.id.clone()),
+            false,
+            None,
+            Vec::new(),
+            Vec::new(),
+            msg.sender.id.map(|i| i.to_string()),
+            msg.created_at.as_deref().and_then(parse_timestamp),
+            None,
+            Some(style_of(msg.sender.identity.as_ref())),
+        );
+    }
+    next
+}
+
+/// The same reply metadata the live path reads, out of an untyped value.
+///
+/// History carries it in the same shape, so this is the one parser rather than
+/// a second one that could drift.
+fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
+    let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
+    reply_preview(Some(&parsed))
+}
+
+/// How a sender should be drawn, out of what Kick sent with the message.
+///
+/// Badges are filtered to the ones that say something about the person rather
+/// than about Kick: a "level" badge is an engagement number and a row of them
+/// beside every nick is noise, while moderator, subscriber and verified are
+/// the ones a reader is actually scanning for.
+fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::SenderStyle {
+    let Some(identity) = identity else { return crate::model::SenderStyle::default() };
+    crate::model::SenderStyle {
+        color: identity.color.clone().filter(|c| !c.is_empty()),
+        badges: identity
+            .badges
+            .iter()
+            .filter(|b| !matches!(b.kind.as_str(), "level" | ""))
+            .cloned()
+            .collect(),
+    }
 }
 
 /// What a reply was replying to, out of the metadata Kick attaches to it.
@@ -626,6 +766,28 @@ fn describe_action(event: &str, p: &serde_json::Value) -> Option<String> {
                 Some(n) if n > 0 => format!("{who} raided with {n} viewers"),
                 _ => format!("{who} raided the channel"),
             })
+        }
+
+        // Somebody timed out or banned. Said in the channel, because it is
+        // moderation everybody in the room can see happening.
+        "UserBannedEvent" => {
+            let who = p.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str())?;
+            let by = p
+                .get("banned_by")
+                .and_then(|u| u.get("username"))
+                .and_then(|v| v.as_str())
+                .map(|b| format!(" by {b}"))
+                .unwrap_or_default();
+            // A ban carries no expiry and a timeout does, which is the whole
+            // of what a reader wants to know from the line.
+            Some(match p.get("expires_at").and_then(|v| v.as_str()) {
+                Some(_) => format!("{who} was timed out{by}"),
+                None => format!("{who} was banned{by}"),
+            })
+        }
+        "UserUnbannedEvent" => {
+            let who = p.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str())?;
+            Some(format!("{who} is allowed back"))
         }
 
         // Deliberately nothing. Both are the same subscription reported again
@@ -926,6 +1088,9 @@ mod tests {
     #[test]
     fn ignores_events_that_are_not_somebody_doing_something() {
         let p = serde_json::json!({ "username": "someone" });
+        // These two are handled in the frame loop rather than here - one
+        // removes a message and the other reports a chat mode - so this is
+        // still the right answer for both.
         assert_eq!(describe_action("App\\Events\\MessageDeletedEvent", &p), None);
         assert_eq!(describe_action("App\\Events\\ChatroomUpdatedEvent", &p), None);
     }
@@ -946,6 +1111,35 @@ mod tests {
         assert_eq!(describe_action("App\\Events\\ChannelSubscriptionEvent", &same), None);
         let info = serde_json::json!({ "message": { "action": "subscribe" }, "user": { "username": "doni433" } });
         assert_eq!(describe_action("App\\Events\\ChatMessageSentEvent", &info), None);
+    }
+
+    #[test]
+    fn tells_a_timeout_from_a_ban() {
+        let timeout = serde_json::json!({
+            "user": { "username": "someone" },
+            "banned_by": { "username": "amod" },
+            "expires_at": "2026-09-02T04:00:00Z"
+        });
+        assert_eq!(
+            describe_action("App\\Events\\UserBannedEvent", &timeout).as_deref(),
+            Some("someone was timed out by amod")
+        );
+
+        // No expiry is a ban, which is the difference worth reporting.
+        let ban = serde_json::json!({ "user": { "username": "someone" }, "banned_by": { "username": "amod" } });
+        assert_eq!(
+            describe_action("App\\Events\\UserBannedEvent", &ban).as_deref(),
+            Some("someone was banned by amod")
+        );
+
+        // A moderator who did not name themselves still produces a line.
+        let anonymous = serde_json::json!({ "user": { "username": "someone" } });
+        assert_eq!(describe_action("UserBannedEvent", &anonymous).as_deref(), Some("someone was banned"));
+
+        assert_eq!(
+            describe_action("App\\Events\\UserUnbannedEvent", &serde_json::json!({ "user": { "username": "someone" } })).as_deref(),
+            Some("someone is allowed back")
+        );
     }
 
     #[test]

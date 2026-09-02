@@ -142,6 +142,12 @@ pub struct IrcChannelListing {
 #[derive(Clone, Debug)]
 pub struct KickChannel {
     pub slug: String,
+    /// Kick's own numeric id for the channel, which is what its history
+    /// endpoint is keyed by - the handle answers that path with a 500.
+    pub channel_id: u64,
+    /// Where the next page of history continues from, or None if the start
+    /// has been reached or nothing has been asked for yet.
+    pub history_cursor: Option<String>,
     /// The room the websocket subscribed to and messages are posted to.
     pub chatroom_id: u64,
     /// Whether this account is subscribed to this streamer, which decides
@@ -1928,6 +1934,12 @@ impl Runtime {
         self.kick_channels.lock().unwrap().get(buffer_id).cloned()
     }
 
+    pub fn set_kick_history_cursor(&self, buffer_id: &str, cursor: Option<String>) {
+        if let Some(channel) = self.kick_channels.lock().unwrap().get_mut(buffer_id) {
+            channel.history_cursor = cursor;
+        }
+    }
+
     pub fn forget_kick_channel(&self, buffer_id: &str) {
         self.kick_channels.lock().unwrap().remove(buffer_id);
     }
@@ -2169,7 +2181,7 @@ impl Runtime {
     ) -> bool {
         self.record_message_at(
             state, account_id, buffer_name, buffer_kind, from, body, is_action, kind, reply_to,
-            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None, None,
+            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None, None, None,
         )
     }
 
@@ -2200,6 +2212,7 @@ impl Runtime {
         sender_id: Option<String>,
         sent_at: Option<i64>,
         html: Option<String>,
+        style: Option<model::SenderStyle>,
     ) -> bool {
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
         let own_nick = self
@@ -2234,7 +2247,7 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref(), buffer_kind) {
+        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref(), buffer_kind, style.as_ref().and_then(|s| s.color.as_deref()), style.as_ref().map(|s| s.badges.as_slice()).unwrap_or(&[])) {
             // Already had it, so there is nothing to announce. Sneedchat
             // replays a room's recent history whenever its connection comes
             // back, and every backend that carries real message ids can
@@ -2286,6 +2299,8 @@ impl Runtime {
             embeds,
             attachments,
             sender_id,
+            sender_color: style.as_ref().and_then(|s| s.color.clone()),
+            badges: style.map(|s| s.badges).unwrap_or_default(),
         };
         state.events.emit("message", serde_json::to_value(&message).unwrap());
 

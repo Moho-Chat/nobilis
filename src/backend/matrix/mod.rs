@@ -720,6 +720,7 @@ async fn handle_timeline_event(
         // than rendered here: it is somebody else's markup and the frontend
         // is where the sanitiser lives.
         protocol::formatted_body(&content).map(str::to_string),
+        None,
     );
 }
 
@@ -1110,6 +1111,9 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
             buffer_id, event_id, &from, &body, ts, is_action, false, "message", None, &[], is_own,
             avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
             &state.runtime.buffer_kind_of(buffer_id),
+            // Matrix has no per-sender colour or badges of its own.
+            None,
+            &[],
         ) {
             tracing::warn!("matrix: storing history message: {e}");
             continue;

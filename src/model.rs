@@ -224,6 +224,18 @@ pub struct ReplyPreview {
     pub body: String,
 }
 
+/// How a service says a sender should look.
+///
+/// One value rather than two more parameters on `record_message_at`, which was
+/// already carrying seventeen: colour and badges always travel together,
+/// always come from the same place, and are always absent together for the
+/// protocols that have no such idea.
+#[derive(Clone, Debug, Default)]
+pub struct SenderStyle {
+    pub color: Option<String>,
+    pub badges: Vec<crate::backend::kick::api::Badge>,
+}
+
 /// One emoji's reaction tally on a message. `me` is whether *this*
 /// account is among the reactors - Discord's REACTION_ADD/REMOVE events
 /// are per-user, so this is accumulated incrementally rather than
@@ -370,6 +382,18 @@ pub struct Message {
     /// showing.
     #[serde(rename = "senderId", skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<String>,
+    /// The colour this service says the sender's name should be.
+    ///
+    /// Kick gives everybody one and it is half of how a busy chat is read.
+    /// A client that has none falls back to colouring the nick itself, which
+    /// is what IRC has always needed - so this overrides that rather than
+    /// replacing it.
+    #[serde(rename = "senderColor", skip_serializing_if = "Option::is_none")]
+    pub sender_color: Option<String>,
+    /// What the sender has earned in this channel: moderator, subscriber,
+    /// verified, and so on. Empty for services that have no such idea.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub badges: Vec<crate::backend::kick::api::Badge>,
     /// The sender's own formatted version of `body`, where the protocol
     /// carries one (Matrix's `formatted_body`). Restricted HTML, and still
     /// untrusted - a frontend must put it through the same sanitiser it

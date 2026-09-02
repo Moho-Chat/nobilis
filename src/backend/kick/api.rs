@@ -406,6 +406,108 @@ fn slugs_in(body: &serde_json::Value) -> Vec<String> {
     out
 }
 
+/// One message out of a channel's history.
+#[derive(Deserialize, Debug)]
+pub struct HistoryMessage {
+    pub id: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(rename = "type", default)]
+    pub kind: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    pub sender: HistorySender,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct HistorySender {
+    #[serde(default)]
+    pub id: Option<u64>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub identity: Option<ChatIdentity>,
+}
+
+/// How somebody appears in chat: their colour, and what they have earned.
+///
+/// Both arrive on every message and were both being dropped at the struct
+/// boundary. Kick chat is substantially about who is talking - a moderator, a
+/// subscriber of two years, the streamer - and without this every line looks
+/// the same.
+///
+/// Named for what it describes rather than `Identity`, which in this module
+/// already means "who the signed-in account is".
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct ChatIdentity {
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub badges: Vec<Badge>,
+}
+
+#[derive(Deserialize, Debug, Clone, Serialize)]
+pub struct Badge {
+    /// `moderator`, `subscriber`, `verified`, `og`, `founder`, `vip`...
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// What Kick calls it, which is what a tooltip should say.
+    #[serde(default)]
+    pub text: String,
+    /// Months subscribed, for the badges that count.
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct HistoryEnvelope {
+    #[serde(default)]
+    data: Option<HistoryPage>,
+}
+
+#[derive(Deserialize)]
+struct HistoryPage {
+    #[serde(default)]
+    messages: Vec<HistoryMessage>,
+    #[serde(default)]
+    cursor: Option<serde_json::Value>,
+}
+
+/// A page of a channel's past, newest first.
+///
+/// Keyed by the numeric channel id rather than the handle: the same path with
+/// a slug answers 500, which is the kind of difference that only shows up by
+/// trying it.
+///
+/// `cursor` continues an earlier page; the returned one continues this page,
+/// and is absent at the end of what the server will give.
+pub async fn history(
+    http: &reqwest::Client,
+    channel_id: u64,
+    cursor: Option<&str>,
+) -> Result<(Vec<HistoryMessage>, Option<String>)> {
+    let mut url = format!("{API_ROOT}/api/v2/channels/{channel_id}/messages");
+    if let Some(cursor) = cursor {
+        url.push_str(&format!("?cursor={}", urlencode(cursor)));
+    }
+    let res = http.get(&url).header("Accept", "application/json").send().await.context("fetching the channel's history")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} for that channel's history", res.status());
+    }
+    let envelope: HistoryEnvelope = res.json().await.context("reading the channel's history")?;
+    let page = envelope.data.unwrap_or(HistoryPage { messages: Vec::new(), cursor: None });
+    // Kick has sent this as a number and as a string; both mean the same
+    // thing to the next request.
+    let cursor = match page.cursor {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s),
+        Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    Ok((page.messages, cursor))
+}
+
 /// What this account is to one channel.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Standing {

@@ -150,6 +150,31 @@ pub async fn dispatch(
                             backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
                         }
                     }
+                    // Kick pages back through its own history endpoint,
+                    // continuing from where the last page stopped rather than
+                    // by timestamp - the endpoint is cursor-based, and asking
+                    // by time would re-fetch the same page forever.
+                    if before > 0 && buffer.account_id.starts_with("kick:") {
+                        if let Some(channel) = state.runtime.kick_channel(buffer_id) {
+                            // No cursor means the start has been reached; the
+                            // store already holds everything there is.
+                            if let Some(cursor) = channel.history_cursor {
+                                if let Ok(http) = backend::kick::api::client() {
+                                    let next = backend::kick::backfill(
+                                        state,
+                                        &http,
+                                        &buffer.account_id,
+                                        &channel.slug,
+                                        channel.channel_id,
+                                        Some(&cursor),
+                                    )
+                                    .await;
+                                    state.runtime.set_kick_history_cursor(buffer_id, next);
+                                }
+                            }
+                        }
+                    }
+
                     // IRC pages back through CHATHISTORY, where the server
                     // has it. Unlike the other two this is not a request with
                     // a reply - the history arrives as ordinary messages on

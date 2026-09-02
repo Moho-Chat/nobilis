@@ -982,9 +982,9 @@ async fn handle_message(
                 return;
             }
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None);
+                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             }
         }
 
@@ -1017,7 +1017,7 @@ async fn handle_message(
                 // are in its queue, why it refused. In the server tab those sit
                 // a long way from the request they answer, and the conversation
                 // that asked shows nothing but your own message.
-                state.runtime.record_message_at(state, account_id, &from, "dm", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None);
+                state.runtime.record_message_at(state, account_id, &from, "dm", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
             }
         }
 

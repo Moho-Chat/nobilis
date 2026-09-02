@@ -85,6 +85,12 @@ impl Store {
             "ALTER TABLE messages ADD COLUMN avatar_url TEXT",
             "ALTER TABLE messages ADD COLUMN embeds TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+            // How the sender looked, where the service says: their colour and
+            // what they have earned. Persisted rather than live-only, or
+            // reopening a conversation would strip a chat of the thing that
+            // makes it readable.
+            "ALTER TABLE messages ADD COLUMN sender_color TEXT",
+            "ALTER TABLE messages ADD COLUMN badges TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE messages ADD COLUMN sender_id TEXT",
             // Matrix sends a formatted body alongside the plain one. Kept
             // separate rather than replacing body: the plain text is the
@@ -153,6 +159,8 @@ impl Store {
         sender_id: Option<&str>,
         html: Option<&str>,
         buffer_kind: &str,
+        sender_color: Option<&str>,
+        badges: &[crate::backend::kick::api::Badge],
     ) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         // Live messages are always freshly created with no reactions yet
@@ -166,8 +174,8 @@ impl Store {
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
-            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19)",
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind, sender_color, badges)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19, ?20, COALESCE(?21, '[]'))",
             params![
                 msg_id,
                 buffer_id,
@@ -188,6 +196,8 @@ impl Store {
                 attachments_json,
                 html,
                 buffer_kind,
+                sender_color,
+                serde_json::to_string(badges).ok(),
             ],
         )?;
         // Whether this was actually new. The insert has always ignored a
@@ -379,6 +389,8 @@ impl Store {
         let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
         let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
         drop_missing_local_copies(&mut attachments);
+        let badges_json: String = row.get::<_, Option<String>>(19)?.unwrap_or_else(|| "[]".to_string());
+        let badges = serde_json::from_str(&badges_json).unwrap_or_default();
         Ok(Message {
             id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
             buffer_id: buffer_id.to_string(),
@@ -396,6 +408,8 @@ impl Store {
             embeds,
             attachments,
             sender_id: row.get(15)?,
+            sender_color: row.get(18)?,
+            badges,
             html: row.get(17)?,
         })
     }
@@ -404,7 +418,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -444,7 +458,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -457,13 +471,18 @@ impl Store {
             // parameter, since unlike every other query here this one spans
             // conversations and each answer belongs to a different one.
             //
-            // Index 18, after the eighteen columns row_to_message reads. It
-            // used to say 17, which is `html` - so every mention on a service
-            // that sends no HTML, meaning all of them but Matrix, failed the
-            // whole query with "Invalid column type Null". Nothing showed that:
-            // the page fills from live messages as well, so mentions appeared
-            // to work and then to vanish whenever the daemon restarted.
-            let buffer_id: String = row.get(18)?;
+            // Index 20, after the twenty columns row_to_message reads - and a
+            // number that has now been wrong twice. It said 17 (`html`), which
+            // made every mention on a service that sends no HTML fail the
+            // whole query with "Invalid column type Null"; adding sender_color
+            // and badges moved it again. Nothing shows it: the page fills from
+            // live messages too, so mentions appear to work and then vanish on
+            // the next restart.
+            //
+            // The real fix is to stop counting - a named column, or a struct
+            // that owns its own column list - and it is worth doing the next
+            // time this query is touched.
+            let buffer_id: String = row.get(20)?;
             Self::row_to_message(&buffer_id, row)
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -550,7 +569,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -594,7 +613,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
@@ -614,6 +633,8 @@ impl Store {
             let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
             let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
             drop_missing_local_copies(&mut attachments);
+            let badges_json: String = row.get::<_, Option<String>>(19)?.unwrap_or_else(|| "[]".to_string());
+            let badges = serde_json::from_str(&badges_json).unwrap_or_default();
             Ok(Message {
                 id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
                 buffer_id: buffer_id.to_string(),
@@ -631,6 +652,8 @@ impl Store {
                 embeds,
                 attachments,
                 sender_id: row.get(15)?,
+                sender_color: row.get(18)?,
+                badges,
                 html: row.get(17)?,
             })
         })?;
@@ -692,18 +715,18 @@ mod tests {
     }
 
     fn append(s: &Store, buffer: &str, id: &str) {
-        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
     }
 
     /// Like `append`, but with text worth searching for.
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
-        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
     }
 
     fn mention(s: &Store, buffer: &str, id: &str, kind: &str) {
-        s.append_message(buffer, id, "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, kind)
+        s.append_message(buffer, id, "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, kind, None, &[])
             .expect("appending");
     }
 
@@ -738,7 +761,7 @@ mod tests {
         // were in have nothing to vouch for them but the live buffer list,
         // which is exactly what this used to rely on.
         let (st, dir) = store();
-        st.append_message("irc|#old", "1", "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+        st.append_message("irc|#old", "1", "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap();
         st.conn.lock().unwrap().execute("UPDATE messages SET buffer_kind = NULL", []).unwrap();
 
@@ -786,10 +809,10 @@ mod tests {
         // same one, over and over, for a message read hours ago.
         let (st, dir) = store();
         let first = st
-            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
         let again = st
-            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending again");
 
         assert!(first, "the first time is new");
@@ -805,10 +828,10 @@ mod tests {
         // silently drop it.
         let (st, dir) = store();
         assert!(st
-            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel")
+            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap());
         assert!(st
-            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None, "channel")
+            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -931,7 +954,7 @@ mod dedupe_tests {
     }
 
     fn put(s: &Store, buffer: &str, id: &str, body: &str) {
-        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel");
+        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[]);
     }
 
     /// A backend replaying history it already has - Sneedchat does this on
