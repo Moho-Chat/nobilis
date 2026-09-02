@@ -105,6 +105,11 @@ impl Store {
             // vanish over a restart: the messages were here all along, and
             // nothing could name the conversations they belonged to.
             "ALTER TABLE messages ADD COLUMN buffer_kind TEXT",
+            // Whether reply_to_id names a thread rather than a single message.
+            // Same column pair for both because the protocol says both the
+            // same way; what differs is that a thread can be opened and
+            // continued, and a reply target cannot.
+            "ALTER TABLE messages ADD COLUMN reply_is_thread INTEGER NOT NULL DEFAULT 0",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -174,8 +179,8 @@ impl Store {
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
-            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind, sender_color, badges)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19, ?20, COALESCE(?21, '[]'))",
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind, sender_color, badges, reply_is_thread)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19, ?20, COALESCE(?21, '[]'), ?22)",
             params![
                 msg_id,
                 buffer_id,
@@ -198,6 +203,7 @@ impl Store {
                 buffer_kind,
                 sender_color,
                 serde_json::to_string(badges).ok(),
+                reply_to.is_some_and(|r| r.thread) as i32,
             ],
         )?;
         // Whether this was actually new. The insert has always ignored a
@@ -368,49 +374,49 @@ impl Store {
 
     /// Oldest-first, matching store.c's getBacklog (query is DESC+LIMIT for
     /// "most recent N", then reversed before returning).
-    /// One row of the message columns, in the order every query selects them.
+    /// One row of the message columns, read by name.
     ///
-    /// Shared rather than inlined because a second reader would otherwise have
-    /// to repeat seventeen positional column indices, and the two would drift
-    /// the first time a column is added.
+    /// By name rather than by position deliberately: this was positional, and
+    /// adding a column silently moved every index after it - which broke the
+    /// mentions query twice, each time by exactly one, each time invisibly.
+    /// Every query below selects these columns under these names, so a column
+    /// added at the end of a select list now costs nothing here.
     fn row_to_message(buffer_id: &str, row: &rusqlite::Row<'_>) -> rusqlite::Result<Message> {
-        let reply_to_id: Option<String> = row.get(7)?;
-        let reply_to_from: Option<String> = row.get(8)?;
-        let reply_to_body: Option<String> = row.get(9)?;
+        let reply_to_id: Option<String> = row.get("reply_to_id")?;
         let reply_to = reply_to_id.map(|id| ReplyPreview {
             id,
-            from: reply_to_from.unwrap_or_default(),
-            body: reply_to_body.unwrap_or_default(),
+            from: row.get::<_, Option<String>>("reply_to_from").ok().flatten().unwrap_or_default(),
+            body: row.get::<_, Option<String>>("reply_to_body").ok().flatten().unwrap_or_default(),
+            thread: row.get::<_, Option<i64>>("reply_is_thread").ok().flatten().unwrap_or(0) != 0,
         });
-        let reactions_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".to_string());
-        let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
-        let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
-        let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
-        let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
-        let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
+        let json_column = |name: &str| -> String {
+            row.get::<_, Option<String>>(name).ok().flatten().unwrap_or_else(|| "[]".to_string())
+        };
+        let reactions: Vec<Reaction> = serde_json::from_str(&json_column("reactions")).unwrap_or_default();
+        let embeds: Vec<Embed> = serde_json::from_str(&json_column("embeds")).unwrap_or_default();
+        let mut attachments: Vec<Attachment> = serde_json::from_str(&json_column("attachments")).unwrap_or_default();
         drop_missing_local_copies(&mut attachments);
-        let badges_json: String = row.get::<_, Option<String>>(19)?.unwrap_or_else(|| "[]".to_string());
-        let badges = serde_json::from_str(&badges_json).unwrap_or_default();
+        let badges = serde_json::from_str(&json_column("badges")).unwrap_or_default();
         Ok(Message {
-            id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            id: row.get::<_, Option<String>>("msg_id")?.unwrap_or_default(),
             buffer_id: buffer_id.to_string(),
-            from: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-            body: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            ts: row.get(3)?,
-            is_action: row.get::<_, i64>(4)? != 0,
-            is_highlight: row.get::<_, i64>(5)? != 0,
-            kind: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "chat".to_string()),
+            from: row.get::<_, Option<String>>("from_nick")?.unwrap_or_default(),
+            body: row.get::<_, Option<String>>("body")?.unwrap_or_default(),
+            ts: row.get("ts")?,
+            is_action: row.get::<_, i64>("is_action")? != 0,
+            is_highlight: row.get::<_, i64>("is_highlight")? != 0,
+            kind: row.get::<_, Option<String>>("kind")?.unwrap_or_else(|| "chat".to_string()),
             reply_to,
-            edited: row.get::<_, i64>(10)? != 0,
+            edited: row.get::<_, i64>("edited")? != 0,
             reactions,
-            is_own: row.get::<_, i64>(12)? != 0,
-            avatar_url: row.get(13)?,
+            is_own: row.get::<_, i64>("is_own")? != 0,
+            avatar_url: row.get("avatar_url")?,
             embeds,
             attachments,
-            sender_id: row.get(15)?,
-            sender_color: row.get(18)?,
+            sender_id: row.get("sender_id")?,
+            sender_color: row.get("sender_color")?,
             badges,
-            html: row.get(17)?,
+            html: row.get("html")?,
         })
     }
 
@@ -418,7 +424,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -458,7 +464,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -482,7 +488,7 @@ impl Store {
             // The real fix is to stop counting - a named column, or a struct
             // that owns its own column list - and it is worth doing the next
             // time this query is touched.
-            let buffer_id: String = row.get(20)?;
+            let buffer_id: String = row.get("buffer_id")?;
             Self::row_to_message(&buffer_id, row)
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -569,7 +575,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -624,53 +630,33 @@ impl Store {
         Ok(rows.next().transpose()?.flatten())
     }
 
+    /// A thread: the message it grew from, then everything said in it, oldest
+    /// first.
+    ///
+    /// The root is included because a thread without the thing it is about is
+    /// half a conversation - and it is fetched separately rather than by a
+    /// clever join, because a room read into local scrollback may hold the
+    /// replies without holding the root, and the reverse.
+    pub fn thread_messages(&self, buffer_id: &str, root_id: &str) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+             FROM messages
+             WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR msg_id = ?2)
+             ORDER BY ts ASC, rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, root_id], |row| Self::row_to_message(buffer_id, row))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
-        let mut rows = stmt.query_map(params![buffer_id, msg_id], |row| {
-            let reply_to_id: Option<String> = row.get(7)?;
-            let reply_to_from: Option<String> = row.get(8)?;
-            let reply_to_body: Option<String> = row.get(9)?;
-            let reply_to = reply_to_id.map(|id| ReplyPreview {
-                id,
-                from: reply_to_from.unwrap_or_default(),
-                body: reply_to_body.unwrap_or_default(),
-            });
-            let reactions_json: String = row.get::<_, Option<String>>(11)?.unwrap_or_else(|| "[]".to_string());
-            let reactions: Vec<Reaction> = serde_json::from_str(&reactions_json).unwrap_or_default();
-            let embeds_json: String = row.get::<_, Option<String>>(14)?.unwrap_or_else(|| "[]".to_string());
-            let embeds: Vec<Embed> = serde_json::from_str(&embeds_json).unwrap_or_default();
-            let attachments_json: String = row.get::<_, Option<String>>(16)?.unwrap_or_else(|| "[]".to_string());
-            let mut attachments: Vec<Attachment> = serde_json::from_str(&attachments_json).unwrap_or_default();
-            drop_missing_local_copies(&mut attachments);
-            let badges_json: String = row.get::<_, Option<String>>(19)?.unwrap_or_else(|| "[]".to_string());
-            let badges = serde_json::from_str(&badges_json).unwrap_or_default();
-            Ok(Message {
-                id: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                buffer_id: buffer_id.to_string(),
-                from: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
-                body: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                ts: row.get(3)?,
-                is_action: row.get::<_, i64>(4)? != 0,
-                is_highlight: row.get::<_, i64>(5)? != 0,
-                kind: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "chat".to_string()),
-                reply_to,
-                edited: row.get::<_, i64>(10)? != 0,
-                reactions,
-                is_own: row.get::<_, i64>(12)? != 0,
-                avatar_url: row.get(13)?,
-                embeds,
-                attachments,
-                sender_id: row.get(15)?,
-                sender_color: row.get(18)?,
-                badges,
-                html: row.get(17)?,
-            })
-        })?;
+        let mut rows = stmt.query_map(params![buffer_id, msg_id], |row| Self::row_to_message(buffer_id, row))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),

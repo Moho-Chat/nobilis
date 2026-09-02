@@ -217,11 +217,20 @@ pub struct BufferGroup {
 /// something even if the original later scrolls out of local history or
 /// gets deleted. `id` is what the frontend's "jump to" click targets if
 /// the original happens to already be loaded.
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct ReplyPreview {
     pub id: String,
     pub from: String,
     pub body: String,
+    /// Whether `id` is a thread rather than a single message being answered.
+    ///
+    /// The two are the same field because they are the same fact from the
+    /// protocol's side - Matrix says both with `m.relates_to`, and a threaded
+    /// message names its thread where a reply names its target. What differs
+    /// is what a client should do with it: a reply points somewhere, a thread
+    /// is somewhere, and only the second can be opened and continued.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread: bool,
 }
 
 /// How a service says a sender should look.

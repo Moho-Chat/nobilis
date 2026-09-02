@@ -496,6 +496,42 @@ pub async fn dispatch(
         // their own piece of work - so this is quietly a no-op elsewhere
         // rather than an error, letting a client call it on every buffer it
         // opens without first asking what protocol it is.
+        // A thread, read whole. Matrix is the only protocol here with the
+        // idea; anything else answers with whatever is already stored, which
+        // for a plain reply chain is just the message being pointed at.
+        // The public room directory - Element's room explorer. Optionally
+        // somebody else's directory, which is how a room on a server this
+        // account has never touched is found at all.
+        "searchMatrixRooms" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("searchMatrixRooms requires \"accountId\"".to_string()));
+            };
+            let query = p_str_opt(params, "query").unwrap_or("");
+            let server = p_str_opt(params, "server").unwrap_or("");
+            let since = p_str_opt(params, "since").unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(30) as u32;
+            match backend::matrix::search_public_rooms(state, account_id, query, server, since, limit).await {
+                Ok(result) => (Some(result), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "fetchThread" => {
+            let (Some(buffer_id), Some(root_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rootId")) else {
+                return (None, Some("fetchThread requires \"bufferId\" and \"rootId\"".to_string()));
+            };
+            let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+            let messages = if account_id.starts_with("matrix:") {
+                match backend::matrix::fetch_thread(state, &account_id, buffer_id, root_id).await {
+                    Ok(messages) => messages,
+                    Err(e) => return (None, Some(format!("{e:#}"))),
+                }
+            } else {
+                state.store.thread_messages(buffer_id, root_id).unwrap_or_default()
+            };
+            (Some(serde_json::json!({ "messages": messages })), None)
+        }
+
         "markBufferRead" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("markBufferRead requires \"bufferId\"".to_string()));
@@ -1437,7 +1473,7 @@ pub async fn dispatch(
                 }
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
-                    Some(cfg) => match backend::matrix::send_message(state, &buffer.account_id, buffer_id, &cfg.access_token, body, reply_to_id, attachment_path).await {
+                    Some(cfg) => match backend::matrix::send_message(state, &buffer.account_id, buffer_id, &cfg.access_token, body, reply_to_id, params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false), attachment_path).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e.to_string())),
                     },

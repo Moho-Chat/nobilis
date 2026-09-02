@@ -550,6 +550,27 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// What a message is answering, and whether that is a thread.
+///
+/// A threaded message names its thread rather than the message before it:
+/// Matrix sends both, and the second is a fallback for clients that cannot
+/// read threads, so following it gives a chain of one-line replies where a
+/// conversation was.
+///
+/// The preview is filled in from local scrollback where the target is there.
+/// Where it is not, the relation is still recorded without one - knowing a
+/// message belongs to a thread matters even when the thread's own first
+/// message has not been read yet.
+fn relation_preview(state: &AppState, buffer_id: &str, content: &Value) -> Option<crate::model::ReplyPreview> {
+    let thread = protocol::thread_root(content);
+    let in_thread = thread.is_some();
+    let target = thread.or_else(|| protocol::reply_target(content))?;
+    match state.store.get_message(buffer_id, target) {
+        Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target.to_string(), from: m.from, body: m.body, thread: in_thread }),
+        _ => Some(crate::model::ReplyPreview { id: target.to_string(), thread: in_thread, ..Default::default() }),
+    }
+}
+
 async fn handle_timeline_event(
     state: &AppState,
     account_id: &str,
@@ -683,16 +704,7 @@ async fn handle_timeline_event(
     // Threads are not their own buffers here, and this does not make them one.
     // It is the difference between a threaded message arriving with no context
     // at all and one that says which conversation it belongs to.
-    let relation = protocol::thread_root(&content).or_else(|| protocol::reply_target(&content));
-    let reply_to = match relation {
-        Some(target_event) => match state.store.get_message(buffer_id, target_event) {
-            Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target_event.to_string(), from: m.from, body: m.body }),
-            // Not (or no longer) in local scrollback - still record that
-            // this is a reply, just without a preview to show.
-            _ => Some(crate::model::ReplyPreview { id: target_event.to_string(), from: String::new(), body: String::new() }),
-        },
-        None => None,
-    };
+    let reply_to = relation_preview(state, buffer_id, &content);
 
     if reply_to.is_some() {
         // The raw body Matrix sends for a reply includes a quoted `> `
@@ -1062,6 +1074,180 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
 ///
 /// Written straight to the store rather than through record_message: these
 /// are old, and the notification path would announce every one of them.
+/// Searches the public room directory, the way Element's room explorer does.
+///
+/// `server` asks another homeserver's directory rather than our own - which is
+/// the only way to find rooms on a server this account has never spoken to,
+/// and how somebody finds a community they were told about by name. Empty
+/// means our own server, which is also what happens when a remote directory
+/// refuses.
+///
+/// `since` pages: the directory is thousands of rooms on a busy server, and
+/// what comes back first is the largest, not the closest match.
+pub async fn search_public_rooms(
+    state: &AppState,
+    account_id: &str,
+    query: &str,
+    server: &str,
+    since: &str,
+    limit: u32,
+) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let mut url = format!("{base}/_matrix/client/v3/publicRooms");
+    if !server.trim().is_empty() {
+        // A bare hostname, not a URL: this names a homeserver in the Matrix
+        // sense, and one typed with a scheme would be rejected by ours.
+        let server = server.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/');
+        url.push_str("?server=");
+        url.push_str(&url::form_urlencoded::byte_serialize(server.as_bytes()).collect::<String>());
+    }
+
+    let mut body = serde_json::json!({ "limit": limit });
+    if !query.trim().is_empty() {
+        body["filter"] = serde_json::json!({ "generic_search_term": query.trim() });
+    }
+    if !since.is_empty() {
+        body["since"] = Value::String(since.to_string());
+    }
+    // POST rather than GET: only the POST form takes a search term at all, and
+    // the GET form's absence of one is why a directory browser without this
+    // could only ever show the first page of the whole server.
+    let resp = http::post_json(&url, Some(&account.access_token), body).await.context("searching the room directory")?;
+
+    let joined: std::collections::HashSet<String> = state.runtime.matrix_joined_rooms(account_id);
+    let rooms: Vec<Value> = resp["chunk"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|room| {
+            let room_id = room["room_id"].as_str().unwrap_or("");
+            serde_json::json!({
+                "roomId": room_id,
+                "name": room["name"].as_str().unwrap_or(""),
+                "alias": room["canonical_alias"].as_str().unwrap_or(""),
+                "topic": room["topic"].as_str().unwrap_or(""),
+                "members": room["num_joined_members"].as_i64().unwrap_or(0),
+                "avatarUrl": room["avatar_url"].as_str(),
+                // Said plainly, because "you are already in this" is the
+                // difference between a join button that works and one that
+                // appears to do nothing.
+                "joined": joined.contains(room_id),
+                "worldReadable": room["world_readable"].as_bool().unwrap_or(false),
+                "guestCanJoin": room["guest_can_join"].as_bool().unwrap_or(false),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "rooms": rooms,
+        "next": resp["next_batch"].as_str().unwrap_or(""),
+        "total": resp["total_room_count_estimate"].as_i64(),
+    }))
+}
+
+/// Reads a thread from the server, then hands back everything known about it.
+///
+/// `/relations` is the only way to see a thread whole: its replies are
+/// ordinary timeline events, so a room read backwards would find them only by
+/// paging back far enough to have crossed all of them, and a thread that has
+/// been quiet for a month is arbitrarily far back.
+///
+/// What comes back is read out of the store rather than built here, so a
+/// thread shows the same messages in the same shape whether they arrived
+/// live, in room history, or through this - and so anything already stored
+/// keeps its edits and reactions instead of being replaced by a plainer copy.
+pub async fn fetch_thread(state: &AppState, account_id: &str, buffer_id: &str, root_id: &str) -> Result<Vec<crate::model::Message>> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let root = url::form_urlencoded::byte_serialize(root_id.as_bytes()).collect::<String>();
+    // v1, not v3: relations were added to the spec after the v3 client API was
+    // frozen, and live under /client/v1 for every server that has them.
+    let url = format!("{base}/_matrix/client/v1/rooms/{room}/relations/{root}/m.thread?dir=f&limit=100");
+
+    match http::get_json(&url, &account.access_token).await {
+        Ok(resp) => {
+            let session = state.runtime.get_matrix_machine(account_id);
+            for event in resp["chunk"].as_array().into_iter().flatten() {
+                store_thread_event(state, account_id, buffer_id, &room_id, &account.user_id, session.as_deref(), event).await;
+            }
+        }
+        // A thread nobody has added to, a server that does not implement
+        // relations, or a root that has been redacted. What is already stored
+        // is still worth showing, so this is not fatal.
+        Err(e) => tracing::debug!("matrix: reading thread {root_id}: {e:#}"),
+    }
+
+    state.store.thread_messages(buffer_id, root_id).map_err(Into::into)
+}
+
+/// One event from a thread, decrypted if it needs to be, into the store.
+/// Deliberately quiet about anything it cannot use: a thread is read whole,
+/// and one unreadable reply should not cost the rest of it.
+async fn store_thread_event(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    room_id: &str,
+    own_user_id: &str,
+    session: Option<&crypto::CryptoSession>,
+    event: &Value,
+) {
+    let decrypted;
+    let event = if protocol::event_type(event) == protocol::EVENT_ROOM_ENCRYPTED {
+        match session {
+            Some(session) => match decrypt_event(session, event, room_id).await.ok() {
+                Some(plain) => {
+                    decrypted = plain;
+                    &decrypted
+                }
+                None => return,
+            },
+            None => return,
+        }
+    } else {
+        event
+    };
+    if protocol::event_type(event) != protocol::EVENT_ROOM_MESSAGE {
+        return;
+    }
+    let content = &event["content"];
+    if protocol::edit_target(content).is_some() {
+        return;
+    }
+    let Some(event_id) = protocol::event_id(event) else { return };
+    let (body, is_action) = protocol::message_body(content);
+    if body.is_empty() {
+        return;
+    }
+    let sender_mxid = protocol::sender(event);
+    let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
+    let reply_to = relation_preview(state, buffer_id, content);
+    let _ = state.store.append_message(
+        buffer_id,
+        event_id,
+        &protocol::short_sender(event),
+        &body,
+        ts,
+        is_action,
+        false,
+        "message",
+        reply_to.as_ref(),
+        &[],
+        sender_mxid == own_user_id,
+        state.runtime.get_matrix_member_avatar(account_id, sender_mxid).as_deref(),
+        &[],
+        &[],
+        Some(sender_mxid),
+        protocol::formatted_body(content),
+        &state.runtime.buffer_kind_of(buffer_id),
+        None,
+        &[],
+    );
+}
+
 pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<usize> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
@@ -1124,8 +1310,11 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
         // years-old conversation at today.
         let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
         let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
+        // History carries its relations like anything else - without this a
+        // thread read back from the server arrived as loose messages.
+        let reply_to = relation_preview(state, buffer_id, content);
         if let Err(e) = state.store.append_message(
-            buffer_id, event_id, &from, &body, ts, is_action, false, "message", None, &[], is_own,
+            buffer_id, event_id, &from, &body, ts, is_action, false, "message", reply_to.as_ref(), &[], is_own,
             avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
             &state.runtime.buffer_kind_of(buffer_id),
             // Matrix has no per-sender colour or badges of its own.
@@ -1506,6 +1695,7 @@ pub async fn send_message(
     access_token: &str,
     body: &str,
     reply_to_id: Option<&str>,
+    thread: bool,
     attachment_path: Option<&str>,
 ) -> Result<()> {
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
@@ -1543,7 +1733,23 @@ pub async fn send_message(
         content
     };
     if let Some(target) = reply_to_id {
-        plain_content["m.relates_to"] = serde_json::json!({ "m.in_reply_to": { "event_id": target } });
+        plain_content["m.relates_to"] = if thread {
+            // The in_reply_to alongside it is the fallback a client that does
+            // not understand threads reads instead, and is marked as such so
+            // one that does knows not to draw a quotation nobody wrote. Both
+            // point at the thread's root here rather than at the last message
+            // in it, which is a simplification: a client showing the fallback
+            // sees the thread's opening quoted rather than the message being
+            // answered.
+            serde_json::json!({
+                "rel_type": "m.thread",
+                "event_id": target,
+                "is_falling_back": true,
+                "m.in_reply_to": { "event_id": target }
+            })
+        } else {
+            serde_json::json!({ "m.in_reply_to": { "event_id": target } })
+        };
     }
 
     let txn_id = model::next_message_id();
@@ -2066,7 +2272,7 @@ mod tests {
         assert_eq!(state.runtime.get_matrix_room(&buffer_id).as_deref(), Some(room_id.as_str()), "buffer's room id mapping is wrong");
 
         let sent_body = format!("phase2-probe-{}", model::next_message_id());
-        send_message(&state, &account_id, &buffer_id, &login.access_token, &sent_body, None, None).await.expect("send_message failed");
+        send_message(&state, &account_id, &buffer_id, &login.access_token, &sent_body, None, false, None).await.expect("send_message failed");
         println!("sent: {sent_body}");
 
         let mut received = false;
@@ -2447,13 +2653,13 @@ mod tests {
 
         // --- send the original message ---
         let original_body = format!("phase5-original-{}", model::next_message_id());
-        send_message(&state, &account_id, &buffer_id, &login.access_token, &original_body, None, None).await.expect("send failed");
+        send_message(&state, &account_id, &buffer_id, &login.access_token, &original_body, None, false, None).await.expect("send failed");
         let original_id = poll_for_message(&state, &buffer_id, |m| m.body == original_body, 30).await.expect("original message never arrived").id;
         println!("sent original: {original_id}");
 
         // --- reply ---
         let reply_body = format!("phase5-reply-{}", model::next_message_id());
-        send_message(&state, &account_id, &buffer_id, &login.access_token, &reply_body, Some(&original_id), None).await.expect("reply send failed");
+        send_message(&state, &account_id, &buffer_id, &login.access_token, &reply_body, Some(&original_id), false, None).await.expect("reply send failed");
         let reply_msg = poll_for_message(&state, &buffer_id, |m| m.body == reply_body, 30).await.expect("reply never arrived");
         assert_eq!(reply_msg.reply_to.as_ref().map(|r| r.id.as_str()), Some(original_id.as_str()), "reply didn't record the right target");
         println!("reply confirmed, targets {}", original_id);
@@ -2598,7 +2804,7 @@ mod tests {
         let buffer_id = buffer_id.expect("buffer never appeared within 30s");
         println!("buffer created: {buffer_id}");
 
-        send_message(&state, &account_id, &buffer_id, &login.access_token, "", None, Some(&image_path)).await.expect("media send failed");
+        send_message(&state, &account_id, &buffer_id, &login.access_token, "", None, false, Some(&image_path)).await.expect("media send failed");
         println!("uploaded and sent {image_path}");
 
         let received = poll_for_message(&state, &buffer_id, |m| m.body.starts_with("file://"), 30).await;

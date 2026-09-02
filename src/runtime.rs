@@ -1450,6 +1450,22 @@ impl Runtime {
         self.matrix_rooms.lock().unwrap().insert(buffer_id.to_string(), room_id.to_string());
     }
 
+    /// Every room this account currently has a buffer for.
+    ///
+    /// Used to say "already joined" against a directory listing - a join
+    /// button that quietly does nothing because you are in the room is worse
+    /// than no button.
+    pub fn matrix_joined_rooms(&self, account_id: &str) -> std::collections::HashSet<String> {
+        let prefix = format!("{account_id}|");
+        self.matrix_rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(buffer_id, _)| buffer_id.starts_with(&prefix))
+            .map(|(_, room_id)| room_id.clone())
+            .collect()
+    }
+
     pub fn get_matrix_room(&self, buffer_id: &str) -> Option<String> {
         self.matrix_rooms.lock().unwrap().get(buffer_id).cloned()
     }
@@ -2470,6 +2486,26 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which rooms count as joined, for the directory's "already in this"
+    /// label. Scoped per account, because two Matrix accounts in the same
+    /// client are in different sets of rooms and a shared answer would offer
+    /// to join a room one of them is already in.
+    #[test]
+    fn joined_rooms_are_the_ones_this_account_has_a_buffer_for() {
+        let runtime = Runtime::new();
+        runtime.matrix_rooms.lock().unwrap().insert("matrix:@me:a.example|Room One".into(), "!one:a.example".into());
+        runtime.matrix_rooms.lock().unwrap().insert("matrix:@me:a.example|Room Two".into(), "!two:a.example".into());
+        runtime.matrix_rooms.lock().unwrap().insert("matrix:@other:b.example|Theirs".into(), "!three:b.example".into());
+
+        let mine = runtime.matrix_joined_rooms("matrix:@me:a.example");
+        assert_eq!(mine.len(), 2);
+        assert!(mine.contains("!one:a.example"));
+        assert!(mine.contains("!two:a.example"));
+        // Somebody else's room, on this same client, is not ours.
+        assert!(!mine.contains("!three:b.example"));
+        assert!(runtime.matrix_joined_rooms("matrix:@nobody:c.example").is_empty());
+    }
 
     /// The flag that keeps IRC's retry loop from undoing a deliberate
     /// disconnect. A session ending looks the same from inside the loop
