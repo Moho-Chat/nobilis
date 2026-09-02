@@ -594,6 +594,11 @@ impl Runtime {
         // runtime is actually holding is filled in here.
         for account in &mut out {
             account.status = self.account_status(&account.id);
+            // Only IRC has one, and only while connected - a configured nick
+            // is not the nick in use if the session landed on the alt.
+            if let Some(nick) = self.irc_current_nick(&account.id) {
+                account.current_nick = nick;
+            }
         }
         out
     }

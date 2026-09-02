@@ -33,6 +33,16 @@ pub struct Account {
     /// file on the machine the daemon is running on rather than this one.
     #[serde(rename = "hasSaslCertificate")]
     pub has_sasl_certificate: bool,
+    /// The nick this account is actually using right now.
+    ///
+    /// Not the same as the configured one: a session that landed on the alt
+    /// nick is using that until GHOST reclaims the real one. Reported because
+    /// a client cannot otherwise tell which row in a member list is the person
+    /// using it - and therefore cannot tell whether they hold op.
+    ///
+    /// Empty for every service that has no such concept.
+    #[serde(rename = "currentNick")]
+    pub current_nick: String,
     /// Whether this account's connection is encrypted.
     ///
     /// Reported so a frontend can tell the truth about what sending
