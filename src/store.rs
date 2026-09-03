@@ -277,6 +277,20 @@ impl Store {
     /// recorded locally). Discord's REACTION_ADD/REMOVE events are
     /// per-user-per-emoji, not a full snapshot, so this accumulates
     /// incrementally rather than replacing the whole list each time.
+    /// Replaces a message's reactions outright. Answers whether the message
+    /// was there to change, so a caller can stay quiet about one it does not
+    /// have - a moderator clearing reactions on something older than this
+    /// client's scrollback is not an error.
+    pub fn set_reactions(&self, buffer_id: &str, msg_id: &str, reactions: &[Reaction]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(reactions)?;
+        let changed = conn.execute(
+            "UPDATE messages SET reactions = ?3 WHERE buffer_id = ?1 AND msg_id = ?2",
+            params![buffer_id, msg_id, json],
+        )?;
+        Ok(changed > 0)
+    }
+
     pub fn update_reaction(&self, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool, add: bool) -> Result<Option<Vec<Reaction>>> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<String> = conn

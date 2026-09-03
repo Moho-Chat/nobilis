@@ -2788,6 +2788,30 @@ impl Runtime {
         }
     }
 
+    /// One emoji's reactions, gone - Discord's REACTION_REMOVE_EMOJI, which
+    /// is a moderator clearing a single reaction rather than all of them.
+    pub fn remove_reaction_entirely(&self, state: &AppState, buffer_id: &str, msg_id: &str, emoji: &str) {
+        let Ok(Some(message)) = state.store.get_message(buffer_id, msg_id) else { return };
+        let kept: Vec<_> = message.reactions.into_iter().filter(|r| r.emoji != emoji).collect();
+        match state.store.set_reactions(buffer_id, msg_id, &kept) {
+            Ok(true) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": kept })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to remove a reaction: {e}"),
+        }
+    }
+
+    /// Every reaction on a message, gone - Discord's REACTION_REMOVE_ALL,
+    /// which is what a moderator clearing a reaction storm sends. Without it
+    /// the reactions stayed on screen forever, since the per-user removals
+    /// that would have cleared them are not sent.
+    pub fn clear_reactions(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
+        match state.store.set_reactions(buffer_id, msg_id, &[]) {
+            Ok(true) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": [] })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to clear reactions: {e}"),
+        }
+    }
+
     /// One reaction add/remove (Discord's REACTION_ADD/REMOVE are
     /// per-user-per-emoji events, not full snapshots) - broadcasts the
     /// message's updated full reaction list once applied.

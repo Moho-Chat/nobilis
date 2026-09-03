@@ -3232,11 +3232,24 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
                         let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
                         let Some(msg_id) = d["id"].as_str() else { continue };
-                        // Edits to embed-only unfurls (Discord re-sends the
-                        // message once it's finished resolving a link
-                        // preview) carry no `edited_timestamp` and nothing
-                        // useful to update - only act on real content edits.
+                        let buffer_id = model::buffer_id(&account_id, &buffer_name);
+                        // No edited_timestamp means nobody edited anything:
+                        // this is Discord re-sending the message once it has
+                        // finished unfurling a link. That used to be dropped,
+                        // so a preview that took a second to resolve never
+                        // appeared at all - and most of them take a second.
+                        //
+                        // Only the embeds are taken from it. The update is a
+                        // partial object: it carries no content, and reading
+                        // a body out of it would replace what somebody wrote
+                        // with nothing.
                         if d["edited_timestamp"].is_null() {
+                            let embeds = extract_embeds(d);
+                            if embeds.is_empty() {
+                                continue;
+                            }
+                            let Ok(Some(stored)) = state.store.get_message(&buffer_id, msg_id) else { continue };
+                            state.runtime.update_message(state, &buffer_id, msg_id, &stored.body, &embeds, &stored.attachments);
                             continue;
                         }
                         let embeds = extract_embeds(d);
@@ -3244,7 +3257,6 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         attachments.extend(extract_stickers(d));
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
-                        let buffer_id = model::buffer_id(&account_id, &buffer_name);
                         state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);
                     }
                     "MESSAGE_DELETE" => {
@@ -3272,6 +3284,83 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
                         state.runtime.update_reaction(state, &buffer_id, msg_id, &emoji_key, is_me, t == "MESSAGE_REACTION_ADD");
                     }
+                    // A server renamed, re-iconed, or changed its emoji. All
+                    // three live in the guild object this client registered
+                    // at connect, so the cheapest correct answer is to
+                    // register it again - which is what the role events
+                    // already do for the same reason.
+                    "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" => {
+                        let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
+                        if guild_context.contains_key(guild_id) {
+                            resync_guild(state, config, guild_id, channel_map).await;
+                        }
+                    }
+
+                    // Our own name or picture changed - which is on every
+                    // message we send, and was invisible here until a
+                    // restart.
+                    "USER_UPDATE" => {
+                        if d["id"].as_str() != Some(config.user_id.as_str()) {
+                            continue;
+                        }
+                        let name = d["global_name"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .or_else(|| d["username"].as_str())
+                            .unwrap_or_default();
+                        if !name.is_empty() {
+                            let _ = state.accounts.set_display_name(&account_id, name);
+                        }
+                        if let (Some(avatar), Some(id)) = (d["avatar"].as_str(), d["id"].as_str()) {
+                            let url = format!("https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128");
+                            if state.accounts.set_discord_avatar_url(&account_id, &url).unwrap_or(false) {
+                                state.events.emit("accountAvatarChanged", json!({ "accountId": account_id, "avatarUrl": url }));
+                            }
+                        }
+                    }
+
+                    // Somebody joined or left the server. The member window is
+                    // a lazy view Discord only sends when asked, so asking
+                    // again is the whole of keeping it right - and only for a
+                    // guild whose list is actually on screen.
+                    "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        if let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) {
+                            request_member_list(state, &buffer_id);
+                        }
+                    }
+
+                    // A purge. Without this every message in it stayed on
+                    // screen, since the per-message deletes are not sent.
+                    "MESSAGE_DELETE_BULK" => {
+                        let channel_id = d["channel_id"].as_str().unwrap_or_default();
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let buffer_id = model::buffer_id(&account_id, &buffer_name);
+                        for id in d["ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                            state.runtime.delete_message(state, &buffer_id, id);
+                        }
+                    }
+
+                    // Reactions cleared wholesale - all of them, or every one
+                    // of a single emoji. Neither sends the per-user removals
+                    // that would otherwise take them off screen.
+                    "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => {
+                        let channel_id = d["channel_id"].as_str().unwrap_or_default();
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some(msg_id) = d["message_id"].as_str() else { continue };
+                        let buffer_id = model::buffer_id(&account_id, &buffer_name);
+                        match d["emoji"]["name"].as_str().filter(|_| t == "MESSAGE_REACTION_REMOVE_EMOJI") {
+                            Some(name) => {
+                                let key = match d["emoji"]["id"].as_str() {
+                                    Some(id) => format!("<:{name}:{id}>"),
+                                    None => name.to_string(),
+                                };
+                                state.runtime.remove_reaction_entirely(state, &buffer_id, msg_id, &key);
+                            }
+                            None => state.runtime.clear_reactions(state, &buffer_id, msg_id),
+                        }
+                    }
+
                     "GUILD_MEMBER_LIST_UPDATE" => {
                         let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) else { continue };
