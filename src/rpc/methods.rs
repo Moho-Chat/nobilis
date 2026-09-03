@@ -545,6 +545,26 @@ pub async fn dispatch(
         // Who and what can be tagged here, beyond the member list the client
         // already has: Discord's mentionable roles. Empty for every service
         // without the idea, so a client can ask unconditionally.
+        // Muting a room for the account rather than for this window. Matrix
+        // keeps it server-side, so a room quietened here is quiet on a phone
+        // too - which is what somebody means by muting a room.
+        "setMatrixRoomMuted" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setMatrixRoomMuted requires \"bufferId\"".to_string()));
+            };
+            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("matrix:") {
+                return (Some(ok_node()), None);
+            }
+            match backend::matrix::set_room_muted(state, &buffer.account_id, buffer_id, muted).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "listMentionRoles" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("listMentionRoles requires \"bufferId\"".to_string()));

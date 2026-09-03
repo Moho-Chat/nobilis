@@ -551,6 +551,10 @@ pub struct Runtime {
     /// Receipts people send privately (`m.read.private`) never reach anybody
     /// else's sync, so this only ever holds what its senders chose to publish.
     matrix_read_receipts: Mutex<HashMap<(String, String), HashMap<String, String>>>,
+    /// (account, room) pairs a tombstone pointed at, waiting to be joined.
+    matrix_upgrades: Mutex<Vec<(String, String)>>,
+    /// account -> its push rules, as the server keeps them.
+    matrix_push_rules: Mutex<HashMap<String, serde_json::Value>>,
     /// Buffers currently being filled with history rather than with things
     /// being said now.
     ///
@@ -560,6 +564,10 @@ pub struct Runtime {
     /// message seen before; this covers the first time, which is exactly the
     /// case that fires.
     replaying: Mutex<std::collections::HashSet<String>>,
+    /// Buffers whose messages must not announce themselves, because the
+    /// service says so - a Matrix room muted through push rules, which every
+    /// other client of that account is also honouring.
+    silenced: Mutex<std::collections::HashSet<String>>,
     /// (account, room) -> the motd last shown there, so it is shown once.
     sneedchat_motds: Mutex<HashMap<(String, String), String>>,
     /// (account, channel, split message) -> who has gone, so far.
@@ -670,7 +678,10 @@ impl Runtime {
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
+            matrix_upgrades: Mutex::new(Vec::new()),
+            matrix_push_rules: Mutex::new(HashMap::new()),
             replaying: Mutex::new(std::collections::HashSet::new()),
+            silenced: Mutex::new(std::collections::HashSet::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
             irc_splits: Mutex::new(HashMap::new()),
@@ -2093,6 +2104,36 @@ impl Runtime {
         }
     }
 
+    pub fn set_matrix_push_rules(&self, account_id: &str, rules: serde_json::Value) {
+        self.matrix_push_rules.lock().unwrap().insert(account_id.to_string(), rules);
+    }
+
+    pub fn matrix_push_rules(&self, account_id: &str) -> Option<serde_json::Value> {
+        self.matrix_push_rules.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Notes a room this account should follow an upgrade into.
+    ///
+    /// Recorded rather than joined on the spot: the join registers the new
+    /// room, which processes its state, which is where this was noticed - so
+    /// doing it here would be a function calling itself. The sync loop drains
+    /// these once it has finished with the response it is holding.
+    pub fn note_matrix_upgrade(&self, account_id: &str, successor: &str) {
+        let mut pending = self.matrix_upgrades.lock().unwrap();
+        let entry = (account_id.to_string(), successor.to_string());
+        if !pending.contains(&entry) {
+            pending.push(entry);
+        }
+    }
+
+    /// The upgrades waiting to be followed, taken off the list.
+    pub fn take_matrix_upgrades(&self, account_id: &str) -> Vec<String> {
+        let mut pending = self.matrix_upgrades.lock().unwrap();
+        let (mine, theirs): (Vec<_>, Vec<_>) = pending.drain(..).partition(|(account, _)| account == account_id);
+        *pending = theirs;
+        mine.into_iter().map(|(_, room)| room).collect()
+    }
+
     /// Records where somebody has read up to, and says whether that was news.
     ///
     /// A room's own sync repeats receipts that have not moved, so a caller
@@ -2187,6 +2228,22 @@ impl Runtime {
         } else {
             all.remove(buffer_id);
         }
+    }
+
+    /// Marks a buffer as one the service says should stay quiet. Unlike a
+    /// local mute this comes from the account itself, so it holds wherever
+    /// that account is signed in.
+    pub fn set_silenced(&self, buffer_id: &str, silenced: bool) {
+        let mut all = self.silenced.lock().unwrap();
+        if silenced {
+            all.insert(buffer_id.to_string());
+        } else {
+            all.remove(buffer_id);
+        }
+    }
+
+    fn is_silenced(&self, buffer_id: &str) -> bool {
+        self.silenced.lock().unwrap().contains(buffer_id)
     }
 
     fn is_replaying(&self, buffer_id: &str) -> bool {
@@ -2723,7 +2780,9 @@ impl Runtime {
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
-        if from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id) {
+        if from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
+            && !self.is_silenced(&buffer.id)
+        {
             state.events.emit(
                 "notification",
                 json!({

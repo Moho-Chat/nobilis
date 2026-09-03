@@ -45,6 +45,33 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                     }
                 }
             }
+            // The room has been replaced - a version upgrade, or a
+            // clear-out. The old room stops taking messages and points at its
+            // successor, and a client that ignores this shows the dead one as
+            // though the conversation had simply gone quiet.
+            //
+            // Joining the successor rather than only saying so: an upgrade is
+            // not a choice anybody made, and every other client follows it.
+            // The old room keeps its buffer, holding its history, with a line
+            // saying where the conversation went.
+            "m.room.tombstone" => {
+                let Some(successor) = event["content"]["replacement_room"].as_str() else { continue };
+                if state.runtime.matrix_buffer_for_room(successor).is_some() {
+                    continue;
+                }
+                let why = event["content"]["body"].as_str().unwrap_or("This room has been replaced");
+                if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, room_id) {
+                    state.runtime.record_message(
+                        state, account_id, &name, &kind, "*", why, false, "system", None, None, false, None,
+                        Vec::new(), Vec::new(), None,
+                    );
+                }
+                // Noted rather than joined here: the join registers the new
+                // room, which processes its state, which is this function.
+                // The sync loop follows it once it has finished with the
+                // response it is holding.
+                state.runtime.note_matrix_upgrade(account_id, successor);
+            }
             "m.room.member" => {
                 // Avatar cached even for a non-"join" membership content (a
                 // leave/ban event still carries the member's last-known
