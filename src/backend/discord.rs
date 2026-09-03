@@ -1534,6 +1534,14 @@ fn extract_body(d: &Value) -> Option<String> {
     if !content.is_empty() {
         parts.push(content.to_string());
     }
+    // A poll is the message when there is one, and a sticker this client
+    // cannot draw is at least a message that arrived.
+    if let Some(poll) = extract_poll(d) {
+        parts.push(poll);
+    }
+    for name in undrawable_sticker_names(d) {
+        parts.push(format!("sent a sticker: {name}"));
+    }
     if let Some(embeds) = d["embeds"].as_array() {
         for embed in embeds {
             // What Discord unfurled to get this embed. When that link is
@@ -2080,6 +2088,137 @@ fn is_empty_message(body: &str, embeds: &[Embed], attachments: &[Attachment]) ->
     body.is_empty() && embeds.is_empty() && attachments.is_empty()
 }
 
+#[cfg(test)]
+mod sticker_and_poll_tests {
+    use super::{extract_body, extract_poll, extract_stickers, is_empty_message};
+    use serde_json::json;
+
+    /// A sticker-only message carries no content, no embed and no attachment,
+    /// so it used to be dropped whole - it arrived as nothing at all, which
+    /// is the worst way for a message to go missing: nobody knows to look.
+    #[test]
+    fn a_sticker_only_message_is_a_message() {
+        let d = json!({ "content": "", "sticker_items": [{ "id": "42", "name": "sad cat", "format_type": 1 }] });
+        let stickers = extract_stickers(&d);
+        assert_eq!(stickers.len(), 1);
+        assert_eq!(stickers[0].filename.as_deref(), Some("sad cat.png"));
+        assert_eq!(stickers[0].url.as_deref(), Some("https://media.discordapp.net/stickers/42.png"));
+        assert!(!is_empty_message("", &[], &stickers));
+    }
+
+    #[test]
+    fn an_animated_sticker_keeps_its_own_format() {
+        let d = json!({ "sticker_items": [{ "id": "7", "name": "dance", "format_type": 4 }] });
+        assert_eq!(extract_stickers(&d)[0].url.as_deref(), Some("https://media.discordapp.net/stickers/7.gif"));
+    }
+
+    /// Lottie is a vector animation format nothing here can draw, so the
+    /// sticker becomes its name - not the sticker, but a message that
+    /// arrived, which is the whole point.
+    #[test]
+    fn a_sticker_we_cannot_draw_becomes_its_name() {
+        let d = json!({ "content": "", "sticker_items": [{ "id": "9", "name": "wave", "format_type": 3 }] });
+        assert!(extract_stickers(&d).is_empty());
+        assert_eq!(extract_body(&d).as_deref(), Some("sent a sticker: wave"));
+    }
+
+    /// A poll-only message used to arrive as nothing, so a channel went quiet
+    /// in the middle of a decision being made.
+    #[test]
+    fn a_poll_arrives_as_its_question_and_options() {
+        let d = json!({
+            "content": "",
+            "poll": {
+                "question": { "text": "Pizza?" },
+                "answers": [
+                    { "poll_media": { "text": "Yes" } },
+                    { "poll_media": { "text": "No", "emoji": { "name": "🙅" } } }
+                ]
+            }
+        });
+        let body = extract_body(&d).expect("a poll is a message");
+        assert!(body.contains("Pizza?"), "{body}");
+        assert!(body.contains("• Yes"), "{body}");
+        assert!(body.contains("• 🙅 No"), "{body}");
+    }
+
+    /// A marker alone on a line says less than nothing.
+    #[test]
+    fn a_poll_with_no_answers_is_not_shown() {
+        assert_eq!(extract_poll(&json!({ "poll": { "question": { "text": "?" }, "answers": [] } })), None);
+        assert_eq!(extract_poll(&json!({ "content": "hi" })), None);
+    }
+}
+
+/// The stickers on a message, as pictures.
+///
+/// A sticker-only message carries no content, no embed and no attachment, so
+/// it used to be dropped whole by is_empty_message - it arrived as nothing at
+/// all, which is the worst way for a message to go missing: nobody knows to
+/// look for it.
+///
+/// Lottie stickers are vector animations in a JSON format nothing here can
+/// draw, so those become their name in the body instead. A named sticker is
+/// not the sticker, but it is a message that arrived.
+fn extract_stickers(d: &Value) -> Vec<Attachment> {
+    d["sticker_items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|sticker| {
+            let id = sticker["id"].as_str()?;
+            let name = sticker["name"].as_str().unwrap_or("sticker");
+            // 1 PNG, 2 APNG, 3 Lottie, 4 GIF - Discord's own numbering.
+            let (extension, mimetype) = match sticker["format_type"].as_i64().unwrap_or(1) {
+                4 => ("gif", "image/gif"),
+                3 => return None,
+                _ => ("png", "image/png"),
+            };
+            Some(Attachment {
+                kind: "image".to_string(),
+                filename: Some(format!("{name}.{extension}")),
+                url: Some(format!("https://media.discordapp.net/stickers/{id}.{extension}")),
+                mimetype: Some(mimetype.to_string()),
+                ..Default::default()
+            })
+        })
+        .collect()
+}
+
+/// A poll, as the text of the question and its options.
+///
+/// Voting is Discord's own interactive machinery and is not implemented (see
+/// the slash-commands issue), but a poll-only message used to arrive as
+/// nothing - so a channel would go quiet in the middle of a decision being
+/// made. This is what was actually asked, which is the part that matters.
+fn extract_poll(d: &Value) -> Option<String> {
+    let poll = d.get("poll").filter(|p| p.is_object())?;
+    let question = poll["question"]["text"].as_str().unwrap_or("Poll");
+    let mut out = format!("📊 {question}");
+    for answer in poll["answers"].as_array().into_iter().flatten() {
+        let text = answer["poll_media"]["text"].as_str().unwrap_or("");
+        if text.is_empty() {
+            continue;
+        }
+        let emoji = answer["poll_media"]["emoji"]["name"].as_str().unwrap_or("");
+        out.push_str(&format!("\n• {emoji}{}{text}", if emoji.is_empty() { "" } else { " " }));
+    }
+    // A Lottie sticker or an empty poll would leave the marker alone on a
+    // line, which says less than nothing.
+    (out.lines().count() > 1).then_some(out)
+}
+
+/// The name of a sticker nothing here can draw - a Lottie animation.
+fn undrawable_sticker_names(d: &Value) -> Vec<String> {
+    d["sticker_items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|s| s["format_type"].as_i64() == Some(3))
+        .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect()
+}
+
 fn extract_attachments(d: &Value) -> Vec<Attachment> {
     let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
     atts.iter()
@@ -2218,7 +2357,8 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
         let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown");
         let is_own = author["id"].as_str() == Some(user_id);
         let embeds = extract_embeds(msg);
-        let attachments = extract_attachments(msg);
+        let mut attachments = extract_attachments(msg);
+        attachments.extend(extract_stickers(msg));
         let body = extract_body(msg).unwrap_or_default();
         if is_empty_message(&body, &embeds, &attachments) {
             continue;
@@ -3045,7 +3185,8 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             .unwrap_or("unknown")
                             .to_string();
                         let embeds = extract_embeds(d);
-                        let attachments = extract_attachments(d);
+                        let mut attachments = extract_attachments(d);
+                        attachments.extend(extract_stickers(d));
                         let body = extract_body(d).unwrap_or_default();
                         if is_empty_message(&body, &embeds, &attachments) {
                             continue;
@@ -3099,7 +3240,8 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             continue;
                         }
                         let embeds = extract_embeds(d);
-                        let attachments = extract_attachments(d);
+                        let mut attachments = extract_attachments(d);
+                        attachments.extend(extract_stickers(d));
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
