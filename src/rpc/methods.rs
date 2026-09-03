@@ -3,7 +3,6 @@ use crate::accounts::IrcAccountConfig;
 use crate::backend;
 use crate::state::AppState;
 use serde_json::Value;
-use std::collections::HashSet;
 
 /// One handler per JSON-RPC method (daemon/nobilis/api.c's handle_request,
 /// split out of the socket-framing code). Returns (result, error) - exactly
@@ -27,7 +26,7 @@ pub async fn dispatch(
     state: &AppState,
     method: &str,
     params: &Value,
-    subscriptions: &mut HashSet<String>,
+    subscriptions: &super::Subscriptions,
 ) -> (Option<Value>, Option<String>) {
     match method {
         "listAccounts" => (Some(serde_json::to_value(state.runtime.list_accounts(state)).unwrap()), None),
@@ -101,7 +100,16 @@ pub async fn dispatch(
         // network first, and the caller's socket closing is the real signal
         // that it is gone.
         "shutdown" => {
-            state.shutdown.notify_one();
+            // After a moment, not now. Requests are answered in their own
+            // tasks, so the "ok" to this one is still on its way to the
+            // connection loop - and a daemon that exits first answers the
+            // request to stop by dropping the socket, which a client cannot
+            // tell apart from a crash.
+            let state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                state.shutdown.notify_one();
+            });
             (Some(ok_node()), None)
         }
 
@@ -249,7 +257,7 @@ pub async fn dispatch(
         "subscribe" => match p_str_opt(params, "bufferId") {
             None => (None, Some("subscribe requires \"bufferId\"".to_string())),
             Some(buffer_id) => {
-                subscriptions.insert(buffer_id.to_string());
+                subscriptions.lock().unwrap().insert(buffer_id.to_string());
                 // Replay the last-known member list immediately - a fresh
                 // subscribe otherwise only sees *future* presenceChange
                 // pushes (join/part/etc.), leaving the userlist empty
@@ -269,7 +277,7 @@ pub async fn dispatch(
 
         "unsubscribe" => {
             if let Some(buffer_id) = p_str_opt(params, "bufferId") {
-                subscriptions.remove(buffer_id);
+                subscriptions.lock().unwrap().remove(buffer_id);
             }
             (Some(ok_node()), None)
         }
