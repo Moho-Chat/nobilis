@@ -5,8 +5,8 @@
 //! this at all - there's no public API, just the rendered page itself).
 //!
 //! The images themselves are bundled with the client under its own
-//! sockchat-smilies/ resource directory (which the client resolves against its
-//! own install root - see the listSockchatSmilies RPC) rather than fetched from
+//! sneedchat-smilies/ resource directory (which the client resolves against its
+//! own install root - see the listSneedchatSmilies RPC) rather than fetched from
 //! kiwifarms.st at runtime - deliberate: this table is static and small (~1.8MB
 //! total), so there's no reason to depend on a live Tor-routed fetch (and its
 //! failure modes) just to show something this project already has a permanent,
@@ -14,7 +14,7 @@
 
 pub struct Smilie {
     pub label: &'static str,
-    /// Filename within sockchat-smilies/ (relative to the client's own
+    /// Filename within sneedchat-smilies/ (relative to the client's own
     /// resource directory, not this crate's) - not a URL or a path on disk
     /// nobilis itself resolves; the client builds the actual URL.
     pub file: &'static str,

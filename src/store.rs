@@ -114,6 +114,17 @@ impl Store {
             let _ = conn.execute(stmt, []);
         }
 
+        // Sneedchat's account ids used to be spelled "sockchat:", after the
+        // implementation this backend was written by studying rather than
+        // after the chat itself. Buffer ids are built from the account id, so
+        // every message ever stored for it carries the old spelling - and
+        // without this they would all belong to conversations that no longer
+        // exist under any name.
+        let _ = conn.execute(
+            "UPDATE messages SET buffer_id = 'sneedchat:' || substr(buffer_id, 10) WHERE buffer_id LIKE 'sockchat:%'",
+            [],
+        );
+
         // A message id identifies a message, so recording one twice is always
         // a mistake - but nothing said so, and a backend that replays history
         // on reconnect quietly stacked up copies. Sneedchat did: seven
@@ -230,7 +241,7 @@ impl Store {
     }
 
     /// Like update_message_body, but doesn't set `edited` - for backend-
-    /// internal rewrites of a message's own body (e.g. backend/sockchat's
+    /// internal rewrites of a message's own body (e.g. backend/sneedchat's
     /// attachment-link resolution swapping in a Tor-fetched local copy
     /// once ready) that aren't a real user edit and shouldn't show an
     /// "(edited)" label.

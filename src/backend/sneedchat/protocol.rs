@@ -1,7 +1,7 @@
 //! Wire format of server frames.
 //!
-//! Ported from sockchat-rs's `chat/json.rs` + `chat/msg.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>). Frames are usually a JSON
+//! Ported from sneedchat-rs's `chat/json.rs` + `chat/msg.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>). Frames are usually a JSON
 //! object, but the server also sends bare plaintext - typically errors such
 //! as "You cannot join this room." Anything that doesn't start with `{` is
 //! treated as plaintext rather than being dropped.
@@ -77,7 +77,7 @@ pub struct WireUser {
     pub username: String,
     /// A relative path (e.g. `/data/avatars/l/.../123.jpg`, needing the
     /// account's own host prefixed) or an already-absolute URL - resolving
-    /// that, and fetching+caching the actual image, is backend/sockchat/
+    /// that, and fetching+caching the actual image, is backend/sneedchat/
     /// mod.rs's job (this module only carries the wire shape faithfully).
     #[serde(default)]
     pub avatar_url: Option<String>,
@@ -245,7 +245,7 @@ impl ServerResponse {
         // said `Whisper`. Worth keeping for the next such question.
         if !raw.extra.is_empty() {
             let shape: Vec<String> = raw.extra.iter().map(|(k, v)| format!("{k}: {}", outline(v))).collect();
-            tracing::debug!("sockchat: frame carried undecoded keys - {}", shape.join(", "));
+            tracing::debug!("sneedchat: frame carried undecoded keys - {}", shape.join(", "));
         }
 
         let users_joined: Vec<WireUser> = raw.users.into_values().collect();

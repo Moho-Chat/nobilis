@@ -1,7 +1,7 @@
 //! KiwiFlare / Tartarus proof-of-work gate.
 //!
-//! Ported from sockchat-rs's `net/kiwiflare.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>). The proxy in front of the
+//! Ported from sneedchat-rs's `net/kiwiflare.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>). The proxy in front of the
 //! service answers a gated request with HTTP 203 and a challenge page whose
 //! `<html>` element carries `data-ttrs-*` attributes. The client finds a
 //! nonce such that `SHA-256(salt ++ nonce)` has some number of leading zero

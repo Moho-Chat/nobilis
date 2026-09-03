@@ -60,12 +60,12 @@ pub struct Account {
     #[serde(rename = "avatarUrl", skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
     /// Currently-enabled Sneedchat rooms (empty for every other service) -
-    /// see accounts.rs's SockChatRoom / the setSockChatRooms RPC. There's
+    /// see accounts.rs's SneedChatRoom / the setSneedChatRooms RPC. There's
     /// no server-side "list every room" endpoint wired up yet, so the
     /// settings UI's own known-channel catalog cross-references against
     /// this to know which toggles should show as on.
-    #[serde(rename = "sockchatRooms", skip_serializing_if = "Vec::is_empty")]
-    pub sockchat_rooms: Vec<SockChatRoomInfo>,
+    #[serde(rename = "sneedchatRooms", skip_serializing_if = "Vec::is_empty")]
+    pub sneedchat_rooms: Vec<SneedChatRoomInfo>,
     #[serde(rename = "torMode", skip_serializing_if = "Option::is_none")]
     pub tor_mode: Option<String>,
     #[serde(rename = "torProxy", skip_serializing_if = "Option::is_none")]
@@ -84,10 +84,10 @@ pub struct Account {
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on
-/// `Account.sockchatRooms` - see accounts.rs's own SockChatRoom (the
+/// `Account.sneedchatRooms` - see accounts.rs's own SneedChatRoom (the
 /// persisted config shape this mirrors).
 #[derive(Serialize, Clone, Debug)]
-pub struct SockChatRoomInfo {
+pub struct SneedChatRoomInfo {
     pub id: u32,
     pub name: String,
 }
@@ -192,7 +192,7 @@ pub struct BufferGroup {
     pub id: String,
     #[serde(rename = "accountId")]
     pub account_id: String,
-    /// "irc" | "discord" | "sockchat" | "matrix" - what brand mark to fall
+    /// "irc" | "discord" | "sneedchat" | "matrix" - what brand mark to fall
     /// back to when there is no icon.
     pub service: String,
     /// "guild" | "space" | "dms" | "account".
@@ -459,7 +459,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("matrix") => "matrix",
         Some("discord") => "discord",
         Some("kick") => "kick",
-        Some("sockchat") => "sockchat",
+        Some("sneedchat") => "sneedchat",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
@@ -475,7 +475,7 @@ mod service_tests {
         assert_eq!(service_of("matrix:@a:example.org"), "matrix");
         assert_eq!(service_of("discord:167790743988076545"), "discord");
         assert_eq!(service_of("kick:someone"), "kick");
-        assert_eq!(service_of("sockchat:Ancient Pioneer"), "sockchat");
+        assert_eq!(service_of("sneedchat:Ancient Pioneer"), "sneedchat");
         // IRC is the one without a prefix, and a host with a port in it must
         // not be read as one.
         assert_eq!(service_of("Salastil@irc.libera.chat"), "irc");

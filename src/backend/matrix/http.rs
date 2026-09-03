@@ -128,7 +128,7 @@ pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
 
 /// Raw bytes, not JSON - for media downloads (see mod.rs's media caching).
 /// Returns the HTTP status and body regardless of success, same shape as
-/// backend/sockchat/http.rs's own get_bytes, so callers can distinguish
+/// backend/sneedchat/http.rs's own get_bytes, so callers can distinguish
 /// "fetch itself failed" from "server returned a non-2xx".
 pub async fn get_bytes(url: &str, token: &str) -> Result<(u16, Vec<u8>)> {
     let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;

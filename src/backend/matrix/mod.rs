@@ -820,7 +820,7 @@ async fn handle_timeline_event(
 /// reaction event we've seen - see Runtime::take_matrix_reaction_target).
 /// Tries the reaction path first since it's a cheap map lookup+remove;
 /// falls back to treating it as a message delete otherwise, matching the
-/// same "try, then fall back" precedent backend/sockchat/mod.rs uses for
+/// same "try, then fall back" precedent backend/sneedchat/mod.rs uses for
 /// its own ambiguous edit-vs-insert wire signal.
 fn handle_redaction(state: &AppState, buffer_id: &str, target_event: &str) {
     if let Some((target_buffer, msg_id, emoji, is_me)) = state.runtime.take_matrix_reaction_target(target_event) {
@@ -881,7 +881,7 @@ async fn thumbnail_for(content: &Value, homeserver_url: &str, access_token: &str
 }
 
 /// Matrix's own mxc:// media ids carry no file extension - unlike
-/// backend/sockchat/mod.rs's cached attachments, which keep whatever
+/// backend/sneedchat/mod.rs's cached attachments, which keep whatever
 /// extension the original filename already had. The cached file still gets a
 /// real extension so that anything reading it off disk (an image viewer the
 /// user opens it in, a frontend sniffing by name) sees the right type - but
@@ -916,7 +916,7 @@ fn extension_for_mimetype(mimetype: &str) -> &'static str {
 /// caching it first if needed - a plain QML `Image`/media element has no
 /// route to send the `Authorization: Bearer` header Matrix's media
 /// endpoint requires, so the raw remote URL would simply never load (same
-/// reasoning backend/sockchat/mod.rs's own avatar caching already
+/// reasoning backend/sneedchat/mod.rs's own avatar caching already
 /// documents). Cached permanently per media id for this daemon's
 /// lifetime - see MEDIA_CACHE_MAX_BYTES/sweep_media_cache for the size
 /// cap that keeps that bounded. `extension` (from extension_for_mimetype,
@@ -1057,13 +1057,13 @@ fn media_cache_dir() -> std::path::PathBuf {
 }
 
 /// Cap on the media cache's total size on disk - same unbounded-growth
-/// concern (and same fix) as backend/sockchat/mod.rs's avatar/attachment
+/// concern (and same fix) as backend/sneedchat/mod.rs's avatar/attachment
 /// caches: every distinct piece of media ever seen would otherwise
 /// accumulate its own permanently-cached file forever.
 pub const MEDIA_CACHE_MAX_BYTES: u64 = 250 * 1024 * 1024;
 /// Evicts the oldest-written files in the media cache until it's back
 /// under MEDIA_CACHE_MAX_BYTES - oldest-by-mtime, same simplification
-/// backend/sockchat/mod.rs's own sweep_cache_dir documents (not true LRU,
+/// backend/sneedchat/mod.rs's own sweep_cache_dir documents (not true LRU,
 /// but a reasonable approximation without an extra dependency).
 pub async fn sweep_media_cache() {
     let dir = media_cache_dir();
@@ -2112,7 +2112,7 @@ pub async fn send_message(
 
 /// `m.room.message` msgtype + upload Content-Type for a local file, chosen
 /// from its extension - a reasonable guess without needing to sniff file
-/// contents, same convention backend/sockchat/mod.rs's own attachment
+/// contents, same convention backend/sneedchat/mod.rs's own attachment
 /// handling uses. Shared by both the plaintext and encrypted upload paths
 /// below - only the mime half is unused by the encrypted one (see its own
 /// doc comment on why the upload itself always goes out as opaque bytes
@@ -2367,7 +2367,7 @@ async fn joined_member_ids(base: &str, access_token: &str, room_id: &str) -> Res
 }
 
 /// Kicks off a login attempt in the background - see backend/discord.rs's
-/// start_qr_login/backend/sockchat's start_login for the identical
+/// start_qr_login/backend/sneedchat's start_login for the identical
 /// async-kickoff shape. Progress/result arrive via matrixLoginStatus/
 /// matrixLoginResult events tagged with `login_id`, not the RPC response
 /// (see rpc/methods.rs's addMatrixAccount).

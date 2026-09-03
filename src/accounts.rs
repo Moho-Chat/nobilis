@@ -103,58 +103,58 @@ impl DiscordAccountConfig {
 }
 
 /// One configured room to maintain a permanent connection to - see
-/// backend/sockchat/mod.rs, which opens one websocket per room rather than
+/// backend/sneedchat/mod.rs, which opens one websocket per room rather than
 /// switching a single connection between them (the earlier v1 approach).
 /// `name` is the room's real, human-chosen name (e.g. "general") - the
 /// server has no endpoint this backend uses to look names up on its own,
 /// so it's supplied at account-creation time, same spirit as an IRC
 /// account's autojoin list being user-provided rather than discovered.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct SockChatRoom {
+pub struct SneedChatRoom {
     pub id: u32,
     pub name: String,
 }
 
-/// Sneedchat (SockChat) account shape. Unlike Discord's token, the daemon
+/// Sneedchat (SneedChat) account shape. Unlike Discord's token, the daemon
 /// needs the raw username/password on hand indefinitely (not just an opaque
 /// session token) because the XenForo session cookie this backend logs in
 /// with can expire and has to be re-derived by logging in again - see
-/// backend/sockchat/auth.rs's `Session::refresh`.
+/// backend/sneedchat/auth.rs's `Session::refresh`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
-pub struct SockChatAccountConfig {
+pub struct SneedChatAccountConfig {
     pub username: String,
     pub password: String,
     #[serde(default)]
     pub totp_secret: Option<String>,
-    #[serde(default = "default_sockchat_host")]
+    #[serde(default = "default_sneedchat_host")]
     pub host: String,
     #[serde(default = "default_tor_mode")]
     pub tor_mode: String,
     #[serde(default)]
     pub proxy: Option<String>,
-    #[serde(default = "default_sockchat_rooms")]
-    pub rooms: Vec<SockChatRoom>,
+    #[serde(default = "default_sneedchat_rooms")]
+    pub rooms: Vec<SneedChatRoom>,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
     pub user_id: Option<u32>,
 }
 
-fn default_sockchat_host() -> String {
-    crate::backend::sockchat::DEFAULT_ONION.to_string()
+fn default_sneedchat_host() -> String {
+    crate::backend::sneedchat::DEFAULT_ONION.to_string()
 }
 
 fn default_tor_mode() -> String {
     "embedded".to_string()
 }
 
-fn default_sockchat_rooms() -> Vec<SockChatRoom> {
-    vec![SockChatRoom { id: 1, name: "general".to_string() }]
+fn default_sneedchat_rooms() -> Vec<SneedChatRoom> {
+    vec![SneedChatRoom { id: 1, name: "general".to_string() }]
 }
 
-impl SockChatAccountConfig {
+impl SneedChatAccountConfig {
     pub fn account_id(&self) -> String {
-        format!("sockchat:{}", self.username)
+        format!("sneedchat:{}", self.username)
     }
 }
 
@@ -231,8 +231,12 @@ struct AccountsFile {
     irc: Vec<IrcAccountConfig>,
     #[serde(default, rename = "discord_account")]
     discord: Vec<DiscordAccountConfig>,
-    #[serde(default, rename = "sockchat_account")]
-    sockchat: Vec<SockChatAccountConfig>,
+    // Accepts the old spelling as well, because it is written into every
+    // existing accounts.toml. Sockchat was an implementation of this protocol
+    // that this backend was written by studying; the chat itself is Sneedchat,
+    // and calling it by the other name was a mistake that outlived its reason.
+    #[serde(default, rename = "sneedchat_account", alias = "sockchat_account")]
+    sneedchat: Vec<SneedChatAccountConfig>,
     #[serde(default, rename = "matrix_account")]
     matrix: Vec<MatrixAccountConfig>,
     #[serde(default, rename = "kick_account")]
@@ -247,28 +251,28 @@ pub struct AccountStore {
     path: PathBuf,
     irc: Mutex<HashMap<String, IrcAccountConfig>>,
     discord: Mutex<HashMap<String, DiscordAccountConfig>>,
-    sockchat: Mutex<HashMap<String, SockChatAccountConfig>>,
+    sneedchat: Mutex<HashMap<String, SneedChatAccountConfig>>,
     matrix: Mutex<HashMap<String, MatrixAccountConfig>>,
     kick: Mutex<HashMap<String, KickAccountConfig>>,
 }
 
 impl AccountStore {
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sockchat, matrix, kick) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
                 .with_context(|| format!("parsing {}", path.display()))?;
             let irc = file.irc.into_iter().map(|a| (a.account_id(), a)).collect();
             let discord = file.discord.into_iter().map(|a| (a.account_id(), a)).collect();
-            let sockchat = file.sockchat.into_iter().map(|a| (a.account_id(), a)).collect();
+            let sneedchat = file.sneedchat.into_iter().map(|a| (a.account_id(), a)).collect();
             let matrix = file.matrix.into_iter().map(|a| (a.account_id(), a)).collect();
             let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sockchat, matrix, kick)
+            (irc, discord, sneedchat, matrix, kick)
         } else {
             (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
-        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sockchat: Mutex::new(sockchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick) })
+        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sneedchat: Mutex::new(sneedchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick) })
     }
 
     /// Callers already hold whichever map they just mutated - the others
@@ -278,14 +282,14 @@ impl AccountStore {
         &self,
         irc: &HashMap<String, IrcAccountConfig>,
         discord: &HashMap<String, DiscordAccountConfig>,
-        sockchat: &HashMap<String, SockChatAccountConfig>,
+        sneedchat: &HashMap<String, SneedChatAccountConfig>,
         matrix: &HashMap<String, MatrixAccountConfig>,
         kick: &HashMap<String, KickAccountConfig>,
     ) -> Result<()> {
         let file = AccountsFile {
             irc: irc.values().cloned().collect(),
             discord: discord.values().cloned().collect(),
-            sockchat: sockchat.values().cloned().collect(),
+            sneedchat: sneedchat.values().cloned().collect(),
             matrix: matrix.values().cloned().collect(),
             kick: kick.values().cloned().collect(),
         };
@@ -325,7 +329,7 @@ impl AccountStore {
             return Ok(None);
         }
         irc.insert(id, config.clone());
-        self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(Some(config))
     }
 
@@ -346,25 +350,25 @@ impl AccountStore {
         let id = config.account_id();
         let mut discord = self.discord.lock().unwrap();
         discord.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
-    pub fn get_sockchat(&self, account_id: &str) -> Option<SockChatAccountConfig> {
-        self.sockchat.lock().unwrap().get(account_id).cloned()
+    pub fn get_sneedchat(&self, account_id: &str) -> Option<SneedChatAccountConfig> {
+        self.sneedchat.lock().unwrap().get(account_id).cloned()
     }
 
-    pub fn all_sockchat(&self) -> Vec<SockChatAccountConfig> {
-        self.sockchat.lock().unwrap().values().cloned().collect()
+    pub fn all_sneedchat(&self) -> Vec<SneedChatAccountConfig> {
+        self.sneedchat.lock().unwrap().values().cloned().collect()
     }
 
     /// Upserts like add_discord - re-adding the same username is how a user
     /// updates a changed password/TOTP secret, not a duplicate mistake.
-    pub fn add_sockchat(&self, config: SockChatAccountConfig) -> Result<SockChatAccountConfig> {
+    pub fn add_sneedchat(&self, config: SneedChatAccountConfig) -> Result<SneedChatAccountConfig> {
         let id = config.account_id();
-        let mut sockchat = self.sockchat.lock().unwrap();
-        sockchat.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        sneedchat.insert(id, config.clone());
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -376,14 +380,14 @@ impl AccountStore {
         self.matrix.lock().unwrap().values().cloned().collect()
     }
 
-    /// Upserts like add_discord/add_sockchat - re-running addMatrixAccount
+    /// Upserts like add_discord/add_sneedchat - re-running addMatrixAccount
     /// for an already-added user_id is how a user refreshes a changed
     /// password, not a duplicate-creation mistake.
     pub fn add_matrix(&self, config: MatrixAccountConfig) -> Result<MatrixAccountConfig> {
         let id = config.account_id();
         let mut matrix = self.matrix.lock().unwrap();
         matrix.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -401,7 +405,7 @@ impl AccountStore {
         let id = config.account_id();
         let mut kick = self.kick.lock().unwrap();
         kick.insert(id, config.clone());
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(config)
     }
 
@@ -414,7 +418,7 @@ impl AccountStore {
             return Ok(false);
         }
         config.followed_synced = true;
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(true)
     }
 
@@ -430,7 +434,7 @@ impl AccountStore {
             return Ok(false);
         }
         config.channels = channels;
-        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(true)
     }
 
@@ -446,7 +450,7 @@ impl AccountStore {
             Some(a) => {
                 a.access_token = access_token.to_string();
                 a.device_id = device_id.to_string();
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -460,23 +464,23 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.next_batch = Some(next_batch.to_string());
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
     }
 
     /// Replaces the account's configured room list - takes effect on the
-    /// next reconnect (see backend/sockchat::spawn, called after this by
+    /// next reconnect (see backend/sneedchat::spawn, called after this by
     /// the RPC handler so it applies immediately rather than waiting for a
     /// daemon restart).
-    pub fn set_sockchat_rooms(&self, account_id: &str, rooms: Vec<SockChatRoom>) -> Result<bool> {
-        let mut sockchat = self.sockchat.lock().unwrap();
-        match sockchat.get_mut(account_id) {
+    pub fn set_sneedchat_rooms(&self, account_id: &str, rooms: Vec<SneedChatRoom>) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
                 a.rooms = rooms;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -484,17 +488,17 @@ impl AccountStore {
 
     /// Updates the account's transport mode (embedded Tor vs an external
     /// SOCKS5 proxy) - takes effect on the next reconnect, same as
-    /// set_sockchat_rooms (the RPC handler re-spawns the account
+    /// set_sneedchat_rooms (the RPC handler re-spawns the account
     /// immediately after this succeeds, rather than waiting for the user
     /// to notice and reconnect manually).
-    pub fn set_sockchat_tor_config(&self, account_id: &str, tor_mode: String, proxy: Option<String>) -> Result<bool> {
-        let mut sockchat = self.sockchat.lock().unwrap();
-        match sockchat.get_mut(account_id) {
+    pub fn set_sneedchat_tor_config(&self, account_id: &str, tor_mode: String, proxy: Option<String>) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
                 a.tor_mode = tor_mode;
                 a.proxy = proxy;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -503,13 +507,13 @@ impl AccountStore {
     /// Called after a successful login once the `xf_user` cookie reveals the
     /// account's numeric id - best-effort, not required for the backend to
     /// function.
-    pub fn set_sockchat_user_id(&self, account_id: &str, user_id: u32) -> Result<bool> {
-        let mut sockchat = self.sockchat.lock().unwrap();
-        match sockchat.get_mut(account_id) {
+    pub fn set_sneedchat_user_id(&self, account_id: &str, user_id: u32) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
                 a.user_id = Some(user_id);
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -519,34 +523,34 @@ impl AccountStore {
         {
             let mut irc = self.irc.lock().unwrap();
             if irc.remove(account_id).is_some() {
-                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut discord = self.discord.lock().unwrap();
             if discord.remove(account_id).is_some() {
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
-            let mut sockchat = self.sockchat.lock().unwrap();
-            if sockchat.remove(account_id).is_some() {
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sockchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+            let mut sneedchat = self.sneedchat.lock().unwrap();
+            if sneedchat.remove(account_id).is_some() {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut matrix = self.matrix.lock().unwrap();
             if matrix.remove(account_id).is_some() {
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         let mut kick = self.kick.lock().unwrap();
         if kick.remove(account_id).is_some() {
-            self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
+            self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
             return Ok(true);
         }
         Ok(false)
@@ -589,7 +593,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.avatar_url = Some(url.to_string());
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -614,7 +618,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.display_name = if name.is_empty() { None } else { Some(name.to_string()) };
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -663,7 +667,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 f(a);
-                self.persist(&irc, &self.discord.lock().unwrap(), &self.sockchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -694,7 +698,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         ssl: a.ssl,
         has_password: a.password.as_deref().is_some_and(|p| !p.is_empty()),
         avatar_url: None,
-        sockchat_rooms: Vec::new(),
+        sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: a.tor_proxy.clone(),
         use_tor: a.use_tor,
@@ -723,7 +727,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         ssl: true,
         has_password: !a.token.is_empty(),
         avatar_url: a.avatar_url.clone(),
-        sockchat_rooms: Vec::new(),
+        sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
         use_tor: false,
@@ -733,10 +737,10 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
 
 /// Sneedchat has none of IRC's autojoin/SASL/NickServ concepts either -
 /// same zero-value convention as discord_account_to_json.
-pub fn sockchat_account_to_json(a: &SockChatAccountConfig, state: &str) -> Account {
+pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Account {
     Account {
         id: a.account_id(),
-        service: "sockchat".to_string(),
+        service: "sneedchat".to_string(),
         status: "online".to_string(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
@@ -751,7 +755,7 @@ pub fn sockchat_account_to_json(a: &SockChatAccountConfig, state: &str) -> Accou
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
-        sockchat_rooms: a.rooms.iter().map(|r| crate::model::SockChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
+        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
         use_tor: false,
@@ -788,7 +792,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         ssl: true,
         has_password: a.token.as_deref().is_some_and(|t| !t.is_empty()),
         avatar_url: None,
-        sockchat_rooms: Vec::new(),
+        sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
         use_tor: false,
@@ -797,7 +801,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
 }
 
 /// Matrix has none of IRC's autojoin/SASL/NickServ concepts either - same
-/// zero-value convention as discord_account_to_json/sockchat_account_to_json.
+/// zero-value convention as discord_account_to_json/sneedchat_account_to_json.
 /// `has_key_backup` comes from the caller (Runtime::list_accounts) rather
 /// than being derivable from `a` alone - it reflects live in-memory
 /// BackupMachine state (see runtime.rs's matrix_backup_enabled), not
@@ -820,7 +824,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
-        sockchat_rooms: Vec::new(),
+        sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
         use_tor: false,

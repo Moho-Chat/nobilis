@@ -385,10 +385,10 @@ pub struct Runtime {
     discord_friends: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Sneedchat-specific: account id -> room id -> outgoing-frame sender.
     /// Unlike a single active-room connection, every configured room gets
-    /// its own permanent websocket (see backend/sockchat/mod.rs), so
+    /// its own permanent websocket (see backend/sneedchat/mod.rs), so
     /// sending has to target the specific room's own socket rather than
     /// one shared per-account sender.
-    sockchat_senders: Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
+    sneedchat_senders: Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
@@ -561,7 +561,7 @@ pub struct Runtime {
     /// case that fires.
     replaying: Mutex<std::collections::HashSet<String>>,
     /// (account, room) -> the motd last shown there, so it is shown once.
-    sockchat_motds: Mutex<HashMap<(String, String), String>>,
+    sneedchat_motds: Mutex<HashMap<(String, String), String>>,
     /// (account, channel, split message) -> who has gone, so far.
     ///
     /// A netsplit takes everybody on the far side of it away at once, which
@@ -584,7 +584,7 @@ pub struct Runtime {
     /// Cached because reading it costs a Tor round trip and a proof-of-work
     /// gate - fifteen seconds is normal - and the answer changes about as
     /// often as the site adds a room.
-    sockchat_rooms: Mutex<HashMap<String, Vec<crate::accounts::SockChatRoom>>>,
+    sneedchat_rooms: Mutex<HashMap<String, Vec<crate::accounts::SneedChatRoom>>>,
     /// Matrix-specific: (account id, user id) -> whether /sync's top-level
     /// presence.events last reported them as "online". Absent (never seen
     /// a presence event for them) is treated as offline - Matrix has no
@@ -624,7 +624,7 @@ impl Runtime {
             discord_history_inflight: Mutex::new(HashSet::new()),
             discord_buffer_emojis: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
-            sockchat_senders: Mutex::new(HashMap::new()),
+            sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
@@ -654,8 +654,8 @@ impl Runtime {
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
             replaying: Mutex::new(std::collections::HashSet::new()),
-            sockchat_motds: Mutex::new(HashMap::new()),
-            sockchat_rooms: Mutex::new(HashMap::new()),
+            sneedchat_motds: Mutex::new(HashMap::new()),
+            sneedchat_rooms: Mutex::new(HashMap::new()),
             irc_splits: Mutex::new(HashMap::new()),
             irc_whois: Mutex::new(HashMap::new()),
             irc_away: Mutex::new(HashMap::new()),
@@ -706,10 +706,10 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::discord_account_to_json(cfg, conn)
         }));
-        out.extend(state.accounts.all_sockchat().iter().map(|cfg| {
+        out.extend(state.accounts.all_sneedchat().iter().map(|cfg| {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
-            crate::accounts::sockchat_account_to_json(cfg, conn)
+            crate::accounts::sneedchat_account_to_json(cfg, conn)
         }));
         out.extend(state.accounts.all_matrix().iter().map(|cfg| {
             let id = cfg.account_id();
@@ -2090,12 +2090,12 @@ impl Runtime {
         self.irc_away.lock().unwrap().get(account_id).is_some_and(|set| set.contains(&nick.to_lowercase()))
     }
 
-    pub fn sockchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SockChatRoom>> {
-        self.sockchat_rooms.lock().unwrap().get(account_id).cloned()
+    pub fn sneedchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SneedChatRoom>> {
+        self.sneedchat_rooms.lock().unwrap().get(account_id).cloned()
     }
 
-    pub fn set_sockchat_room_catalogue(&self, account_id: &str, rooms: Vec<crate::accounts::SockChatRoom>) {
-        self.sockchat_rooms.lock().unwrap().insert(account_id.to_string(), rooms);
+    pub fn set_sneedchat_room_catalogue(&self, account_id: &str, rooms: Vec<crate::accounts::SneedChatRoom>) {
+        self.sneedchat_rooms.lock().unwrap().insert(account_id.to_string(), rooms);
     }
 
     /// Whether this is the first time this room has said this particular
@@ -2104,8 +2104,8 @@ impl Runtime {
     /// Keyed by room, holding the text: the site re-sends the motd on every
     /// reconnect, and a room that reconnects often would otherwise collect a
     /// line of it each time. A changed motd is genuinely new and does show.
-    pub fn take_new_sockchat_motd(&self, account_id: &str, room: &str, motd: &str) -> bool {
-        let mut seen = self.sockchat_motds.lock().unwrap();
+    pub fn take_new_sneedchat_motd(&self, account_id: &str, room: &str, motd: &str) -> bool {
+        let mut seen = self.sneedchat_motds.lock().unwrap();
         let key = (account_id.to_string(), room.to_string());
         if seen.get(&key).map(String::as_str) == Some(motd) {
             return false;
@@ -2184,8 +2184,8 @@ impl Runtime {
             .collect()
     }
 
-    pub fn insert_sockchat_sender(&self, account_id: &str, room: u32, sender: tokio::sync::mpsc::UnboundedSender<String>) {
-        self.sockchat_senders.lock().unwrap().entry(account_id.to_string()).or_default().insert(room, sender);
+    pub fn insert_sneedchat_sender(&self, account_id: &str, room: u32, sender: tokio::sync::mpsc::UnboundedSender<String>) {
+        self.sneedchat_senders.lock().unwrap().entry(account_id.to_string()).or_default().insert(room, sender);
     }
 
     /// Only removes the entry if it's still exactly the sender being torn
@@ -2201,8 +2201,8 @@ impl Runtime {
     /// currently connected to this room" for no visible reason - confirmed
     /// as the actual cause of a real "can't send to #fishtank, but still
     /// receiving" report.
-    pub fn remove_sockchat_sender(&self, account_id: &str, room: u32, sender: &tokio::sync::mpsc::UnboundedSender<String>) {
-        if let Some(rooms) = self.sockchat_senders.lock().unwrap().get_mut(account_id) {
+    pub fn remove_sneedchat_sender(&self, account_id: &str, room: u32, sender: &tokio::sync::mpsc::UnboundedSender<String>) {
+        if let Some(rooms) = self.sneedchat_senders.lock().unwrap().get_mut(account_id) {
             if rooms.get(&room).is_some_and(|current| current.same_channel(sender)) {
                 rooms.remove(&room);
             }
@@ -2211,7 +2211,7 @@ impl Runtime {
 
     /// Drops every room's sender for this account - called when the whole
     /// account-level connection is being rebuilt from scratch (see
-    /// backend::sockchat::run_with_retry), so a stale sender from a
+    /// backend::sneedchat::run_with_retry), so a stale sender from a
     /// pre-restart room task can't be mistaken for a live one.
     /// What this daemon knows about one watched Kick channel.
     ///
@@ -2413,12 +2413,12 @@ impl Runtime {
         self.kick_senders.lock().unwrap().remove(account_id);
     }
 
-    pub fn clear_sockchat_senders(&self, account_id: &str) {
-        self.sockchat_senders.lock().unwrap().remove(account_id);
+    pub fn clear_sneedchat_senders(&self, account_id: &str) {
+        self.sneedchat_senders.lock().unwrap().remove(account_id);
     }
 
-    pub fn sockchat_sender(&self, account_id: &str, room: u32) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
-        self.sockchat_senders.lock().unwrap().get(account_id).and_then(|rooms| rooms.get(&room)).cloned()
+    pub fn sneedchat_sender(&self, account_id: &str, room: u32) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.sneedchat_senders.lock().unwrap().get(account_id).and_then(|rooms| rooms.get(&room)).cloned()
     }
 
     /// Sends QUIT to every currently-connected account - called on
@@ -2673,7 +2673,7 @@ impl Runtime {
     /// A live edit (Discord's MESSAGE_UPDATE) - a no-op broadcast-wise if
     /// the message was never recorded locally (nothing visible to update).
     /// Returns whether a row was actually found and updated - backend/
-    /// sockchat/mod.rs uses this to fall back to inserting a new message
+    /// sneedchat/mod.rs uses this to fall back to inserting a new message
     /// when an "edit" (a message_edit_date bump) arrives for a uuid it
     /// never actually stored, e.g. seeing a message for the first time
     /// that already carries prior edit history.
@@ -2692,7 +2692,7 @@ impl Runtime {
     }
 
     /// Like update_message, but for a backend-internal body rewrite that
-    /// isn't a real user edit (see backend/sockchat's attachment-link
+    /// isn't a real user edit (see backend/sneedchat's attachment-link
     /// resolution) - doesn't set the `edited` flag either in storage or in
     /// the emitted event, so the frontend's "(edited)" label doesn't show
     /// up for something the user never touched.

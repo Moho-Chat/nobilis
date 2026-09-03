@@ -34,7 +34,7 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// event loop, and when that ends it waits and connects again.
 ///
 /// It used to stop instead, which made a momentary drop permanent - the one
-/// backend where that was true, since sockchat, Discord and Matrix have all
+/// backend where that was true, since sneedchat, Discord and Matrix have all
 /// had retry loops for a while. Recovering meant noticing and reconnecting
 /// by hand, and on a client left running all day the noticing is the part
 /// that does not happen.

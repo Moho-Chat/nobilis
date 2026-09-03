@@ -42,7 +42,7 @@ qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# Sneedchat backend (SockChat over embedded Tor)
+# Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.44", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }
 tor-rtcompat = { version = "0.44", features = ["tokio", "rustls"] }
 tokio-socks = "0.5"

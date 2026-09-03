@@ -6,4 +6,4 @@ pub mod irc_dcc;
 pub mod irc_sasl;
 pub mod kick;
 pub mod matrix;
-pub mod sockchat;
+pub mod sneedchat;

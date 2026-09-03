@@ -1,7 +1,7 @@
 //! A small HTTP/1.1 client that rides our [`Transport`].
 //!
-//! Ported from sockchat-rs's `net/http.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>). `reqwest` (already used by
+//! Ported from sneedchat-rs's `net/http.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>). `reqwest` (already used by
 //! `backend/discord.rs`) cannot use an in-process Arti stream as its
 //! connector - it only knows how to dial its own connector or a SOCKS5
 //! proxy *URL* - so rather than run two different transport stacks for this
@@ -249,7 +249,7 @@ impl HttpClient {
     /// POSTs an arbitrary mix of plain fields and one file as a single
     /// `multipart/form-data` request (postimg.cc's upload needs `gallery`/
     /// `optsize`/`expire`/`numfiles`/`upload_session` alongside the file
-    /// itself - see backend/sockchat/mod.rs's send_attachment).
+    /// itself - see backend/sneedchat/mod.rs's send_attachment).
     /// `extra_headers` threads straight through to send_once_raw_bytes.
     pub async fn post_multipart(&self, url: &str, fields: &[MultipartField<'_>], extra_headers: &[(&str, &str)]) -> Result<(u16, Bytes)> {
         let boundary = format!("nobilis{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());

@@ -222,8 +222,8 @@ async fn main() -> Result<()> {
     for cfg in state.accounts.all_discord() {
         backend::discord::spawn(state.clone(), cfg);
     }
-    for cfg in state.accounts.all_sockchat() {
-        backend::sockchat::spawn(state.clone(), cfg);
+    for cfg in state.accounts.all_sneedchat() {
+        backend::sneedchat::spawn(state.clone(), cfg);
     }
     for cfg in state.accounts.all_matrix() {
         backend::matrix::spawn(state.clone(), cfg);
@@ -272,7 +272,7 @@ async fn main() -> Result<()> {
 /// long as this daemon process stays up: scrollback (a busy buffer left
 /// open for months of uptime never stops growing on its own) and the
 /// Sneedchat avatar cache (every distinct poster ever seen gets a
-/// permanently-cached file - see backend/sockchat/mod.rs's
+/// permanently-cached file - see backend/sneedchat/mod.rs's
 /// cached_avatar_path). Neither is a one-time startup cost, so this
 /// re-runs periodically rather than once.
 async fn run_housekeeping(state: AppState) {
@@ -304,13 +304,13 @@ async fn run_housekeeping(state: AppState) {
             Ok(n) => tracing::info!("transfers: forgot {n} old record(s)"),
         }
 
-        backend::sockchat::sweep_avatar_cache().await;
-        backend::sockchat::sweep_attachment_cache().await;
+        backend::sneedchat::sweep_avatar_cache().await;
+        backend::sneedchat::sweep_attachment_cache().await;
         backend::matrix::sweep_media_cache().await;
         backend::discord::sweep_thumbnail_cache().await;
         backend::discord::sweep_guild_icon_cache().await;
 
-        tokio::time::sleep(backend::sockchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
+        tokio::time::sleep(backend::sneedchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
     }
 }
 

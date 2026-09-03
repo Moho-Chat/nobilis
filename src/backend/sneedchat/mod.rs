@@ -1,7 +1,7 @@
-//! "Sneedchat" - SockChat, the XenForo-based chat plugin used by Kiwi Farms
+//! "Sneedchat" - SneedChat, the XenForo-based chat plugin used by Kiwi Farms
 //! (`kiwifarms.st` / its `.onion`). Reachable only through Tor in practice;
 //! see `net::tor` for the embedded-Tor/SOCKS5-proxy transport this backend
-//! runs on. Ported from sockchat-rs (<https://gitgud.io/jcmoon/sockchat-rs>).
+//! runs on. Ported from sneedchat-rs (<https://gitgud.io/jcmoon/sneedchat-rs>).
 //!
 //! A single websocket can only ever be joined to one room at a time - the
 //! server has no "subscribe to several" verb, only `/join <room_id>`, which
@@ -21,7 +21,7 @@ pub mod protocol;
 pub mod smilies;
 pub mod totp;
 
-use crate::accounts::{SockChatAccountConfig, SockChatRoom};
+use crate::accounts::{SneedChatAccountConfig, SneedChatRoom};
 use crate::net::tor::{BoxStream, Transport};
 use crate::runtime::ConnState;
 use crate::state::AppState;
@@ -44,9 +44,9 @@ pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Ge
 
 /// Spawns the background task that keeps a Sneedchat account's connection
 /// alive - the real-time equivalent of backend::discord::spawn. Called both
-/// right after a fresh addSockChatAccount and, from main.rs, for every
+/// right after a fresh addSneedChatAccount and, from main.rs, for every
 /// saved account on daemon startup.
-pub fn spawn(state: AppState, config: SockChatAccountConfig) {
+pub fn spawn(state: AppState, config: SneedChatAccountConfig) {
     let account_id = config.account_id();
     // Same guard as backend::discord::spawn - guarantees at most one live
     // connection per account (see Runtime::reset_connection's doc comment).
@@ -69,7 +69,7 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// same shape as backend::discord::run_gateway_with_retry, including "no
 /// give up permanently" - a bad password just keeps failing visibly rather
 /// than settling into a silently-stuck state.
-async fn run_with_retry(state: &AppState, config: &SockChatAccountConfig, account_id: &str) {
+async fn run_with_retry(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
@@ -77,15 +77,15 @@ async fn run_with_retry(state: &AppState, config: &SockChatAccountConfig, accoun
         let detail = match result {
             Ok(Ok(())) => "connection ended".to_string(),
             Ok(Err(e)) => {
-                tracing::warn!("sockchat[{account_id}]: {e:#}");
+                tracing::warn!("sneedchat[{account_id}]: {e:#}");
                 format!("{e:#}")
             }
             Err(_) => {
-                tracing::error!("sockchat[{account_id}]: connection task panicked");
+                tracing::error!("sneedchat[{account_id}]: connection task panicked");
                 "internal error (see nobilis logs)".to_string()
             }
         };
-        state.runtime.clear_sockchat_senders(account_id);
+        state.runtime.clear_sneedchat_senders(account_id);
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
         state.runtime.report_progress(state, account_id, &format!("{detail} - reconnecting in {}s...", delay.as_secs()));
         tokio::time::sleep(delay).await;
@@ -93,7 +93,7 @@ async fn run_with_retry(state: &AppState, config: &SockChatAccountConfig, accoun
     }
 }
 
-async fn build_transport(state: &AppState, config: &SockChatAccountConfig, account_id: &str) -> Result<Transport> {
+async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<Transport> {
     match config.tor_mode.as_str() {
         "proxy" => {
             let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
@@ -119,7 +119,7 @@ async fn build_transport(state: &AppState, config: &SockChatAccountConfig, accou
 /// and the id is a link to the forum profile where all of that lives, so that
 /// is what this offers rather than inventing the rest.
 pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
-    let mut profile = crate::profile::pending("sockchat", account_id, username);
+    let mut profile = crate::profile::pending("sneedchat", account_id, username);
     profile["pending"] = serde_json::json!(false);
 
     // The roster the room already has: their id and picture are in it.
@@ -132,7 +132,7 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
         {
             if let Some(id) = member["userId"].as_str() {
                 profile["id"] = serde_json::json!(id);
-                if let Some(config) = state.accounts.get_sockchat(account_id) {
+                if let Some(config) = state.accounts.get_sneedchat(account_id) {
                     crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.host));
                 }
             }
@@ -167,9 +167,9 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
     tokio::spawn(async move {
         match list_rooms(&state, &account_id).await {
             Ok(rooms) => {
-                state.runtime.set_sockchat_room_catalogue(&account_id, rooms.clone());
+                state.runtime.set_sneedchat_room_catalogue(&account_id, rooms.clone());
                 state.events.emit(
-                    "sockchatRooms",
+                    "sneedchatRooms",
                     serde_json::json!({
                         "accountId": account_id,
                         "rooms": rooms.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>(),
@@ -178,13 +178,13 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
             }
             // Not surfaced: the client already has a list to show, and a
             // failure here means it keeps showing it.
-            Err(e) => tracing::debug!("sockchat[{account_id}]: reading the room list: {e:#}"),
+            Err(e) => tracing::debug!("sneedchat[{account_id}]: reading the room list: {e:#}"),
         }
     });
 }
 
-pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SockChatRoom>> {
-    let config = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
+    let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let transport = build_transport(state, &config, account_id).await?;
     let session = Session::new(transport, format!("https://{}", config.host), DEFAULT_USER_AGENT.to_string());
 
@@ -206,7 +206,7 @@ pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SockCh
 /// parse: `data-id` and the text after it. The page is generated markup and
 /// its shape will change; a scan that finds nothing is a room list that could
 /// not be read, which the caller reports, and not a panic or silent empty.
-fn parse_rooms(html: &str) -> Vec<SockChatRoom> {
+fn parse_rooms(html: &str) -> Vec<SneedChatRoom> {
     let mut rooms = Vec::new();
     for chunk in html.split("class=\"chat-room\"").skip(1) {
         let Some(id) = chunk.split("data-id=\"").nth(1).and_then(|rest| rest.split('"').next()) else { continue };
@@ -216,8 +216,8 @@ fn parse_rooms(html: &str) -> Vec<SockChatRoom> {
             continue;
         };
         let name = slug(label);
-        if !name.is_empty() && !rooms.iter().any(|r: &SockChatRoom| r.id == id) {
-            rooms.push(SockChatRoom { id, name });
+        if !name.is_empty() && !rooms.iter().any(|r: &SneedChatRoom| r.id == id) {
+            rooms.push(SneedChatRoom { id, name });
         }
     }
     rooms
@@ -294,7 +294,7 @@ const MAX_WS_REDIRECTS: usize = 3;
 /// page would - in particular `Origin`, without which the site's anti-bot
 /// proxy silently drops the upgrade instead of completing or rejecting it
 /// (confirmed live: omitting it just hangs forever with no error at all).
-/// Ported from sockchat-rs's `chat/socket.rs::connect`.
+/// Ported from sneedchat-rs's `chat/socket.rs::connect`.
 async fn open_chat_websocket(transport: &Transport, host: &str, cookie_header: &str) -> Result<WebSocketStream<BoxStream>> {
     let mut url = format!("wss://{host}/chat.ws");
     let origin = format!("https://{host}");
@@ -328,7 +328,7 @@ async fn open_chat_websocket(transport: &Transport, host: &str, cookie_header: &
                 match (status.is_redirection(), location) {
                     (true, Some(loc)) => {
                         url = resolve_ws_redirect(&url, &loc)?;
-                        tracing::info!("sockchat: websocket redirected to {url}");
+                        tracing::info!("sneedchat: websocket redirected to {url}");
                     }
                     _ => bail!("chat handshake rejected with HTTP {status}"),
                 }
@@ -362,7 +362,7 @@ fn resolve_ws_redirect(base: &str, location: &str) -> Result<String> {
 /// fully rebuilt from scratch (fresh transport, fresh login) if this
 /// function returns, which `run_with_retry` treats as a failure like any
 /// other.
-async fn run(state: &AppState, config: &SockChatAccountConfig, account_id: &str) -> Result<()> {
+async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
     let transport = build_transport(state, config, account_id).await?;
 
     let base = format!("https://{}", config.host);
@@ -376,14 +376,14 @@ async fn run(state: &AppState, config: &SockChatAccountConfig, account_id: &str)
     state.runtime.report_progress(state, account_id, "logging in...");
     session.ensure_authenticated(&creds, &two_factor).await.context("logging in")?;
     if let Some(uid) = session.user_id() {
-        let _ = state.accounts.set_sockchat_user_id(account_id, uid);
+        let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
     }
 
     state.runtime.set_own_identity(account_id, &config.username);
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
     let rooms = effective_rooms(config);
-    tracing::info!("sockchat[{account_id}]: authenticated, connecting {} room(s)", rooms.len());
+    tracing::info!("sneedchat[{account_id}]: authenticated, connecting {} room(s)", rooms.len());
 
     // Only the first room's connection stores whispers - every room's
     // websocket appears to receive the same whisper pushes (they aren't
@@ -454,7 +454,7 @@ async fn run_room(
     two_factor: &TwoFactor,
     account_id: &str,
     host: &str,
-    room: &SockChatRoom,
+    room: &SneedChatRoom,
     is_primary: bool,
 ) {
     let mut delay = ROOM_RECONNECT_INITIAL_DELAY;
@@ -463,16 +463,16 @@ async fn run_room(
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::warn!("sockchat[{account_id}] room {} ({}): {e:#}", room.id, room.name);
+                tracing::warn!("sneedchat[{account_id}] room {} ({}): {e:#}", room.id, room.name);
                 // A stale session is the most likely reason one specific
                 // room starts failing while the others keep working -
                 // refresh before retrying rather than hammering the same
                 // rejected cookies every backoff cycle.
                 if let Err(re) = session.refresh(creds, two_factor).await {
-                    tracing::warn!("sockchat[{account_id}] room {}: session refresh failed: {re:#}", room.id);
+                    tracing::warn!("sneedchat[{account_id}] room {}: session refresh failed: {re:#}", room.id);
                 }
             }
-            Err(_) => tracing::error!("sockchat[{account_id}] room {} ({}): task panicked", room.id, room.name),
+            Err(_) => tracing::error!("sneedchat[{account_id}] room {} ({}): task panicked", room.id, room.name),
         }
         // No cleanup call here - run_room_once's own RemoveSenderOnDrop
         // guard already ran (on every return path, including a panic) by
@@ -484,7 +484,7 @@ async fn run_room(
     }
 }
 
-async fn run_room_once(state: &AppState, transport: &Transport, session: &Session, account_id: &str, host: &str, room: &SockChatRoom, is_primary: bool) -> Result<()> {
+async fn run_room_once(state: &AppState, transport: &Transport, session: &Session, account_id: &str, host: &str, room: &SneedChatRoom, is_primary: bool) -> Result<()> {
     let cookie_header = session.cookie_header().unwrap_or_default();
     let ws = open_chat_websocket(transport, host, &cookie_header).await?;
     let (sink, mut incoming) = ws.split();
@@ -506,7 +506,7 @@ async fn run_room_once(state: &AppState, transport: &Transport, session: &Sessio
     }
     let _forwarder_guard = AbortOnDrop(forwarder);
 
-    state.runtime.insert_sockchat_sender(account_id, room.id, out_tx.clone());
+    state.runtime.insert_sneedchat_sender(account_id, room.id, out_tx.clone());
     struct RemoveSenderOnDrop<'a> {
         state: &'a AppState,
         account_id: &'a str,
@@ -515,7 +515,7 @@ async fn run_room_once(state: &AppState, transport: &Transport, session: &Sessio
     }
     impl Drop for RemoveSenderOnDrop<'_> {
         fn drop(&mut self) {
-            self.state.runtime.remove_sockchat_sender(self.account_id, self.room, &self.sender);
+            self.state.runtime.remove_sneedchat_sender(self.account_id, self.room, &self.sender);
         }
     }
     let _sender_guard = RemoveSenderOnDrop { state, account_id, room: room.id, sender: out_tx.clone() };
@@ -529,7 +529,7 @@ async fn run_room_once(state: &AppState, transport: &Transport, session: &Sessio
     // The server follows a join with the room's whole roster, so anything left
     // from a previous connection would only be stale.
     state.runtime.set_presence(&crate::model::buffer_id(account_id, &buffer_name), serde_json::json!([]));
-    tracing::info!("sockchat[{account_id}]: joined room {} ({})", room.id, room.name);
+    tracing::info!("sneedchat[{account_id}]: joined room {} ({})", room.id, room.name);
 
     loop {
         // Bounded, not a bare `.await` - a Tor circuit that's gone quietly
@@ -567,7 +567,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
     }
 
     if let Some(text) = &resp.plaintext {
-        tracing::debug!("sockchat[{account_id}]: {text}");
+        tracing::debug!("sneedchat[{account_id}]: {text}");
         let lower = text.to_lowercase();
         if lower.contains("cannot join") || lower.contains("session") {
             bail!("server rejected the connection: {text}");
@@ -660,7 +660,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
     // again, and a room whose connection drops twice an hour would otherwise
     // fill with copies of the same announcement.
     if let Some(motd) = &resp.motd {
-        if state.runtime.take_new_sockchat_motd(account_id, buffer_name, motd) {
+        if state.runtime.take_new_sneedchat_motd(account_id, buffer_name, motd) {
             state.runtime.record_message(
                 // "system" rather than "topic": a topic line is filtered by the
                 // setting that hides IRC topic changes, and a room's own
@@ -711,7 +711,7 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
 /// migrate_caches_to_xdg_cache_dir moves any pre-existing directory here
 /// once at startup.
 fn avatar_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sockchat-avatars")
+    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sneedchat-avatars")
 }
 
 /// Cap on the avatar cache's total size on disk - without this, every
@@ -766,7 +766,7 @@ pub async fn sweep_cache_dir(dir: &std::path::Path, max_bytes: u64, label: &str)
         }
     }
     tracing::info!(
-        "sockchat: {label} cache was {}MB over its {}MB cap, evicted {removed} oldest file(s)",
+        "sneedchat: {label} cache was {}MB over its {}MB cap, evicted {removed} oldest file(s)",
         overage / 1024 / 1024,
         max_bytes / 1024 / 1024
     );
@@ -785,7 +785,7 @@ pub async fn sweep_avatar_cache() {
 /// migrate_caches_to_xdg_cache_dir moves any pre-existing `/tmp` directory
 /// here once at startup.
 fn attachment_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sockchat-attachments")
+    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sneedchat-attachments")
 }
 
 /// Bigger than the avatar cap - full images/clips run much larger than
@@ -884,14 +884,14 @@ async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, 
     // that just hangs) would otherwise stall that entire room's message
     // processing until it resolved.
     let Ok(fetch) = tokio::time::timeout(std::time::Duration::from_secs(15), http.get_bytes(&url)).await else {
-        tracing::debug!("sockchat: avatar fetch for user {user_id} timed out");
+        tracing::debug!("sneedchat: avatar fetch for user {user_id} timed out");
         return None;
     };
 
     match fetch {
         Ok((status, bytes)) if (200..300).contains(&status) && !bytes.is_empty() => {
             if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                tracing::debug!("sockchat: creating avatar cache dir: {e}");
+                tracing::debug!("sneedchat: creating avatar cache dir: {e}");
                 return None;
             }
             // Name the file after what it actually is. The site's avatar URLs
@@ -901,17 +901,17 @@ async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, 
             let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
             let path = dir.join(format!("{user_id}.{ext}"));
             if let Err(e) = tokio::fs::write(&path, &bytes).await {
-                tracing::debug!("sockchat: caching avatar for user {user_id}: {e}");
+                tracing::debug!("sneedchat: caching avatar for user {user_id}: {e}");
                 return None;
             }
             Some(format!("file://{}", path.display()))
         }
         Ok((status, _)) => {
-            tracing::debug!("sockchat: avatar fetch for user {user_id} returned HTTP {status}");
+            tracing::debug!("sneedchat: avatar fetch for user {user_id} returned HTTP {status}");
             None
         }
         Err(e) => {
-            tracing::debug!("sockchat: fetching avatar for user {user_id}: {e}");
+            tracing::debug!("sneedchat: fetching avatar for user {user_id}: {e}");
             None
         }
     }
@@ -993,20 +993,20 @@ fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, buffer_id: 
                     if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
                         Some(format!("file://{}", path.display()))
                     } else {
-                        tracing::debug!("sockchat: caching attachment {id} failed");
+                        tracing::debug!("sneedchat: caching attachment {id} failed");
                         None
                     }
                 }
                 Ok(Ok((status, _))) => {
-                    tracing::debug!("sockchat: attachment {id} fetch returned HTTP {status}");
+                    tracing::debug!("sneedchat: attachment {id} fetch returned HTTP {status}");
                     None
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!("sockchat: fetching attachment {id}: {e}");
+                    tracing::debug!("sneedchat: fetching attachment {id}: {e}");
                     None
                 }
                 Err(_) => {
-                    tracing::debug!("sockchat: attachment {id} fetch timed out");
+                    tracing::debug!("sneedchat: attachment {id} fetch timed out");
                     None
                 }
             }
@@ -1019,17 +1019,17 @@ fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, buffer_id: 
     });
 }
 
-/// Shared by sendMessage/editMessage/deleteMessage's SockChat branches -
+/// Shared by sendMessage/editMessage/deleteMessage's SneedChat branches -
 /// looks up which configured room a buffer belongs to and returns that
 /// room's own permanent connection (see `run_room`). There's no "switch
 /// active room" step needed since every configured room is already
 /// connected simultaneously.
 fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let room_name = room_name_of(buffer_name);
     let rooms = effective_rooms(&cfg);
     let room = rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
-    state.runtime.sockchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
+    state.runtime.sneedchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
 /// Whether a name on the wire is this account's own.
@@ -1042,7 +1042,7 @@ fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str)
 /// differ only in case, which cannot happen because the site's names are
 /// unique without it.
 fn is_own_name(state: &AppState, account_id: &str, name: &str) -> bool {
-    let Some(cfg) = state.accounts.get_sockchat(account_id) else { return false };
+    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return false };
     name_matches(cfg.display_name.as_deref().unwrap_or_default(), &cfg.username, name)
 }
 
@@ -1105,9 +1105,9 @@ fn record_whisper(
     // particular and has to be visible wherever the reader is.
     only: Option<&str>,
 ) -> Vec<String> {
-    let Some(cfg) = state.accounts.get_sockchat(account_id) else { return Vec::new() };
+    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return Vec::new() };
     let mut fresh = Vec::new();
-    let rooms: Vec<SockChatRoom> = match only {
+    let rooms: Vec<SneedChatRoom> = match only {
         Some(buffer_name) => {
             let wanted = room_name_of(buffer_name);
             effective_rooms(&cfg).into_iter().filter(|r| r.name == wanted).collect()
@@ -1153,10 +1153,10 @@ fn record_whisper(
 /// there has to be one, since the only way to say anything at all is over a
 /// room's socket.
 fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     effective_rooms(&cfg)
         .iter()
-        .find_map(|r| state.runtime.sockchat_sender(account_id, r.id))
+        .find_map(|r| state.runtime.sneedchat_sender(account_id, r.id))
         .ok_or_else(|| anyhow!("not connected to Sneedchat"))
 }
 
@@ -1173,9 +1173,9 @@ fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mp
 /// rooms" - true of the stored config and plainly untrue of the connection
 /// the user was looking at. One definition of "which rooms" means the two
 /// cannot disagree again.
-fn effective_rooms(config: &SockChatAccountConfig) -> Vec<SockChatRoom> {
+fn effective_rooms(config: &SneedChatAccountConfig) -> Vec<SneedChatRoom> {
     if config.rooms.is_empty() {
-        vec![SockChatRoom { id: 1, name: "general".to_string() }]
+        vec![SneedChatRoom { id: 1, name: "general".to_string() }]
     } else {
         config.rooms.clone()
     }
@@ -1238,14 +1238,14 @@ pub fn send_whisper(
     // The addressing, not the message: enough to tell a wrong command from a
     // wrong target without putting somebody's private message in a log.
     tracing::debug!(
-        "sockchat[{account_id}]: sending whisper addressed {:?}",
+        "sneedchat[{account_id}]: sending whisper addressed {:?}",
         protocol::prepare_whisper(target, "")
     );
     sender.send(wire).map_err(|_| anyhow!("chat socket closed"))?;
 
     let me = state
         .accounts
-        .get_sockchat(account_id)
+        .get_sneedchat(account_id)
         .map(|c| c.display_name.filter(|n| !n.is_empty()).unwrap_or(c.username))
         .unwrap_or_default();
     let at = if target.starts_with('@') { "" } else { "@" };
@@ -1439,7 +1439,7 @@ pub async fn upload_to_postimg(file_path: &str) -> Result<PostimgLinks> {
     Ok(PostimgLinks { page: short_page_url, direct: direct_url })
 }
 
-/// The "+" attachment button's SockChat backend. Unlike Discord (whose API
+/// The "+" attachment button's SneedChat backend. Unlike Discord (whose API
 /// natively accepts a file alongside a message), Sneedchat's own chat
 /// protocol is text-only - there's no upload endpoint on the site itself.
 /// This does what regulars already do by hand: upload the file to a
@@ -1494,7 +1494,7 @@ pub async fn send_attachment(
 ) -> Result<()> {
     // Only used to confirm the account is real before spending any time on
     // the upload - the transport below is deliberately unrelated to it.
-    state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
 
     match host {
         None | Some(crate::upload::Host::Postimg) => {}
@@ -1545,7 +1545,7 @@ fn posted_markup(file_name: &str, link: &str) -> String {
     }
 }
 
-/// `editMessage`'s SockChat branch (see rpc/methods.rs). The server has no
+/// `editMessage`'s SneedChat branch (see rpc/methods.rs). The server has no
 /// direct "edit accepted" reply - the edited message just comes back
 /// through the normal live stream with a bumped message_edit_date, which
 /// handle_frame already detects and applies via Runtime::update_message.
@@ -1555,7 +1555,7 @@ pub fn edit_message(state: &AppState, account_id: &str, buffer_name: &str, msg_i
     Ok(())
 }
 
-/// `deleteMessage`'s SockChat branch - same "no direct reply" story as
+/// `deleteMessage`'s SneedChat branch - same "no direct reply" story as
 /// edit_message; the deletion gets applied locally once it's echoed back
 /// (either as a top-level `delete` batch or a `deleted`/`is_deleted` flag).
 pub fn delete_message(state: &AppState, account_id: &str, buffer_name: &str, msg_id: &str) -> Result<()> {
@@ -1566,12 +1566,12 @@ pub fn delete_message(state: &AppState, account_id: &str, buffer_name: &str, msg
 
 /// Kicks off a fresh account's first login in the background - unlike
 /// spawn() (used for accounts that already have saved credentials and are
-/// reconnecting), this is what addSockChatAccount calls, since Tor
+/// reconnecting), this is what addSneedChatAccount calls, since Tor
 /// bootstrap + login + a possible proof-of-work solve can take anywhere
 /// from instant to over a minute and must not block the RPC response.
-/// Progress/result arrive via sockChatLoginStatus/sockChatLoginResult
+/// Progress/result arrive via sneedChatLoginStatus/sneedChatLoginResult
 /// events tagged with `login_id`, mirroring backend::discord::start_qr_login.
-pub fn start_login(state: AppState, login_id: String, config: SockChatAccountConfig) {
+pub fn start_login(state: AppState, login_id: String, config: SneedChatAccountConfig) {
     tokio::spawn(async move {
         let result = std::panic::AssertUnwindSafe(try_login(&state, &login_id, &config)).catch_unwind().await;
         let error = match result {
@@ -1579,14 +1579,14 @@ pub fn start_login(state: AppState, login_id: String, config: SockChatAccountCon
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
-        tracing::warn!("sockchat login[{login_id}]: {error}");
-        state.events.emit("sockChatLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
+        tracing::warn!("sneedchat login[{login_id}]: {error}");
+        state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
     });
 }
 
-async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountConfig) -> Result<()> {
+async fn try_login(state: &AppState, login_id: &str, config: &SneedChatAccountConfig) -> Result<()> {
     let emit_progress = |msg: &str| {
-        state.events.emit("sockChatLoginStatus", serde_json::json!({ "loginId": login_id, "detail": msg }));
+        state.events.emit("sneedChatLoginStatus", serde_json::json!({ "loginId": login_id, "detail": msg }));
     };
 
     // Saved before anything can fail, not after everything has succeeded.
@@ -1603,7 +1603,7 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
     // corrected password simply overwrites the stored one. What lands here is
     // an account that exists, holds what was entered, and is disconnected -
     // which is exactly the state Connect knows how to retry.
-    state.accounts.add_sockchat(config.clone())?;
+    state.accounts.add_sneedchat(config.clone())?;
 
     let transport = match config.tor_mode.as_str() {
         "proxy" => {
@@ -1629,11 +1629,11 @@ async fn try_login(state: &AppState, login_id: &str, config: &SockChatAccountCon
 
     let mut saved_config = config.clone();
     saved_config.user_id = session.user_id();
-    let saved = state.accounts.add_sockchat(saved_config)?;
-    let account = crate::accounts::sockchat_account_to_json(&saved, "connecting");
+    let saved = state.accounts.add_sneedchat(saved_config)?;
+    let account = crate::accounts::sneedchat_account_to_json(&saved, "connecting");
     spawn(state.clone(), saved);
 
-    state.events.emit("sockChatLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
+    state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
     Ok(())
 }
 
@@ -1775,7 +1775,7 @@ mod tests {
     // shortcode in a live message.
     #[test]
     fn smilie_bundled_files_all_exist_on_disk() {
-        let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/sockchat-smilies");
+        let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/sneedchat-smilies");
         for s in super::smilies::SMILIES {
             assert!(assets_dir.join(s.file).is_file(), "missing bundled asset for {:?}: {}", s.label, s.file);
         }
@@ -1840,10 +1840,10 @@ mod live_probe {
     /// Phase-2 live check: fetch the real login page through embedded Tor
     /// and confirm the KiwiFlare gate (if hit) is solved for real, ending
     /// with a normal page response. Not run by default; run explicitly:
-    ///   cargo test --release -- --ignored --nocapture sockchat_http_probe
+    ///   cargo test --release -- --ignored --nocapture sneedchat_http_probe
     #[tokio::test]
     #[ignore]
-    async fn sockchat_http_probe() {
+    async fn sneedchat_http_probe() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir().join("nobilis-tor-spike");
         let manager = TorManager::new(&dir);
@@ -1869,7 +1869,7 @@ mod live_probe {
     }
 
     /// What the chat page says about which rooms exist. Not run by default:
-    ///   cargo test --release -- --ignored --nocapture sockchat_rooms_probe
+    ///   cargo test --release -- --ignored --nocapture sneedchat_rooms_probe
     ///
     /// The room catalogue has been a literal in the frontend since the start,
     /// with a comment saying no endpoint lists them. This is how that gets
@@ -1878,7 +1878,7 @@ mod live_probe {
     /// assumption.
     #[tokio::test]
     #[ignore]
-    async fn sockchat_rooms_probe() {
+    async fn sneedchat_rooms_probe() {
         let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir().join("nobilis-tor-spike");
         let manager = TorManager::new(&dir);
@@ -1907,26 +1907,26 @@ mod live_probe {
     /// environment rather than taking them as literals anywhere in this
     /// repo or conversation - set them in your own shell before running:
     ///
-    ///   SOCKCHAT_USERNAME=... SOCKCHAT_PASSWORD=... \
-    ///     cargo test --release -- --ignored --nocapture sockchat_login_probe
+    ///   SNEEDCHAT_USERNAME=... SNEEDCHAT_PASSWORD=... \
+    ///     cargo test --release -- --ignored --nocapture sneedchat_login_probe
     ///
-    /// Add SOCKCHAT_TOTP_SECRET=... too if the account has 2FA enabled.
-    /// Skips (rather than failing) if SOCKCHAT_USERNAME/PASSWORD aren't set,
+    /// Add SNEEDCHAT_TOTP_SECRET=... too if the account has 2FA enabled.
+    /// Skips (rather than failing) if SNEEDCHAT_USERNAME/PASSWORD aren't set,
     /// so this is safe to leave in the suite without real credentials
     /// present in CI or anyone else's environment.
     #[tokio::test]
     #[ignore]
-    async fn sockchat_login_probe() {
-        let Ok(username) = std::env::var("SOCKCHAT_USERNAME") else {
-            println!("SOCKCHAT_USERNAME not set, skipping");
+    async fn sneedchat_login_probe() {
+        let Ok(username) = std::env::var("SNEEDCHAT_USERNAME") else {
+            println!("SNEEDCHAT_USERNAME not set, skipping");
             return;
         };
-        let Ok(password) = std::env::var("SOCKCHAT_PASSWORD") else {
-            println!("SOCKCHAT_PASSWORD not set, skipping");
+        let Ok(password) = std::env::var("SNEEDCHAT_PASSWORD") else {
+            println!("SNEEDCHAT_PASSWORD not set, skipping");
             return;
         };
-        let two_factor = match std::env::var("SOCKCHAT_TOTP_SECRET") {
-            Ok(secret) => TwoFactor::Totp(super::totp::decode_secret(&secret).expect("SOCKCHAT_TOTP_SECRET is not valid base32")),
+        let two_factor = match std::env::var("SNEEDCHAT_TOTP_SECRET") {
+            Ok(secret) => TwoFactor::Totp(super::totp::decode_secret(&secret).expect("SNEEDCHAT_TOTP_SECRET is not valid base32")),
             Err(_) => TwoFactor::None,
         };
 
@@ -1956,7 +1956,7 @@ mod live_probe {
 /// Ordering is by name here rather than left to the client: every other
 /// backend hands over a sorted roster, and a five-hundred-name list arriving
 /// in map order would be unreadable.
-/// The site owner's forum account. SockChat carries no rank information at
+/// The site owner's forum account. SneedChat carries no rank information at
 /// all - the roster's user objects are id, name, avatar and last activity, and
 /// the only `permissions` frame describes our *own* ability to view and send -
 /// so there is no wire signal to derive staff from. This one id is a fact

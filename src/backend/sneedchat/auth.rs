@@ -1,7 +1,7 @@
 //! Logging in to the forum and keeping the resulting session alive.
 //!
-//! Ported from sockchat-rs's `auth/mod.rs` + `chat/session.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>), combined here since nobilis
+//! Ported from sneedchat-rs's `auth/mod.rs` + `chat/session.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>), combined here since nobilis
 //! doesn't need the reference's separate on-disk session-cache file - the
 //! account's own username/password (persisted in accounts.toml, same as
 //! Discord's token) is always available to log back in with, so there's
@@ -76,7 +76,7 @@ impl TwoFactor {
 }
 
 /// Cloneable so one authenticated session can be shared across a multi-room
-/// account's per-room connection tasks (see backend/sockchat/mod.rs) -
+/// account's per-room connection tasks (see backend/sneedchat/mod.rs) -
 /// cheap, since `HttpClient`'s cookie jar is itself `Arc`-shared, so every
 /// clone sees the same live cookies (a refresh from any one room's retry
 /// loop benefits every other room's next attempt too).

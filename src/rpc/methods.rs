@@ -81,16 +81,16 @@ pub async fn dispatch(
             Some(buffer_id) => (Some(serde_json::json!(state.runtime.get_discord_buffer_emojis(buffer_id))), None),
         },
 
-        // Sneedchat's own site-wide smiley table (see backend/sockchat/
+        // Sneedchat's own site-wide smiley table (see backend/sneedchat/
         // smilies.rs) - unlike Discord's per-guild emoji above, this is
         // fixed and global, so no bufferId is needed. `file` is a filename
-        // within the client's own bundled sockchat-smilies/ resource dir,
+        // within the client's own bundled sneedchat-smilies/ resource dir,
         // not a URL - these images ship with the client rather than being
         // fetched from kiwifarms.st at runtime, so the client resolves the
         // actual path itself (it already knows its own install directory)
         // and this needs no I/O of any kind to answer.
-        "listSockchatSmilies" => (
-            Some(serde_json::json!(backend::sockchat::smilies::SMILIES.iter().map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file })).collect::<Vec<_>>())),
+        "listSneedchatSmilies" => (
+            Some(serde_json::json!(backend::sneedchat::smilies::SMILIES.iter().map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file })).collect::<Vec<_>>())),
             None,
         ),
 
@@ -129,7 +129,7 @@ pub async fn dispatch(
                 { "id": "irc", "name": "IRC", "available": true },
                 { "id": "matrix", "name": "Matrix", "available": true },
                 { "id": "discord", "name": "Discord", "available": true },
-                { "id": "sockchat", "name": "Sneedchat", "available": true },
+                { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "jabber", "name": "XMPP", "available": false },
                 { "id": "slack", "name": "Slack", "available": false },
@@ -348,10 +348,10 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
-                    } else if id.starts_with("sockchat:") {
-                        match state.accounts.get_sockchat(id) {
+                    } else if id.starts_with("sneedchat:") {
+                        match state.accounts.get_sneedchat(id) {
                             Some(cfg) => {
-                                backend::sockchat::spawn(state.clone(), cfg);
+                                backend::sneedchat::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -569,7 +569,7 @@ pub async fn dispatch(
                         "matrix" => backend::matrix::profile(&state, &account_id, &buffer_id, &user_id).await,
                         "discord" => backend::discord::profile(&state, &account_id, &buffer_id, &user_id, &who).await,
                         "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
-                        "sockchat" => backend::sockchat::profile(&state, &account_id, &buffer_id, &who),
+                        "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1512,7 +1512,7 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     }
                 }
-                Some(buffer) if buffer.account_id.starts_with("sockchat:") => {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
                     // Sneedchat answers somebody by name rather than by
                     // message id, so a reply needs whoever wrote the message
                     // being replied to. A reply to something no longer in
@@ -1522,7 +1522,7 @@ pub async fn dispatch(
                         .and_then(|id| state.store.get_message(buffer_id, id).ok().flatten())
                         .map(|m| m.from);
                     // Unlike Discord, Sneedchat's own chat protocol has no
-                    // upload endpoint at all - see backend::sockchat::
+                    // upload endpoint at all - see backend::sneedchat::
                     // send_attachment's own doc comment for how this
                     // still ends up posting a real image. The host choice
                     // reaches it the same way it reaches IRC below; without
@@ -1531,9 +1531,9 @@ pub async fn dispatch(
                     let result = match attachment_path {
                         Some(path) => {
                             let host = p_str_opt(params, "uploadHost").and_then(crate::upload::Host::parse);
-                            backend::sockchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host).await
+                            backend::sneedchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host).await
                         }
-                        None => backend::sockchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
+                        None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
@@ -1593,7 +1593,7 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e.to_string())),
                     },
                 },
-                Some(buffer) if buffer.account_id.starts_with("sockchat:") => match backend::sockchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e.to_string())),
                 },
@@ -1663,7 +1663,7 @@ pub async fn dispatch(
                         }
                     }
                 }
-                Some(buffer) if buffer.account_id.starts_with("sockchat:") => match backend::sockchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
+                Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e.to_string())),
                 },
@@ -1743,43 +1743,43 @@ pub async fn dispatch(
         // Tor bootstrap + login (+ a possible proof-of-work solve) can take
         // anywhere from instant to over a minute - same async-kickoff shape
         // as addDiscordAccount, with progress/result arriving via
-        // sockChatLoginStatus/sockChatLoginResult events (see backend/
-        // sockchat/mod.rs's start_login).
-        "addSockChatAccount" => {
+        // sneedChatLoginStatus/sneedChatLoginResult events (see backend/
+        // sneedchat/mod.rs's start_login).
+        "addSneedChatAccount" => {
             let (username, password) = match (p_str_opt(params, "username"), p_str_opt(params, "password")) {
                 (Some(u), Some(p)) => (u.to_string(), p.to_string()),
-                _ => return (None, Some("addSockChatAccount requires \"username\" and \"password\"".to_string())),
+                _ => return (None, Some("addSneedChatAccount requires \"username\" and \"password\"".to_string())),
             };
-            let config = crate::accounts::SockChatAccountConfig {
+            let config = crate::accounts::SneedChatAccountConfig {
                 username,
                 password,
                 totp_secret: p_str_opt(params, "totpSecret").map(String::from),
-                host: p_str_opt(params, "host").map(String::from).unwrap_or_else(|| backend::sockchat::DEFAULT_ONION.to_string()),
+                host: p_str_opt(params, "host").map(String::from).unwrap_or_else(|| backend::sneedchat::DEFAULT_ONION.to_string()),
                 tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| "embedded".to_string()),
                 proxy: p_str_opt(params, "proxy").map(String::from),
-                rooms: parse_sockchat_rooms(params).unwrap_or_default(),
+                rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
                 display_name: None,
                 user_id: None,
             };
-            let login_id = format!("sockchat-login-{}", crate::model::next_message_id());
-            backend::sockchat::start_login(state.clone(), login_id.clone(), config);
+            let login_id = format!("sneedchat-login-{}", crate::model::next_message_id());
+            backend::sneedchat::start_login(state.clone(), login_id.clone(), config);
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
         // What rooms the site has, read from the site rather than from a
-        // list written into the client. Separate from setSockChatRooms
+        // list written into the client. Separate from setSneedChatRooms
         // because knowing which rooms exist and choosing which to join are
         // different acts - and a person may well want to see the catalogue
         // without changing anything.
-        "listSockChatRooms" => match p_str_opt(params, "accountId") {
-            None => (None, Some("listSockChatRooms requires \"accountId\"".to_string())),
+        "listSneedChatRooms" => match p_str_opt(params, "accountId") {
+            None => (None, Some("listSneedChatRooms requires \"accountId\"".to_string())),
             Some(id) => {
                 // Whatever was read last, at once - and a fresh read started
-                // behind it, which arrives as a sockchatRooms event. Waiting
+                // behind it, which arrives as a sneedchatRooms event. Waiting
                 // here would block this client's whole socket for the fifteen
                 // seconds the site takes to answer through Tor and its gate.
-                let cached = state.runtime.sockchat_room_catalogue(id).unwrap_or_default();
-                backend::sockchat::refresh_rooms(state.clone(), id.to_string());
+                let cached = state.runtime.sneedchat_room_catalogue(id).unwrap_or_default();
+                backend::sneedchat::refresh_rooms(state.clone(), id.to_string());
                 (
                     Some(serde_json::json!({
                         "rooms": cached.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>()
@@ -1792,16 +1792,16 @@ pub async fn dispatch(
         // Replaces the account's configured room list and reconnects it
         // immediately (rather than only on the next daemon restart) so a
         // freshly-added room shows up right away.
-        "setSockChatRooms" => match p_str_opt(params, "accountId") {
+        "setSneedChatRooms" => match p_str_opt(params, "accountId") {
             None => (None, Some("no such account".to_string())),
             Some(id) => {
-                let Some(rooms) = parse_sockchat_rooms(params) else {
-                    return (None, Some("setSockChatRooms requires \"rooms\": [{\"id\":.., \"name\":..}, ...]".to_string()));
+                let Some(rooms) = parse_sneedchat_rooms(params) else {
+                    return (None, Some("setSneedChatRooms requires \"rooms\": [{\"id\":.., \"name\":..}, ...]".to_string()));
                 };
-                match state.accounts.set_sockchat_rooms(id, rooms) {
-                    Ok(true) => match state.accounts.get_sockchat(id) {
+                match state.accounts.set_sneedchat_rooms(id, rooms) {
+                    Ok(true) => match state.accounts.get_sneedchat(id) {
                         Some(cfg) => {
-                            backend::sockchat::spawn(state.clone(), cfg);
+                            backend::sneedchat::spawn(state.clone(), cfg);
                             (Some(ok_node()), None)
                         }
                         None => (None, Some("no such account".to_string())),
@@ -1816,17 +1816,17 @@ pub async fn dispatch(
         // one - there's only ever one embedded TorManager, so "embedded vs
         // external proxy" is applied uniformly to every configured
         // Sneedchat account rather than asked per-account. Reconnects each
-        // affected account immediately, same as setSockChatRooms above.
+        // affected account immediately, same as setSneedChatRooms above.
         "setTorConfig" => {
             let tor_mode = p_str(params, "torMode", "embedded").to_string();
             let proxy = p_str_opt(params, "proxy").filter(|s| !s.is_empty()).map(String::from);
-            for cfg in state.accounts.all_sockchat() {
+            for cfg in state.accounts.all_sneedchat() {
                 let id = cfg.account_id();
-                if let Err(e) = state.accounts.set_sockchat_tor_config(&id, tor_mode.clone(), proxy.clone()) {
+                if let Err(e) = state.accounts.set_sneedchat_tor_config(&id, tor_mode.clone(), proxy.clone()) {
                     return (None, Some(e.to_string()));
                 }
-                if let Some(cfg) = state.accounts.get_sockchat(&id) {
-                    backend::sockchat::spawn(state.clone(), cfg);
+                if let Some(cfg) = state.accounts.get_sneedchat(&id) {
+                    backend::sneedchat::spawn(state.clone(), cfg);
                 }
             }
             (Some(ok_node()), None)
@@ -1840,8 +1840,8 @@ pub async fn dispatch(
         // own (see TorManager::restart's doc comment).
         "regenerateTorCircuit" => {
             state.tor.restart().await;
-            for cfg in state.accounts.all_sockchat() {
-                backend::sockchat::spawn(state.clone(), cfg);
+            for cfg in state.accounts.all_sneedchat() {
+                backend::sneedchat::spawn(state.clone(), cfg);
             }
             (Some(ok_node()), None)
         }
@@ -1859,8 +1859,8 @@ pub async fn dispatch(
                 }
             }
             state.tor.restart().await;
-            for cfg in state.accounts.all_sockchat() {
-                backend::sockchat::spawn(state.clone(), cfg);
+            for cfg in state.accounts.all_sneedchat() {
+                backend::sneedchat::spawn(state.clone(), cfg);
             }
             (Some(ok_node()), None)
         }
@@ -1897,7 +1897,7 @@ pub async fn dispatch(
         "addXmppAccount" | "addSlackAccount" => (None, Some(format!("{method}: not implemented yet"))),
 
         // Login (homeserver reachability + m.login.password) can take a
-        // moment - same async-kickoff shape as addSockChatAccount, with
+        // moment - same async-kickoff shape as addSneedChatAccount, with
         // progress/result arriving via matrixLoginStatus/matrixLoginResult
         // events (see backend/matrix/mod.rs's start_login).
         "addMatrixAccount" => {
@@ -2333,7 +2333,7 @@ pub async fn dispatch(
                 .and_then(|id| state.runtime.get_buffer(id))
                 .filter(|b| b.account_id == account_id)
                 .map(|b| b.name);
-            match backend::sockchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()) {
+            match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()) {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e.to_string())),
             }
@@ -2521,14 +2521,14 @@ pub async fn dispatch(
 /// Reads `params.rooms` as `[{"id": .., "name": ..}, ...]`. `None` when the
 /// field is absent entirely (so callers can tell "not provided" from "an
 /// explicit empty list") vs. malformed entries, which are just skipped.
-fn parse_sockchat_rooms(params: &Value) -> Option<Vec<crate::accounts::SockChatRoom>> {
+fn parse_sneedchat_rooms(params: &Value) -> Option<Vec<crate::accounts::SneedChatRoom>> {
     let arr = params.get("rooms")?.as_array()?;
     Some(
         arr.iter()
             .filter_map(|r| {
                 let id = r.get("id")?.as_u64()? as u32;
                 let name = r.get("name")?.as_str()?.to_string();
-                Some(crate::accounts::SockChatRoom { id, name })
+                Some(crate::accounts::SneedChatRoom { id, name })
             })
             .collect(),
     )

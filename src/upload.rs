@@ -64,7 +64,7 @@ impl Host {
     /// arrival.
     pub fn accepted_extensions(self) -> Option<&'static [(&'static str, &'static str)]> {
         match self {
-            Host::Postimg => Some(crate::backend::sockchat::POSTIMG_TYPES),
+            Host::Postimg => Some(crate::backend::sneedchat::POSTIMG_TYPES),
             _ => None,
         }
     }
@@ -141,7 +141,7 @@ pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<S
         // in BBCode because it renders markup; a caller reaching this has
         // none, so what it wants is the URL that ends in a file extension -
         // it is what makes a link unfurl into a picture at the far end.
-        Host::Postimg => Ok(crate::backend::sockchat::upload_to_postimg(path).await?.direct),
+        Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg(path).await?.direct),
     }
 }
 

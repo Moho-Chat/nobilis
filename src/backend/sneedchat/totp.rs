@@ -1,7 +1,7 @@
 //! RFC 6238 time-based one-time passwords.
 //!
-//! Ported from sockchat-rs's `auth/totp.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>). Verified against the RFC 6238
+//! Ported from sneedchat-rs's `auth/totp.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>). Verified against the RFC 6238
 //! Appendix B test vectors. This is what makes 2FA login unattended: given
 //! the base32 secret from the "can't scan the QR code?" link during 2FA
 //! setup, the daemon derives the same six digits an authenticator app

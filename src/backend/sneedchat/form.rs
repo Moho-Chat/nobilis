@@ -1,7 +1,7 @@
 //! Minimal HTML form scraping.
 //!
-//! Ported from sockchat-rs's `auth/form.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>). XenForo forms carry CSRF
+//! Ported from sneedchat-rs's `auth/form.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>). XenForo forms carry CSRF
 //! tokens and bookkeeping fields that must be echoed back verbatim. Rather
 //! than hardcode a field list - which would break the moment the forum
 //! software is upgraded - the form is read and resubmitted with only the

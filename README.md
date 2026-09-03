@@ -1,6 +1,6 @@
 # nobilis
 
-A chat daemon. It speaks IRC, Discord, Sneedchat (SockChat, the Tor-only XenForo chat feature)
+A chat daemon. It speaks IRC, Discord, Sneedchat (SneedChat, the Tor-only XenForo chat feature)
 and Matrix, and translates all of them into one unified JSON model — accounts, buffers, messages
 — served over a Unix socket.
 
@@ -16,7 +16,7 @@ one frontend can attach at once — the socket accepts multiple clients, each wi
 subscriptions.
 
 ```
-src/backend/      one module per protocol (irc, discord, sockchat, matrix)
+src/backend/      one module per protocol (irc, discord, sneedchat, matrix)
 src/rpc/          the Unix-socket JSON-RPC server
 src/runtime.rs    protocol-agnostic connection/buffer/message state
 src/store.rs      SQLite-backed scrollback persistence
@@ -45,13 +45,13 @@ push:     {"event": "message", "data": {...}}
 Core methods: `listAccounts`, `listBuffers`, `listProtocols`, `addAccount`, `removeAccount`,
 `setAccountConnected`, `joinBuffer`, `partBuffer`, `sendMessage`, `editMessage`, `deleteMessage`,
 `toggleReaction`, `subscribe`/`unsubscribe`, `getBacklog`. Each protocol also has its own
-account-creation method (`addAccount` for IRC, `addDiscordAccount`, `addSockChatAccount`,
+account-creation method (`addAccount` for IRC, `addDiscordAccount`, `addSneedChatAccount`,
 `addMatrixAccount`).
 
 Push events: `message`, `messageUpdated`, `messageDeleted`, `reactionsChanged`, `presenceChange`,
 `bufferListChange`, `connectionState`, `notification`, plus per-protocol login-flow events
-(`discordLoginQr`/`discordLoginScanned`/`discordLoginResult`, `sockChatLoginStatus`/
-`sockChatLoginResult`, `matrixLoginStatus`/`matrixLoginResult`) and Matrix verification events
+(`discordLoginQr`/`discordLoginScanned`/`discordLoginResult`, `sneedChatLoginStatus`/
+`sneedChatLoginResult`, `matrixLoginStatus`/`matrixLoginResult`) and Matrix verification events
 (`matrixVerificationStatus`/`matrixVerificationEmoji`/`matrixVerificationResult`).
 
 `message`, `presenceChange`, `messageUpdated`, `messageDeleted` and `reactionsChanged` are only
@@ -67,7 +67,7 @@ delivered to clients that called `subscribe` for that buffer; everything else br
 - Media that nobilis fetched on the client's behalf (Tor-routed Sneedchat avatars and
   attachments, Matrix media, the Discord login QR) is handed over as a local `file://` path or
   filesystem path, not a remote URL. This assumes the frontend runs on the same machine.
-- `listSockchatSmilies` returns a bare filename per smiley, resolved against `resources/sockchat-smilies/`
+- `listSneedchatSmilies` returns a bare filename per smiley, resolved against `resources/sneedchat-smilies/`
   in this repository. A frontend that renders them needs its own copy of that directory.
 
 ## Protocol backends
@@ -75,7 +75,7 @@ delivered to clients that called `subscribe` for that buffer; everything else br
 - **IRC** — TLS with SASL PLAIN, NickServ auto-identify, autojoin, optional SOCKS5 proxying.
 - **Discord** — the official cross-device QR login, a real-time gateway client, and message
   edit/delete/reaction/reply sync.
-- **Sneedchat (SockChat)** — the Tor-only chat built into Kiwi Farms. Runs over an embedded Tor
+- **Sneedchat (SneedChat)** — the Tor-only chat built into Kiwi Farms. Runs over an embedded Tor
   client (or an external SOCKS5 proxy), solves the site's proof-of-work anti-bot gate, and holds
   one persistent websocket per configured room behind a single login. Avatars and attachments are
   fetched through the same Tor session and cached locally, since a frontend has no route to a

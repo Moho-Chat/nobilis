@@ -2,8 +2,8 @@
 //! (via Arti, no external `tor` daemon required), an external SOCKS5 proxy
 //! (a system Tor daemon or Tor Browser), or a direct connection.
 //!
-//! Ported from sockchat-rs's own `net/mod.rs`
-//! (<https://gitgud.io/jcmoon/sockchat-rs>), which needed the exact same
+//! Ported from sneedchat-rs's own `net/mod.rs`
+//! (<https://gitgud.io/jcmoon/sneedchat-rs>), which needed the exact same
 //! thing for the exact same reason: `reqwest` and most other HTTP/websocket
 //! clients only know how to dial their own connector or a SOCKS5 proxy
 //! *URL* - they have no "here is a raw stream, use it" escape hatch, so
@@ -42,7 +42,7 @@ pub enum Transport {
 /// Shared, lazily-bootstrapped embedded Tor client - one per daemon process,
 /// not one per account. Bootstrapping fetches a directory consensus and
 /// builds circuits, which the Tor Project's own docs put at "a few seconds
-/// to a minute" on a cold cache; every SockChat/Sneedchat account shares
+/// to a minute" on a cold cache; every SneedChat/Sneedchat account shares
 /// this single instance rather than each paying that cost independently.
 ///
 /// Uses an `RwLock<Option<...>>` rather than a `OnceCell` (the original

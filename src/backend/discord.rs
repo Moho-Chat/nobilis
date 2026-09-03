@@ -1882,7 +1882,7 @@ fn guild_icon_cache_dir() -> std::path::PathBuf {
 }
 
 pub async fn sweep_guild_icon_cache() {
-    super::sockchat::sweep_cache_dir(&guild_icon_cache_dir(), GUILD_ICON_CACHE_MAX_BYTES, "discord guild icon").await;
+    super::sneedchat::sweep_cache_dir(&guild_icon_cache_dir(), GUILD_ICON_CACHE_MAX_BYTES, "discord guild icon").await;
 }
 
 /// Guild icons are small and there are only as many as the user has servers,
@@ -1968,7 +1968,7 @@ fn thumbnail_cache_dir() -> std::path::PathBuf {
 const THUMBNAIL_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 pub async fn sweep_thumbnail_cache() {
-    super::sockchat::sweep_cache_dir(&thumbnail_cache_dir(), THUMBNAIL_CACHE_MAX_BYTES, "discord thumbnail").await;
+    super::sneedchat::sweep_cache_dir(&thumbnail_cache_dir(), THUMBNAIL_CACHE_MAX_BYTES, "discord thumbnail").await;
 }
 
 /// Throw away the previews taken before animation was asked for.
