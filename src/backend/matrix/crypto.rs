@@ -142,6 +142,14 @@ impl CryptoSession {
     /// enabled or there's nothing new to back up.
     pub async fn run_pending_backup(&self, homeserver_url: &str, access_token: &str) {
         let backup_machine = self.machine.backup_machine();
+        // Asked before backing up rather than after, because the crypto
+        // machine warns every time it is asked to back up without a key -
+        // once per sync cycle, per account, forever. That was 451 lines in
+        // one session, which is how a log stops being somewhere anybody
+        // looks for the warnings that matter.
+        if !backup_machine.enabled().await {
+            return;
+        }
         let pending = match backup_machine.backup().await {
             Ok(p) => p,
             Err(e) => {

@@ -4833,7 +4833,7 @@ pub async fn close_dm(state: &AppState, account_id: &str, channel_id: &str) -> R
 /// stale. A channel with no buffer yet is a DM this account has never opened;
 /// there is nothing to ring against, so it is dropped rather than invented.
 pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringing: bool) {
-    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(channel_id) else { return };
+    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) else { return };
     if !state.runtime.set_ringing(&buffer_id, account_id, channel_id, ringing) {
         return;
     }

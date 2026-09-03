@@ -1490,8 +1490,20 @@ impl Runtime {
             .collect()
     }
 
-    pub fn discord_buffer_for_channel(&self, channel_id: &str) -> Option<String> {
-        self.discord_channels.lock().unwrap().iter().find(|(_, c)| c.as_str() == channel_id).map(|(b, _)| b.clone())
+    /// The buffer showing a Discord channel, for one account.
+    ///
+    /// Scoped, for the same reason the Matrix one is: two accounts signed in
+    /// here can be in the same guild, and each has its own buffer for its
+    /// channels. Unscoped, a call arriving on one account could ring against
+    /// the other account's conversation.
+    pub fn discord_buffer_for_channel(&self, account_id: &str, channel_id: &str) -> Option<String> {
+        let prefix = format!("{account_id}|");
+        self.discord_channels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(buffer_id, channel)| channel.as_str() == channel_id && buffer_id.starts_with(&prefix))
+            .map(|(buffer_id, _)| buffer_id.clone())
     }
 
     pub fn get_discord_channel(&self, buffer_id: &str) -> Option<String> {
@@ -1622,8 +1634,8 @@ impl Runtime {
     /// race against the background sync loop, which runs concurrently and
     /// can independently discover (and buffer, under a worse name - see
     /// open_dm's own doc comment) the exact same freshly-created room.
-    pub fn get_buffer_id_for_matrix_room(&self, room_id: &str) -> Option<String> {
-        self.matrix_rooms.lock().unwrap().iter().find(|(_, r)| r.as_str() == room_id).map(|(b, _)| b.clone())
+    pub fn get_buffer_id_for_matrix_room(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_buffer_for_room(account_id, room_id)
     }
 
     pub fn set_matrix_room_name(&self, account_id: &str, room_id: &str, name: &str, kind: &str) {
@@ -1987,13 +1999,29 @@ impl Runtime {
     }
 
     /// The buffer showing a Matrix room, if one has been created for it.
-    pub fn matrix_buffer_for_room(&self, room_id: &str) -> Option<String> {
-        self.matrix_rooms.lock().unwrap().iter().find(|(_, r)| r.as_str() == room_id).map(|(b, _)| b.clone())
+    /// The buffer showing a Matrix room, for one account.
+    ///
+    /// Scoped to the account, because two accounts in this client can be in
+    /// the same room and the answer is a different buffer for each. It was
+    /// not: whichever the map happened to yield first was returned, so one
+    /// account registering a space could remove the *other* account's buffer
+    /// for a room they share, or file it under a group it does not belong to.
+    pub fn matrix_buffer_for_room(&self, account_id: &str, room_id: &str) -> Option<String> {
+        let prefix = format!("{account_id}|");
+        self.matrix_rooms
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(buffer_id, room)| room.as_str() == room_id && buffer_id.starts_with(&prefix))
+            .map(|(buffer_id, _)| buffer_id.clone())
     }
 
     pub fn set_matrix_room_avatar(&self, state: &AppState, account_id: &str, room_id: &str, avatar_url: &str) {
         self.matrix_room_avatars.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), avatar_url.to_string());
-        let Some(buffer_id) = self.matrix_rooms.lock().unwrap().iter().find(|(_, r)| r.as_str() == room_id).map(|(b, _)| b.clone()) else { return };
+        // This account's buffer for the room, not whichever account's the map
+        // yields first - two accounts here can be in one room, and a picture
+        // set for one of them is not a picture for the other's copy of it.
+        let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) else { return };
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(&buffer_id) {
@@ -2886,6 +2914,27 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two accounts can be in the same room, and each has its own buffer for
+    /// it. An unscoped answer let one account's space registration delete the
+    /// other's conversation - which is a room disappearing from the list for
+    /// no reason anybody could see.
+    #[test]
+    fn a_room_belongs_to_one_account_at_a_time() {
+        let runtime = Runtime::new();
+        runtime.matrix_rooms.lock().unwrap().insert("matrix:@a:x.example|Shared".into(), "!shared:x.example".into());
+        runtime.matrix_rooms.lock().unwrap().insert("matrix:@b:y.example|Shared".into(), "!shared:x.example".into());
+
+        assert_eq!(
+            runtime.matrix_buffer_for_room("matrix:@a:x.example", "!shared:x.example").as_deref(),
+            Some("matrix:@a:x.example|Shared")
+        );
+        assert_eq!(
+            runtime.matrix_buffer_for_room("matrix:@b:y.example", "!shared:x.example").as_deref(),
+            Some("matrix:@b:y.example|Shared")
+        );
+        assert_eq!(runtime.matrix_buffer_for_room("matrix:@c:z.example", "!shared:x.example"), None);
+    }
 
     /// Which rooms count as joined, for the directory's "already in this"
     /// label. Scoped per account, because two Matrix accounts in the same

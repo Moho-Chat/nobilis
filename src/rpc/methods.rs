@@ -1064,7 +1064,7 @@ pub async fn dispatch(
                         .or_else(|| {
                             state
                                 .runtime
-                                .discord_buffer_for_channel(&channel_id)
+                                .discord_buffer_for_channel(id, &channel_id)
                                 .and_then(|b| state.runtime.get_buffer(&b))
                                 .map(|b| b.name)
                         })
@@ -1077,7 +1077,7 @@ pub async fn dispatch(
                         // Which conversation this call is in, so a client can
                         // mark the right row rather than guessing from the
                         // account - which cannot tell one DM from another.
-                        "bufferId": state.runtime.discord_buffer_for_channel(&channel_id),
+                        "bufferId": state.runtime.discord_buffer_for_channel(id, &channel_id),
                         // A call with no guild is a one-to-one call, which a
                         // client shows differently.
                         "isDirect": guild_id.is_none(),

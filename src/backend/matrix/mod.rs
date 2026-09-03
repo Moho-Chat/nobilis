@@ -511,7 +511,7 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
         // The room has been heard from, so it is no longer waiting to be. Set
         // on join and cleared here, which is the first moment there is
         // anything true to say about what is in it.
-        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(room_id) {
+        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
             state.runtime.set_buffer_syncing(state, &buffer_id, false);
         }
 
@@ -2234,7 +2234,7 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
     // stray buffer exists for this room id and always (re)creating the
     // correctly-named "dm" one ourselves, regardless of which side got
     // here first.
-    if let Some(stray_buffer_id) = state.runtime.get_buffer_id_for_matrix_room(&room_id) {
+    if let Some(stray_buffer_id) = state.runtime.get_buffer_id_for_matrix_room(account_id, &room_id) {
         state.runtime.remove_buffer(state, &stray_buffer_id);
     }
 
@@ -3498,14 +3498,14 @@ async fn register_space(
     // If the other side got here first and made a buffer for this space,
     // discard it: a space is not somewhere you talk, and leaving it in the
     // room list is how spaces end up looking like empty chats.
-    if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(room_id) {
+    if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
         tracing::debug!("matrix[{account_id}]: {room_id} is a space, dropping the buffer made for it");
         state.runtime.remove_buffer(state, &buffer_id);
     }
 
     for child in rooms::space_children(events) {
         state.runtime.set_matrix_space_parent(account_id, &child, &group_id);
-        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(&child) {
+        if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, &child) {
             state.runtime.set_buffer_group(state, &buffer_id, &group_id);
         }
     }

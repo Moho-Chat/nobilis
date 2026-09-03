@@ -56,7 +56,7 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // saying where the conversation went.
             "m.room.tombstone" => {
                 let Some(successor) = event["content"]["replacement_room"].as_str() else { continue };
-                if state.runtime.matrix_buffer_for_room(successor).is_some() {
+                if state.runtime.matrix_buffer_for_room(account_id, successor).is_some() {
                     continue;
                 }
                 let why = event["content"]["body"].as_str().unwrap_or("This room has been replaced");
