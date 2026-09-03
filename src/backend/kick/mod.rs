@@ -642,10 +642,38 @@ async fn handle_frame(
         other => other.clone(),
     };
 
-    match frame.event.as_str() {
-        "pusher:ping" => {
-            socket.send(WsMessage::Text(r#"{"event":"pusher:pong","data":{}}"#.to_string())).await?;
-        }
+    if frame.event == "pusher:ping" {
+        socket.send(WsMessage::Text(r#"{"event":"pusher:pong","data":{}}"#.to_string())).await?;
+        return Ok(());
+    }
+    handle_event(state, account_id, watched, &frame.event, frame.channel.as_deref(), payload)
+}
+
+/// One Kick event, once it has been unwrapped from Pusher's envelope.
+///
+/// Split from handle_frame so it can be driven with a payload rather than a
+/// socket. Everything a stream does that is not somebody talking - polls,
+/// predictions, redemptions, raids, moderation - arrives here, and none of it
+/// can be produced on demand from a real channel: a poll happens when a
+/// streamer decides to run one. Being able to hand this a payload is the only
+/// way any of it is testable at all.
+fn handle_event(
+    state: &AppState,
+    account_id: &str,
+    watched: &mut Watched,
+    event: &str,
+    channel: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<()> {
+    // Rebuilt so the arms below can keep reading `frame.channel`, which is
+    // how a channel is identified for every event that does not carry an id
+    // of its own.
+    let frame = PusherFrame {
+        event: event.to_string(),
+        channel: channel.map(str::to_string),
+        data: serde_json::Value::Null,
+    };
+    match event {
         "pusher:error" => {
             let msg = payload.get("message").and_then(|m| m.as_str()).unwrap_or("Kick refused the connection");
             anyhow::bail!("{msg}");
@@ -752,10 +780,46 @@ async fn handle_frame(
         // voting goes through the player, and a chat client showing the
         // question and the options is the part somebody reading chat is
         // missing - a running poll is otherwise invisible here.
+        //
+        // One line per poll, rewritten as the votes come in. Kick sends this
+        // event on every vote, so recording each one put a near-identical
+        // line in the chat several times a second and buried the conversation
+        // the poll is about.
         e if e.ends_with("PollUpdateEvent") => {
             let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             if let Some(line) = describe_poll(&payload) {
-                system_line(state, account_id, &slug, &line, "poll");
+                live_line(state, account_id, &slug, &poll_message_id(&slug, &payload), &line, "poll");
+            }
+        }
+
+        // The poll is over. The line stays - what was asked and how it went is
+        // worth keeping in the log - but stops claiming to be running.
+        e if e.ends_with("PollDeleteEvent") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let buffer_id = crate::model::buffer_id(account_id, &slug);
+            let id = poll_message_id(&slug, &payload);
+            if let Ok(Some(stored)) = state.store.get_message(&buffer_id, &id) {
+                let ended = stored.body.replacen("poll:", "poll ended:", 1);
+                state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
+            }
+        }
+
+        // A prediction: the same shape as a poll, with money on it. Kick's
+        // payload for these is not documented and this client has never seen
+        // one, so the parser is deliberately tolerant - it reads a title and
+        // a set of named outcomes wherever they sit, and shows nothing at all
+        // rather than something wrong if the shape is not what it expects.
+        e if e.contains("Prediction") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            if e.ends_with("PredictionDeleteEvent") || e.ends_with("PredictionDeletedEvent") {
+                let buffer_id = crate::model::buffer_id(account_id, &slug);
+                let id = prediction_message_id(&slug, &payload);
+                if let Ok(Some(stored)) = state.store.get_message(&buffer_id, &id) {
+                    let ended = stored.body.replacen("prediction:", "prediction closed:", 1);
+                    state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
+                }
+            } else if let Some(line) = describe_prediction(&payload) {
+                live_line(state, account_id, &slug, &prediction_message_id(&slug, &payload), &line, "poll");
             }
         }
 
@@ -841,6 +905,87 @@ pub async fn backfill(
 fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
     let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
     reply_preview(Some(&parsed))
+}
+
+/// One line that keeps being rewritten rather than repeated.
+///
+/// A poll or a prediction is one thing happening over a minute or two, not a
+/// stream of events - so it gets one message that changes, the way an edited
+/// message does, and the chat around it stays readable.
+fn live_line(state: &AppState, account_id: &str, slug: &str, msg_id: &str, what: &str, kind: &str) {
+    let buffer_id = crate::model::buffer_id(account_id, slug);
+    if state.runtime.update_message(state, &buffer_id, msg_id, what, &[], &[]) {
+        return;
+    }
+    state.runtime.record_message(
+        state, account_id, slug, "channel", slug, what, false, kind, None, Some(msg_id.to_string()),
+        false, None, Vec::new(), Vec::new(), None,
+    );
+}
+
+/// The id the line for this poll keeps, so later updates find it.
+///
+/// Kick's own poll id where there is one; the channel otherwise, since a
+/// channel runs one poll at a time and a stable-but-approximate id is better
+/// than a fresh line per vote.
+fn poll_message_id(slug: &str, payload: &serde_json::Value) -> String {
+    let poll = payload.get("poll").unwrap_or(payload);
+    match poll.get("id").and_then(|v| v.as_u64()) {
+        Some(id) => format!("kick-poll-{slug}-{id}"),
+        None => format!("kick-poll-{slug}"),
+    }
+}
+
+fn prediction_message_id(slug: &str, payload: &serde_json::Value) -> String {
+    let prediction = payload.get("prediction").unwrap_or(payload);
+    match prediction.get("id").and_then(|v| v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(str::to_string))) {
+        Some(id) => format!("kick-prediction-{slug}-{id}"),
+        None => format!("kick-prediction-{slug}"),
+    }
+}
+
+/// A prediction, as one readable line.
+///
+/// Written from the shape a prediction has rather than from a payload anybody
+/// has seen: a title, and outcomes that carry a name and some count of what
+/// has been staked on them. Kick does not document this and this client has
+/// never received one, so every field is optional and a payload that does not
+/// match produces nothing - which shows the chat as it was rather than a line
+/// of empty brackets.
+fn describe_prediction(payload: &serde_json::Value) -> Option<String> {
+    let prediction = payload.get("prediction").unwrap_or(payload);
+    let title = prediction
+        .get("title")
+        .or_else(|| prediction.get("question"))
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty())?;
+
+    let outcomes: Vec<String> = prediction
+        .get("outcomes")
+        .or_else(|| prediction.get("options"))
+        .and_then(|v| v.as_array())
+        .map(|outcomes| {
+            outcomes
+                .iter()
+                .filter_map(|o| {
+                    let label = o.get("label").or_else(|| o.get("title")).or_else(|| o.get("name"))?.as_str()?;
+                    let staked = ["votes", "points", "total", "amount"]
+                        .iter()
+                        .find_map(|field| o.get(field).and_then(|v| v.as_u64()));
+                    Some(match staked {
+                        Some(n) => format!("{label} ({n})"),
+                        None => label.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(if outcomes.is_empty() {
+        format!("prediction: {title}")
+    } else {
+        format!("prediction: {title} — {}", outcomes.join(", "))
+    })
 }
 
 /// A poll, as one readable line.
@@ -1118,6 +1263,131 @@ mod tests {
         assert_eq!(parse_timestamp("2026-01-08T23:32:57.000000Z"), Some(1767915177));
         assert_eq!(parse_timestamp("2026-01-08T23:32:57Z"), Some(1767915177));
         assert_eq!(parse_timestamp("not a time"), None);
+    }
+
+    /// A whole daemon in a temporary directory, so a stream event can be fed
+    /// in and the message it produces read back out.
+    ///
+    /// Nothing about a poll or a prediction can be produced on demand from a
+    /// real channel - they happen when a streamer decides to run one - so the
+    /// only way to know this code works is to hand it the payload and look at
+    /// what lands in the store. That is what these do.
+    fn simulated_daemon(name: &str) -> AppState {
+        // The same convention the audio and Tor probes use for a scratch
+        // directory - a dependency for one test would be a poor trade.
+        let dir = std::env::temp_dir().join(format!("nobilis-kick-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        AppState {
+            store: std::sync::Arc::new(crate::store::Store::open(&dir.join("scrollback.db")).expect("store")),
+            accounts: std::sync::Arc::new(crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts")),
+            events: crate::events::EventBus::new(),
+            runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
+            tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
+            dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
+        }
+    }
+
+    /// The messages a channel's buffer holds, oldest first.
+    fn lines(state: &AppState, slug: &str) -> Vec<String> {
+        state
+            .store
+            .get_backlog(&crate::model::buffer_id("kick:tester", slug), 0, 50)
+            .expect("backlog")
+            .into_iter()
+            .map(|m| m.body)
+            .collect()
+    }
+
+    fn feed(state: &AppState, watched: &mut Watched, event: &str, payload: serde_json::Value) {
+        // odablock's own chatroom, as the fixture below sets it up.
+        handle_event(state, "kick:tester", watched, event, Some("chatrooms.2393554.v2"), payload).expect("handled");
+    }
+
+    /// A poll is one thing happening over a minute, not a stream of events -
+    /// Kick sends its update on every vote, and a line each would bury the
+    /// conversation the poll is about.
+    #[test]
+    fn a_poll_is_one_line_that_keeps_up_with_the_votes() {
+        let state = simulated_daemon("poll-votes");
+        let mut watched = watching_odablock();
+
+        feed(&state, &mut watched, "App\\Events\\PollUpdateEvent", serde_json::json!({
+            "poll": { "id": 5, "title": "next game?", "options": [
+                { "label": "runescape", "votes": 3 },
+                { "label": "chess", "votes": 1 }
+            ]}
+        }));
+        assert_eq!(lines(&state, "odablock"), vec!["poll: next game? — runescape (3), chess (1)"]);
+
+        // Somebody votes. Same poll, same line.
+        feed(&state, &mut watched, "App\\Events\\PollUpdateEvent", serde_json::json!({
+            "poll": { "id": 5, "title": "next game?", "options": [
+                { "label": "runescape", "votes": 9 },
+                { "label": "chess", "votes": 1 }
+            ]}
+        }));
+        assert_eq!(lines(&state, "odablock"), vec!["poll: next game? — runescape (9), chess (1)"]);
+    }
+
+    /// The line stays when the poll ends - what was asked and how it went is
+    /// worth keeping - but stops claiming to be running.
+    #[test]
+    fn a_finished_poll_says_so() {
+        let state = simulated_daemon("poll-ended");
+        let mut watched = watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\PollUpdateEvent", serde_json::json!({
+            "poll": { "id": 5, "title": "next game?", "options": [{ "label": "runescape", "votes": 9 }] }
+        }));
+        feed(&state, &mut watched, "App\\Events\\PollDeleteEvent", serde_json::json!({ "poll": { "id": 5 } }));
+        assert_eq!(lines(&state, "odablock"), vec!["poll ended: next game? — runescape (9)"]);
+    }
+
+    /// Two polls in a row are two lines: the id is part of what identifies
+    /// the message, so the second does not overwrite the first.
+    #[test]
+    fn a_second_poll_does_not_overwrite_the_first() {
+        let state = simulated_daemon("two-polls");
+        let mut watched = watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\PollUpdateEvent", serde_json::json!({
+            "poll": { "id": 1, "title": "first", "options": [] }
+        }));
+        feed(&state, &mut watched, "App\\Events\\PollUpdateEvent", serde_json::json!({
+            "poll": { "id": 2, "title": "second", "options": [] }
+        }));
+        assert_eq!(lines(&state, "odablock"), vec!["poll: first", "poll: second"]);
+    }
+
+    /// Predictions have never been seen by this client and Kick documents
+    /// nothing, so the parser reads a title and named outcomes wherever they
+    /// sit - and produces nothing at all rather than a line of empty brackets
+    /// when the shape is not what it expects.
+    #[test]
+    fn a_prediction_reads_whichever_way_kick_writes_it() {
+        let state = simulated_daemon("prediction");
+        let mut watched = watching_odablock();
+
+        feed(&state, &mut watched, "App\\Events\\PredictionUpdateEvent", serde_json::json!({
+            "prediction": { "id": 3, "title": "will he win?", "outcomes": [
+                { "label": "yes", "points": 400 },
+                { "label": "no", "points": 120 }
+            ]}
+        }));
+        assert_eq!(lines(&state, "odablock"), vec!["prediction: will he win? — yes (400), no (120)"]);
+
+        feed(&state, &mut watched, "App\\Events\\PredictionDeleteEvent", serde_json::json!({ "prediction": { "id": 3 } }));
+        assert_eq!(lines(&state, "odablock"), vec!["prediction closed: will he win? — yes (400), no (120)"]);
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_prediction_produces_nothing() {
+        let state = simulated_daemon("prediction-empty");
+        let mut watched = watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\PredictionUpdateEvent", serde_json::json!({ "prediction": { "id": 8 } }));
+        assert!(lines(&state, "odablock").is_empty());
     }
 
     /// odablock's real numbers: the chatroom and the channel differ, which is
