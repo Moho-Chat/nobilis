@@ -1347,13 +1347,36 @@ async fn directory_targets(
         from_rooms.extend(resp["joined_rooms"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
     }
 
-    let named = from_rooms.iter().filter_map(|id| id.rsplit(':').next().map(str::to_string));
+    let named = from_rooms.iter().filter_map(|id| server_of_room(id).map(str::to_string));
     for server in named.chain(extra.iter().map(|s| server_name(s))) {
         if !server.is_empty() && seen.insert(server.clone()) {
             targets.push(server);
         }
     }
     targets
+}
+
+/// The homeserver named inside a room id, where there is one.
+///
+/// Room ids used to be `!opaque:server.example` and this could be taken as
+/// "everything after the colon". Room version 12 ids are the hash of the
+/// create event and carry no server at all - `!phpQp7HD_h1IuRlU61Vop1...` and
+/// nothing else - so splitting on a colon that is not there returned the whole
+/// room id as if it were a hostname. That was then asked to search its own
+/// directory, and the server answered M_BAD_JSON, which is exactly what it
+/// should say about `?server=!phpQp7HD...`.
+///
+/// A room whose id names no server is not a lost cause elsewhere - it is
+/// reachable through the people in it - but it has nothing to contribute to a
+/// list of directories to search, so it is skipped here.
+fn server_of_room(room_id: &str) -> Option<&str> {
+    let (_, server) = room_id.split_once(':')?;
+    // A hostname, not merely "text after a colon": the point is to catch
+    // anything that would be sent as ?server= and be nonsense there.
+    let plausible = !server.is_empty()
+        && server.contains('.')
+        && server.chars().all(|c| c.is_ascii_alphanumeric() || "-._:[]".contains(c));
+    plausible.then_some(server)
 }
 
 /// A homeserver's name, from whatever somebody typed. A bare hostname, not a
@@ -1365,7 +1388,22 @@ fn server_name(typed: &str) -> String {
 
 #[cfg(test)]
 mod directory_tests {
-    use super::server_name;
+    use super::{server_name, server_of_room};
+
+    /// Room version 12 ids are a hash and nothing else. Reading a server out
+    /// of one gave the whole room id as a hostname, which was then asked to
+    /// search its own directory and answered M_BAD_JSON - a real error in the
+    /// server list, against a "server" that was a room.
+    #[test]
+    fn a_room_id_only_names_a_server_when_it_has_one() {
+        assert_eq!(server_of_room("!abc:matrix.org"), Some("matrix.org"));
+        assert_eq!(server_of_room("!phpQp7HD_h1IuRlU61Vop1-1RL5GxApK3Foo8E6KHxM"), None);
+        assert_eq!(server_of_room("!abc:"), None);
+        // A hostname has a dot in it; "localhost" is not something to go
+        // asking a public directory of.
+        assert_eq!(server_of_room("!abc:localhost"), None);
+        assert_eq!(server_of_room("!abc:matrix.example.com:8448"), Some("matrix.example.com:8448"));
+    }
 
     #[test]
     fn a_server_is_named_however_somebody_typed_it() {
