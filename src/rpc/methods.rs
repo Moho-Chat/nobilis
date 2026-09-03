@@ -542,6 +542,24 @@ pub async fn dispatch(
         // What comes back immediately is the little that is known without
         // asking anyone - the name, and that a question is outstanding - so
         // the card opens filled in rather than blank.
+        // Who and what can be tagged here, beyond the member list the client
+        // already has: Discord's mentionable roles. Empty for every service
+        // without the idea, so a client can ask unconditionally.
+        "listMentionRoles" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMentionRoles requires \"bufferId\"".to_string()));
+            };
+            let roles = state
+                .runtime
+                .get_buffer(buffer_id)
+                .filter(|b| b.account_id.starts_with("discord:"))
+                .and_then(|b| b.group_id)
+                .and_then(|g| g.rsplit_once("guild:").map(|(_, id)| id.to_string()))
+                .map(|guild| state.runtime.discord_mentionable_roles(&guild))
+                .unwrap_or_default();
+            (Some(serde_json::json!({ "roles": roles })), None)
+        }
+
         "requestProfile" => {
             let (Some(buffer_id), Some(who)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "nick")) else {
                 return (None, Some("requestProfile requires \"bufferId\" and \"nick\"".to_string()));

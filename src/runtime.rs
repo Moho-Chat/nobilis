@@ -597,6 +597,23 @@ pub struct Runtime {
     matrix_presence: Mutex<HashMap<(String, String), bool>>,
 }
 
+/// Whether a message tags the whole place, in the words the service uses.
+///
+/// Discord has two - everyone, and everyone currently online - Matrix has
+/// `@room`, Sneedchat has `@everyone`. Kick and IRC have none: on IRC the
+/// idea does not exist, and a client that highlighted on the phrase would be
+/// inventing a mention the network never sent.
+fn mentions_the_room(service: &str, body: &str) -> bool {
+    let words: &[&str] = match service {
+        "discord" => &["@everyone", "@here"],
+        "matrix" => &["@room"],
+        "sneedchat" => &["@everyone"],
+        _ => &[],
+    };
+    let lower = body.to_lowercase();
+    words.iter().any(|word| lower.contains(word))
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self {
@@ -1268,6 +1285,21 @@ impl Runtime {
     /// A typing notice from a DM carries no member object to read a name
     /// out of, and "Someone is typing" is worse than the name we already
     /// saw on their last message.
+    /// Every name this account has seen, with whose it is.
+    ///
+    /// The reverse of discord_known_name, and for the one thing that needs
+    /// the mapping that way round: turning a name somebody typed into the id
+    /// Discord pings on.
+    pub fn discord_known_names(&self, account_id: &str) -> Vec<(String, String)> {
+        self.discord_voice_names
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((account, _), _)| account == account_id)
+            .map(|((_, user_id), name)| (name.clone(), user_id.clone()))
+            .collect()
+    }
+
     pub fn discord_known_name(&self, account_id: &str, user_id: &str) -> Option<String> {
         self.discord_voice_names
             .lock()
@@ -1803,6 +1835,37 @@ impl Runtime {
 
     pub fn set_discord_guild_roles(&self, guild_id: &str, roles: Vec<serde_json::Value>) {
         self.discord_guild_roles.lock().unwrap().insert(guild_id.to_string(), roles);
+    }
+
+    /// Every role in a guild that can be mentioned, most senior first.
+    ///
+    /// `mentionable` is the guild's own answer to "may an ordinary member
+    /// ping this?" - offering the rest would be offering pings that come back
+    /// as errors. @everyone is excluded: it is a role in the data and a
+    /// keyword in the message, and Discord reads the keyword.
+    pub fn discord_mentionable_roles(&self, guild_id: &str) -> Vec<serde_json::Value> {
+        let all = self.discord_guild_roles.lock().unwrap();
+        let Some(roles) = all.get(guild_id) else { return Vec::new() };
+        let mut listed: Vec<(i64, serde_json::Value)> = roles
+            .iter()
+            .filter(|r| r["mentionable"].as_bool().unwrap_or(false))
+            .filter(|r| r["id"].as_str() != Some(guild_id))
+            .map(|r| {
+                (
+                    r["position"].as_i64().unwrap_or(0),
+                    serde_json::json!({
+                        "id": r["id"].as_str().unwrap_or(""),
+                        "name": r["name"].as_str().unwrap_or(""),
+                        // A role's colour is how people recognise it in a
+                        // member list, so the picker can look like the thing
+                        // being picked. Zero means "no colour of its own".
+                        "colour": r["color"].as_i64().filter(|c| *c > 0).map(|c| format!("#{c:06x}")),
+                    }),
+                )
+            })
+            .collect();
+        listed.sort_by(|a, b| b.0.cmp(&a.0));
+        listed.into_iter().map(|(_, role)| role).collect()
     }
 
     /// The names of the roles somebody holds, in the guild's own order -
@@ -2576,7 +2639,12 @@ impl Runtime {
         let is_highlight = force_highlight
             || (!own_nick.is_empty()
                 && from != own_nick
-                && body.to_lowercase().contains(&own_nick.to_lowercase()));
+                && body.to_lowercase().contains(&own_nick.to_lowercase()))
+            // Being addressed with everybody else still counts as being
+            // addressed. Only where the service acts on the word: "@everyone"
+            // on IRC is somebody typing a phrase, and highlighting it would be
+            // this client inventing a mention the network does not have.
+            || (from != own_nick && mentions_the_room(model::service_of(account_id), body));
         let is_own = !own_nick.is_empty() && from == own_nick;
         let is_dm = buffer_kind == "dm";
         let ts = sent_at.unwrap_or_else(|| {

@@ -768,6 +768,17 @@ async fn handle_timeline_event(
     // at all and one that says which conversation it belongs to.
     let reply_to = relation_preview(state, buffer_id, &content);
 
+    // Whether this was aimed at us, as the sender said rather than as this
+    // client guesses. Matrix used to leave every client to scan every message
+    // for its own name, which is why the same mention could be seen by one
+    // client and missed by another.
+    let mentioned = content["m.mentions"]["user_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|id| id.as_str() == Some(own_user_id))
+        || content["m.mentions"]["room"].as_bool() == Some(true);
+
     if reply_to.is_some() {
         // The raw body Matrix sends for a reply includes a quoted `> `
         // fallback block ahead of the real text, for clients that don't
@@ -801,7 +812,7 @@ async fn handle_timeline_event(
         "message",
         reply_to,
         Some(event_id.to_string()),
-        false,
+        mentioned,
         sender_avatar_url,
         Vec::new(),
         attachments,
@@ -1839,6 +1850,46 @@ pub async fn mark_read(state: &AppState, account_id: &str, buffer_id: &str, publ
     Ok(())
 }
 
+/// Who a message is aimed at, in the form the spec calls intentional
+/// mentions.
+///
+/// Names are matched against the room's own roster, longest first, so
+/// "@Sam Vimes" is one person rather than Sam and a loose word. "@room" is the
+/// whole-room mention, which is a flag rather than a name.
+///
+/// Absent - a null - when nobody was named, because an empty `m.mentions` is
+/// a positive statement that a message mentions nobody, and that is only
+/// worth sending when it is a correction.
+fn intentional_mentions(state: &AppState, account_id: &str, room_id: &str, body: &str) -> Value {
+    let mut named: Vec<String> = Vec::new();
+    let members = state.runtime.get_matrix_room_members(account_id, room_id);
+
+    let mut by_length: Vec<(&String, &String)> = members.iter().collect();
+    by_length.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
+    let lower = body.to_lowercase();
+    for (user_id, display) in by_length {
+        if display.is_empty() {
+            continue;
+        }
+        if lower.contains(&format!("@{}", display.to_lowercase())) && !named.contains(user_id) {
+            named.push(user_id.clone());
+        }
+    }
+
+    let room_wide = lower.contains("@room");
+    if named.is_empty() && !room_wide {
+        return Value::Null;
+    }
+    let mut mentions = serde_json::Map::new();
+    if !named.is_empty() {
+        mentions.insert("user_ids".into(), serde_json::json!(named));
+    }
+    if room_wide {
+        mentions.insert("room".into(), serde_json::json!(true));
+    }
+    Value::Object(mentions)
+}
+
 pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typing: bool) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
@@ -2059,6 +2110,15 @@ pub async fn send_message(
             None => ("m.text", body),
         };
         let mut content = serde_json::json!({ "msgtype": msgtype, "body": body });
+        // Who this is aimed at, said outright rather than left to be guessed
+        // from the text. Matrix used to work by every client scanning every
+        // message for its own name, which is why a mention could be missed by
+        // one client and seen by another; `m.mentions` is the answer to that,
+        // and it is what Element sends.
+        let mentions = intentional_mentions(state, account_id, &room_id, body);
+        if !mentions.is_null() {
+            content["m.mentions"] = mentions;
+        }
         // The formatting somebody typed, where they typed any. Sent
         // alongside the plain text rather than instead of it: body stays the
         // fallback for a client that will not render HTML.

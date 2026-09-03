@@ -3285,12 +3285,172 @@ fn reply_reference(reply_to_id: Option<&str>) -> Option<Value> {
 
 /// REST message send - Discord's gateway is receive-only from the client's
 /// perspective for user accounts; sending is always a plain HTTP POST.
+/// Turns the names somebody typed into the mentions Discord understands.
+///
+/// Discord pings on `<@id>` and on nothing else: a literal "@alice" is text.
+/// So every mention typed in this client reached the channel looking right
+/// and notifying nobody - which is worse than not being able to mention at
+/// all, because it looks like it worked.
+///
+/// Longest name first, because display names overlap: a channel with "Sam"
+/// and "Sam Vimes" in it must not turn "@Sam Vimes" into a ping for Sam
+/// followed by the word "Vimes".
+///
+/// `@everyone` and `@here` are left exactly as typed. They are Discord's own
+/// keywords, not names, and rewriting them would be inventing an id for
+/// something that has none.
+fn resolve_outgoing_mentions(body: &str, mut candidates: Vec<(String, String)>) -> String {
+    candidates.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    let mut out = body.to_string();
+    for (name, id) in candidates {
+        if name.is_empty() || name.eq_ignore_ascii_case("everyone") || name.eq_ignore_ascii_case("here") {
+            continue;
+        }
+        out = replace_mention(&out, &name, &id);
+    }
+    out
+}
+
+/// One name, everywhere it was typed as a mention.
+///
+/// Case-insensitive, because nobody types capitals the way a display name
+/// carries them - and bounded, so "@sam" inside "email@sample.org" is left
+/// alone: the "@" must start a word, and the name must end one.
+fn replace_mention(body: &str, name: &str, id: &str) -> String {
+    let lower_body = body.to_lowercase();
+    let needle = format!("@{}", name.to_lowercase());
+    let mut out = String::with_capacity(body.len());
+    let mut cursor = 0usize;
+
+    while let Some(found) = lower_body[cursor..].find(&needle) {
+        let start = cursor + found;
+        let end = start + needle.len();
+        let before_ok = start == 0 || body[..start].chars().next_back().is_some_and(|c| c.is_whitespace() || c == '(');
+        let after_ok = body[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| c.is_whitespace() || matches!(c, ',' | '.' | '!' | '?' | ':' | ';' | ')' | '\''));
+        out.push_str(&body[cursor..start]);
+        if before_ok && after_ok {
+            // A role id arrives with its own "&" already on it, which is
+            // the only difference between the two forms Discord accepts.
+            out.push_str(&format!("<@{id}>"));
+        } else {
+            out.push_str(&body[start..end]);
+        }
+        cursor = end;
+    }
+    out.push_str(&body[cursor..]);
+    out
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::resolve_outgoing_mentions;
+
+    fn people() -> Vec<(String, String)> {
+        vec![
+            ("Sam".into(), "1".into()),
+            ("Sam Vimes".into(), "2".into()),
+            ("alice".into(), "3".into()),
+        ]
+    }
+
+    /// The whole point: Discord pings on `<@id>` and treats "@alice" as text,
+    /// so a mention that is not rewritten reaches the channel looking right
+    /// and notifying nobody.
+    #[test]
+    fn a_typed_name_becomes_the_id_discord_pings_on() {
+        assert_eq!(resolve_outgoing_mentions("@alice hello", people()), "<@3> hello");
+        assert_eq!(resolve_outgoing_mentions("hello @alice", people()), "hello <@3>");
+        assert_eq!(resolve_outgoing_mentions("(@alice)", people()), "(<@3>)");
+        assert_eq!(resolve_outgoing_mentions("@alice, hello", people()), "<@3>, hello");
+    }
+
+    /// Display names overlap. Longest first, or "@Sam Vimes" becomes a ping
+    /// for Sam followed by the loose word "Vimes".
+    #[test]
+    fn the_longer_name_wins() {
+        assert_eq!(resolve_outgoing_mentions("@Sam Vimes hi", people()), "<@2> hi");
+        assert_eq!(resolve_outgoing_mentions("@Sam hi", people()), "<@1> hi");
+    }
+
+    #[test]
+    fn case_does_not_matter_but_word_boundaries_do() {
+        assert_eq!(resolve_outgoing_mentions("@ALICE hi", people()), "<@3> hi");
+        // Inside a word: an address, not a mention.
+        assert_eq!(resolve_outgoing_mentions("mail@alice.example", people()), "mail@alice.example");
+        // A longer name that merely starts with a known one.
+        assert_eq!(resolve_outgoing_mentions("@alicent hi", people()), "@alicent hi");
+    }
+
+    /// Discord's own keywords are not names and have no id to become.
+    #[test]
+    fn everyone_and_here_are_left_alone() {
+        let mut roster = people();
+        roster.push(("everyone".into(), "9".into()));
+        roster.push(("here".into(), "10".into()));
+        assert_eq!(resolve_outgoing_mentions("@everyone look", roster.clone()), "@everyone look");
+        assert_eq!(resolve_outgoing_mentions("@here look", roster), "@here look");
+    }
+
+    /// Roles are tagged the same way, with an ampersand in the id - which is
+    /// carried on the id itself so one rewrite handles both.
+    #[test]
+    fn a_role_becomes_a_role_mention() {
+        let roster = vec![("Gaymer Word User".to_string(), "&42".to_string())];
+        assert_eq!(resolve_outgoing_mentions("@Gaymer Word User look", roster), "<@&42> look");
+    }
+
+    #[test]
+    fn text_with_no_mentions_is_untouched() {
+        assert_eq!(resolve_outgoing_mentions("just talking", people()), "just talking");
+        assert_eq!(resolve_outgoing_mentions("", people()), "");
+    }
+}
+
+/// Everybody this conversation could be talking about: the channel's own
+/// member list first, then anybody this account has seen elsewhere.
+///
+/// The roster is what a person is looking at when they type a name, so it is
+/// the authority; the wider cache catches somebody who has left the visible
+/// window but is still in the conversation.
+fn mention_candidates(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<(String, String)> {
+    let mut candidates: Vec<(String, String)> = Vec::new();
+    if let Some(members) = state.runtime.get_presence(buffer_id) {
+        for member in members.as_array().into_iter().flatten() {
+            if let (Some(nick), Some(id)) = (member["nick"].as_str(), member["userId"].as_str()) {
+                candidates.push((nick.to_string(), id.to_string()));
+            }
+        }
+    }
+    // Roles are mentioned as `<@&id>` - the same shape with an ampersand -
+    // and a guild's mentionable roles are as much a thing people tag as its
+    // members are.
+    if let Some(guild) = state
+        .runtime
+        .get_buffer(buffer_id)
+        .and_then(|b| b.group_id)
+        .and_then(|g| g.rsplit_once("guild:").map(|(_, id)| id.to_string()))
+    {
+        for role in state.runtime.discord_mentionable_roles(&guild) {
+            if let (Some(name), Some(id)) = (role["name"].as_str(), role["id"].as_str()) {
+                candidates.push((name.to_string(), format!("&{id}")));
+            }
+        }
+    }
+    candidates.extend(state.runtime.discord_known_names(account_id));
+    candidates
+}
+
 pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let mut payload = json!({ "content": body });
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+    let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    let mut payload = json!({ "content": content });
     if let Some(reference) = reply_reference(reply_to_id) {
         payload["message_reference"] = reference;
     }
@@ -3322,7 +3482,11 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
     let path = std::path::Path::new(attachment_path);
     let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
     let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {attachment_path}"))?;
-    let mut payload = json!({ "content": body });
+    // A caption is a message like any other, so a name typed in one is a
+    // mention like any other.
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+    let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    let mut payload = json!({ "content": content });
     if let Some(reference) = reply_reference(reply_to_id) {
         payload["message_reference"] = reference;
     }
