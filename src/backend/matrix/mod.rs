@@ -1190,7 +1190,15 @@ pub async fn search_public_rooms(
     let base = account.homeserver_url.trim_end_matches('/').to_string();
     let token = account.access_token.clone();
 
-    let targets = directory_targets(state, account_id, &account.user_id, servers);
+    // Paging asks only the servers that gave us a place to continue from.
+    // Asking them all would hand a server with no token its *first* page
+    // again, so "show more" would append rooms already on screen - which is
+    // exactly what it did.
+    let targets: Vec<String> = if since.is_empty() {
+        directory_targets(state, account_id, &account.user_id, &base, &token, servers).await
+    } else {
+        since.keys().cloned().collect()
+    };
     let requests = targets.iter().map(|server| {
         let base = base.clone();
         let token = token.clone();
@@ -1200,19 +1208,33 @@ pub async fn search_public_rooms(
     let answers = futures::future::join_all(requests).await;
 
     let joined = state.runtime.matrix_joined_rooms(account_id);
+    // Our own server has no name in a request - the spec spells "ask locally"
+    // as the absence of the parameter - but it very much has one to a reader,
+    // and a list of servers with a blank in it says less than nothing.
+    let own_server = account.user_id.rsplit(':').next().unwrap_or("").to_string();
+    let named = |server: &str| if server.is_empty() { own_server.clone() } else { server.to_string() };
+
     let mut rooms: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut next = serde_json::Map::new();
-    let mut refused: Vec<String> = Vec::new();
+    let mut answered: Vec<Value> = Vec::new();
 
     for (server, answer) in answers {
-        let Ok(resp) = answer else {
-            refused.push(server);
-            continue;
+        let resp = match answer {
+            Ok(resp) => resp,
+            // Why, not just that: "did not answer" covers a server that is
+            // down, one that will not federate its directory, and one that
+            // rate-limited us, and those are three different things to do
+            // next about it.
+            Err(e) => {
+                answered.push(serde_json::json!({ "server": named(&server), "error": format!("{e:#}"), "rooms": 0 }));
+                continue;
+            }
         };
         if let Some(token) = resp["next_batch"].as_str() {
             next.insert(server.clone(), Value::String(token.to_string()));
         }
+        let before = rooms.len();
         for room in resp["chunk"].as_array().into_iter().flatten() {
             let room_id = room["room_id"].as_str().unwrap_or("").to_string();
             // The same room is listed by every server that knows it. Whoever
@@ -1244,10 +1266,15 @@ pub async fn search_public_rooms(
                 // the server a room lives on is the thing that says what kind
                 // of place it is - and it is the routing hint a room with no
                 // published alias needs to be joined at all.
-                "via": server,
+                "via": named(&server),
                 "joined": joined.contains(&room_id),
             }));
         }
+        // What this server actually contributed, after the rooms every other
+        // server had already listed were dropped. That is the honest number:
+        // a server whose whole page was rooms somebody else had listed added
+        // nothing to what is on screen, however many it returned.
+        answered.push(serde_json::json!({ "server": named(&server), "rooms": rooms.len() - before }));
     }
 
     // Busiest first, across all of them. Each server returns its own list in
@@ -1255,14 +1282,19 @@ pub async fn search_public_rooms(
     // happened to answer rather than by anything about the rooms.
     rooms.sort_by(|a, b| b["members"].as_i64().unwrap_or(0).cmp(&a["members"].as_i64().unwrap_or(0)));
 
+    // By name, which does not change. Sorting by what each contributed put
+    // them in a different order after every search, so a switch somebody was
+    // reaching for moved as they reached - and the count beside it is what
+    // says which gave the most anyway.
+    answered.sort_by(|a, b| a["server"].as_str().unwrap_or("").cmp(b["server"].as_str().unwrap_or("")));
+
     Ok(serde_json::json!({
         "rooms": rooms,
         "next": next,
-        "servers": targets,
-        // Named rather than swallowed: a server that will not answer is why a
-        // room somebody expected is missing, and silence there reads as the
-        // room not existing.
-        "refused": refused,
+        // One entry per homeserver asked, named, with what it contributed or
+        // why it contributed nothing. A count of servers said none of this,
+        // and "3 homeservers" is not something anybody can check.
+        "servers": answered,
     }))
 }
 
@@ -1286,11 +1318,18 @@ async fn directory_page(base: &str, token: &str, server: &str, query: &str, sinc
     http::post_json(&url, Some(token), body).await.context("searching the room directory")
 }
 
-/// Which homeservers to ask: ours, the ones this account already has rooms
-/// on, and whatever the caller added - deduplicated, and with our own written
-/// as the empty string because that is how the spec spells "no server
-/// parameter, ask locally".
-fn directory_targets(state: &AppState, account_id: &str, own_user_id: &str, extra: &[String]) -> Vec<String> {
+/// Which homeservers to ask: ours, the ones this account has rooms on, and
+/// whatever the caller added - deduplicated, and with our own written as the
+/// empty string because that is how the spec spells "no server parameter, ask
+/// locally".
+async fn directory_targets(
+    state: &AppState,
+    account_id: &str,
+    own_user_id: &str,
+    base: &str,
+    access_token: &str,
+    extra: &[String],
+) -> Vec<String> {
     let mut targets: Vec<String> = vec![String::new()];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // Our own server by name as well as locally would ask the same directory
@@ -1299,7 +1338,15 @@ fn directory_targets(state: &AppState, account_id: &str, own_user_id: &str, extr
         seen.insert(own.to_string());
     }
 
-    let from_rooms = state.runtime.matrix_joined_rooms(account_id);
+    // Asked of the server rather than read off the buffers this window has
+    // built, because those appear over the first minute of a session: a
+    // search run before a room's buffer existed silently left that room's
+    // homeserver out, and the results looked like the server had nothing.
+    let mut from_rooms: Vec<String> = state.runtime.matrix_joined_rooms(account_id).into_iter().collect();
+    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/joined_rooms"), access_token).await {
+        from_rooms.extend(resp["joined_rooms"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
+    }
+
     let named = from_rooms.iter().filter_map(|id| id.rsplit(':').next().map(str::to_string));
     for server in named.chain(extra.iter().map(|s| server_name(s))) {
         if !server.is_empty() && seen.insert(server.clone()) {
