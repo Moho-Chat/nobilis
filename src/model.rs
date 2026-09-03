@@ -449,6 +449,40 @@ pub enum MemberRank {
     Founder,
 }
 
+/// Which service an account id belongs to.
+///
+/// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
+/// except IRC, whose ids are "nick@host" and predate the convention. That
+/// exception is why this exists rather than each caller splitting on a colon.
+pub fn service_of(account_id: &str) -> &'static str {
+    match account_id.split_once(':').map(|(prefix, _)| prefix) {
+        Some("matrix") => "matrix",
+        Some("discord") => "discord",
+        Some("kick") => "kick",
+        Some("sockchat") => "sockchat",
+        Some("jabber") => "jabber",
+        Some("slack") => "slack",
+        _ => "irc",
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::service_of;
+
+    #[test]
+    fn an_account_id_names_its_service() {
+        assert_eq!(service_of("matrix:@a:example.org"), "matrix");
+        assert_eq!(service_of("discord:167790743988076545"), "discord");
+        assert_eq!(service_of("kick:someone"), "kick");
+        assert_eq!(service_of("sockchat:Ancient Pioneer"), "sockchat");
+        // IRC is the one without a prefix, and a host with a port in it must
+        // not be read as one.
+        assert_eq!(service_of("Salastil@irc.libera.chat"), "irc");
+        assert_eq!(service_of("Salastil@irc.example.net:6697"), "irc");
+    }
+}
+
 impl MemberRank {
     pub fn prefix(self) -> &'static str {
         match self {
@@ -458,6 +492,24 @@ impl MemberRank {
             MemberRank::Voice => "+",
             MemberRank::None => "",
         }
+    }
+
+    /// What the rank is called, for somewhere there is room to say it. None
+    /// for an ordinary member, who has no rank to name.
+    pub fn title(self) -> Option<&'static str> {
+        match self {
+            MemberRank::Founder => Some("Founder"),
+            MemberRank::Op => Some("Operator"),
+            MemberRank::HalfOp => Some("Half-operator"),
+            MemberRank::Voice => Some("Voiced"),
+            MemberRank::None => None,
+        }
+    }
+
+    /// Whether this rank can act on other people. Voice is the right to
+    /// speak in a moderated channel, not the right to moderate one.
+    pub fn can_moderate(self) -> bool {
+        matches!(self, MemberRank::Founder | MemberRank::Op | MemberRank::HalfOp)
     }
 }
 

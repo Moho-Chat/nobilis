@@ -1414,6 +1414,74 @@ mod directory_tests {
     }
 }
 
+/// Who somebody is, as far as Matrix will say.
+///
+/// Three sources, because Matrix keeps them apart: the profile endpoint has
+/// the name and the picture, the room's power levels have their standing in
+/// this room, and presence has when they were last seen. Presence is often
+/// refused - a server may not federate it, or may have it switched off - and
+/// that is not an error, just an absence.
+pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_id: &str) -> Value {
+    let mut profile = crate::profile::pending("matrix", account_id, user_id);
+    profile["pending"] = serde_json::json!(false);
+    profile["id"] = Value::String(user_id.to_string());
+    profile["handle"] = Value::String(user_id.to_string());
+    profile["name"] = Value::String(protocol::mxid_localpart(user_id));
+
+    let Some(account) = state.accounts.get_matrix(account_id) else { return profile };
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded_user = url::form_urlencoded::byte_serialize(user_id.as_bytes()).collect::<String>();
+
+    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/profile/{encoded_user}"), &account.access_token).await {
+        if let Some(name) = resp["displayname"].as_str().filter(|n| !n.is_empty()) {
+            profile["name"] = Value::String(name.to_string());
+        }
+        if let Some(mxc) = resp["avatar_url"].as_str() {
+            if let Some(path) = cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await {
+                profile["avatarUrl"] = Value::String(path);
+            }
+        }
+    }
+
+    // Their standing in this room, from what the sync already carries.
+    if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
+        if let Some(levels) = state.runtime.get_matrix_power_levels(account_id, &room_id) {
+            let level = moderation::user_power_level(&levels, user_id);
+            // Matrix's own conventional names for the two ranks anybody
+            // recognises. A room can set any number, so a level that is
+            // neither is reported as itself rather than rounded to a word.
+            let role = match level {
+                100 => Some("Admin".to_string()),
+                50 => Some("Moderator".to_string()),
+                0 => None,
+                other => Some(format!("Power level {other}")),
+            };
+            if let Some(role) = role {
+                profile["roles"] = serde_json::json!([role]);
+            }
+            profile["isModerator"] = serde_json::json!(level >= 50);
+        }
+    }
+
+    // When they were last seen. `last_active_ago` is milliseconds, and is the
+    // only "last seen" Matrix has - there is no join date to be had without
+    // walking the room's whole state history.
+    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/presence/{encoded_user}/status"), &account.access_token).await {
+        if let Some(status) = resp["presence"].as_str() {
+            profile["status"] = Value::String(status.to_string());
+        }
+        if let Some(ago) = resp["last_active_ago"].as_i64() {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            profile["lastActiveTs"] = serde_json::json!(now - ago / 1000);
+        }
+        if let Some(message) = resp["status_msg"].as_str().filter(|m| !m.is_empty()) {
+            crate::profile::note(&mut profile, "Status", message);
+        }
+    }
+
+    profile
+}
+
 /// Reads a thread from the server, then hands back everything known about it.
 ///
 /// `/relations` is the only way to see a thread whole: its replies are

@@ -526,6 +526,65 @@ pub async fn dispatch(
             }
         }
 
+        // Who somebody is. Answered as a `profile` event rather than as this
+        // call's own reply: IRC's answer is several numerics ending in one
+        // that says the reply is over, and everything else needs a request
+        // over the network that this daemon must not sit on (see rpc/mod.rs).
+        //
+        // What comes back immediately is the little that is known without
+        // asking anyone - the name, and that a question is outstanding - so
+        // the card opens filled in rather than blank.
+        "requestProfile" => {
+            let (Some(buffer_id), Some(who)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "nick")) else {
+                return (None, Some("requestProfile requires \"bufferId\" and \"nick\"".to_string()));
+            };
+            let user_id = p_str_opt(params, "userId").unwrap_or(who).to_string();
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let account_id = buffer.account_id.clone();
+            let service = crate::model::service_of(&account_id).to_string();
+            let (who, buffer_id) = (who.to_string(), buffer_id.to_string());
+            // Built before the lookup is handed to a task, since that task
+            // takes the name with it.
+            let opening = crate::profile::pending(crate::model::service_of(&account_id), &account_id, &who);
+
+            // IRC asks by sending a command; its answer arrives through the
+            // same numerics /whois has always used.
+            if service == "irc" {
+                match state.runtime.irc_sender(&account_id) {
+                    Some(sender) => {
+                        state.runtime.begin_irc_whois(&account_id, &who);
+                        let line = format!("WHOIS {who}");
+                        if let Ok(message) = line.parse::<irc::proto::Message>() {
+                            let _ = sender.send(message);
+                        }
+                    }
+                    None => return (None, Some("not connected".to_string())),
+                }
+            } else {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let profile = match service.as_str() {
+                        "matrix" => backend::matrix::profile(&state, &account_id, &buffer_id, &user_id).await,
+                        "discord" => backend::discord::profile(&state, &account_id, &buffer_id, &user_id, &who).await,
+                        "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
+                        "sockchat" => backend::sockchat::profile(&state, &account_id, &buffer_id, &who),
+                        // A service with nothing to add still answers, so the
+                        // card stops waiting and shows the name.
+                        other => {
+                            let mut bare = crate::profile::pending(other, &account_id, &who);
+                            bare["pending"] = serde_json::json!(false);
+                            bare
+                        }
+                    };
+                    crate::profile::emit(&state, profile);
+                });
+            }
+
+            (Some(opening), None)
+        }
+
         "fetchThread" => {
             let (Some(buffer_id), Some(root_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rootId")) else {
                 return (None, Some("fetchThread requires \"bufferId\" and \"rootId\"".to_string()));

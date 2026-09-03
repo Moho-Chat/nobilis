@@ -5,6 +5,7 @@ mod ipc;
 mod model;
 mod net;
 mod nickserv;
+mod profile;
 mod rpc;
 mod runtime;
 mod secure;

@@ -304,6 +304,20 @@ pub struct Runtime {
     /// not: roles decide which channels are permitted, and a nickname change
     /// arrives on the same event and decides nothing.
     discord_own_roles: Mutex<HashMap<String, Vec<String>>>,
+    /// guild id -> its roles, as the gateway last described them.
+    ///
+    /// The gateway task keeps its own copy for permission checks; this one
+    /// exists so anything outside that task - a profile lookup, say - can
+    /// turn a member's role ids into names and into whether they moderate.
+    discord_guild_roles: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// (guild id, user id) -> that person's membership of the guild.
+    ///
+    /// Learned from the member window, which is the only place a user token
+    /// ever sees it: the profile endpoint refuses anybody this account has no
+    /// relationship with, and the members endpoint is closed to user tokens
+    /// entirely. So "when did they join" is knowable for whoever has been on
+    /// screen, and honestly absent for everybody else.
+    discord_members: Mutex<HashMap<(String, String), serde_json::Value>>,
     /// Per (account, room) pagination token for reading older history.
     matrix_back_tokens: Mutex<HashMap<(String, String), String>>,
     /// A guild channel's member window in Discord's own order, by buffer.
@@ -548,6 +562,23 @@ pub struct Runtime {
     replaying: Mutex<std::collections::HashSet<String>>,
     /// (account, room) -> the motd last shown there, so it is shown once.
     sockchat_motds: Mutex<HashMap<(String, String), String>>,
+    /// (account, channel, split message) -> who has gone, so far.
+    ///
+    /// A netsplit takes everybody on the far side of it away at once, which
+    /// on a large network is hundreds of people in a second. Drawn one line
+    /// each it buries the conversation; gathered up it is one line saying
+    /// what happened.
+    irc_splits: Mutex<HashMap<(String, String, String), Vec<String>>>,
+    /// (account, lowercased nick) -> the WHOIS reply being assembled.
+    ///
+    /// A WHOIS answer is a handful of separate numerics ending in 318, so it
+    /// has to be gathered before it can be shown as the one thing it is.
+    irc_whois: Mutex<HashMap<(String, String), Value>>,
+    /// (account) -> nicks the server says are away.
+    ///
+    /// Per account rather than per channel: away is a property of the person,
+    /// and the same nick in three channels is away in all of them.
+    irc_away: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// account -> the room catalogue last read off the site.
     ///
     /// Cached because reading it costs a Tor round trip and a proof-of-work
@@ -579,6 +610,8 @@ impl Runtime {
             discord_gated: Mutex::new(std::collections::HashSet::new()),
             discord_resync: Mutex::new(HashMap::new()),
             discord_own_roles: Mutex::new(HashMap::new()),
+            discord_guild_roles: Mutex::new(HashMap::new()),
+            discord_members: Mutex::new(HashMap::new()),
             matrix_back_tokens: Mutex::new(HashMap::new()),
             discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
@@ -623,6 +656,9 @@ impl Runtime {
             replaying: Mutex::new(std::collections::HashSet::new()),
             sockchat_motds: Mutex::new(HashMap::new()),
             sockchat_rooms: Mutex::new(HashMap::new()),
+            irc_splits: Mutex::new(HashMap::new()),
+            irc_whois: Mutex::new(HashMap::new()),
+            irc_away: Mutex::new(HashMap::new()),
             matrix_presence: Mutex::new(HashMap::new()),
         }
     }
@@ -1754,6 +1790,56 @@ impl Runtime {
     /// The first sighting is not a change: it is the baseline, and treating
     /// it as one would re-read every guild on the first member update after
     /// connecting.
+    pub fn remember_discord_member(&self, guild_id: &str, user_id: &str, member: &serde_json::Value) {
+        self.discord_members
+            .lock()
+            .unwrap()
+            .insert((guild_id.to_string(), user_id.to_string()), member.clone());
+    }
+
+    pub fn discord_member(&self, guild_id: &str, user_id: &str) -> Option<serde_json::Value> {
+        self.discord_members.lock().unwrap().get(&(guild_id.to_string(), user_id.to_string())).cloned()
+    }
+
+    pub fn set_discord_guild_roles(&self, guild_id: &str, roles: Vec<serde_json::Value>) {
+        self.discord_guild_roles.lock().unwrap().insert(guild_id.to_string(), roles);
+    }
+
+    /// The names of the roles somebody holds, in the guild's own order -
+    /// which is its hierarchy, so the first is the one that matters most.
+    /// `@everyone` is dropped: it is not a role anybody was given.
+    pub fn discord_role_names(&self, guild_id: &str, held: &[serde_json::Value]) -> Vec<String> {
+        let held: std::collections::HashSet<&str> = held.iter().filter_map(|v| v.as_str()).collect();
+        let all = self.discord_guild_roles.lock().unwrap();
+        let Some(roles) = all.get(guild_id) else { return Vec::new() };
+        let mut named: Vec<(i64, String)> = roles
+            .iter()
+            .filter(|r| r["id"].as_str().is_some_and(|id| held.contains(id) && id != guild_id))
+            .filter_map(|r| Some((r["position"].as_i64().unwrap_or(0), r["name"].as_str()?.to_string())))
+            .collect();
+        named.sort_by(|a, b| b.0.cmp(&a.0));
+        named.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Whether any role they hold can act on other people. The four bits that
+    /// mean it: administrator, kick, ban, and managing other people's
+    /// messages - which is what "moderator" means to anybody being asked.
+    pub fn discord_roles_moderate(&self, guild_id: &str, held: &[serde_json::Value]) -> bool {
+        const ADMINISTRATOR: u64 = 1 << 3;
+        const KICK_MEMBERS: u64 = 1 << 1;
+        const BAN_MEMBERS: u64 = 1 << 2;
+        const MANAGE_MESSAGES: u64 = 1 << 13;
+        let can_moderate = ADMINISTRATOR | KICK_MEMBERS | BAN_MEMBERS | MANAGE_MESSAGES;
+
+        let held: std::collections::HashSet<&str> = held.iter().filter_map(|v| v.as_str()).collect();
+        let all = self.discord_guild_roles.lock().unwrap();
+        let Some(roles) = all.get(guild_id) else { return false };
+        roles
+            .iter()
+            .filter(|r| r["id"].as_str().is_some_and(|id| held.contains(id)))
+            .any(|r| r["permissions"].as_str().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0) & can_moderate != 0)
+    }
+
     pub fn set_discord_own_roles(&self, group_id: &str, roles: Vec<String>) -> bool {
         let mut sorted = roles;
         sorted.sort();
@@ -1949,6 +2035,61 @@ impl Runtime {
     /// A room's own sync repeats receipts that have not moved, so a caller
     /// that emitted on every one would redraw the whole room's markers
     /// whenever anything at all happened in it.
+    /// Adds somebody to a running netsplit. Returns true when this is the
+    /// first of its split in this channel, which is the caller's cue to
+    /// schedule the line that reports it.
+    pub fn add_irc_split(&self, account_id: &str, channel: &str, reason: &str, nick: &str) -> bool {
+        let mut all = self.irc_splits.lock().unwrap();
+        let entry = all.entry((account_id.to_string(), channel.to_string(), reason.to_string())).or_default();
+        entry.push(nick.to_string());
+        entry.len() == 1
+    }
+
+    /// Everybody who went in one split, taken off the pile.
+    pub fn take_irc_split(&self, account_id: &str, channel: &str, reason: &str) -> Vec<String> {
+        self.irc_splits
+            .lock()
+            .unwrap()
+            .remove(&(account_id.to_string(), channel.to_string(), reason.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Starts collecting a WHOIS answer for `nick`, discarding any half-built
+    /// one - a second lookup of the same person is a fresh question.
+    pub fn begin_irc_whois(&self, account_id: &str, nick: &str) {
+        self.irc_whois
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), nick.to_lowercase()), json!({ "nick": nick }));
+    }
+
+    /// Adds one numeric's worth of answer. Ignored when nothing asked: a
+    /// WHOIS somebody else triggered (a script, another client on the same
+    /// bouncer) would otherwise open a window nobody asked for.
+    pub fn add_irc_whois_field(&self, account_id: &str, nick: &str, field: &str, value: Value) {
+        let mut all = self.irc_whois.lock().unwrap();
+        if let Some(entry) = all.get_mut(&(account_id.to_string(), nick.to_lowercase())) {
+            entry[field] = value;
+        }
+    }
+
+    /// The finished answer, removed from the pile.
+    pub fn take_irc_whois(&self, account_id: &str, nick: &str) -> Option<Value> {
+        self.irc_whois.lock().unwrap().remove(&(account_id.to_string(), nick.to_lowercase()))
+    }
+
+    /// Records that somebody is away, or is back. Returns whether this
+    /// changed anything, so a caller only redraws rosters that moved.
+    pub fn set_irc_away(&self, account_id: &str, nick: &str, away: bool) -> bool {
+        let mut all = self.irc_away.lock().unwrap();
+        let set = all.entry(account_id.to_string()).or_default();
+        if away { set.insert(nick.to_lowercase()) } else { set.remove(&nick.to_lowercase()) }
+    }
+
+    pub fn is_irc_away(&self, account_id: &str, nick: &str) -> bool {
+        self.irc_away.lock().unwrap().get(account_id).is_some_and(|set| set.contains(&nick.to_lowercase()))
+    }
+
     pub fn sockchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SockChatRoom>> {
         self.sockchat_rooms.lock().unwrap().get(account_id).cloned()
     }

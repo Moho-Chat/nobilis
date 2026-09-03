@@ -112,6 +112,38 @@ async fn build_transport(state: &AppState, config: &SockChatAccountConfig, accou
     }
 }
 
+/// Who somebody is, on Sneedchat.
+///
+/// The chat protocol carries a user id, a name and a picture and nothing
+/// else - no join date, no rank, no last seen. What it does carry is the id,
+/// and the id is a link to the forum profile where all of that lives, so that
+/// is what this offers rather than inventing the rest.
+pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
+    let mut profile = crate::profile::pending("sockchat", account_id, username);
+    profile["pending"] = serde_json::json!(false);
+
+    // The roster the room already has: their id and picture are in it.
+    if let Some(members) = state.runtime.get_presence(buffer_id) {
+        if let Some(member) = members
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["nick"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(username)))
+        {
+            if let Some(id) = member["userId"].as_str() {
+                profile["id"] = serde_json::json!(id);
+                if let Some(config) = state.accounts.get_sockchat(account_id) {
+                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.host));
+                }
+            }
+            if let Some(avatar) = member["avatarUrl"].as_str() {
+                profile["avatarUrl"] = serde_json::json!(avatar);
+            }
+        }
+    }
+    profile
+}
+
 /// Which rooms the site has, asked of the site.
 ///
 /// The catalogue was six rooms written into the frontend, with a comment

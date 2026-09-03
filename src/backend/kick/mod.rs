@@ -56,6 +56,58 @@ pub enum Command {
     Part(String),
 }
 
+/// Who somebody is, on Kick.
+///
+/// Kick's own moderation popup asks one endpoint for this, and it answers the
+/// two things that matter in a stream chat: how long they have followed, and
+/// what they have earned here. Badges are what the chat itself already shows
+/// beside their name, so the profile agrees with the line above it.
+pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
+    let mut profile = crate::profile::pending("kick", account_id, username);
+    profile["pending"] = serde_json::json!(false);
+
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return profile };
+    let slug = api::normalise_slug(&buffer.name);
+    let token = state.accounts.get_kick(account_id).and_then(|c| c.token);
+    let Ok(http) = api::client() else { return profile };
+
+    let Ok(body) = api::channel_user(&http, token.as_deref(), &slug, username).await else { return profile };
+
+    if let Some(id) = body["id"].as_i64() {
+        profile["id"] = serde_json::json!(id.to_string());
+    }
+    if let Some(name) = body["username"].as_str() {
+        profile["name"] = serde_json::json!(name);
+    }
+    if let Some(picture) = body["profile_pic"].as_str().filter(|p| !p.is_empty()) {
+        profile["avatarUrl"] = serde_json::json!(picture);
+    }
+    // "Following since" is Kick's own phrase and its own date format.
+    if let Some(since) = body["following_since"].as_str() {
+        crate::profile::note(&mut profile, "Following since", since.split('T').next().unwrap_or(since));
+    }
+    if body["banned"].is_object() {
+        crate::profile::note(&mut profile, "Banned", "yes, in this channel");
+    }
+
+    let badges: Vec<String> = body["badges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b["text"].as_str().or_else(|| b["type"].as_str()).map(str::to_string))
+        .collect();
+    let moderator = body["badges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|b| matches!(b["type"].as_str(), Some("moderator") | Some("broadcaster")));
+    if !badges.is_empty() {
+        profile["roles"] = serde_json::json!(badges);
+    }
+    profile["isModerator"] = serde_json::json!(moderator);
+    profile
+}
+
 pub fn spawn(state: AppState, config: KickAccountConfig) {
     let account_id = config.account_id();
     state.runtime.reset_connection(&account_id);

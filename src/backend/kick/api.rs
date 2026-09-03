@@ -533,6 +533,27 @@ struct MeJson {
 /// An error here is not fatal anywhere it is called. Not knowing means being
 /// treated as not subscribed, which costs a locked emote rather than a
 /// conversation.
+/// What a channel knows about one of its viewers.
+///
+/// `/channels/{slug}/users/{username}` is what the site's own moderation
+/// popup asks: the day they started following, their badges here, and whether
+/// they are currently banned. Unauthenticated it answers the public half,
+/// which is why this takes an optional token rather than requiring one.
+pub async fn channel_user(http: &reqwest::Client, token: Option<&str>, slug: &str, username: &str) -> Result<serde_json::Value> {
+    let encoded = url::form_urlencoded::byte_serialize(username.as_bytes()).collect::<String>();
+    let mut request = http
+        .get(format!("{API_ROOT}/api/v2/channels/{slug}/users/{encoded}"))
+        .header("Accept", "application/json");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let res = request.send().await.context("asking Kick about a viewer")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about that viewer", res.status());
+    }
+    res.json().await.context("reading Kick's answer")
+}
+
 pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result<Standing> {
     let res = http
         .get(format!("{API_ROOT}/api/v2/channels/{slug}/me"))

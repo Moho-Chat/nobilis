@@ -677,6 +677,97 @@ fn dm_channel_name(ch: &Value) -> String {
 /// runs on a real user token - see this module's own doc comment). `invite`
 /// may be a bare code or a full discord.gg/xxx (or discord.com/invite/xxx)
 /// URL; only the trailing path segment (the actual code) is ever sent.
+/// Who somebody is, on Discord.
+///
+/// The account's age needs no request at all: every Discord id is a timestamp
+/// with a counter on the end (see profile::snowflake_created), which is the
+/// one fact people actually want from a profile and the one the rate-limited
+/// endpoints are worst at giving.
+///
+/// The rest comes from the user-profile endpoint, which for a guild member
+/// carries the day they joined *this* guild and their roles in it. It is
+/// refused for somebody who shares no space with this account, and refused
+/// under rate limiting - in both cases what is already known still shows.
+pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_id: &str, name: &str) -> Value {
+    let mut profile = crate::profile::pending("discord", account_id, name);
+    profile["pending"] = json!(false);
+    profile["id"] = json!(user_id);
+    crate::profile::set(&mut profile, "createdTs", crate::profile::snowflake_created(user_id).map(|ts| json!(ts)));
+
+    let Some(config) = state.accounts.get_discord(account_id) else { return profile };
+    let guild_id = state
+        .runtime
+        .get_buffer(buffer_id)
+        .and_then(|b| b.group_id)
+        .and_then(|g| g.rsplit_once("guild:").map(|(_, id)| id.to_string()));
+
+    let mut url = format!("{API_BASE}/users/{user_id}/profile?with_mutual_guilds=false");
+    if let Some(guild) = &guild_id {
+        url.push_str(&format!("&guild_id={guild}"));
+    }
+
+    // What the member window already saw, which is the only place a user
+    // token learns when somebody joined a guild - see remember_discord_member.
+    if let Some(guild) = &guild_id {
+        if let Some(member) = state.runtime.discord_member(guild, user_id) {
+            if let Some(joined) = member["joined_at"].as_str().and_then(parse_iso8601_seconds) {
+                profile["joinedTs"] = json!(joined);
+            }
+            if let Some(nick) = member["nick"].as_str().filter(|s| !s.is_empty()) {
+                crate::profile::note(&mut profile, "Nickname here", nick);
+            }
+            let held = member["roles"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+            let names = state.runtime.discord_role_names(guild, held);
+            if !names.is_empty() {
+                profile["roles"] = json!(names);
+            }
+            profile["isModerator"] = json!(state.runtime.discord_roles_moderate(guild, held));
+            if let Some(status) = member["presence"]["status"].as_str() {
+                profile["status"] = json!(status);
+            }
+        }
+    }
+
+    let response = http_client().get(&url).header("Authorization", &config.token).send().await;
+    let Ok(body) = response else { return profile };
+    let Ok(body) = body.json::<Value>().await else { return profile };
+
+    let user = &body["user"];
+    if let Some(display) = user["global_name"].as_str().filter(|s| !s.is_empty()) {
+        profile["name"] = json!(display);
+        profile["handle"] = json!(user["username"].as_str().unwrap_or(name));
+    } else if let Some(username) = user["username"].as_str() {
+        profile["name"] = json!(username);
+    }
+    if let (Some(avatar), Some(id)) = (user["avatar"].as_str(), user["id"].as_str()) {
+        profile["avatarUrl"] = json!(format!("https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128"));
+    }
+    if let Some(bio) = user["bio"].as_str().filter(|s| !s.trim().is_empty()) {
+        crate::profile::note(&mut profile, "About", bio.trim());
+    }
+    if let Some(since) = body["premium_since"].as_str() {
+        crate::profile::note(&mut profile, "Nitro since", since.split('T').next().unwrap_or(since));
+    }
+
+    // The same facts from the endpoint, where it answered - it does not for
+    // somebody this account shares nothing with, which is why the member
+    // window above is the primary source rather than the fallback.
+    let member = &body["guild_member"];
+    if profile.get("joinedTs").is_none() {
+        if let Some(joined) = member["joined_at"].as_str().and_then(parse_iso8601_seconds) {
+            profile["joinedTs"] = json!(joined);
+        }
+    }
+
+    profile
+}
+
+/// Seconds since the epoch from an ISO 8601 timestamp, which is how Discord
+/// writes every date it sends.
+fn parse_iso8601_seconds(text: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.timestamp())
+}
+
 pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let code = invite.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(invite.trim());
@@ -2141,7 +2232,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, None, None, &state.runtime.buffer_kind_of(buffer_id), None, &[]) {
+        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &[]) {
             tracing::warn!("discord: storing history message: {e}");
             continue;
         }
@@ -2766,6 +2857,11 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         // need the guild's roles and our own membership,
                         // which arrive only here.
                         if let Some(guild_id) = d["id"].as_str() {
+                            // Kept in the runtime as well as here: the
+                            // gateway task owns this map, and a profile
+                            // asked for from an RPC needs the same roles to
+                            // say what somebody is in a guild.
+                            state.runtime.set_discord_guild_roles(guild_id, d["roles"].as_array().cloned().unwrap_or_default());
                             guild_context.insert(guild_id.to_string(), d.clone());
                         }
                     }
@@ -2983,7 +3079,10 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             real_msg_id.clone().unwrap_or_default(),
                             attachments.clone(),
                         );
-                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, None);
+                        // The author's id travels with the message. It is what a profile
+                        // lookup asks Discord about - a display name is not something
+                        // the API accepts - and what a moderation action would need.
+                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
                         if !thumb_target.1.is_empty() {
                             cache_thumbnails(state.clone(), thumb_target.0, thumb_target.1, thumb_target.2);
                         }
@@ -3599,20 +3698,20 @@ mod tests {
         let mut window: Vec<serde_json::Value> = Vec::new();
 
         let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [member("1", "anna", "online"), member("2", "bob", "idle")] });
-        assert!(apply_member_op(&runtime, "discord:me", &mut window, &sync));
+        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync));
         assert_eq!(window.len(), 2);
         assert_eq!(window[0]["nick"], "anna");
 
         let insert = json!({ "op": "INSERT", "index": 1, "item": member("3", "carol", "online") });
-        assert!(apply_member_op(&runtime, "discord:me", &mut window, &insert));
+        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &insert));
         assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "carol", "bob"]);
 
         let update = json!({ "op": "UPDATE", "index": 0, "item": member("1", "anna", "offline") });
-        assert!(apply_member_op(&runtime, "discord:me", &mut window, &update));
+        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &update));
         assert_eq!(window[0]["away"], true);
 
         let delete = json!({ "op": "DELETE", "index": 1 });
-        assert!(apply_member_op(&runtime, "discord:me", &mut window, &delete));
+        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &delete));
         assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "bob"]);
     }
 
@@ -3625,14 +3724,14 @@ mod tests {
         let mut window: Vec<serde_json::Value> = Vec::new();
 
         let header = json!({ "op": "INSERT", "index": 0, "item": { "group": { "id": "online", "count": 4 } } });
-        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &header));
+        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &header));
         assert!(window.is_empty());
 
         let past_end = json!({ "op": "DELETE", "index": 7 });
-        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &past_end));
+        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &past_end));
 
         let invalidate = json!({ "op": "INVALIDATE", "range": [0, 99] });
-        assert!(!apply_member_op(&runtime, "discord:me", &mut window, &invalidate));
+        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &invalidate));
     }
     use super::{
         attachment_expired, default_avatar_url, dm_avatar_url, extract_attachments, extract_body,
@@ -3967,7 +4066,7 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// its view changes.
 /// One entry of Discord's member window, or nothing if the item is a role
 /// header rather than a person.
-fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, item: &Value) -> Option<Value> {
+fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
     let member = item.get("member")?;
     let user = &member["user"];
     let user_id = user["id"].as_str()?;
@@ -3985,6 +4084,14 @@ fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, item: &Valu
     // state only when someone moves, so anyone already sitting in a channel
     // when we connect would otherwise be shown as a raw snowflake forever.
     runtime.remember_discord_name(account_id, user_id, nick);
+    // And their membership of this guild, which arrives here and nowhere else
+    // a user token can reach: /users/{id}/profile answers "Unknown User" for
+    // anybody this account has no relationship with, and /guilds/../members
+    // is closed to user tokens entirely. The member window is how Discord's
+    // own client knows when somebody joined, so it is how this does too.
+    if !guild_id.is_empty() {
+        runtime.remember_discord_member(guild_id, user_id, member);
+    }
     Some(json!({
         "nick": nick,
         "userId": user_id,
@@ -4006,7 +4113,7 @@ fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, item: &Valu
 /// INSERT, UPDATE and DELETE address the window by index, which is why the
 /// list they are applied to is held in Discord's order rather than the
 /// sorted one that gets displayed.
-fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, window: &mut Vec<Value>, op: &Value) -> bool {
+fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, window: &mut Vec<Value>, op: &Value) -> bool {
     let index = |op: &Value| op["index"].as_u64().map(|i| i as usize);
     match op["op"].as_str().unwrap_or("") {
         "SYNC" => {
@@ -4014,7 +4121,7 @@ fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, window: 
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|item| member_entry(runtime, account_id, item))
+                .filter_map(|item| member_entry(runtime, account_id, guild_id, item))
                 .collect();
             // The range is the slice of the window this SYNC describes.
             // Only ever [0, 99] is asked for, so this replaces the lot -
@@ -4028,7 +4135,7 @@ fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, window: 
             }
             true
         }
-        "INSERT" => match (index(op), member_entry(runtime, account_id, &op["item"])) {
+        "INSERT" => match (index(op), member_entry(runtime, account_id, guild_id, &op["item"])) {
             (Some(i), Some(entry)) if i <= window.len() => {
                 window.insert(i, entry);
                 true
@@ -4038,7 +4145,7 @@ fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, window: 
             // by the next SYNC rather than being left subtly misaligned.
             _ => false,
         },
-        "UPDATE" => match (index(op), member_entry(runtime, account_id, &op["item"])) {
+        "UPDATE" => match (index(op), member_entry(runtime, account_id, guild_id, &op["item"])) {
             (Some(i), Some(entry)) if i < window.len() => {
                 window[i] = entry;
                 true
@@ -4062,8 +4169,12 @@ fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
     let mut window = state.runtime.discord_member_window(buffer_id);
     let mut changed = false;
 
+    // The guild the window belongs to, so each member's own membership of it
+    // - when they joined, which roles they hold - can be remembered as it
+    // goes past. It is on the dispatch rather than on the entries.
+    let guild_id = d["guild_id"].as_str().unwrap_or("");
     for op in d["ops"].as_array().into_iter().flatten() {
-        changed |= apply_member_op(&state.runtime, &account_id, &mut window, op);
+        changed |= apply_member_op(&state.runtime, &account_id, guild_id, &mut window, op);
     }
 
     if !changed {

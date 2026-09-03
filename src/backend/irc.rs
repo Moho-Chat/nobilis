@@ -703,6 +703,17 @@ pub const DEFAULT_QUIT_MESSAGE: &str = "moho";
 const WANTED_CAPS: &[&str] = &[
     "server-time",
     "multi-prefix",
+    // Who is away, as it happens. Without it away is known only about
+    // somebody just looked up or just messaged, so a roster is a list of
+    // people who might be there.
+    "away-notify",
+    // Who is identified to services, and to what account - carried on the
+    // join itself rather than needing a WHOIS per person.
+    "extended-join",
+    "account-notify",
+    // A host change without the fake part-and-rejoin a server otherwise has
+    // to fake it with.
+    "chghost",
     // A message's own id, which is what makes replayed history recognisable
     // as history rather than as new. Without it every backfill would arrive
     // as a fresh copy of everything already on screen: IRC has no id of its
@@ -1047,16 +1058,25 @@ async fn handle_message(
                     }
                 }
             }
+            if from != own_nick {
+                let line = format!("{from} entered the room");
+                state.runtime.record_message(state, account_id, &channel, "channel", "*", &line, false, "join", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
             emit_presence(state, account_id, &channel, members);
         }
 
-        Command::PART(channel, _) => {
+        Command::PART(channel, reason) => {
             if from == own_nick {
                 let buffer_id = crate::model::buffer_id(account_id, &channel);
                 state.runtime.remove_buffer(state, &buffer_id);
                 channels.remove(&channel);
             } else if let Some(members) = channels.get_mut(&channel) {
                 members.remove(&from);
+                let line = match reason.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+                    Some(why) => format!("{from} left the room ({why})"),
+                    None => format!("{from} left the room"),
+                };
+                state.runtime.record_message(state, account_id, &channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
                 emit_presence(state, account_id, &channel, members);
             }
         }
@@ -1154,11 +1174,34 @@ async fn handle_message(
             }
         }
 
-        Command::QUIT(_) => {
+        Command::QUIT(reason) => {
+            let reason = reason.unwrap_or_default();
+            let reason = reason.trim();
+            // A netsplit says so in the quit message itself: two server names
+            // and nothing else. Everybody on the far side goes in the same
+            // second, so they are gathered and reported once instead of one
+            // line per person - which on a large network is hundreds of them.
+            let split = is_netsplit(reason).then(|| reason.to_string());
             for (channel, members) in channels.iter_mut() {
-                if members.remove(&from).is_some() {
-                    emit_presence(state, account_id, channel, members);
+                if members.remove(&from).is_none() {
+                    continue;
                 }
+                match &split {
+                    Some(reason) => {
+                        if state.runtime.add_irc_split(account_id, channel, reason, &from) {
+                            schedule_split_report(state.clone(), account_id.to_string(), channel.clone(), reason.clone());
+                        }
+                    }
+                    None => {
+                        let line = if reason.is_empty() {
+                            format!("{from} has quit")
+                        } else {
+                            format!("{from} has quit ({reason})")
+                        };
+                        state.runtime.record_message(state, account_id, channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
+                    }
+                }
+                emit_presence(state, account_id, channel, members);
             }
         }
 
@@ -1166,8 +1209,103 @@ async fn handle_message(
             for (channel, members) in channels.iter_mut() {
                 if let Some(rank) = members.remove(&from) {
                     members.insert(new_nick.clone(), rank);
+                    let line = format!("{from} is now known as {new_nick}");
+                    state.runtime.record_message(state, account_id, channel, "channel", "*", &line, false, "nick", None, None, false, None, Vec::new(), Vec::new(), None);
                     emit_presence(state, account_id, channel, members);
                 }
+            }
+        }
+
+        // --- WHOIS/WHOWAS: one answer assembled from several numerics ---
+        //
+        // Each of these carries the queried nick as args[1]; the pieces are
+        // collected under it and shown when 318 (or 369) says the reply is
+        // complete. A numeric for somebody nothing asked about is dropped,
+        // so another client sharing this connection cannot open a window
+        // here.
+        Command::Response(Response::RPL_WHOISUSER, args) | Command::Response(Response::RPL_WHOWASUSER, args) => {
+            // args: [me, nick, user, host, "*", :real name]
+            if let Some(nick) = args.get(1) {
+                state.runtime.add_irc_whois_field(account_id, nick, "nick", json!(nick));
+                if let (Some(user), Some(host)) = (args.get(2), args.get(3)) {
+                    state.runtime.add_irc_whois_field(account_id, nick, "mask", json!(format!("{nick}!{user}@{host}")));
+                }
+                if let Some(real) = args.last() {
+                    state.runtime.add_irc_whois_field(account_id, nick, "realName", json!(real));
+                }
+            }
+        }
+        Command::Response(Response::RPL_WHOISSERVER, args) => {
+            if let (Some(nick), Some(server)) = (args.get(1), args.get(2)) {
+                let info = args.get(3).cloned().unwrap_or_default();
+                state.runtime.add_irc_whois_field(account_id, nick, "server", json!(format!("{server} ({info})")));
+            }
+        }
+        Command::Response(Response::RPL_WHOISOPERATOR, args) => {
+            if let Some(nick) = args.get(1) {
+                state.runtime.add_irc_whois_field(account_id, nick, "operator", json!(args.last().cloned().unwrap_or_default()));
+            }
+        }
+        Command::Response(Response::RPL_WHOISIDLE, args) => {
+            // args: [me, nick, idle seconds, signon unix time, :info]
+            if let Some(nick) = args.get(1) {
+                if let Some(idle) = args.get(2).and_then(|v| v.parse::<i64>().ok()) {
+                    state.runtime.add_irc_whois_field(account_id, nick, "idleSeconds", json!(idle));
+                }
+                if let Some(signon) = args.get(3).and_then(|v| v.parse::<i64>().ok()) {
+                    state.runtime.add_irc_whois_field(account_id, nick, "signOnTs", json!(signon));
+                }
+            }
+        }
+        Command::Response(Response::RPL_WHOISCHANNELS, args) => {
+            if let (Some(nick), Some(list)) = (args.get(1), args.last()) {
+                let channels: Vec<&str> = list.split_whitespace().collect();
+                state.runtime.add_irc_whois_field(account_id, nick, "channels", json!(channels));
+            }
+        }
+        Command::Response(Response::RPL_ENDOFWHOIS, args) | Command::Response(Response::RPL_ENDOFWHOWAS, args) => {
+            if let Some(nick) = args.get(1) {
+                if let Some(whois) = state.runtime.take_irc_whois(account_id, nick) {
+                    crate::profile::emit(state, irc_profile(state, account_id, nick, whois, channels));
+                }
+            }
+        }
+
+        // --- away ---
+        //
+        // 301 arrives two ways: inside a WHOIS reply, and on its own when a
+        // message is sent to somebody away. Both mean the same thing, so it
+        // feeds the roster either way and only joins the WHOIS if one is
+        // being assembled.
+        Command::Response(Response::RPL_AWAY, args) => {
+            if let Some(nick) = args.get(1) {
+                let reason = args.last().cloned().unwrap_or_default();
+                state.runtime.add_irc_whois_field(account_id, nick, "away", json!(reason));
+                if state.runtime.set_irc_away(account_id, nick, true) {
+                    refresh_rosters_containing(state, account_id, nick, channels);
+                }
+            }
+        }
+        // The server's own confirmation, which is what gets shown - rather
+        // than /away claiming success the moment it is typed.
+        Command::Response(Response::RPL_NOWAWAY, args) | Command::Response(Response::RPL_UNAWAY, args) => {
+            let text = args.last().cloned().unwrap_or_default();
+            let now_away = text.to_lowercase().contains("marked as being away") && !text.to_lowercase().contains("no longer");
+            if let Some(own) = state.runtime.irc_current_nick(account_id) {
+                if state.runtime.set_irc_away(account_id, &own, now_away) {
+                    refresh_rosters_containing(state, account_id, &own, channels);
+                }
+            }
+            let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+            state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+        }
+
+        // Somebody else going away or coming back, live - the `away-notify`
+        // capability. Without it away state is only ever known about people
+        // who have just been WHOISed or messaged.
+        Command::AWAY(reason) => {
+            if state.runtime.set_irc_away(account_id, &from, reason.is_some()) {
+                refresh_rosters_containing(state, account_id, &from, channels);
             }
         }
 
@@ -1534,11 +1672,124 @@ fn parse_prefixed_nick(raw: &str) -> (MemberRank, &str) {
     (rank, rest)
 }
 
+/// The WHOIS answer, as a profile.
+///
+/// IRC's numerics are the oldest form of this in chat, and most of what they
+/// carry maps straight across: the mask, the real name, the server, how long
+/// they have been idle and when they connected. What has no equivalent -
+/// there is no account age on IRC, because there are no accounts - is simply
+/// absent rather than guessed at.
+fn irc_profile(
+    state: &AppState,
+    account_id: &str,
+    nick: &str,
+    whois: serde_json::Value,
+    channels: &HashMap<String, HashMap<String, MemberRank>>,
+) -> serde_json::Value {
+    let mut profile = crate::profile::pending("irc", account_id, nick);
+    profile["pending"] = json!(false);
+    crate::profile::set(&mut profile, "handle", whois.get("mask").cloned());
+    crate::profile::set(&mut profile, "idleSeconds", whois.get("idleSeconds").cloned());
+    // The signon time is when this connection started, which is the closest
+    // thing IRC has to "joined" - and is what every client labels as such.
+    crate::profile::set(&mut profile, "joinedTs", whois.get("signOnTs").cloned());
+    crate::profile::set(&mut profile, "away", whois.get("away").cloned());
+    crate::profile::set(&mut profile, "channels", whois.get("channels").cloned());
+
+    if let Some(real) = whois.get("realName").and_then(serde_json::Value::as_str) {
+        crate::profile::note(&mut profile, "Name", real);
+    }
+    if let Some(server) = whois.get("server").and_then(serde_json::Value::as_str) {
+        crate::profile::note(&mut profile, "Server", server);
+    }
+    if let Some(oper) = whois.get("operator").and_then(serde_json::Value::as_str) {
+        crate::profile::note(&mut profile, "Operator", oper);
+    }
+
+    // Their standing where we can see them. A rank is per channel on IRC, so
+    // this reports every channel we share where they hold one - which is the
+    // honest form of "are they a moderator" on a protocol with no global
+    // answer to it.
+    let mut roles: Vec<String> = Vec::new();
+    let mut moderator = false;
+    for (channel, members) in channels {
+        if let Some(rank) = members.get(nick) {
+            if let Some(word) = rank.title() {
+                roles.push(format!("{word} in {channel}"));
+                moderator |= rank.can_moderate();
+            }
+        }
+    }
+    if !roles.is_empty() {
+        profile["roles"] = json!(roles);
+    }
+    profile["isModerator"] = json!(moderator);
+    profile["status"] = json!(if state.runtime.is_irc_away(account_id, nick) { "idle" } else { "online" });
+    profile
+}
+
+/// Whether a quit message is a netsplit rather than something somebody typed.
+///
+/// A split's quit message is the two servers that stopped talking to each
+/// other and nothing else - "irc.example.net hub.example.net". That shape is
+/// the only signal there is, so it is matched conservatively: exactly two
+/// words, both looking like hostnames, neither of them a sentence.
+fn is_netsplit(reason: &str) -> bool {
+    let mut words = reason.split_whitespace();
+    let (Some(a), Some(b), None) = (words.next(), words.next(), words.next()) else { return false };
+    let hostish = |w: &str| w.contains('.') && !w.contains(':') && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+    hostish(a) && hostish(b)
+}
+
+/// How long to keep gathering before reporting a split. Long enough that the
+/// server has finished sending the quits, short enough that the line is still
+/// about something that just happened.
+const SPLIT_REPORT_DELAY: Duration = Duration::from_secs(3);
+
+/// Reports one netsplit, once, after the quits have stopped arriving.
+fn schedule_split_report(state: AppState, account_id: String, channel: String, reason: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SPLIT_REPORT_DELAY).await;
+        let gone = state.runtime.take_irc_split(&account_id, &channel, &reason);
+        if gone.is_empty() {
+            return;
+        }
+        let line = if gone.len() == 1 {
+            format!("{} has quit ({reason})", gone[0])
+        } else {
+            format!("{} people split from the network ({reason})", gone.len())
+        };
+        state.runtime.record_message(&state, &account_id, &channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
+    });
+}
+
+/// Redraws every roster this person appears in.
+///
+/// Away is a property of the person rather than of a channel, so one AWAY
+/// line moves them in all of them at once - and a roster that was not redrawn
+/// keeps showing them as present, which is precisely the thing away exists to
+/// correct.
+fn refresh_rosters_containing(state: &AppState, account_id: &str, nick: &str, channels: &HashMap<String, HashMap<String, MemberRank>>) {
+    for (channel, members) in channels.iter() {
+        if members.contains_key(nick) {
+            emit_presence(state, account_id, channel, members);
+        }
+    }
+}
+
 fn emit_presence(state: &AppState, account_id: &str, channel: &str, members: &HashMap<String, MemberRank>) {
     let buffer_id = crate::model::buffer_id(account_id, channel);
     let member_list: Vec<_> = members
         .iter()
-        .map(|(nick, rank)| json!({ "nick": nick, "prefix": rank.prefix(), "away": false }))
+        .map(|(nick, rank)| json!({
+            "nick": nick,
+            "prefix": rank.prefix(),
+            // Was hardcoded false for everybody, which made the field a
+            // decoration rather than a fact. It is the server's answer now -
+            // from away-notify where the network has it, and from a WHOIS or
+            // a bounced message where it does not.
+            "away": state.runtime.is_irc_away(account_id, nick),
+        }))
         .collect();
     let member_list = json!(member_list);
     // Persisted so a client subscribing after this point (reopening the
@@ -1655,6 +1906,64 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
                 }
                 send_plain(state, account_id, sender, to, text)
             }
+            // Who somebody is. The reply arrives as numerics and is
+            // gathered into one answer rather than printed line by line -
+            // see take_whois.
+            "whois" | "whowas" => {
+                let nick = if arg.is_empty() { target_buffer } else { arg.split_whitespace().next().unwrap_or("") };
+                if nick.is_empty() || is_channel(nick) {
+                    bail!("/{cmd} requires a nick");
+                }
+                state.runtime.begin_irc_whois(account_id, nick);
+                let raw = format!("{} {nick}", cmd.to_uppercase());
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
+            }
+            // Away with a reason, back without one. The server confirms
+            // either way (305/306) and that confirmation is what gets shown,
+            // rather than this claiming success on its own.
+            "away" => sender.send(Command::AWAY((!arg.is_empty()).then(|| arg.to_string()))).map_err(|e| anyhow!(e)),
+            "back" => sender.send(Command::AWAY(None)).map_err(|e| anyhow!(e)),
+            // A notice, which is what a client sends when it does not want an
+            // answer - and what services and bots are expected to reply with,
+            // since a notice must never be auto-replied to.
+            "notice" => {
+                let mut notice_parts = arg.splitn(2, ' ');
+                let to = notice_parts.next().unwrap_or("");
+                let text = notice_parts.next().unwrap_or("").trim();
+                if to.is_empty() || text.is_empty() {
+                    bail!("/notice requires a target and a message");
+                }
+                sender.send(Command::NOTICE(to.to_string(), text.to_string())).map_err(|e| anyhow!(e))?;
+                let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
+                let line = format!("-> -{to}- {text}");
+                state.runtime.record_message(state, account_id, target_buffer, buffer_kind_hint(target_buffer), &own_nick, &line, false, "notice", None, None, false, None, Vec::new(), Vec::new(), None);
+                Ok(())
+            }
+            // CTCP: a PRIVMSG wrapped in \x01, which is all CTCP has ever
+            // been. VERSION, PING and TIME are the ones anybody sends; the
+            // answers come back as notices and are already recognised as
+            // administrative rather than conversational.
+            "ctcp" => {
+                let mut ctcp_parts = arg.splitn(2, ' ');
+                let to = ctcp_parts.next().unwrap_or("");
+                let rest = ctcp_parts.next().unwrap_or("").trim();
+                if to.is_empty() || rest.is_empty() {
+                    bail!("/ctcp requires a target and a command, e.g. /ctcp nick VERSION");
+                }
+                sender.send(Command::PRIVMSG(to.to_string(), format!("\u{1}{rest}\u{1}"))).map_err(|e| anyhow!(e))
+            }
+            // The escape hatch. Sixteen commands cannot cover a protocol with
+            // per-network extensions, services with their own vocabularies and
+            // a numeric for everything - and a client with no way to send a
+            // line verbatim is a client that cannot do the thing its network
+            // documents. What comes back shows in the server buffer, as it
+            // already does for everything unrecognised.
+            "quote" | "raw" => {
+                if arg.is_empty() {
+                    bail!("/{cmd} needs something to send");
+                }
+                sender.send(arg.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
+            }
             other => bail!("unknown command \"/{other}\""),
         };
     }
@@ -1762,6 +2071,31 @@ fn buffer_kind_hint(target: &str) -> &'static str {
 /// improvement worth making silently.
 fn sasl_transport_ok(ssl: bool, allow_plaintext: bool) -> bool {
     ssl || allow_plaintext
+}
+
+#[cfg(test)]
+mod away_and_split_tests {
+    use super::is_netsplit;
+
+    /// The only thing that marks a netsplit is the shape of its quit message:
+    /// two server names and nothing else. Anything a person could have typed
+    /// has to fall the other way, because a quit wrongly folded into a split
+    /// is a quit nobody ever sees.
+    #[test]
+    fn a_split_is_two_servers_and_nothing_else() {
+        assert!(is_netsplit("irc.example.net hub.example.net"));
+        assert!(is_netsplit("card.freenode.net orwell.freenode.net"));
+
+        assert!(!is_netsplit("Leaving"));
+        assert!(!is_netsplit("brb food"));
+        assert!(!is_netsplit(""));
+        // Three words is somebody talking, not a split.
+        assert!(!is_netsplit("a.example b.example c.example"));
+        // A quit message that happens to name one server is still a quit.
+        assert!(!is_netsplit("irc.example.net"));
+        // Quit messages carrying a URL are common and are not splits.
+        assert!(!is_netsplit("https://example.com hexchat.example"));
+    }
 }
 
 #[cfg(test)]
