@@ -537,6 +537,23 @@ pub struct Runtime {
     /// Receipts people send privately (`m.read.private`) never reach anybody
     /// else's sync, so this only ever holds what its senders chose to publish.
     matrix_read_receipts: Mutex<HashMap<(String, String), HashMap<String, String>>>,
+    /// Buffers currently being filled with history rather than with things
+    /// being said now.
+    ///
+    /// A replayed batch is real traffic - it is stored, it is shown - but it
+    /// is not news, and announcing it is how a reconnect turns an hours-old
+    /// mention into a fresh alert. Duplicate suppression already covers a
+    /// message seen before; this covers the first time, which is exactly the
+    /// case that fires.
+    replaying: Mutex<std::collections::HashSet<String>>,
+    /// (account, room) -> the motd last shown there, so it is shown once.
+    sockchat_motds: Mutex<HashMap<(String, String), String>>,
+    /// account -> the room catalogue last read off the site.
+    ///
+    /// Cached because reading it costs a Tor round trip and a proof-of-work
+    /// gate - fifteen seconds is normal - and the answer changes about as
+    /// often as the site adds a room.
+    sockchat_rooms: Mutex<HashMap<String, Vec<crate::accounts::SockChatRoom>>>,
     /// Matrix-specific: (account id, user id) -> whether /sync's top-level
     /// presence.events last reported them as "online". Absent (never seen
     /// a presence event for them) is treated as offline - Matrix has no
@@ -603,6 +620,9 @@ impl Runtime {
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
+            replaying: Mutex::new(std::collections::HashSet::new()),
+            sockchat_motds: Mutex::new(HashMap::new()),
+            sockchat_rooms: Mutex::new(HashMap::new()),
             matrix_presence: Mutex::new(HashMap::new()),
         }
     }
@@ -1929,6 +1949,46 @@ impl Runtime {
     /// A room's own sync repeats receipts that have not moved, so a caller
     /// that emitted on every one would redraw the whole room's markers
     /// whenever anything at all happened in it.
+    pub fn sockchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SockChatRoom>> {
+        self.sockchat_rooms.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn set_sockchat_room_catalogue(&self, account_id: &str, rooms: Vec<crate::accounts::SockChatRoom>) {
+        self.sockchat_rooms.lock().unwrap().insert(account_id.to_string(), rooms);
+    }
+
+    /// Whether this is the first time this room has said this particular
+    /// message of the day - and remembers it if so.
+    ///
+    /// Keyed by room, holding the text: the site re-sends the motd on every
+    /// reconnect, and a room that reconnects often would otherwise collect a
+    /// line of it each time. A changed motd is genuinely new and does show.
+    pub fn take_new_sockchat_motd(&self, account_id: &str, room: &str, motd: &str) -> bool {
+        let mut seen = self.sockchat_motds.lock().unwrap();
+        let key = (account_id.to_string(), room.to_string());
+        if seen.get(&key).map(String::as_str) == Some(motd) {
+            return false;
+        }
+        seen.insert(key, motd.to_string());
+        true
+    }
+
+    /// Marks a buffer as being filled with history, so nothing in it is
+    /// announced until it stops. Paired - a caller that sets this must clear
+    /// it, including on the error paths, or the buffer goes quiet for good.
+    pub fn set_replaying(&self, buffer_id: &str, replaying: bool) {
+        let mut all = self.replaying.lock().unwrap();
+        if replaying {
+            all.insert(buffer_id.to_string());
+        } else {
+            all.remove(buffer_id);
+        }
+    }
+
+    fn is_replaying(&self, buffer_id: &str) -> bool {
+        self.replaying.lock().unwrap().contains(buffer_id)
+    }
+
     pub fn set_matrix_read_receipt(&self, account_id: &str, room_id: &str, user_id: &str, event_id: &str) -> bool {
         let mut all = self.matrix_read_receipts.lock().unwrap();
         let room = all.entry((account_id.to_string(), room_id.to_string())).or_default();
@@ -2454,7 +2514,7 @@ impl Runtime {
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
-        if from != own_nick && (is_dm || is_highlight) {
+        if from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id) {
             state.events.emit(
                 "notification",
                 json!({

@@ -112,6 +112,149 @@ async fn build_transport(state: &AppState, config: &SockChatAccountConfig, accou
     }
 }
 
+/// Which rooms the site has, asked of the site.
+///
+/// The catalogue was six rooms written into the frontend, with a comment
+/// saying no endpoint lists them. There is one - it is simply not an API: the
+/// chat page the browser loads carries the room switcher as ordinary markup,
+/// `<a class="chat-room" data-id="20">Lolcows</a>`, and that is the same list
+/// a person sees down the side of the site.
+///
+/// Unauthenticated on purpose. The list is the same for everybody and the
+/// gate is the only thing in the way, so this needs no account session - which
+/// means the room list can be refreshed while an account is signed out or
+/// failing to sign in.
+/// Reads the catalogue in the background and tells everybody when it arrives.
+///
+/// Not returned from the RPC that asks for it, because reading it costs a Tor
+/// round trip through a proof-of-work gate - about fifteen seconds - and the
+/// daemon answers one request at a time per client. A blocking answer here
+/// froze the whole window for the duration, which is a far worse thing than a
+/// room list that fills in a moment later.
+pub fn refresh_rooms(state: AppState, account_id: String) {
+    tokio::spawn(async move {
+        match list_rooms(&state, &account_id).await {
+            Ok(rooms) => {
+                state.runtime.set_sockchat_room_catalogue(&account_id, rooms.clone());
+                state.events.emit(
+                    "sockchatRooms",
+                    serde_json::json!({
+                        "accountId": account_id,
+                        "rooms": rooms.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>(),
+                    }),
+                );
+            }
+            // Not surfaced: the client already has a list to show, and a
+            // failure here means it keeps showing it.
+            Err(e) => tracing::debug!("sockchat[{account_id}]: reading the room list: {e:#}"),
+        }
+    });
+}
+
+pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SockChatRoom>> {
+    let config = state.accounts.get_sockchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    let transport = build_transport(state, &config, account_id).await?;
+    let session = Session::new(transport, format!("https://{}", config.host), DEFAULT_USER_AGENT.to_string());
+
+    let url = format!("https://{}/test-chat", config.host);
+    let resp = session.fetch(&url).await.context("fetching the chat page")?;
+    if !(200..400).contains(&resp.status) {
+        bail!("the chat page answered HTTP {}", resp.status);
+    }
+    let rooms = parse_rooms(&resp.body);
+    if rooms.is_empty() {
+        bail!("the chat page listed no rooms - its markup has probably changed");
+    }
+    Ok(rooms)
+}
+
+/// The room switcher, out of the chat page's markup.
+///
+/// Deliberately a scan for the two things that matter rather than an HTML
+/// parse: `data-id` and the text after it. The page is generated markup and
+/// its shape will change; a scan that finds nothing is a room list that could
+/// not be read, which the caller reports, and not a panic or silent empty.
+fn parse_rooms(html: &str) -> Vec<SockChatRoom> {
+    let mut rooms = Vec::new();
+    for chunk in html.split("class=\"chat-room\"").skip(1) {
+        let Some(id) = chunk.split("data-id=\"").nth(1).and_then(|rest| rest.split('"').next()) else { continue };
+        let Ok(id) = id.parse::<u32>() else { continue };
+        // The link's own text, which is the room's name as the site writes it.
+        let Some(label) = chunk.split_once('>').map(|(_, rest)| rest).and_then(|rest| rest.split('<').next()) else {
+            continue;
+        };
+        let name = slug(label);
+        if !name.is_empty() && !rooms.iter().any(|r: &SockChatRoom| r.id == id) {
+            rooms.push(SockChatRoom { id, name });
+        }
+    }
+    rooms
+}
+
+/// The site's own display name reduced to the form this project has always
+/// used for a room - lower case, words joined by hyphens, punctuation gone.
+///
+/// Not a new convention: run over the rooms the catalogue already listed it
+/// reproduces every one of them exactly ("Beauty Parlor" -> beauty-parlor,
+/// "SPORTS!!" -> sports), which is what says the rule is the right one rather
+/// than merely a plausible one.
+fn slug(label: &str) -> String {
+    let mut out = String::new();
+    for ch in label.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod room_list_tests {
+    use super::{parse_rooms, slug};
+
+    /// The six rooms the catalogue held were written by hand from the site.
+    /// If the rule that turns a display name into one of them is right, it
+    /// reproduces all six - and it does.
+    #[test]
+    fn the_sites_names_become_the_names_this_project_already_used() {
+        assert_eq!(slug("General"), "general");
+        assert_eq!(slug("Gunt"), "gunt");
+        assert_eq!(slug("Keno Kasino"), "keno-kasino");
+        assert_eq!(slug("Fishtank"), "fishtank");
+        assert_eq!(slug("Beauty Parlor"), "beauty-parlor");
+        assert_eq!(slug("SPORTS!!"), "sports");
+        // And the one that was missing.
+        assert_eq!(slug("Lolcows"), "lolcows");
+    }
+
+    #[test]
+    fn reads_the_room_switcher_out_of_the_page() {
+        let html = concat!(
+            "<div id=\"chat-rooms\">",
+            "<a class=\"chat-room\" role=\"button\" href=\"#1\" data-id=\"1\">General</a>",
+            "<a class=\"chat-room\" role=\"button\" href=\"#20\" data-id=\"20\">Lolcows</a>",
+            "<a class=\"chat-room\" role=\"button\" href=\"#19\" data-id=\"19\">SPORTS!!</a>",
+            "</div>"
+        );
+        let rooms = parse_rooms(html);
+        assert_eq!(rooms.len(), 3);
+        assert_eq!((rooms[0].id, rooms[0].name.as_str()), (1, "general"));
+        assert_eq!((rooms[1].id, rooms[1].name.as_str()), (20, "lolcows"));
+        assert_eq!((rooms[2].id, rooms[2].name.as_str()), (19, "sports"));
+    }
+
+    /// Markup that no longer says what this expects reads as no rooms, which
+    /// the caller turns into an error rather than an empty catalogue - the
+    /// difference between "the site has no rooms" and "this could not tell".
+    #[test]
+    fn markup_that_changed_reads_as_nothing_rather_than_as_nonsense() {
+        assert!(parse_rooms("<div>no switcher here</div>").is_empty());
+        assert!(parse_rooms("<a class=\"chat-room\" data-id=\"x\">Bad</a>").is_empty());
+    }
+}
+
 const MAX_WS_REDIRECTS: usize = 3;
 
 /// Opens the chat websocket, following redirects manually (tungstenite
@@ -426,6 +569,15 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
         state.runtime.delete_message(state, &buffer_id, uuid);
     }
 
+    // A replayed batch is stored and shown like anything else, but it is not
+    // news: the site sends the room's recent history on every join, so without
+    // this a reconnect turns an hours-old mention into a fresh alert. The
+    // already-seen check catches the second reconnect onwards; this catches
+    // the first, which is the one that actually fires.
+    if resp.history {
+        state.runtime.set_replaying(&buffer_id, true);
+    }
+
     for m in &resp.messages {
         if m.is_deleted() {
             state.runtime.delete_message(state, &buffer_id, &m.message_uuid);
@@ -461,6 +613,29 @@ async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, acc
         // request per message, over Tor, for answers already on disk.
         if is_new && !m.message_uuid.is_empty() {
             spawn_attachment_resolve(state.clone(), http.clone(), buffer_id.clone(), m.message_uuid.clone(), body);
+        }
+    }
+    // Cleared unconditionally rather than only when it was set: nothing above
+    // returns early, and leaving it set would silence the room permanently.
+    state.runtime.set_replaying(&buffer_id, false);
+
+    // What the site says on entering the room. Recorded as a line in the room
+    // rather than shown as a banner, because it is the same kind of thing as
+    // an IRC topic arriving and this client already has somewhere to put that
+    // - and because a banner nobody dismissed would still be there tomorrow.
+    //
+    // Once per text rather than once per connect: every reconnect carries it
+    // again, and a room whose connection drops twice an hour would otherwise
+    // fill with copies of the same announcement.
+    if let Some(motd) = &resp.motd {
+        if state.runtime.take_new_sockchat_motd(account_id, buffer_name, motd) {
+            state.runtime.record_message(
+                // "system" rather than "topic": a topic line is filtered by the
+                // setting that hides IRC topic changes, and a room's own
+                // announcement is not an IRC topic change.
+                state, account_id, buffer_name, "channel", "", motd, false, "system", None, None, false, None,
+                Vec::new(), Vec::new(), None,
+            );
         }
     }
 
@@ -1659,6 +1834,41 @@ mod live_probe {
 
         println!("final status: HTTP {}, body length {} bytes", final_resp.status, final_resp.body.len());
         assert!((200..400).contains(&final_resp.status), "expected a normal page response, got HTTP {}", final_resp.status);
+    }
+
+    /// What the chat page says about which rooms exist. Not run by default:
+    ///   cargo test --release -- --ignored --nocapture sockchat_rooms_probe
+    ///
+    /// The room catalogue has been a literal in the frontend since the start,
+    /// with a comment saying no endpoint lists them. This is how that gets
+    /// settled: fetch the page a browser would and print every fragment that
+    /// mentions a room, so the answer comes from the site rather than from
+    /// assumption.
+    #[tokio::test]
+    #[ignore]
+    async fn sockchat_rooms_probe() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join("nobilis-tor-spike");
+        let manager = TorManager::new(&dir);
+        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
+
+        let http = HttpClient::new(Transport::Tor(client), CookieJar::new(), super::DEFAULT_USER_AGENT.to_string());
+        let url = format!("https://{}/test-chat", super::DEFAULT_ONION);
+
+        let mut resp = http.get(&url).await.expect("GET /chat failed");
+        if resp.status == pow::GATE_STATUS {
+            pow::clear(&http, &url, 8).await.expect("failed to clear the gate");
+            resp = http.get(&url).await.expect("GET after clearing gate failed");
+        }
+        println!("HTTP {} body {} bytes", resp.status, resp.body.len());
+
+        let body = resp.body.clone();
+        for (i, line) in body.lines().enumerate() {
+            let lower = line.to_lowercase();
+            if lower.contains("room") || lower.contains("chat.ws") || lower.contains("channel") {
+                println!("{i}: {}", line.trim().chars().take(400).collect::<String>());
+            }
+        }
     }
 
     /// Phase-3 live check: a real login. Reads credentials from the

@@ -1707,6 +1707,29 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // What rooms the site has, read from the site rather than from a
+        // list written into the client. Separate from setSockChatRooms
+        // because knowing which rooms exist and choosing which to join are
+        // different acts - and a person may well want to see the catalogue
+        // without changing anything.
+        "listSockChatRooms" => match p_str_opt(params, "accountId") {
+            None => (None, Some("listSockChatRooms requires \"accountId\"".to_string())),
+            Some(id) => {
+                // Whatever was read last, at once - and a fresh read started
+                // behind it, which arrives as a sockchatRooms event. Waiting
+                // here would block this client's whole socket for the fifteen
+                // seconds the site takes to answer through Tor and its gate.
+                let cached = state.runtime.sockchat_room_catalogue(id).unwrap_or_default();
+                backend::sockchat::refresh_rooms(state.clone(), id.to_string());
+                (
+                    Some(serde_json::json!({
+                        "rooms": cached.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>()
+                    })),
+                    None,
+                )
+            }
+        },
+
         // Replaces the account's configured room list and reconnects it
         // immediately (rather than only on the next daemon restart) so a
         // freshly-added room shows up right away.

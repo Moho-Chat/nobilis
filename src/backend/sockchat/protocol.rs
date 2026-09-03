@@ -130,6 +130,15 @@ struct RawResponse {
     /// a user object, which is why this is a separate key from `users`.
     #[serde(default)]
     user: std::collections::BTreeMap<String, bool>,
+    /// Whether this batch is the room's recent history being replayed rather
+    /// than things being said now - sent on every join, and on every
+    /// reconnect after it.
+    #[serde(default)]
+    history: bool,
+    /// The room's message of the day. Null in most frames; a string when the
+    /// site has something to say on entering a room.
+    #[serde(default)]
+    motd: Option<String>,
     /// Whatever else the server sent. The protocol is undocumented, so this
     /// is how a frame nobody has decoded yet becomes visible instead of being
     /// silently dropped - `unhandled_shape` reports its outline at debug level
@@ -179,6 +188,10 @@ pub struct ServerResponse {
     pub users_left: Vec<String>,
     /// Non-JSON payload, if the frame wasn't an object.
     pub plaintext: Option<String>,
+    /// This batch is history being replayed, not conversation arriving.
+    pub history: bool,
+    /// The room's message of the day, when the frame carried one.
+    pub motd: Option<String>,
 }
 
 impl ServerResponse {
@@ -249,6 +262,11 @@ impl ServerResponse {
             users_joined,
             users_left,
             plaintext: None,
+            history: raw.history,
+            // An empty motd is the site having none rather than the site
+            // saying nothing, and drawing a blank line for it would be worse
+            // than drawing nothing.
+            motd: raw.motd.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
         }
     }
 
