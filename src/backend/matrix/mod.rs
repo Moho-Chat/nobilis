@@ -363,7 +363,7 @@ async fn register_room(
     state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
 
     let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
-    state.runtime.set_matrix_room(&buffer.id, room_id);
+    state.runtime.set_matrix_room(state, &buffer.id, room_id);
     // Only for a room this is the first sight of. A sync that has already
     // carried the room has already said what is in it, and marking it as
     // waiting afterwards would leave a spinner turning against a room that
@@ -555,7 +555,7 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
         };
 
         let buffer = state.runtime.ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
-        state.runtime.set_matrix_room(&buffer.id, room_id);
+        state.runtime.set_matrix_room(state, &buffer.id, room_id);
 
         // A room can be added to a space at any time, and a space seen after
         // this room was first synced only records the mapping - so this is
@@ -1943,7 +1943,7 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
     let name = if target_display_name.is_empty() { target_user_id.to_string() } else { target_display_name.to_string() };
     state.runtime.set_matrix_room_name(account_id, &room_id, &name, "dm");
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state.runtime.set_matrix_room(&buffer.id, &room_id);
+    state.runtime.set_matrix_room(state, &buffer.id, &room_id);
 
     Ok(buffer.id)
 }

@@ -805,6 +805,11 @@ impl Runtime {
 
     pub fn remove_buffer(&self, state: &AppState, buffer_id: &str) {
         self.buffers.lock().unwrap().remove(buffer_id);
+        // And what pointed at it. A Matrix room whose buffer went away but
+        // whose mapping stayed still counted as joined, so the room directory
+        // offered "Joined" against a room this account had left - and left no
+        // way to rejoin it from there.
+        self.matrix_rooms.lock().unwrap().remove(buffer_id);
         state.events.emit("bufferListChange", json!({ "id": buffer_id, "removed": true }));
     }
 
@@ -1447,8 +1452,31 @@ impl Runtime {
         true
     }
 
-    pub fn set_matrix_room(&self, buffer_id: &str, room_id: &str) {
+    /// Ties a buffer to its Matrix room, both ways.
+    ///
+    /// Published on the buffer as `remoteId` as well as kept in the map, the
+    /// same pairing set_discord_channel makes and for a related reason: the
+    /// map is how events find their buffer, while the field is how a frontend
+    /// recognises the room it just asked to join - the buffer's own id is
+    /// derived from a name nothing knows until the room's state arrives.
+    pub fn set_matrix_room(&self, state: &AppState, buffer_id: &str, room_id: &str) {
         self.matrix_rooms.lock().unwrap().insert(buffer_id.to_string(), room_id.to_string());
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.remote_id.as_deref() != Some(room_id) => {
+                    b.remote_id = Some(room_id.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        // Only on a real change - this runs again for every room on every
+        // reconnect, and a frontend redrawing its whole list each time would
+        // flicker.
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
     }
 
     /// Every room this account currently has a buffer for.
