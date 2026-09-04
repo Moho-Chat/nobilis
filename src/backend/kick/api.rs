@@ -667,6 +667,43 @@ pub async fn channel_user(http: &reqwest::Client, token: Option<&str>, slug: &st
     res.json().await.context("reading Kick's answer")
 }
 
+/// Follows a channel, or stops.
+///
+/// The same endpoint both ways, POST to follow and DELETE to stop, which is
+/// how kick.com's own button works. Following is the one of these actions
+/// worth having in a chat client: it is what decides whether a channel is in
+/// the list this account syncs, so doing it here keeps that list somewhere a
+/// person can edit it.
+pub async fn set_following(http: &reqwest::Client, token: &str, slug: &str, follow: bool) -> Result<()> {
+    let slug = normalise_slug(slug);
+    if slug.is_empty() {
+        bail!("that is not a Kick handle");
+    }
+    let url = format!("{API_ROOT}/api/v2/channels/{slug}/follow");
+    let request = if follow { http.post(&url) } else { http.delete(&url) };
+    let res = request
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| if follow { format!("following {slug}") } else { format!("unfollowing {slug}") })?;
+
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
+    }
+    // Kick rate-limits following hard, and for minutes rather than seconds -
+    // found by following and unfollowing one channel twice in a row. Said in
+    // words, because "429" tells somebody nothing about what to do, and what
+    // to do is wait.
+    if res.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        bail!("Kick is rate-limiting follows right now - try again in a few minutes");
+    }
+    if !res.status().is_success() {
+        bail!("Kick answered {} to that", res.status());
+    }
+    Ok(())
+}
+
 pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result<Standing> {
     let res = http
         .get(format!("{API_ROOT}/api/v2/channels/{slug}/me"))

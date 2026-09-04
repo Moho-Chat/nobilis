@@ -2105,6 +2105,42 @@ pub async fn dispatch(
         // Adds only. Un-following on Kick does not close the buffer here: by
         // this point the list is the person's own, and a sync that removed
         // things would be the same overreach as one that put them back.
+        // Following a channel, or stopping. Deliberately only following:
+        // subscribing is money and raiding is a broadcaster's own gesture,
+        // and neither belongs behind a chat client's button.
+        //
+        // Kick's follow list is also what this account's channel list syncs
+        // from, so doing it here keeps that list editable from the place it
+        // is read.
+        "setKickFollowing" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setKickFollowing requires \"bufferId\"".to_string()));
+            };
+            let follow = params.get("follow").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let Some(token) = state.accounts.get_kick(&buffer.account_id).and_then(|c| c.token).filter(|t| !t.is_empty())
+            else {
+                return (None, Some("sign in to Kick from Accounts to follow channels".to_string()));
+            };
+            let http = match backend::kick::api::client() {
+                Ok(c) => c,
+                Err(e) => return (None, Some(e.to_string())),
+            };
+            match backend::kick::api::set_following(&http, &token, &channel.slug, follow).await {
+                Ok(()) => {
+                    // The header reads this, and it has just changed.
+                    backend::kick::refresh_standing(state, buffer_id).await;
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "syncKickFollows" => {
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("syncKickFollows requires \"accountId\"".to_string()));

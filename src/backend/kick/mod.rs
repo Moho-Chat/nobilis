@@ -459,7 +459,10 @@ async fn prepare(
     // What is on air. A Kick channel is a stream as much as a chat, and moho
     // showed only the chat - so the title, the game and how many people are
     // watching, which is most of what a viewer wants to know, were nowhere.
-    announce_stream(state, &buffer.id, &channel);
+    // Follow state is not asked for here: this runs for every channel at
+    // connect, and that would be one extra request per channel before the
+    // first message arrives. It is filled in when the channel is opened.
+    announce_stream(state, &buffer.id, &channel, None);
 
     // The streamer's own picture on the channel. Parsed since the first
     // version of this backend and used by nothing, so every Kick channel drew
@@ -918,7 +921,7 @@ fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crat
 ///
 /// Kick's own channel endpoint carries all of it and this backend was already
 /// calling it - the numbers were parsed away and dropped.
-fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel) {
+fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, following: Option<bool>) {
     let stream = serde_json::json!({
         "bufferId": buffer_id,
         "live": channel.live.is_some(),
@@ -927,9 +930,36 @@ fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel) {
         "viewers": channel.live.as_ref().and_then(|l| l.viewers),
         "startedTs": channel.live.as_ref().and_then(|l| l.started_ts),
         "followers": channel.followers,
+        // Absent rather than false for an account that is not signed in:
+        // "not following" and "cannot say" are different, and a button that
+        // offers to follow when it cannot is a button that fails when pressed.
+        "following": following,
     });
     state.runtime.set_kick_stream(buffer_id, stream.clone());
     state.events.emit("kickStream", stream);
+}
+
+/// Whether this account follows the channel, where it can say.
+async fn following_now(state: &AppState, http: &reqwest::Client, account_id: &str, slug: &str) -> Option<bool> {
+    let token = state.accounts.get_kick(account_id)?.token.filter(|t| !t.is_empty())?;
+    api::standing(http, &token, slug).await.ok().map(|s| s.following)
+}
+
+/// Re-reads whether this account follows a channel and says so.
+///
+/// Its own function because following is the one thing here a person changes
+/// from this client - the rest of what a channel says about itself changes
+/// because the streamer did something.
+pub async fn refresh_standing(state: &AppState, buffer_id: &str) {
+    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return };
+    let Ok(http) = api::client() else { return };
+    let following = following_now(state, &http, &buffer.account_id, &channel.slug).await;
+    if let Some(mut stream) = state.runtime.kick_stream(buffer_id) {
+        stream["following"] = serde_json::json!(following);
+        state.runtime.set_kick_stream(buffer_id, stream.clone());
+        state.events.emit("kickStream", stream);
+    }
 }
 
 /// Asks Kick what a channel is doing now and says so.
@@ -940,8 +970,12 @@ fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel) {
 pub async fn refresh_stream(state: &AppState, buffer_id: &str) {
     let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
     let Ok(http) = api::client() else { return };
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     match api::channel(&http, &channel.slug).await {
-        Ok(fresh) => announce_stream(state, buffer_id, &fresh),
+        Ok(fresh) => {
+            let following = following_now(state, &http, &account_id, &channel.slug).await;
+            announce_stream(state, buffer_id, &fresh, following);
+        }
         Err(e) => tracing::debug!("kick: refreshing {}: {e:#}", channel.slug),
     }
 }
