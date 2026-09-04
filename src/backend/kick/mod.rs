@@ -122,6 +122,13 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
+/// How many channels to resolve at once when connecting.
+///
+/// Enough to make thirty channels feel immediate, well short of anything Kick
+/// would read as a burst - the whole point of the bulk poll elsewhere in this
+/// file is to stay a quiet client.
+const CONNECT_CONCURRENCY: usize = 8;
+
 /// How many followed channels to open on a first connect.
 ///
 /// A cap rather than all of them, because somebody can follow hundreds and
@@ -233,8 +240,33 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
     // makes one map look like it works.
     let mut watched = Watched::default();
 
-    for slug in &channels {
-        match prepare(state, &http, config, account_id, slug).await {
+    // Several at a time rather than one after another.
+    //
+    // Each channel needs its own `/channels/<handle>` before it can be
+    // subscribed to - the chatroom and channel ids the Pusher subscription is
+    // addressed with are there and nowhere else, so the bulk follow lists
+    // cannot stand in for it. But nothing about them has to happen in order:
+    // done one at a time, an account following thirty channels spent half a
+    // minute watching its own list appear a row at a time.
+    //
+    // Subscribing stays serial, because the socket is one thing and only one
+    // subscription can be written to it at a time. It is the waiting that is
+    // parallel, not the writing.
+    let queue: Vec<_> = channels
+        .iter()
+        .cloned()
+        .map(|slug| {
+            let http = &http;
+            async move {
+                let prepared = prepare(state, http, config, account_id, &slug).await;
+                (slug, prepared)
+            }
+        })
+        .collect();
+    let mut prepares = futures::stream::iter(queue).buffer_unordered(CONNECT_CONCURRENCY);
+
+    while let Some((slug, prepared)) = prepares.next().await {
+        match prepared {
             Ok(channel) => {
                 subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                 watched.add(&channel);
@@ -249,6 +281,7 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
             }
         }
     }
+    drop(prepares);
 
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
