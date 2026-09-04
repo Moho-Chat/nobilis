@@ -394,6 +394,12 @@ pub struct Runtime {
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
     /// What is known about each watched Kick channel, by buffer id.
     kick_channels: Mutex<HashMap<String, KickChannel>>,
+    /// buffer id -> what that Kick channel is broadcasting, as last asked.
+    ///
+    /// Kept so a window opening the channel can be told at once, rather than
+    /// waiting for the stream to start or stop before the header says
+    /// anything.
+    kick_streams: Mutex<HashMap<String, serde_json::Value>>,
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
@@ -652,6 +658,7 @@ impl Runtime {
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
+            kick_streams: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
@@ -2383,6 +2390,14 @@ impl Runtime {
             channel.emotes = emotes;
             channel.subscribed = subscribed;
         }
+    }
+
+    pub fn set_kick_stream(&self, buffer_id: &str, stream: serde_json::Value) {
+        self.kick_streams.lock().unwrap().insert(buffer_id.to_string(), stream);
+    }
+
+    pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {
+        self.kick_streams.lock().unwrap().get(buffer_id).cloned()
     }
 
     pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {

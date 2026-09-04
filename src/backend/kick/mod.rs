@@ -456,6 +456,11 @@ async fn prepare(
         },
     );
 
+    // What is on air. A Kick channel is a stream as much as a chat, and moho
+    // showed only the chat - so the title, the game and how many people are
+    // watching, which is most of what a viewer wants to know, were nowhere.
+    announce_stream(state, &buffer.id, &channel);
+
     // The streamer's own picture on the channel. Parsed since the first
     // version of this backend and used by nothing, so every Kick channel drew
     // as a bare "#" among rows that all had faces.
@@ -729,15 +734,16 @@ fn handle_event(
         }
         // Worth a line in the channel it happened in: somebody watching a
         // handful of streamers is largely watching for this.
-        e if e.ends_with("StreamerIsLive") => {
-            if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "went live", "stream");
-            }
-        }
-        e if e.ends_with("StopStreamBroadcast") => {
-            if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "ended the stream", "stream");
-            }
+        e if e.ends_with("StreamerIsLive") || e.ends_with("StopStreamBroadcast") => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let live = e.ends_with("StreamerIsLive");
+            system_line(state, account_id, &slug, if live { "went live" } else { "ended the stream" }, "stream");
+            // And the header, which is otherwise still describing the stream
+            // that just ended. Asked of Kick rather than assembled from this
+            // event: the title and the game arrive with the channel, not with
+            // the notice that it went live.
+            let (state, buffer_id) = (state.clone(), crate::model::buffer_id(account_id, &slug));
+            tokio::spawn(async move { refresh_stream(&state, &buffer_id).await });
         }
         // A message taken down, by its author or by a moderator. Removed here
         // too, or moho shows a different chat from the one everybody else is
@@ -905,6 +911,39 @@ pub async fn backfill(
 fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
     let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
     reply_preview(Some(&parsed))
+}
+
+/// Tells the client what is on air in a channel, and remembers it so a window
+/// opening later can be told the same thing.
+///
+/// Kick's own channel endpoint carries all of it and this backend was already
+/// calling it - the numbers were parsed away and dropped.
+fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel) {
+    let stream = serde_json::json!({
+        "bufferId": buffer_id,
+        "live": channel.live.is_some(),
+        "title": channel.live.as_ref().map(|l| l.title.clone()),
+        "category": channel.live.as_ref().and_then(|l| l.category.clone()),
+        "viewers": channel.live.as_ref().and_then(|l| l.viewers),
+        "startedTs": channel.live.as_ref().and_then(|l| l.started_ts),
+        "followers": channel.followers,
+    });
+    state.runtime.set_kick_stream(buffer_id, stream.clone());
+    state.events.emit("kickStream", stream);
+}
+
+/// Asks Kick what a channel is doing now and says so.
+///
+/// Used when the answer has just changed - a stream starting or ending - and
+/// when somebody opens the channel, since a viewer count from an hour ago is
+/// worse than none.
+pub async fn refresh_stream(state: &AppState, buffer_id: &str) {
+    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
+    let Ok(http) = api::client() else { return };
+    match api::channel(&http, &channel.slug).await {
+        Ok(fresh) => announce_stream(state, buffer_id, &fresh),
+        Err(e) => tracing::debug!("kick: refreshing {}: {e:#}", channel.slug),
+    }
 }
 
 /// One line that keeps being rewritten rather than repeated.
@@ -1402,6 +1441,8 @@ mod tests {
             avatar_url: None,
             subscribers_only: false,
             followers_only: false,
+            live: None,
+            followers: None,
         });
         w
     }
@@ -1532,11 +1573,11 @@ mod tests {
         let mut w = Watched::default();
         w.add(&api::Channel {
             id: 999, chatroom_id: 111, slug: "first".into(), username: "first".into(),
-            avatar_url: None, subscribers_only: false, followers_only: false,
+            avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
         });
         w.add(&api::Channel {
             id: 222, chatroom_id: 999, slug: "second".into(), username: "second".into(),
-            avatar_url: None, subscribers_only: false, followers_only: false,
+            avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
         });
         // 999 is first's channel and second's chatroom. Which one is meant is
         // never a guess - the subscription name says which kind it is.

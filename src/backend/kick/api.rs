@@ -58,6 +58,21 @@ pub struct Channel {
     pub subscribers_only: bool,
     /// Chat is restricted to followers right now.
     pub followers_only: bool,
+    /// What is on air, when anything is.
+    pub live: Option<Live>,
+    /// How many people follow the channel - the one number about a channel
+    /// that means something while it is offline.
+    pub followers: Option<u64>,
+}
+
+/// A stream in progress, as the channel endpoint describes it.
+#[derive(Clone, Debug, Default)]
+pub struct Live {
+    pub title: String,
+    pub category: Option<String>,
+    pub viewers: Option<u64>,
+    /// Kick's own "2026-09-03 19:57:50", in unix seconds where it parses.
+    pub started_ts: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +81,45 @@ struct ChannelJson {
     slug: String,
     chatroom: ChatroomJson,
     user: Option<UserJson>,
+    #[serde(default)]
+    livestream: Option<LivestreamJson>,
+    /// A number, or the same number written as a string - Kick sends both,
+    /// and a strict `u64` here failed the *whole* channel parse, so the
+    /// channels that happened to be sent that way would not connect at all.
+    #[serde(default, deserialize_with = "loose_number")]
+    followers_count: Option<u64>,
+}
+
+/// A count that may arrive as a number or as a string containing one.
+fn loose_number<'de, D>(d: D) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<serde_json::Value>::deserialize(d)? {
+        Some(serde_json::Value::Number(n)) => Ok(n.as_u64()),
+        Some(serde_json::Value::String(s)) => Ok(s.parse().ok()),
+        _ => Ok(None),
+    }
+}
+
+#[derive(Deserialize)]
+struct LivestreamJson {
+    #[serde(default)]
+    session_title: Option<String>,
+    #[serde(default)]
+    is_live: bool,
+    #[serde(default, deserialize_with = "loose_number")]
+    viewer_count: Option<u64>,
+    #[serde(default)]
+    start_time: Option<String>,
+    #[serde(default)]
+    categories: Vec<CategoryJson>,
+}
+
+#[derive(Deserialize)]
+struct CategoryJson {
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,6 +159,15 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
         bail!("Kick answered {} for {slug}", res.status());
     }
     let json: ChannelJson = res.json().await.context("reading Kick's answer about that channel")?;
+    // `livestream` is null when the channel is offline, which is the honest
+    // answer and the one the header draws as "offline" rather than as a blank.
+    let live = json.livestream.filter(|l| l.is_live).map(|l| Live {
+        title: l.session_title.unwrap_or_default(),
+        category: l.categories.into_iter().find_map(|c| c.name),
+        viewers: l.viewer_count,
+        started_ts: l.start_time.as_deref().and_then(parse_kick_datetime),
+    });
+
     Ok(Channel {
         id: json.id,
         chatroom_id: json.chatroom.id,
@@ -112,8 +175,58 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
         avatar_url: json.user.and_then(|u| u.profile_pic),
         subscribers_only: json.chatroom.subscribers_mode,
         followers_only: json.chatroom.followers_mode,
+        live,
+        followers: json.followers_count,
         slug,
     })
+}
+
+/// Kick's stream start time, which is not the format the rest of its API
+/// uses: "2026-09-03 19:57:50", a space rather than a T and no zone at all.
+/// Read as UTC, which is what it is.
+fn parse_kick_datetime(text: &str) -> Option<i64> {
+    let iso = format!("{}Z", text.trim().replacen(' ', "T", 1));
+    chrono::DateTime::parse_from_rfc3339(&iso).ok().map(|dt| dt.timestamp())
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::{parse_kick_datetime, ChannelJson};
+
+    /// The one timestamp Kick writes differently from all its others - a
+    /// space instead of a T, and no zone.
+    #[test]
+    fn reads_the_start_time_kick_actually_sends() {
+        assert_eq!(parse_kick_datetime("2026-09-03 19:57:50"), Some(1788465470));
+        assert_eq!(parse_kick_datetime("not a time"), None);
+    }
+
+    /// Kick sends a follower count as a number for some channels and as a
+    /// string for others. A strict u64 failed the *whole* channel parse, so
+    /// the channels sent the second way did not connect at all - which is a
+    /// far worse thing than a missing number.
+    #[test]
+    fn a_count_is_read_whichever_way_kick_writes_it() {
+        let numeric: ChannelJson = serde_json::from_value(serde_json::json!({
+            "id": 1, "slug": "a", "chatroom": { "id": 2 }, "followers_count": 4123
+        }))
+        .expect("numeric");
+        assert_eq!(numeric.followers_count, Some(4123));
+
+        let stringly: ChannelJson = serde_json::from_value(serde_json::json!({
+            "id": 1, "slug": "a", "chatroom": { "id": 2 }, "followers_count": "4123"
+        }))
+        .expect("string");
+        assert_eq!(stringly.followers_count, Some(4123));
+
+        // Absent, null, or something else entirely is simply no answer - not
+        // a reason to lose the channel.
+        let missing: ChannelJson = serde_json::from_value(serde_json::json!({
+            "id": 1, "slug": "a", "chatroom": { "id": 2 }, "followers_count": null
+        }))
+        .expect("null");
+        assert_eq!(missing.followers_count, None);
+    }
 }
 
 /// The handle out of whatever was typed, or empty if there was none in there.

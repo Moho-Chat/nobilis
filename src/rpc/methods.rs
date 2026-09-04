@@ -271,6 +271,17 @@ pub async fn dispatch(
                 // window opened afterwards would show none until somebody
                 // read something new.
                 backend::matrix::replay_read_receipts(state, buffer_id);
+
+                // And what a Kick channel is broadcasting, which changes while
+                // nobody is looking: a viewer count from an hour ago is worse
+                // than none, so opening the channel asks again.
+                if let Some(stream) = state.runtime.kick_stream(buffer_id) {
+                    state.events.emit("kickStream", stream);
+                }
+                if state.runtime.kick_channel(buffer_id).is_some() {
+                    let (state, buffer_id) = (state.clone(), buffer_id.to_string());
+                    tokio::spawn(async move { backend::kick::refresh_stream(&state, &buffer_id).await });
+                }
                 (Some(ok_node()), None)
             }
         },
