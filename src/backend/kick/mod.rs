@@ -850,6 +850,12 @@ fn handle_event(
             if let Some(line) = describe_poll(&payload) {
                 live_line(state, account_id, &slug, &poll_message_id(&slug, &payload), &line, "poll");
             }
+            // And the poll itself, for the card that can be voted in. The
+            // line above is the record of what was asked; this is the thing
+            // on screen while it is still being asked.
+            if let Ok(poll) = serde_json::from_value::<api::Poll>(payload["poll"].clone()) {
+                announce_poll(state, &crate::model::buffer_id(account_id, &slug), Some(&poll));
+            }
         }
 
         // The poll is over. The line stays - what was asked and how it went is
@@ -862,6 +868,7 @@ fn handle_event(
                 let ended = stored.body.replacen("poll:", "poll ended:", 1);
                 state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
             }
+            announce_poll(state, &buffer_id, None);
         }
 
         // A prediction: the same shape as a poll, with money on it. Kick's
@@ -988,6 +995,60 @@ fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, fo
     });
     state.runtime.set_kick_stream(buffer_id, stream.clone());
     state.events.emit("kickStream", stream);
+}
+
+/// The poll in a channel, or its absence, in the shape the card reads.
+///
+/// Absence is a message rather than silence: a poll that has been taken down
+/// has to leave the screen, and a client that only ever heard about polls
+/// starting would keep showing one that ended an hour ago.
+pub fn announce_poll(state: &AppState, buffer_id: &str, poll: Option<&api::Poll>) {
+    let value = match poll {
+        None => serde_json::json!({ "bufferId": buffer_id, "poll": serde_json::Value::Null }),
+        Some(poll) => serde_json::json!({
+            "bufferId": buffer_id,
+            "poll": {
+                "title": poll.title,
+                "options": poll.options.iter().map(|o| serde_json::json!({
+                    "id": o.id,
+                    "label": o.label,
+                    "votes": o.votes,
+                })).collect::<Vec<_>>(),
+                "duration": poll.duration,
+                // Seconds left when this was written. The client counts down
+                // from it rather than asking Kick every second.
+                "remaining": poll.remaining,
+                "resultDisplayDuration": poll.result_display_duration,
+                "hasVoted": poll.has_voted,
+                "votedOptionId": poll.voted_option_id,
+            }
+        }),
+    };
+    match poll {
+        None => state.runtime.forget_kick_poll(buffer_id),
+        Some(_) => state.runtime.set_kick_poll(buffer_id, value.clone()),
+    }
+    state.events.emit("kickPoll", value);
+}
+
+/// Reads the poll a channel has running, for somebody who has just opened it.
+///
+/// A poll that started before you arrived is the common case - they run for a
+/// minute and a chat is opened at any moment in it - and the events only tell
+/// you about the ones that change while you are watching.
+pub async fn refresh_poll(state: &AppState, buffer_id: &str) {
+    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
+    let Ok(http) = api::client() else { return };
+    let token = state
+        .runtime
+        .get_buffer(buffer_id)
+        .and_then(|b| state.accounts.get_kick(&b.account_id))
+        .and_then(|c| c.token)
+        .filter(|t| !t.is_empty());
+    match api::poll(&http, token.as_deref(), &channel.slug).await {
+        Ok(poll) => announce_poll(state, buffer_id, poll.as_ref()),
+        Err(e) => tracing::debug!("kick: reading {}'s poll: {e:#}", channel.slug),
+    }
 }
 
 /// Whether this account follows the channel, where it can say.

@@ -403,6 +403,9 @@ pub struct Runtime {
     /// When each channel was last asked about directly, so opening twenty
     /// buffers at once does not become twenty channel fetches at once.
     kick_stream_fetched: Mutex<HashMap<String, std::time::Instant>>,
+    /// The poll running in each channel, so a window opened while one is
+    /// running is told about it rather than waiting for the next vote.
+    kick_polls: Mutex<HashMap<String, serde_json::Value>>,
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
@@ -738,6 +741,7 @@ impl Runtime {
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
             kick_stream_fetched: Mutex::new(HashMap::new()),
+            kick_polls: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
@@ -2496,6 +2500,18 @@ impl Runtime {
                 true
             }
         }
+    }
+
+    pub fn set_kick_poll(&self, buffer_id: &str, poll: serde_json::Value) {
+        self.kick_polls.lock().unwrap().insert(buffer_id.to_string(), poll);
+    }
+
+    pub fn kick_poll(&self, buffer_id: &str) -> Option<serde_json::Value> {
+        self.kick_polls.lock().unwrap().get(buffer_id).cloned()
+    }
+
+    pub fn forget_kick_poll(&self, buffer_id: &str) {
+        self.kick_polls.lock().unwrap().remove(buffer_id);
     }
 
     pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {

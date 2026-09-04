@@ -1108,6 +1108,34 @@ mod tests {
         assert_eq!(next_cursor(&body).as_deref(), Some("20"));
     }
 
+    /// Kick answers 200 and puts the refusal inside the body, so this is the
+    /// difference between "your vote counted" and "you already voted".
+    #[test]
+    fn a_refusal_inside_a_success_is_still_a_refusal() {
+        let refused: PollEnvelope = serde_json::from_str(
+            r#"{"status":{"code":400,"message":"User has already voted","error":true},"data":null}"#,
+        )
+        .expect("parse");
+        assert_eq!(refused.complaint(), Some((400, "User has already voted".to_string())));
+
+        let empty: PollEnvelope =
+            serde_json::from_str(r#"{"status":{"code":404,"message":"Poll not found","error":true},"data":null}"#)
+                .expect("parse");
+        assert_eq!(empty.complaint().map(|(code, _)| code), Some(404));
+
+        let fine: PollEnvelope = serde_json::from_str(
+            r#"{"status":{"code":200,"message":"Poll retrieved successfully","error":false},
+                "data":{"poll":{"title":"next game?","options":[{"id":0,"label":"chess","votes":2}],
+                "duration":60,"remaining":41,"result_display_duration":30,"has_voted":true,"voted_option_id":0}}}"#,
+        )
+        .expect("parse");
+        assert_eq!(fine.complaint(), None);
+        let poll = fine.data.and_then(|d| d.poll).expect("a poll");
+        assert_eq!(poll.remaining, 41);
+        assert_eq!(poll.voted_option_id, Some(0));
+        assert_eq!(poll.options[0].votes, 2);
+    }
+
     #[test]
     fn takes_the_handle_out_of_whatever_was_typed() {
         for input in [
@@ -1225,4 +1253,148 @@ mod tests {
         // A stray percent is left alone rather than eating the next two bytes.
         assert_eq!(percent_decode("100%"), "100%");
     }
+}
+
+/// A poll, as Kick describes one.
+///
+/// There is no id anywhere in it: a channel has at most one poll running, and
+/// Kick identifies it by the channel it is in. `remaining` is the seconds left
+/// when the answer was written, so a client counts down from it rather than
+/// asking again every second.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Poll {
+    pub title: String,
+    #[serde(default)]
+    pub options: Vec<PollOption>,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub remaining: u32,
+    /// How long the result stays up after the voting stops.
+    #[serde(default)]
+    pub result_display_duration: u32,
+    #[serde(default)]
+    pub has_voted: bool,
+    #[serde(default)]
+    pub voted_option_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PollOption {
+    pub id: i64,
+    pub label: String,
+    #[serde(default)]
+    pub votes: u64,
+}
+
+/// Kick's answer about a poll, envelope and all.
+///
+/// The envelope is the whole point: this API answers 200 and puts the failure
+/// *inside* the body - "User has already voted" arrives as an HTTP success
+/// with `status.error` set - so a client reading only the status code reports
+/// a refused vote as a vote that went through.
+#[derive(Deserialize)]
+struct PollEnvelope {
+    #[serde(default)]
+    status: Option<PollStatus>,
+    #[serde(default)]
+    data: Option<PollData>,
+}
+
+#[derive(Deserialize)]
+struct PollStatus {
+    #[serde(default)]
+    code: u32,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    error: bool,
+}
+
+impl PollEnvelope {
+    /// What went wrong inside a 200, in Kick's own words where it gave any.
+    fn complaint(&self) -> Option<(u32, String)> {
+        let status = self.status.as_ref().filter(|s| s.error)?;
+        let said = status.message.trim();
+        let words = if said.is_empty() { "Kick would not do that".to_string() } else { said.to_string() };
+        Some((status.code, words))
+    }
+}
+
+#[derive(Deserialize)]
+struct PollData {
+    #[serde(default)]
+    poll: Option<Poll>,
+}
+
+/// The poll running in a channel now, if there is one.
+///
+/// `None` rather than an error for "no poll": Kick answers 200 with a 404
+/// *inside* the envelope for a channel with nothing running, which is a
+/// normal state and not a failure.
+///
+/// Signed in where possible, because two fields of the answer - whether this
+/// account has voted and for what - only exist for somebody Kick can identify.
+pub async fn poll(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Result<Option<Poll>> {
+    let mut req = http
+        .get(format!("{API_ROOT}/api/v2/channels/{slug}/polls"))
+        .header("Accept", "application/json");
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await.context("asking Kick about this channel's poll")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about this channel's poll", res.status());
+    }
+    let body: PollEnvelope = res.json().await.context("reading Kick's answer about the poll")?;
+    match body.complaint() {
+        // "Poll not found" is the ordinary answer for a channel with nothing
+        // running, and not a failure to report.
+        Some((404, _)) | None => Ok(body.data.and_then(|d| d.poll)),
+        Some((_, said)) => bail!("{said}"),
+    }
+}
+
+/// Votes for one option, and reads back the poll that vote landed in.
+pub async fn vote_poll(http: &reqwest::Client, token: &str, slug: &str, option_id: i64) -> Result<Poll> {
+    let res = http
+        .post(format!("{API_ROOT}/api/v2/channels/{slug}/polls/vote"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "id": option_id }))
+        .send()
+        .await
+        .context("sending your vote to Kick")?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("sign in to Kick from Accounts to vote");
+    }
+    if !res.status().is_success() {
+        bail!("Kick would not take that vote ({})", res.status());
+    }
+    let body: PollEnvelope = res.json().await.context("reading Kick's answer to the vote")?;
+    if let Some((_, said)) = body.complaint() {
+        bail!("{said}");
+    }
+    body.data
+        .and_then(|d| d.poll)
+        .ok_or_else(|| anyhow::anyhow!("Kick took the vote but said nothing about the poll"))
+}
+
+/// Takes the poll down. The streamer's own button, and Kick refuses it for
+/// anybody else - which is the right place for that check to live.
+pub async fn delete_poll(http: &reqwest::Client, token: &str, slug: &str) -> Result<()> {
+    let res = http
+        .delete(format!("{API_ROOT}/api/v2/channels/{slug}/polls"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("asking Kick to end the poll")?;
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED || res.status() == reqwest::StatusCode::FORBIDDEN {
+        bail!("only the streamer and their moderators can end a poll");
+    }
+    if !res.status().is_success() {
+        bail!("Kick answered {} to ending the poll", res.status());
+    }
+    Ok(())
 }

@@ -12,6 +12,12 @@ use serde_json::Value;
 /// One place, because every moderation call needs both and the signed-out
 /// case needs saying rather than reporting as "not connected" - the account
 /// is connected and reading fine, it simply cannot act.
+/// Which account a conversation belongs to, or an empty string - which every
+/// lookup that takes one already treats as "no such account".
+fn channel_account(state: &AppState, buffer_id: &str) -> String {
+    state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default()
+}
+
 fn kick_credential(state: &AppState, account_id: &str) -> std::result::Result<(reqwest::Client, String), String> {
     let cfg = state.accounts.get_kick(account_id).ok_or_else(|| "no such account".to_string())?;
     let token = cfg
@@ -266,9 +272,17 @@ pub async fn dispatch(
                 if let Some(stream) = state.runtime.kick_stream(buffer_id) {
                     state.events.emit("kickStream", stream);
                 }
+                // A poll already running when you opened the channel: the
+                // events only carry the ones that change while you watch.
+                if let Some(poll) = state.runtime.kick_poll(buffer_id) {
+                    state.events.emit("kickPoll", poll);
+                }
                 if state.runtime.kick_channel(buffer_id).is_some() {
                     let (state, buffer_id) = (state.clone(), buffer_id.to_string());
-                    tokio::spawn(async move { backend::kick::refresh_stream(&state, &buffer_id).await });
+                    tokio::spawn(async move {
+                        backend::kick::refresh_stream(&state, &buffer_id).await;
+                        backend::kick::refresh_poll(&state, &buffer_id).await;
+                    });
                 }
                 (Some(ok_node()), None)
             }
@@ -2133,6 +2147,54 @@ pub async fn dispatch(
             let (state, buffer_id) = (state.clone(), buffer_id.to_string());
             tokio::spawn(async move { backend::kick::refresh_stream_now(&state, &buffer_id).await });
             (Some(ok_node()), None)
+        }
+
+        // A vote in the poll on screen. The answer Kick sends back is the
+        // poll with the vote in it, so the card updates from the reply rather
+        // than waiting for the broadcast that follows it.
+        "voteKickPoll" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("voteKickPoll requires \"bufferId\"".to_string()));
+            };
+            let Some(option_id) = params.get("optionId").and_then(|v| v.as_i64()) else {
+                return (None, Some("voteKickPoll requires \"optionId\"".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let (http, token) = match kick_credential(state, &channel_account(state, buffer_id)) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::kick::api::vote_poll(&http, &token, &channel.slug, option_id).await {
+                Ok(poll) => {
+                    backend::kick::announce_poll(state, buffer_id, Some(&poll));
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Taking the poll down, which Kick allows the streamer and their
+        // moderators and refuses to everybody else.
+        "endKickPoll" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("endKickPoll requires \"bufferId\"".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let (http, token) = match kick_credential(state, &channel_account(state, buffer_id)) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::kick::api::delete_poll(&http, &token, &channel.slug).await {
+                Ok(()) => {
+                    backend::kick::announce_poll(state, buffer_id, None);
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         "setKickFollowing" => {
