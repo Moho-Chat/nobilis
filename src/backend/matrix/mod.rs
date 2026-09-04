@@ -180,6 +180,11 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
         tracing::debug!("matrix[{account_id}]: read receipts: {e:#}");
     }
 
+    // And the invitations already waiting - see fetch_pending_invites.
+    if let Err(e) = fetch_pending_invites(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
+        tracing::debug!("matrix[{account_id}]: pending invites: {e:#}");
+    }
+
     // And what this account has asked to be told about - see fetch_push_rules.
     fetch_push_rules(state, account_id, &config.homeserver_url, &access_token).await;
     // And who it has asked never to hear from.
@@ -465,7 +470,15 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
                 .collect()
         })
         .unwrap_or_default();
-    if state.runtime.set_matrix_invites(account_id, invites.clone()) {
+    // An invite is taken down by being answered, not by a sync failing to
+    // mention it: the rooms this response reports as joined or left are the
+    // ones that have been, here or in another client.
+    let resolved: std::collections::HashSet<String> = ["join", "leave"]
+        .iter()
+        .flat_map(|kind| resp["rooms"][kind].as_object().into_iter().flatten().map(|(room_id, _)| room_id.clone()))
+        .collect();
+    if state.runtime.merge_matrix_invites(account_id, invites, &resolved) {
+        let invites = state.runtime.matrix_invites(account_id);
         state.events.emit("matrixInvites", serde_json::json!({ "accountId": account_id, "invites": invites }));
     }
 
@@ -2097,6 +2110,50 @@ mod push_rule_tests {
 /// zero is not something every homeserver will agree to. The `next_batch` it
 /// comes back with is deliberately thrown away - the real sync loop keeps its
 /// own place, and taking this one would skip everything in between.
+/// The invitations already waiting when this client signed in.
+///
+/// Same reason the receipts above need their own sync, and the same shape: a
+/// session resuming from a stored token is told what changed, and an invite
+/// that arrived while the client was closed has already changed - so it is
+/// mentioned once, if at all, and never again. An invite nobody has answered
+/// is not news that expires, so it is asked for outright at connect.
+async fn fetch_pending_invites(
+    state: &AppState,
+    account_id: &str,
+    own_user_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+) -> Result<()> {
+    let filter = serde_json::json!({
+        "room": { "timeline": { "limit": 1 }, "ephemeral": { "types": [] } },
+        "presence": { "types": [] }
+    })
+    .to_string();
+    let url = format!(
+        "{}/_matrix/client/v3/sync?timeout=0&filter={}",
+        homeserver_url.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(filter.as_bytes()).collect::<String>()
+    );
+    let resp = http::get_json(&url, access_token).await.context("invite sync")?;
+    let invites: Vec<Value> = resp["rooms"]["invite"]
+        .as_object()
+        .map(|rooms| {
+            rooms
+                .iter()
+                .map(|(room_id, room)| {
+                    let events: Vec<&Value> = room["invite_state"]["events"].as_array().into_iter().flatten().collect();
+                    rooms::invite_summary(room_id, own_user_id, &events)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if state.runtime.merge_matrix_invites(account_id, invites, &Default::default()) {
+        let invites = state.runtime.matrix_invites(account_id);
+        state.events.emit("matrixInvites", serde_json::json!({ "accountId": account_id, "invites": invites }));
+    }
+    Ok(())
+}
+
 async fn fetch_read_receipts(
     state: &AppState,
     account_id: &str,

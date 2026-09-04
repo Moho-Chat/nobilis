@@ -1198,17 +1198,37 @@ impl Runtime {
     /// Replaces this account's pending invitations, and says whether that
     /// changed anything.
     ///
-    /// Every sync carries the full invite set, so this is a replace rather
-    /// than a merge - an invite answered from another client simply stops
-    /// being listed, and that is how it disappears here too. The changed
-    /// answer is what keeps an event from being emitted on every sync tick
-    /// for a set nobody has touched.
-    pub fn set_matrix_invites(&self, account_id: &str, invites: Vec<serde_json::Value>) -> bool {
+    /// Kept until the invite is actually answered, rather than rebuilt from
+    /// each sync. Only an *initial* sync carries the whole invite set: an
+    /// incremental one mentions a room when something about it changed, so
+    /// replacing the list every cycle meant an invite survived exactly one
+    /// sync and was wiped by the next one that had nothing to say about it.
+    ///
+    /// `resolved` is the rooms this response reported as joined or left,
+    /// which is what taking an invite down actually looks like - answered
+    /// here, or answered in Element an hour ago.
+    pub fn merge_matrix_invites(
+        &self,
+        account_id: &str,
+        seen: Vec<serde_json::Value>,
+        resolved: &std::collections::HashSet<String>,
+    ) -> bool {
+        let room_of = |invite: &serde_json::Value| invite["roomId"].as_str().unwrap_or_default().to_string();
         let mut all = self.matrix_invites.lock().unwrap();
+        let existing = all.get(account_id).cloned().unwrap_or_default();
+        let mut next: Vec<serde_json::Value> = existing
+            .into_iter()
+            .filter(|invite| !resolved.contains(&room_of(invite)) && !seen.iter().any(|s| room_of(s) == room_of(invite)))
+            .collect();
+        for invite in seen {
+            if !resolved.contains(&room_of(&invite)) {
+                next.push(invite);
+            }
+        }
         match all.get(account_id) {
-            Some(existing) if *existing == invites => false,
+            Some(current) if *current == next => false,
             _ => {
-                all.insert(account_id.to_string(), invites);
+                all.insert(account_id.to_string(), next);
                 true
             }
         }
@@ -3354,6 +3374,52 @@ mod voice_flag_tests {
     #[test]
     fn a_state_that_says_nothing_claims_nothing() {
         assert_eq!(VoiceFlags::from_voice_state(&json!({})), VoiceFlags::default());
+    }
+}
+
+#[cfg(test)]
+mod invite_tests {
+    use crate::runtime::Runtime;
+    use std::collections::HashSet;
+
+    fn invite(room: &str) -> serde_json::Value {
+        serde_json::json!({ "roomId": room, "name": room })
+    }
+
+    /// The bug this replaced: an incremental sync mentions a room only when
+    /// something about it changed, so rebuilding the list from every response
+    /// meant an invite lived for exactly one sync cycle and was wiped by the
+    /// next one that had nothing to say about it. An invitation nobody has
+    /// answered is not news that expires.
+    #[test]
+    fn an_invite_survives_a_sync_that_does_not_mention_it() {
+        let runtime = Runtime::new();
+        assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
+        // The next sync says nothing about it, as every quiet sync does.
+        assert!(!runtime.merge_matrix_invites("matrix:@me:example.org", vec![], &HashSet::new()));
+        assert_eq!(runtime.matrix_invites("matrix:@me:example.org").len(), 1);
+    }
+
+    /// And it does come down when it is actually answered - here or in
+    /// another client, which looks the same from a sync: the room turns up
+    /// as joined.
+    #[test]
+    fn answering_an_invite_takes_it_down() {
+        let runtime = Runtime::new();
+        runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new());
+        let joined: HashSet<String> = ["!dm".to_string()].into_iter().collect();
+        assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![], &joined));
+        assert!(runtime.matrix_invites("matrix:@me:example.org").is_empty());
+    }
+
+    /// Seeing the same invite again is not a change, or every sync would
+    /// announce the same invitation to the client forever.
+    #[test]
+    fn the_same_invite_twice_is_not_news() {
+        let runtime = Runtime::new();
+        assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
+        assert!(!runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
+        assert_eq!(runtime.matrix_invites("matrix:@me:example.org").len(), 1);
     }
 }
 
