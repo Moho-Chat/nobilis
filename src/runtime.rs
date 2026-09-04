@@ -631,6 +631,81 @@ fn mentions_the_room(service: &str, body: &str) -> bool {
     words.iter().any(|word| lower.contains(word))
 }
 
+/// A mention of you, written the way you asked to be called.
+///
+/// The rename is a local one - no service is told about it - so a message
+/// arrives saying whatever the sender typed, which is the nick the service
+/// knows you by. This puts your own name in where it appears, and only there:
+/// whether the message counted as addressing you was already decided against
+/// the real nick, before this runs, so being called something else here
+/// cannot change whether somebody reaches you.
+///
+/// Whole words only, with the `@` some services put in front and some do not,
+/// and one `@` in the answer either way. A nick sitting inside a longer word
+/// is not a mention and is left exactly as it was typed.
+fn rename_own_mentions(body: &str, nick: &str, alias: &str) -> String {
+    if nick.is_empty() || alias.is_empty() || nick.eq_ignore_ascii_case(alias) {
+        return body.to_string();
+    }
+    // IRC allows plenty of punctuation in a nick, so "not a boundary" has to
+    // mean more than "alphanumeric" or half of `some_nick` would match as a
+    // mention of `some`.
+    let joined = |c: char| c.is_alphanumeric() || "_-[]{}\\^|`".contains(c);
+    let lower_body = body.to_lowercase();
+    let lower_nick = nick.to_lowercase();
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0;
+    while let Some(hit) = lower_body[at..].find(&lower_nick) {
+        let start = at + hit;
+        let end = start + nick.len();
+        let before = body[..start].chars().next_back();
+        let after = body[end..].chars().next();
+        if before.is_some_and(joined) || after.is_some_and(joined) {
+            // Inside a longer word: copy it through and carry on past it.
+            out.push_str(&body[at..end]);
+            at = end;
+            continue;
+        }
+        // An `@` already in front is part of the mention, not text around it.
+        let keep_to = if before == Some('@') { start - 1 } else { start };
+        out.push_str(&body[at..keep_to]);
+        out.push('@');
+        out.push_str(alias);
+        at = end;
+    }
+    out.push_str(&body[at..]);
+    out
+}
+
+/// The same rename, in the formatted copy of a message.
+///
+/// Matrix and Discord send an HTML body alongside the plain one, and a client
+/// that renamed only the plain text would show the rename everywhere except
+/// the message itself. Tags are copied through untouched: the mention pill
+/// carries the real user id in its href, which is an address rather than a
+/// name and must survive being renamed.
+fn rename_own_mentions_html(html: &str, nick: &str, alias: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(open) = rest.find('<') {
+        out.push_str(&rename_own_mentions(&rest[..open], nick, alias));
+        match rest[open..].find('>') {
+            // An unclosed "<" is text, not a tag, and this is a renderer's
+            // input rather than a parser's.
+            None => {
+                out.push_str(&rename_own_mentions(&rest[open..], nick, alias));
+                return out;
+            }
+            Some(close) => {
+                out.push_str(&rest[open..open + close + 1]);
+                rest = &rest[open + close + 1..];
+            }
+        }
+    }
+    out.push_str(&rename_own_mentions(rest, nick, alias));
+    out
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self {
@@ -2766,6 +2841,21 @@ impl Runtime {
             // this client inventing a mention the network does not have.
             || (from != own_nick && mentions_the_room(model::service_of(account_id), body));
         let is_own = !own_nick.is_empty() && from == own_nick;
+        // Everything above this line reads the real nick, and everything
+        // below it reads what you asked to be called. The order is the whole
+        // point: a local rename decides how a mention of you is written, and
+        // never whether it was one.
+        let alias = state.accounts.display_name_override(account_id).filter(|_| !is_own);
+        let renamed = match &alias {
+            Some(alias) => rename_own_mentions(body, &own_nick, alias),
+            None => body.to_string(),
+        };
+        let body = renamed.as_str();
+        let renamed_html = match (&alias, html.as_deref()) {
+            (Some(alias), Some(html)) => Some(rename_own_mentions_html(html, &own_nick, alias)),
+            _ => html,
+        };
+        let html = renamed_html;
         let is_dm = buffer_kind == "dm";
         let ts = sent_at.unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -3115,5 +3205,46 @@ mod voice_flag_tests {
     #[test]
     fn a_state_that_says_nothing_claims_nothing() {
         assert_eq!(VoiceFlags::from_voice_state(&json!({})), VoiceFlags::default());
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+
+    #[test]
+    fn a_mention_of_you_is_written_the_way_you_asked_to_be_called() {
+        let say = |body: &str| rename_own_mentions(body, "Salastil", "You");
+        assert_eq!(say("Salastil textgoeshere"), "@You textgoeshere");
+        assert_eq!(say("@Salastil textgoeshere"), "@You textgoeshere");
+        assert_eq!(say("hey salastil, look"), "hey @You, look");
+        assert_eq!(say("thanks Salastil"), "thanks @You");
+        // Twice in one line is twice.
+        assert_eq!(say("Salastil: ask Salastil"), "@You: ask @You");
+    }
+
+    #[test]
+    fn a_nick_inside_a_longer_word_is_not_a_mention() {
+        let say = |body: &str| rename_own_mentions(body, "sal", "You");
+        assert_eq!(say("salad for lunch"), "salad for lunch");
+        assert_eq!(say("ask sal_ about it"), "ask sal_ about it");
+        assert_eq!(say("ask sal about it"), "ask @You about it");
+    }
+
+    #[test]
+    fn a_mention_pill_keeps_its_address_and_loses_its_name() {
+        let html = "<a href=\"https://matrix.to/#/@salastil:example.org\">Salastil</a> textgoeshere";
+        assert_eq!(
+            rename_own_mentions_html(html, "salastil", "You"),
+            "<a href=\"https://matrix.to/#/@salastil:example.org\">@You</a> textgoeshere"
+        );
+    }
+
+    #[test]
+    fn nothing_to_rename_leaves_the_line_alone() {
+        assert_eq!(rename_own_mentions("hello there", "", "You"), "hello there");
+        assert_eq!(rename_own_mentions("hello there", "sal", ""), "hello there");
+        // The rename that is not one - the same name in different case.
+        assert_eq!(rename_own_mentions("hi Sal", "sal", "Sal"), "hi Sal");
     }
 }

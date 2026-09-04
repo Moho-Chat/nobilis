@@ -1504,6 +1504,43 @@ mod tests {
         handle_event(state, "kick:tester", watched, event, Some("chatrooms.2393554.v2"), payload).expect("handled");
     }
 
+    /// A local rename changes what a mention of you says, and nothing else.
+    ///
+    /// The two halves matter equally: the line reads the way you asked to be
+    /// called, and the message is still a highlight - decided against the
+    /// name Kick knows you by, before the rename runs. A client where calling
+    /// yourself "You" quietly stopped people reaching you would be worse than
+    /// one with no rename at all.
+    #[test]
+    fn renaming_yourself_changes_the_words_and_not_the_ping() {
+        let state = simulated_daemon("own-rename");
+        let mut watched = watching_odablock();
+        state
+            .accounts
+            .add_kick(crate::accounts::KickAccountConfig {
+                username: "tester".to_string(),
+                display_name: Some("You".to_string()),
+                ..Default::default()
+            })
+            .expect("account");
+        state.runtime.set_own_identity("kick:tester", "tester");
+
+        feed(&state, &mut watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": "m1",
+            "chatroom_id": 2393554,
+            "content": "tester textgoeshere",
+            "sender": { "id": 9, "username": "someoneelse", "identity": null }
+        }));
+
+        let stored = state
+            .store
+            .get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50)
+            .expect("backlog");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].body, "@You textgoeshere");
+        assert!(stored[0].is_highlight, "still addressed, whatever it is called");
+    }
+
     /// A poll is one thing happening over a minute, not a stream of events -
     /// Kick sends its update on every vote, and a line each would bury the
     /// conversation the poll is about.

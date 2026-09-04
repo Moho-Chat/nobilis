@@ -1998,6 +1998,9 @@ pub async fn dispatch(
             let existing = state.accounts.get_kick(&format!("kick:{username}"));
             let config = crate::accounts::KickAccountConfig {
                 username,
+                // Signing in again is not a reason to forget what this
+                // account is called here.
+                display_name: existing.as_ref().and_then(|e| e.display_name.clone()),
                 token,
                 // Signing in again keeps what was being watched, and keeps
                 // knowing that the follows have already been read in. Losing

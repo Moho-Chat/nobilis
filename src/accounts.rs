@@ -205,6 +205,9 @@ impl MatrixAccountConfig {
 pub struct KickAccountConfig {
     /// Who this is on Kick, or a placeholder for a signed-out reader.
     pub username: String,
+    /// What to call this account here. Local: Kick is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
     #[serde(default)]
@@ -599,29 +602,79 @@ impl AccountStore {
         }
     }
 
-    /// Purely a local rename - never touches Discord's API (there's no
-    /// "display name" concept to push there anyway; Discord's real
-    /// global_name/username still drives what other users see). Tries the
-    /// IRC store first, falling back to Discord, since `mutate` only
-    /// knows about IrcAccountConfig - this was the bug behind "Display
-    /// Name doesn't work for Discord": every call silently hit the IRC-only
-    /// path and returned `false` for any discord: account id without
-    /// touching discord_account_to_json's own display_name field at all.
+    /// What to call an account here, and nowhere else.
+    ///
+    /// Purely a local rename: no service is told about it, nothing is sent,
+    /// and nothing about being addressed changes. Being pinged is decided
+    /// against the real identity the service knows you by (see runtime.rs's
+    /// `record_message`), so renaming yourself to "You" cannot stop anyone
+    /// from reaching you - it only changes what this client calls you.
+    ///
+    /// Every service, which is the fix: this used to try IRC and then
+    /// Discord, and `mutate` only knows about IrcAccountConfig - so setting a
+    /// display name on a Matrix, Sneedchat or Kick account silently did
+    /// nothing at all. Written out per store rather than looped, because the
+    /// five configs are five types.
     pub fn set_display_name(&self, account_id: &str, name: &str) -> Result<bool> {
-        if self.mutate(account_id, |a| {
-            a.display_name = if name.is_empty() { None } else { Some(name.to_string()) }
-        })? {
+        let value = if name.is_empty() { None } else { Some(name.to_string()) };
+        if self.mutate(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
-        let mut discord = self.discord.lock().unwrap();
-        match discord.get_mut(account_id) {
+        {
+            let mut discord = self.discord.lock().unwrap();
+            if let Some(a) = discord.get_mut(account_id) {
+                a.display_name = value;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let mut sneedchat = self.sneedchat.lock().unwrap();
+            if let Some(a) = sneedchat.get_mut(account_id) {
+                a.display_name = value;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let mut matrix = self.matrix.lock().unwrap();
+            if let Some(a) = matrix.get_mut(account_id) {
+                a.display_name = value;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        let mut kick = self.kick.lock().unwrap();
+        match kick.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
-                a.display_name = if name.is_empty() { None } else { Some(name.to_string()) };
-                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                a.display_name = value;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
                 Ok(true)
             }
         }
+    }
+
+    /// The local rename alone - `None` where there is none.
+    ///
+    /// Different from the `display_name` on a listed account, which falls
+    /// back to the service's own identity so the sidebar always has a label.
+    /// Here the absence is the answer: nothing to substitute.
+    pub fn display_name_override(&self, account_id: &str) -> Option<String> {
+        let named = |v: &Option<String>| v.clone().filter(|s| !s.trim().is_empty());
+        if let Some(a) = self.irc.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.discord.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.sneedchat.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.matrix.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
     }
 
     /// Empty password means "leave whatever's stored untouched" - same
@@ -775,7 +828,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         id: a.account_id(),
         service: "kick".to_string(),
         status: "online".to_string(),
-        display_name: a.username.clone(),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         // The watched channels are deliberately not reported as `autojoin`.
         // That field is IRC's comma-separated string with IRC's meaning, and
@@ -829,5 +882,41 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         tor_proxy: None,
         use_tor: false,
         has_key_backup,
+    }
+}
+
+#[cfg(test)]
+mod display_name_tests {
+    use super::*;
+
+    fn store(name: &str) -> AccountStore {
+        let path = std::env::temp_dir().join(format!("nobilis-names-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        AccountStore::open(path).expect("accounts")
+    }
+
+    /// The rename used to reach IRC and Discord only - `mutate` knows about
+    /// IrcAccountConfig and nothing else - so on the other three services
+    /// typing a name into the box did nothing and said nothing.
+    #[test]
+    fn every_service_can_be_renamed_locally() {
+        let store = store("all-services");
+        store.add_kick(KickAccountConfig { username: "kotbarsik".into(), ..Default::default() }).expect("kick");
+        let kick = "kick:kotbarsik";
+        assert!(store.set_display_name(kick, "You").expect("set"));
+        assert_eq!(store.display_name_override(kick).as_deref(), Some("You"));
+        assert_eq!(kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name, "You");
+
+        // And clearing it puts the service's own name back rather than
+        // leaving an empty label.
+        assert!(store.set_display_name(kick, "").expect("clear"));
+        assert_eq!(store.display_name_override(kick), None);
+        assert_eq!(kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name, "kotbarsik");
+    }
+
+    #[test]
+    fn renaming_something_that_is_not_there_says_so() {
+        let store = store("missing");
+        assert!(!store.set_display_name("kick:nobody", "You").expect("set"));
     }
 }
