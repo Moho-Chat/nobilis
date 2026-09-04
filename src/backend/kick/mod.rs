@@ -1125,7 +1125,7 @@ pub fn announce_prediction(state: &AppState, buffer_id: &str, payload: &serde_js
     // bet, not your points. Both were known a moment ago if this is the same
     // prediction moving, so they are carried across rather than blanked -
     // otherwise somebody else's bet would wipe yours off the card.
-    let known = state.runtime.kick_poll(buffer_id, "prediction");
+    let known = state.runtime.live_card(buffer_id, "prediction");
     let same = known
         .as_ref()
         .and_then(|card| card["id"].as_str().map(|id| id == format!("prediction:{}", prediction.id)))
@@ -1287,9 +1287,9 @@ fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serd
         card
     });
     match &card {
-        None => state.runtime.forget_kick_poll(buffer_id, kind),
+        None => state.runtime.forget_live_card(buffer_id, kind),
         Some(card) => {
-            state.runtime.set_kick_poll(buffer_id, kind, card.clone());
+            state.runtime.set_live_card(buffer_id, kind, card.clone());
             // Written down as it changes, so what is read back later is how
             // it finished rather than how it opened.
             let id = card["id"].as_str().unwrap_or_default().to_string();
@@ -1360,7 +1360,7 @@ fn now_secs() -> i64 {
 /// title matches, since a second of drift in `remaining` must not split one
 /// poll into two.
 fn card_id(state: &AppState, buffer_id: &str, kind: &str, title: &str, duration: u32, remaining: u32) -> String {
-    if let Some(open) = state.runtime.kick_poll(buffer_id, kind) {
+    if let Some(open) = state.runtime.live_card(buffer_id, kind) {
         if open["title"].as_str() == Some(title) {
             if let Some(id) = open["id"].as_str() {
                 return id.to_string();
@@ -1986,7 +1986,7 @@ mod tests {
                 "winning_outcome_id": "OUT2"
             }
         }));
-        let card = state.runtime.kick_poll(&buffer_id, "prediction").expect("a card");
+        let card = state.runtime.live_card(&buffer_id, "prediction").expect("a card");
         assert_eq!(card["kind"], "prediction");
         assert_eq!(card["id"], "prediction:01M1PQXD465ZFG2RJJ2FE4166R");
         assert_eq!(card["title"], "who will win?");
@@ -2027,7 +2027,7 @@ mod tests {
         };
         let vote = api::PredictionVote { outcome_id: "OUT1".into(), total_vote_amount: 250.0 };
         announce_prediction_card(&state, &buffer_id, &prediction, Some(&vote), Some(9_000));
-        let card = state.runtime.kick_poll(&buffer_id, "prediction").expect("a card");
+        let card = state.runtime.live_card(&buffer_id, "prediction").expect("a card");
         assert_eq!(card["hasVoted"], true);
         assert_eq!(card["votedOptionId"], "OUT1");
         assert_eq!(card["stake"], 250.0);

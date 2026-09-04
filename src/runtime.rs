@@ -403,9 +403,21 @@ pub struct Runtime {
     /// When each channel was last asked about directly, so opening twenty
     /// buffers at once does not become twenty channel fetches at once.
     kick_stream_fetched: Mutex<HashMap<String, std::time::Instant>>,
-    /// The poll running in each channel, so a window opened while one is
-    /// running is told about it rather than waiting for the next vote.
-    kick_polls: Mutex<HashMap<String, serde_json::Value>>,
+    /// The polls and predictions on screen, by conversation and kind.
+    ///
+    /// Not Kick's alone any more: a Matrix poll is the same idea - a
+    /// question, a set of answers, a tally - and lands on the same card.
+    live_cards: Mutex<HashMap<String, serde_json::Value>>,
+    /// The question and answers of each Matrix poll, and whether it has been
+    /// ended, by conversation and poll.
+    matrix_polls: Mutex<HashMap<(String, String), (String, Vec<(String, String)>, bool)>>,
+    /// Who voted for what in each Matrix poll, by conversation and poll.
+    ///
+    /// Matrix sends the votes as individual events rather than a running
+    /// total, and only the last one from each person counts - so the tally is
+    /// this client's to keep, and keeping it by sender is what makes a
+    /// changed vote replace rather than double.
+    matrix_poll_votes: Mutex<HashMap<(String, String), HashMap<String, String>>>,
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
@@ -754,7 +766,9 @@ impl Runtime {
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
             kick_stream_fetched: Mutex::new(HashMap::new()),
-            kick_polls: Mutex::new(HashMap::new()),
+            live_cards: Mutex::new(HashMap::new()),
+            matrix_polls: Mutex::new(HashMap::new()),
+            matrix_poll_votes: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
@@ -2545,19 +2559,75 @@ impl Runtime {
 
     /// Keyed by kind as well as conversation: a channel can have a poll and
     /// a prediction running at once, and they are two cards.
-    pub fn set_kick_poll(&self, buffer_id: &str, kind: &str, poll: serde_json::Value) {
-        self.kick_polls.lock().unwrap().insert(format!("{buffer_id}|{kind}"), poll);
+    pub fn set_live_card(&self, buffer_id: &str, kind: &str, poll: serde_json::Value) {
+        self.live_cards.lock().unwrap().insert(format!("{buffer_id}|{kind}"), poll);
     }
 
-    pub fn kick_poll(&self, buffer_id: &str, kind: &str) -> Option<serde_json::Value> {
-        self.kick_polls.lock().unwrap().get(&format!("{buffer_id}|{kind}")).cloned()
+    /// Remembers a poll's question and answers, which arrive once, in the
+    /// event that started it - every vote afterwards names only an answer id.
+    pub fn set_matrix_poll(&self, buffer_id: &str, poll_id: &str, question: &str, answers: &[(String, String)]) {
+        let key = (buffer_id.to_string(), poll_id.to_string());
+        let mut polls = self.matrix_polls.lock().unwrap();
+        // A poll seen twice - a backfill after a live one, say - keeps
+        // whether it had already been ended.
+        let ended = polls.get(&key).map(|(_, _, ended)| *ended).unwrap_or(false);
+        polls.insert(key, (question.to_string(), answers.to_vec(), ended));
+    }
+
+    pub fn matrix_poll(&self, buffer_id: &str, poll_id: &str) -> Option<(String, Vec<(String, String)>, bool)> {
+        self.matrix_polls.lock().unwrap().get(&(buffer_id.to_string(), poll_id.to_string())).cloned()
+    }
+
+    pub fn matrix_poll_ended(&self, buffer_id: &str, poll_id: &str) -> bool {
+        self.matrix_polls
+            .lock()
+            .unwrap()
+            .get(&(buffer_id.to_string(), poll_id.to_string()))
+            .map(|(_, _, ended)| *ended)
+            .unwrap_or(false)
+    }
+
+    /// The counting is over. Recorded even for a poll this client never saw
+    /// start, so a late-arriving start cannot reopen it.
+    pub fn end_matrix_poll(&self, buffer_id: &str, poll_id: &str) {
+        let key = (buffer_id.to_string(), poll_id.to_string());
+        let mut polls = self.matrix_polls.lock().unwrap();
+        match polls.get_mut(&key) {
+            Some(entry) => entry.2 = true,
+            None => {
+                polls.insert(key, (String::new(), Vec::new(), true));
+            }
+        }
+    }
+
+    /// Records one person's answer, replacing whatever they answered before.
+    pub fn set_matrix_poll_vote(&self, buffer_id: &str, poll_id: &str, voter: &str, answer: &str) {
+        self.matrix_poll_votes
+            .lock()
+            .unwrap()
+            .entry((buffer_id.to_string(), poll_id.to_string()))
+            .or_default()
+            .insert(voter.to_string(), answer.to_string());
+    }
+
+    pub fn matrix_poll_votes(&self, buffer_id: &str, poll_id: &str) -> HashMap<String, String> {
+        self.matrix_poll_votes
+            .lock()
+            .unwrap()
+            .get(&(buffer_id.to_string(), poll_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn live_card(&self, buffer_id: &str, kind: &str) -> Option<serde_json::Value> {
+        self.live_cards.lock().unwrap().get(&format!("{buffer_id}|{kind}")).cloned()
     }
 
     /// Every card running in a conversation, for a window that has just
     /// opened it.
-    pub fn kick_polls_for(&self, buffer_id: &str) -> Vec<serde_json::Value> {
+    pub fn live_cards_for(&self, buffer_id: &str) -> Vec<serde_json::Value> {
         let prefix = format!("{buffer_id}|");
-        self.kick_polls
+        self.live_cards
             .lock()
             .unwrap()
             .iter()
@@ -2566,8 +2636,8 @@ impl Runtime {
             .collect()
     }
 
-    pub fn forget_kick_poll(&self, buffer_id: &str, kind: &str) {
-        self.kick_polls.lock().unwrap().remove(&format!("{buffer_id}|{kind}"));
+    pub fn forget_live_card(&self, buffer_id: &str, kind: &str) {
+        self.live_cards.lock().unwrap().remove(&format!("{buffer_id}|{kind}"));
     }
 
     pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {

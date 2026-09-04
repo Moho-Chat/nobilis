@@ -275,7 +275,7 @@ pub async fn dispatch(
                 // A poll or prediction already running when you opened the
                 // channel: the events only carry the ones that change while
                 // you are watching.
-                for card in state.runtime.kick_polls_for(buffer_id) {
+                for card in state.runtime.live_cards_for(buffer_id) {
                     // Only while it still means something. A card kept from
                     // an hour ago is not news to a window opening now, and
                     // one whose clock ran out before you arrived would open
@@ -2362,9 +2362,27 @@ pub async fn dispatch(
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("votePoll requires \"bufferId\"".to_string()));
             };
-            let Some(option_id) = params.get("optionId").and_then(|v| v.as_i64()) else {
-                return (None, Some("votePoll requires \"optionId\"".to_string()));
-            };
+            // Kick numbers its options and Matrix gives them ids of their
+            // own, so this is read as whichever it is and handed back to
+            // whichever service the conversation belongs to.
+            let option_id = params.get("optionId").and_then(|v| v.as_i64()).unwrap_or(-1);
+            // Matrix polls answer the same question through a different
+            // door: a vote is an event in the room, not a call to an API.
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                if buffer.account_id.starts_with("matrix:") {
+                    let Some(poll_id) = state.runtime.live_card(buffer_id, "poll").and_then(|c| c["id"].as_str().map(|s| s.to_string()))
+                    else {
+                        return (None, Some("there is no poll open here".to_string()));
+                    };
+                    let answer = p_str_opt(params, "answerId")
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| option_id.to_string());
+                    return match backend::matrix::vote_in_poll(state, &buffer.account_id, buffer_id, &poll_id, &answer).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    };
+                }
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };

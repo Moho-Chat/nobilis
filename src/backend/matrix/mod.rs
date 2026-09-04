@@ -27,6 +27,7 @@ pub mod crypto;
 pub mod http;
 pub mod markup;
 pub mod moderation;
+pub mod polls;
 pub mod protocol;
 pub mod roomstate;
 pub mod rooms;
@@ -684,7 +685,12 @@ async fn handle_timeline_event(
         return;
     }
 
-    if outer_type != protocol::EVENT_ROOM_MESSAGE && outer_type != protocol::EVENT_ROOM_ENCRYPTED && outer_type != protocol::EVENT_REACTION {
+    if outer_type != protocol::EVENT_ROOM_MESSAGE
+        && outer_type != protocol::EVENT_ROOM_ENCRYPTED
+        && outer_type != protocol::EVENT_REACTION
+        // A poll is three kinds of event and none of them is a message.
+        && !polls::is_poll_event(outer_type)
+    {
         // Membership/name changes were already folded into naming in
         // process_sync_response; anything else (typing, receipts, other
         // state events) isn't rendered.
@@ -739,6 +745,15 @@ async fn handle_timeline_event(
         let is_me = sender == own_user_id;
         state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me);
         state.runtime.update_reaction(state, buffer_id, target_event, emoji, is_me, true);
+        return;
+    }
+
+    // A poll: the question, a vote, or the end of the counting. Handled after
+    // decryption like everything else, because a poll in an encrypted room
+    // arrives as ciphertext the same way a message does.
+    if polls::is_poll_event(&effective_type)
+        && polls::handle(state, account_id, buffer_id, own_user_id, &effective_type, event_id, sender, &content)
+    {
         return;
     }
 
@@ -2941,6 +2956,55 @@ pub async fn edit_message(state: &AppState, account_id: &str, buffer_id: &str, a
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
     http::put_json(&url, access_token, body_json).await.context("sending edit")?;
+    Ok(())
+}
+
+/// Answers a poll.
+///
+/// The stable spelling is sent, which is what a current Element writes;
+/// everything on the way in is read either way, because a room with older
+/// clients in it has both. Encrypted where the room is - a vote is an event
+/// like any other, and a room that hides its messages hides its votes.
+///
+/// The answer is recorded here as well as sent: the echo arrives on the next
+/// sync, and a card that does not move when pressed reads as a card that did
+/// not take the press.
+pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str, answer: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let content = serde_json::json!({
+        "m.relates_to": { "rel_type": "m.reference", "event_id": poll_id },
+        "m.selections": [answer],
+    });
+
+    let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, &access_token, &room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, polls::POLL_RESPONSE[0], content)
+            .await
+            .context("encrypting the vote")?;
+        (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
+    } else {
+        (polls::POLL_RESPONSE[0].to_string(), content)
+    };
+
+    let txn_id = model::next_message_id();
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
+    );
+    http::put_json(&url, &access_token, body_json).await.context("sending your vote")?;
+
+    if !state.runtime.matrix_poll_ended(buffer_id, poll_id) {
+        state.runtime.set_matrix_poll_vote(buffer_id, poll_id, &account.user_id, answer);
+        polls::republish(state, account_id, buffer_id, poll_id, &account.user_id);
+    }
     Ok(())
 }
 
