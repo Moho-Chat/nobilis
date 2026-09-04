@@ -1013,6 +1013,29 @@ pub async fn dispatch(
             }
         }
 
+        // Who this account has asked never to hear from. The account's own
+        // list, so it agrees with Element and travels to every client.
+        "listMatrixIgnored" => match p_str_opt(params, "accountId") {
+            None => (None, Some("listMatrixIgnored requires \"accountId\"".to_string())),
+            Some(account_id) => {
+                let mut users: Vec<String> = state.runtime.matrix_ignored(account_id).into_iter().collect();
+                users.sort();
+                (Some(serde_json::json!({ "accountId": account_id, "users": users })), None)
+            }
+        },
+
+        "setMatrixIgnored" => {
+            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
+                (Some(a), Some(u)) => (a, u),
+                _ => return (None, Some("setMatrixIgnored requires \"accountId\" and \"userId\"".to_string())),
+            };
+            let ignored = params.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
+            match backend::matrix::set_ignored_user(state, account_id, user_id, ignored).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // What a room has told everyone to read first.
         "listMatrixPinned" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {

@@ -181,6 +181,8 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
 
     // And what this account has asked to be told about - see fetch_push_rules.
     fetch_push_rules(state, account_id, &config.homeserver_url, &access_token).await;
+    // And who it has asked never to hear from.
+    fetch_ignored_users(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
 
     // No RAII drop-guard here (deliberately) - run_with_retry's own
     // catch_unwind wraps this whole function, so a plain `?` return
@@ -420,6 +422,17 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
     // one of them - a user going online/offline with no other room
     // activity this cycle wouldn't otherwise show up in rooms.join at all,
     // so this can't just be folded into the per-room pass.
+    // The account's own settings, which arrive at the top level rather than in
+    // any room. Only the ignore list is read: it changes from other clients,
+    // and a block that only applies where it was made is not a block.
+    if let Some(events) = resp["account_data"]["events"].as_array() {
+        for event in events {
+            if event["type"].as_str() == Some("m.ignored_user_list") {
+                apply_ignored_users(state, account_id, &event["content"]);
+            }
+        }
+    }
+
     if let Some(events) = resp["presence"]["events"].as_array() {
         for event in events {
             let Some(sender) = event["sender"].as_str() else { continue };
@@ -679,6 +692,12 @@ async fn handle_timeline_event(
     }
 
     let sender = protocol::sender(event);
+    // Somebody this account has asked never to hear from. Synapse filters
+    // them out of sync before they get here; not every homeserver does, and a
+    // block honoured only by some servers is not one worth having.
+    if sender != own_user_id && state.runtime.matrix_is_ignored(account_id, sender) {
+        return;
+    }
     let from = if sender == own_user_id {
         state.runtime.own_identity(account_id).unwrap_or_else(|| protocol::short_sender(event))
     } else {
@@ -1816,6 +1835,74 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
 /// Stored whole and interpreted at the point of use - see notify_decision.
 /// Only a subset of the rule language is honoured, and honestly: the two
 /// kinds people actually set are a per-room mute and a keyword.
+/// Reads `m.ignored_user_list` - the account's own block list.
+///
+/// Account data rather than a local preference, which is the whole point:
+/// blocking somebody on one machine and hearing from them on the next is not
+/// blocking them. A server that filters them out of sync is doing the same
+/// thing from its end; this client honours the list either way, since not
+/// every homeserver does.
+async fn fetch_ignored_users(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str, user_id: &str) {
+    let base = homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/user/{}/account_data/m.ignored_user_list",
+        url::form_urlencoded::byte_serialize(user_id.as_bytes()).collect::<String>()
+    );
+    match http::get_json(&url, access_token).await {
+        Ok(content) => apply_ignored_users(state, account_id, &content),
+        // A 404 is an account that has never ignored anybody, which is the
+        // ordinary case and not worth a word.
+        Err(e) => tracing::debug!("matrix[{account_id}]: reading the ignore list: {e:#}"),
+    }
+}
+
+/// Takes an `m.ignored_user_list` content and makes it this account's list.
+pub fn apply_ignored_users(state: &AppState, account_id: &str, content: &Value) {
+    let users: std::collections::HashSet<String> = content["ignored_users"]
+        .as_object()
+        .map(|map| map.keys().cloned().collect())
+        .unwrap_or_default();
+    state.runtime.set_matrix_ignored(account_id, users.clone());
+    let mut listed: Vec<&String> = users.iter().collect();
+    listed.sort();
+    state.events.emit(
+        "matrixIgnored",
+        serde_json::json!({ "accountId": account_id, "users": listed }),
+    );
+}
+
+/// Adds somebody to the ignore list, or takes them off it.
+///
+/// The list is read back from the server first for the same reason pinning is:
+/// this is a whole-map replacement, and writing a stale copy would un-ignore
+/// whoever was added from another client since this one last looked.
+pub async fn set_ignored_user(state: &AppState, account_id: &str, user_id: &str, ignored: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/user/{}/account_data/m.ignored_user_list",
+        url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+    );
+    let mut users: std::collections::BTreeMap<String, Value> = match http::get_json(&url, &account.access_token).await {
+        Ok(content) => content["ignored_users"]
+            .as_object()
+            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+        Err(_) => Default::default(),
+    };
+    if ignored {
+        // The value is an empty object by spec - the key is the whole
+        // statement.
+        users.insert(user_id.to_string(), serde_json::json!({}));
+    } else {
+        users.remove(user_id);
+    }
+    let content = serde_json::json!({ "ignored_users": users });
+    http::put_json(&url, &account.access_token, content.clone()).await.context("writing the ignore list")?;
+    apply_ignored_users(state, account_id, &content);
+    Ok(())
+}
+
 async fn fetch_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) {
     let base = homeserver_url.trim_end_matches('/');
     match http::get_json(&format!("{base}/_matrix/client/v3/pushrules/"), access_token).await {

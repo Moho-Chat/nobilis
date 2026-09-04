@@ -546,6 +546,13 @@ pub struct Runtime {
     /// this is advisory/UI-gating only, an unauthorized action would be
     /// rejected server-side regardless of what's cached here.
     matrix_power_levels: Mutex<HashMap<(String, String), Value>>,
+    /// Who this account has asked never to hear from, by account.
+    ///
+    /// The account's own list rather than this window's: `m.ignored_user_list`
+    /// travels to every client signed in, which is the whole point of it -
+    /// blocking somebody on one machine and hearing from them on the next is
+    /// not blocking them.
+    matrix_ignored: Mutex<HashMap<String, HashSet<String>>>,
     /// The event ids a room has pinned, by account and room.
     ///
     /// The ids only: what those events *say* lives in scrollback or on the
@@ -773,6 +780,7 @@ impl Runtime {
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
+            matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
             matrix_upgrades: Mutex::new(Vec::new()),
@@ -2191,6 +2199,19 @@ impl Runtime {
 
     pub fn set_matrix_power_levels(&self, account_id: &str, room_id: &str, content: Value) {
         self.matrix_power_levels.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), content);
+    }
+
+    pub fn set_matrix_ignored(&self, account_id: &str, users: HashSet<String>) {
+        self.matrix_ignored.lock().unwrap().insert(account_id.to_string(), users);
+    }
+
+    pub fn matrix_ignored(&self, account_id: &str) -> HashSet<String> {
+        self.matrix_ignored.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Whether this account has asked never to hear from somebody.
+    pub fn matrix_is_ignored(&self, account_id: &str, user_id: &str) -> bool {
+        self.matrix_ignored.lock().unwrap().get(account_id).is_some_and(|list| list.contains(user_id))
     }
 
     pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {
