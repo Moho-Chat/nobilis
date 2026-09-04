@@ -111,6 +111,14 @@ pub async fn post_json(url: &str, token: Option<&str>, body: Value) -> Result<Va
     handle_response(resp).await
 }
 
+/// A GET with no credential, for the handful of endpoints that take none -
+/// asking a homeserver how it lets people sign in is the first thing that
+/// happens, before there is anybody to be.
+pub async fn get_json_anonymous(url: &str) -> Result<Value> {
+    let resp = http_client().get(url).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
 pub async fn get_json(url: &str, token: &str) -> Result<Value> {
     let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await

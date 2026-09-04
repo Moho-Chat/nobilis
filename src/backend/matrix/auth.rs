@@ -45,6 +45,46 @@ pub async fn login(homeserver_url: &str, username: &str, password: &str, device_
     Ok(LoginResult { user_id, access_token, device_id })
 }
 
+/// Which ways a homeserver will let somebody sign in.
+///
+/// Asked before anything is typed, because the answer decides what to ask
+/// for: a server with only `m.login.sso` has no password to take, and a form
+/// that demands one there is a form nobody can complete.
+pub async fn login_flows(homeserver_url: &str) -> Result<Vec<String>> {
+    let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
+    let resp = super::http::get_json_anonymous(&url).await.context("asking how to sign in")?;
+    Ok(resp["flows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|flow| flow["type"].as_str().map(|s| s.to_string()))
+        .collect())
+}
+
+/// Finishes an SSO sign-in with the one-time token the browser came back
+/// with.
+///
+/// The same endpoint as a password login, with the type that says a third
+/// party already did the identifying. `device_id` is reused for exactly the
+/// reason the module doc gives - the identity has to survive.
+pub async fn login_with_token(homeserver_url: &str, token: &str, device_id: Option<&str>) -> Result<LoginResult> {
+    let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
+    let mut body = json!({
+        "type": "m.login.token",
+        "token": token,
+        "initial_device_display_name": "nobilis",
+    });
+    if let Some(device_id) = device_id {
+        body["device_id"] = json!(device_id);
+    }
+    let resp = post_json(&url, None, body).await.context("finishing the sign-in")?;
+    Ok(LoginResult {
+        user_id: resp["user_id"].as_str().context("login response missing user_id")?.to_string(),
+        access_token: resp["access_token"].as_str().context("login response missing access_token")?.to_string(),
+        device_id: resp["device_id"].as_str().context("login response missing device_id")?.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

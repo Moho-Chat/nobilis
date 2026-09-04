@@ -2190,6 +2190,36 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // How a homeserver lets people sign in, asked before anything is
+        // typed: a server offering only SSO has no password to take, and a
+        // form demanding one there is a form nobody can complete.
+        "matrixLoginFlows" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("matrixLoginFlows requires \"homeserverUrl\"".to_string()));
+            };
+            match backend::matrix::login_flows(homeserver_url).await {
+                Ok(flows) => (Some(serde_json::json!({ "flows": flows })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Signing in through the homeserver's own web login. Answers with the
+        // login id straight away; the URL to open arrives as a status event a
+        // moment later, once the port it has to point at exists.
+        "addMatrixAccountSso" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("addMatrixAccountSso requires \"homeserverUrl\"".to_string()));
+            };
+            let login_id = format!("matrix-login-{}", crate::model::next_message_id());
+            backend::matrix::start_sso_login(
+                state.clone(),
+                login_id.clone(),
+                homeserver_url.to_string(),
+                p_str_opt(params, "provider").map(|s| s.to_string()),
+            );
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
         // Adds a Kick account, signed in or not.
         //
         // The token is optional and that is the interesting part: Kick's chat
