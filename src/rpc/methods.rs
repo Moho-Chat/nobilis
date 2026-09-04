@@ -1013,6 +1013,47 @@ pub async fn dispatch(
             }
         }
 
+        // The same question asked of the homeserver rather than of this
+        // window's own copy.
+        //
+        // Separate from `searchMessages` rather than folded into it: local
+        // search is instant and offline, server search is a round trip that
+        // can fail, and a client should be able to show the first while it
+        // waits for the second. Every other protocol keeps the old method
+        // untouched.
+        "searchMatrixMessages" => {
+            let (buffer_id, query) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "query")) {
+                (Some(b), Some(q)) => (b, q),
+                _ => return (None, Some("searchMatrixMessages requires \"bufferId\" and \"query\"".to_string())),
+            };
+            if query.trim().is_empty() {
+                return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("matrix:") {
+                return (None, Some("that conversation is not on Matrix".to_string()));
+            }
+            // "This room" or "everywhere" - the room is often exactly what
+            // the person searching has forgotten.
+            let room = match p_str(params, "scope", "room") {
+                "account" => None,
+                _ => state.runtime.get_matrix_room(buffer_id),
+            };
+            let limit = p_i64(params, "limit", 25).clamp(1, 100) as u32;
+            match backend::matrix::search_messages(state, &buffer.account_id, room.as_deref(), query.trim(), limit).await {
+                Ok(mut answer) => {
+                    // Why an encrypted room comes back empty, said once here
+                    // rather than guessed at by every frontend: the server
+                    // holds ciphertext and cannot read it.
+                    answer["encrypted"] = serde_json::json!(state.runtime.is_matrix_room_encrypted(buffer_id));
+                    (Some(answer), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Calling someone directly. Opens the conversation if there is not
         // one yet, so calling from a member list works for somebody you have
         // never messaged.

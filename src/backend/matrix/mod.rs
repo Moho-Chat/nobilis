@@ -1175,6 +1175,100 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
     Ok(())
 }
 
+/// Searches the homeserver's own copy of the conversation.
+///
+/// The local scrollback is this window's copy of what it happened to be
+/// present for; the server has everything the room has, including what was
+/// said before this account joined and what this client has never downloaded.
+/// Element searches both, and searching only one of them is why something
+/// said last year in a room joined last week could not be found here.
+///
+/// One room or the whole account: a search worth doing is often "where did
+/// somebody say that", and the room is exactly what the person has forgotten.
+///
+/// An encrypted room returns nothing from this, and honestly so - the server
+/// holds ciphertext and cannot read it. That is not a failure to report as
+/// one, and the caller is told the room is encrypted so it can say which kind
+/// of nothing this is.
+pub async fn search_messages(
+    state: &AppState,
+    account_id: &str,
+    room_id: Option<&str>,
+    term: &str,
+    limit: u32,
+) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let mut filter = serde_json::Map::new();
+    filter.insert("limit".into(), Value::from(limit.clamp(1, 100)));
+    if let Some(room_id) = room_id.filter(|r| !r.is_empty()) {
+        filter.insert("rooms".into(), serde_json::json!([room_id]));
+    }
+    let body = serde_json::json!({
+        "search_categories": {
+            "room_events": {
+                "search_term": term,
+                // The message text, which is what somebody searching means.
+                // Searching over topics and names as well turns "did anyone
+                // mention the deploy" into a list of rooms with deploy in
+                // their name.
+                "keys": ["content.body"],
+                "order_by": "recent",
+                "filter": Value::Object(filter),
+                // Names for the senders, so a result reads as a message from
+                // a person rather than from an mxid.
+                "event_context": { "before_limit": 0, "after_limit": 0, "include_profile": true },
+            }
+        }
+    });
+
+    let resp = http::post_json(&format!("{base}/_matrix/client/v3/search"), Some(&account.access_token), body)
+        .await
+        .context("searching the server")?;
+    let events = resp["search_categories"]["room_events"]["results"].as_array().cloned().unwrap_or_default();
+
+    let mut results = Vec::new();
+    let mut room_names = serde_json::Map::new();
+    for hit in events {
+        let event = &hit["result"];
+        let Some(event_id) = event["event_id"].as_str() else { continue };
+        let Some(room) = event["room_id"].as_str() else { continue };
+        let sender = event["sender"].as_str().unwrap_or_default();
+        // The display name the server sent alongside the hit, where it did.
+        let profile = hit["context"]["profile_info"][sender]["displayname"].as_str();
+        let body = event["content"]["body"].as_str().unwrap_or_default();
+        if body.is_empty() {
+            continue;
+        }
+        let buffer_id = state.runtime.matrix_buffer_for_room(account_id, room).unwrap_or_default();
+        if !buffer_id.is_empty() {
+            if let Some((name, _kind)) = state.runtime.get_matrix_room_name(account_id, room) {
+                room_names.insert(buffer_id.clone(), Value::from(name));
+            }
+        }
+        results.push(serde_json::json!({
+            "id": event_id,
+            "bufferId": buffer_id,
+            "from": profile.map(|name| name.to_string()).unwrap_or_else(|| protocol::mxid_localpart(sender)),
+            "body": body,
+            // Matrix counts in milliseconds and everything here counts in
+            // seconds.
+            "ts": event["origin_server_ts"].as_i64().unwrap_or_default() / 1000,
+            "isAction": false,
+            "isHighlight": false,
+            "kind": "chat",
+            "edited": false,
+            "isOwn": sender == account.user_id,
+        }));
+    }
+
+    Ok(serde_json::json!({
+        "results": results,
+        "roomNames": Value::Object(room_names),
+        "count": resp["search_categories"]["room_events"]["count"].as_i64().unwrap_or(results.len() as i64),
+    }))
+}
+
 /// Leaves a room, for real, on the server.
 ///
 /// Closing a conversation used to remove the buffer and nothing else, so it
