@@ -2112,6 +2112,23 @@ pub async fn dispatch(
         // Kick's follow list is also what this account's channel list syncs
         // from, so doing it here keeps that list editable from the place it
         // is read.
+        // The viewer count for the channel somebody is looking at.
+        //
+        // Kick pushes a stream starting and stopping but never the count, and
+        // the client is the only side that knows which channel is on screen -
+        // so it asks, on its own clock, for that one channel.
+        "refreshKickStream" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("refreshKickStream requires \"bufferId\"".to_string()));
+            };
+            if state.runtime.kick_channel(buffer_id).is_none() {
+                return (None, Some("that is not a Kick channel".to_string()));
+            }
+            let (state, buffer_id) = (state.clone(), buffer_id.to_string());
+            tokio::spawn(async move { backend::kick::refresh_stream_now(&state, &buffer_id).await });
+            (Some(ok_node()), None)
+        }
+
         "setKickFollowing" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("setKickFollowing requires \"bufferId\"".to_string()));

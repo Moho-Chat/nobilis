@@ -432,6 +432,27 @@ async fn collect_follows(
     path: &str,
     out: &mut Vec<String>,
 ) -> Result<()> {
+    walk_follows(http, token, path, |body| {
+        for slug in slugs_in(body) {
+            if !out.contains(&slug) {
+                out.push(slug);
+            }
+        }
+    })
+    .await
+}
+
+/// Walks one paginated follow list, handing each page's body to the caller.
+///
+/// The paging - cursor, stall guard, page cap, the two ways Kick spells the
+/// cursor - is the same whether the caller wants handles or live state, so it
+/// lives here once rather than in each of them.
+async fn walk_follows(
+    http: &reqwest::Client,
+    token: &str,
+    path: &str,
+    mut each: impl FnMut(&serde_json::Value),
+) -> Result<()> {
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_FOLLOW_PAGES {
         let url = match &cursor {
@@ -452,11 +473,7 @@ async fn collect_follows(
             bail!("Kick answered {} for this account's follows", res.status());
         }
         let body: serde_json::Value = res.json().await.context("reading this account's follows")?;
-        for slug in slugs_in(&body) {
-            if !out.contains(&slug) {
-                out.push(slug);
-            }
-        }
+        each(&body);
         match next_cursor(&body) {
             // A cursor that has not moved would walk the same page forever.
             Some(next) if Some(&next) != cursor.as_ref() => cursor = Some(next),
@@ -464,6 +481,108 @@ async fn collect_follows(
         }
     }
     Ok(())
+}
+
+/// What a follow list says about one channel right now.
+///
+/// Deliberately not a `Channel`: this comes from a list endpoint that carries
+/// live state and nothing else useful, and pretending otherwise would invite
+/// code to read ids off it that are not there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FollowedLive {
+    pub slug: String,
+    pub live: bool,
+    pub title: Option<String>,
+    pub category: Option<String>,
+    pub viewers: Option<u64>,
+}
+
+/// Live state and viewer counts for everything this account follows, in bulk.
+///
+/// This is what Kick's own Following panel does, and it is the difference
+/// between one request a minute and one request per channel per minute: an
+/// account following thirty channels is thirty channel fetches otherwise,
+/// which is how a client earns a rate limit.
+///
+/// Both lists again, for the same reason `followed` reads both: the live list
+/// carries the stream title and the full list carries the channels that are
+/// not live, and a channel missing from the answer is not the same as a
+/// channel that is off air.
+pub async fn followed_live(http: &reqwest::Client, token: &str) -> Result<Vec<FollowedLive>> {
+    let mut out: Vec<FollowedLive> = Vec::new();
+    let mut collect = |body: &serde_json::Value| {
+        for row in live_rows(body) {
+            match out.iter_mut().find(|c| c.slug == row.slug) {
+                // First writer wins on presence, but a later page still fills
+                // in what the earlier one did not carry - the full list has no
+                // session title, so an entry from it would otherwise erase the
+                // title the live list already provided.
+                Some(existing) => {
+                    existing.live |= row.live;
+                    if existing.title.is_none() {
+                        existing.title = row.title;
+                    }
+                    if existing.category.is_none() {
+                        existing.category = row.category;
+                    }
+                    if existing.viewers.is_none() {
+                        existing.viewers = row.viewers;
+                    }
+                }
+                None => out.push(row),
+            }
+        }
+    };
+    let live = walk_follows(http, token, "/api/v2/channels/followed", &mut collect).await;
+    let all = walk_follows(http, token, "/api/v2/channels/followed-page", &mut collect).await;
+    match (live, all) {
+        (Err(e), Err(_)) => Err(e),
+        _ => Ok(out),
+    }
+}
+
+/// The live state rows in one page of a follow list.
+fn live_rows(body: &serde_json::Value) -> Vec<FollowedLive> {
+    let items = body
+        .as_array()
+        .or_else(|| body.get("data").and_then(|v| v.as_array()))
+        .or_else(|| body.get("channels").and_then(|v| v.as_array()))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for item in items {
+        let raw = item
+            .get("slug")
+            .or_else(|| item.get("channel").and_then(|c| c.get("slug")))
+            .or_else(|| item.get("channel_slug"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let slug = normalise_slug(raw);
+        if slug.is_empty() {
+            continue;
+        }
+        let live = item.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false);
+        let text = |key: &str| {
+            item.get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        out.push(FollowedLive {
+            slug,
+            live,
+            title: text("session_title"),
+            category: text("category_name"),
+            // Zero on an off-air channel is Kick saying nothing rather than
+            // saying nobody is watching, and a "0 viewers" chip on a stream
+            // that is not running reads as a bug.
+            viewers: item
+                .get("viewer_count")
+                .and_then(|v| v.as_u64())
+                .filter(|_| live),
+        });
+    }
+    out
 }
 
 /// Where the next page starts, if there is one.
@@ -946,6 +1065,48 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two follow lists have different shapes - the live one carries the
+    /// session title, the full one does not - and this is the parsing that
+    /// keeps a live channel from being reported as off air by the second one.
+    #[test]
+    fn reads_live_state_out_of_a_follow_page() {
+        let body = serde_json::json!({
+            "channels": [
+                {
+                    "channel_slug": "shoovy",
+                    "is_live": true,
+                    "viewer_count": 292,
+                    "session_title": " sleeping ",
+                    "category_name": "Just Chatting"
+                },
+                { "channel_slug": "winnerdog", "is_live": false, "viewer_count": 0 }
+            ],
+            "nextCursor": 20
+        });
+        let rows = live_rows(&body);
+        assert_eq!(
+            rows,
+            vec![
+                FollowedLive {
+                    slug: "shoovy".into(),
+                    live: true,
+                    title: Some("sleeping".into()),
+                    category: Some("Just Chatting".into()),
+                    viewers: Some(292),
+                },
+                FollowedLive {
+                    slug: "winnerdog".into(),
+                    live: false,
+                    title: None,
+                    category: None,
+                    // Not Some(0): off air, Kick sends zero for "no answer".
+                    viewers: None,
+                },
+            ]
+        );
+        assert_eq!(next_cursor(&body).as_deref(), Some("20"));
+    }
 
     #[test]
     fn takes_the_handle_out_of_whatever_was_typed() {

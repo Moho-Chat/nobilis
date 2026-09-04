@@ -207,7 +207,7 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
                     let _ = state.accounts.set_kick_channels(account_id, channels.clone());
                     let _ = state.accounts.mark_kick_follows_synced(account_id);
                     if added > 0 {
-                        state.runtime.report_progress(state, account_id, &format!("following {added} channels you already follow on Kick"));
+                        state.runtime.report_progress(state, account_id, &format!("opened {added} channels you follow on Kick"));
                     }
                 }
                 // Not fatal, and not retried on the next connect either -
@@ -259,6 +259,14 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
     let mut ping = tokio::time::interval(Duration::from_secs(60));
     ping.tick().await;
 
+    // Who is live, and how many people are watching. Kick pushes the start and
+    // the stop of a stream but never the count, so the only way to keep the
+    // channel list honest is to ask - once for every followed channel at a
+    // time, which is what Kick's own Following panel does.
+    let live_token = config.token.clone().filter(|t| !t.is_empty());
+    let mut live_poll = tokio::time::interval(LIVE_POLL);
+    live_poll.tick().await;
+
     loop {
         tokio::select! {
             command = rx.recv() => match command {
@@ -286,6 +294,14 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
                     state.runtime.forget_kick_channel(&format!("{account_id}|{slug}"));
                 }
             },
+            _ = live_poll.tick(), if live_token.is_some() => {
+                // Not awaited in the loop: the socket has a ping to send and
+                // frames to read, and neither should wait on an HTTP round
+                // trip to somebody else's API.
+                let (state, http) = (state.clone(), http.clone());
+                let (account_id, token) = (account_id.to_string(), live_token.clone().unwrap_or_default());
+                tokio::spawn(async move { refresh_followed_live(&state, &http, &account_id, &token).await });
+            }
             _ = ping.tick() => {
                 socket.send(WsMessage::Text(r#"{"event":"pusher:ping","data":{}}"#.to_string())).await
                     .context("Kick's chat connection went away")?;
@@ -746,7 +762,9 @@ fn handle_event(
             // event: the title and the game arrive with the channel, not with
             // the notice that it went live.
             let (state, buffer_id) = (state.clone(), crate::model::buffer_id(account_id, &slug));
-            tokio::spawn(async move { refresh_stream(&state, &buffer_id).await });
+            // Now, not when the throttle next allows it: this is the moment
+            // the answer changed.
+            tokio::spawn(async move { refresh_stream_now(&state, &buffer_id).await });
         }
         // A message taken down, by its author or by a moderator. Removed here
         // too, or moho shows a different chat from the one everybody else is
@@ -962,12 +980,85 @@ pub async fn refresh_standing(state: &AppState, buffer_id: &str) {
     }
 }
 
+/// How often the followed channels are asked about as a group.
+const LIVE_POLL: Duration = Duration::from_secs(60);
+
+/// How recently a channel must have been asked about directly for a second ask
+/// to be pointless.
+///
+/// Opening a client with thirty Kick channels subscribes to thirty buffers at
+/// once, and each subscription used to become its own channel fetch; the poll
+/// above covers all of them for the price of one request.
+const DIRECT_REFRESH: Duration = Duration::from_secs(45);
+
+/// Live state for everything this account follows, in one request.
+///
+/// Only channels this client actually has open are updated: the follow list
+/// can be longer than the buffers, and a stream state for a buffer that does
+/// not exist has nobody to tell.
+async fn refresh_followed_live(state: &AppState, http: &reqwest::Client, account_id: &str, token: &str) {
+    let rows = match api::followed_live(http, token).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!("kick[{account_id}]: polling live channels: {e:#}");
+            return;
+        }
+    };
+    for row in rows {
+        let buffer_id = crate::model::buffer_id(account_id, &row.slug);
+        // A channel with no chat connection is one this client does not have
+        // open, whatever the follow list says.
+        if state.runtime.kick_channel(&buffer_id).is_none() {
+            continue;
+        }
+        let mut stream = state.runtime.kick_stream(&buffer_id).unwrap_or_else(|| {
+            serde_json::json!({ "bufferId": buffer_id, "live": false })
+        });
+        let before = stream.clone();
+        stream["live"] = serde_json::json!(row.live);
+        stream["viewers"] = serde_json::json!(row.viewers);
+        if row.live {
+            // The full follow list carries no session title, so a title
+            // already known from the channel itself is better than none.
+            if let Some(title) = row.title {
+                stream["title"] = serde_json::json!(title);
+            }
+            if let Some(category) = row.category {
+                stream["category"] = serde_json::json!(category);
+            }
+        } else {
+            stream["title"] = serde_json::Value::Null;
+            stream["category"] = serde_json::Value::Null;
+            stream["startedTs"] = serde_json::Value::Null;
+        }
+        // This list says nothing about whether the account follows the
+        // channel - it is the follow list, so it does, and anything already
+        // known stays as it is.
+        if stream["following"].is_null() {
+            stream["following"] = serde_json::json!(true);
+        }
+        if stream != before {
+            state.runtime.set_kick_stream(&buffer_id, stream.clone());
+            state.events.emit("kickStream", stream);
+        }
+    }
+}
+
 /// Asks Kick what a channel is doing now and says so.
 ///
 /// Used when the answer has just changed - a stream starting or ending - and
 /// when somebody opens the channel, since a viewer count from an hour ago is
 /// worse than none.
 pub async fn refresh_stream(state: &AppState, buffer_id: &str) {
+    if !state.runtime.kick_stream_due(buffer_id, DIRECT_REFRESH) {
+        return;
+    }
+    refresh_stream_now(state, buffer_id).await
+}
+
+/// The same, for a caller that has already decided the answer is stale - a
+/// stream going on or off air, or the channel somebody is looking at.
+pub async fn refresh_stream_now(state: &AppState, buffer_id: &str) {
     let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
     let Ok(http) = api::client() else { return };
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();

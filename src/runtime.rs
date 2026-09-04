@@ -400,6 +400,9 @@ pub struct Runtime {
     /// waiting for the stream to start or stop before the header says
     /// anything.
     kick_streams: Mutex<HashMap<String, serde_json::Value>>,
+    /// When each channel was last asked about directly, so opening twenty
+    /// buffers at once does not become twenty channel fetches at once.
+    kick_stream_fetched: Mutex<HashMap<String, std::time::Instant>>,
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
@@ -659,6 +662,7 @@ impl Runtime {
             kick_senders: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
+            kick_stream_fetched: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
@@ -2394,6 +2398,22 @@ impl Runtime {
 
     pub fn set_kick_stream(&self, buffer_id: &str, stream: serde_json::Value) {
         self.kick_streams.lock().unwrap().insert(buffer_id.to_string(), stream);
+    }
+
+    /// Whether this channel is due a direct fetch, marking it fetched if so.
+    ///
+    /// One call rather than a read and a write, because two callers deciding
+    /// at the same moment must not both decide yes.
+    pub fn kick_stream_due(&self, buffer_id: &str, every: std::time::Duration) -> bool {
+        let now = std::time::Instant::now();
+        let mut seen = self.kick_stream_fetched.lock().unwrap();
+        match seen.get(buffer_id) {
+            Some(last) if now.duration_since(*last) < every => false,
+            _ => {
+                seen.insert(buffer_id.to_string(), now);
+                true
+            }
+        }
     }
 
     pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {
