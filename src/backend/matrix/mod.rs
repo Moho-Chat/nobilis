@@ -688,6 +688,7 @@ async fn handle_timeline_event(
     if outer_type != protocol::EVENT_ROOM_MESSAGE
         && outer_type != protocol::EVENT_ROOM_ENCRYPTED
         && outer_type != protocol::EVENT_REACTION
+        && outer_type != protocol::EVENT_STICKER
         // A poll is three kinds of event and none of them is a message.
         && !polls::is_poll_event(outer_type)
     {
@@ -719,7 +720,7 @@ async fn handle_timeline_event(
     // reaction can be encrypted too, not just messages) - so the
     // effective type/content used below come from the decrypted envelope
     // when there is one, the outer event otherwise.
-    let (effective_type, content, undecryptable): (String, Value, bool) = if outer_type == protocol::EVENT_ROOM_ENCRYPTED {
+    let (effective_type, mut content, undecryptable): (String, Value, bool) = if outer_type == protocol::EVENT_ROOM_ENCRYPTED {
         match decrypt_event(session, event, room_id).await {
             Ok(decrypted) => {
                 let t = decrypted["type"].as_str().unwrap_or(protocol::EVENT_ROOM_MESSAGE).to_string();
@@ -757,7 +758,15 @@ async fn handle_timeline_event(
         return;
     }
 
-    if effective_type != protocol::EVENT_ROOM_MESSAGE {
+    // A sticker is an image that arrived under its own event type rather
+    // than as a message with a msgtype. Given the msgtype it is missing, the
+    // whole media path below - fetch, cache, describe - reads it as what it
+    // is instead of dropping it for having the wrong envelope.
+    if effective_type == protocol::EVENT_STICKER {
+        if let Some(object) = content.as_object_mut() {
+            object.entry("msgtype").or_insert_with(|| Value::from("m.image"));
+        }
+    } else if effective_type != protocol::EVENT_ROOM_MESSAGE {
         return;
     }
 
@@ -796,6 +805,12 @@ async fn handle_timeline_event(
         let path = cached_encrypted_media_path(homeserver_url, access_token, file, ext).await;
         attachments.push(build_attachment(&content, path, thumbnail_for(&content, homeserver_url, access_token).await));
         (protocol::message_body(&content).0, false)
+    } else if let Some(place) = protocol::location_of(&content) {
+        // A place, as the one thing a chat client can honestly do with one:
+        // what the sender called it, and a link to a map that can show it.
+        // Drawing the map here would mean shipping tiles from somebody's
+        // server on every message that mentions a street corner.
+        (place, false)
     } else {
         protocol::message_body(&content)
     };
@@ -849,6 +864,13 @@ async fn handle_timeline_event(
                 body = after.to_string();
             }
         }
+    }
+
+    // A voice message is an audio file with a note on it saying it was
+    // spoken rather than sent. Element shows it as a waveform; this at least
+    // stops it reading as somebody attaching "Voice message.ogg".
+    if protocol::is_voice_message(&content) {
+        body = "Voice message".to_string();
     }
 
     let sender_avatar_url = state.runtime.get_matrix_member_avatar(account_id, sender);

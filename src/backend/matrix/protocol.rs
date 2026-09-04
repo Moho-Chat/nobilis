@@ -16,6 +16,8 @@ pub const EVENT_ROOM_ENCRYPTION: &str = "m.room.encryption";
 pub const EVENT_ROOM_ENCRYPTED: &str = "m.room.encrypted";
 pub const EVENT_REACTION: &str = "m.reaction";
 pub const EVENT_REDACTION: &str = "m.room.redaction";
+/// A sticker: an image under its own event type rather than a msgtype.
+pub const EVENT_STICKER: &str = "m.sticker";
 
 pub fn event_type(event: &Value) -> &str {
     event["type"].as_str().unwrap_or("")
@@ -54,6 +56,38 @@ pub fn message_body(content: &Value) -> (String, bool) {
     let body = content["body"].as_str().unwrap_or("").to_string();
     let is_action = content["msgtype"].as_str() == Some("m.emote");
     (body, is_action)
+}
+
+/// Whether this is a voice message rather than an attached audio file.
+///
+/// The marker is still under its MSC prefix everywhere that sends it, and the
+/// stable name is read too so this keeps working when that lands.
+pub fn is_voice_message(content: &Value) -> bool {
+    content["msgtype"].as_str() == Some("m.audio")
+        && (content.get("org.matrix.msc3245.voice").is_some() || content.get("m.voice").is_some())
+}
+
+/// A location message, as a line somebody can act on.
+///
+/// `geo_uri` is "geo:lat,long" and means nothing to a person; the description
+/// beside it usually does. Both are given, with a link to a map that can show
+/// the point - pointing at one is honest, drawing one would mean fetching
+/// tiles from somebody's server for every message that mentions a place.
+pub fn location_of(content: &Value) -> Option<String> {
+    if content["msgtype"].as_str() != Some("m.location") {
+        return None;
+    }
+    let geo = content["geo_uri"].as_str()?;
+    let point = geo.strip_prefix("geo:")?.split(';').next()?;
+    let (lat, long) = point.split_once(',')?;
+    let described = content["body"].as_str().filter(|b| !b.is_empty()).unwrap_or("Location");
+    Some(format!(
+        "{described} — https://www.openstreetmap.org/?mlat={}&mlon={}#map=16/{}/{}",
+        lat.trim(),
+        long.trim(),
+        lat.trim(),
+        long.trim()
+    ))
 }
 
 /// The sender's formatted version of the body, if there is one.
@@ -197,6 +231,40 @@ pub fn encrypted_media_file(content: &Value) -> Option<&Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// A place, in the only form a chat client can honestly show one.
+    #[test]
+    fn reads_a_location_as_something_to_press() {
+        let content = serde_json::json!({
+            "msgtype": "m.location",
+            "body": "The pub",
+            "geo_uri": "geo:52.2053,0.1218"
+        });
+        let line = location_of(&content).expect("a location");
+        assert!(line.starts_with("The pub — https://www.openstreetmap.org/?mlat=52.2053&mlon=0.1218"), "{line}");
+
+        // A geo URI with a precision suffix is still a point.
+        let precise = serde_json::json!({ "msgtype": "m.location", "geo_uri": "geo:52.2,0.12;u=35" });
+        assert!(location_of(&precise).expect("a location").starts_with("Location — "));
+
+        // Anything else is not a location and must not be read as one.
+        assert_eq!(location_of(&serde_json::json!({ "msgtype": "m.text", "body": "geo:1,2" })), None);
+    }
+
+    /// A voice message is an audio file with a note saying it was spoken.
+    #[test]
+    fn tells_a_voice_message_from_an_audio_file() {
+        assert!(is_voice_message(&serde_json::json!({
+            "msgtype": "m.audio",
+            "org.matrix.msc3245.voice": {}
+        })));
+        // The stable name, for when it lands.
+        assert!(is_voice_message(&serde_json::json!({ "msgtype": "m.audio", "m.voice": {} })));
+        // An ordinary attached song is not a voice message.
+        assert!(!is_voice_message(&serde_json::json!({ "msgtype": "m.audio" })));
+    }
+
     use super::formatted_body;
     use serde_json::json;
 
