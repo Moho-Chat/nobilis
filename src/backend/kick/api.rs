@@ -173,7 +173,10 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
         if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
             break;
         }
-        let wait = retry_after(&res).unwrap_or(Duration::from_millis(750 * attempt as u64));
+        // Seconds rather than milliseconds: Kick's limit is measured in
+        // requests per window, and asking again immediately only spends the
+        // next window's budget on the same refusal.
+        let wait = retry_after(&res).unwrap_or(Duration::from_secs(2 * attempt as u64));
         tokio::time::sleep(wait).await;
         res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
     }
@@ -209,8 +212,17 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
 /// Kick's stream start time, which is not the format the rest of its API
 /// uses: "2026-09-03 19:57:50", a space rather than a T and no zone at all.
 /// Read as UTC, which is what it is.
-fn parse_kick_datetime(text: &str) -> Option<i64> {
-    let iso = format!("{}Z", text.trim().replacen(' ', "T", 1));
+pub fn parse_kick_datetime(text: &str) -> Option<i64> {
+    let text = text.trim();
+    // Kick writes a stream's start time as "2026-09-03 19:57:50" and a
+    // prediction's as "2026-09-04T17:45:16Z". Appending a zone to the second
+    // one produced "...ZZ", which parses as nothing - and a prediction whose
+    // start cannot be read is one whose clock never runs down.
+    let iso = if text.ends_with('Z') || text.contains('+') {
+        text.to_string()
+    } else {
+        format!("{}Z", text.replacen(' ', "T", 1))
+    };
     chrono::DateTime::parse_from_rfc3339(&iso).ok().map(|dt| dt.timestamp())
 }
 
@@ -223,6 +235,8 @@ mod live_tests {
     #[test]
     fn reads_the_start_time_kick_actually_sends() {
         assert_eq!(parse_kick_datetime("2026-09-03 19:57:50"), Some(1788465470));
+        // And the one it writes the ordinary way, which predictions use.
+        assert_eq!(parse_kick_datetime("2026-09-04T17:45:16Z"), Some(1788543916));
         assert_eq!(parse_kick_datetime("not a time"), None);
     }
 
@@ -1422,4 +1436,200 @@ pub async fn delete_poll(http: &reqwest::Client, token: &str, slug: &str) -> Res
         bail!("Kick answered {} to ending the poll", res.status());
     }
     Ok(())
+}
+
+/// A prediction, as Kick's own viewer panel reads one.
+///
+/// Read from the site's own calls rather than guessed: the ids are ULID
+/// strings rather than numbers, the stake is `total_vote_amount`, and the
+/// payout is a rate rather than a phrase - "1:2.8" is how the page writes
+/// `return_rate` 2.8, not something the API sends.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Prediction {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub outcomes: Vec<PredictionOutcome>,
+    #[serde(default)]
+    pub duration: u32,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    /// ACTIVE while it takes bets, LOCKED once it stops, then RESOLVED or
+    /// CANCELLED.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub winning_outcome_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PredictionOutcome {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub total_vote_amount: f64,
+    #[serde(default)]
+    pub vote_count: u64,
+    #[serde(default)]
+    pub return_rate: f64,
+}
+
+/// What this account has riding on the prediction, where it has anything.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct PredictionVote {
+    pub outcome_id: String,
+    #[serde(default)]
+    pub total_vote_amount: f64,
+}
+
+#[derive(Deserialize)]
+struct PredictionEnvelope {
+    #[serde(default)]
+    data: Option<PredictionData>,
+}
+
+#[derive(Deserialize)]
+struct PredictionData {
+    #[serde(default)]
+    prediction: Option<Prediction>,
+    #[serde(default)]
+    user_vote: Option<PredictionVote>,
+}
+
+#[derive(Deserialize)]
+struct PointsEnvelope {
+    #[serde(default)]
+    data: Option<PointsData>,
+}
+
+#[derive(Deserialize)]
+struct PointsData {
+    #[serde(default)]
+    points: f64,
+}
+
+/// The prediction a channel has going, and this account's stake in it.
+///
+/// Signed in where possible for the same reason the poll is: the stake only
+/// exists for somebody Kick can identify.
+pub async fn prediction_latest(
+    http: &reqwest::Client,
+    token: Option<&str>,
+    slug: &str,
+) -> Result<Option<(Prediction, Option<PredictionVote>)>> {
+    let body = prediction_call(http, token, &format!("/api/v2/channels/{slug}/predictions/latest"), None).await?;
+    Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
+}
+
+/// The predictions this channel has run before, newest first.
+pub async fn predictions_recent(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Result<Vec<Prediction>> {
+    #[derive(Deserialize)]
+    struct RecentEnvelope {
+        #[serde(default)]
+        data: Option<RecentData>,
+    }
+    #[derive(Deserialize)]
+    struct RecentData {
+        #[serde(default)]
+        predictions: Vec<Prediction>,
+    }
+    let url = format!("{API_ROOT}/api/v2/channels/{slug}/predictions/recent");
+    let mut req = http.get(&url).header("Accept", "application/json");
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await.context("asking Kick about past predictions")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about past predictions", res.status());
+    }
+    let body: RecentEnvelope = res.json().await.context("reading Kick's answer about past predictions")?;
+    Ok(body.data.map(|d| d.predictions).unwrap_or_default())
+}
+
+/// Puts points on an outcome.
+///
+/// Ten is Kick's own floor and the client says so before sending, because
+/// "amount must be at least 10" is a better answer than a refusal that
+/// arrives a round trip later.
+pub async fn vote_prediction(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    outcome_id: &str,
+    amount: i64,
+) -> Result<Option<(Prediction, Option<PredictionVote>)>> {
+    if amount < MIN_PREDICTION_BET {
+        bail!("Kick takes bets of {MIN_PREDICTION_BET} points or more");
+    }
+    let payload = serde_json::json!({ "amount": amount, "outcome_id": outcome_id });
+    let body = prediction_call(
+        http,
+        Some(token),
+        &format!("/api/v2/channels/{slug}/predictions/vote"),
+        Some(payload),
+    )
+    .await?;
+    Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
+}
+
+/// The smallest bet Kick accepts, which its own form enforces.
+pub const MIN_PREDICTION_BET: i64 = 10;
+
+/// This account's channel points in a channel, which is what a bet spends.
+pub async fn points(http: &reqwest::Client, token: &str, slug: &str) -> Result<i64> {
+    let res = http
+        .get(format!("{API_ROOT}/api/v2/channels/{slug}/points"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("asking Kick about this account's points")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about this account's points", res.status());
+    }
+    let body: PointsEnvelope = res.json().await.context("reading Kick's answer about points")?;
+    Ok(body.data.map(|d| d.points as i64).unwrap_or_default())
+}
+
+/// One request to the prediction endpoints, GET or POST, with Kick's own
+/// wording carried out of a refusal.
+async fn prediction_call(
+    http: &reqwest::Client,
+    token: Option<&str>,
+    path: &str,
+    payload: Option<serde_json::Value>,
+) -> Result<PredictionEnvelope> {
+    let url = format!("{API_ROOT}{path}");
+    let mut req = match &payload {
+        Some(body) => http.post(&url).json(body),
+        None => http.get(&url),
+    };
+    req = req.header("Accept", "application/json");
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await.context("asking Kick about the prediction")?;
+    let status = res.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        bail!("sign in to Kick from Accounts to bet on predictions");
+    }
+    // A channel that has never run one answers 404, which is an absence
+    // rather than a failure.
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(PredictionEnvelope { data: None });
+    }
+    let text = res.text().await.context("reading Kick's answer about the prediction")?;
+    if !status.is_success() {
+        // Kick words these well - "not enough points", "prediction is locked"
+        // - and its own words beat a status code every time.
+        let said = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["message"].as_str().map(|s| s.to_string()))
+            .filter(|s| !s.is_empty());
+        match said {
+            Some(said) => bail!("{said}"),
+            None => bail!("Kick answered {status} about the prediction"),
+        }
+    }
+    serde_json::from_str(&text).context("reading Kick's answer about the prediction")
 }

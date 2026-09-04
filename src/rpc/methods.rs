@@ -290,11 +290,21 @@ pub async fn dispatch(
                         "poll": card,
                     }));
                 }
-                if state.runtime.kick_channel(buffer_id).is_some() {
+                // Asked of the account rather than of the channel: a window
+                // restores the conversation it had open before the account
+                // has finished connecting, and a gate on the channel's own
+                // ids meant the poll and the prediction running right now
+                // were never asked about at all. The refreshers wait for the
+                // channel themselves.
+                if state.runtime.get_buffer(buffer_id).is_some_and(|b| b.account_id.starts_with("kick:")) {
                     let (state, buffer_id) = (state.clone(), buffer_id.to_string());
                     tokio::spawn(async move {
                         backend::kick::refresh_stream(&state, &buffer_id).await;
                         backend::kick::refresh_poll(&state, &buffer_id).await;
+                        // And the prediction, which carries two things no
+                        // broadcast does: what this account has riding on it
+                        // and what it has left to bet.
+                        backend::kick::refresh_prediction(&state, &buffer_id).await;
                     });
                 }
                 (Some(ok_node()), None)
@@ -2182,6 +2192,40 @@ pub async fn dispatch(
             match backend::kick::api::vote_poll(&http, &token, &channel.slug, option_id).await {
                 Ok(poll) => {
                     backend::kick::announce_poll(state, buffer_id, Some(&poll));
+                    (Some(ok_node()), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Points on an outcome. The answer carries the prediction with this
+        // bet in it, so the card redraws from the reply rather than waiting
+        // for the broadcast that follows.
+        "betPrediction" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("betPrediction requires \"bufferId\"".to_string()));
+            };
+            let Some(option_id) = p_str_opt(params, "optionId") else {
+                return (None, Some("betPrediction requires \"optionId\"".to_string()));
+            };
+            let amount = params.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let (http, token) = match kick_credential(state, &channel_account(state, buffer_id)) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::kick::api::vote_prediction(&http, &token, &channel.slug, option_id, amount).await {
+                Ok(answer) => {
+                    let points = backend::kick::api::points(&http, &token, &channel.slug).await.ok();
+                    match answer {
+                        Some((prediction, vote)) => {
+                            backend::kick::announce_prediction_card(state, buffer_id, &prediction, vote.as_ref(), points)
+                        }
+                        // Took the bet and said nothing useful about it: ask.
+                        None => backend::kick::refresh_prediction(state, buffer_id).await,
+                    }
                     (Some(ok_node()), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),

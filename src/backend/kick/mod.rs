@@ -672,6 +672,12 @@ async fn subscribe(socket: &mut Socket, chatroom_id: u64, channel_id: u64) -> Re
         format!("chatrooms.{chatroom_id}"),
         format!("chatroom_{chatroom_id}"),
         format!("channel.{channel_id}"),
+        // Predictions are broadcast nowhere near the chat: Kick's own viewer
+        // panel listens on this one, and this client heard none of them
+        // because it never asked. Named with hyphens rather than dots, which
+        // is a detail worth spelling out - the parser that reads a channel
+        // id back out of a subscription has to know both shapes.
+        format!("predictions-channel-{channel_id}"),
     ] {
         socket
             .send(WsMessage::Text(
@@ -1103,72 +1109,168 @@ pub fn announce_prediction_gone(state: &AppState, buffer_id: &str) {
 }
 
 /// The same for a prediction, which is a poll with money on it.
-///
-/// Read tolerantly on purpose: Kick's prediction payload is not documented
-/// and this backend has had no chance to see a real one, so every field is
-/// looked for in the two or three places it could plausibly sit and left out
-/// where it is not found. A card missing its odds is worth more than no card.
 pub fn announce_prediction(state: &AppState, buffer_id: &str, payload: &serde_json::Value) {
-    publish_card(state, buffer_id, "prediction", prediction_card(state, buffer_id, payload));
+    // Kick sends the whole prediction on its own broadcast channel, in the
+    // same shape its REST endpoints answer with - so one parser reads both.
+    let found = serde_json::from_value::<api::Prediction>(payload.get("prediction").unwrap_or(payload).clone());
+    let prediction = match found {
+        Ok(prediction) => prediction,
+        Err(e) => {
+            tracing::debug!("kick: prediction payload not understood: {e}");
+            return;
+        }
+    };
+
+    // The broadcast carries the prediction and nothing about you: not your
+    // bet, not your points. Both were known a moment ago if this is the same
+    // prediction moving, so they are carried across rather than blanked -
+    // otherwise somebody else's bet would wipe yours off the card.
+    let known = state.runtime.kick_poll(buffer_id, "prediction");
+    let same = known
+        .as_ref()
+        .and_then(|card| card["id"].as_str().map(|id| id == format!("prediction:{}", prediction.id)))
+        .unwrap_or(false);
+    let mut vote = None;
+    let mut points = None;
+    if same {
+        if let Some(card) = known.as_ref() {
+            vote = card["votedOptionId"].as_str().map(|outcome| api::PredictionVote {
+                outcome_id: outcome.to_string(),
+                total_vote_amount: card["stake"].as_f64().unwrap_or_default(),
+            });
+            points = card["balance"].as_i64();
+        }
+    }
+    announce_prediction_card(state, buffer_id, &prediction, vote.as_ref(), points);
+
+    // A prediction this client has not seen before: ask once for the two
+    // things the broadcast cannot say. Once per prediction rather than once
+    // per bet, which is the difference between a request and a flood.
+    // Through the handle rather than `tokio::spawn`, because this is called
+    // from a plain function that the tests drive with no runtime under it -
+    // and a card that draws correctly in a test is worth more than a panic
+    // proving there was nowhere to send the request.
+    if !same {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (state, buffer_id) = (state.clone(), buffer_id.to_string());
+            runtime.spawn(async move { refresh_prediction(&state, &buffer_id).await });
+        }
+    }
 }
 
-/// A prediction in the shape the card reads, where the payload carries one.
-fn prediction_card(state: &AppState, buffer_id: &str, payload: &serde_json::Value) -> Option<serde_json::Value> {
-    let body = payload.get("prediction").unwrap_or(payload);
-    let text = |value: &serde_json::Value, keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| value.get(*k).and_then(|v| v.as_str()))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    };
-    let number = |value: &serde_json::Value, keys: &[&str]| -> Option<f64> {
-        keys.iter().find_map(|k| {
-            value.get(*k).and_then(|v| {
-                v.as_f64().or_else(|| v.as_str().and_then(|s| s.replace(',', "").parse().ok()))
-            })
-        })
-    };
-    let title = text(body, &["title", "question", "name"])?;
-    let outcomes = ["outcomes", "options", "choices"]
-        .iter()
-        .find_map(|k| body.get(*k).and_then(|v| v.as_array()))?;
+/// A prediction in the shape the card reads.
+///
+/// The two things the card cannot work out for itself are carried alongside:
+/// what this account has riding on it, and what it has left to bet with.
+pub fn announce_prediction_card(
+    state: &AppState,
+    buffer_id: &str,
+    prediction: &api::Prediction,
+    vote: Option<&api::PredictionVote>,
+    points: Option<i64>,
+) {
+    publish_card(state, buffer_id, "prediction", Some(prediction_card(prediction, vote, points)));
+}
 
-    let options: Vec<serde_json::Value> = outcomes
+/// The card, from Kick's own prediction object.
+fn prediction_card(
+    prediction: &api::Prediction,
+    vote: Option<&api::PredictionVote>,
+    points: Option<i64>,
+) -> serde_json::Value {
+    let open = prediction.state.eq_ignore_ascii_case("ACTIVE");
+    let started = prediction.created_at.as_deref().and_then(api::parse_kick_datetime);
+    // How long is left, from when it started rather than from when this
+    // arrived: a prediction event carries no clock of its own.
+    let remaining = match (open, started) {
+        (true, Some(started)) => {
+            let gone = now_secs().saturating_sub(started);
+            (prediction.duration as i64 - gone).max(0) as u32
+        }
+        (true, None) => prediction.duration,
+        // Locked, resolved or cancelled: the betting is over whatever the
+        // clock says.
+        _ => 0,
+    };
+    let staked: f64 = prediction.outcomes.iter().map(|o| o.total_vote_amount).sum();
+    let options: Vec<serde_json::Value> = prediction
+        .outcomes
         .iter()
-        .enumerate()
-        .map(|(index, outcome)| {
+        .map(|outcome| {
             serde_json::json!({
-                "id": number(outcome, &["id"]).map(|n| n as i64).unwrap_or(index as i64),
-                "label": text(outcome, &["title", "label", "name"]).unwrap_or_else(|| format!("Option {}", index + 1)),
-                // Points staked rather than votes, which is the same number
-                // in the same place on the card.
-                "votes": number(outcome, &["points", "total", "amount", "votes", "sum"]).unwrap_or(0.0),
-                "backers": number(outcome, &["users", "voters", "backers", "user_count"]),
-                "odds": text(outcome, &["odds", "return", "multiplier"]),
-                "winner": outcome.get("is_winner").and_then(|v| v.as_bool())
-                    .or_else(|| outcome.get("winner").and_then(|v| v.as_bool()))
-                    .unwrap_or(false),
+                "id": outcome.id,
+                "label": outcome.title,
+                // Points where a poll counts votes: the same bar, measuring
+                // the thing this service measures.
+                "votes": outcome.total_vote_amount,
+                "backers": outcome.vote_count,
+                // Kick's own page writes the rate this way rather than
+                // sending it as a phrase.
+                "odds": (outcome.return_rate > 0.0).then(|| format!("1:{:.1}", outcome.return_rate)),
+                "winner": prediction.winning_outcome_id.as_deref() == Some(outcome.id.as_str()),
             })
         })
         .collect();
 
-    let duration = number(body, &["duration", "lock_time", "seconds"]).unwrap_or(0.0) as u32;
-    let remaining = number(body, &["remaining", "seconds_remaining", "time_left"]).unwrap_or(0.0) as u32;
-    Some(serde_json::json!({
-        "bufferId": buffer_id,
+    // What this bet would come back as, at the rate the outcome is paying
+    // now. Kick shows the same number and marks it as an estimate while the
+    // betting is open, because every later bet moves it.
+    let your_return = vote.and_then(|vote| {
+        prediction
+            .outcomes
+            .iter()
+            .find(|o| o.id == vote.outcome_id)
+            .map(|o| vote.total_vote_amount * o.return_rate)
+    });
+
+    serde_json::json!({
         "kind": "prediction",
-        "id": card_id(state, buffer_id, "prediction", &title, duration, remaining),
-        "title": title,
+        // Kick names these, so the card takes its name rather than inventing
+        // one from the clock the way a poll has to.
+        "id": format!("prediction:{}", prediction.id),
+        "title": prediction.title,
         "options": options,
-        "duration": duration,
+        "duration": prediction.duration,
         "remaining": remaining,
         "resultDisplayDuration": 0,
-        "hasVoted": body.get("has_voted").and_then(|v| v.as_bool()).unwrap_or(false),
-        "votedOptionId": number(body, &["voted_option_id", "voted_outcome_id"]).map(|n| n as i64),
-        "total": number(body, &["total", "points", "points_contributed", "total_points"]),
-        "yourReturn": number(body, &["your_return", "return", "payout"]),
-        "state": text(body, &["state", "status"]),
-    }))
+        "hasVoted": vote.is_some(),
+        "votedOptionId": vote.map(|v| v.outcome_id.clone()),
+        "stake": vote.map(|v| v.total_vote_amount),
+        "total": staked,
+        "yourReturn": your_return,
+        "state": prediction.state,
+        "balance": points,
+        "minBet": api::MIN_PREDICTION_BET,
+    })
+}
+
+/// Reads the prediction a channel has going, for somebody opening it.
+///
+/// The events say when one starts and changes; this is how a window that
+/// arrives mid-way learns there is one at all - and the only place the two
+/// things the card cannot compute come from: this account's own bet, and the
+/// points it has left.
+pub async fn refresh_prediction(state: &AppState, buffer_id: &str) {
+    let Some(channel) = channel_when_ready(state, buffer_id).await else { return };
+    let Ok(http) = api::client() else { return };
+    let token = state
+        .runtime
+        .get_buffer(buffer_id)
+        .and_then(|b| state.accounts.get_kick(&b.account_id))
+        .and_then(|c| c.token)
+        .filter(|t| !t.is_empty());
+    match api::prediction_latest(&http, token.as_deref(), &channel.slug).await {
+        Ok(Some((prediction, vote))) => {
+            let points = match token.as_deref() {
+                Some(token) => api::points(&http, token, &channel.slug).await.ok(),
+                None => None,
+            };
+            announce_prediction_card(state, buffer_id, &prediction, vote.as_ref(), points);
+        }
+        // Nothing running, and nothing to show.
+        Ok(None) => publish_card(state, buffer_id, "prediction", None),
+        Err(e) => tracing::debug!("kick: reading {}'s prediction: {e:#}", channel.slug),
+    }
 }
 
 /// Stores a card, writes it down, and tells the client - or says it is gone.
@@ -1222,6 +1324,26 @@ pub fn card_is_current(card: &serde_json::Value) -> bool {
     now_secs() - as_of <= alive
 }
 
+/// The channel behind a conversation, waiting a little for it to arrive.
+///
+/// A window restores the conversation it had open before its account has
+/// finished connecting - which for Kick means before the channel's ids are
+/// known - so asking straight away is asking too early. Every caller here is
+/// already running in the background, and the alternative to waiting is a
+/// poll or a prediction that is running right now and shows up nowhere until
+/// something else changes.
+async fn channel_when_ready(state: &AppState, buffer_id: &str) -> Option<crate::runtime::KickChannel> {
+    for wait in [0, 3, 8, 20] {
+        if wait > 0 {
+            tokio::time::sleep(Duration::from_secs(wait)).await;
+        }
+        if let Some(channel) = state.runtime.kick_channel(buffer_id) {
+            return Some(channel);
+        }
+    }
+    None
+}
+
 /// The wall clock, in seconds, as everything here writes it down.
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
@@ -1254,7 +1376,7 @@ fn card_id(state: &AppState, buffer_id: &str, kind: &str, title: &str, duration:
 /// minute and a chat is opened at any moment in it - and the events only tell
 /// you about the ones that change while you are watching.
 pub async fn refresh_poll(state: &AppState, buffer_id: &str) {
-    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
+    let Some(channel) = channel_when_ready(state, buffer_id).await else { return };
     let Ok(http) = api::client() else { return };
     let token = state
         .runtime
@@ -1705,6 +1827,9 @@ fn id_in_subscription(name: &str) -> Option<Subscribed> {
     if let Some(rest) = name.strip_prefix("channel.") {
         return rest.split('.').next()?.parse().ok().map(Subscribed::Channel);
     }
+    if let Some(rest) = name.strip_prefix("predictions-channel-") {
+        return rest.parse().ok().map(Subscribed::Channel);
+    }
     None
 }
 
@@ -1839,54 +1964,90 @@ mod tests {
         assert!(!card_is_current(&serde_json::json!({ "remaining": 60 })));
     }
 
-    /// A prediction lands on the same card a poll does, from a payload this
-    /// backend has never been shown - so the parser looks for each field in
-    /// the places it could plausibly sit and leaves out what it cannot find.
+    /// The card is built from Kick's own prediction object, copied field
+    /// for field off the endpoint its viewer panel reads - ULID ids, points
+    /// where a poll counts votes, and a payout rate rather than a phrase.
     #[test]
     fn a_prediction_becomes_the_same_card_a_poll_does() {
         let state = simulated_daemon("prediction-card");
         let buffer_id = crate::model::buffer_id("kick:tester", "odablock");
         announce_prediction(&state, &buffer_id, &serde_json::json!({
             "prediction": {
+                "id": "01M1PQXD465ZFG2RJJ2FE4166R",
+                "channel_id": 54194893,
                 "title": "who will win?",
-                "duration": 120,
-                "remaining": 45,
-                "total": 36875,
-                "status": "open",
                 "outcomes": [
-                    { "id": 1, "title": "guy (mike)", "points": 23800, "odds": "1:1.5", "users": 12 },
-                    { "id": 2, "title": "dude (brandon)", "points": 13100, "odds": "1:2.8", "is_winner": true }
-                ]
+                    { "id": "OUT1", "title": "guy (mike)", "total_vote_amount": 23800, "vote_count": 12, "return_rate": 1.5 },
+                    { "id": "OUT2", "title": "dude (brandon)", "total_vote_amount": 13100, "vote_count": 7, "return_rate": 2.8 }
+                ],
+                "duration": 120,
+                "created_at": "2026-09-04T17:36:55Z",
+                "state": "RESOLVED",
+                "winning_outcome_id": "OUT2"
             }
         }));
         let card = state.runtime.kick_poll(&buffer_id, "prediction").expect("a card");
         assert_eq!(card["kind"], "prediction");
+        assert_eq!(card["id"], "prediction:01M1PQXD465ZFG2RJJ2FE4166R");
         assert_eq!(card["title"], "who will win?");
-        assert_eq!(card["total"], 36875.0);
-        assert_eq!(card["remaining"], 45);
+        assert_eq!(card["total"], 36900.0);
         assert_eq!(card["options"][0]["label"], "guy (mike)");
         assert_eq!(card["options"][0]["votes"], 23800.0);
+        assert_eq!(card["options"][0]["backers"], 12);
         assert_eq!(card["options"][0]["odds"], "1:1.5");
         assert_eq!(card["options"][1]["winner"], true);
+        // Resolved, so nothing is left to bet on however long it ran.
+        assert_eq!(card["remaining"], 0);
 
-        // And it is written down, so it can be read back after a restart.
         let kept = state.store.live_cards(&buffer_id, "prediction", 10).expect("history");
         assert_eq!(kept.len(), 1);
         assert!(kept[0].0.contains("who will win?"));
     }
 
-    /// Nothing recognisable is no card at all, rather than an empty one: a
-    /// prediction card with no question and no outcomes says nothing and
-    /// takes the top of the chat to say it.
+    /// What this account has on it, and what it stands to get back - the two
+    /// things no broadcast carries and the card cannot work out alone.
     #[test]
-    fn a_payload_that_is_not_a_prediction_makes_no_card() {
-        let state = simulated_daemon("prediction-nonsense");
+    fn a_bet_of_your_own_shows_what_it_would_return() {
+        let state = simulated_daemon("prediction-bet");
         let buffer_id = crate::model::buffer_id("kick:tester", "odablock");
-        announce_prediction(&state, &buffer_id, &serde_json::json!({ "something": "else" }));
-        assert!(state.runtime.kick_poll(&buffer_id, "prediction").is_none());
+        let prediction = api::Prediction {
+            id: "P1".into(),
+            title: "who will win?".into(),
+            outcomes: vec![api::PredictionOutcome {
+                id: "OUT1".into(),
+                title: "guy".into(),
+                total_vote_amount: 500.0,
+                vote_count: 2,
+                return_rate: 2.0,
+            }],
+            duration: 120,
+            created_at: None,
+            state: "ACTIVE".into(),
+            winning_outcome_id: None,
+        };
+        let vote = api::PredictionVote { outcome_id: "OUT1".into(), total_vote_amount: 250.0 };
+        announce_prediction_card(&state, &buffer_id, &prediction, Some(&vote), Some(9_000));
+        let card = state.runtime.kick_poll(&buffer_id, "prediction").expect("a card");
+        assert_eq!(card["hasVoted"], true);
+        assert_eq!(card["votedOptionId"], "OUT1");
+        assert_eq!(card["stake"], 250.0);
+        assert_eq!(card["yourReturn"], 500.0);
+        assert_eq!(card["balance"], 9_000);
+        assert_eq!(card["minBet"], 10);
     }
 
-    /// A poll is one thing happening over a minute, not a stream of events -
+    /// Predictions arrive on a broadcast channel of their own, named with
+    /// hyphens where the chat's are named with dots. Reading the channel id
+    /// back out of it is what tells the card which conversation it belongs
+    /// to - and getting it wrong is how a prediction goes unnoticed.
+    #[test]
+    fn a_prediction_subscription_names_its_channel() {
+        assert!(matches!(id_in_subscription("predictions-channel-54194893"), Some(Subscribed::Channel(54194893))));
+        assert!(matches!(id_in_subscription("channel.54194893"), Some(Subscribed::Channel(54194893))));
+        assert!(matches!(id_in_subscription("chatrooms.53906513.v2"), Some(Subscribed::Chatroom(53906513))));
+    }
+
+    /// A poll is one thing happening over a minute    /// A poll is one thing happening over a minute, not a stream of events -
     /// Kick sends its update on every vote, and a line each would bury the
     /// conversation the poll is about.
     #[test]
