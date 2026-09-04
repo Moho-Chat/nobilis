@@ -83,6 +83,59 @@ pub async fn delete_device(state: &AppState, account_id: &str, device_id: &str, 
     Ok(())
 }
 
+/// Where this account stands on cross-signing.
+///
+/// Three separate questions, and the client needs all three to say anything
+/// useful: whether an identity exists at all, whether this device holds the
+/// private keys that identity is made of, and whether this device has been
+/// signed by it. A client holding no keys can still be *verified by* another
+/// session; a client holding all three can verify anybody.
+pub async fn cross_signing_status(state: &AppState, account_id: &str) -> Result<serde_json::Value> {
+    let (config, session) = account_session(state, account_id).await?;
+    let own_user_id = UserId::parse(&config.user_id).context("invalid own user_id")?;
+    let status = session.cross_signing_status().await;
+    let identity = session.machine.get_identity(&own_user_id, None).await.ok().flatten();
+    let own_device = session
+        .machine
+        .get_device(&own_user_id, session.machine.device_id(), None)
+        .await
+        .ok()
+        .flatten();
+    Ok(serde_json::json!({
+        "accountId": account_id,
+        // Published on the homeserver, by this client or any other.
+        "hasIdentity": identity.is_some(),
+        "hasMaster": status.has_master,
+        // What this device can do: sign your own devices, and sign other
+        // people.
+        "canSignDevices": status.has_self_signing,
+        "canSignOthers": status.has_user_signing,
+        // Whether this session itself is signed by that identity, which is
+        // what every other client draws its shield from.
+        "thisDeviceSigned": own_device.map(|d| d.is_cross_signed_by_owner()).unwrap_or(false),
+        // A password is what the homeserver asks for before it will publish
+        // signing keys, and an account signed in by token has none stored.
+        "canBootstrap": !config.password.is_empty(),
+    }))
+}
+
+/// Creates this account's cross-signing identity, where it has none.
+pub async fn bootstrap_cross_signing(state: &AppState, account_id: &str, password: &str) -> Result<()> {
+    let (config, session) = account_session(state, account_id).await?;
+    let password = if password.is_empty() { config.password.clone() } else { password.to_string() };
+    if password.is_empty() {
+        bail!("your homeserver asks for your password before it will publish signing keys");
+    }
+    session
+        .bootstrap_cross_signing(&config.homeserver_url, &config.access_token, &config.user_id, &password)
+        .await?;
+    state.events.emit(
+        "matrixCrossSigning",
+        cross_signing_status(state, account_id).await.unwrap_or_else(|_| serde_json::json!({ "accountId": account_id })),
+    );
+    Ok(())
+}
+
 fn status_event(v: &ActiveVerification, state: &str) -> serde_json::Value {
     serde_json::json!({
         "accountId": v.account_id,
@@ -95,18 +148,28 @@ fn status_event(v: &ActiveVerification, state: &str) -> serde_json::Value {
 /// active verification per account for v1 - starting a new one cancels
 /// any existing one first (best-effort - a cancel failing to send doesn't
 /// block starting the new flow, it'll just time out on its own).
-pub async fn start_verification(state: &AppState, account_id: &str, device_id: &str) -> Result<String> {
+pub async fn start_verification(
+    state: &AppState,
+    account_id: &str,
+    user_id: Option<&str>,
+    device_id: &str,
+) -> Result<String> {
     let (config, session) = account_session(state, account_id).await?;
 
     for old_id in state.runtime.matrix_verification_ids_for_account(account_id) {
         let _ = cancel(state, account_id, &old_id).await;
     }
 
-    let own_user_id = UserId::parse(&config.user_id).context("invalid own user_id")?;
+    // Somebody else's device, or one of ours where none is named. The flow is
+    // the same either way - emoji over to-device events - and what differs is
+    // which key ends up signing the result: your self-signing key for your
+    // own devices, your user-signing key for anybody else's.
+    let whose = user_id.filter(|id| !id.is_empty()).unwrap_or(&config.user_id);
+    let whose_user_id = UserId::parse(whose).context("invalid user id")?;
     let device_id_ruma = <&DeviceId>::from(device_id);
     let device = session
         .machine
-        .get_device(&own_user_id, device_id_ruma, None)
+        .get_device(&whose_user_id, device_id_ruma, None)
         .await
         .context("get_device")?
         .with_context(|| format!("unknown device {device_id}"))?;
@@ -161,11 +224,28 @@ pub async fn confirm_sas(state: &AppState, account_id: &str, verification_id: &s
     let sas = v.sas.clone().context("verification has not reached the emoji stage yet")?;
 
     if matches {
-        let (requests, _signature_upload) = sas.confirm().await.context("confirm")?;
+        let (requests, signature_upload) = sas.confirm().await.context("confirm")?;
         for req in requests {
             session.send_verification_request(&config.homeserver_url, &config.access_token, req).await.context("sending confirmation")?;
         }
+        // The half that makes it mean something anywhere else. Both sides
+        // agreeing is a private fact until this is published: without it a
+        // device verified here still reads as unverified in Element, which is
+        // exactly the complaint this path was written to answer.
+        if let Some(upload) = signature_upload {
+            session
+                .post_signatures(&config.homeserver_url, &config.access_token, &upload)
+                .await
+                .context("publishing the signature for this verification")?;
+        }
         if sas.is_done() {
+            // Now that the other session trusts this one, ask it for the
+            // cross-signing keys this client does not hold. Nothing to send
+            // and nothing to wait for: the answer arrives as a to-device
+            // secret through the sync loop already running.
+            if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
+                tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
+            }
             state.events.emit(
                 "matrixVerificationResult",
                 serde_json::json!({ "accountId": account_id, "verificationId": verification_id, "success": true }),
@@ -500,7 +580,7 @@ mod tests {
         let device_a_id = wait_for_device(&b.state, &b.account_id, &a.device_id).await;
         println!("A sees B's device: {device_b_id}\nB sees A's device: {device_a_id}");
 
-        let verification_id = start_verification(&a.state, &a.account_id, &device_b_id).await.expect("start_verification");
+        let verification_id = start_verification(&a.state, &a.account_id, None, &device_b_id).await.expect("start_verification");
         println!("A started verification {verification_id}");
 
         let mut b_saw_request = false;

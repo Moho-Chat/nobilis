@@ -164,6 +164,42 @@ pub async fn delete_with_password_uia(url: &str, token: &str, user_id: &str, pas
     handle_response(resp).await
 }
 
+/// The same dance for a POST.
+///
+/// Uploading cross-signing keys is user-interactive-auth gated exactly the way
+/// deleting a device is: the first attempt is refused with a 401 carrying a
+/// session, and the second one repeats the body with the password attached.
+/// The server decides which flows it accepts; a homeserver that will not take
+/// a password says so in its own words rather than being guessed at here.
+pub async fn post_with_password_uia(
+    url: &str,
+    token: &str,
+    user_id: &str,
+    password: &str,
+    body: Value,
+) -> Result<Value> {
+    let resp = http_client().post(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
+    if resp.status().as_u16() != 401 {
+        return handle_response(resp).await;
+    }
+    let challenge: Value = resp.json().await.context("invalid JSON response")?;
+    let session = challenge["session"].as_str().context("no UIA session in 401 response")?.to_string();
+    let mut authed = body;
+    if let Some(object) = authed.as_object_mut() {
+        object.insert(
+            "auth".to_string(),
+            serde_json::json!({
+                "type": "m.login.password",
+                "identifier": { "type": "m.id.user", "user": user_id },
+                "password": password,
+                "session": session,
+            }),
+        );
+    }
+    let resp = http_client().post(url).bearer_auth(token).json(&authed).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
 async fn handle_response(resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
     let body: Value = resp.json().await.context("invalid JSON response")?;

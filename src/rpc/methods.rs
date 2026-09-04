@@ -2392,12 +2392,34 @@ pub async fn dispatch(
             }
         }
 
+        // Where this account stands on cross-signing, and how to fix it.
+        "matrixCrossSigningStatus" => match p_str_opt(params, "accountId") {
+            None => (None, Some("matrixCrossSigningStatus requires \"accountId\"".to_string())),
+            Some(account_id) => match backend::matrix::verification::cross_signing_status(state, account_id).await {
+                Ok(status) => (Some(status), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+        },
+
+        // Creating the identity where there is none. Never a reset: replacing
+        // one un-verifies every device you have, everywhere, for everyone -
+        // not something a client should offer behind the same button.
+        "matrixBootstrapCrossSigning" => match p_str_opt(params, "accountId") {
+            None => (None, Some("matrixBootstrapCrossSigning requires \"accountId\"".to_string())),
+            Some(account_id) => {
+                match backend::matrix::verification::bootstrap_cross_signing(state, account_id, p_str(params, "password", "")).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                }
+            }
+        },
+
         "startMatrixVerification" => {
             let (account_id, device_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "deviceId")) {
                 (Some(a), Some(d)) => (a, d),
                 _ => return (None, Some("startMatrixVerification requires \"accountId\" and \"deviceId\"".to_string())),
             };
-            match backend::matrix::verification::start_verification(state, account_id, device_id).await {
+            match backend::matrix::verification::start_verification(state, account_id, p_str_opt(params, "userId"), device_id).await {
                 Ok(verification_id) => (Some(serde_json::json!({ "verificationId": verification_id })), None),
                 Err(e) => (None, Some(e.to_string())),
             }

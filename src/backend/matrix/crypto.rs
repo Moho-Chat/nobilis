@@ -39,7 +39,7 @@ use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
-use ruma_client_api::keys::{claim_keys, get_keys, upload_keys};
+use ruma_client_api::keys::{claim_keys, get_keys, upload_keys, upload_signatures};
 use ruma_client_api::sync::sync_events::DeviceLists;
 use ruma_client_api::to_device::send_event_to_device;
 use ruma_common::serde::Raw;
@@ -245,15 +245,133 @@ impl CryptoSession {
             AnyOutgoingRequest::ToDeviceRequest(req) => {
                 self.send_to_device_request(homeserver_url, access_token, request.request_id(), req).await?;
             }
-            // Signature upload / room message: never actually produced by
-            // anything this backend calls - session verification here is
-            // self-verification only (see verification.rs's module doc),
-            // which always resolves to a to-device request, never an
-            // in-room one, and this project's trust model doesn't upload
-            // cross-signing signatures (see this module's doc comment).
-            // Skip defensively rather than erroring.
+            // The signature that makes a verification mean something outside
+            // this client. Skipped here for a long time, which is why a
+            // device verified in moho still read as unverified in Element:
+            // the emoji matched, both sides agreed, and nobody ever told the
+            // homeserver.
+            AnyOutgoingRequest::SignatureUpload(req) => {
+                self.post_signatures(homeserver_url, access_token, req).await?;
+                let response = upload_signatures::v3::Response::new();
+                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(SignatureUpload)")?;
+            }
+            // A room message: only in-room verification produces one, which
+            // this backend does not do - it verifies over to-device events.
+            // Skipped defensively rather than erroring.
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Publishes signatures over somebody's keys.
+    ///
+    /// This is what a verification is *for*: having agreed that a device is
+    /// what it claims to be, this account signs it with its own cross-signing
+    /// key so every other client of yours, and everyone who trusts you, can
+    /// see that agreement without repeating it.
+    ///
+    /// Failures come back inside a 200 - per-key, per-user - and are reported
+    /// rather than swallowed: a signature the server rejected is a device
+    /// that will keep showing as unverified, and silence there is the bug
+    /// this whole path exists to fix.
+    pub async fn post_signatures(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        req: &upload_signatures::v3::Request,
+    ) -> Result<()> {
+        if req.signed_keys.is_empty() {
+            return Ok(());
+        }
+        let base = homeserver_url.trim_end_matches('/');
+        let body = serde_json::to_value(&req.signed_keys).context("serialising signatures")?;
+        let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/signatures/upload"), Some(access_token), body)
+            .await
+            .context("keys/signatures/upload")?;
+        if let Some(failures) = resp["failures"].as_object().filter(|f| !f.is_empty()) {
+            tracing::warn!("matrix: the homeserver refused some signatures: {failures:?}");
+        }
+        Ok(())
+    }
+
+    /// Whether this account holds each of the three cross-signing keys.
+    ///
+    /// The master key signs the other two; the self-signing key is what signs
+    /// your own devices; the user-signing key is what signs other people. A
+    /// client holding none of them can verify nothing beyond its own screen.
+    pub async fn cross_signing_status(&self) -> matrix_sdk_crypto::olm::CrossSigningStatus {
+        self.machine.cross_signing_status().await
+    }
+
+    /// Creates this account's cross-signing identity and publishes it.
+    ///
+    /// Only where there is none: `bootstrap_cross_signing(false)` uploads the
+    /// existing identity again rather than replacing it, and replacing one is
+    /// destructive in a way no client should do quietly - every device you
+    /// have verified anywhere becomes unverified, for everyone.
+    ///
+    /// Password-gated because the homeserver gates it: publishing signing keys
+    /// is user-interactive auth, the same as removing a device.
+    pub async fn bootstrap_cross_signing(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        user_id: &str,
+        password: &str,
+    ) -> Result<()> {
+        let base = homeserver_url.trim_end_matches('/');
+
+        // The guard that matters, and the reason this is not simply a call to
+        // the crate's own bootstrap: `bootstrap_cross_signing(false)` decides
+        // whether to create keys by looking at what *this* client holds, and
+        // an identity created by Element sits on the homeserver with its
+        // private half on Element's machine. This client holds nothing, so
+        // the crate would happily mint a second identity - and publishing
+        // that replaces the first, un-verifying every device the account has,
+        // everywhere, for everyone. The way back into an existing identity is
+        // to verify this session against one that holds the keys.
+        let own = UserId::parse(user_id).context("invalid own user id")?;
+        let published = self.machine.get_identity(&own, None).await.context("get_identity")?;
+        let held = self.machine.cross_signing_status().await;
+        if published.is_some() && !held.has_master {
+            anyhow::bail!(
+                "this account already has a cross-signing identity - verify this session against                  one that has the keys rather than replacing it"
+            );
+        }
+
+        let requests = self.machine.bootstrap_cross_signing(false).await.context("bootstrap_cross_signing")?;
+
+        // In the order the crate documents, which is the order the server
+        // needs: the device's own keys, then the signing keys, then the
+        // signatures that tie them together.
+        if let Some(upload) = &requests.upload_keys_req {
+            self.send_one(homeserver_url, access_token, upload).await.context("uploading device keys")?;
+        }
+
+        let mut body = serde_json::Map::new();
+        let keys = &requests.upload_signing_keys_req;
+        if let Some(master) = &keys.master_key {
+            body.insert("master_key".into(), serde_json::to_value(master)?);
+        }
+        if let Some(self_signing) = &keys.self_signing_key {
+            body.insert("self_signing_key".into(), serde_json::to_value(self_signing)?);
+        }
+        if let Some(user_signing) = &keys.user_signing_key {
+            body.insert("user_signing_key".into(), serde_json::to_value(user_signing)?);
+        }
+        http::post_with_password_uia(
+            &format!("{base}/_matrix/client/v3/keys/device_signing/upload"),
+            access_token,
+            user_id,
+            password,
+            serde_json::Value::Object(body),
+        )
+        .await
+        .context("publishing cross-signing keys")?;
+
+        self.post_signatures(homeserver_url, access_token, &requests.upload_signatures_req)
+            .await
+            .context("signing this device with the new identity")?;
         Ok(())
     }
 
