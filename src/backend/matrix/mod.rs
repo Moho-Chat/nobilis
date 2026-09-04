@@ -2363,6 +2363,82 @@ pub async fn create_room(
 ///
 /// Both are the same shape of call with a different type, and both are
 /// refused by the server if this account's power level is too low, which is
+/// The threads a room has, newest activity first.
+///
+/// A thread can be opened from its root message and continued, but a root
+/// that has scrolled past is unreachable without this: the room knows its
+/// threads and only the server can list them.
+///
+/// Each one carries what the panel needs to be worth opening - who started
+/// it, how many replies it has, whether this account has said anything in it
+/// - which is exactly what the server sends alongside the root event.
+pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    // Client v1, not v3: threads arrived after v3 was frozen, the same way
+    // /relations did.
+    //
+    // `include=all` is sent rather than left to the default, which the spec
+    // says is that anyway: Conduit's deserializer treats the parameter as
+    // required and answers M_BAD_JSON without it, so two of the four rooms
+    // tested here could not list their threads at all. Synapse accepts it
+    // either way, so saying it costs nothing and fixes a whole homeserver.
+    let url = format!(
+        "{base}/_matrix/client/v1/rooms/{encoded_room}/threads?include=all&limit={}",
+        limit.clamp(1, 100)
+    );
+    let resp = http::get_json(&url, &account.access_token).await.context("listing threads")?;
+
+    let session = state.runtime.get_matrix_machine(account_id);
+    let room = ruma_common::RoomId::parse(&room_id).ok();
+    let members = state.runtime.get_matrix_room_members(account_id, &room_id);
+    let mut threads = Vec::new();
+    for root in resp["chunk"].as_array().into_iter().flatten() {
+        let Some(root_id) = root["event_id"].as_str() else { continue };
+        let root = read_event(&session, room.as_deref(), root).await;
+        let sender = root["sender"].as_str().unwrap_or_default();
+        let relation = &root["unsigned"]["m.relations"]["m.thread"];
+        // The most recent reply, which is what somebody scanning a list of
+        // threads is actually looking at.
+        let latest = read_event(&session, room.as_deref(), &relation["latest_event"]).await;
+        let name_of = |user: &str| {
+            members.get(user).cloned().unwrap_or_else(|| protocol::mxid_localpart(user))
+        };
+        threads.push(serde_json::json!({
+            "rootId": root_id,
+            "from": name_of(sender),
+            "body": root["content"]["body"].as_str().unwrap_or("This message cannot be read here."),
+            "ts": root["origin_server_ts"].as_i64().unwrap_or_default() / 1000,
+            "replies": relation["count"].as_i64().unwrap_or(0),
+            // Whether this account has said anything in it - Element sorts
+            // its own list by this, and it is the difference between "a
+            // thread happened" and "a thread you are in happened".
+            "joined": relation["current_user_participated"].as_bool().unwrap_or(false),
+            "lastFrom": latest["sender"].as_str().map(|u| name_of(u)),
+            "lastBody": latest["content"]["body"].as_str(),
+            "lastTs": latest["origin_server_ts"].as_i64().map(|ms| ms / 1000),
+        }));
+    }
+    Ok(serde_json::json!({ "bufferId": buffer_id, "threads": threads, "next": resp["next_batch"].clone() }))
+}
+
+/// An event as text, decrypted where it needs to be and where this session
+/// can. Shared by the thread list and the pinned list, which both read events
+/// the sync loop never handed to a buffer.
+async fn read_event(session: &Option<std::sync::Arc<crypto::CryptoSession>>, room: Option<&ruma_common::RoomId>, event: &Value) -> Value {
+    if event["type"].as_str() != Some("m.room.encrypted") {
+        return event.clone();
+    }
+    if let (Some(session), Some(room)) = (session, room) {
+        if let Ok(plain) = crypto::decrypt_room_event(session, event, room).await {
+            return plain;
+        }
+    }
+    event.clone()
+}
+
 /// The messages a room has pinned, as messages rather than as ids.
 ///
 /// Looked up locally first, because most pins point at something this window
@@ -2660,6 +2736,76 @@ fn file_extension(path: &str) -> (String, String) {
 /// Uploads a local file to the homeserver's media repository and builds
 /// the corresponding `m.room.message` content (`m.image`/`m.video`/
 /// `m.audio`/`m.file`) - unencrypted rooms only, see
+/// Changes what this account is called, for everyone.
+///
+/// The homeserver's copy rather than the local rename beside it in the
+/// account panel: one is how moho refers to you and the other is what every
+/// room you are in shows. Both exist on purpose, and only this one leaves the
+/// machine.
+pub async fn set_own_display_name(state: &AppState, account_id: &str, name: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/profile/{}/displayname",
+        url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+    );
+    http::put_json(&url, &account.access_token, serde_json::json!({ "displayname": name }))
+        .await
+        .context("changing your display name")?;
+    Ok(())
+}
+
+/// Changes this account's picture, for everyone.
+///
+/// Uploaded unencrypted on purpose, unlike an attachment: a profile picture
+/// is shown to anybody who can see the account at all, including in rooms
+/// this client has never been in, and there is nobody to share a key with.
+pub async fn set_own_avatar(state: &AppState, account_id: &str, path: &str) -> Result<String> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let bytes = tokio::fs::read(path).await.context("reading the picture")?;
+    let (filename, ext) = file_extension(path);
+    let (_msgtype, mime) = media_msgtype_and_mime(&ext);
+    let upload_url = format!(
+        "{base}/_matrix/media/v3/upload?filename={}",
+        url::form_urlencoded::byte_serialize(filename.as_bytes()).collect::<String>()
+    );
+    let resp = http_client_post_bytes(&upload_url, &account.access_token, mime, bytes)
+        .await
+        .context("uploading the picture")?;
+    let content_uri = resp["content_uri"].as_str().context("the server took the picture but did not say where")?;
+
+    let url = format!(
+        "{base}/_matrix/client/v3/profile/{}/avatar_url",
+        url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+    );
+    http::put_json(&url, &account.access_token, serde_json::json!({ "avatar_url": content_uri }))
+        .await
+        .context("setting your picture")?;
+    Ok(content_uri.to_string())
+}
+
+/// What the homeserver currently says this account is called and looks like.
+pub async fn own_profile(state: &AppState, account_id: &str) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/profile/{}",
+        url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+    );
+    let profile = http::get_json(&url, &account.access_token).await.context("reading your profile")?;
+    let avatar = match profile["avatar_url"].as_str() {
+        Some(mxc) => cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await,
+        None => None,
+    };
+    Ok(serde_json::json!({
+        "accountId": account_id,
+        "userId": account.user_id,
+        "displayName": profile["displayname"].as_str().unwrap_or_default(),
+        "avatarUrl": avatar,
+    }))
+}
+
 /// upload_encrypted_media_message for the E2EE counterpart.
 async fn upload_media_message(base: &str, access_token: &str, path: &str, body: &str) -> Result<Value> {
     let bytes = tokio::fs::read(path).await.context("reading attachment")?;

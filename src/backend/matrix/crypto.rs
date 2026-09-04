@@ -49,6 +49,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tokio::sync::Mutex as AsyncMutex;
 
+/// PBKDF2 rounds for a key export, matching what Element writes.
+const EXPORT_ROUNDS: u32 = 500_000;
+
 pub fn decryption_settings() -> DecryptionSettings {
     DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted }
 }
@@ -373,6 +376,47 @@ impl CryptoSession {
             .await
             .context("signing this device with the new identity")?;
         Ok(())
+    }
+
+    /// Writes every room key this session holds into Element's own encrypted
+    /// export format.
+    ///
+    /// The point of a file, next to the server-side backup already here, is
+    /// that it does not depend on the homeserver being up or reachable - it
+    /// is how history moves to a client that cannot see the backup, and how
+    /// somebody keeps a copy of their own.
+    ///
+    /// The passphrase is the whole of the protection: the file is readable by
+    /// anybody who has it and the words, and by nobody else.
+    pub async fn export_room_keys(&self, passphrase: &str) -> Result<(String, usize)> {
+        if passphrase.is_empty() {
+            anyhow::bail!("an export with no passphrase is a plain copy of your keys - choose one");
+        }
+        let keys = self.machine.store().export_room_keys(|_| true).await.context("reading this session's room keys")?;
+        let count = keys.len();
+        // The same work factor Element writes, so a file from here costs an
+        // attacker what a file from there does.
+        let text = matrix_sdk_crypto::encrypt_room_key_export(&keys, passphrase, EXPORT_ROUNDS)
+            .context("encrypting the export")?;
+        Ok((text, count))
+    }
+
+    /// Reads one back in.
+    ///
+    /// Returns how many keys the file held and how many were new, because
+    /// those are different numbers and the second is the one that answers
+    /// "did that do anything".
+    pub async fn import_room_keys(&self, text: &str, passphrase: &str) -> Result<(usize, usize)> {
+        let keys = matrix_sdk_crypto::decrypt_room_key_export(std::io::Cursor::new(text), passphrase)
+            .map_err(|e| anyhow::anyhow!("that file would not open - wrong passphrase, or not a key export ({e})"))?;
+        let total = keys.len();
+        let result = self
+            .machine
+            .store()
+            .import_exported_room_keys(keys, |_, _| {})
+            .await
+            .context("importing the keys")?;
+        Ok((result.imported_count, total))
     }
 
     /// Sends a `/keys/claim` request and feeds the response back in.

@@ -1013,6 +1013,75 @@ pub async fn dispatch(
             }
         }
 
+        // A copy of this session's room keys, in Element's own encrypted
+        // format - the one that does not depend on the homeserver being up.
+        "exportMatrixKeys" => {
+            let (account_id, path) = match (p_str_opt(params, "accountId"), p_str_opt(params, "path")) {
+                (Some(a), Some(p)) => (a, p),
+                _ => return (None, Some("exportMatrixKeys requires \"accountId\" and \"path\"".to_string())),
+            };
+            let Some(session) = state.runtime.get_matrix_machine(account_id) else {
+                return (None, Some("account is not connected".to_string()));
+            };
+            match session.export_room_keys(p_str(params, "passphrase", "")).await {
+                Ok((text, count)) => match tokio::fs::write(path, text).await {
+                    Ok(()) => (Some(serde_json::json!({ "keys": count, "path": path })), None),
+                    Err(e) => (None, Some(format!("could not write the file: {e}"))),
+                },
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "importMatrixKeys" => {
+            let (account_id, path) = match (p_str_opt(params, "accountId"), p_str_opt(params, "path")) {
+                (Some(a), Some(p)) => (a, p),
+                _ => return (None, Some("importMatrixKeys requires \"accountId\" and \"path\"".to_string())),
+            };
+            let Some(session) = state.runtime.get_matrix_machine(account_id) else {
+                return (None, Some("account is not connected".to_string()));
+            };
+            let text = match tokio::fs::read_to_string(path).await {
+                Ok(text) => text,
+                Err(e) => return (None, Some(format!("could not read the file: {e}"))),
+            };
+            match session.import_room_keys(&text, p_str(params, "passphrase", "")).await {
+                Ok((imported, total)) => (Some(serde_json::json!({ "imported": imported, "total": total })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // What the homeserver says this account is called and looks like -
+        // which is a different question from the local rename beside it in
+        // the account panel, and the only one anybody else can see.
+        "matrixOwnProfile" => match p_str_opt(params, "accountId") {
+            None => (None, Some("matrixOwnProfile requires \"accountId\"".to_string())),
+            Some(account_id) => match backend::matrix::own_profile(state, account_id).await {
+                Ok(profile) => (Some(profile), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+        },
+
+        "setMatrixProfileName" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setMatrixProfileName requires \"accountId\"".to_string()));
+            };
+            match backend::matrix::set_own_display_name(state, account_id, p_str(params, "name", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "setMatrixProfileAvatar" => {
+            let (account_id, path) = match (p_str_opt(params, "accountId"), p_str_opt(params, "path")) {
+                (Some(a), Some(p)) => (a, p),
+                _ => return (None, Some("setMatrixProfileAvatar requires \"accountId\" and \"path\"".to_string())),
+            };
+            match backend::matrix::set_own_avatar(state, account_id, path).await {
+                Ok(url) => (Some(serde_json::json!({ "avatarUrl": url })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Who this account has asked never to hear from. The account's own
         // list, so it agrees with Element and travels to every client.
         "listMatrixIgnored" => match p_str_opt(params, "accountId") {
@@ -1032,6 +1101,25 @@ pub async fn dispatch(
             let ignored = params.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
             match backend::matrix::set_ignored_user(state, account_id, user_id, ignored).await {
                 Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Which conversations a room has going on beside the main one.
+        //
+        // From the server rather than from scrollback: a thread whose root
+        // has scrolled past is unreachable otherwise, which is exactly the
+        // thread somebody is looking for.
+        "listMatrixThreads" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixThreads requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let limit = p_i64(params, "limit", 25).clamp(1, 100) as u32;
+            match backend::matrix::list_threads(state, &buffer.account_id, buffer_id, limit).await {
+                Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
