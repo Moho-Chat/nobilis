@@ -2276,6 +2276,108 @@ pub async fn create_room(
 ///
 /// Both are the same shape of call with a different type, and both are
 /// refused by the server if this account's power level is too low, which is
+/// The messages a room has pinned, as messages rather than as ids.
+///
+/// Looked up locally first, because most pins point at something this window
+/// already has; anything else is fetched from the server and decrypted the
+/// same way a scrollback message is. A pin whose message is gone is still
+/// listed - the room is saying something is pinned, and silently dropping it
+/// would be this client disagreeing with every other one.
+pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let session = state.runtime.get_matrix_machine(account_id);
+    let room = ruma_common::RoomId::parse(&room_id).ok();
+
+    let mut out = Vec::new();
+    for event_id in state.runtime.get_matrix_pinned(account_id, &room_id) {
+        if let Ok(Some(message)) = state.store.get_message(buffer_id, &event_id) {
+            out.push(serde_json::to_value(message)?);
+            continue;
+        }
+        let url = format!(
+            "{base}/_matrix/client/v3/rooms/{encoded_room}/event/{}",
+            url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
+        );
+        let mut event = match http::get_json(&url, &account.access_token).await {
+            Ok(event) => event,
+            Err(e) => {
+                tracing::debug!("matrix: pinned event {event_id} could not be read: {e:#}");
+                out.push(serde_json::json!({
+                    "id": event_id,
+                    "bufferId": buffer_id,
+                    "from": "",
+                    "body": "This pinned message is no longer available.",
+                    "ts": 0,
+                    "kind": "system",
+                }));
+                continue;
+            }
+        };
+        if event["type"].as_str() == Some("m.room.encrypted") {
+            if let (Some(session), Some(room)) = (&session, &room) {
+                match crypto::decrypt_room_event(session, &event, room).await {
+                    Ok(plain) => event = plain,
+                    Err(e) => tracing::debug!("matrix: pinned event {event_id} would not decrypt: {e:#}"),
+                }
+            }
+        }
+        let sender = event["sender"].as_str().unwrap_or_default();
+        out.push(serde_json::json!({
+            "id": event_id,
+            "bufferId": buffer_id,
+            "from": state
+                .runtime
+                .get_matrix_room_members(account_id, &room_id)
+                .get(sender)
+                .cloned()
+                .unwrap_or_else(|| protocol::mxid_localpart(sender)),
+            "body": event["content"]["body"].as_str().unwrap_or("This pinned message cannot be read here."),
+            "ts": event["origin_server_ts"].as_i64().unwrap_or_default() / 1000,
+            "kind": "chat",
+        }));
+    }
+    Ok(serde_json::json!({ "bufferId": buffer_id, "pinned": out }))
+}
+
+/// Pins a message, or takes the pin off.
+///
+/// The list is read back from the server before it is written rather than
+/// taken from this client's copy: pinning is a whole-list replacement, and
+/// writing a stale list would unpin whatever somebody else pinned while this
+/// window was not looking. Whether this account may do it at all is the
+/// server's decision, and its refusal is reported in its own words.
+pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str, pinned: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+
+    let url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.pinned_events/");
+    // A room that has never pinned anything has no such state event at all,
+    // which is a 404 and an empty list rather than a failure.
+    let current: Vec<String> = match http::get_json(&url, &account.access_token).await {
+        Ok(content) => content["pinned"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(|id| id.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+
+    let mut next: Vec<String> = current.into_iter().filter(|id| id != event_id).collect();
+    if pinned {
+        next.push(event_id.to_string());
+    }
+    set_room_state(state, account_id, buffer_id, "m.room.pinned_events", serde_json::json!({ "pinned": next })).await?;
+    // Locally too, so the list is right before the next sync arrives.
+    state.runtime.set_matrix_pinned(account_id, &room_id, next.clone());
+    state.events.emit("matrixPinned", serde_json::json!({ "bufferId": buffer_id, "pinned": next }));
+    Ok(())
+}
+
+
 /// where that question belongs.
 pub async fn set_room_state(
     state: &AppState,

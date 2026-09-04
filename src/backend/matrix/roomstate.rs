@@ -38,6 +38,23 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             "m.room.power_levels" => {
                 state.runtime.set_matrix_power_levels(account_id, room_id, event["content"].clone());
             }
+            // What the room has told everyone to read first. Ids only: the
+            // messages themselves are looked up when somebody asks to see
+            // them, because a pin can point at something said years before
+            // this client ever joined.
+            "m.room.pinned_events" => {
+                let pinned: Vec<String> = event["content"]["pinned"]
+                    .as_array()
+                    .map(|ids| ids.iter().filter_map(|id| id.as_str().map(|s| s.to_string())).collect())
+                    .unwrap_or_default();
+                state.runtime.set_matrix_pinned(account_id, room_id, pinned.clone());
+                if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
+                    state.events.emit(
+                        "matrixPinned",
+                        serde_json::json!({ "bufferId": buffer_id, "pinned": pinned }),
+                    );
+                }
+            }
             "m.room.avatar" => {
                 if let Some(mxc) = event["content"]["url"].as_str() {
                     if let Some(path) = cached_media_path(homeserver_url, access_token, mxc, "").await {

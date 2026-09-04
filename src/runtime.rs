@@ -546,6 +546,12 @@ pub struct Runtime {
     /// this is advisory/UI-gating only, an unauthorized action would be
     /// rejected server-side regardless of what's cached here.
     matrix_power_levels: Mutex<HashMap<(String, String), Value>>,
+    /// The event ids a room has pinned, by account and room.
+    ///
+    /// The ids only: what those events *say* lives in scrollback or on the
+    /// server, and a pin outliving the message it points at is a normal state
+    /// rather than a broken one.
+    matrix_pinned: Mutex<HashMap<(String, String), Vec<String>>>,
     /// Matrix-specific: (account id, room id) -> {user id -> display name}
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
@@ -766,6 +772,7 @@ impl Runtime {
             matrix_member_avatars: Mutex::new(HashMap::new()),
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
+            matrix_pinned: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
             matrix_upgrades: Mutex::new(Vec::new()),
@@ -2184,6 +2191,19 @@ impl Runtime {
 
     pub fn set_matrix_power_levels(&self, account_id: &str, room_id: &str, content: Value) {
         self.matrix_power_levels.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), content);
+    }
+
+    pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {
+        self.matrix_pinned.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), events);
+    }
+
+    pub fn get_matrix_pinned(&self, account_id: &str, room_id: &str) -> Vec<String> {
+        self.matrix_pinned
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn get_matrix_power_levels(&self, account_id: &str, room_id: &str) -> Option<Value> {

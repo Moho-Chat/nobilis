@@ -1013,6 +1013,37 @@ pub async fn dispatch(
             }
         }
 
+        // What a room has told everyone to read first.
+        "listMatrixPinned" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixPinned requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            match backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Pinning one, or taking the pin off. Whether this account may is the
+        // server's decision, and its refusal is passed through in its words.
+        "setMatrixPinned" => {
+            let (buffer_id, event_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "eventId")) {
+                (Some(b), Some(e)) => (b, e),
+                _ => return (None, Some("setMatrixPinned requires \"bufferId\" and \"eventId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let pinned = params.get("pinned").and_then(|v| v.as_bool()).unwrap_or(true);
+            match backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, event_id, pinned).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The same question asked of the homeserver rather than of this
         // window's own copy.
         //
