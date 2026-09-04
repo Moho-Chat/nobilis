@@ -145,13 +145,38 @@ struct UserJson {
 /// form they have seen it: with the URL still attached, with an @ in front
 /// because that is how handles work everywhere else, in the wrong case. All of
 /// those name the same channel, so all of them are accepted; see `normalise_slug`.
+/// How many times to wait and ask again when Kick says to slow down.
+const CHANNEL_RETRIES: usize = 3;
+
+/// How long Kick asked us to wait, where it said.
+fn retry_after(res: &reqwest::Response) -> Option<Duration> {
+    let said = res.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let seconds: u64 = said.trim().parse().ok()?;
+    // Capped: a client that obeys a ten-minute Retry-After during startup has
+    // hung, as far as anybody watching it can tell.
+    Some(Duration::from_secs(seconds.min(10)))
+}
+
 pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     let slug = normalise_slug(slug);
     if slug.is_empty() {
         bail!("that is not a Kick handle");
     }
     let url = format!("{API_ROOT}/api/v2/channels/{slug}");
-    let res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
+    // Kick rate-limits this endpoint, and connecting asks about every channel
+    // an account watches - so being told to wait is an ordinary part of
+    // starting up rather than a failure. Answered by waiting: a channel
+    // dropped here is a channel missing from the list until the next
+    // restart, which is a far worse outcome than a slower connect.
+    let mut res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
+    for attempt in 1..=CHANNEL_RETRIES {
+        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        let wait = retry_after(&res).unwrap_or(Duration::from_millis(750 * attempt as u64));
+        tokio::time::sleep(wait).await;
+        res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
+    }
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         bail!("there is no Kick channel called \"{slug}\"");
     }

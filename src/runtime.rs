@@ -2502,16 +2502,31 @@ impl Runtime {
         }
     }
 
-    pub fn set_kick_poll(&self, buffer_id: &str, poll: serde_json::Value) {
-        self.kick_polls.lock().unwrap().insert(buffer_id.to_string(), poll);
+    /// Keyed by kind as well as conversation: a channel can have a poll and
+    /// a prediction running at once, and they are two cards.
+    pub fn set_kick_poll(&self, buffer_id: &str, kind: &str, poll: serde_json::Value) {
+        self.kick_polls.lock().unwrap().insert(format!("{buffer_id}|{kind}"), poll);
     }
 
-    pub fn kick_poll(&self, buffer_id: &str) -> Option<serde_json::Value> {
-        self.kick_polls.lock().unwrap().get(buffer_id).cloned()
+    pub fn kick_poll(&self, buffer_id: &str, kind: &str) -> Option<serde_json::Value> {
+        self.kick_polls.lock().unwrap().get(&format!("{buffer_id}|{kind}")).cloned()
     }
 
-    pub fn forget_kick_poll(&self, buffer_id: &str) {
-        self.kick_polls.lock().unwrap().remove(buffer_id);
+    /// Every card running in a conversation, for a window that has just
+    /// opened it.
+    pub fn kick_polls_for(&self, buffer_id: &str) -> Vec<serde_json::Value> {
+        let prefix = format!("{buffer_id}|");
+        self.kick_polls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, card)| card.clone())
+            .collect()
+    }
+
+    pub fn forget_kick_poll(&self, buffer_id: &str, kind: &str) {
+        self.kick_polls.lock().unwrap().remove(&format!("{buffer_id}|{kind}"));
     }
 
     pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {

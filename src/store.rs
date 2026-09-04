@@ -70,7 +70,26 @@ impl Store {
                 error TEXT,
                 ts INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_transfers_ts ON transfers(ts);",
+            CREATE INDEX IF NOT EXISTS idx_transfers_ts ON transfers(ts);
+            /* Polls and predictions, kept so they can be read back after the
+               fact. The card on screen is a live thing, but what was voted
+               on last night outlives the minute the vote was open - and
+               outlives this process, which is why it is kept here rather
+               than in the runtime memory.
+
+               One row per card, replaced as the votes come in: card_id is
+               whatever the service uses to mean the same poll, or the moment
+               it started where the service names nothing. */
+            CREATE TABLE IF NOT EXISTS live_cards (
+                buffer_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                card_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                PRIMARY KEY (buffer_id, kind, card_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_live_cards_ts ON live_cards(buffer_id, ts);",
         )?;
         // Defensive no-ops for a scrollback.db predating these columns,
         // same as store.c's post-hoc ALTER TABLE. Ignore "duplicate column".
@@ -546,6 +565,32 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Writes a poll or prediction down, replacing the last state of it.
+    ///
+    /// The card on screen changes every few seconds while people vote; what
+    /// is kept is the latest of it, so what is read back afterwards is how it
+    /// finished rather than how it opened.
+    pub fn record_live_card(&self, buffer_id: &str, kind: &str, card_id: &str, title: &str, body: &str, ts: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO live_cards (buffer_id, kind, card_id, title, body, ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(buffer_id, kind, card_id) DO UPDATE SET title = ?4, body = ?5",
+            params![buffer_id, kind, card_id, title, body, ts],
+        )?;
+        Ok(())
+    }
+
+    /// The polls or predictions this conversation has seen, newest first.
+    pub fn live_cards(&self, buffer_id: &str, kind: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT body, ts FROM live_cards WHERE buffer_id = ?1 AND kind = ?2 ORDER BY ts DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, kind, limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     /// The transfers worth remembering, newest first.

@@ -52,6 +52,9 @@ fn pusher_url() -> String {
 pub enum Command {
     /// Watch a channel, by whatever the user typed as a handle.
     Join(String),
+    /// Try a channel Kick refused for the rate limit again, counting the
+    /// attempts so this cannot become a connection that asks forever.
+    Rejoin(String, u8),
     /// Stop watching one.
     Part(String),
 }
@@ -124,10 +127,29 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
 
 /// How many channels to resolve at once when connecting.
 ///
-/// Enough to make thirty channels feel immediate, well short of anything Kick
-/// would read as a burst - the whole point of the bulk poll elsewhere in this
-/// file is to stay a quiet client.
-const CONNECT_CONCURRENCY: usize = 8;
+/// How many times a rate-limited channel is asked for again before giving up.
+const REJOIN_ATTEMPTS: u8 = 3;
+
+/// Asks for a refused channel again, later, and further out each time.
+///
+/// Each attempt is its own task with its own wait, so thirty refusals do not
+/// become thirty simultaneous retries - which is the burst that caused them.
+fn retry_later(state: &AppState, account_id: &str, slug: String, attempt: u8) {
+    let Some(sender) = state.runtime.kick_sender(account_id) else { return };
+    tokio::spawn(async move {
+        // Well outside whatever window was exhausted, and staggered by the
+        // channel's own name so they do not all come back at once.
+        let stagger = (slug.len() % 7) as u64;
+        tokio::time::sleep(Duration::from_secs(20 * attempt as u64 + stagger)).await;
+        let _ = sender.send(Command::Rejoin(slug, attempt));
+    });
+}
+
+/// Measured, not guessed: eight at a time drew 429s from Kick on an account
+/// watching thirty channels, and the channels that were refused went missing
+/// from the list entirely. Four, with the retry in `api::channel` behind it,
+/// connects the same thirty in a few seconds and asks nothing twice.
+const CONNECT_CONCURRENCY: usize = 3;
 
 /// How many followed channels to open on a first connect.
 ///
@@ -265,6 +287,7 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
         .collect();
     let mut prepares = futures::stream::iter(queue).buffer_unordered(CONNECT_CONCURRENCY);
 
+    let mut refused = Vec::new();
     while let Some((slug, prepared)) = prepares.next().await {
         match prepared {
             Ok(channel) => {
@@ -276,12 +299,33 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
             // sessions, and that is this account's problem with one buffer
             // rather than with Kick.
             Err(e) => {
-                tracing::warn!("kick[{account_id}]: {slug}: {e:#}");
-                state.runtime.report_progress(state, account_id, &format!("{slug}: {e:#}"));
+                let words = format!("{e:#}");
+                tracing::warn!("kick[{account_id}]: {slug}: {words}");
+                // Being told to slow down is not the same as being told no.
+                // A channel refused for the rate limit is asked for again in
+                // a moment; without that it is simply missing from the list
+                // until the client is restarted, which is how an account
+                // watching thirty channels loses eight of them.
+                if words.contains("429") {
+                    refused.push(slug);
+                } else {
+                    state.runtime.report_progress(state, account_id, &format!("{slug}: {words}"));
+                }
             }
         }
     }
     drop(prepares);
+
+    if !refused.is_empty() {
+        state.runtime.report_progress(
+            state,
+            account_id,
+            &format!("Kick asked us to slow down - retrying {} channels", refused.len()),
+        );
+        for slug in refused {
+            retry_later(state, account_id, slug, 1);
+        }
+    }
 
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
@@ -315,6 +359,26 @@ async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> 
                             watched.add(&channel);
                         }
                         Err(e) => state.runtime.report_progress(state, account_id, &format!("{e:#}")),
+                    }
+                }
+                Some(Command::Rejoin(handle, attempt)) => {
+                    match prepare(state, &http, config, account_id, &handle).await {
+                        Ok(channel) => {
+                            subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
+                            watched.add(&channel);
+                        }
+                        Err(e) => {
+                            let words = format!("{e:#}");
+                            // Still being told to slow down: wait longer and
+                            // ask again, a few times, rather than leaving a
+                            // channel silently missing from the list for the
+                            // rest of the session.
+                            if words.contains("429") && attempt < REJOIN_ATTEMPTS {
+                                retry_later(state, account_id, handle, attempt + 1);
+                            } else {
+                                state.runtime.report_progress(state, account_id, &format!("{handle}: {words}"));
+                            }
+                        }
                     }
                 }
                 Some(Command::Part(slug)) => {
@@ -878,15 +942,22 @@ fn handle_event(
         // rather than something wrong if the shape is not what it expects.
         e if e.contains("Prediction") => {
             let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let buffer_id = crate::model::buffer_id(account_id, &slug);
             if e.ends_with("PredictionDeleteEvent") || e.ends_with("PredictionDeletedEvent") {
-                let buffer_id = crate::model::buffer_id(account_id, &slug);
                 let id = prediction_message_id(&slug, &payload);
                 if let Ok(Some(stored)) = state.store.get_message(&buffer_id, &id) {
                     let ended = stored.body.replacen("prediction:", "prediction closed:", 1);
                     state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
                 }
-            } else if let Some(line) = describe_prediction(&payload) {
-                live_line(state, account_id, &slug, &prediction_message_id(&slug, &payload), &line, "poll");
+                announce_prediction_gone(state, &buffer_id);
+            } else {
+                if let Some(line) = describe_prediction(&payload) {
+                    live_line(state, account_id, &slug, &prediction_message_id(&slug, &payload), &line, "poll");
+                }
+                // And the card, which is the same card a poll gets: the two
+                // are one question with a set of answers, and the money is a
+                // column rather than a different idea.
+                announce_prediction(state, &buffer_id, &payload);
             }
         }
 
@@ -1003,35 +1074,152 @@ fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, fo
 /// has to leave the screen, and a client that only ever heard about polls
 /// starting would keep showing one that ended an hour ago.
 pub fn announce_poll(state: &AppState, buffer_id: &str, poll: Option<&api::Poll>) {
-    let value = match poll {
-        None => serde_json::json!({ "bufferId": buffer_id, "poll": serde_json::Value::Null }),
-        Some(poll) => serde_json::json!({
+    let card = poll.map(|poll| {
+        serde_json::json!({
             "bufferId": buffer_id,
-            "poll": {
-                "title": poll.title,
-                "options": poll.options.iter().map(|o| serde_json::json!({
-                    "id": o.id,
-                    "label": o.label,
-                    "votes": o.votes,
-                })).collect::<Vec<_>>(),
-                "duration": poll.duration,
-                // Seconds left when this was written. The client counts down
-                // from it rather than asking Kick every second.
-                "remaining": poll.remaining,
-                "resultDisplayDuration": poll.result_display_duration,
-                "hasVoted": poll.has_voted,
-                "votedOptionId": poll.voted_option_id,
-            }
-        }),
-    };
-    match poll {
-        None => state.runtime.forget_kick_poll(buffer_id),
-        Some(_) => state.runtime.set_kick_poll(buffer_id, value.clone()),
-    }
-    state.events.emit("kickPoll", value);
+            "kind": "poll",
+            "id": card_id(state, buffer_id, "poll", &poll.title, poll.duration, poll.remaining),
+            "title": poll.title,
+            "options": poll.options.iter().map(|o| serde_json::json!({
+                "id": o.id,
+                "label": o.label,
+                "votes": o.votes,
+            })).collect::<Vec<_>>(),
+            "duration": poll.duration,
+            // Seconds left when this was written. The client counts down from
+            // it rather than asking Kick every second.
+            "remaining": poll.remaining,
+            "resultDisplayDuration": poll.result_display_duration,
+            "hasVoted": poll.has_voted,
+            "votedOptionId": poll.voted_option_id,
+        })
+    });
+    publish_card(state, buffer_id, "poll", card);
 }
 
-/// Reads the poll a channel has running, for somebody who has just opened it.
+/// Says the prediction is over, so the card stops offering to back it.
+pub fn announce_prediction_gone(state: &AppState, buffer_id: &str) {
+    publish_card(state, buffer_id, "prediction", None);
+}
+
+/// The same for a prediction, which is a poll with money on it.
+///
+/// Read tolerantly on purpose: Kick's prediction payload is not documented
+/// and this backend has had no chance to see a real one, so every field is
+/// looked for in the two or three places it could plausibly sit and left out
+/// where it is not found. A card missing its odds is worth more than no card.
+pub fn announce_prediction(state: &AppState, buffer_id: &str, payload: &serde_json::Value) {
+    publish_card(state, buffer_id, "prediction", prediction_card(state, buffer_id, payload));
+}
+
+/// A prediction in the shape the card reads, where the payload carries one.
+fn prediction_card(state: &AppState, buffer_id: &str, payload: &serde_json::Value) -> Option<serde_json::Value> {
+    let body = payload.get("prediction").unwrap_or(payload);
+    let text = |value: &serde_json::Value, keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|k| value.get(*k).and_then(|v| v.as_str()))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let number = |value: &serde_json::Value, keys: &[&str]| -> Option<f64> {
+        keys.iter().find_map(|k| {
+            value.get(*k).and_then(|v| {
+                v.as_f64().or_else(|| v.as_str().and_then(|s| s.replace(',', "").parse().ok()))
+            })
+        })
+    };
+    let title = text(body, &["title", "question", "name"])?;
+    let outcomes = ["outcomes", "options", "choices"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(|v| v.as_array()))?;
+
+    let options: Vec<serde_json::Value> = outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            serde_json::json!({
+                "id": number(outcome, &["id"]).map(|n| n as i64).unwrap_or(index as i64),
+                "label": text(outcome, &["title", "label", "name"]).unwrap_or_else(|| format!("Option {}", index + 1)),
+                // Points staked rather than votes, which is the same number
+                // in the same place on the card.
+                "votes": number(outcome, &["points", "total", "amount", "votes", "sum"]).unwrap_or(0.0),
+                "backers": number(outcome, &["users", "voters", "backers", "user_count"]),
+                "odds": text(outcome, &["odds", "return", "multiplier"]),
+                "winner": outcome.get("is_winner").and_then(|v| v.as_bool())
+                    .or_else(|| outcome.get("winner").and_then(|v| v.as_bool()))
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+
+    let duration = number(body, &["duration", "lock_time", "seconds"]).unwrap_or(0.0) as u32;
+    let remaining = number(body, &["remaining", "seconds_remaining", "time_left"]).unwrap_or(0.0) as u32;
+    Some(serde_json::json!({
+        "bufferId": buffer_id,
+        "kind": "prediction",
+        "id": card_id(state, buffer_id, "prediction", &title, duration, remaining),
+        "title": title,
+        "options": options,
+        "duration": duration,
+        "remaining": remaining,
+        "resultDisplayDuration": 0,
+        "hasVoted": body.get("has_voted").and_then(|v| v.as_bool()).unwrap_or(false),
+        "votedOptionId": number(body, &["voted_option_id", "voted_outcome_id"]).map(|n| n as i64),
+        "total": number(body, &["total", "points", "points_contributed", "total_points"]),
+        "yourReturn": number(body, &["your_return", "return", "payout"]),
+        "state": text(body, &["state", "status"]),
+    }))
+}
+
+/// Stores a card, writes it down, and tells the client - or says it is gone.
+fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serde_json::Value>) {
+    match &card {
+        None => state.runtime.forget_kick_poll(buffer_id, kind),
+        Some(card) => {
+            state.runtime.set_kick_poll(buffer_id, kind, card.clone());
+            // Written down as it changes, so what is read back later is how
+            // it finished rather than how it opened.
+            let id = card["id"].as_str().unwrap_or_default().to_string();
+            let title = card["title"].as_str().unwrap_or_default().to_string();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if let Err(e) = state.store.record_live_card(buffer_id, kind, &id, &title, &card.to_string(), ts) {
+                tracing::debug!("kick: keeping the {kind}: {e:#}");
+            }
+        }
+    }
+    state.events.emit("pollCard", serde_json::json!({
+        "bufferId": buffer_id,
+        "kind": kind,
+        "poll": card.unwrap_or(serde_json::Value::Null),
+    }));
+}
+
+/// What identifies one poll or prediction for as long as it runs.
+///
+/// Kick names neither of them, so the moment it started does: the same card
+/// keeps its id while the votes come in, and the next one - even with the
+/// same question - gets its own. The id already in flight wins where the
+/// title matches, since a second of drift in `remaining` must not split one
+/// poll into two.
+fn card_id(state: &AppState, buffer_id: &str, kind: &str, title: &str, duration: u32, remaining: u32) -> String {
+    if let Some(open) = state.runtime.kick_poll(buffer_id, kind) {
+        if open["title"].as_str() == Some(title) {
+            if let Some(id) = open["id"].as_str() {
+                return id.to_string();
+            }
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    format!("{kind}:{}", now - (duration.saturating_sub(remaining)) as i64)
+}
+
+/// Reads the poll a channel has running, for somebody who has just opened it./// Reads the poll a channel has running, for somebody who has just opened it.
 ///
 /// A poll that started before you arrived is the common case - they run for a
 /// minute and a chat is opened at any moment in it - and the events only tell
@@ -1600,6 +1788,53 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].body, "@You textgoeshere");
         assert!(stored[0].is_highlight, "still addressed, whatever it is called");
+    }
+
+    /// A prediction lands on the same card a poll does, from a payload this
+    /// backend has never been shown - so the parser looks for each field in
+    /// the places it could plausibly sit and leaves out what it cannot find.
+    #[test]
+    fn a_prediction_becomes_the_same_card_a_poll_does() {
+        let state = simulated_daemon("prediction-card");
+        let buffer_id = crate::model::buffer_id("kick:tester", "odablock");
+        announce_prediction(&state, &buffer_id, &serde_json::json!({
+            "prediction": {
+                "title": "who will win?",
+                "duration": 120,
+                "remaining": 45,
+                "total": 36875,
+                "status": "open",
+                "outcomes": [
+                    { "id": 1, "title": "guy (mike)", "points": 23800, "odds": "1:1.5", "users": 12 },
+                    { "id": 2, "title": "dude (brandon)", "points": 13100, "odds": "1:2.8", "is_winner": true }
+                ]
+            }
+        }));
+        let card = state.runtime.kick_poll(&buffer_id, "prediction").expect("a card");
+        assert_eq!(card["kind"], "prediction");
+        assert_eq!(card["title"], "who will win?");
+        assert_eq!(card["total"], 36875.0);
+        assert_eq!(card["remaining"], 45);
+        assert_eq!(card["options"][0]["label"], "guy (mike)");
+        assert_eq!(card["options"][0]["votes"], 23800.0);
+        assert_eq!(card["options"][0]["odds"], "1:1.5");
+        assert_eq!(card["options"][1]["winner"], true);
+
+        // And it is written down, so it can be read back after a restart.
+        let kept = state.store.live_cards(&buffer_id, "prediction", 10).expect("history");
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].0.contains("who will win?"));
+    }
+
+    /// Nothing recognisable is no card at all, rather than an empty one: a
+    /// prediction card with no question and no outcomes says nothing and
+    /// takes the top of the chat to say it.
+    #[test]
+    fn a_payload_that_is_not_a_prediction_makes_no_card() {
+        let state = simulated_daemon("prediction-nonsense");
+        let buffer_id = crate::model::buffer_id("kick:tester", "odablock");
+        announce_prediction(&state, &buffer_id, &serde_json::json!({ "something": "else" }));
+        assert!(state.runtime.kick_poll(&buffer_id, "prediction").is_none());
     }
 
     /// A poll is one thing happening over a minute, not a stream of events -

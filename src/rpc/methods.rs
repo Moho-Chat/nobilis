@@ -272,10 +272,15 @@ pub async fn dispatch(
                 if let Some(stream) = state.runtime.kick_stream(buffer_id) {
                     state.events.emit("kickStream", stream);
                 }
-                // A poll already running when you opened the channel: the
-                // events only carry the ones that change while you watch.
-                if let Some(poll) = state.runtime.kick_poll(buffer_id) {
-                    state.events.emit("kickPoll", poll);
+                // A poll or prediction already running when you opened the
+                // channel: the events only carry the ones that change while
+                // you are watching.
+                for card in state.runtime.kick_polls_for(buffer_id) {
+                    state.events.emit("pollCard", serde_json::json!({
+                        "bufferId": buffer_id,
+                        "kind": card["kind"].clone(),
+                        "poll": card,
+                    }));
                 }
                 if state.runtime.kick_channel(buffer_id).is_some() {
                     let (state, buffer_id) = (state.clone(), buffer_id.to_string());
@@ -2152,12 +2157,12 @@ pub async fn dispatch(
         // A vote in the poll on screen. The answer Kick sends back is the
         // poll with the vote in it, so the card updates from the reply rather
         // than waiting for the broadcast that follows it.
-        "voteKickPoll" => {
+        "votePoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("voteKickPoll requires \"bufferId\"".to_string()));
+                return (None, Some("votePoll requires \"bufferId\"".to_string()));
             };
             let Some(option_id) = params.get("optionId").and_then(|v| v.as_i64()) else {
-                return (None, Some("voteKickPoll requires \"optionId\"".to_string()));
+                return (None, Some("votePoll requires \"optionId\"".to_string()));
             };
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
@@ -2177,9 +2182,9 @@ pub async fn dispatch(
 
         // Taking the poll down, which Kick allows the streamer and their
         // moderators and refuses to everybody else.
-        "endKickPoll" => {
+        "endPoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("endKickPoll requires \"bufferId\"".to_string()));
+                return (None, Some("endPoll requires \"bufferId\"".to_string()));
             };
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
@@ -2194,6 +2199,35 @@ pub async fn dispatch(
                     (Some(ok_node()), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // What this conversation has voted on before now.
+        //
+        // Read from storage rather than from memory: a poll outlives the
+        // minute it was open, and "what did we vote on last night" is a
+        // question asked after a restart more often than before one.
+        "listPolls" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listPolls requires \"bufferId\"".to_string()));
+            };
+            let kind = p_str(params, "kind", "poll");
+            let limit = params.get("limit").and_then(|v| v.as_i64()).unwrap_or(25).clamp(1, 200);
+            match state.store.live_cards(buffer_id, kind, limit) {
+                Ok(rows) => {
+                    let cards: Vec<serde_json::Value> = rows
+                        .into_iter()
+                        .filter_map(|(body, ts)| {
+                            let mut card: serde_json::Value = serde_json::from_str(&body).ok()?;
+                            // When it was, which the card itself does not
+                            // carry - it only ever knew how long it had left.
+                            card["ts"] = serde_json::json!(ts);
+                            Some(card)
+                        })
+                        .collect();
+                    (Some(serde_json::json!(cards)), None)
+                }
+                Err(e) => (None, Some(e.to_string())),
             }
         }
 
