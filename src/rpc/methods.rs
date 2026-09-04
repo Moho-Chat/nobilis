@@ -41,22 +41,10 @@ pub async fn dispatch(
             let mut groups = state.runtime.list_buffer_groups();
             let registered: std::collections::HashSet<String> = groups.iter().map(|g| g.id.clone()).collect();
             for account in state.runtime.list_accounts(state) {
-                let id = crate::model::account_group_id(&account.id);
-                if registered.contains(&id) {
+                if registered.contains(&crate::model::account_group_id(&account.id)) {
                     continue;
                 }
-                groups.push(crate::model::BufferGroup {
-                    id,
-                    account_id: account.id.clone(),
-                    service: account.service.clone(),
-                    kind: "account".to_string(),
-                    name: account.display_name.clone(),
-                    icon_url: account.avatar_url.clone(),
-                    // After the guilds, which are the entries a user picks
-                    // between most often.
-                    position: 1000,
-                    pending: false,
-        });
+                groups.push(account_group(&account));
             }
             groups.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
             (Some(serde_json::to_value(groups).unwrap()), None)
@@ -420,7 +408,22 @@ pub async fn dispatch(
 
         "setAccountDisplayName" => match p_str_opt(params, "accountId") {
             None => (None, Some("no such account".to_string())),
-            Some(id) => account_mutation_result(state.accounts.set_display_name(id, p_str(params, "name", ""))),
+            Some(id) => {
+                let renamed = account_mutation_result(state.accounts.set_display_name(id, p_str(params, "name", "")));
+                // The rail entry carries the same name, and it is built from
+                // the account rather than stored - so nothing would have told
+                // anybody it changed, and the heading above the channel list
+                // kept the old name until the client was restarted.
+                if renamed.1.is_none() {
+                    if let Some(account) = state.runtime.list_accounts(state).into_iter().find(|a| a.id == id) {
+                        state.events.emit(
+                            "bufferGroupChange",
+                            serde_json::to_value(account_group(&account)).unwrap(),
+                        );
+                    }
+                }
+                renamed
+            }
         },
 
         "setAccountSasl" => match p_str_opt(params, "accountId") {
@@ -2645,6 +2648,26 @@ fn parse_sneedchat_rooms(params: &Value) -> Option<Vec<crate::accounts::SneedCha
             })
             .collect(),
     )
+}
+
+/// The rail entry an account has by being an account.
+///
+/// Not stored anywhere: guilds and spaces are registered by the backends that
+/// discover them, but an account's own entry is whatever the account says it
+/// is right now - which is why renaming one has to say so itself.
+fn account_group(account: &crate::model::Account) -> crate::model::BufferGroup {
+    crate::model::BufferGroup {
+        id: crate::model::account_group_id(&account.id),
+        account_id: account.id.clone(),
+        service: account.service.clone(),
+        kind: "account".to_string(),
+        name: account.display_name.clone(),
+        icon_url: account.avatar_url.clone(),
+        // After the guilds, which are the entries a user picks between most
+        // often.
+        position: 1000,
+        pending: false,
+    }
 }
 
 fn account_mutation_result(result: anyhow::Result<bool>) -> (Option<Value>, Option<String>) {

@@ -794,9 +794,16 @@ impl Runtime {
         // runtime is actually holding is filled in here.
         for account in &mut out {
             account.status = self.account_status(&account.id);
-            // Only IRC has one, and only while connected - a configured nick
-            // is not the nick in use if the session landed on the alt.
-            if let Some(nick) = self.irc_current_nick(&account.id) {
+            // Who the service knows this account as, which is not the same
+            // question as what it is called here: a local rename moves
+            // `display_name` and must leave this alone, or the client would
+            // stop recognising its own user - who is a moderator, whose
+            // message is whose - the moment somebody renamed themselves.
+            //
+            // IRC first and only while connected, since a configured nick is
+            // not the nick in use if the session landed on the alt; every
+            // other service reports the identity its backend registered.
+            if let Some(nick) = self.irc_current_nick(&account.id).or_else(|| self.own_identity(&account.id)) {
                 account.current_nick = nick;
             }
         }
