@@ -276,6 +276,14 @@ pub async fn dispatch(
                 // channel: the events only carry the ones that change while
                 // you are watching.
                 for card in state.runtime.kick_polls_for(buffer_id) {
+                    // Only while it still means something. A card kept from
+                    // an hour ago is not news to a window opening now, and
+                    // one whose clock ran out before you arrived would open
+                    // the conversation with somebody else's finished poll
+                    // across the top of it.
+                    if !backend::kick::card_is_current(&card) {
+                        continue;
+                    }
                     state.events.emit("pollCard", serde_json::json!({
                         "bufferId": buffer_id,
                         "kind": card["kind"].clone(),

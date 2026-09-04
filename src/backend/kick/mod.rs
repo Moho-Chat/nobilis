@@ -1173,6 +1173,17 @@ fn prediction_card(state: &AppState, buffer_id: &str, payload: &serde_json::Valu
 
 /// Stores a card, writes it down, and tells the client - or says it is gone.
 fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serde_json::Value>) {
+    // When this was true, stamped here so every card carries one.
+    //
+    // The clock is the whole point: `remaining` is a number of seconds that
+    // was accurate at one moment, and a client told only the number counts
+    // down from whenever it happened to hear it. Replay a stored card into a
+    // window opened an hour later and the poll appears to have its full time
+    // left - which is exactly what a poll timer must never do.
+    let card = card.map(|mut card| {
+        card["asOf"] = serde_json::json!(now_secs());
+        card
+    });
     match &card {
         None => state.runtime.forget_kick_poll(buffer_id, kind),
         Some(card) => {
@@ -1181,10 +1192,7 @@ fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serd
             // it finished rather than how it opened.
             let id = card["id"].as_str().unwrap_or_default().to_string();
             let title = card["title"].as_str().unwrap_or_default().to_string();
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64;
+            let ts = now_secs();
             if let Err(e) = state.store.record_live_card(buffer_id, kind, &id, &title, &card.to_string(), ts) {
                 tracing::debug!("kick: keeping the {kind}: {e:#}");
             }
@@ -1195,6 +1203,31 @@ fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serd
         "kind": kind,
         "poll": card.unwrap_or(serde_json::Value::Null),
     }));
+}
+
+/// Whether a stored card still has anything to say.
+///
+/// Its own function because two places ask: the replay into a window that has
+/// just opened, and the tests. A card is current while its clock is running
+/// and for as long as the service leaves the result up afterwards.
+pub fn card_is_current(card: &serde_json::Value) -> bool {
+    let seconds = |key: &str| card[key].as_i64().unwrap_or(0);
+    let as_of = seconds("asOf");
+    if as_of == 0 {
+        // Stamped by every card this backend makes; anything without one is
+        // from a version that did not, and its clock cannot be trusted.
+        return false;
+    }
+    let alive = seconds("remaining") + seconds("resultDisplayDuration");
+    now_secs() - as_of <= alive
+}
+
+/// The wall clock, in seconds, as everything here writes it down.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// What identifies one poll or prediction for as long as it runs.
@@ -1212,11 +1245,7 @@ fn card_id(state: &AppState, buffer_id: &str, kind: &str, title: &str, duration:
             }
         }
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    format!("{kind}:{}", now - (duration.saturating_sub(remaining)) as i64)
+    format!("{kind}:{}", now_secs() - (duration.saturating_sub(remaining)) as i64)
 }
 
 /// Reads the poll a channel has running, for somebody who has just opened it./// Reads the poll a channel has running, for somebody who has just opened it.
@@ -1788,6 +1817,26 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].body, "@You textgoeshere");
         assert!(stored[0].is_highlight, "still addressed, whatever it is called");
+    }
+
+    /// A poll heard about an hour ago has no time left, whatever the number
+    /// it was carrying said - the number was true at a moment, and the moment
+    /// is part of it.
+    #[test]
+    fn a_card_is_only_current_while_its_clock_is() {
+        let running = serde_json::json!({ "asOf": now_secs() - 5, "remaining": 60, "resultDisplayDuration": 30 });
+        assert!(card_is_current(&running));
+
+        // Voting is over but the result is still up.
+        let showing = serde_json::json!({ "asOf": now_secs() - 70, "remaining": 60, "resultDisplayDuration": 30 });
+        assert!(card_is_current(&showing));
+
+        let gone = serde_json::json!({ "asOf": now_secs() - 3600, "remaining": 60, "resultDisplayDuration": 30 });
+        assert!(!card_is_current(&gone));
+
+        // No stamp at all: written by a version that did not carry one, and
+        // its clock cannot be believed.
+        assert!(!card_is_current(&serde_json::json!({ "remaining": 60 })));
     }
 
     /// A prediction lands on the same card a poll does, from a payload this
