@@ -161,7 +161,14 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
         }
     }
 
-    let display = name.or(alias).unwrap_or_else(|| room_id.to_string());
+    // A direct message has no name of its own, so falling back to the room
+    // id put a tile in the rail labelled "!vj6SZEo74ZIjCajgM..." - which is
+    // both unreadable and unanswerable. Whoever sent it is the only thing
+    // about an unnamed invitation worth showing.
+    let display = name
+        .or(alias)
+        .or_else(|| if is_direct { inviter.clone() } else { None })
+        .unwrap_or_else(|| room_id.to_string());
     serde_json::json!({
         "roomId": room_id,
         "name": display,
