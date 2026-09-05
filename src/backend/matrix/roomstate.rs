@@ -50,7 +50,7 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                 state.runtime.set_matrix_pinned(account_id, room_id, pinned.clone());
                 if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
                     state.events.emit(
-                        "matrixPinned",
+                        "pinnedMessages",
                         serde_json::json!({ "bufferId": buffer_id, "pinned": pinned }),
                     );
                 }

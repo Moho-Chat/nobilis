@@ -1125,14 +1125,26 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
-        "listMatrixPinned" => {
+        // What a conversation has told everyone to read first.
+        //
+        // One method for every service that has pins rather than one each:
+        // the panel that shows them is the same panel, and the difference
+        // between a Matrix pin and a Discord one is entirely on this side.
+        "listPinned" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("listMatrixPinned requires \"bufferId\"".to_string()));
+                return (None, Some("listPinned requires \"bufferId\"".to_string()));
             };
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
-            match backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await {
+            let answer = if buffer.account_id.starts_with("discord:") {
+                backend::discord::list_pinned(state, &buffer.account_id, buffer_id).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await
+            } else {
+                Err(anyhow::anyhow!("this service has no pinned messages"))
+            };
+            match answer {
                 Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -1140,16 +1152,23 @@ pub async fn dispatch(
 
         // Pinning one, or taking the pin off. Whether this account may is the
         // server's decision, and its refusal is passed through in its words.
-        "setMatrixPinned" => {
-            let (buffer_id, event_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "eventId")) {
+        "setPinned" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId").or_else(|| p_str_opt(params, "eventId"))) {
                 (Some(b), Some(e)) => (b, e),
-                _ => return (None, Some("setMatrixPinned requires \"bufferId\" and \"eventId\"".to_string())),
+                _ => return (None, Some("setPinned requires \"bufferId\" and \"messageId\"".to_string())),
             };
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such conversation".to_string()));
             };
             let pinned = params.get("pinned").and_then(|v| v.as_bool()).unwrap_or(true);
-            match backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, event_id, pinned).await {
+            let done = if buffer.account_id.starts_with("discord:") {
+                backend::discord::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
+            } else {
+                Err(anyhow::anyhow!("this service has no pinned messages"))
+            };
+            match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }

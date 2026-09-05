@@ -858,6 +858,107 @@ pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String
     Ok(buffer.id)
 }
 
+/// The messages a channel has pinned, as this client's own message shape.
+///
+/// Asked of Discord every time rather than kept: a pin is set by whoever is
+/// running the channel, often while nobody here is looking, and a cached list
+/// would be a list of what was pinned when this window last happened to ask.
+/// The same messages are usually already in scrollback, but not always - a
+/// channel's rules are typically pinned years before anybody reads them.
+pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/pins"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading the pins")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading the pins"));
+    }
+    let messages: Vec<Value> = resp.json().await.context("reading the pins")?;
+
+    // Discord returns newest first, which is the order a pin list is read in:
+    // the thing pinned most recently is the thing being talked about now.
+    let own_display_name = cfg.display_name.clone();
+    let pinned: Vec<Value> = messages
+        .iter()
+        .filter_map(|msg| {
+            let id = msg["id"].as_str()?;
+            let author = &msg["author"];
+            let from = author["global_name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| author["username"].as_str())
+                .unwrap_or("unknown");
+            let body = resolve_mentions(&extract_body(msg).unwrap_or_default(), msg, &cfg.user_id, own_display_name.as_deref());
+            let ts = msg["timestamp"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp())
+                .unwrap_or(0);
+            Some(json!({
+                "id": id,
+                "bufferId": buffer_id,
+                "from": from,
+                // An attachment or an embed with no words is a real pin and a
+                // common one - a picture everybody is meant to have seen - so
+                // it is listed saying what it is rather than as a blank row.
+                "body": if body.trim().is_empty() { describe_wordless(msg) } else { body },
+                "ts": ts,
+                "kind": "chat",
+            }))
+        })
+        .collect();
+    let ids: Vec<&str> = pinned.iter().filter_map(|m| m["id"].as_str()).collect();
+    // Told as well as answered, so the header's count is right for every
+    // window watching this conversation rather than only the one that asked.
+    state.events.emit("pinnedMessages", json!({ "bufferId": buffer_id, "pinned": ids }));
+    Ok(json!({ "bufferId": buffer_id, "pinned": pinned }))
+}
+
+/// What to call a message that has no words in it.
+fn describe_wordless(msg: &Value) -> String {
+    let attachments = msg["attachments"].as_array().map(|a| a.len()).unwrap_or(0);
+    let embeds = msg["embeds"].as_array().map(|a| a.len()).unwrap_or(0);
+    match (attachments, embeds) {
+        (0, 0) => "(no text)".to_string(),
+        (1, _) => "(an attachment)".to_string(),
+        (n, _) if n > 1 => format!("({n} attachments)"),
+        _ => "(a link)".to_string(),
+    }
+}
+
+/// Pins a message, or takes the pin off.
+///
+/// Whether this account may is Discord's decision - MANAGE_MESSAGES in a
+/// guild, and anybody in a DM - so it is asked rather than worked out here,
+/// and a refusal is passed through in Discord's own words.
+pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, pinned: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let url = format!("{API_BASE}/channels/{channel_id}/pins/{message_id}");
+    let http = http_client();
+    let request = if pinned { http.put(url) } else { http.delete(url) };
+    let doing = if pinned { "pinning the message" } else { "unpinning the message" };
+    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, doing));
+    }
+    // Read back, so the header's count and the menu's wording agree with what
+    // just happened. Discord sends no pin event to a user client, so nothing
+    // else would tell this window - or any other one - that the list changed.
+    if let Err(e) = list_pinned(state, account_id, buffer_id).await {
+        tracing::debug!("discord: re-reading the pins: {e:#}");
+    }
+    Ok(())
+}
+
 /// How many other people a Discord group message holds - ten including you.
 const GROUP_DM_MAX_OTHERS: usize = 9;
 

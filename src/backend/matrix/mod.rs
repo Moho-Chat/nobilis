@@ -2681,7 +2681,7 @@ pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, eve
     set_room_state(state, account_id, buffer_id, "m.room.pinned_events", serde_json::json!({ "pinned": next })).await?;
     // Locally too, so the list is right before the next sync arrives.
     state.runtime.set_matrix_pinned(account_id, &room_id, next.clone());
-    state.events.emit("matrixPinned", serde_json::json!({ "bufferId": buffer_id, "pinned": next }));
+    state.events.emit("pinnedMessages", serde_json::json!({ "bufferId": buffer_id, "pinned": next }));
     Ok(())
 }
 
