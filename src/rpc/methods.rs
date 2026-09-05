@@ -1138,6 +1138,39 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
+        // Discord's own search, over a whole server rather than this window's
+        // copy of one channel.
+        //
+        // The filters are the ones Discord's own box takes, and they are sent
+        // as names because that is what somebody types - resolving them to ids
+        // happens in the backend, where the conversations are.
+        "searchDiscordMessages" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("searchDiscordMessages requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("discord:") {
+                return (None, Some("that is not a Discord conversation".to_string()));
+            }
+            let text = |key: &str| p_str_opt(params, key).map(str::trim).filter(|v| !v.is_empty()).map(String::from);
+            let filters = backend::discord::SearchFilters {
+                content: text("query"),
+                from: text("from"),
+                mentions: text("mentions"),
+                in_channel: text("in"),
+                has: text("has"),
+                before: params.get("before").and_then(|v| v.as_i64()),
+                after: params.get("after").and_then(|v| v.as_i64()),
+                offset: params.get("offset").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, 5000),
+            };
+            match backend::discord::search_messages(state, &buffer.account_id, buffer_id, &filters).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Goes and gets the part of the conversation one message is in.
         //
         // What makes a pinned message or a search result reachable rather than

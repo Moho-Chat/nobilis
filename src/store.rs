@@ -479,6 +479,24 @@ impl Store {
         Ok(out)
     }
 
+    /// Who somebody is, from the last thing they said.
+    ///
+    /// Search filters are typed as names - "from:coty1911" - and Discord wants
+    /// an id. Nothing else here keeps a name-to-id table, but every stored
+    /// message carries both, so the most recent one somebody sent under that
+    /// name is the answer. Scoped by buffer prefix so an account only ever
+    /// resolves names against its own conversations.
+    pub fn sender_id_by_nick(&self, buffer_prefix: &str, nick: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT sender_id FROM messages
+             WHERE buffer_id LIKE ?1 || '%' AND from_nick = ?2 COLLATE NOCASE AND sender_id IS NOT NULL
+             ORDER BY ts DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![buffer_prefix, nick])?;
+        Ok(rows.next()?.map(|row| row.get::<_, String>(0)).transpose()?)
+    }
+
     /// The conversation from one moment forward, oldest first.
     ///
     /// `get_backlog` reads backwards because that is what scrolling up wants.
