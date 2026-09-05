@@ -1151,7 +1151,20 @@ pub async fn dispatch(
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
             match found {
-                Ok(ts) => (Some(serde_json::json!({ "ts": ts })), None),
+                // The window itself, not just where to find it: the client
+                // would otherwise have to page backwards from what it has to
+                // reach these rows, which is the walk through everything in
+                // between that this call exists to avoid.
+                Ok(ts) => {
+                    let around = state.store.messages_around(buffer_id, ts, 50).unwrap_or_default();
+                    (
+                        Some(serde_json::json!({
+                            "ts": ts,
+                            "messages": serde_json::to_value(around).unwrap_or_default(),
+                        })),
+                        None,
+                    )
+                }
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }

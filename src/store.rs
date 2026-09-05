@@ -478,6 +478,33 @@ impl Store {
         out.reverse();
         Ok(out)
     }
+
+    /// The conversation either side of one moment, oldest first.
+    ///
+    /// `get_backlog` only ever reads backwards, which is right for scrolling
+    /// up and wrong for arriving somewhere: a message shown with nothing after
+    /// it looks like the end of the conversation, and the reader has no way to
+    /// tell that it is not. Both halves rather than a wider backward read for
+    /// the same reason.
+    pub fn messages_around(&self, buffer_id: &str, ts: i64, span: i64) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let span = if span > 0 { span } else { 50 };
+        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread";
+
+        let mut older = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
+        ))?;
+        let rows = older.query_map(params![buffer_id, ts, span], |row| Self::row_to_message(buffer_id, row))?;
+        let mut out: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
+        out.reverse();
+
+        let mut newer = conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts > ?2 ORDER BY ts ASC LIMIT ?3"
+        ))?;
+        let rows = newer.query_map(params![buffer_id, ts, span], |row| Self::row_to_message(buffer_id, row))?;
+        out.extend(rows.collect::<rusqlite::Result<Vec<Message>>>()?);
+        Ok(out)
+    }
 }
 
 impl Store {
