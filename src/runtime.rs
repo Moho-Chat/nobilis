@@ -565,6 +565,12 @@ pub struct Runtime {
     /// blocking somebody on one machine and hearing from them on the next is
     /// not blocking them.
     matrix_ignored: Mutex<HashMap<String, HashSet<String>>>,
+    /// Whose verification traffic this account has seen, by account.
+    ///
+    /// Verifying another person happens in the room you share, and the
+    /// machine is asked about requests one user at a time - so the senders
+    /// of the events that arrive are the only list of who to ask about.
+    matrix_verification_peers: Mutex<HashMap<String, HashSet<String>>>,
     /// The event ids a room has pinned, by account and room.
     ///
     /// The ids only: what those events *say* lives in scrollback or on the
@@ -794,6 +800,7 @@ impl Runtime {
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
+            matrix_verification_peers: Mutex::new(HashMap::new()),
             matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
             matrix_read_receipts: Mutex::new(HashMap::new()),
@@ -2246,6 +2253,19 @@ impl Runtime {
     /// Whether this account has asked never to hear from somebody.
     pub fn matrix_is_ignored(&self, account_id: &str, user_id: &str) -> bool {
         self.matrix_ignored.lock().unwrap().get(account_id).is_some_and(|list| list.contains(user_id))
+    }
+
+    pub fn note_matrix_verification_peer(&self, account_id: &str, user_id: &str) {
+        self.matrix_verification_peers
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(user_id.to_string());
+    }
+
+    pub fn matrix_verification_peers(&self, account_id: &str) -> HashSet<String> {
+        self.matrix_verification_peers.lock().unwrap().get(account_id).cloned().unwrap_or_default()
     }
 
     pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {

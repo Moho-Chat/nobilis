@@ -704,6 +704,8 @@ async fn handle_timeline_event(
         && outer_type != protocol::EVENT_STICKER
         // A poll is three kinds of event and none of them is a message.
         && !polls::is_poll_event(outer_type)
+        // And a verification with another person travels through the room.
+        && !outer_type.starts_with("m.key.verification.")
     {
         // Membership/name changes were already folded into naming in
         // process_sync_response; anything else (typing, receipts, other
@@ -759,6 +761,31 @@ async fn handle_timeline_event(
         let is_me = sender == own_user_id;
         state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me);
         state.runtime.update_reaction(state, buffer_id, target_event, emoji, is_me, true);
+        return;
+    }
+
+    // Verifying another person: the whole flow travels through the room the
+    // two of you share, because until you have agreed which devices you are
+    // talking about there is no device to address it to. None of it is chat,
+    // so it goes to the machine and stops here.
+    if effective_type.starts_with("m.key.verification.")
+        || content["msgtype"].as_str() == Some("m.key.verification.request")
+    {
+        if sender != own_user_id {
+            state.runtime.note_matrix_verification_peer(account_id, sender);
+        }
+        let mut event = event.clone();
+        // The decrypted content where there was any, so an encrypted room's
+        // verification reads the same as a plain one's.
+        if outer_type == protocol::EVENT_ROOM_ENCRYPTED && !undecryptable {
+            if let Some(object) = event.as_object_mut() {
+                object.insert("type".to_string(), Value::from(effective_type.clone()));
+                object.insert("content".to_string(), content.clone());
+            }
+        }
+        if let Err(e) = session.receive_room_verification(&event, room_id).await {
+            tracing::debug!("matrix[{account_id}]: verification event {event_id}: {e:#}");
+        }
         return;
     }
 

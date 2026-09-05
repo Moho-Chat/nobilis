@@ -141,6 +141,13 @@ fn status_event(v: &ActiveVerification, state: &str) -> serde_json::Value {
         "accountId": v.account_id,
         "verificationId": v.flow_id,
         "state": state,
+        // Who is on the other end. For one of your own sessions this is you
+        // and the device is the interesting half; for somebody else it is
+        // the whole point, and a dialog that cannot say whose emoji these
+        // are is a dialog nobody should press yes on.
+        "otherUser": v.request.other_user().as_str(),
+        "otherDevice": v.request.other_device_id().map(|d| d.to_string()),
+        "isSelf": v.request.other_user() == v.request.own_user_id(),
     })
 }
 
@@ -290,7 +297,17 @@ pub async fn cancel(state: &AppState, account_id: &str, verification_id: &str) -
 /// the flow finishing/being cancelled from the other end.
 pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, own_user_id: &UserId, homeserver_url: &str, access_token: &str) {
     let known = state.runtime.matrix_known_flow_ids(account_id);
-    for request in session.machine.get_verification_requests(own_user_id) {
+    // Our own other sessions, and anybody who has sent verification traffic
+    // into a room we share. The machine is asked one user at a time, so
+    // asking only about ourselves - which is what this did - meant a request
+    // from another person was never even looked for.
+    let mut whose: Vec<ruma_common::OwnedUserId> = vec![own_user_id.to_owned()];
+    for peer in state.runtime.matrix_verification_peers(account_id) {
+        if let Ok(user_id) = UserId::parse(&peer) {
+            whose.push(user_id);
+        }
+    }
+    for request in whose.iter().flat_map(|user| session.machine.get_verification_requests(user)) {
         if request.we_started() {
             continue;
         }
@@ -309,7 +326,13 @@ pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, o
         };
         state.events.emit(
             "matrixVerificationIncoming",
-            serde_json::json!({ "accountId": account_id, "verificationId": flow_id, "fromDevice": other_device }),
+            serde_json::json!({
+                "accountId": account_id,
+                "verificationId": flow_id,
+                "fromDevice": other_device,
+                "fromUser": v.request.other_user().as_str(),
+                "isSelf": v.request.other_user() == v.request.own_user_id(),
+            }),
         );
         state.runtime.insert_matrix_verification(&flow_id, v);
     }

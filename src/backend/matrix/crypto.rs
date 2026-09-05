@@ -39,6 +39,9 @@ use matrix_sdk_crypto::{
     CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
+// For `event_type()` on a verification step's content - the wire needs the
+// name of the event, and only the trait knows it.
+use ruma_events::MessageLikeEventContent;
 use ruma_client_api::keys::{claim_keys, get_keys, upload_keys, upload_signatures};
 use ruma_client_api::sync::sync_events::DeviceLists;
 use ruma_client_api::to_device::send_event_to_device;
@@ -258,11 +261,48 @@ impl CryptoSession {
                 let response = upload_signatures::v3::Response::new();
                 self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(SignatureUpload)")?;
             }
-            // A room message: only in-room verification produces one, which
-            // this backend does not do - it verifies over to-device events.
-            // Skipped defensively rather than erroring.
+            // A verification step sent as a room event rather than to-device.
+            //
+            // This is what verifying *another person* looks like: Element and
+            // every other client carry a cross-user verification in the room
+            // the two of you share, because there is no device to address it
+            // to until you have agreed which devices you are talking about.
+            AnyOutgoingRequest::RoomMessage(req) => {
+                let event_type = req.content.event_type().to_string();
+                let url = format!(
+                    "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
+                    url::form_urlencoded::byte_serialize(req.room_id.as_str().as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(req.txn_id.as_str().as_bytes()).collect::<String>(),
+                );
+                let body = serde_json::to_value(&req.content).context("serialising a verification step")?;
+                let resp = http::put_json(&url, access_token, body).await.context("sending a verification step")?;
+                let response = ruma_client_api::message::send_message_event::v3::Response::new(
+                    ruma_common::OwnedEventId::try_from(resp["event_id"].as_str().unwrap_or("$unknown"))
+                        .unwrap_or_else(|_| ruma_common::OwnedEventId::try_from("$unknown").expect("static event id")),
+                );
+                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(RoomMessage)")?;
+            }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Hands the machine a verification step that arrived as a room event.
+    ///
+    /// In-room verification is how one person verifies another: the events
+    /// travel through the room the two of them share rather than to-device,
+    /// so nothing in the ordinary to-device path ever sees them. The room id
+    /// is put back on the event first - a sync timeline event does not carry
+    /// the room it came from, and the machine needs it to know which flow
+    /// this belongs to.
+    pub async fn receive_room_verification(&self, event: &Value, room_id: &str) -> Result<()> {
+        let mut event = event.clone();
+        if let Some(object) = event.as_object_mut() {
+            object.insert("room_id".to_string(), Value::from(room_id));
+        }
+        let parsed: ruma_events::AnyMessageLikeEvent =
+            serde_json::from_value(event).context("reading a verification event")?;
+        self.machine.receive_verification_event(&parsed).await.context("receive_verification_event")?;
         Ok(())
     }
 
