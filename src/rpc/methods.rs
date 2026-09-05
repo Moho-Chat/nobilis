@@ -1125,6 +1125,37 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
+        // Goes and gets the part of the conversation one message is in.
+        //
+        // What makes a pinned message or a search result reachable rather than
+        // merely listed: both name a message that may be older than anything
+        // stored here, and a client that could only page backwards would have
+        // to read the whole conversation in between to reach it - which for a
+        // pin from two years ago is not a wait, it is a refusal.
+        //
+        // Answers with when the message was sent, which is what a client needs
+        // to read it back out of the store.
+        "loadMessageContext" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some("loadMessageContext requires \"bufferId\" and \"messageId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let found = if buffer.account_id.starts_with("discord:") {
+                backend::discord::load_context(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::load_context(state, &buffer.account_id, buffer_id, message_id).await
+            } else {
+                Err(anyhow::anyhow!("this service cannot be asked for one message"))
+            };
+            match found {
+                Ok(ts) => (Some(serde_json::json!({ "ts": ts })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // What a conversation has told everyone to read first.
         //
         // One method for every service that has pins rather than one each:

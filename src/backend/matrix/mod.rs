@@ -1834,6 +1834,124 @@ async fn store_thread_event(
     );
 }
 
+/// Stores one event read back from the server, decrypting it first if it
+/// arrived encrypted.
+///
+/// Extracted from `backfill` so that reading history and reaching one
+/// particular message - a pinned one, a search result - put the same thing in
+/// the store. Two loops that stored "almost the same" message would drift, and
+/// the one used less often would be the one that drifted.
+///
+/// Returns whether anything was stored: an event that is not a message, an
+/// edit, or one that will not decrypt is skipped rather than stored as a
+/// placeholder, because a screenful of "unable to decrypt" is worse than a
+/// shorter page of what can be read.
+async fn store_history_event(
+    state: &AppState,
+    account: &crate::accounts::MatrixAccountConfig,
+    account_id: &str,
+    buffer_id: &str,
+    room_id: &str,
+    session: Option<&std::sync::Arc<crypto::CryptoSession>>,
+    event: &Value,
+) -> bool {
+    let decrypted;
+    let event = if protocol::event_type(event) == "m.room.encrypted" {
+        let plain = match session {
+            Some(session) => decrypt_event(session, event, room_id).await.ok().map(|(plain, _)| plain),
+            None => None,
+        };
+        match plain {
+            Some(plain) => {
+                decrypted = plain;
+                &decrypted
+            }
+            None => return false,
+        }
+    } else {
+        event
+    };
+    if protocol::event_type(event) != "m.room.message" {
+        return false;
+    }
+    let Some(event_id) = protocol::event_id(event) else { return false };
+    let content = &event["content"];
+    // An edit carries the replacement rather than a message of its own.
+    if protocol::edit_target(content).is_some() {
+        return false;
+    }
+    let (body, is_action) = protocol::message_body(content);
+    if body.is_empty() {
+        return false;
+    }
+    let html = protocol::formatted_body(content).map(str::to_string);
+    let from = protocol::short_sender(event);
+    let sender_mxid = protocol::sender(event);
+    let is_own = sender_mxid == account.user_id;
+    // Real send time, unlike live messages before server-time existed
+    // elsewhere: history dated to the moment it was fetched would put
+    // years-old conversation at today.
+    let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
+    let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
+    // History carries its relations like anything else - without this a
+    // thread read back from the server arrived as loose messages.
+    let reply_to = relation_preview(state, buffer_id, content);
+    if let Err(e) = state.store.append_message(
+        buffer_id, event_id, &from, &body, ts, is_action, false, "message", reply_to.as_ref(), &[], is_own,
+        avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
+        &state.runtime.buffer_kind_of(buffer_id),
+        // Matrix has no per-sender colour or badges of its own.
+        None,
+        &[],
+    ) {
+        tracing::warn!("matrix: storing history message: {e}");
+        return false;
+    }
+    true
+}
+
+/// Fetches the conversation around one event and stores it.
+///
+/// What makes a pinned message or a search result reachable: both name a
+/// message that may be years older than anything this client has, and paging
+/// backwards to it would mean reading the whole room in between. The server
+/// will hand over that one moment directly, so this asks for it - and stores
+/// the messages either side of it too, because arriving at a line with no
+/// conversation around it is arriving nowhere.
+///
+/// Returns when the message was sent, which is what a client needs to go and
+/// read it out of the store.
+pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<i64> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
+    let url = format!("{base}/_matrix/client/v3/rooms/{room}/context/{event}?limit=30");
+    let resp = http::get_json(&url, &account.access_token).await.context("reading that part of the room")?;
+
+    let session = state.runtime.get_matrix_machine(account_id);
+    // Oldest first, so the store reads in the order it was said: the events
+    // before this one arrive newest-first from the server.
+    let before: Vec<Value> = resp["events_before"].as_array().cloned().unwrap_or_default();
+    for event in before.iter().rev() {
+        store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), event).await;
+    }
+    let target = resp["event"].clone();
+    store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &target).await;
+    for event in resp["events_after"].as_array().cloned().unwrap_or_default() {
+        store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &event).await;
+    }
+
+    // From the event itself rather than from the store: an event that would
+    // not decrypt is not in the store, and the client still needs to know
+    // where in the room it was to read what surrounds it.
+    target["origin_server_ts"]
+        .as_i64()
+        .map(|ms| ms / 1000)
+        .context("the server did not say when that message was sent")
+}
+
 pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<usize> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
@@ -1855,62 +1973,9 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
     // the order it was said.
     let chunk: Vec<Value> = resp["chunk"].as_array().cloned().unwrap_or_default();
     for event in chunk.iter().rev() {
-        let decrypted;
-        let event = if protocol::event_type(event) == "m.room.encrypted" {
-            let plain = match session.as_ref() {
-                Some(session) => decrypt_event(session, event, &room_id).await.ok().map(|(plain, _)| plain),
-                None => None,
-            };
-            match plain {
-                Some(plain) => {
-                    decrypted = plain;
-                    &decrypted
-                }
-                // Undecryptable history is skipped rather than stored as a
-                // placeholder: a screenful of "unable to decrypt" is worse
-                // than a shorter page of what can be read.
-                None => continue,
-            }
-        } else {
-            event
-        };
-        if protocol::event_type(event) != "m.room.message" {
-            continue;
+        if store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), event).await {
+            added += 1;
         }
-        let Some(event_id) = protocol::event_id(event) else { continue };
-        let content = &event["content"];
-        // An edit carries the replacement rather than a message of its own.
-        if protocol::edit_target(content).is_some() {
-            continue;
-        }
-        let (body, is_action) = protocol::message_body(content);
-        if body.is_empty() {
-            continue;
-        }
-        let html = protocol::formatted_body(content).map(str::to_string);
-        let from = protocol::short_sender(event);
-        let sender_mxid = protocol::sender(event);
-        let is_own = sender_mxid == account.user_id;
-        // Real send time, unlike live messages before server-time existed
-        // elsewhere: history dated to the moment it was fetched would put
-        // years-old conversation at today.
-        let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
-        let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
-        // History carries its relations like anything else - without this a
-        // thread read back from the server arrived as loose messages.
-        let reply_to = relation_preview(state, buffer_id, content);
-        if let Err(e) = state.store.append_message(
-            buffer_id, event_id, &from, &body, ts, is_action, false, "message", reply_to.as_ref(), &[], is_own,
-            avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
-            &state.runtime.buffer_kind_of(buffer_id),
-            // Matrix has no per-sender colour or badges of its own.
-            None,
-            &[],
-        ) {
-            tracing::warn!("matrix: storing history message: {e}");
-            continue;
-        }
-        added += 1;
     }
 
     // Where the next page starts. Absent means the room has been read to its

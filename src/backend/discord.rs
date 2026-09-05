@@ -2668,6 +2668,46 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
     state.runtime.finish_discord_history_fetch(buffer_id);
 }
 
+/// Fetches the conversation around one message and stores it.
+///
+/// The counterpart of `extend_history` for a message somebody has named
+/// rather than scrolled to: a pin or a search result can be years older than
+/// anything stored here, and paging backwards to it would mean reading the
+/// whole channel in between. Discord will hand over that one moment directly.
+///
+/// The messages either side of it are stored too - fifty of them, Discord's
+/// own window - because arriving at a line with no conversation around it is
+/// arriving nowhere.
+///
+/// Returns when the message was sent, which is what a client needs to go and
+/// read it out of the store.
+pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<i64> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", "50"), ("around", message_id)])
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading that part of the channel")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading that part of the channel"));
+    }
+    let messages: Vec<Value> = resp.json().await.context("reading that part of the channel")?;
+    store_history_messages(state, buffer_id, &messages, &cfg.user_id, cfg.display_name.as_deref());
+
+    messages
+        .iter()
+        .find(|m| m["id"].as_str() == Some(message_id))
+        .and_then(|m| m["timestamp"].as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+        .context("Discord did not return that message")
+}
+
 /// Discord's gateway close code for "the token in your IDENTIFY payload is
 /// invalid/revoked" - documented at discord.com/developers/docs/topics/
 /// opcodes-and-status-codes#gateway-close-event-codes, and confirmed live
