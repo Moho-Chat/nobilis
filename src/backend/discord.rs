@@ -2681,6 +2681,37 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
 ///
 /// Returns when the message was sent, which is what a client needs to go and
 /// read it out of the store.
+/// Reads forward from a message, for a reader who arrived in the middle of a
+/// conversation and is now working their way back towards the present.
+///
+/// The counterpart of `extend_history`, which only ever reads the other way.
+/// Both exist because a jump leaves a hole: what was fetched around the
+/// message ends somewhere, the recent conversation begins somewhere later,
+/// and scrolling down from the first to the second used to cross that hole
+/// without saying so and without filling it.
+///
+/// Returns how many messages were stored, so a caller can tell the difference
+/// between "here is more" and "there is no more".
+pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<usize> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", "50"), ("after", message_id)])
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading the rest of the channel")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading the rest of the channel"));
+    }
+    let messages: Vec<Value> = resp.json().await.context("reading the rest of the channel")?;
+    store_history_messages(state, buffer_id, &messages, &cfg.user_id, cfg.display_name.as_deref());
+    Ok(messages.len())
+}
+
 pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<i64> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;

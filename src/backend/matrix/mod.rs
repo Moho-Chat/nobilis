@@ -1921,6 +1921,45 @@ async fn store_history_event(
 ///
 /// Returns when the message was sent, which is what a client needs to go and
 /// read it out of the store.
+/// Reads forward from an event, for a reader working back towards the present
+/// from somewhere they jumped to.
+///
+/// Two requests rather than one: `/messages` pages from a token rather than
+/// from an event, and the only place to get a token pointing at one
+/// particular moment is `/context` for that event - which is what `end` is.
+///
+/// Returns how many messages were stored, so a caller can tell "here is more"
+/// from "there is no more".
+pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<usize> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
+
+    let anchored = http::get_json(&format!("{base}/_matrix/client/v3/rooms/{room}/context/{event}?limit=1"), &account.access_token)
+        .await
+        .context("finding that part of the room")?;
+    let end = anchored["end"].as_str().context("the server gave no way to read forward from there")?;
+    let from = url::form_urlencoded::byte_serialize(end.as_bytes()).collect::<String>();
+    let resp = http::get_json(
+        &format!("{base}/_matrix/client/v3/rooms/{room}/messages?dir=f&limit=50&from={from}"),
+        &account.access_token,
+    )
+    .await
+    .context("reading the rest of the room")?;
+
+    let session = state.runtime.get_matrix_machine(account_id);
+    let mut added = 0usize;
+    // dir=f already reads oldest first, unlike the backward page.
+    for event in resp["chunk"].as_array().cloned().unwrap_or_default() {
+        if store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &event).await {
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
 pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<i64> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;

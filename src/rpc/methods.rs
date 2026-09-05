@@ -142,6 +142,19 @@ pub async fn dispatch(
         "getBacklog" => match p_str_opt(params, "bufferId") {
             None => (None, Some("getBacklog requires \"bufferId\"".to_string())),
             Some(buffer_id) => {
+                // Reading forward instead, for a reader who arrived in the
+                // middle of a conversation and is coming back towards the
+                // present. Answered on its own rather than falling through the
+                // rest of this arm, none of which - the Discord catch-up, the
+                // Kick cursor - is about that direction.
+                let after = p_i64(params, "after", 0);
+                if after > 0 {
+                    let limit = p_i64(params, "limit", 200);
+                    return match state.store.messages_after(buffer_id, after, limit) {
+                        Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                        Err(e) => (None, Some(e.to_string())),
+                    };
+                }
                 let before = p_i64(params, "before", 0);
                 let limit = p_i64(params, "limit", 200);
                 // A nonzero `before` means the frontend is paginating
@@ -1165,6 +1178,33 @@ pub async fn dispatch(
                         None,
                     )
                 }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Reads forward from a message, towards the present.
+        //
+        // The other half of arriving in the middle of a conversation: what was
+        // fetched around a pinned message ends somewhere, and the reader who
+        // carries on downwards past it should be given the rest rather than
+        // silently stepping over a hole into last week.
+        "loadNewerMessages" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some("loadNewerMessages requires \"bufferId\" and \"messageId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let added = if buffer.account_id.starts_with("discord:") {
+                backend::discord::load_newer(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::load_newer(state, &buffer.account_id, buffer_id, message_id).await
+            } else {
+                Err(anyhow::anyhow!("this service cannot be read forward"))
+            };
+            match added {
+                Ok(added) => (Some(serde_json::json!({ "added": added })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }

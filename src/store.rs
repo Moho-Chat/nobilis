@@ -479,6 +479,24 @@ impl Store {
         Ok(out)
     }
 
+    /// The conversation from one moment forward, oldest first.
+    ///
+    /// `get_backlog` reads backwards because that is what scrolling up wants.
+    /// This is what a reader working their way back towards the present wants,
+    /// after arriving in the middle of a conversation.
+    pub fn messages_after(&self, buffer_id: &str, after: i64, limit: i64) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit > 0 { limit } else { 200 };
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+             FROM messages
+             WHERE buffer_id = ?1 AND ts > ?2
+             ORDER BY ts ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, after, limit], |row| Self::row_to_message(buffer_id, row))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The conversation either side of one moment, oldest first.
     ///
     /// `get_backlog` only ever reads backwards, which is right for scrolling
