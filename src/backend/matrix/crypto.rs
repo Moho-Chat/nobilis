@@ -718,6 +718,27 @@ fn parse_otk_counts(value: &Value) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
 /// `type`/`event_id`/`sender`/`origin_server_ts`/`content` - the machine
 /// needs the whole envelope, not just `content`). Returns the decrypted
 /// event's own JSON on success.
+/// The same, plus whether the device that sent it has been verified.
+///
+/// The machine works this out as part of decrypting and it was being thrown
+/// away: a message can only be attributed to a device the moment it is
+/// decrypted, and asking again later is asking a different question.
+pub async fn decrypt_room_event_with_trust(
+    session: &CryptoSession,
+    event: &Value,
+    room_id: &RoomId,
+) -> Result<(Value, bool)> {
+    let raw: Raw<matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent> =
+        Raw::from_json_string(event.to_string()).context("re-serializing event for decryption")?;
+    let decrypted = session.machine.decrypt_room_event(&raw, room_id, &decryption_settings()).await.context("decrypt_room_event")?;
+    let verified = matches!(
+        decrypted.encryption_info.verification_state,
+        matrix_sdk_common::deserialized_responses::VerificationState::Verified
+    );
+    let value: Value = serde_json::from_str(decrypted.event.json().get()).context("parsing decrypted event JSON")?;
+    Ok((value, verified))
+}
+
 pub async fn decrypt_room_event(session: &CryptoSession, event: &Value, room_id: &RoomId) -> Result<Value> {
     // matrix-sdk-crypto uses its own lightweight `Event<C>` wrapper here
     // (types::events::room::encrypted::EncryptedEvent), not a ruma_events

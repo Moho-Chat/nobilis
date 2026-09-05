@@ -195,6 +195,68 @@ pub async fn start_verification(
     Ok(verification_id)
 }
 
+/// Starts verifying another person.
+///
+/// Not the same gesture as verifying one of your own sessions, and not the
+/// same transport: there is no device to address it to until the two of you
+/// have agreed which devices you are talking about, so the request goes into
+/// the room you share as an ordinary message. Element does the same, which is
+/// why one sent from there arrives as a direct message invitation rather than
+/// as anything that looks like verification.
+///
+/// The direct message is made if there is not one already - asking somebody
+/// to verify is asking them something, and a client that could only do it in
+/// rooms that happened to exist would refuse most of the time.
+pub async fn start_user_verification(state: &AppState, account_id: &str, user_id: &str) -> Result<String> {
+    let (config, session) = account_session(state, account_id).await?;
+
+    for old_id in state.runtime.matrix_verification_ids_for_account(account_id) {
+        let _ = cancel(state, account_id, &old_id).await;
+    }
+
+    let whose = UserId::parse(user_id).context("that is not a Matrix address")?;
+    if whose.as_str() == config.user_id {
+        bail!("that is this account - verify one of its sessions instead");
+    }
+    let identity = session
+        .machine
+        .get_identity(&whose, None)
+        .await
+        .context("looking them up")?
+        .and_then(|identity| identity.other())
+        .context("they have no cross-signing identity to verify against")?;
+
+    // The room to carry it, made if there is not one.
+    let buffer_id = super::open_dm(state, account_id, user_id, user_id).await.context("opening a direct message")?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(&buffer_id)
+        .context("that direct message has no room yet - try again in a moment")?;
+    let room = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
+
+    // An ordinary room message, encrypted where the room is: a request to
+    // verify is a message like any other until the other end answers it.
+    let content = serde_json::to_value(identity.verification_request_content(None))
+        .context("building the verification request")?;
+    let event_id = super::send_room_event(state, account_id, &buffer_id, &room_id, content).await?;
+    let event = ruma_common::EventId::parse(&event_id).context("the server returned an event id this client cannot read")?;
+
+    let request = identity.request_verification(&room, &event, None);
+    let flow_id = request.flow_id().as_str().to_string();
+    let v = ActiveVerification {
+        account_id: account_id.to_string(),
+        flow_id: flow_id.clone(),
+        request,
+        sas: None,
+        emoji_emitted: false,
+        done: false,
+    };
+    state.events.emit("matrixVerificationStatus", status_event(&v, "requested"));
+    state.runtime.insert_matrix_verification(&flow_id, v);
+    state.runtime.note_matrix_verification_peer(account_id, user_id);
+    Ok(flow_id)
+}
+
 /// Accepts or declines an incoming verification request (one the *other*
 /// session started - see tick's incoming-request scan below).
 pub async fn respond_to_request(state: &AppState, account_id: &str, verification_id: &str, accept: bool) -> Result<()> {

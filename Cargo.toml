@@ -62,6 +62,11 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # matrix-sdk-crypto, the standalone vodozemac-backed Olm/Megolm state
 # machine matrix-sdk itself uses - see backend/matrix/crypto.rs)
 matrix-sdk-crypto = "0.18"
+# Pinned to exactly what matrix-sdk-crypto 0.18 resolves to, for the same
+# reason the ruma crates below are: this is where its own response types live
+# - the verification state a decrypted message carries among them - and a
+# version skew here is a type mismatch rather than a missing feature.
+matrix-sdk-common = "=0.18.0"
 matrix-sdk-sqlite = { version = "0.18", default-features = false, features = ["crypto-store", "bundled"] }
 # Pinned exactly to whatever matrix-sdk-crypto 0.18.0 itself resolves to
 # (confirmed via `cargo tree -p matrix-sdk-crypto`) - OlmMachine's public

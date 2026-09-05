@@ -735,9 +735,14 @@ async fn handle_timeline_event(
     // reaction can be encrypted too, not just messages) - so the
     // effective type/content used below come from the decrypted envelope
     // when there is one, the outer event otherwise.
+    // Whether the sender's device has been verified, which is only a question
+    // an encrypted message can answer: in a plain room there is no device
+    // claim to judge, so there is nothing to say rather than something bad.
+    let mut sender_verified: Option<bool> = None;
     let (effective_type, mut content, undecryptable): (String, Value, bool) = if outer_type == protocol::EVENT_ROOM_ENCRYPTED {
         match decrypt_event(session, event, room_id).await {
-            Ok(decrypted) => {
+            Ok((decrypted, verified)) => {
+                sender_verified = Some(verified);
                 let t = decrypted["type"].as_str().unwrap_or(protocol::EVENT_ROOM_MESSAGE).to_string();
                 (t, decrypted["content"].clone(), false)
             }
@@ -943,7 +948,23 @@ async fn handle_timeline_event(
         // than rendered here: it is somebody else's markup and the frontend
         // is where the sanitiser lives.
         protocol::formatted_body(&content).map(str::to_string),
-        None,
+        // A mark beside the name where the message came from a device this
+        // account has never verified. Only where there was something to
+        // check - an encrypted message from somebody else - and only when the
+        // answer is no: Element marks the doubtful ones rather than ticking
+        // every ordinary message, and a badge on all of them would say
+        // nothing while taking room from the ones that matter.
+        match sender_verified {
+            Some(false) if sender != own_user_id => Some(model::SenderStyle {
+                color: None,
+                badges: vec![crate::backend::kick::api::Badge {
+                    kind: "unverified".to_string(),
+                    text: "Sent from a device you have not verified".to_string(),
+                    count: None,
+                }],
+            }),
+            _ => None,
+        },
     );
 }
 
@@ -962,9 +983,10 @@ fn handle_redaction(state: &AppState, buffer_id: &str, target_event: &str) {
     state.runtime.delete_message(state, buffer_id, target_event);
 }
 
-async fn decrypt_event(session: &crypto::CryptoSession, event: &Value, room_id: &str) -> Result<Value> {
+/// The plaintext, and whether the device that sent it has been verified.
+async fn decrypt_event(session: &crypto::CryptoSession, event: &Value, room_id: &str) -> Result<(Value, bool)> {
     let room_id = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
-    crypto::decrypt_room_event(session, event, &room_id).await
+    crypto::decrypt_room_event_with_trust(session, event, &room_id).await
 }
 
 /// Turns a media event's `content` into an Attachment, carrying across the
@@ -1760,7 +1782,9 @@ async fn store_thread_event(
     let decrypted;
     let event = if protocol::event_type(event) == protocol::EVENT_ROOM_ENCRYPTED {
         match session {
-            Some(session) => match decrypt_event(session, event, room_id).await.ok() {
+            // The trust half is for the timeline, where a message is drawn
+            // beside a name; here only the plaintext matters.
+            Some(session) => match decrypt_event(session, event, room_id).await.ok().map(|(plain, _)| plain) {
                 Some(plain) => {
                     decrypted = plain;
                     &decrypted
@@ -1834,7 +1858,7 @@ pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit
         let decrypted;
         let event = if protocol::event_type(event) == "m.room.encrypted" {
             let plain = match session.as_ref() {
-                Some(session) => decrypt_event(session, event, &room_id).await.ok(),
+                Some(session) => decrypt_event(session, event, &room_id).await.ok().map(|(plain, _)| plain),
                 None => None,
             };
             match plain {
@@ -3065,7 +3089,54 @@ pub async fn edit_message(state: &AppState, account_id: &str, buffer_id: &str, a
     Ok(())
 }
 
-/// Answers a poll.
+/// Sends one message-shaped event into a room and says what id it got.
+///
+/// Shared by the things that are messages without being chat - so far the
+/// request that opens a verification with somebody. Encrypted where the room
+/// is, for the same reason everything else is: a room that hides what is said
+/// in it should not make an exception for this.
+///
+/// The event id is the return value because these events are referred to
+/// afterwards - a verification is identified by the id of the message that
+/// asked for it.
+pub async fn send_room_event(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    room_id: &str,
+    content: Value,
+) -> Result<String> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, &access_token, room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, protocol::EVENT_ROOM_MESSAGE, content)
+            .await
+            .context("encrypting the message")?;
+        (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
+    } else {
+        (protocol::EVENT_ROOM_MESSAGE.to_string(), content)
+    };
+
+    let txn_id = model::next_message_id();
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
+    );
+    let resp = http::put_json(&url, &access_token, body_json).await.context("sending the message")?;
+    resp["event_id"]
+        .as_str()
+        .map(|id| id.to_string())
+        .context("the server took the message but did not say what id it got")
+}
+
+/// Answers a poll./// Answers a poll.
 ///
 /// The stable spelling is sent, which is what a current Element writes;
 /// everything on the way in is read either way, because a room with older

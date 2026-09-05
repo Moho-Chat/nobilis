@@ -2645,6 +2645,20 @@ pub async fn dispatch(
             }
         },
 
+        // Verifying another person, which is a different gesture from
+        // verifying one of your own sessions: it travels through a direct
+        // message with them, made if there is not one.
+        "startMatrixUserVerification" => {
+            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
+                (Some(a), Some(u)) => (a, u),
+                _ => return (None, Some("startMatrixUserVerification requires \"accountId\" and \"userId\"".to_string())),
+            };
+            match backend::matrix::verification::start_user_verification(state, account_id, user_id).await {
+                Ok(verification_id) => (Some(serde_json::json!({ "verificationId": verification_id })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "startMatrixVerification" => {
             let (account_id, device_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "deviceId")) {
                 (Some(a), Some(d)) => (a, d),
