@@ -1174,6 +1174,70 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
+        // The slash commands this conversation offers, and running one.
+        //
+        // Listed per channel because that is the question with the right
+        // answer: a bot installed across a guild can still be unusable in the
+        // channel somebody is typing in.
+        "listDiscordCommands" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listDiscordCommands requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let query = p_str(params, "query", "");
+            match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "runDiscordCommand" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("runDiscordCommand requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            // The command as Discord described it, handed straight back:
+            // Discord checks it against its own copy and refuses one that has
+            // been rebuilt from the parts a client happened to show.
+            let Some(command) = params.get("command").filter(|c| c.is_object()) else {
+                return (None, Some("runDiscordCommand requires the command it was given".to_string()));
+            };
+            let options = params.get("options").cloned().unwrap_or_else(|| serde_json::json!([]));
+            match backend::discord::run_command(state, &buffer.account_id, buffer_id, command, options).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Pressing a button on a message, or answering one of its menus.
+        "useDiscordComponent" => {
+            let (buffer_id, message_id, custom_id) = match (
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "messageId"),
+                p_str_opt(params, "customId"),
+            ) {
+                (Some(b), Some(m), Some(c)) => (b, m, c),
+                _ => return (None, Some("useDiscordComponent requires \"bufferId\", \"messageId\" and \"customId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let is_select = params.get("select").and_then(|v| v.as_bool()).unwrap_or(false);
+            let values: Vec<String> = params
+                .get("values")
+                .and_then(|v| v.as_array())
+                .map(|vs| vs.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::discord::use_component(state, &buffer.account_id, buffer_id, message_id, custom_id, is_select, values).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Discord's own search, over a whole server rather than this window's
         // copy of one channel.
         //

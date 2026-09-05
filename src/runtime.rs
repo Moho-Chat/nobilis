@@ -347,6 +347,8 @@ pub struct Runtime {
     /// this is the only place that mapping is kept (IRC has no equivalent
     /// need since its buffer name already *is* the protocol target).
     discord_channels: Mutex<HashMap<String, String>>,
+    /// Account id -> the gateway session it is on, for interactions.
+    discord_gateway_sessions: Mutex<HashMap<String, String>>,
     /// Conversations currently ringing this machine, buffer id -> (account,
     /// channel).
     ///
@@ -803,6 +805,7 @@ impl Runtime {
             presence: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
             discord_channels: Mutex::new(HashMap::new()),
+            discord_gateway_sessions: Mutex::new(HashMap::new()),
             ringing_calls: Mutex::new(HashMap::new()),
             buffer_groups: Mutex::new(HashMap::new()),
             discord_guild_id: Mutex::new(HashMap::new()),
@@ -1703,6 +1706,21 @@ impl Runtime {
             .iter()
             .find(|(buffer_id, channel)| channel.as_str() == channel_id && buffer_id.starts_with(&prefix))
             .map(|(buffer_id, _)| buffer_id.clone())
+    }
+
+    /// The gateway session this account is on.
+    ///
+    /// Kept because an interaction - running a slash command, pressing a
+    /// button - has to say which live session it came from, and Discord
+    /// refuses one that names a session it has never heard of. The value is
+    /// only handed out by the gateway at READY, and only to whoever holds the
+    /// socket, so it is remembered here rather than asked for.
+    pub fn set_discord_gateway_session(&self, account_id: &str, session_id: &str) {
+        self.discord_gateway_sessions.lock().unwrap().insert(account_id.to_string(), session_id.to_string());
+    }
+
+    pub fn discord_gateway_session(&self, account_id: &str) -> Option<String> {
+        self.discord_gateway_sessions.lock().unwrap().get(account_id).cloned()
     }
 
     pub fn get_discord_channel(&self, buffer_id: &str) -> Option<String> {
@@ -3148,6 +3166,9 @@ impl Runtime {
 
         let message = Message {
             html: html.clone(),
+            // Filled in by the backend that has them, immediately after this
+            // returns - only Discord has any, and it is the one that knows.
+            components: Vec::new(),
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),

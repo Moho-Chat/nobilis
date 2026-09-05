@@ -2477,6 +2477,7 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             tracing::warn!("discord: storing history message: {e}");
             continue;
         }
+        note_components(state, buffer_id, msg_id, msg);
         // Backfilled messages need previews as much as live ones do - more so,
         // since a channel read for the first time is all history and none of it
         // would otherwise survive its links expiring.
@@ -2681,6 +2682,403 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
 ///
 /// Returns when the message was sent, which is what a client needs to go and
 /// read it out of the store.
+/// The buttons and menus on a message, in this client's own shape.
+///
+/// Discord lays them out in rows of up to five; the row is kept so a client
+/// can draw them as they were arranged rather than as one long line, and the
+/// type numbers are turned into words on the way through - a frontend should
+/// not have to know that 2 means button.
+fn extract_components(msg: &Value) -> Vec<model::Component> {
+    let Some(rows) = msg["components"].as_array() else { return Vec::new() };
+    let mut out = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        // A row is itself a component (type 1) holding the real ones. A
+        // message whose top level is already a control is not a shape Discord
+        // sends, but reading it either way costs nothing.
+        let children = row["components"].as_array().cloned().unwrap_or_else(|| vec![row.clone()]);
+        for child in children {
+            let kind = match child["type"].as_i64() {
+                Some(2) => "button",
+                // 3 is the plain string select; 5 through 8 are the ones that
+                // pick users, roles, mentionables and channels. They are all
+                // menus, and all of them answer the same way.
+                Some(3) | Some(5) | Some(6) | Some(7) | Some(8) => "select",
+                _ => continue,
+            };
+            let style = child["style"].as_i64().map(|s| match s {
+                1 => "primary",
+                2 => "secondary",
+                3 => "success",
+                4 => "danger",
+                5 => "link",
+                _ => "secondary",
+            });
+            let options = child["options"]
+                .as_array()
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| {
+                            Some(model::ComponentOption {
+                                value: o["value"].as_str()?.to_string(),
+                                label: o["label"].as_str().unwrap_or_default().to_string(),
+                                description: o["description"].as_str().map(str::to_string),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(model::Component {
+                kind: kind.to_string(),
+                custom_id: child["custom_id"].as_str().map(str::to_string),
+                label: child["label"].as_str().filter(|l| !l.is_empty()).map(str::to_string),
+                style: style.map(str::to_string),
+                url: child["url"].as_str().map(str::to_string),
+                disabled: child["disabled"].as_bool().unwrap_or(false),
+                // Written the way this client writes emoji everywhere else, so
+                // a button's picture renders like one in a message does.
+                emoji: match (child["emoji"]["name"].as_str(), child["emoji"]["id"].as_str()) {
+                    (Some(name), Some(id)) => Some(format!("<:{name}:{id}>")),
+                    (Some(name), None) => Some(name.to_string()),
+                    _ => None,
+                },
+                options,
+                placeholder: child["placeholder"].as_str().map(str::to_string),
+                row: row_index as i64,
+            });
+        }
+    }
+    out
+}
+
+/// Stores a message's buttons and tells the client, if it has any.
+///
+/// Separate from the message itself because they arrive with it and are
+/// written a moment later - see Store::set_components - and because a message
+/// that gains or loses its buttons in an edit has to be able to say so.
+fn note_components(state: &AppState, buffer_id: &str, msg_id: &str, msg: &Value) {
+    let components = extract_components(msg);
+    if components.is_empty() {
+        return;
+    }
+    if let Err(e) = state.store.set_components(buffer_id, msg_id, &components) {
+        tracing::debug!("discord: keeping the buttons on {msg_id}: {e:#}");
+        return;
+    }
+    state.events.emit(
+        "messageComponents",
+        json!({ "bufferId": buffer_id, "messageId": msg_id, "components": components }),
+    );
+}
+
+#[cfg(test)]
+mod component_tests {
+    use super::extract_components;
+    use serde_json::json;
+
+    /// A message as Discord sends one: rows holding the controls, with the
+    /// type numbers and style numbers this client turns into words.
+    fn message() -> serde_json::Value {
+        json!({
+            "components": [
+                { "type": 1, "components": [
+                    { "type": 2, "style": 1, "label": "Accept", "custom_id": "accept" },
+                    { "type": 2, "style": 4, "label": "Decline", "custom_id": "decline", "disabled": true },
+                    { "type": 2, "style": 5, "label": "Read the rules", "url": "https://example.com/rules" }
+                ]},
+                { "type": 1, "components": [
+                    { "type": 3, "custom_id": "role", "placeholder": "Pick a role", "options": [
+                        { "label": "Red", "value": "red", "description": "the red one" },
+                        { "label": "Blue", "value": "blue" }
+                    ]}
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn buttons_and_menus_come_out_named_rather_than_numbered() {
+        let out = extract_components(&message());
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0].kind, "button");
+        assert_eq!(out[0].label.as_deref(), Some("Accept"));
+        assert_eq!(out[0].style.as_deref(), Some("primary"));
+        assert_eq!(out[0].custom_id.as_deref(), Some("accept"));
+        assert_eq!(out[1].style.as_deref(), Some("danger"));
+        assert!(out[1].disabled);
+        assert_eq!(out[2].style.as_deref(), Some("link"));
+        assert_eq!(out[2].url.as_deref(), Some("https://example.com/rules"));
+        assert_eq!(out[3].kind, "select");
+        assert_eq!(out[3].placeholder.as_deref(), Some("Pick a role"));
+        assert_eq!(out[3].options.len(), 2);
+        assert_eq!(out[3].options[0].value, "red");
+        assert_eq!(out[3].options[0].description.as_deref(), Some("the red one"));
+    }
+
+    /// The rows are kept, because how they were laid out is something the bot
+    /// meant: five on one line and one below is not the same as six in a row.
+    #[test]
+    fn the_rows_survive() {
+        let out = extract_components(&message());
+        assert_eq!(out[0].row, 0);
+        assert_eq!(out[2].row, 0);
+        assert_eq!(out[3].row, 1);
+    }
+
+    #[test]
+    fn a_custom_emoji_is_written_the_way_this_client_writes_them() {
+        let msg = json!({ "components": [{ "type": 1, "components": [
+            { "type": 2, "style": 2, "custom_id": "a", "emoji": { "name": "pepe", "id": "12345" } },
+            { "type": 2, "style": 2, "custom_id": "b", "emoji": { "name": "👍" } }
+        ]}]});
+        let out = extract_components(&msg);
+        assert_eq!(out[0].emoji.as_deref(), Some("<:pepe:12345>"));
+        assert_eq!(out[1].emoji.as_deref(), Some("👍"));
+    }
+
+    /// Discord keeps adding component types. One this client has never heard
+    /// of is skipped rather than drawn as an empty button.
+    #[test]
+    fn a_kind_this_does_not_know_is_left_alone() {
+        let msg = json!({ "components": [{ "type": 1, "components": [
+            { "type": 4, "custom_id": "text-input" },
+            { "type": 2, "style": 2, "label": "Real", "custom_id": "real" }
+        ]}]});
+        let out = extract_components(&msg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].label.as_deref(), Some("Real"));
+    }
+
+    /// The menus that pick people, roles and channels are menus too - they
+    /// carry no options of their own, since the service fills them in.
+    #[test]
+    fn the_other_kinds_of_menu_are_menus() {
+        for kind in [5, 6, 7, 8] {
+            let msg = json!({ "components": [{ "type": 1, "components": [
+                { "type": kind, "custom_id": "pick", "placeholder": "Choose" }
+            ]}]});
+            let out = extract_components(&msg);
+            assert_eq!(out.len(), 1, "type {kind}");
+            assert_eq!(out[0].kind, "select", "type {kind}");
+        }
+    }
+
+    #[test]
+    fn a_message_with_nothing_on_it_has_nothing_on_it() {
+        assert!(extract_components(&json!({})).is_empty());
+        assert!(extract_components(&json!({ "components": [] })).is_empty());
+    }
+}
+
+/// The slash commands this conversation offers.
+///
+/// Asked of Discord per channel rather than per guild, because that is the
+/// question with the right answer: a bot can be installed guild-wide and
+/// still be unusable in the channel somebody is typing in, and the same
+/// endpoint is what Discord's own client asks when a `/` is typed.
+pub async fn list_commands(state: &AppState, account_id: &str, buffer_id: &str, query: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let mut params: Vec<(&str, String)> = vec![
+        // Type 1 is a slash command. The other two - the ones on the
+        // right-click menus for a message or a person - have nowhere to be
+        // offered from here.
+        ("type", "1".to_string()),
+        ("include_applications", "true".to_string()),
+        ("limit", "25".to_string()),
+    ];
+    if !query.is_empty() {
+        params.push(("query", query.to_string()));
+    }
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/application-commands/search"))
+        .query(&params)
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading the commands")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading the commands"));
+    }
+    let answer: Value = resp.json().await.context("reading the commands")?;
+
+    // Which bot each command belongs to, so the list can say who answers it -
+    // two servers commonly have a /ban that does different things.
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for app in answer["applications"].as_array().cloned().unwrap_or_default() {
+        if let (Some(id), Some(name)) = (app["id"].as_str(), app["name"].as_str()) {
+            names.insert(id.to_string(), name.to_string());
+        }
+    }
+    let commands: Vec<Value> = answer["application_commands"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|command| {
+            let application_id = command["application_id"].as_str().unwrap_or_default().to_string();
+            json!({
+                "id": command["id"],
+                "name": command["name"],
+                "description": command["description"],
+                "applicationId": application_id,
+                "application": names.get(&application_id),
+                // Discord wants the command handed back to it as it was given,
+                // so it travels to the client and back rather than being
+                // rebuilt from the parts this list happens to show.
+                "command": command,
+            })
+        })
+        .collect();
+    Ok(json!({ "commands": commands }))
+}
+
+/// Runs a slash command, or presses something on a message.
+///
+/// One function because Discord has one endpoint: an interaction says what
+/// kind it is and carries the data for that kind. Both need the gateway
+/// session id, which is Discord's way of asking that the thing doing this be
+/// a client somebody is actually using.
+async fn interact(state: &AppState, account_id: &str, buffer_id: &str, kind: i64, application_id: &str, data: Value) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let session_id = state
+        .runtime
+        .discord_gateway_session(account_id)
+        .context("this account is not connected to Discord right now")?;
+    let mut payload = json!({
+        "type": kind,
+        "application_id": application_id,
+        "channel_id": channel_id,
+        "session_id": session_id,
+        "data": data,
+        // Discord dedupes on this, the same way it does for a message.
+        "nonce": snowflake_at(chrono::Utc::now().timestamp()),
+    });
+    if let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) {
+        payload["guild_id"] = json!(guild_id);
+    }
+    let resp = http_client()
+        .post(format!("{API_BASE}/interactions"))
+        .header("Authorization", &cfg.token)
+        .json(&payload)
+        .send()
+        .await
+        .context("sending the interaction")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "sending that"));
+    }
+    // Nothing comes back but a 204: whatever the bot does about it arrives as
+    // an ordinary message, or as an edit to the one that was pressed.
+    Ok(())
+}
+
+/// Runs one of the commands `list_commands` offered.
+pub async fn run_command(state: &AppState, account_id: &str, buffer_id: &str, command: &Value, options: Value) -> Result<()> {
+    let application_id = command["application_id"].as_str().context("that command says which bot it belongs to")?;
+    let data = json!({
+        "version": command["version"],
+        "id": command["id"],
+        "name": command["name"],
+        "type": command["type"],
+        "options": options,
+        // Handed back as it was given. Discord validates the command against
+        // its own copy and refuses a description that does not match.
+        "application_command": command,
+        "attachments": [],
+    });
+    interact(state, account_id, buffer_id, 2, application_id, data).await
+}
+
+/// Presses a button, or answers a menu.
+pub async fn use_component(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    message_id: &str,
+    custom_id: &str,
+    is_select: bool,
+    values: Vec<String>,
+) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    // Which bot to tell is on the message that carries the control, not on
+    // the control itself - so it is read from the message rather than guessed.
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("finding out whose button that is")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "finding out whose button that is"));
+    }
+    let message: Value = resp.json().await.context("reading that message")?;
+    let application_id = message["application_id"]
+        .as_str()
+        .or_else(|| message["author"]["id"].as_str())
+        .context("that message does not say which bot posted it")?
+        .to_string();
+
+    let mut data = json!({
+        // 2 is a button and 3 a menu, which is the one place these numbers
+        // have to survive: Discord reads them back.
+        "component_type": if is_select { 3 } else { 2 },
+        "custom_id": custom_id,
+    });
+    if is_select {
+        data["values"] = json!(values);
+    }
+    interact_with_message(state, account_id, buffer_id, &application_id, data, message_id).await
+}
+
+/// The same as `interact`, naming the message a control belongs to.
+async fn interact_with_message(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    application_id: &str,
+    data: Value,
+    message_id: &str,
+) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let session_id = state
+        .runtime
+        .discord_gateway_session(account_id)
+        .context("this account is not connected to Discord right now")?;
+    let mut payload = json!({
+        "type": 3,
+        "application_id": application_id,
+        "channel_id": channel_id,
+        "message_id": message_id,
+        "session_id": session_id,
+        "data": data,
+        "nonce": snowflake_at(chrono::Utc::now().timestamp()),
+    });
+    if let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) {
+        payload["guild_id"] = json!(guild_id);
+    }
+    let resp = http_client()
+        .post(format!("{API_BASE}/interactions"))
+        .header("Authorization", &cfg.token)
+        .json(&payload)
+        .send()
+        .await
+        .context("sending the interaction")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "pressing that"));
+    }
+    Ok(())
+}
+
 /// Everything a Discord search can be narrowed by.
 ///
 /// One struct rather than a pile of arguments because the client sends them
@@ -3249,6 +3647,9 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         // What a later reconnect needs to pick this session
                         // back up rather than starting over.
                         if let Some(session_id) = d["session_id"].as_str() {
+                            // Also what an interaction has to name - see
+                            // Runtime::set_discord_gateway_session.
+                            state.runtime.set_discord_gateway_session(&account_id, session_id);
                             *resume = Some(Resume {
                                 session_id: session_id.to_string(),
                                 url: d["resume_gateway_url"]
@@ -3604,6 +4005,13 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         // lookup asks Discord about - a display name is not something
                         // the API accepts - and what a moderation action would need.
                         state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
+                        // The buttons under it, if it has any. After the
+                        // message rather than with it: they are written onto
+                        // the row that was just made, and a great many bot
+                        // messages are nothing but their buttons.
+                        if let Some(id) = d["id"].as_str() {
+                            note_components(state, &thumb_target.0, id, d);
+                        }
                         if !thumb_target.1.is_empty() {
                             cache_thumbnails(state.clone(), thumb_target.0, thumb_target.1, thumb_target.2);
                         }
@@ -3638,6 +4046,9 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);
+                        // A bot editing its own message routinely swaps the
+                        // buttons - a poll that closes, a page that turns.
+                        note_components(state, &buffer_id, msg_id, d);
                     }
                     "MESSAGE_DELETE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
@@ -4522,6 +4933,7 @@ mod tests {
             id: id.into(),
             buffer_id: "b".into(),
             html: None,
+            components: Vec::new(),
             sender_color: None,
             badges: Vec::new(),
             from: "x".into(),

@@ -115,6 +115,11 @@ impl Store {
             // separate rather than replacing body: the plain text is the
             // fallback every other protocol uses and the one search reads.
             "ALTER TABLE messages ADD COLUMN html TEXT",
+            // Buttons and menus on a message. Kept rather than shown live and
+            // forgotten: a role picker or a ticket panel is posted once and
+            // pressed for months, so a client that lost them on restart would
+            // be showing a message whose whole point had gone.
+            "ALTER TABLE messages ADD COLUMN components TEXT NOT NULL DEFAULT '[]'",
             // Which kind of conversation this was said in.
             //
             // Buffers live only as long as the daemon does - they are rebuilt
@@ -441,6 +446,7 @@ impl Store {
         let mut attachments: Vec<Attachment> = serde_json::from_str(&json_column("attachments")).unwrap_or_default();
         drop_missing_local_copies(&mut attachments);
         let badges = serde_json::from_str(&json_column("badges")).unwrap_or_default();
+        let components = serde_json::from_str(&json_column("components")).unwrap_or_default();
         Ok(Message {
             id: row.get::<_, Option<String>>("msg_id")?.unwrap_or_default(),
             buffer_id: buffer_id.to_string(),
@@ -461,6 +467,7 @@ impl Store {
             sender_color: row.get("sender_color")?,
             badges,
             html: row.get("html")?,
+            components,
         })
     }
 
@@ -468,7 +475,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -477,6 +484,26 @@ impl Store {
         let mut out: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
         out.reverse();
         Ok(out)
+    }
+
+    /// Puts the buttons and menus on a message that already exists.
+    ///
+    /// Its own call rather than another argument to `append_message`, which
+    /// takes nineteen already: these belong to one service, are written by
+    /// that service's backend immediately after the message lands, and adding
+    /// a twentieth parameter would make every other backend say "no
+    /// components" in a language none of them speak.
+    pub fn set_components(&self, buffer_id: &str, msg_id: &str, components: &[crate::model::Component]) -> Result<()> {
+        if components.is_empty() {
+            return Ok(());
+        }
+        let json = serde_json::to_string(components)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET components = ?3 WHERE buffer_id = ?1 AND msg_id = ?2",
+            params![buffer_id, msg_id, json],
+        )?;
+        Ok(())
     }
 
     /// Who somebody is, from the last thing they said.
@@ -506,7 +533,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2
              ORDER BY ts ASC LIMIT ?3",
@@ -525,7 +552,7 @@ impl Store {
     pub fn messages_around(&self, buffer_id: &str, ts: i64, span: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let span = if span > 0 { span } else { 50 };
-        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread";
+        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components";
 
         let mut older = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
@@ -571,7 +598,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -708,7 +735,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -773,7 +800,7 @@ impl Store {
     pub fn thread_messages(&self, buffer_id: &str, root_id: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components
              FROM messages
              WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR msg_id = ?2)
              ORDER BY ts ASC, rowid ASC",
@@ -785,7 +812,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, components
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;

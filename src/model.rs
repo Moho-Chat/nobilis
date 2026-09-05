@@ -298,6 +298,58 @@ pub struct Embed {
     pub url: Option<String>,
 }
 
+/// Something on a message that can be pressed.
+///
+/// Discord's own name for these is components, and a great many servers now
+/// work through them: a bot posts a message and the thing it is for is the
+/// button underneath, not the words. A client that draws only the words shows
+/// half of what was sent - a role picker with no roles, a ticket panel with no
+/// way to open a ticket.
+///
+/// Deliberately not modelled after Discord's wire shape. Their type numbers
+/// (2 is a button, 3 is a select) mean nothing to a frontend and would leak an
+/// integer nobody can read into every other protocol that grows the same idea.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Component {
+    /// "button" or "select".
+    pub kind: String,
+    /// What the service calls this control, sent back when it is used. A link
+    /// button has none: pressing it opens a page rather than telling anybody.
+    #[serde(rename = "customId", skip_serializing_if = "Option::is_none")]
+    pub custom_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// primary, secondary, success, danger or link - which is what the colour
+    /// means, rather than the number the service sends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    /// Where a link button goes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub disabled: bool,
+    /// The emoji on the button, as this client writes emoji elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    /// What a select offers. Empty for a button.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ComponentOption>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Which row it was on, so a client can draw them as they were laid out.
+    #[serde(default)]
+    pub row: i64,
+}
+
+/// One choice in a select menu.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ComponentOption {
+    pub value: String,
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
 /// A file attached to a message, described rather than inlined.
 ///
 /// Modelled on how Matrix itself carries media and how matrix-rust-sdk hands
@@ -424,6 +476,9 @@ pub struct Message {
     /// what search reads.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub html: Option<String>,
+    /// Buttons and menus on the message, where the service has them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<Component>,
 }
 
 pub fn buffer_id(account_id: &str, name: &str) -> String {
