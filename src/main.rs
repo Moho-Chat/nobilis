@@ -1,5 +1,6 @@
 mod accounts;
 mod backend;
+mod commands;
 mod events;
 mod highlights;
 mod ipc;

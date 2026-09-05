@@ -2980,6 +2980,31 @@ pub async fn list_commands(state: &AppState, account_id: &str, buffer_id: &str, 
     Ok(json!({ "commands": commands }))
 }
 
+/// What goes after a command's name, written the way a manual page would.
+///
+/// Built from the command's own description of its arguments, because that is
+/// the only place it exists: `/wordle` and `/ban somebody [reason]` are the
+/// same kind of line to a menu, and one of them has to be assembled.
+pub fn command_usage(command: &Value) -> String {
+    let Some(options) = command["options"].as_array() else { return String::new() };
+    options
+        .iter()
+        // Subcommands and groups are a menu of their own rather than an
+        // argument, and writing them as one would promise something this
+        // client cannot yet do.
+        .filter(|o| !matches!(o["type"].as_i64(), Some(1) | Some(2)))
+        .map(|o| {
+            let name = o["name"].as_str().unwrap_or("arg");
+            if o["required"].as_bool().unwrap_or(false) {
+                format!("<{name}>")
+            } else {
+                format!("[{name}]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Runs a slash command, or presses something on a message.
 ///
 /// One function because Discord has one endpoint: an interaction says what

@@ -1197,7 +1197,69 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
-        // The slash commands this conversation offers, and running one.
+        // Every command that can be typed here, whoever implements it.
+        //
+        // One list rather than one per source: somebody typing a slash wants
+        // to know what happens next, and whether the answer is this daemon's
+        // own parser or a bot a server installed is not a distinction they
+        // are asking about. The menu says which anyway, on the right, the way
+        // Discord's own does.
+        //
+        // Built-ins are matched here rather than in the client for the reason
+        // the table is here at all: the commands belong to the daemon, and a
+        // second matcher in a window would be a second thing to keep in step.
+        "listCommands" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listCommands requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let query = p_str(params, "query", "");
+            let service = crate::model::service_of(&buffer.account_id);
+            let mut out: Vec<serde_json::Value> = crate::commands::matching(service, query)
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "usage": c.usage,
+                        "description": c.description,
+                        "source": "Built-in",
+                        "kind": "builtin",
+                    })
+                })
+                .collect();
+
+            // And whatever this channel's bots offer, which only Discord has.
+            // Its own search does the matching, so a query no built-in
+            // answers can still be answered here.
+            if service == "discord" {
+                match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
+                    Ok(answer) => {
+                        if let Some(rows) = answer["commands"].as_array() {
+                            for row in rows {
+                                out.push(serde_json::json!({
+                                    "name": row["name"],
+                                    "usage": backend::discord::command_usage(&row["command"]),
+                                    "description": row["description"],
+                                    "source": row["application"].as_str().unwrap_or("Application"),
+                                    "kind": "application",
+                                    "command": row["command"],
+                                }));
+                            }
+                        }
+                    }
+                    // Not an error: a channel whose bots cannot be asked
+                    // about still has the built-ins, and a menu that refused
+                    // to open because one half of it failed would be worse
+                    // than a menu missing that half.
+                    Err(e) => tracing::debug!("discord: listing commands: {e:#}"),
+                }
+            }
+            (Some(serde_json::json!({ "commands": out })), None)
+        }
+
+        // The slash commands a channel's own bots offer, on their own.
         //
         // Listed per channel because that is the question with the right
         // answer: a bot installed across a guild can still be unusable in the
