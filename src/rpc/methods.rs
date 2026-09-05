@@ -2083,19 +2083,46 @@ pub async fn dispatch(
             // there is. A person with a single Sneedchat account should not
             // have to say which - and a person with several must.
             let existing = state.accounts.all_sneedchat();
-            let config = match p_str_opt(params, "accountId") {
-                Some(id) => state.accounts.get_sneedchat(id),
-                None => match existing.len() {
-                    1 => existing.into_iter().next(),
+            let named = p_str_opt(params, "accountId").and_then(|id| state.accounts.get_sneedchat(id));
+            // Who the browser says just signed in. It is also how an account
+            // is found when the window is the only thing that has ever known
+            // this person's name - which, with the login form gone, it is.
+            let signed_in_as = p_str_opt(params, "username").map(str::trim).filter(|u| !u.is_empty());
+            let config = named
+                .or_else(|| signed_in_as.and_then(|u| state.accounts.get_sneedchat(&format!("sneedchat:{u}"))))
+                .or_else(|| match existing.len() {
+                    1 => existing.first().cloned(),
                     _ => None,
+                });
+            let mut config = match (config, signed_in_as) {
+                (Some(found), _) => found,
+                // Nobody to attach this to, but the site said who it is - so
+                // the account is made here rather than demanded first. This
+                // is the whole of adding a Sneedchat account now: the form
+                // that used to take a password cannot get anybody in.
+                (None, Some(username)) => crate::accounts::SneedChatAccountConfig {
+                    username: username.to_string(),
+                    password: String::new(),
+                    totp_secret: None,
+                    host: backend::sneedchat::DEFAULT_ONION.to_string(),
+                    tor_mode: "embedded".to_string(),
+                    proxy: None,
+                    rooms: Vec::new(),
+                    display_name: None,
+                    user_id: None,
+                    cookies: Default::default(),
                 },
+                (None, None) => {
+                    return (
+                        None,
+                        Some("could not tell who signed in - add the account first, then sign in again".to_string()),
+                    )
+                }
             };
-            let Some(mut config) = config else {
-                return (
-                    None,
-                    Some("add the Sneedchat account first, then sign in with a browser".to_string()),
-                );
-            };
+            // Deliberately not renamed to match whoever the browser signed in
+            // as: an existing account's id is derived from its name, so a
+            // rename here would leave the old account behind and quietly
+            // start a second one beside it.
             config.cookies = cookies;
             let account_id = config.account_id();
             if let Err(e) = state.accounts.add_sneedchat(config.clone()) {
