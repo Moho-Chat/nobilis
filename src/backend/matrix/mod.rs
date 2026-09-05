@@ -3773,6 +3773,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -3888,6 +3889,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -3997,6 +3999,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
 
         let config_a = MatrixAccountConfig {
@@ -4151,6 +4154,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -4304,6 +4308,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
 
         let config = MatrixAccountConfig {

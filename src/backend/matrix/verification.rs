@@ -536,6 +536,7 @@ mod tests {
             voice: Arc::new(crate::backend::discord_voice::VoiceState::new()),
             voice_prefs: Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            highlights: Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
         };
         let config = MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),

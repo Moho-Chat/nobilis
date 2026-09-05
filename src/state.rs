@@ -31,4 +31,8 @@ pub struct AppState {
     /// so a deliberate mute is still in force after a restart.
     pub voice_prefs: Arc<crate::backend::audio::VoicePrefsStore>,
     pub dcc_prefs: Arc<crate::backend::irc_dcc::DccPrefsStore>,
+    /// The words that make a message worth being told about, besides your
+    /// name. Here rather than in a window because this is where a message is
+    /// decided to be a highlight - see highlights.rs.
+    pub highlights: Arc<crate::highlights::HighlightStore>,
 }

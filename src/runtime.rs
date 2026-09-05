@@ -665,6 +665,48 @@ fn mentions_the_room(service: &str, body: &str) -> bool {
     words.iter().any(|word| lower.contains(word))
 }
 
+/// Whether a message contains one of the words somebody asked to be told
+/// about.
+///
+/// Whole words, case-insensitively: "cat" does not match "catalogue", and a
+/// keyword that matched inside longer words would light up half a busy
+/// channel and be turned off within the hour. The boundary test is the same
+/// one `rename_own_mentions` uses below, because a name is exactly the sort
+/// of thing people put in this list and it has to behave the same way in both
+/// places.
+///
+/// A keyword of several words matches as the phrase, with a boundary at each
+/// end - "release day" is a thing worth being told about and is two words.
+fn matches_keyword(body: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() || body.is_empty() {
+        return false;
+    }
+    // The same "not a boundary" test as the rename below: nick punctuation
+    // counts as part of a word, or `some_word` would match `some`.
+    let joined = |c: char| c.is_alphanumeric() || "_-[]{}\\^|`".contains(c);
+    let lower_body = body.to_lowercase();
+    keywords.iter().any(|keyword| {
+        let keyword = keyword.trim().to_lowercase();
+        if keyword.is_empty() {
+            return false;
+        }
+        let mut at = 0;
+        while let Some(hit) = lower_body[at..].find(&keyword) {
+            let start = at + hit;
+            let end = start + keyword.len();
+            let before = lower_body[..start].chars().next_back();
+            let after = lower_body[end..].chars().next();
+            if !before.is_some_and(joined) && !after.is_some_and(joined) {
+                return true;
+            }
+            // Inside a longer word. Carry on past this one rather than
+            // giving up: the same word may appear again on its own.
+            at = end;
+        }
+        false
+    })
+}
+
 /// A mention of you, written the way you asked to be called.
 ///
 /// The rename is a local one - no service is told about it - so a message
@@ -846,6 +888,10 @@ impl Runtime {
             if let Some(nick) = self.irc_current_nick(&account.id).or_else(|| self.own_identity(&account.id)) {
                 account.current_nick = nick;
             }
+            // This account's own words, not the global ones: the field this
+            // fills edits one account's list, and showing everybody's words
+            // in it would mean saving them onto this account as well.
+            account.highlight_keywords = state.highlights.account(&account.id);
         }
         out
     }
@@ -3028,7 +3074,11 @@ impl Runtime {
             // addressed. Only where the service acts on the word: "@everyone"
             // on IRC is somebody typing a phrase, and highlighting it would be
             // this client inventing a mention the network does not have.
-            || (from != own_nick && mentions_the_room(model::service_of(account_id), body));
+            || (from != own_nick && mentions_the_room(model::service_of(account_id), body))
+            // And the words somebody asked to be told about, which is the
+            // same question asked about a different list - your name is
+            // simply the one word everybody has.
+            || (from != own_nick && matches_keyword(body, &state.highlights.for_account(account_id)));
         let is_own = !own_nick.is_empty() && from == own_nick;
         // Everything above this line reads the real nick, and everything
         // below it reads what you asked to be called. The order is the whole
@@ -3440,6 +3490,65 @@ mod invite_tests {
         assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
         assert!(!runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
         assert_eq!(runtime.matrix_invites("matrix:@me:example.org").len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod keyword_tests {
+    use super::matches_keyword;
+
+    fn words(list: &[&str]) -> Vec<String> {
+        list.iter().map(|w| w.to_string()).collect()
+    }
+
+    #[test]
+    fn a_word_on_its_own_counts() {
+        assert!(matches_keyword("has anyone tried moho yet", &words(&["moho"])));
+        assert!(matches_keyword("moho", &words(&["moho"])));
+        assert!(matches_keyword("what about moho?", &words(&["moho"])));
+    }
+
+    /// The rule that decides whether this is usable at all: a keyword that
+    /// matched inside longer words would light up half a busy channel.
+    #[test]
+    fn a_word_inside_another_word_does_not() {
+        assert!(!matches_keyword("the catalogue is out", &words(&["cat"])));
+        assert!(!matches_keyword("mohogany table", &words(&["moho"])));
+        assert!(!matches_keyword("some_word", &words(&["some"])));
+    }
+
+    /// And the same word said properly later in the message still counts.
+    #[test]
+    fn one_bad_match_does_not_hide_a_good_one() {
+        assert!(matches_keyword("the catalogue, and also the cat", &words(&["cat"])));
+    }
+
+    #[test]
+    fn case_is_not_part_of_the_question() {
+        assert!(matches_keyword("MOHO shipped", &words(&["moho"])));
+        assert!(matches_keyword("moho shipped", &words(&["MoHo"])));
+    }
+
+    #[test]
+    fn a_keyword_can_be_a_phrase() {
+        assert!(matches_keyword("is it release day yet", &words(&["release day"])));
+        assert!(!matches_keyword("release something", &words(&["release day"])));
+    }
+
+    #[test]
+    fn nothing_asked_for_never_matches() {
+        assert!(!matches_keyword("anything at all", &[]));
+        assert!(!matches_keyword("anything at all", &words(&["", "   "])));
+        assert!(!matches_keyword("", &words(&["moho"])));
+    }
+
+    /// Punctuation is not part of a word, so a keyword still counts when it
+    /// is the thing being asked about.
+    #[test]
+    fn punctuation_around_a_word_is_not_part_of_it() {
+        assert!(matches_keyword("(moho)", &words(&["moho"])));
+        assert!(matches_keyword("moho: any news", &words(&["moho"])));
+        assert!(matches_keyword("@moho", &words(&["moho"])));
     }
 }
 

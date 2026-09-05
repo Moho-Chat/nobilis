@@ -1,6 +1,7 @@
 mod accounts;
 mod backend;
 mod events;
+mod highlights;
 mod ipc;
 mod model;
 mod net;
@@ -210,6 +211,7 @@ async fn main() -> Result<()> {
         voice: Arc::new(backend::discord_voice::VoiceState::new()),
         voice_prefs: Arc::new(backend::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
         dcc_prefs: Arc::new(backend::irc_dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
+        highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
     };
 
     // Reconnect every saved account, same as

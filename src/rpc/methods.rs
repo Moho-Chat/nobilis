@@ -384,6 +384,11 @@ pub async fn dispatch(
                 // Its guilds would otherwise stay in the rail with nothing
                 // under them.
                 state.runtime.clear_buffer_groups_for_account(id);
+                // Its highlight words live in their own file rather than on
+                // the account, so removing the account has to say so - or
+                // they would come back with an account added under the same
+                // name later.
+                state.highlights.forget(id);
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
@@ -455,6 +460,37 @@ pub async fn dispatch(
             None => (None, Some("no such account".to_string())),
             Some(id) => account_mutation_result(state.accounts.set_nickserv_password(id, p_str(params, "password", ""))),
         },
+
+        // The words that count besides your name.
+        //
+        // Global ones and one account's own are the same call with and
+        // without an account: they are the same kind of thing, and a message
+        // only has to match one of them.
+        "getHighlightKeywords" => (
+            Some(serde_json::json!({ "global": state.highlights.global() })),
+            None,
+        ),
+
+        "setHighlightKeywords" => {
+            let Some(words) = params.get("keywords").and_then(|v| v.as_array()) else {
+                return (None, Some("setHighlightKeywords requires \"keywords\"".to_string()));
+            };
+            let words: Vec<String> = words.iter().filter_map(|w| w.as_str().map(str::to_string)).collect();
+            match p_str_opt(params, "accountId").filter(|id| !id.is_empty()) {
+                Some(account_id) => {
+                    if state.runtime.list_accounts(state).iter().all(|a| a.id != account_id) {
+                        return (None, Some("no such account".to_string()));
+                    }
+                    // No event: the account carries its own words, and the
+                    // client re-reads the accounts after a change it made -
+                    // which is how every other per-account setting here
+                    // finds its way back onto the screen.
+                    state.highlights.set_account(account_id, words);
+                }
+                None => state.highlights.set_global(words),
+            }
+            (Some(serde_json::json!({ "global": state.highlights.global() })), None)
+        }
 
         "setAccountDisplayName" => match p_str_opt(params, "accountId") {
             None => (None, Some("no such account".to_string())),

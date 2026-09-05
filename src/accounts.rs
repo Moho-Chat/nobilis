@@ -778,6 +778,9 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         // Filled in by Runtime::list_accounts, which is the only place that
         // can see a live connection.
         current_nick: String::new(),
+        // Filled in by Runtime::list_accounts, which can see the store these
+        // live in; the constructors here only ever see one account's config.
+        highlight_keywords: Vec::new(),
         ssl: a.ssl,
         has_password: a.password.as_deref().is_some_and(|p| !p.is_empty()),
         avatar_url: None,
@@ -807,6 +810,9 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
+        // Filled in by Runtime::list_accounts, which can see the store these
+        // live in; the constructors here only ever see one account's config.
+        highlight_keywords: Vec::new(),
         ssl: true,
         has_password: !a.token.is_empty(),
         avatar_url: a.avatar_url.clone(),
@@ -835,6 +841,9 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
+        // Filled in by Runtime::list_accounts, which can see the store these
+        // live in; the constructors here only ever see one account's config.
+        highlight_keywords: Vec::new(),
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
@@ -872,6 +881,9 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
+        // Filled in by Runtime::list_accounts, which can see the store these
+        // live in; the constructors here only ever see one account's config.
+        highlight_keywords: Vec::new(),
         ssl: true,
         has_password: a.token.as_deref().is_some_and(|t| !t.is_empty()),
         avatar_url: None,
@@ -904,6 +916,9 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
+        // Filled in by Runtime::list_accounts, which can see the store these
+        // live in; the constructors here only ever see one account's config.
+        highlight_keywords: Vec::new(),
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,

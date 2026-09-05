@@ -33,6 +33,11 @@ pub struct Account {
     /// file on the machine the daemon is running on rather than this one.
     #[serde(rename = "hasSaslCertificate")]
     pub has_sasl_certificate: bool,
+    /// The words that make a message here worth being told about, besides
+    /// this account's own name. Reported with the account so the field that
+    /// edits them can be filled in without a second question.
+    #[serde(rename = "highlightKeywords", default)]
+    pub highlight_keywords: Vec<String>,
     /// The nick this account is actually using right now.
     ///
     /// Not the same as the configured one: a session that landed on the alt
