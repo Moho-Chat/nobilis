@@ -1284,6 +1284,11 @@ fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serd
     // left - which is exactly what a poll timer must never do.
     let card = card.map(|mut card| {
         card["asOf"] = serde_json::json!(now_secs());
+        // Which conversation it belongs to, stamped here rather than by each
+        // builder: a card read back out of storage is matched against the
+        // open channel by this field, and a prediction that forgot to carry
+        // one was recalled from the menu into nothing.
+        card["bufferId"] = serde_json::json!(buffer_id);
         card
     });
     match &card {
