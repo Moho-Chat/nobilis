@@ -2572,7 +2572,12 @@ pub async fn dispatch(
                 return (None, Some("that is not a Kick channel".to_string()));
             }
             let (state, buffer_id) = (state.clone(), buffer_id.to_string());
-            tokio::spawn(async move { backend::kick::refresh_stream_now(&state, &buffer_id).await });
+            // Throttled rather than forced. Every window showing a channel
+            // asks on its own minute, so popping one out doubled the rate on
+            // an endpoint Kick rate-limits readily - and being rate-limited is
+            // indistinguishable, from here, from being signed out. The
+            // throttle makes the cost of a second window nothing.
+            tokio::spawn(async move { backend::kick::refresh_stream(&state, &buffer_id).await });
             (Some(ok_node()), None)
         }
 

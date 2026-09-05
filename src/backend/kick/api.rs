@@ -1050,13 +1050,45 @@ pub async fn send_message(
         .ok()
         .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
         .filter(|s| !s.is_empty());
+    // Whatever went wrong, a refusal is a reason to stop trusting the CSRF
+    // token: it costs one request to replace and a stale one fails every send
+    // until it is.
+    forget_xsrf();
     match detail {
         Some(msg) => Err(anyhow!("{msg}")),
+        // Said apart from the sign-in being dead, because the two look
+        // identical from here and only one of them is worth acting on. Being
+        // told to slow down is not being logged out, and telling somebody to
+        // sign in again - which is what this used to say - sends them to
+        // re-authorise an account that was never deauthorised.
+        None if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            Err(anyhow!("Kick is rate-limiting this account - wait a moment and send it again"))
+        }
         None if status == reqwest::StatusCode::UNAUTHORIZED => {
             Err(anyhow!("Kick no longer accepts this sign-in - sign in again from Accounts"))
         }
         None => Err(anyhow!("Kick refused the message ({status})")),
     }
+}
+
+/// How long a CSRF token is reused before being asked for again.
+///
+/// It used to be fetched for every single message, which doubled the requests
+/// a conversation costs - and did it on the endpoint least worth spending
+/// them on. Kick rate-limits this account readily enough that the extra call
+/// was a real cause of messages failing, and a failed fetch means the send
+/// goes without the header and is refused.
+const XSRF_TTL: Duration = Duration::from_secs(600);
+
+/// The last CSRF token seen for a session, and when.
+static XSRF_CACHE: std::sync::Mutex<Option<(String, String, std::time::Instant)>> = std::sync::Mutex::new(None);
+
+/// Throws the cached token away, so the next send goes and gets a fresh one.
+///
+/// Called when a send is refused: a stale CSRF token is one of the things
+/// Kick refuses for, and it is the one thing here worth retrying differently.
+fn forget_xsrf() {
+    *XSRF_CACHE.lock().unwrap() = None;
 }
 
 /// The CSRF token Kick last handed this client, if it has handed one over.
@@ -1065,6 +1097,17 @@ pub async fn send_message(
 /// because the request without it fails with Kick's own explanation, which is
 /// more useful than a guess made here about why.
 async fn xsrf_token(http: &reqwest::Client, token: &str) -> Option<String> {
+    if let Some((session, value, when)) = XSRF_CACHE.lock().unwrap().clone() {
+        if session == token && when.elapsed() < XSRF_TTL {
+            return Some(value);
+        }
+    }
+    let fresh = fetch_xsrf_token(http, token).await?;
+    *XSRF_CACHE.lock().unwrap() = Some((token.to_string(), fresh.clone(), std::time::Instant::now()));
+    Some(fresh)
+}
+
+async fn fetch_xsrf_token(http: &reqwest::Client, token: &str) -> Option<String> {
     // Any authenticated GET hands one over; this is the cheapest one. Read
     // straight off the response rather than through a cookie jar - the session
     // itself travels as a bearer header, so a jar would exist for this one

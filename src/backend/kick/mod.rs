@@ -1396,9 +1396,32 @@ pub async fn refresh_poll(state: &AppState, buffer_id: &str) {
 }
 
 /// Whether this account follows the channel, where it can say.
-async fn following_now(state: &AppState, http: &reqwest::Client, account_id: &str, slug: &str) -> Option<bool> {
-    let token = state.accounts.get_kick(account_id)?.token.filter(|t| !t.is_empty())?;
-    api::standing(http, &token, slug).await.ok().map(|s| s.following)
+async fn following_now(
+    state: &AppState,
+    http: &reqwest::Client,
+    account_id: &str,
+    slug: &str,
+    known: Option<bool>,
+) -> Option<bool> {
+    // Nothing to ask with. This is the one honest "cannot say", and the
+    // client draws it as an account that is not signed in.
+    let Some(token) = state.accounts.get_kick(account_id).and_then(|c| c.token).filter(|t| !t.is_empty()) else {
+        return None;
+    };
+    match api::standing(http, &token, slug).await {
+        Ok(standing) => Some(standing.following),
+        // A question that could not be asked is not an answer of "no idea".
+        //
+        // It used to be: any failure here became None, which is the value
+        // that means signed out - so one rate-limited request drew the whole
+        // account as logged out of Kick. Kick rate-limits this endpoint
+        // readily, and every open window asking on its own minute is how that
+        // happens, so this is a state the client reached routinely.
+        Err(e) => {
+            tracing::debug!("kick[{account_id}]: reading standing in {slug}: {e:#}");
+            known
+        }
+    }
 }
 
 /// Re-reads whether this account follows a channel and says so.
@@ -1410,7 +1433,8 @@ pub async fn refresh_standing(state: &AppState, buffer_id: &str) {
     let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
     let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return };
     let Ok(http) = api::client() else { return };
-    let following = following_now(state, &http, &buffer.account_id, &channel.slug).await;
+    let known = state.runtime.kick_stream(buffer_id).and_then(|s| s["following"].as_bool());
+    let following = following_now(state, &http, &buffer.account_id, &channel.slug, known).await;
     if let Some(mut stream) = state.runtime.kick_stream(buffer_id) {
         stream["following"] = serde_json::json!(following);
         state.runtime.set_kick_stream(buffer_id, stream.clone());
@@ -1427,7 +1451,9 @@ const LIVE_POLL: Duration = Duration::from_secs(60);
 /// Opening a client with thirty Kick channels subscribes to thirty buffers at
 /// once, and each subscription used to become its own channel fetch; the poll
 /// above covers all of them for the price of one request.
-const DIRECT_REFRESH: Duration = Duration::from_secs(45);
+/// Just under the minute each open window asks on, so two windows watching
+/// the same channel cost what one does rather than twice what one does.
+const DIRECT_REFRESH: Duration = Duration::from_secs(50);
 
 /// Live state for everything this account follows, in one request.
 ///
@@ -1500,9 +1526,10 @@ pub async fn refresh_stream_now(state: &AppState, buffer_id: &str) {
     let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
     let Ok(http) = api::client() else { return };
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+    let known = state.runtime.kick_stream(buffer_id).and_then(|s| s["following"].as_bool());
     match api::channel(&http, &channel.slug).await {
         Ok(fresh) => {
-            let following = following_now(state, &http, &account_id, &channel.slug).await;
+            let following = following_now(state, &http, &account_id, &channel.slug, known).await;
             announce_stream(state, buffer_id, &fresh, following);
         }
         Err(e) => tracing::debug!("kick: refreshing {}: {e:#}", channel.slug),
