@@ -26,6 +26,10 @@ pub struct Builtin {
 
 const IRC: &[&str] = &["irc"];
 const IRC_AND_MATRIX: &[&str] = &["irc", "matrix"];
+/// The ones that are only text, and so work wherever text does.
+const EVERYWHERE: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat"];
+/// Spoilers exist on the two services that have a syntax for them.
+const SPOILERS: &[&str] = &["discord", "matrix"];
 
 /// Ordered roughly by how often each is wanted, since a fuzzy match that ties
 /// keeps this order.
@@ -52,7 +56,48 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "voice", usage: "<nick>", description: "Give somebody voice", services: IRC },
     Builtin { name: "devoice", usage: "<nick>", description: "Take voice away", services: IRC },
     Builtin { name: "mode", usage: "[target] <modes>", description: "Set or read channel modes", services: IRC },
+    // Text and nothing else, which is why they work everywhere: the message
+    // that leaves is the one somebody would have typed by hand.
+    Builtin { name: "shrug", usage: "[message]", description: "Append ¯\\_(ツ)_/¯", services: EVERYWHERE },
+    Builtin { name: "tableflip", usage: "[message]", description: "Append (╯°□°)╯︵ ┻━┻", services: EVERYWHERE },
+    Builtin { name: "unflip", usage: "[message]", description: "Append ┬─┬ ノ( ゜-゜ノ)", services: EVERYWHERE },
+    Builtin { name: "spoiler", usage: "<message>", description: "Hide the message behind a spoiler", services: SPOILERS },
 ];
+
+/// The commands that are only a way of writing something, applied on the way
+/// out.
+///
+/// Done here rather than in a window because the daemon is what sends the
+/// message: a frontend that did its own rewriting would be one more place for
+/// "/shrug" to mean something different, and a headless one would send the
+/// word itself. The same reason the table above lives here.
+///
+/// Returns the message to send instead, or nothing when this was not one of
+/// them - including for "//shrug", which is somebody escaping a literal
+/// slash and is left exactly as it was typed.
+pub fn rewrite(service: &str, body: &str) -> Option<String> {
+    let rest = body.strip_prefix('/')?;
+    if rest.starts_with('/') {
+        return None;
+    }
+    let (name, argument) = match rest.split_once(' ') {
+        Some((name, argument)) => (name, argument.trim()),
+        None => (rest, ""),
+    };
+    let name = name.to_lowercase();
+    let appended = |tail: &str| {
+        Some(if argument.is_empty() { tail.to_string() } else { format!("{argument} {tail}") })
+    };
+    match name.as_str() {
+        "shrug" => appended("¯\\_(ツ)_/¯"),
+        "tableflip" => appended("(╯°□°)╯︵ ┻━┻"),
+        "unflip" => appended("┬─┬ ノ( ゜-゜ノ)"),
+        // Only where the service has a spelling for it. Wrapping text in bars
+        // on IRC would send the bars.
+        "spoiler" if SPOILERS.contains(&service) && !argument.is_empty() => Some(format!("||{argument}||")),
+        _ => None,
+    }
+}
 
 /// How well a typed fragment matches a command name, or nothing if it does
 /// not match at all.
@@ -138,16 +183,38 @@ mod tests {
     fn nothing_typed_offers_everything_this_service_has() {
         let irc = matching("irc", "");
         assert!(irc.len() > 10);
-        // And a service with no commands of its own offers none rather than
-        // offering somebody else's.
-        assert!(matching("kick", "").is_empty());
-        assert!(matching("discord", "").is_empty());
+        // Every service has the text ones, so no conversation opens a menu
+        // with nothing in it.
+        assert!(!matching("kick", "").is_empty());
+        assert!(!matching("discord", "").is_empty());
     }
 
     #[test]
-    fn matrix_gets_the_ones_it_actually_implements() {
-        let names: Vec<&str> = matching("matrix", "").iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["me"]);
+    fn a_service_is_only_offered_what_it_can_do() {
+        let names = |service| matching(service, "").iter().map(|c| c.name).collect::<Vec<_>>();
+        assert!(names("matrix").contains(&"me"));
+        // Kick has no actions and no spoilers; it still has the text ones.
+        assert!(!names("kick").contains(&"me"));
+        assert!(!names("kick").contains(&"spoiler"));
+        assert!(names("kick").contains(&"shrug"));
+        assert!(names("discord").contains(&"spoiler"));
+        // And nobody is offered IRC's channel modes.
+        assert!(!names("discord").contains(&"mode"));
+    }
+
+    #[test]
+    fn the_text_ones_rewrite_what_is_sent() {
+        use super::rewrite;
+        assert_eq!(rewrite("kick", "/shrug").as_deref(), Some("¯\\_(ツ)_/¯"));
+        assert_eq!(rewrite("irc", "/shrug well then").as_deref(), Some("well then ¯\\_(ツ)_/¯"));
+        assert_eq!(rewrite("discord", "/spoiler the butler did it").as_deref(), Some("||the butler did it||"));
+        // Not a command here, so not rewritten - the bars would be sent.
+        assert_eq!(rewrite("irc", "/spoiler the butler did it"), None);
+        // An escaped slash is somebody typing the word itself.
+        assert_eq!(rewrite("irc", "//shrug"), None);
+        // And anything else is left for the backend that owns it.
+        assert_eq!(rewrite("irc", "/kick somebody"), None);
+        assert_eq!(rewrite("irc", "hello"), None);
     }
 
     #[test]

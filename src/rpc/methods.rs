@@ -2058,6 +2058,15 @@ pub async fn dispatch(
             // NickServ being IRC-only fields on the account).
             let attachment_path = p_str_opt(params, "attachmentPath");
             let reply_to_id = p_str_opt(params, "replyToId");
+            // The commands that are only a way of writing something, applied
+            // before anybody decides how to send it: they mean the same on
+            // every service because they are just text, and doing it here is
+            // what keeps them meaning the same.
+            let rewritten = state
+                .runtime
+                .get_buffer(buffer_id)
+                .and_then(|b| crate::commands::rewrite(crate::model::service_of(&b.account_id), body));
+            let body: &str = rewritten.as_deref().unwrap_or(body);
             match state.runtime.get_buffer(buffer_id) {
                 None => (None, Some("sendMessage requires a known \"bufferId\" and \"body\"".to_string())),
                 Some(buffer) if buffer.account_id.starts_with("discord:") => match state.accounts.get_discord(&buffer.account_id) {
