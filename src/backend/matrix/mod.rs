@@ -4483,8 +4483,13 @@ pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status
         .get_matrix(&config.account_id())
         .context("account is no longer configured")?;
     let access_token = account.access_token;
+    // Matrix has three, and they do not line up one for one. Do-not-disturb
+    // is somebody present who does not want interrupting, which is closest to
+    // unavailable; invisible has no equivalent at all, and offline is the
+    // honest answer - it is what invisible means to everybody looking.
     let presence = match status {
-        "idle" => "unavailable",
+        "idle" | "dnd" => "unavailable",
+        "invisible" => "offline",
         _ => "online",
     };
     let user = url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>();

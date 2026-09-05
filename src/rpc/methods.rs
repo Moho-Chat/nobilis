@@ -891,6 +891,21 @@ pub async fn dispatch(
             }
         }
 
+        // Answering a request somebody sent, or taking back one this account
+        // sent. Both are the same pair of calls to Discord; which of the
+        // three states you were in decides what it means.
+        "answerDiscordFriendRequest" => {
+            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
+                (Some(a), Some(u)) => (a, u),
+                _ => return (None, Some("answerDiscordFriendRequest requires \"accountId\" and \"userId\"".to_string())),
+            };
+            let accept = params.get("accept").and_then(|v| v.as_bool()).unwrap_or(false);
+            match backend::discord::answer_friend_request(state, account_id, user_id, accept).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "createDiscordGuild" => {
             let (account_id, name) = match (p_str_opt(params, "accountId"), p_str_opt(params, "name")) {
                 (Some(a), Some(n)) => (a, n),
@@ -988,8 +1003,16 @@ pub async fn dispatch(
                 (Some(a), Some(s)) => (a, s),
                 _ => return (None, Some("setAccountStatus requires \"accountId\" and \"status\"".to_string())),
             };
-            if !matches!(status, "online" | "idle") {
-                return (None, Some("status must be online or idle".to_string()));
+            // Four rather than two. Do-not-disturb and invisible are what
+            // people actually want from a client that is not the service's
+            // own - invisible in particular is how you read a server without
+            // being counted as present - and both are ordinary statuses to
+            // Discord rather than a disconnection.
+            //
+            // Every service is told whatever it can make of them: Matrix has
+            // no such distinction and maps them itself.
+            if !matches!(status, "online" | "idle" | "dnd" | "invisible") {
+                return (None, Some("status must be online, idle, dnd or invisible".to_string()));
             }
             // Recorded before it is applied: a status set while disconnected
             // still has to survive to the next connection.

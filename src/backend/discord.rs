@@ -1032,6 +1032,29 @@ pub async fn add_friend(state: &AppState, account_id: &str, username: &str) -> R
     Ok(())
 }
 
+/// Answers a friend request: accepts it, or refuses it.
+///
+/// Accepting is the same call that sends one - PUT on the person - which is
+/// how Discord models it: a request already sent the other way makes the pair
+/// mutual. Refusing and withdrawing are both DELETE, and so is unfriending;
+/// what differs is only which of the three you were in.
+pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: &str, accept: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let http = http_client();
+    let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
+    let request = if accept { http.put(url).json(&json!({})) } else { http.delete(url) };
+    let doing = if accept { "accepting the friend request" } else { "declining the friend request" };
+    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, doing));
+    }
+    // The gateway says so too, and that is what updates the list - this only
+    // has to have happened.
+    Ok(())
+}
+
 /// Creates a brand-new guild owned by this account - Discord's own "Create
 /// My Own" server flow, same endpoint real clients use. Discord auto-
 /// creates a default #general channel; the gateway's own GUILD_CREATE
@@ -2682,6 +2705,29 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
 ///
 /// Returns when the message was sent, which is what a client needs to go and
 /// read it out of the store.
+/// One relationship, in the shape the friends list draws.
+///
+/// The kind travels with it because the three are answered differently: a
+/// friend can be messaged, an incoming request accepted or refused, and an
+/// outgoing one only withdrawn.
+fn friend_json(relationship: &Value, presences: &HashMap<&str, &str>) -> Option<Value> {
+    let user = &relationship["user"];
+    let user_id = user["id"].as_str()?;
+    let kind = match relationship["type"].as_i64() {
+        Some(3) => "incoming",
+        Some(4) => "outgoing",
+        _ => "friend",
+    };
+    Some(json!({
+        "userId": user_id,
+        "username": user["username"].as_str().unwrap_or("unknown"),
+        "globalName": user["global_name"].as_str(),
+        "avatarUrl": author_avatar_url(user),
+        "status": presences.get(user_id).copied().unwrap_or("offline"),
+        "kind": kind,
+    }))
+}
+
 /// The buttons and menus on a message, in this client's own shape.
 ///
 /// Discord lays them out in rows of up to five; the row is kept so a client
@@ -3693,18 +3739,15 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         if let Some(relationships) = d["relationships"].as_array() {
                             let friends: Vec<Value> = relationships
                                 .iter()
-                                .filter(|r| r["type"].as_i64() == Some(1))
-                                .filter_map(|r| {
-                                    let user = &r["user"];
-                                    let user_id = user["id"].as_str()?;
-                                    Some(json!({
-                                        "userId": user_id,
-                                        "username": user["username"].as_str().unwrap_or("unknown"),
-                                        "globalName": user["global_name"].as_str(),
-                                        "avatarUrl": author_avatar_url(user),
-                                        "status": presences.get(user_id).copied().unwrap_or("offline"),
-                                    }))
-                                })
+                                // 1 is a friend, 3 a request somebody sent
+                                // this account, 4 one it sent. All three
+                                // belong in the list: an incoming request
+                                // that is not shown is one that cannot be
+                                // answered, which is how it used to be.
+                                // 2 is blocked, which is not a friend and is
+                                // not waiting for anything.
+                                .filter(|r| matches!(r["type"].as_i64(), Some(1) | Some(3) | Some(4)))
+                                .filter_map(|r| Some(friend_json(r, &presences)?))
                                 .collect();
                             state.runtime.set_discord_friends(&account_id, friends);
                         }
@@ -3887,6 +3930,31 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                                 "bufferId": crate::model::buffer_id(&account_id, name),
                             }),
                         );
+                    }
+
+                    // Somebody asked to be friends, was accepted, or is
+                    // gone. Unhandled until now, so a request that arrived
+                    // while the client was running stayed invisible until the
+                    // next restart - and one answered elsewhere stayed in the
+                    // list until then too.
+                    "RELATIONSHIP_ADD" => {
+                        let mut friends = state.runtime.get_discord_friends(&account_id);
+                        if let Some(user_id) = d["user"]["id"].as_str() {
+                            friends.retain(|f| f["userId"].as_str() != Some(user_id));
+                        }
+                        if let Some(row) = friend_json(d, &HashMap::new()) {
+                            friends.push(row);
+                        }
+                        state.runtime.set_discord_friends(&account_id, friends.clone());
+                        state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
+                    }
+
+                    "RELATIONSHIP_REMOVE" => {
+                        let Some(user_id) = d["id"].as_str() else { continue };
+                        let mut friends = state.runtime.get_discord_friends(&account_id);
+                        friends.retain(|f| f["userId"].as_str() != Some(user_id));
+                        state.runtime.set_discord_friends(&account_id, friends.clone());
+                        state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
                     }
 
                     "CHANNEL_DELETE" => {
@@ -5152,12 +5220,32 @@ mod tests {
 /// Discord's own vocabulary matches ours for both values, so they pass
 /// through unchanged - the mapping only exists so an unrecognised value
 /// cannot put the account into some unintended state.
-fn presence_payload(status: &str) -> serde_json::Value {
-    let discord_status = match status {
+/// The four Discord actually has, from whatever it was asked for.
+///
+/// Invisible is the one people want from a client that is not Discord's own:
+/// it is how you read a server without being counted as present. It is a real
+/// status to Discord rather than a disconnection - the account stays
+/// connected and keeps receiving everything, and only the presence others see
+/// says offline.
+fn discord_status(status: &str) -> &'static str {
+    match status {
         "idle" => "idle",
+        "dnd" | "do_not_disturb" | "busy" => "dnd",
+        "invisible" | "offline" => "invisible",
         _ => "online",
-    };
-    json!({ "status": discord_status, "since": 0, "activities": [], "afk": status == "idle" })
+    }
+}
+
+fn presence_payload(status: &str) -> serde_json::Value {
+    json!({
+        "status": discord_status(status),
+        "since": 0,
+        "activities": [],
+        // Only idle means away. Do-not-disturb is somebody who is here and
+        // does not want to be interrupted, and invisible is somebody who is
+        // here and would rather nobody knew.
+        "afk": status == "idle",
+    })
 }
 
 /// Sets an account's status.
@@ -5175,14 +5263,10 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> b
     }
 
     let Some(config) = state.accounts.get_discord(account_id) else { return false };
-    let discord_status = match status {
-        "idle" => "idle",
-        _ => "online",
-    };
     match http_client()
         .patch(format!("{API_BASE}/users/@me/settings"))
         .header("Authorization", &config.token)
-        .json(&json!({ "status": discord_status }))
+        .json(&json!({ "status": discord_status(status) }))
         .send()
         .await
     {
