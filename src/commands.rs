@@ -26,10 +26,17 @@ pub struct Builtin {
 
 const IRC: &[&str] = &["irc"];
 const IRC_AND_MATRIX: &[&str] = &["irc", "matrix"];
-/// The ones that are only text, and so work wherever text does.
-const EVERYWHERE: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat"];
+/// The ones that are only text, and so work wherever this daemon does the
+/// sending itself.
+///
+/// Not Sneedchat: its site reads a message for commands of its own before
+/// anybody else sees it, and inventing four more that only this client knows
+/// about would mean the same typing doing different things depending on which
+/// client you were at.
+const TEXT_ONLY: &[&str] = &["irc", "matrix", "discord", "kick"];
 /// Spoilers exist on the two services that have a syntax for them.
 const SPOILERS: &[&str] = &["discord", "matrix"];
+const SNEEDCHAT: &[&str] = &["sneedchat"];
 
 /// Ordered roughly by how often each is wanted, since a fuzzy match that ties
 /// keeps this order.
@@ -58,10 +65,15 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "mode", usage: "[target] <modes>", description: "Set or read channel modes", services: IRC },
     // Text and nothing else, which is why they work everywhere: the message
     // that leaves is the one somebody would have typed by hand.
-    Builtin { name: "shrug", usage: "[message]", description: "Append ¯\\_(ツ)_/¯", services: EVERYWHERE },
-    Builtin { name: "tableflip", usage: "[message]", description: "Append (╯°□°)╯︵ ┻━┻", services: EVERYWHERE },
-    Builtin { name: "unflip", usage: "[message]", description: "Append ┬─┬ ノ( ゜-゜ノ)", services: EVERYWHERE },
+    Builtin { name: "shrug", usage: "[message]", description: "Append ¯\\_(ツ)_/¯", services: TEXT_ONLY },
+    Builtin { name: "tableflip", usage: "[message]", description: "Append (╯°□°)╯︵ ┻━┻", services: TEXT_ONLY },
+    Builtin { name: "unflip", usage: "[message]", description: "Append ┬─┬ ノ( ゜-゜ノ)", services: TEXT_ONLY },
     Builtin { name: "spoiler", usage: "<message>", description: "Hide the message behind a spoiler", services: SPOILERS },
+    // The one Sneedchat has. The site's own command, read here rather than
+    // passed through so the whisper is recorded in this window too - see
+    // backend/sneedchat/protocol.rs's parse_whisper_command, which also takes
+    // "/whisper" and a name with a comma after it.
+    Builtin { name: "w", usage: "<@user|user id> <message>", description: "Whisper somebody privately", services: SNEEDCHAT },
 ];
 
 /// The commands that are only a way of writing something, applied on the way
@@ -85,6 +97,11 @@ pub fn rewrite(service: &str, body: &str) -> Option<String> {
         None => (rest, ""),
     };
     let name = name.to_lowercase();
+    // Only where it is offered. The menu and the rewriting have to agree, or
+    // a service would quietly do something it never said it could.
+    if !BUILTINS.iter().any(|c| c.name == name && c.services.contains(&service)) {
+        return None;
+    }
     let appended = |tail: &str| {
         Some(if argument.is_empty() { tail.to_string() } else { format!("{argument} {tail}") })
     };
@@ -92,9 +109,9 @@ pub fn rewrite(service: &str, body: &str) -> Option<String> {
         "shrug" => appended("¯\\_(ツ)_/¯"),
         "tableflip" => appended("(╯°□°)╯︵ ┻━┻"),
         "unflip" => appended("┬─┬ ノ( ゜-゜ノ)"),
-        // Only where the service has a spelling for it. Wrapping text in bars
-        // on IRC would send the bars.
-        "spoiler" if SPOILERS.contains(&service) && !argument.is_empty() => Some(format!("||{argument}||")),
+        // The wrapping is only meaningful where the service reads it, which
+        // the check above has already established.
+        "spoiler" if !argument.is_empty() => Some(format!("||{argument}||")),
         _ => None,
     }
 }
@@ -183,10 +200,21 @@ mod tests {
     fn nothing_typed_offers_everything_this_service_has() {
         let irc = matching("irc", "");
         assert!(irc.len() > 10);
-        // Every service has the text ones, so no conversation opens a menu
+        // And every service has something, so no conversation opens a menu
         // with nothing in it.
-        assert!(!matching("kick", "").is_empty());
-        assert!(!matching("discord", "").is_empty());
+        for service in ["kick", "discord", "sneedchat", "matrix"] {
+            assert!(!matching(service, "").is_empty(), "{service} offers nothing");
+        }
+    }
+
+    /// Sneedchat's own command, and only its own: the site reads a message
+    /// for commands before anybody else does, so four invented here would
+    /// mean the same typing doing different things in different clients.
+    #[test]
+    fn sneedchat_is_offered_its_own_command_and_nothing_invented() {
+        let names: Vec<&str> = matching("sneedchat", "").iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["w"]);
+        assert_eq!(super::rewrite("sneedchat", "/tableflip"), None);
     }
 
     #[test]
@@ -197,6 +225,7 @@ mod tests {
         assert!(!names("kick").contains(&"me"));
         assert!(!names("kick").contains(&"spoiler"));
         assert!(names("kick").contains(&"shrug"));
+        assert!(!names("sneedchat").contains(&"shrug"));
         assert!(names("discord").contains(&"spoiler"));
         // And nobody is offered IRC's channel modes.
         assert!(!names("discord").contains(&"mode"));
