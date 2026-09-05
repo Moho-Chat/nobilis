@@ -2030,6 +2030,7 @@ pub async fn dispatch(
                 (Some(u), Some(p)) => (u.to_string(), p.to_string()),
                 _ => return (None, Some("addSneedChatAccount requires \"username\" and \"password\"".to_string())),
             };
+            let username_for_cookies = username.clone();
             let config = crate::accounts::SneedChatAccountConfig {
                 username,
                 password,
@@ -2040,10 +2041,70 @@ pub async fn dispatch(
                 rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
                 display_name: None,
                 user_id: None,
+                // Kept from a previous browser sign-in when this is the same
+                // account being re-added with a corrected password: a live
+                // session is the one thing here that still gets anybody in.
+                cookies: state
+                    .accounts
+                    .get_sneedchat(&format!("sneedchat:{username_for_cookies}"))
+                    .map(|old| old.cookies)
+                    .unwrap_or_default(),
             };
             let login_id = format!("sneedchat-login-{}", crate::model::next_message_id());
             backend::sneedchat::start_login(state.clone(), login_id.clone(), config);
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // A session obtained by signing in somewhere with a screen.
+        //
+        // The forum's login form now carries a CAPTCHA, so a stored password
+        // is no longer a way in on its own. The client opens the site's own
+        // login page in a browser window, a person answers the verification
+        // there, and what comes back is the session cookies - which is all
+        // the daemon ever wanted from a password anyway.
+        //
+        // Takes the cookies as the header a browser would send: one string,
+        // the shape the value already has wherever it came from.
+        "setSneedChatCookies" => {
+            let Some(raw) = p_str_opt(params, "cookies").filter(|c| !c.trim().is_empty()) else {
+                return (None, Some("setSneedChatCookies requires \"cookies\"".to_string()));
+            };
+            let cookies: std::collections::BTreeMap<String, String> = raw
+                .split(';')
+                .filter_map(|pair| pair.split_once('='))
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+                .collect();
+            if cookies.is_empty() {
+                return (None, Some("those do not look like cookies".to_string()));
+            }
+
+            // Which account they belong to: the one named, or the only one
+            // there is. A person with a single Sneedchat account should not
+            // have to say which - and a person with several must.
+            let existing = state.accounts.all_sneedchat();
+            let config = match p_str_opt(params, "accountId") {
+                Some(id) => state.accounts.get_sneedchat(id),
+                None => match existing.len() {
+                    1 => existing.into_iter().next(),
+                    _ => None,
+                },
+            };
+            let Some(mut config) = config else {
+                return (
+                    None,
+                    Some("add the Sneedchat account first, then sign in with a browser".to_string()),
+                );
+            };
+            config.cookies = cookies;
+            let account_id = config.account_id();
+            if let Err(e) = state.accounts.add_sneedchat(config.clone()) {
+                return (None, Some(e.to_string()));
+            }
+            // Straight into a connection: the session is live now, and the
+            // point of having just signed in is not to wait for a retry.
+            backend::sneedchat::spawn(state.clone(), config);
+            (Some(serde_json::json!({ "ok": true, "accountId": account_id })), None)
         }
 
         // What rooms the site has, read from the site rather than from a

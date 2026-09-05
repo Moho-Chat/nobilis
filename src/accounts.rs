@@ -138,6 +138,16 @@ pub struct SneedChatAccountConfig {
     pub display_name: Option<String>,
     #[serde(default)]
     pub user_id: Option<u32>,
+    /// A session obtained by signing in somewhere else - a browser window,
+    /// where a person answered the site's CAPTCHA themselves.
+    ///
+    /// Kept because the forum's login form now carries a verification widget
+    /// that a headless client cannot answer, so the password below no longer
+    /// gets anybody in on its own. These cookies are what the daemon presents
+    /// instead; they are exactly as sensitive as the password and live in the
+    /// same file for the same reason.
+    #[serde(default)]
+    pub cookies: std::collections::BTreeMap<String, String>,
 }
 
 fn default_sneedchat_host() -> String {
@@ -516,6 +526,26 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.user_id = Some(user_id);
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Records the session a browser sign-in produced, or the fresher one a
+    /// connection has been handed since - the forum rotates `xf_session`, and
+    /// a saved copy that is never updated is a saved copy that expires.
+    pub fn set_sneedchat_cookies(&self, account_id: &str, cookies: std::collections::BTreeMap<String, String>) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                if a.cookies == cookies {
+                    // Written on every reconnect otherwise, which rewrites the
+                    // whole file to say what it already said.
+                    return Ok(true);
+                }
+                a.cookies = cookies;
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }

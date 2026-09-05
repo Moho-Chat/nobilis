@@ -112,6 +112,53 @@ async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, acco
     }
 }
 
+/// Hands a session whatever cookies were captured from a browser sign-in.
+///
+/// Done before the first request rather than after a failed login, because
+/// `ensure_authenticated` asks the site whether it is already signed in and
+/// only reaches for the password when the answer is no. With a live session
+/// restored, that answer is yes and the login form - CAPTCHA and all - is
+/// never involved.
+fn restore_session(session: &Session, config: &SneedChatAccountConfig) {
+    if config.cookies.is_empty() {
+        return;
+    }
+    session.http.jar.restore(config.cookies.clone());
+}
+
+/// Writes the session back after a successful connection.
+///
+/// The forum rotates its session cookie, so the copy captured from the
+/// browser is the oldest one that will ever work. Saving what the jar holds
+/// now is what keeps a browser sign-in good across restarts instead of good
+/// until the site next rotates.
+fn remember_session(state: &AppState, account_id: &str, session: &Session) {
+    let jar = session.http.jar.snapshot();
+    if jar.is_empty() {
+        return;
+    }
+    if let Err(e) = state.accounts.set_sneedchat_cookies(account_id, jar) {
+        tracing::debug!("sneedchat[{account_id}]: keeping the session: {e:#}");
+    }
+}
+
+/// What to say when there is no way in.
+///
+/// The forum's login form carries a verification widget that a client without
+/// a browser cannot answer, so a stored password is no longer a way in by
+/// itself. Said plainly and pointed at the thing that does work, because the
+/// site's own wording ("you did not complete the CAPTCHA verification
+/// properly") reads like something the person did wrong.
+fn no_way_in(e: anyhow::Error) -> anyhow::Error {
+    let text = format!("{e:#}");
+    if text.to_lowercase().contains("captcha") {
+        return anyhow!(
+            "the forum now asks for a CAPTCHA when signing in, which moho cannot answer -              use \"Sign in with a browser\" in Accounts to complete it yourself"
+        );
+    }
+    e
+}
+
 /// Who somebody is, on Sneedchat.
 ///
 /// The chat protocol carries a user id, a name and a picture and nothing
@@ -187,6 +234,7 @@ pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedC
     let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let transport = build_transport(state, &config, account_id).await?;
     let session = Session::new(transport, format!("https://{}", config.host), DEFAULT_USER_AGENT.to_string());
+    restore_session(&session, &config);
 
     let url = format!("https://{}/test-chat", config.host);
     let resp = session.fetch(&url).await.context("fetching the chat page")?;
@@ -374,7 +422,9 @@ async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str
     let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
 
     state.runtime.report_progress(state, account_id, "logging in...");
-    session.ensure_authenticated(&creds, &two_factor).await.context("logging in")?;
+    restore_session(&session, config);
+    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
+    remember_session(state, account_id, &session);
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
     }
@@ -1625,9 +1675,11 @@ async fn try_login(state: &AppState, login_id: &str, config: &SneedChatAccountCo
     let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
 
     emit_progress("logging in...");
-    session.ensure_authenticated(&creds, &two_factor).await.context("logging in")?;
+    restore_session(&session, config);
+    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
 
     let mut saved_config = config.clone();
+    saved_config.cookies = session.http.jar.snapshot();
     saved_config.user_id = session.user_id();
     let saved = state.accounts.add_sneedchat(saved_config)?;
     let account = crate::accounts::sneedchat_account_to_json(&saved, "connecting");
