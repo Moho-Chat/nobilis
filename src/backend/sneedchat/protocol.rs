@@ -401,19 +401,59 @@ pub fn prepare_whisper(target: &str, body: &str) -> String {
 /// else, and taking it means a message meant for one person cannot go to the
 /// room because of the word chosen for it.
 pub fn parse_whisper_command(text: &str) -> Option<(String, String)> {
+    parse_whisper_command_among(text, &[])
+}
+
+/// The same, told who is in the room.
+///
+/// A name with a space in it cannot be found any other way. "/w @Ancient
+/// Pioneer hello" is the form the site takes and the one people type, and
+/// read without knowing the names it splits at the first space - so the
+/// whisper went to "Ancient" about "Pioneer hello", which is nobody, and the
+/// line came back written into the room instead. The comma form was the only
+/// one that worked, and nothing said so.
+///
+/// So the names are matched against, longest first: the longest one the text
+/// actually begins with is the one meant, because a shorter name that is also
+/// a prefix would leave the rest of its own name in the message.
+pub fn parse_whisper_command_among(text: &str, known: &[String]) -> Option<(String, String)> {
     let rest = text
         .strip_prefix("/w ")
         .or_else(|| text.strip_prefix("/whisper "))
         .or_else(|| text.strip_prefix("/W "))?
         .trim_start();
 
-    // The comma first, because that is what actually ends a name here and
-    // names contain spaces. Splitting on whitespace would read "Fishtank
-    // Observer" as a whisper to "Fishtank" about "Observer, ...".
+    // Whoever is here, longest name first.
+    let mut names: Vec<&String> = known.iter().collect();
+    names.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
+    let without_at = rest.strip_prefix('@').unwrap_or(rest);
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() || without_at.len() < name.len() {
+            continue;
+        }
+        let (head, tail) = without_at.split_at(name.len());
+        if !head.eq_ignore_ascii_case(name) {
+            continue;
+        }
+        // The name has to end where it ends: "Ann" must not match "Annabel",
+        // and the comma people type after a name is not part of it.
+        let body = tail.trim_start_matches(',').trim();
+        if !tail.is_empty() && !tail.starts_with([' ', ',']) {
+            continue;
+        }
+        if body.is_empty() {
+            return None;
+        }
+        return Some((name.to_string(), body.to_string()));
+    }
+
+    // The comma next, because that is what ends a name for anybody not in the
+    // room right now - somebody who has left, or a name typed from memory.
     let (target, body) = match rest.split_once(',') {
         Some((target, body)) => (target, body),
-        // No comma, so the name has to be one word - which is the form
-        // somebody types for a single-word name, and is unambiguous.
+        // No comma and no known name, so it has to be one word: a
+        // single-word name, or the numeric id the site also takes.
         None => rest.split_once(char::is_whitespace)?,
     };
     let target = target.trim().trim_start_matches('@').trim();
@@ -645,6 +685,52 @@ mod tests {
         // with an empty body would be a whisper nobody wrote, and passing it
         // through as ordinary text is what the site does with it anyway.
         assert_eq!(parse_whisper_command("/w @Someone"), None);
+    }
+
+    /// The form the site takes and people type: an @name with a space in it
+    /// and no comma. Unreadable without knowing who is here, which is why the
+    /// room's own roster is handed in - read blind it split at the first
+    /// space, so a whisper to "Ancient Pioneer" went to "Ancient" about
+    /// "Pioneer ..." and came back in the room instead.
+    #[test]
+    fn a_name_with_a_space_is_found_among_the_people_in_the_room() {
+        let here = vec!["Ancient Pioneer".to_string(), "Ann".to_string(), "Annabel Lee".to_string()];
+        assert_eq!(
+            parse_whisper_command_among("/w @Ancient Pioneer a", &here),
+            Some(("Ancient Pioneer".into(), "a".into()))
+        );
+        // Without the @, which the site also takes.
+        assert_eq!(
+            parse_whisper_command_among("/w Ancient Pioneer hello there", &here),
+            Some(("Ancient Pioneer".into(), "hello there".into()))
+        );
+        // The comma still works, and is not left in the message.
+        assert_eq!(
+            parse_whisper_command_among("/w @Ancient Pioneer, hello", &here),
+            Some(("Ancient Pioneer".into(), "hello".into()))
+        );
+        // The longer name wins, or half of it would be left in the message.
+        assert_eq!(
+            parse_whisper_command_among("/w @Annabel Lee hi", &here),
+            Some(("Annabel Lee".into(), "hi".into()))
+        );
+        // And a name that merely starts the same is not it.
+        assert_eq!(parse_whisper_command_among("/w @Ann hi", &here), Some(("Ann".into(), "hi".into())));
+    }
+
+    /// A numeric id is the site's other form, and belongs to nobody in the
+    /// roster - so it still has to fall through to the plain split.
+    #[test]
+    fn an_id_still_works_when_nobody_here_is_called_that() {
+        let here = vec!["Ancient Pioneer".to_string()];
+        assert_eq!(parse_whisper_command_among("/w 38746 hello", &here), Some(("38746".into(), "hello".into())));
+    }
+
+    #[test]
+    fn a_name_with_nothing_after_it_is_not_a_whisper() {
+        let here = vec!["Ancient Pioneer".to_string()];
+        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer", &here), None);
+        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer   ", &here), None);
         assert_eq!(parse_whisper_command("/w @Someone,"), None);
         assert_eq!(parse_whisper_command("/w , body"), None);
         assert_eq!(parse_whisper_command("/w "), None);

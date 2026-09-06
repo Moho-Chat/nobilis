@@ -1244,7 +1244,31 @@ pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body:
     // site will do. Routed through the same path either way, so it is recorded
     // as a whisper here too - passed straight through it would be a real
     // whisper that this client never saw, since the site echoes none back.
-    if let Some((target, text)) = protocol::parse_whisper_command(body) {
+    // Told who might be meant, because a name with a space in it cannot be
+    // picked out of the text any other way - see parse_whisper_command_among.
+    //
+    // Two sources, because neither is enough alone: the room's roster is the
+    // authority on who is here, and this site does not always send one - but
+    // whoever has spoken lately is in the log either way, and is who somebody
+    // is usually answering.
+    let buffer_id = crate::model::buffer_id(account_id, buffer_name);
+    let mut roster: Vec<String> = state
+        .runtime
+        .get_presence(&buffer_id)
+        .and_then(|members| {
+            members.as_array().map(|list| {
+                list.iter().filter_map(|m| m["nick"].as_str().map(str::to_string)).collect()
+            })
+        })
+        .unwrap_or_default();
+    if let Ok(spoken) = state.store.recent_senders(&buffer_id, 200) {
+        for name in spoken {
+            if !roster.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                roster.push(name);
+            }
+        }
+    }
+    if let Some((target, text)) = protocol::parse_whisper_command_among(body, &roster) {
         return send_whisper(state, account_id, &target, &text, Some(buffer_name));
     }
     let body = as_reply(body, reply_to);

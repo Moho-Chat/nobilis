@@ -506,6 +506,24 @@ impl Store {
         Ok(())
     }
 
+    /// The names that have spoken here lately, most recent first.
+    ///
+    /// Wanted because a roster is not always there to ask: a service may not
+    /// send one until somebody joins or leaves, and a name with a space in it
+    /// cannot be picked out of typed text without a list of the names it
+    /// could be. Whoever has spoken recently is the list that matters anyway
+    /// - they are who somebody is answering.
+    pub fn recent_senders(&self, buffer_id: &str, limit: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT from_nick FROM messages
+             WHERE buffer_id = ?1 AND from_nick IS NOT NULL AND from_nick != ''
+             GROUP BY from_nick ORDER BY MAX(ts) DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, limit.max(1)], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Who somebody is, from the last thing they said.
     ///
     /// Search filters are typed as names - "from:coty1911" - and Discord wants
