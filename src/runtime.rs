@@ -432,6 +432,13 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Sticker packs, per account: pack key -> the images it offers.
+    ///
+    /// One flat table rather than per-room, because a picker offers everything
+    /// this account has: a pack shared by one room is still a pack, and
+    /// hiding it in every other room would be a picker that changes its mind
+    /// depending on where you opened it.
+    matrix_stickers: Mutex<HashMap<String, HashMap<String, Vec<crate::backend::matrix::stickers::Sticker>>>>,
     /// Accounts whose server has answered a MONITOR - see irc_monitors.
     irc_monitor: Mutex<std::collections::HashSet<String>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
@@ -828,6 +835,7 @@ impl Runtime {
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
+            matrix_stickers: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2909,6 +2917,31 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    /// Records one sticker pack, replacing whatever was under that key.
+    ///
+    /// An empty pack removes the key rather than leaving an empty group in
+    /// the picker: a pack somebody emptied should stop being offered.
+    pub fn set_matrix_sticker_pack(&self, account_id: &str, key: &str, fallback_name: &str, content: &serde_json::Value) {
+        let stickers = crate::backend::matrix::stickers::read_pack(content, fallback_name);
+        let mut all = self.matrix_stickers.lock().unwrap();
+        let packs = all.entry(account_id.to_string()).or_default();
+        if stickers.is_empty() {
+            packs.remove(key);
+        } else {
+            packs.insert(key.to_string(), stickers);
+        }
+    }
+
+    /// Every sticker this account has, pack by pack.
+    pub fn matrix_stickers(&self, account_id: &str) -> Vec<crate::backend::matrix::stickers::Sticker> {
+        self.matrix_stickers
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|packs| packs.values().flatten().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Whether this server answers MONITOR, learnt from it doing so.

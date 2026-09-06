@@ -31,6 +31,7 @@ pub mod polls;
 pub mod calls;
 pub mod protocol;
 pub mod roomstate;
+pub mod stickers;
 pub mod rooms;
 pub mod verification;
 
@@ -392,6 +393,18 @@ async fn register_room(
 
     state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
 
+    // The packs this room shares with everybody in it. Keyed by state key
+    // because a room may carry several, and named after the room where the
+    // pack itself gives no name.
+    for event in event_refs.iter().filter(|e| e["type"].as_str() == Some("im.ponies.room_emotes")) {
+        state.runtime.set_matrix_sticker_pack(
+            account_id,
+            &format!("{room_id}|{}", event["state_key"].as_str().unwrap_or("")),
+            &info.name,
+            &event["content"],
+        );
+    }
+
     roomstate::process_state_events(state, account_id, room_id, homeserver_url, access_token, &event_refs).await;
     // No presence data available at bootstrap time (that's /sync-only
     // - there's no bulk "current presence for all these users"
@@ -436,6 +449,12 @@ async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: 
         for event in events {
             if event["type"].as_str() == Some("m.ignored_user_list") {
                 apply_ignored_users(state, account_id, &event["content"]);
+            }
+            // The account's own sticker pack, which travels with it between
+            // clients - see backend/matrix/stickers.rs for the two places a
+            // pack lives.
+            if event["type"].as_str() == Some("im.ponies.user_emotes") {
+                state.runtime.set_matrix_sticker_pack(account_id, "", "your stickers", &event["content"]);
             }
         }
     }
@@ -1306,6 +1325,104 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
     Ok(())
 }
 
+/// Sends one of the account's stickers.
+///
+/// Its own event type rather than a message with an image in it, which is what
+/// makes a sticker a sticker: clients draw it without a filename, without a
+/// download button, and inline at its own size. moho has read them since
+/// stickers were supported and could send none.
+pub async fn send_sticker(state: &AppState, account_id: &str, buffer_id: &str, mxc: &str, body: &str) -> Result<()> {
+    let sticker = stickers::Sticker {
+        name: body.to_string(),
+        pack: String::new(),
+        mxc: mxc.to_string(),
+        body: body.to_string(),
+    };
+    send_typed_event(state, account_id, buffer_id, protocol::EVENT_STICKER, stickers::sticker_event(&sticker)).await
+}
+
+/// Sends a place.
+///
+/// A pin rather than live location sharing, which is a different feature with
+/// a different set of promises attached - this says "here is somewhere",
+/// once, and stops being true about nothing when the window closes.
+pub async fn send_location(state: &AppState, account_id: &str, buffer_id: &str, place: &str, label: &str) -> Result<()> {
+    let Some((latitude, longitude)) = stickers::parse_place(place) else {
+        anyhow::bail!("that does not look like a place - try \"51.5, -0.12\" or a map link");
+    };
+    send_typed_event(
+        state,
+        account_id,
+        buffer_id,
+        protocol::EVENT_ROOM_MESSAGE,
+        stickers::location_event(latitude, longitude, label),
+    )
+    .await
+}
+
+/// Asks to be let in, where a room is asked rather than entered.
+///
+/// A knock room is one whose join rule says "ask first": joining it outright
+/// is refused, and the way in is to knock and wait for somebody inside to
+/// answer with an invitation. Without this a room like that was simply a dead
+/// end here - the join failed with the server's refusal and there was nothing
+/// else to try.
+///
+/// The reason travels with the knock and is what the people inside see, so it
+/// is worth writing: "asking to join" with no name attached is what most
+/// knocks look like, and most of those are ignored.
+pub async fn knock_room(state: &AppState, account_id: &str, room_id_or_alias: &str, via: &[String], reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes()).collect::<String>();
+    let mut url = format!("{base}/_matrix/client/v3/knock/{encoded}");
+    // Same routing problem a join by room id has: the id names the room and
+    // not who has it.
+    for (i, server) in via.iter().filter(|s| !s.trim().is_empty()).enumerate() {
+        url.push(if i == 0 { '?' } else { '&' });
+        url.push_str("server_name=");
+        url.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
+    }
+    let body = if reason.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "reason": reason.trim() })
+    };
+    http::post_json(&url, Some(&account.access_token), body).await.context("knocking on that room")?;
+    // Deliberately no buffer: a knock is not a join, and putting the room in
+    // the list would say you are in somewhere you have only asked about. The
+    // answer arrives as an invitation, which the invite list already shows.
+    Ok(())
+}
+
+/// Reports a message to the people who run the homeserver.
+///
+/// The other answers to somebody behaving badly act on the person - ignoring
+/// them, or leaving. This is the one that reaches whoever can actually do
+/// something about it, and it is the only one a server's moderators can act
+/// on. It needs no power in the room: reporting is a thing anybody may do,
+/// which is the point of it.
+pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/report/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
+    );
+    // The score is a severity from -100 to 0 that no server this client has
+    // met does anything with, and a number nobody chose is worse than no
+    // number: the reason is what a moderator reads.
+    let body = if reason.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::json!({ "reason": reason.trim() })
+    };
+    http::post_json(&url, Some(&account.access_token), body).await.context("reporting that message")?;
+    Ok(())
+}
+
 /// Searches the homeserver's own copy of the conversation.
 ///
 /// The local scrollback is this window's copy of what it happened to be
@@ -1529,6 +1646,12 @@ pub async fn search_public_rooms(
                 // published alias needs to be joined at all.
                 "via": named(&server),
                 "joined": joined.contains(&room_id),
+                // How to get in. Most rooms in a directory are "public" and
+                // are simply joined; a "knock" room has to be asked, and a
+                // "restricted" one is open to members of a space this account
+                // may not be in. A client that shows one Join button for all
+                // three offers a button that fails for two of them.
+                "joinRule": room["join_rule"].as_str().unwrap_or("public"),
             }));
         }
         // What this server actually contributed, after the rooms every other
@@ -2811,14 +2934,72 @@ pub async fn set_room_state(
     event_type: &str,
     content: serde_json::Value,
 ) -> Result<()> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    put_room_state(state, account_id, &room_id, event_type, "", content).await
+}
+
+/// One state event in a room, by type and key.
+///
+/// The key is the half `set_room_state` above never had: a name or a topic is
+/// the room's only one of its kind and needs none, but the events that make a
+/// space a space are keyed by the room they are about - one `m.space.child`
+/// per child - and without a key every child written would overwrite the last.
+pub async fn put_room_state(
+    state: &AppState,
+    account_id: &str,
+    room_id: &str,
+    event_type: &str,
+    state_key: &str,
+    content: serde_json::Value,
+) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/state/{event_type}/",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
+        "{base}/_matrix/client/v3/rooms/{}/state/{event_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(state_key.as_bytes()).collect::<String>()
     );
     http::put_json(&url, &account.access_token, content).await.context("setting room state")?;
+    Ok(())
+}
+
+/// Puts a room in a space, or takes it out of one.
+///
+/// A space is an ordinary room whose contents are `m.space.child` state
+/// events, one per child, keyed by the child's room id. moho has read those
+/// since spaces were supported and never written one, so a space made here
+/// stayed empty for ever and one made elsewhere could be looked at and not
+/// rearranged.
+///
+/// Removing sends empty content rather than deleting the event, because Matrix
+/// has no delete: an entry with nothing in it is how the protocol spells "no
+/// longer a child", and `rooms::space_children` already skips those.
+///
+/// The child is told about its parent as well, where this account may say so.
+/// That is what makes the relationship visible from the room rather than only
+/// from the space - and it is allowed to fail: setting `m.space.parent` needs
+/// power in the *child*, which somebody adding their own room to somebody
+/// else's space will not have.
+pub async fn set_space_child(state: &AppState, account_id: &str, space_id: &str, child_room_id: &str, child: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let via = account.user_id.split(':').nth(1).unwrap_or_default().to_string();
+    let content = if child {
+        // `via` is not decoration: without a server to route through, a client
+        // that has never met this room cannot join it from the space listing.
+        serde_json::json!({ "via": [via], "suggested": false })
+    } else {
+        serde_json::json!({})
+    };
+    put_room_state(state, account_id, space_id, "m.space.child", child_room_id, content).await?;
+
+    let parent = if child {
+        serde_json::json!({ "via": [via], "canonical": true })
+    } else {
+        serde_json::json!({})
+    };
+    if let Err(e) = put_room_state(state, account_id, child_room_id, "m.space.parent", space_id, parent).await {
+        tracing::debug!("matrix[{account_id}]: {child_room_id} keeps no parent for {space_id}: {e:#}");
+    }
     Ok(())
 }
 
@@ -2901,6 +3082,16 @@ pub async fn send_message(
         // Matrix spells m.emote. Inbound emotes were already understood;
         // typing one here sent the literal text. "//" escapes a leading
         // slash, matching how the IRC backend reads the same box.
+        // Somewhere, rather than something said. Handled here because it is
+        // typed in the same box and is a message like any other once sent -
+        // and refused rather than posted as text when what follows is not a
+        // place, since "/location where are you" said out loud to a room is
+        // not what anybody meant.
+        if let Some(rest) = body.strip_prefix("/location ").or_else(|| body.strip_prefix("/place ")) {
+            let (place, label) = stickers::split_place_and_label(rest)
+                .unwrap_or_else(|| (rest.to_string(), String::new()));
+            return send_location(state, account_id, buffer_id, &place, &label).await;
+        }
         let (msgtype, body) = match body.strip_prefix('/') {
             Some(literal) if literal.starts_with('/') => ("m.text", literal),
             Some(rest) => match rest.strip_prefix("me ") {
@@ -4468,6 +4659,27 @@ mod tests {
 /// The rail entry id for one Matrix space.
 fn space_group_id(account_id: &str, room_id: &str) -> String {
     format!("{account_id}|space:{room_id}")
+}
+
+/// The room behind a space's rail entry, back out of its group id.
+///
+/// The client names a space by the group id it was given, which is the only
+/// handle it has; the room id inside it is what the protocol wants.
+pub fn space_room_id(group_id: &str) -> Option<String> {
+    group_id.split_once("|space:").map(|(_, room)| room.to_string())
+}
+
+#[cfg(test)]
+mod space_id_tests {
+    use super::{space_group_id, space_room_id};
+
+    #[test]
+    fn a_group_id_carries_its_room_id() {
+        let group = space_group_id("matrix:@a:example.org", "!space:example.org");
+        assert_eq!(space_room_id(&group).as_deref(), Some("!space:example.org"));
+        // A Discord guild's rail entry is not a space and must not answer.
+        assert_eq!(space_room_id("discord:123|guild:456"), None);
+    }
 }
 
 /// Turns a joined Space into a rail entry and files its rooms under it.

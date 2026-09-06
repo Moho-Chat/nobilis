@@ -3495,6 +3495,122 @@ pub async fn dispatch(
 
         // A room's own name and topic. Two state events with one shape, which
         // is why they share a method rather than having one each.
+        // The account's own stickers, from the packs it carries and the ones
+        // its rooms share.
+        "listMatrixStickers" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixStickers requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let account = match state.accounts.get_matrix(&buffer.account_id) {
+                Some(a) => a,
+                None => return (Some(serde_json::json!([])), None),
+            };
+            let mut out = Vec::new();
+            for sticker in state.runtime.matrix_stickers(&buffer.account_id) {
+                // Resolved here, where the token is: an mxc URI names media on
+                // a homeserver and is not a URL anything can load.
+                let path = backend::matrix::cached_media_path(&account.homeserver_url, &account.access_token, &sticker.mxc, "").await;
+                out.push(serde_json::json!({
+                    "name": sticker.name,
+                    "pack": sticker.pack,
+                    "mxc": sticker.mxc,
+                    "body": sticker.body,
+                    "url": path,
+                }));
+            }
+            (Some(serde_json::json!(out)), None)
+        }
+
+        "sendMatrixSticker" => {
+            let (buffer_id, mxc) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "mxc")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some("sendMatrixSticker requires \"bufferId\" and \"mxc\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::send_sticker(state, &buffer.account_id, buffer_id, mxc, p_str(params, "body", "sticker")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Somewhere, as a pin. Live location sharing is a different feature
+        // with different promises and is deliberately not this.
+        "sendMatrixLocation" => {
+            let (buffer_id, place) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "place")) {
+                (Some(b), Some(p)) => (b, p),
+                _ => return (None, Some("sendMatrixLocation requires \"bufferId\" and \"place\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::send_location(state, &buffer.account_id, buffer_id, place, p_str(params, "label", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Asking to be let into a room that is asked rather than entered.
+        "knockMatrixRoom" => {
+            let (account_id, room) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomIdOrAlias")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some("knockMatrixRoom requires \"accountId\" and \"roomIdOrAlias\"".to_string())),
+            };
+            let via: Vec<String> = params
+                .get("via")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::matrix::knock_room(state, account_id, room, &via, p_str(params, "reason", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Telling whoever runs the server about a message. Needs no power in
+        // the room, which is the whole point of it.
+        "reportMatrixMessage" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some("reportMatrixMessage requires \"bufferId\" and \"messageId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::report_message(state, &buffer.account_id, buffer_id, message_id, p_str(params, "reason", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Putting a room in a space, or taking it out of one.
+        "setMatrixSpaceChild" => {
+            let (space_group_id, buffer_id) = match (p_str_opt(params, "spaceId"), p_str_opt(params, "bufferId")) {
+                (Some(s), Some(b)) => (s, b),
+                _ => return (None, Some("setMatrixSpaceChild requires \"spaceId\" and \"bufferId\"".to_string())),
+            };
+            let child = params.get("child").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(child_room) = state.runtime.get_matrix_room(buffer_id) else {
+                return (None, Some("that conversation is not a Matrix room".to_string()));
+            };
+            // The client names the space by its group id, which is what the
+            // rail and the room list both hold; the room id is inside it.
+            let Some(space_room) = crate::backend::matrix::space_room_id(space_group_id) else {
+                return (None, Some("that is not a Matrix space".to_string()));
+            };
+            match backend::matrix::set_space_child(state, &buffer.account_id, &space_room, &child_room, child).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "setMatrixRoomState" => {
             let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
                 (Some(a), Some(b)) => (a, b),

@@ -26,6 +26,7 @@ pub struct Builtin {
 
 const IRC: &[&str] = &["irc"];
 const IRC_AND_MATRIX: &[&str] = &["irc", "matrix"];
+const MATRIX: &[&str] = &["matrix"];
 /// The ones that are only text, and so work wherever this daemon does the
 /// sending itself.
 ///
@@ -50,6 +51,12 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "away", usage: "[reason]", description: "Mark yourself away", services: IRC },
     Builtin { name: "back", usage: "", description: "Stop being away", services: IRC },
     Builtin { name: "whois", usage: "<nick>", description: "Look somebody up", services: IRC },
+    Builtin {
+        name: "location",
+        usage: "<lat,lon or a map link> [name]",
+        description: "Send a place",
+        services: MATRIX,
+    },
     Builtin { name: "notify", usage: "[nick]", description: "Watch for somebody arriving, or list who is watched", services: IRC },
     Builtin { name: "unnotify", usage: "<nick>", description: "Stop watching for somebody", services: IRC },
     Builtin { name: "whowas", usage: "<nick>", description: "Look up somebody who has left", services: IRC },
