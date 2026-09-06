@@ -1738,17 +1738,24 @@ impl Runtime {
         self.discord_guild_id.lock().unwrap().get(buffer_id).cloned()
     }
 
-    /// Every buffer belonging to a guild.
+    /// One account's buffers in a guild.
     ///
     /// For a guild that has gone away: leaving one from another client, or
-    /// it being deleted, has to take its channels with it rather than
+    /// being removed from it, has to take its channels with it rather than
     /// leaving them sitting there looking joinable.
-    pub fn discord_buffers_in_guild(&self, guild_id: &str) -> Vec<String> {
+    ///
+    /// Scoped to the account, and that is the whole point. Two accounts
+    /// signed in here can be in the same server, and this map is keyed by
+    /// buffer alone - so answering the question guild-wide meant one account
+    /// being kicked took the other account's channels with it, and one
+    /// account's permission check could delete the other's buffers.
+    pub fn discord_buffers_in_guild(&self, account_id: &str, guild_id: &str) -> Vec<String> {
+        let prefix = format!("{account_id}|");
         self.discord_guild_id
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, g)| g.as_str() == guild_id)
+            .filter(|(buffer_id, g)| g.as_str() == guild_id && buffer_id.starts_with(&prefix))
             .map(|(buffer_id, _)| buffer_id.clone())
             .collect()
     }
@@ -3488,6 +3495,34 @@ mod voice_flag_tests {
     #[test]
     fn a_state_that_says_nothing_claims_nothing() {
         assert_eq!(VoiceFlags::from_voice_state(&json!({})), VoiceFlags::default());
+    }
+}
+
+#[cfg(test)]
+mod guild_buffer_tests {
+    use super::Runtime;
+
+    /// Two accounts signed in here can be in the same server, and what
+    /// happens to one of them must not happen to the other's channels.
+    ///
+    /// This is the bug as it was reported: kicking one account out of a
+    /// server took the other account's channels with it, because the answer
+    /// to "which buffers are in this guild" was the same for both.
+    #[test]
+    fn one_accounts_channels_are_not_anothers() {
+        let runtime = Runtime::new();
+        runtime.set_discord_guild("discord:one|Server/#general", "g1");
+        runtime.set_discord_guild("discord:one|Server/#other", "g1");
+        runtime.set_discord_guild("discord:two|Server/#general", "g1");
+        runtime.set_discord_guild("discord:one|Elsewhere/#general", "g2");
+
+        let mine = runtime.discord_buffers_in_guild("discord:one", "g1");
+        assert_eq!(mine.len(), 2, "got {mine:?}");
+        assert!(mine.iter().all(|b| b.starts_with("discord:one|")));
+        assert_eq!(runtime.discord_buffers_in_guild("discord:two", "g1").len(), 1);
+        // And an account with nothing there is told nothing, rather than
+        // being handed somebody else's.
+        assert!(runtime.discord_buffers_in_guild("discord:three", "g1").is_empty());
     }
 }
 

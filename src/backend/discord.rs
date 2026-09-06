@@ -1250,7 +1250,7 @@ async fn resync_guild_once(state: &AppState, config: &DiscordAccountConfig, guil
     // Anything this guild used to have and no longer offers. Deleted, or
     // still there and no longer ours to read - which look the same from
     // here and want the same answer.
-    for buffer_id in state.runtime.discord_buffers_in_guild(guild_id) {
+    for buffer_id in state.runtime.discord_buffers_in_guild(&account_id, guild_id) {
         let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) else { continue };
         if visible.contains(&channel_id) {
             continue;
@@ -4481,7 +4481,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                             continue;
                         }
                         guild_context.remove(guild_id);
-                        for buffer_id in state.runtime.discord_buffers_in_guild(guild_id) {
+                        for buffer_id in state.runtime.discord_buffers_in_guild(&account_id, guild_id) {
                             if let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) {
                                 channel_map.remove(&channel_id);
                             }
