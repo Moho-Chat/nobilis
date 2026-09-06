@@ -310,6 +310,8 @@ pub struct Runtime {
     /// exists so anything outside that task - a profile lookup, say - can
     /// turn a member's role ids into names and into whether they moderate.
     discord_guild_roles: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Guild id -> the id of whoever owns it.
+    discord_guild_owners: Mutex<HashMap<String, String>>,
     /// (guild id, user id) -> that person's membership of the guild.
     ///
     /// Learned from the member window, which is the only place a user token
@@ -798,6 +800,7 @@ impl Runtime {
             discord_resync: Mutex::new(HashMap::new()),
             discord_own_roles: Mutex::new(HashMap::new()),
             discord_guild_roles: Mutex::new(HashMap::new()),
+            discord_guild_owners: Mutex::new(HashMap::new()),
             discord_members: Mutex::new(HashMap::new()),
             matrix_back_tokens: Mutex::new(HashMap::new()),
             discord_member_windows: Mutex::new(HashMap::new()),
@@ -2073,8 +2076,28 @@ impl Runtime {
         self.discord_members.lock().unwrap().get(&(guild_id.to_string(), user_id.to_string())).cloned()
     }
 
+    /// Who owns a guild, which is the one permission that overrides every
+    /// other: an owner may do anything in their own server, and Discord does
+    /// not spell that out in any role.
+    pub fn set_discord_guild_owner(&self, guild_id: &str, owner_id: &str) {
+        self.discord_guild_owners.lock().unwrap().insert(guild_id.to_string(), owner_id.to_string());
+    }
+
+    pub fn discord_guild_owner(&self, guild_id: &str) -> Option<String> {
+        self.discord_guild_owners.lock().unwrap().get(guild_id).cloned()
+    }
+
     pub fn set_discord_guild_roles(&self, guild_id: &str, roles: Vec<serde_json::Value>) {
         self.discord_guild_roles.lock().unwrap().insert(guild_id.to_string(), roles);
+    }
+
+    /// Every role a guild has, as the service described it.
+    ///
+    /// Wanted whole rather than filtered, for the two questions that need all
+    /// of them: what this account is allowed to do here, and which roles it
+    /// could give somebody.
+    pub fn discord_guild_roles(&self, guild_id: &str) -> Vec<serde_json::Value> {
+        self.discord_guild_roles.lock().unwrap().get(guild_id).cloned().unwrap_or_default()
     }
 
     /// Every role in a guild that can be mentioned, most senior first.

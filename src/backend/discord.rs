@@ -1098,6 +1098,11 @@ pub fn message_link(channel_id: &str, guild_id: Option<&str>, message_id: &str) 
 
 const PERM_ADMINISTRATOR: u64 = 1 << 3;
 const PERM_VIEW_CHANNEL: u64 = 1 << 10;
+const PERM_KICK_MEMBERS: u64 = 1 << 1;
+const PERM_BAN_MEMBERS: u64 = 1 << 2;
+const PERM_MANAGE_ROLES: u64 = 1 << 28;
+/// Discord's own name for putting somebody in timeout.
+const PERM_MODERATE_MEMBERS: u64 = 1 << 40;
 
 fn parse_perm(v: &Value) -> u64 {
     v.as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0)
@@ -1393,6 +1398,22 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
     // the way the roles-only version could.
     let me = own_member(config, guild).await;
     let own_roles = member_role_ids(me.as_ref());
+
+    // Kept where every path that registers a guild passes, rather than in the
+    // GUILD_CREATE arm alone: for this kind of account Discord sends the
+    // guilds inside READY and GUILD_CREATE never fires, so everything that
+    // needed the roles - who may moderate here, which roles can be mentioned -
+    // was asking an empty table and quietly getting "nobody" and "none".
+    state.runtime.set_discord_guild_roles(guild_id, roles.clone());
+    if let Some(owner_id) = guild["owner_id"].as_str() {
+        state.runtime.set_discord_guild_owner(guild_id, owner_id);
+    }
+    // Our own membership, which is where our roles here come from. Fetched
+    // just above for the permission check; remembered so an RPC asked later
+    // does not have to fetch it again.
+    if let Some(me) = &me {
+        state.runtime.remember_discord_member(guild_id, &config.user_id, me);
+    }
     // An owner sees everything regardless, so the permission check is handed
     // an empty list rather than spending the lookup - but the baseline above
     // wants the real ones either way.
@@ -1493,6 +1514,10 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
 
     // Type 4 is a category: not a channel anyone talks in, but the heading
     // the others are filed under, and it carries its own ordering.
+    // Which channel each thread hangs under, by id: its name for the heading
+    // and its place for the ordering, so a thread sits with its channel
+    // rather than at the end of the list.
+    let mut parents: HashMap<String, (String, i64)> = HashMap::new();
     let categories: HashMap<&str, (&str, i64)> = channels
         .iter()
         .filter(|c| c["type"].as_i64() == Some(4))
@@ -1554,11 +1579,384 @@ async fn register_guild_channels(state: &AppState, config: &DiscordAccountConfig
             state.runtime.set_discord_buffer_emojis(&buf.id, usable);
         }
         channel_map.insert(channel_id.to_string(), (name, "channel".to_string()));
+        parents.insert(channel_id.to_string(), (chan_name.to_string(), sort));
         new_channels.push((buf.id, channel_id.to_string()));
+    }
+
+    // A forum is not a channel anybody talks in: it holds posts, and every
+    // post is a thread. So it is registered as the heading its posts are
+    // filed under rather than as a buffer that would always be empty.
+    for ch in channels {
+        let kind_num = ch["type"].as_i64().unwrap_or(-1);
+        if kind_num != 15 && kind_num != 16 {
+            continue;
+        }
+        let Some(channel_id) = ch["id"].as_str() else { continue };
+        if !can_view_channel(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch) {
+            continue;
+        }
+        visible.insert(channel_id.to_string());
+        let chan_name = ch["name"].as_str().unwrap_or("forum").to_string();
+        let parent = ch["parent_id"].as_str().and_then(|p| categories.get(p));
+        let channel_pos = ch["position"].as_i64().unwrap_or(0);
+        let sort = match parent {
+            Some((_, cat_pos)) => (cat_pos + 1) * 10_000 + channel_pos,
+            None => channel_pos,
+        };
+        parents.insert(channel_id.to_string(), (chan_name, sort));
+    }
+
+    // The threads this account is already in, which arrive with the guild.
+    // Everything else a channel or forum holds is asked for when it is
+    // opened - see list_threads - because a guild can have hundreds and most
+    // of them are conversations nobody here is part of.
+    for thread in guild["threads"].as_array().cloned().unwrap_or_default() {
+        if let Some((buffer_id, thread_id)) =
+            register_thread(state, &account_id, guild_id, &guild_name, &group_id, &parents, &thread, channel_map)
+        {
+            visible.insert(thread_id.clone());
+            new_channels.push((buffer_id, thread_id));
+        }
     }
 
     spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_channels);
     visible
+}
+
+/// Puts one thread on the list, under the channel or forum it belongs to.
+///
+/// A buffer of its own rather than a panel, because that is what a thread is
+/// here: somewhere people are talking, with its own history and its own
+/// composer. Discord gives it a channel id like any other, so everything that
+/// already works for a channel - sending, backfill, reading - works for it
+/// without knowing it is a thread.
+///
+/// Returns nothing when the thread's parent is not a channel this account can
+/// see: a thread is exactly as private as what it hangs under.
+fn register_thread(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    guild_name: &str,
+    group_id: &str,
+    parents: &HashMap<String, (String, i64)>,
+    thread: &Value,
+    channel_map: &mut HashMap<String, (String, String)>,
+) -> Option<(String, String)> {
+    let kind_num = thread["type"].as_i64().unwrap_or(-1);
+    // 10 is a thread on an announcement, 11 a public one, 12 a private one.
+    if !matches!(kind_num, 10 | 11 | 12) {
+        return None;
+    }
+    let thread_id = thread["id"].as_str()?;
+    let (parent_name, parent_sort) = parents.get(thread["parent_id"].as_str()?)?;
+    let thread_name = thread["name"].as_str().unwrap_or("thread");
+    // Named for the thread and filed under the channel, so the list reads as
+    // a channel with its conversations under it rather than as a wall of
+    // similar-looking names.
+    let name = format!("{guild_name}/#{thread_name}");
+    if channel_map.contains_key(thread_id) {
+        return None;
+    }
+    let buf = state.runtime.ensure_buffer(state, account_id, &name, "channel");
+    state.runtime.set_discord_channel(state, &buf.id, thread_id);
+    state.runtime.set_discord_guild(&buf.id, guild_id);
+    state.runtime.set_buffer_group(state, &buf.id, group_id);
+    // Just after the channel it hangs under, and in the order Discord lists
+    // them: a thread's own position is its last message, which is what
+    // "recent" means for a conversation.
+    state.runtime.set_buffer_category(state, &buf.id, Some(parent_name), parent_sort + 1);
+    channel_map.insert(thread_id.to_string(), (name.clone(), "channel".to_string()));
+    Some((buf.id, thread_id.to_string()))
+}
+
+/// The threads a channel or forum is holding, asked for when it is opened.
+///
+/// Not fetched at connect: a guild can be holding hundreds, most of them
+/// conversations nobody here is part of, and the ones this account has joined
+/// already arrive with the guild. This is the rest - what a forum's posts
+/// are, and what somebody means by "what else is going on in here".
+///
+/// Archived threads are included, because on a forum that is most of them:
+/// a post nobody has answered in a week is still the post somebody came
+/// looking for.
+pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Two lists, because Discord keeps them apart: what is live, and what has
+    // gone quiet. Neither alone is the answer to "what threads are here".
+    let guild_id = state.runtime.get_discord_guild(buffer_id);
+    let mut requests: Vec<String> = Vec::new();
+    if let Some(guild) = &guild_id {
+        requests.push(format!("{API_BASE}/guilds/{guild}/threads/active"));
+    }
+    requests.push(format!("{API_BASE}/channels/{channel_id}/threads/archived/public?limit=25"));
+
+    for url in requests {
+        let resp = match http_client().get(&url).header("Authorization", &cfg.token).send().await {
+            Ok(resp) if resp.status().is_success() => resp,
+            // A channel with no archive, or one this account may not read the
+            // archive of, is not a failure worth refusing the whole list for.
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!("discord: reading threads: {e}");
+                continue;
+            }
+        };
+        let answer: Value = match resp.json().await {
+            Ok(answer) => answer,
+            Err(_) => continue,
+        };
+        for thread in answer["threads"].as_array().cloned().unwrap_or_default() {
+            // The active list covers the whole guild, so the ones under other
+            // channels are somebody else's question.
+            if thread["parent_id"].as_str() != Some(channel_id.as_str()) {
+                continue;
+            }
+            let Some(id) = thread["id"].as_str() else { continue };
+            if !seen.insert(id.to_string()) {
+                continue;
+            }
+            out.push(json!({
+                "id": id,
+                "name": thread["name"].as_str().unwrap_or("thread"),
+                "archived": thread["thread_metadata"]["archived"].as_bool().unwrap_or(false),
+                "messageCount": thread["message_count"].as_i64().unwrap_or(0),
+                "lastMessageId": thread["last_message_id"],
+                "thread": thread,
+            }));
+        }
+    }
+    Ok(json!({ "threads": out }))
+}
+
+/// What this account may do to other people in a guild.
+///
+/// Worked out here rather than asked of Discord, because Discord has no
+/// endpoint for "what may I do" - a client computes it from the roles it has
+/// already been sent, which is what its own client does too. Advisory either
+/// way: Discord re-checks every action and refuses it in its own words, so
+/// the worst this can be wrong about is which menu entries are offered.
+pub fn guild_powers(state: &AppState, account_id: &str, buffer_id: &str) -> Value {
+    let nothing = json!({ "canKick": false, "canBan": false, "canMute": false, "canAssignRoles": false });
+    let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) else { return nothing };
+    let Some(cfg) = state.accounts.get_discord(account_id) else { return nothing };
+    // Owning the place is the permission that outranks every role.
+    if state.runtime.discord_guild_owner(&guild_id).as_deref() == Some(cfg.user_id.as_str()) {
+        return json!({ "canKick": true, "canBan": true, "canMute": true, "canAssignRoles": true });
+    }
+    let roles = state.runtime.discord_guild_roles(&guild_id);
+    let mine = state
+        .runtime
+        .discord_member(&guild_id, &cfg.user_id)
+        .map(|m| member_role_ids(Some(&m)))
+        .unwrap_or_default();
+
+    let mut perms: u64 = 0;
+    for role in &roles {
+        let id = role["id"].as_str().unwrap_or("");
+        // The guild's own id is @everyone, which everybody has.
+        if id == guild_id || mine.iter().any(|r| r == id) {
+            perms |= parse_perm(&role["permissions"]);
+        }
+    }
+    let admin = perms & PERM_ADMINISTRATOR != 0;
+    let may = |bit: u64| admin || perms & bit != 0;
+    json!({
+        "canKick": may(PERM_KICK_MEMBERS),
+        "canBan": may(PERM_BAN_MEMBERS),
+        // Timeout, which is what "mute" means on Discord.
+        "canMute": may(PERM_MODERATE_MEMBERS),
+        "canAssignRoles": may(PERM_MANAGE_ROLES),
+    })
+}
+
+/// The roles a guild has, for a menu that offers to give somebody one.
+///
+/// @everyone is left out - it is not a role anybody is given - and so is
+/// anything managed by a bot or an integration, which Discord refuses to hand
+/// out by hand and which would only be an entry that always fails.
+pub fn assignable_roles(state: &AppState, buffer_id: &str) -> Value {
+    let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) else { return json!([]) };
+    let mut roles: Vec<(i64, Value)> = state
+        .runtime
+        .discord_guild_roles(&guild_id)
+        .into_iter()
+        .filter(|r| r["id"].as_str() != Some(guild_id.as_str()))
+        .filter(|r| !r["managed"].as_bool().unwrap_or(false))
+        .map(|r| {
+            (
+                r["position"].as_i64().unwrap_or(0),
+                json!({
+                    "id": r["id"].as_str().unwrap_or(""),
+                    "name": r["name"].as_str().unwrap_or("role"),
+                    // Zero means "no colour of its own", which is how
+                    // Discord says a role is drawn like everybody else.
+                    "colour": r["color"].as_i64().filter(|c| *c > 0).map(|c| format!("#{c:06x}")),
+                }),
+            )
+        })
+        .collect();
+    // Most senior first, the way Discord lists them.
+    roles.sort_by(|a, b| b.0.cmp(&a.0));
+    json!(roles.into_iter().map(|(_, r)| r).collect::<Vec<_>>())
+}
+
+/// Removes somebody from a guild, bars them from it, or puts them in timeout.
+///
+/// One function because they are one gesture with different weights, and
+/// because every one of them is Discord's decision rather than this client's:
+/// what comes back when it refuses is worth far more than a guess made here
+/// about whether it would.
+pub async fn moderate_member(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    user_id: &str,
+    action: &str,
+    minutes: Option<i64>,
+    reason: Option<&str>,
+) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
+    let http = http_client();
+    let base = format!("{API_BASE}/guilds/{guild_id}");
+    let (request, doing) = match action {
+        "kick" => (http.delete(format!("{base}/members/{user_id}")), "removing them from the server"),
+        "ban" => (
+            http.put(format!("{base}/bans/{user_id}"))
+                // Nothing deleted by default: a ban is about the person, and
+                // taking their last week of messages with them is a separate
+                // decision that nobody made here.
+                .json(&json!({ "delete_message_seconds": 0 })),
+            "banning them",
+        ),
+        "unban" => (http.delete(format!("{base}/bans/{user_id}")), "lifting the ban"),
+        "mute" | "timeout" => {
+            // Discord takes the moment it ends rather than how long it lasts.
+            let until = chrono::Utc::now() + chrono::Duration::minutes(minutes.unwrap_or(10));
+            (
+                http.patch(format!("{base}/members/{user_id}"))
+                    .json(&json!({ "communication_disabled_until": until.to_rfc3339() })),
+                "putting them in timeout",
+            )
+        }
+        "unmute" => (
+            http.patch(format!("{base}/members/{user_id}"))
+                .json(&json!({ "communication_disabled_until": Value::Null })),
+            "lifting the timeout",
+        ),
+        other => bail!("moho does not know how to {other} somebody on Discord"),
+    };
+    let mut request = request.header("Authorization", &cfg.token);
+    // Discord records this against the action in the server's audit log,
+    // which is where anybody asking "why was I removed" will look.
+    if let Some(reason) = reason.filter(|r| !r.trim().is_empty()) {
+        request = request.header("X-Audit-Log-Reason", reason);
+    }
+    let resp = request.send().await.context(doing)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, doing));
+    }
+    Ok(())
+}
+
+/// Gives somebody a role, or takes it away.
+pub async fn set_member_role(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    user_id: &str,
+    role_id: &str,
+    give: bool,
+) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
+    let url = format!("{API_BASE}/guilds/{guild_id}/members/{user_id}/roles/{role_id}");
+    let http = http_client();
+    let request = if give { http.put(url).json(&json!({})) } else { http.delete(url) };
+    let doing = if give { "giving them the role" } else { "taking the role away" };
+    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, doing));
+    }
+    Ok(())
+}
+
+/// Opens a thread as a conversation of its own, joining it if need be.
+///
+/// Discord will not deliver a thread's messages to somebody who is not in it,
+/// and reading one is how you end up in it - which is why opening is a call
+/// rather than a lookup. Joining an archived thread also un-archives it for
+/// this account, which is what makes an old forum post readable at all.
+pub async fn open_thread(state: &AppState, account_id: &str, buffer_id: &str, thread_id: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
+    let http = http_client();
+
+    // Best-effort: already being a member answers 204 as well, and a thread
+    // that refuses the join may still be readable.
+    let joined = http
+        .put(format!("{API_BASE}/channels/{thread_id}/thread-members/@me"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await;
+    if let Err(e) = &joined {
+        tracing::debug!("discord: joining thread {thread_id}: {e}");
+    }
+
+    let resp = http
+        .get(format!("{API_BASE}/channels/{thread_id}"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("opening the thread")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "opening the thread"));
+    }
+    let thread: Value = resp.json().await.context("reading the thread")?;
+
+    // Named and filed the same way the ones that arrive with the guild are,
+    // by the same function - so a thread opened by hand and a thread this
+    // account was already in are the same kind of thing in the list.
+    let guild_name = state
+        .runtime
+        .get_buffer(buffer_id)
+        .map(|b| b.name.split('/').next().unwrap_or("guild").to_string())
+        .unwrap_or_else(|| "guild".to_string());
+    let group_id = state
+        .runtime
+        .get_buffer_group(buffer_id)
+        .map(|g| g.id)
+        .unwrap_or_default();
+    let parent_id = state.runtime.get_discord_channel(buffer_id).unwrap_or_default();
+    let parent_name = state
+        .runtime
+        .get_buffer(buffer_id)
+        .and_then(|b| b.name.split('#').nth(1).map(str::to_string))
+        .unwrap_or_else(|| "threads".to_string());
+    let mut parents: HashMap<String, (String, i64)> = HashMap::new();
+    parents.insert(parent_id, (parent_name, 0));
+
+    let mut channel_map: HashMap<String, (String, String)> = HashMap::new();
+    let opened = register_thread(state, account_id, &guild_id, &guild_name, &group_id, &parents, &thread, &mut channel_map);
+    let name = format!("{guild_name}/#{}", thread["name"].as_str().unwrap_or("thread"));
+    let id = opened
+        .map(|(buffer_id, _)| buffer_id)
+        .unwrap_or_else(|| crate::model::buffer_id(account_id, &name));
+    // Its history, so the conversation is there when the buffer opens rather
+    // than filling in a moment later.
+    backfill_channel_history(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), &id, thread_id).await;
+    Ok(json!({ "bufferId": id }))
 }
 
 /// Fires off history backfill for a batch of newly-registered buffers as a
@@ -3860,6 +4258,49 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                     // whatever it had been at connect: a new channel never
                     // showed, a deleted one stayed, and a rename never
                     // landed - all of it only fixed by restarting.
+                    // A thread started, renamed, or gone. Unhandled until
+                    // now, which is why a thread only ever appeared if this
+                    // account was already in it when the client connected.
+                    "THREAD_CREATE" | "THREAD_UPDATE" | "THREAD_LIST_SYNC" => {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        let Some(guild) = guild_context.get(guild_id).cloned() else { continue };
+                        // Registered by re-running the guild with these
+                        // threads on it, so the naming, the heading and the
+                        // permission check are the same code that ran at
+                        // connect rather than a second copy of it.
+                        let threads = match t {
+                            "THREAD_LIST_SYNC" => d["threads"].as_array().cloned().unwrap_or_default(),
+                            _ => vec![d.clone()],
+                        };
+                        // A rename is a new name, and a buffer's identity is
+                        // its name - so the old one goes first or both would
+                        // sit in the list.
+                        if t == "THREAD_UPDATE" {
+                            if let Some(id) = d["id"].as_str() {
+                                if let Some((old_name, _)) = channel_map.get(id).cloned() {
+                                    let renamed = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
+                                    if renamed.as_deref() != Some(old_name.as_str()) {
+                                        state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
+                                        channel_map.remove(id);
+                                    }
+                                }
+                            }
+                        }
+                        let mut one = guild.clone();
+                        one["threads"] = serde_json::Value::Array(threads);
+                        register_guild_channels(state, config, &one, channel_map).await;
+                    }
+
+                    // Deleted, or archived out of reach. Either way it is no
+                    // longer somewhere to talk, and a buffer left behind
+                    // would be one whose sends all fail.
+                    "THREAD_DELETE" => {
+                        let Some(id) = d["id"].as_str() else { continue };
+                        if let Some((name, _)) = channel_map.remove(id) {
+                            state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
+                        }
+                    }
+
                     "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
                         let Some(channel_id) = d["channel_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         match d["guild_id"].as_str() {
@@ -5388,6 +5829,14 @@ fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &
     if !guild_id.is_empty() {
         runtime.remember_discord_member(guild_id, user_id, member);
     }
+    // The roles they hold here, by name, so a menu offering to take one away
+    // knows which they have - the member object carries ids, and an id is not
+    // something to put in front of anybody.
+    let roles = if guild_id.is_empty() {
+        Vec::new()
+    } else {
+        runtime.discord_role_names(guild_id, member["roles"].as_array().unwrap_or(&Vec::new()))
+    };
     Some(json!({
         "nick": nick,
         "userId": user_id,
@@ -5396,7 +5845,8 @@ fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &
         // still connected - Discord lists them with everyone else who is
         // present, and their own status word says the rest.
         "away": status == "offline",
-        "status": status
+        "status": status,
+        "roles": roles
     }))
 }
 

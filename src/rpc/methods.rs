@@ -1197,6 +1197,98 @@ pub async fn dispatch(
         }
 
         // What a room has told everyone to read first.
+        // What this account may do to other people here, and which roles it
+        // could give them. Advisory - Discord re-checks every action - so a
+        // failure to answer means no moderation entries rather than an error.
+        "getDiscordPowers" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("getDiscordPowers requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let mut answer = backend::discord::guild_powers(state, &buffer.account_id, buffer_id);
+            answer["roles"] = backend::discord::assignable_roles(state, buffer_id);
+
+            (Some(answer), None)
+        }
+
+        // Removing somebody, barring them, or putting them in timeout.
+        "moderateDiscordMember" => {
+            let (buffer_id, user_id, action) = match (
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "userId"),
+                p_str_opt(params, "action"),
+            ) {
+                (Some(b), Some(u), Some(a)) => (b, u, a),
+                _ => return (None, Some("moderateDiscordMember requires \"bufferId\", \"userId\" and \"action\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let minutes = params.get("minutes").and_then(|v| v.as_i64());
+            let reason = p_str_opt(params, "reason");
+            match backend::discord::moderate_member(state, &buffer.account_id, buffer_id, user_id, action, minutes, reason).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "setDiscordMemberRole" => {
+            let (buffer_id, user_id, role_id) = match (
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "userId"),
+                p_str_opt(params, "roleId"),
+            ) {
+                (Some(b), Some(u), Some(r)) => (b, u, r),
+                _ => return (None, Some("setDiscordMemberRole requires \"bufferId\", \"userId\" and \"roleId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let give = params.get("give").and_then(|v| v.as_bool()).unwrap_or(true);
+            match backend::discord::set_member_role(state, &buffer.account_id, buffer_id, user_id, role_id, give).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The threads a Discord channel or forum is holding.
+        //
+        // Asked for when it is opened rather than at connect: a guild can be
+        // holding hundreds, and the ones this account is already in arrive
+        // with the guild anyway.
+        "listDiscordThreads" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listDiscordThreads requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("discord:") {
+                return (None, Some("that is not a Discord conversation".to_string()));
+            }
+            match backend::discord::list_threads(state, &buffer.account_id, buffer_id).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Opens one of them as a conversation of its own.
+        "openDiscordThread" => {
+            let (buffer_id, thread_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "threadId")) {
+                (Some(b), Some(t)) => (b, t),
+                _ => return (None, Some("openDiscordThread requires \"bufferId\" and \"threadId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            match backend::discord::open_thread(state, &buffer.account_id, buffer_id, thread_id).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Every command that can be typed here, whoever implements it.
         //
         // One list rather than one per source: somebody typing a slash wants
