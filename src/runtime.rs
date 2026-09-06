@@ -432,6 +432,8 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Accounts whose server has answered a MONITOR - see irc_monitors.
+    irc_monitor: Mutex<std::collections::HashSet<String>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
     /// human-friendly (see backend/matrix/rooms.rs's naming fallback
     /// chain), but sending/reacting/etc. needs the real `!opaque:server`
@@ -825,6 +827,7 @@ impl Runtime {
             matrix_poll_votes: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
+            irc_monitor: Mutex::new(std::collections::HashSet::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2906,6 +2909,30 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    /// Whether this server answers MONITOR, learnt from it doing so.
+    ///
+    /// Not negotiated and not advertised in a way worth parsing: a server that
+    /// has it replies to `MONITOR +`, and a server that has not answers 421.
+    /// So this is set by the first answer that arrives, and its absence means
+    /// the ISON poll stays on.
+    pub fn irc_monitors(&self, account_id: &str) -> bool {
+        self.irc_monitor.lock().unwrap().contains(account_id)
+    }
+
+    pub fn set_irc_monitors(&self, account_id: &str, yes: bool) {
+        let mut all = self.irc_monitor.lock().unwrap();
+        if yes {
+            all.insert(account_id.to_string());
+        } else {
+            all.remove(account_id);
+        }
+    }
+
+    /// Whether the server granted a capability by this name.
+    pub fn irc_has_cap(&self, account_id: &str, cap: &str) -> bool {
+        self.irc_caps.lock().unwrap().get(account_id).is_some_and(|caps| caps.contains(cap))
     }
 
     /// Whether this connection may be asked for history.

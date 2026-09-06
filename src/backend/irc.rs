@@ -228,6 +228,14 @@ async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<()> {
     // capability negotiation to work anywhere.
     let ison = tokio::spawn(poll_query_presence(state.clone(), account_id.clone(), sender.clone()));
 
+    // And who to be told about whether or not there is a conversation open
+    // with them. Cleared first: a reconnect knows nothing about who is on, and
+    // keeping the old answers would announce arrivals that are only this
+    // client coming back.
+    notify_seen().lock().unwrap().remove(&account_id);
+    state.runtime.set_irc_monitors(&account_id, false);
+    start_monitor(&sender, &notify_list(config));
+
     // Published for as long as this connection is up, so a file offered over
     // it is fetched back the same way. Registered rather than rebuilt when a
     // transfer starts: turning Tor off in settings does not move a connection
@@ -728,7 +736,30 @@ const WANTED_CAPS: &[&str] = &[
     // simply NAK it, which costs nothing.
     "draft/chathistory",
     "chathistory",
+    // Our own messages, sent back to us by the server.
+    //
+    // Which makes the line on screen the line the network delivered - with
+    // the server's own id and timestamp, and after whatever truncation or
+    // rewriting it applied - rather than this client's guess at it. Where it
+    // is absent the local copy is still written; see send_plain.
+    "echo-message",
+    // A tag on a send, repeated on whatever answers it. Not needed to match
+    // the echo (the echo is recognisable on its own) but it is what turns a
+    // refusal into an answer about *this* message rather than a numeric that
+    // arrived at about the same time.
+    "labeled-response",
 ];
+
+/// The capabilities named by a CAP ACK, from whichever field they arrived in.
+///
+/// `CAP * ACK :multi-prefix` puts the list in the parameter before the
+/// trailing one, which is not where reading a raw IRC line suggests it would
+/// be. Both are accepted because both are legal on the wire, and getting this
+/// wrong is silent: nothing errors, the client simply believes the server
+/// granted nothing.
+fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &'a str {
+    param.or(suffix).unwrap_or("")
+}
 
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
@@ -797,13 +828,31 @@ async fn poll_query_presence(state: AppState, account_id: String, sender: irc::c
     loop {
         tokio::time::sleep(ISON_INTERVAL).await;
 
-        let nicks: Vec<String> = state
+        // Anything sent whose echo never came back, on a connection quiet
+        // enough that no incoming message has swept it.
+        sweep_pending_sends(&state);
+
+        // Conversation partners, plus anybody on the watch list - one poll
+        // answers both questions, and a name in both is asked about once.
+        let watched = state.accounts.get_irc(&account_id).map(|c| notify_list(&c)).unwrap_or_default();
+        let mut nicks: Vec<String> = state
             .runtime
             .list_buffers()
             .into_iter()
             .filter(|b| b.account_id == account_id && b.kind == "dm")
             .map(|b| b.name)
             .collect();
+        for nick in &watched {
+            if !nicks.iter().any(|n| n.eq_ignore_ascii_case(nick)) {
+                nicks.push(nick.clone());
+            }
+        }
+        // Only where the server has no MONITOR. Where it has, it is already
+        // telling us, and polling on top of it would be asking a question
+        // that has been answered.
+        if !watched.is_empty() && !state.runtime.irc_monitors(&account_id) {
+            settle_notify(&state, &account_id, &watched);
+        }
         if nicks.is_empty() {
             continue;
         }
@@ -813,6 +862,136 @@ async fn poll_query_presence(state: AppState, account_id: String, sender: irc::c
             if sender.send(Command::Raw("ISON".to_string(), chunk.to_vec())).is_err() {
                 return;
             }
+        }
+    }
+}
+
+/// The people this account has asked to be told about.
+///
+/// Stored as typed, so the list reads back the way it was written; matched
+/// case-insensitively, because IRC nicks are.
+pub fn notify_list(config: &IrcAccountConfig) -> Vec<String> {
+    config.notify.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
+}
+
+/// Who on the watch list was last seen online, per account.
+///
+/// `None` for a nick nothing is known about yet, which is the whole point of
+/// keeping it: an arrival is only worth announcing against a previous state.
+/// A first sighting - on connect, or the moment somebody is added to the list
+/// - records silently, so signing on does not print a paragraph about people
+/// who were already there.
+fn notify_seen() -> &'static std::sync::Mutex<HashMap<String, HashMap<String, bool>>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, bool>>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// Folds one sighting in, and says whether it is news.
+///
+/// Pure, so the rule that matters - the first answer about somebody is never
+/// an announcement - is tested rather than argued about.
+fn note_presence(seen: &mut HashMap<String, bool>, nick: &str, online: bool) -> bool {
+    let key = nick.to_lowercase();
+    let previous = seen.insert(key, online);
+    previous.is_some_and(|was| was != online)
+}
+
+/// Says somebody on the watch list arrived or left, in the server buffer.
+///
+/// The server buffer because it is about the network rather than about any
+/// conversation - the same place a WHOIS answer and a network notice go.
+fn announce_presence(state: &AppState, account_id: &str, nick: &str, online: bool) {
+    let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+    let body = if online { format!("{nick} is online") } else { format!("{nick} is offline") };
+    state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+}
+
+/// Starts watching, the good way where the server has it.
+///
+/// MONITOR is the server keeping the list and telling us when it changes,
+/// which is one line at sign-on and nothing at all afterwards until somebody
+/// moves. Where it is missing the ISON poll below covers the same ground more
+/// expensively, so this is tried without asking whether it will work: a server
+/// that has never heard of MONITOR answers 421, which costs one line.
+fn start_monitor(sender: &Sender, nicks: &[String]) {
+    if nicks.is_empty() {
+        return;
+    }
+    // Chunked, because the list goes on one line and a line has a length.
+    for chunk in nicks.chunks(20) {
+        let raw = format!("MONITOR + {}", chunk.join(","));
+        if let Ok(msg) = raw.parse::<Message>() {
+            let _ = sender.send(msg);
+        }
+    }
+}
+
+/// Turns a poll's worth of ISON answers into arrivals and departures.
+///
+/// ISON says only who *is* on, so absence is the answer for everybody asked
+/// about - which is why this runs a tick later than the asking: the replies to
+/// the previous poll have all arrived by then, and what they did not mention
+/// is offline.
+fn settle_notify(state: &AppState, account_id: &str, watched: &[String]) {
+    let replied = {
+        let mut all = ison_replies().lock().unwrap();
+        all.remove(account_id).unwrap_or_default()
+    };
+    // Nothing came back at all: a connection that has not answered yet, which
+    // is not the same as everybody being offline.
+    if replied.is_empty() && !ison_asked().lock().unwrap().contains(account_id) {
+        return;
+    }
+    // Decided under the lock, announced outside it: recording a message
+    // reaches the store and the event bus, which is not somewhere to go while
+    // holding a mutex this small.
+    let news: Vec<(String, bool)> = {
+        let mut all = notify_seen().lock().unwrap();
+        let seen = all.entry(account_id.to_string()).or_default();
+        watched
+            .iter()
+            .filter_map(|nick| {
+                let online = replied.contains(&nick.to_lowercase());
+                note_presence(seen, nick, online).then(|| (nick.clone(), online))
+            })
+            .collect()
+    };
+    for (nick, online) in news {
+        announce_presence(state, account_id, &nick, online);
+    }
+}
+
+/// Nicks named by ISON replies since the last poll settled.
+fn ison_replies() -> &'static std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>> {
+    static REPLIES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>>> =
+        std::sync::OnceLock::new();
+    REPLIES.get_or_init(Default::default)
+}
+
+/// Accounts that have been asked at least once, so "no reply yet" and
+/// "everybody is offline" can be told apart.
+fn ison_asked() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static ASKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    ASKED.get_or_init(Default::default)
+}
+
+/// MONITOR's own answer: these people are on, or these have gone.
+fn apply_monitor(state: &AppState, account_id: &str, targets: &str, online: bool) {
+    state.runtime.set_irc_monitors(account_id, true);
+    for target in targets.split(',') {
+        // 730 sends full masks, 731 bare nicks. The nick is the part before
+        // the "!" either way.
+        let nick = target.trim().split('!').next().unwrap_or("").trim();
+        if nick.is_empty() {
+            continue;
+        }
+        let news = {
+            let mut all = notify_seen().lock().unwrap();
+            note_presence(all.entry(account_id.to_string()).or_default(), nick, online)
+        };
+        if news {
+            announce_presence(state, account_id, nick, online);
         }
     }
 }
@@ -840,6 +1019,234 @@ fn apply_ison(state: &AppState, account_id: &str, online: &str) {
     }
 }
 
+/// How long a typing notice stands before the person is assumed to have
+/// stopped.
+///
+/// The `+typing` tag's own guidance: refresh while still composing, and forget
+/// a notice that has not been refreshed. Six seconds against the client's
+/// four-second refresh leaves room for one lost message before somebody stops
+/// appearing to type - which is the right way round, since a name stuck on
+/// screen is worse than one that flickers off a moment early.
+const TYPING_TTL: Duration = Duration::from_secs(6);
+
+/// Who is composing, and where.
+///
+/// Kept here rather than in `Runtime` because nothing outside this file asks:
+/// it exists so that one person going quiet removes one name from a list
+/// rather than clearing the whole list, which is what emitting a bare "nobody
+/// is typing" would do to the other people still writing.
+fn typers() -> &'static std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>> {
+    static TYPERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>> =
+        std::sync::OnceLock::new();
+    TYPERS.get_or_init(Default::default)
+}
+
+/// The names still composing in a buffer after this one's news is folded in.
+///
+/// Pure so it can be tested: the state, the person, what they said, and now.
+/// Returns the list to announce, already free of anyone whose notice ran out.
+fn fold_typing(
+    room: &mut HashMap<String, std::time::Instant>,
+    nick: &str,
+    state: TypingState,
+    now: std::time::Instant,
+) -> Vec<String> {
+    match state {
+        // "paused" is somebody who stopped mid-sentence with a half-written
+        // line still in the box. They are still writing to anybody watching,
+        // so it refreshes the notice like "active" does.
+        TypingState::Active | TypingState::Paused => {
+            room.insert(nick.to_string(), now);
+        }
+        TypingState::Done => {
+            room.remove(nick);
+        }
+    }
+    room.retain(|_, seen| now.duration_since(*seen) < TYPING_TTL);
+    let mut names: Vec<String> = room.keys().cloned().collect();
+    // Stable, because this list is drawn as a sentence and a sentence whose
+    // words swap places every few seconds is unreadable.
+    names.sort_unstable();
+    names
+}
+
+/// The three things `+typing` can say.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypingState {
+    Active,
+    Paused,
+    Done,
+}
+
+impl TypingState {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "done" => Some(Self::Done),
+            // An unknown value is not a reason to guess. The tag is versioned
+            // by its values, and a client that treated anything unrecognised
+            // as "typing" would be wrong in the direction that shows.
+            _ => None,
+        }
+    }
+}
+
+/// Says this end is composing, where the network can carry it.
+///
+/// A TAGMSG with a client-only tag and no text: servers relay it to the target
+/// exactly as they relay a message, and clients that do not understand it drop
+/// it. Gated on `message-tags` because without that capability the server
+/// strips tags from what it forwards, so the line would arrive as an empty
+/// TAGMSG saying nothing at all.
+pub fn send_typing(state: &AppState, account_id: &str, target: &str, typing: bool) {
+    if !state.runtime.irc_has_cap(account_id, "message-tags") {
+        return;
+    }
+    let Some(sender) = state.runtime.irc_sender(account_id) else {
+        return;
+    };
+    let mut msg = Message::from(Command::Raw("TAGMSG".to_string(), vec![target.to_string()]));
+    msg.tags = Some(vec![irc::proto::message::Tag(
+        "+typing".to_string(),
+        Some(if typing { "active" } else { "done" }.to_string()),
+    )]);
+    let _ = sender.send(msg);
+}
+
+/// Somebody else composing, arriving as a TAGMSG.
+///
+/// The same event every other backend emits for this, so the window needs to
+/// know nothing about how IRC says it.
+fn note_typing(state: &AppState, account_id: &str, from: &str, target: &str, value: &str) {
+    let Some(said) = TypingState::parse(value) else {
+        return;
+    };
+    // Our own typing, reflected back by a server that echoes what we send.
+    // Announcing it would put this account's own name in its own "somebody is
+    // typing" line.
+    if from.eq_ignore_ascii_case(&state.runtime.irc_current_nick(account_id).unwrap_or_default()) {
+        return;
+    }
+    let buffer_name = if is_channel(target) { target } else { from };
+    // Only where the conversation already exists. A notice that somebody is
+    // composing is not a reason to open a window: anybody on the network can
+    // send one of these, and a stranger typing at you should not put a new
+    // conversation on screen before they have said anything.
+    let Some(buffer) = state
+        .runtime
+        .list_buffers()
+        .into_iter()
+        .find(|b| b.account_id == account_id && b.name.eq_ignore_ascii_case(buffer_name))
+    else {
+        return;
+    };
+    let names = {
+        let mut all = typers().lock().unwrap();
+        let room = all.entry(buffer.id.clone()).or_default();
+        fold_typing(room, from, said, std::time::Instant::now())
+    };
+    state.events.emit(
+        "typing",
+        json!({
+            "accountId": account_id,
+            "bufferId": buffer.id,
+            "nicks": names,
+            "expiresInMs": TYPING_TTL.as_millis() as u64,
+        }),
+    );
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::{note_presence, notify_list};
+    use std::collections::HashMap;
+
+    fn config(notify: &str) -> crate::accounts::IrcAccountConfig {
+        let mut c = crate::accounts::IrcAccountConfig {
+            nick: "me".into(),
+            host: "example.org".into(),
+            ..Default::default()
+        };
+        c.notify = notify.to_string();
+        c
+    }
+
+    #[test]
+    fn the_list_reads_back_as_written() {
+        assert_eq!(notify_list(&config("ada, grace ,,")), vec!["ada", "grace"]);
+        assert!(notify_list(&config("")).is_empty());
+    }
+
+    #[test]
+    fn the_first_answer_about_somebody_is_never_news() {
+        let mut seen = HashMap::new();
+        // Signing on and finding somebody already there is not an arrival.
+        assert!(!note_presence(&mut seen, "ada", true));
+        assert!(!note_presence(&mut seen, "ada", true));
+        // Going is.
+        assert!(note_presence(&mut seen, "ada", false));
+        assert!(note_presence(&mut seen, "ada", true));
+    }
+
+    #[test]
+    fn a_nick_is_the_same_nick_in_any_case() {
+        let mut seen = HashMap::new();
+        assert!(!note_presence(&mut seen, "Ada", true));
+        // The server may answer in a different case than the list was
+        // written in; announcing that as a second person would be wrong.
+        assert!(note_presence(&mut seen, "ada", false));
+    }
+}
+
+#[cfg(test)]
+mod typing_tests {
+    use super::{fold_typing, TypingState, TYPING_TTL};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn active_adds_and_done_removes_only_that_person() {
+        let now = Instant::now();
+        let mut room = HashMap::new();
+        assert_eq!(fold_typing(&mut room, "ada", TypingState::Active, now), vec!["ada"]);
+        assert_eq!(fold_typing(&mut room, "grace", TypingState::Active, now), vec!["ada", "grace"]);
+        // The whole point of keeping the set: one person stopping does not
+        // clear the other.
+        assert_eq!(fold_typing(&mut room, "ada", TypingState::Done, now), vec!["grace"]);
+    }
+
+    #[test]
+    fn paused_still_counts_as_composing() {
+        let now = Instant::now();
+        let mut room = HashMap::new();
+        fold_typing(&mut room, "ada", TypingState::Active, now);
+        // A half-written line left in the box is still a line being written.
+        assert_eq!(fold_typing(&mut room, "ada", TypingState::Paused, now), vec!["ada"]);
+    }
+
+    #[test]
+    fn a_notice_that_was_never_refreshed_expires() {
+        let now = Instant::now();
+        let mut room = HashMap::new();
+        fold_typing(&mut room, "ada", TypingState::Active, now);
+        let later = now + TYPING_TTL + Duration::from_secs(1);
+        // Somebody who closed their client mid-sentence never sends "done".
+        assert!(fold_typing(&mut room, "grace", TypingState::Active, later) == vec!["grace"]);
+    }
+
+    #[test]
+    fn only_the_three_known_values_are_believed() {
+        assert_eq!(TypingState::parse("active"), Some(TypingState::Active));
+        assert_eq!(TypingState::parse("paused"), Some(TypingState::Paused));
+        assert_eq!(TypingState::parse("done"), Some(TypingState::Done));
+        // A value from a later version of the tag is not a guess to make in
+        // the direction that shows on screen.
+        assert_eq!(TypingState::parse("thinking"), None);
+        assert_eq!(TypingState::parse(""), None);
+    }
+}
+
 async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<()> {
     let result = tokio::time::timeout(REGISTRATION_TIMEOUT, async {
         loop {
@@ -860,6 +1267,18 @@ async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut Clien
                         if matches!(code, Response::RPL_WELCOME) {
                             return Ok(());
                         }
+                    }
+                    // Capabilities are ACKed during registration, which is
+                    // exactly the window this loop is scanning - and this
+                    // loop used to drop everything it was not looking for.
+                    // So every capability the server granted was forgotten
+                    // the moment it was granted, and the whole client
+                    // behaved as though the server had none: no history
+                    // backfill, no typing tag, no echo of what was sent.
+                    Command::CAP(_, CapSubCommand::ACK, param, suffix) => {
+                        let caps = cap_list(param.as_deref(), suffix.as_deref());
+                        tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
+                        state.runtime.grant_irc_caps(account_id, caps);
                     }
                     Command::Response(Response::ERR_NICKNAMEINUSE, args) => {
                         return Err(anyhow!("nickname already in use{}", args.first().map(|n| format!(" ({n})")).unwrap_or_default()))
@@ -977,11 +1396,24 @@ async fn handle_message(
     // Carried alongside, because everything below matches on `msg.command`
     // and would otherwise have moved the message out from under it.
     let msg_id = message_id(&msg);
+    // Anything carrying one of our labels is the server accounting for a send
+    // - the echo of it, or a refusal - so the send is no longer outstanding.
+    settle_send(&msg);
+    // And anything the server never accounted for gets written locally. Here
+    // as well as on the ISON tick so that on a busy connection it happens at
+    // once; the map is empty except between a send and its echo.
+    sweep_pending_sends(state);
 
     match msg.command {
         Command::PRIVMSG(target, body) => {
+            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
             let (buffer_name, kind) = if is_channel(&target) {
                 (target.clone(), "channel")
+            } else if from.eq_ignore_ascii_case(&own) {
+                // Our own message, echoed back by a server with
+                // echo-message: it belongs in the conversation it was sent
+                // to, not in one named after ourselves.
+                (target.clone(), "dm")
             } else {
                 (from.clone(), "dm")
             };
@@ -1310,8 +1742,25 @@ async fn handle_message(
         }
 
         // args: [nick, "nick1 nick2 ..."] - only those who are on.
+        // The watch list, answered by the server rather than polled for.
+        Command::Response(code @ (Response::RPL_MONONLINE | Response::RPL_MONOFFLINE), args) => {
+            let targets = args.last().map(String::as_str).unwrap_or("");
+            apply_monitor(state, account_id, targets, matches!(code, Response::RPL_MONONLINE));
+        }
+
         Command::Response(Response::RPL_ISON, args) => {
-            apply_ison(state, account_id, args.last().map(String::as_str).unwrap_or(""));
+            let online = args.last().map(String::as_str).unwrap_or("");
+            // Gathered as well as applied: the watch list is settled a poll
+            // later, once every chunk of this answer has come back.
+            {
+                let mut all = ison_replies().lock().unwrap();
+                let set = all.entry(account_id.to_string()).or_default();
+                for nick in online.split_whitespace() {
+                    set.insert(nick.to_lowercase());
+                }
+            }
+            ison_asked().lock().unwrap().insert(account_id.to_string());
+            apply_ison(state, account_id, online);
         }
 
         // The server's own answer that a message went nowhere. Authoritative
@@ -1397,8 +1846,10 @@ async fn handle_message(
         // Which capabilities the server actually granted. Requested without
         // waiting for the answer, so this is where we find out - and asking a
         // server for history it never offered is an error in the server tab.
-        Command::CAP(_, CapSubCommand::ACK, _, Some(caps)) => {
-            state.runtime.grant_irc_caps(account_id, &caps);
+        Command::CAP(_, CapSubCommand::ACK, ref param, ref suffix) => {
+            let caps = cap_list(param.as_deref(), suffix.as_deref());
+            tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
+            state.runtime.grant_irc_caps(account_id, caps);
         }
 
         // What modes a channel currently has, in answer to a bare /mode.
@@ -1471,6 +1922,17 @@ async fn handle_message(
             if let Some(text) = channel_error_text(&args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
                 state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+        }
+
+        // Somebody composing. A TAGMSG carries tags and nothing else, which
+        // is how a client says something that is not a message - and the only
+        // one this cares about is `+typing`.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("TAGMSG") => {
+            if let (Some(target), Some(tags)) = (args.first(), msg.tags.as_ref()) {
+                if let Some(value) = tags.iter().find(|t| t.0 == "+typing").and_then(|t| t.1.as_deref()) {
+                    note_typing(state, account_id, &from, target, value);
+                }
             }
         }
 
@@ -1906,6 +2368,60 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
                 }
                 send_plain(state, account_id, sender, to, text)
             }
+            // Who to be told about when they arrive. The list is the
+            // account's own - the server is what watches it - so this reads
+            // and writes the stored one and puts the answer where the other
+            // answers about the network go.
+            "notify" | "unnotify" => {
+                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+                let Some(config) = state.accounts.get_irc(account_id) else {
+                    bail!("no such account");
+                };
+                let mut list = notify_list(&config);
+                let nick = arg.split_whitespace().next().unwrap_or("");
+                if cmd == "notify" && nick.is_empty() {
+                    // Asking rather than setting, which is what a bare
+                    // /notify means in every client that has one.
+                    let body = if list.is_empty() {
+                        "watching nobody - /notify <nick> adds somebody".to_string()
+                    } else {
+                        format!("watching: {}", list.join(", "))
+                    };
+                    state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                    return Ok(());
+                }
+                if nick.is_empty() || is_channel(nick) {
+                    bail!("/{cmd} requires a nick");
+                }
+                let known = list.iter().any(|n| n.eq_ignore_ascii_case(nick));
+                let body = if cmd == "notify" {
+                    if known {
+                        format!("already watching {nick}")
+                    } else {
+                        list.push(nick.to_string());
+                        let raw = format!("MONITOR + {nick}");
+                        if let Ok(msg) = raw.parse::<Message>() {
+                            let _ = sender.send(msg);
+                        }
+                        format!("watching {nick}")
+                    }
+                } else if known {
+                    list.retain(|n| !n.eq_ignore_ascii_case(nick));
+                    // Told to forget as well as forgotten here: a server still
+                    // monitoring a nick keeps sending news about them.
+                    let raw = format!("MONITOR - {nick}");
+                    if let Ok(msg) = raw.parse::<Message>() {
+                        let _ = sender.send(msg);
+                    }
+                    notify_seen().lock().unwrap().entry(account_id.to_string()).or_default().remove(&nick.to_lowercase());
+                    format!("no longer watching {nick}")
+                } else {
+                    format!("not watching {nick}")
+                };
+                state.accounts.set_irc_notify(account_id, &list.join(","))?;
+                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                Ok(())
+            }
             // Who somebody is. The reply arrives as numerics and is
             // gathered into one answer rather than printed line by line -
             // see take_whois.
@@ -2048,13 +2564,119 @@ fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode, add: bool
 }
 
 fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
-    sender.send_privmsg(target, body)?;
-    // No echo-message capability requested, so the server won't send this
-    // back to us - record it locally, same as libpurple's write_im/
-    // write_chat firing for locally-sent messages too.
-    let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
-    state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+    // Where the server echoes what we send, it is the echo that gets written:
+    // it carries the server's id and time, and it is proof the message was
+    // actually delivered rather than merely handed over. Without the
+    // capability nothing comes back, so the local copy is still the only
+    // copy - same as libpurple's write_im/write_chat firing for locally-sent
+    // messages too.
+    let echoes = state.runtime.irc_has_cap(account_id, "echo-message");
+    if !echoes {
+        sender.send_privmsg(target, body)?;
+        let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
+        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+        return Ok(());
+    }
+
+    let label = next_label();
+    let mut msg = Message::from(Command::PRIVMSG(target.to_string(), body.to_string()));
+    if state.runtime.irc_has_cap(account_id, "labeled-response") {
+        msg.tags = Some(vec![irc::proto::message::Tag("label".to_string(), Some(label.clone()))]);
+    }
+    sender.send(msg)?;
+    pending_sends().lock().unwrap().insert(
+        label,
+        PendingSend {
+            account_id: account_id.to_string(),
+            target: target.to_string(),
+            body: body.to_string(),
+            sent: std::time::Instant::now(),
+        },
+    );
     Ok(())
+}
+
+/// A send waiting for the server to say what became of it.
+struct PendingSend {
+    account_id: String,
+    target: String,
+    body: String,
+    sent: std::time::Instant,
+}
+
+/// How long to wait for an echo before writing the message locally anyway.
+///
+/// A server that granted `echo-message` and then does not echo would
+/// otherwise swallow the message silently, which is the one outcome worse
+/// than a duplicate. Long enough that a slow network is not mistaken for a
+/// broken server.
+const ECHO_GRACE: Duration = Duration::from_secs(6);
+
+fn pending_sends() -> &'static std::sync::Mutex<HashMap<String, PendingSend>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PendingSend>>> = std::sync::OnceLock::new();
+    PENDING.get_or_init(Default::default)
+}
+
+/// A label nothing else will be using. Per process, which is the scope a label
+/// has to be unique in.
+fn next_label() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    format!("moho-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Writes anything the server never answered about.
+///
+/// Run from the ISON tick and after each incoming message, so on a busy
+/// connection it is immediate and on a silent one it is at worst a poll late.
+/// Both cheap: the map is empty except in the moment between a send and its
+/// echo.
+fn sweep_pending_sends(state: &AppState) {
+    let overdue: Vec<PendingSend> = {
+        let mut all = pending_sends().lock().unwrap();
+        if all.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let stale: Vec<String> = all
+            .iter()
+            .filter(|(_, p)| now.duration_since(p.sent) > ECHO_GRACE)
+            .map(|(label, _)| label.clone())
+            .collect();
+        stale.into_iter().filter_map(|label| all.remove(&label)).collect()
+    };
+    for send in overdue {
+        let own_nick = state.runtime.irc_current_nick(&send.account_id).unwrap_or_default();
+        state.runtime.record_message(
+            state,
+            &send.account_id,
+            &send.target,
+            buffer_kind_hint(&send.target),
+            &own_nick,
+            &send.body,
+            false,
+            "chat",
+            None,
+            None,
+            false,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
+    }
+}
+
+/// Drops the record of a send the server has now accounted for.
+fn settle_send(msg: &Message) {
+    let Some(label) = msg
+        .tags
+        .as_ref()
+        .and_then(|tags| tags.iter().find(|t| t.0 == "label"))
+        .and_then(|t| t.1.clone())
+    else {
+        return;
+    };
+    pending_sends().lock().unwrap().remove(&label);
 }
 
 fn buffer_kind_hint(target: &str) -> &'static str {
@@ -2362,5 +2984,34 @@ mod tests {
         // The allowance is a floor, not a mode: it only ever answers for the
         // connection that had no encryption to begin with.
         assert!(sasl_transport_ok(true, true));
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::cap_list;
+    use irc::proto::{CapSubCommand, Command, Message};
+
+    /// Where the granted capabilities actually live in a parsed CAP ACK.
+    ///
+    /// Not a hypothetical: this client read them out of the trailing
+    /// parameter, and the crate puts them in the one before it - so every
+    /// capability every server ever granted was dropped on the floor, and
+    /// the whole client behaved as though no server had any.
+    #[test]
+    fn a_cap_ack_carries_its_list_in_the_parameter() {
+        let msg: Message = ":lithium.libera.chat CAP me ACK :echo-message\r\n".parse().unwrap();
+        let Command::CAP(_, CapSubCommand::ACK, param, suffix) = &msg.command else {
+            panic!("not a CAP ACK: {:?}", msg.command);
+        };
+        assert_eq!(cap_list(param.as_deref(), suffix.as_deref()), "echo-message");
+    }
+
+    #[test]
+    fn both_spellings_are_read() {
+        // Whichever field it lands in, and however many are granted at once.
+        assert_eq!(cap_list(Some("a b"), None), "a b");
+        assert_eq!(cap_list(None, Some("a b")), "a b");
+        assert_eq!(cap_list(None, None), "");
     }
 }

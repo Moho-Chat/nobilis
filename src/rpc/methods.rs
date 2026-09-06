@@ -337,6 +337,7 @@ pub async fn dispatch(
                 _ => return (None, Some("addAccount requires \"nick\" and \"host\"".to_string())),
             };
             let config = IrcAccountConfig {
+                notify: String::new(),
                 nick: nick.to_string(),
                 host: host.to_string(),
                 port: params.get("port").and_then(|v| v.as_u64()).map(|v| v as u16),
@@ -593,6 +594,13 @@ pub async fn dispatch(
                             tracing::debug!("sendTyping: {e}");
                         }
                     }
+                    (Some(ok_node()), None)
+                }
+                // IRC says it with a client-only tag on an empty TAGMSG,
+                // and says nothing at all where the server has no
+                // message-tags to carry one - see send_typing.
+                Some(buffer) if crate::model::service_of(&buffer.account_id) == "irc" => {
+                    backend::irc::send_typing(state, &buffer.account_id, &buffer.name, typing);
                     (Some(ok_node()), None)
                 }
                 _ => (Some(ok_node()), None),

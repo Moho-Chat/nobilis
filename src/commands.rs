@@ -50,6 +50,8 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "away", usage: "[reason]", description: "Mark yourself away", services: IRC },
     Builtin { name: "back", usage: "", description: "Stop being away", services: IRC },
     Builtin { name: "whois", usage: "<nick>", description: "Look somebody up", services: IRC },
+    Builtin { name: "notify", usage: "[nick]", description: "Watch for somebody arriving, or list who is watched", services: IRC },
+    Builtin { name: "unnotify", usage: "<nick>", description: "Stop watching for somebody", services: IRC },
     Builtin { name: "whowas", usage: "<nick>", description: "Look up somebody who has left", services: IRC },
     Builtin { name: "notice", usage: "<target> <message>", description: "Send a notice", services: IRC },
     Builtin { name: "ctcp", usage: "<nick> <request>", description: "Send a CTCP request", services: IRC },

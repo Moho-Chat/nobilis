@@ -49,6 +49,13 @@ pub struct IrcAccountConfig {
     pub allow_plaintext_sasl: bool,
     #[serde(default)]
     pub autojoin: String,
+    /// Nicks to watch for, comma-separated, in the order they were added.
+    ///
+    /// A property of the connection rather than of this window: which people
+    /// you want to be told about is the same answer on every machine the
+    /// account is used from, and the server is what is asked.
+    #[serde(default)]
+    pub notify: String,
     #[serde(default)]
     pub nickserv_password: Option<String>,
     #[serde(default)]
@@ -591,6 +598,11 @@ impl AccountStore {
 
     pub fn set_autojoin(&self, account_id: &str, channels_csv: &str) -> Result<bool> {
         self.mutate(account_id, |a| a.autojoin = channels_csv.to_string())
+    }
+
+    /// Replaces the watch list. Comma-separated, same shape as autojoin.
+    pub fn set_irc_notify(&self, account_id: &str, nicks_csv: &str) -> Result<bool> {
+        self.mutate(account_id, |a| a.notify = nicks_csv.to_string())
     }
 
     pub fn set_nickserv_password(&self, account_id: &str, password: &str) -> Result<bool> {
