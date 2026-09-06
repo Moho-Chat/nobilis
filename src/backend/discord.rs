@@ -63,6 +63,79 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// nothing to fall back on when the lie is spotted.
 const USER_AGENT: &str = concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)");
 
+/// The shortest gap between two things this client *does* on Discord.
+///
+/// Reading is not paced - a client that could not fetch history quickly would
+/// be a slow client - but writing is, because Discord judges accounts on it.
+/// This project has already lost one to a spam flag, and while the messages
+/// in question were seconds apart rather than milliseconds, a client with no
+/// pacing at all is a client that will eventually send a burst.
+const WRITE_GAP: Duration = Duration::from_millis(400);
+
+/// How many times to wait out a rate limit before giving up on a request.
+const RATE_LIMIT_RETRIES: usize = 3;
+
+/// When the last write went out, so the next one can wait its turn.
+static LAST_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Sends something that changes state, at a civilised pace, and waits out a
+/// rate limit rather than reporting it.
+///
+/// Discord answers a rate limit with 429 and says in the response how long to
+/// wait; nothing here read that, so every one became an error shown to
+/// somebody who could do nothing about it but try again - the worst possible
+/// answer to being told to slow down.
+///
+/// Reads deliberately do not go through this. A client that could not fetch
+/// history quickly would be a slow client, and what Discord judges an account
+/// on is what it sends.
+async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    // The gap is held across every account, because the traffic Discord sees
+    // is this machine's rather than one account's.
+    let wait = {
+        let mut last = LAST_WRITE.lock().unwrap();
+        let wait = last.map(|at| WRITE_GAP.saturating_sub(at.elapsed())).unwrap_or_default();
+        *last = Some(std::time::Instant::now() + wait);
+        wait
+    };
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+
+    let mut pending = Some(request);
+    for attempt in 0..=RATE_LIMIT_RETRIES {
+        let Some(current) = pending.take() else { break };
+        // A retry needs its own copy, taken before the body is consumed. One
+        // that cannot be cloned is one this cannot retry, and is sent once.
+        let again = current.try_clone();
+        let resp = current.send().await.context("talking to Discord")?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
+            return Ok(resp);
+        }
+        let Some(again) = again else { return Ok(resp) };
+        let pause = retry_after(&resp);
+        tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
+        tokio::time::sleep(pause).await;
+        pending = Some(again);
+    }
+    bail!("Discord kept rate-limiting that request")
+}
+
+/// How long Discord asked this client to wait.
+///
+/// Seconds, as a decimal, in a header - clamped at both ends: a limit with no
+/// number is not a reason to hammer, and one asking for half an hour is not a
+/// wait anybody would sit through inside a request.
+fn retry_after(resp: &reqwest::Response) -> Duration {
+    let seconds = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    Duration::from_millis(((seconds.max(0.0) * 1000.0) as u64).clamp(200, 30_000))
+}
+
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -485,11 +558,12 @@ async fn run_qr_login(state: &AppState, login_id: &str, reauth_account_id: Optio
     .map_err(|_| anyhow!("QR code expired - open the form again for a new one"))??;
 
     let ticket = flow;
-    let resp: Value = http_client()
+    let resp: Value = send_write(
+        http_client()
         .post("https://discord.com/api/v9/users/@me/remote-auth/login")
         .json(&json!({ "ticket": ticket }))
-        .send()
-        .await
+        )
+    .await
         .context("exchanging ticket for token")?
         .json()
         .await
@@ -771,12 +845,13 @@ fn parse_iso8601_seconds(text: &str) -> Option<i64> {
 pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let code = invite.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(invite.trim());
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/invites/{code}"))
         .header("Authorization", &cfg.token)
         .json(&json!({}))
-        .send()
-        .await
+        )
+    .await
         .context("accepting Discord invite")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -830,12 +905,13 @@ pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String
     } else {
         json!({ "recipients": user_ids })
     };
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/users/@me/channels"))
         .header("Authorization", &cfg.token)
         .json(&body)
-        .send()
-        .await
+        )
+    .await
         .context("opening Discord DM")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -969,12 +1045,13 @@ const GROUP_DM_MAX_OTHERS: usize = 9;
 /// means making a new group, which is `open_dm_with` with the whole list.
 pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .put(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
         .header("Authorization", &cfg.token)
         .json(&json!({}))
-        .send()
-        .await
+        )
+    .await
         .context("adding somebody to the group")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -991,11 +1068,12 @@ pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &st
 /// means; `close_dm` is the one that says "leave" out loud.
 pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .delete(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
         .header("Authorization", &cfg.token)
-        .send()
-        .await
+        )
+    .await
         .context("removing somebody from the group")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1017,12 +1095,13 @@ pub async fn add_friend(state: &AppState, account_id: &str, username: &str) -> R
         Some((n, d)) if d.chars().all(|c| c.is_ascii_digit()) && !d.is_empty() => (n, Some(d)),
         _ => (username.trim(), None),
     };
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/users/@me/relationships"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "username": name, "discriminator": discriminator }))
-        .send()
-        .await
+        )
+    .await
         .context("sending Discord friend request")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1062,12 +1141,13 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
 /// it into a buffer, so nothing else is needed here.
 pub async fn create_guild(state: &AppState, account_id: &str, name: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/guilds"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "name": name.trim() }))
-        .send()
-        .await
+        )
+    .await
         .context("creating Discord guild")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -1159,12 +1239,13 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
         })
         .collect();
 
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .put(format!("{API_BASE}/guilds/{guild_id}/requests/@me"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "version": version, "form_fields": fields }))
-        .send()
-        .await
+        )
+    .await
         .context("agreeing to this server's rules")?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
@@ -1903,11 +1984,11 @@ pub async fn open_thread(state: &AppState, account_id: &str, buffer_id: &str, th
 
     // Best-effort: already being a member answers 204 as well, and a thread
     // that refuses the join may still be readable.
-    let joined = http
-        .put(format!("{API_BASE}/channels/{thread_id}/thread-members/@me"))
-        .header("Authorization", &cfg.token)
-        .send()
-        .await;
+    let joined = send_write(
+        http.put(format!("{API_BASE}/channels/{thread_id}/thread-members/@me"))
+            .header("Authorization", &cfg.token),
+    )
+    .await;
     if let Err(e) = &joined {
         tracing::debug!("discord: joining thread {thread_id}: {e}");
     }
@@ -3215,6 +3296,39 @@ fn note_components(state: &AppState, buffer_id: &str, msg_id: &str, msg: &Value)
 }
 
 #[cfg(test)]
+mod pacing_tests {
+    use std::time::Duration;
+
+    /// The wait Discord asked for, read the way it sends it: seconds, with a
+    /// decimal point, in a header.
+    ///
+    /// Clamped at both ends on purpose - a limit with no number is not a
+    /// reason to hammer, and a half-hour one is not a wait to sit through
+    /// inside a request - and this is the arithmetic that decides both.
+    fn pause_for(seconds: Option<&str>) -> Duration {
+        let seconds = seconds.and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
+        Duration::from_millis(((seconds.max(0.0) * 1000.0) as u64).clamp(200, 30_000))
+    }
+
+    #[test]
+    fn a_wait_is_taken_as_asked() {
+        assert_eq!(pause_for(Some("1.5")), Duration::from_millis(1500));
+        assert_eq!(pause_for(Some("0.75")), Duration::from_millis(750));
+    }
+
+    #[test]
+    fn a_missing_or_absurd_wait_is_still_a_wait() {
+        assert_eq!(pause_for(None), Duration::from_millis(1000));
+        assert_eq!(pause_for(Some("nonsense")), Duration::from_millis(1000));
+        // Nothing is not an answer to being told to slow down.
+        assert_eq!(pause_for(Some("0")), Duration::from_millis(200));
+        assert_eq!(pause_for(Some("-5")), Duration::from_millis(200));
+        // And nobody waits half an hour inside one request.
+        assert_eq!(pause_for(Some("1800")), Duration::from_millis(30_000));
+    }
+}
+
+#[cfg(test)]
 mod component_tests {
     use super::extract_components;
     use serde_json::json;
@@ -3428,12 +3542,13 @@ async fn interact(state: &AppState, account_id: &str, buffer_id: &str, kind: i64
     if let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) {
         payload["guild_id"] = json!(guild_id);
     }
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/interactions"))
         .header("Authorization", &cfg.token)
         .json(&payload)
-        .send()
-        .await
+        )
+    .await
         .context("sending the interaction")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -3533,12 +3648,13 @@ async fn interact_with_message(
     if let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) {
         payload["guild_id"] = json!(guild_id);
     }
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/interactions"))
         .header("Authorization", &cfg.token)
         .json(&payload)
-        .send()
-        .await
+        )
+    .await
         .context("sending the interaction")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5010,12 +5126,13 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     if let Some(reference) = reply_reference(reply_to_id) {
         payload["message_reference"] = reference;
     }
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .json(&payload)
-        .send()
-        .await
+        )
+    .await
         .context("sending Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5049,12 +5166,13 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
     let form = reqwest::multipart::Form::new()
         .text("payload_json", payload.to_string())
         .part("files[0]", reqwest::multipart::Part::bytes(bytes).file_name(file_name));
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .multipart(form)
-        .send()
-        .await
+        )
+    .await
         .context("uploading Discord attachment")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5072,12 +5190,13 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .patch(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
         .json(&json!({ "content": body }))
-        .send()
-        .await
+        )
+    .await
         .context("editing Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5101,12 +5220,13 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    http_client()
+    send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/typing"))
         .header("Authorization", token)
         .header("Content-Length", "0")
-        .send()
-        .await
+        )
+    .await
         .context("sending a Discord typing notice")?;
     Ok(())
 }
@@ -5129,12 +5249,13 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
         .header("Authorization", token)
         .json(&json!({ "token": serde_json::Value::Null }))
-        .send()
-        .await
+        )
+    .await
         .context("acking Discord read state")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5149,11 +5270,12 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .delete(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
-        .send()
-        .await
+        )
+    .await
         .context("deleting Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -5729,12 +5851,13 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> b
     }
 
     let Some(config) = state.accounts.get_discord(account_id) else { return false };
-    match http_client()
+    match send_write(
+        http_client()
         .patch(format!("{API_BASE}/users/@me/settings"))
         .header("Authorization", &config.token)
         .json(&json!({ "status": discord_status(status) }))
-        .send()
-        .await
+        )
+    .await
     {
         Ok(resp) if resp.status().is_success() => true,
         Ok(resp) => {
@@ -6138,14 +6261,15 @@ pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Res
 /// offering this should say so before it happens rather than after.
 pub async fn leave_guild(state: &AppState, account_id: &str, guild_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
-        .delete(format!("{API_BASE}/users/@me/guilds/{guild_id}"))
-        .header("Authorization", &cfg.token)
-        // Discord distinguishes leaving from being removed; this is a leave.
-        .json(&json!({ "lurking": false }))
-        .send()
-        .await
-        .context("leaving the server")?;
+    let resp = send_write(
+        http_client()
+            .delete(format!("{API_BASE}/users/@me/guilds/{guild_id}"))
+            .header("Authorization", &cfg.token)
+            // Discord distinguishes leaving from being removed; this is a leave.
+            .json(&json!({ "lurking": false })),
+    )
+    .await
+    .context("leaving the server")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -6162,11 +6286,12 @@ pub async fn leave_guild(state: &AppState, account_id: &str, guild_id: &str) -> 
 /// consequences.
 pub async fn close_dm(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
+    let resp = send_write(
+        http_client()
         .delete(format!("{API_BASE}/channels/{channel_id}"))
         .header("Authorization", &cfg.token)
-        .send()
-        .await
+        )
+    .await
         .context("closing the conversation")?;
     if !resp.status().is_success() {
         let status = resp.status();
@@ -6222,12 +6347,13 @@ pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Resu
 /// what pressing it means.
 pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let _ = http_client()
+    let _ = send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "recipients": [&cfg.user_id] }))
-        .send()
-        .await;
+        )
+    .await;
     announce_call(state, account_id, channel_id, false);
     Ok(())
 }
@@ -6247,15 +6373,16 @@ pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) ->
 /// answered by Discord with a call that ends the moment they accept it.
 pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
-        .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
-        .header("Authorization", &cfg.token)
-        // A null recipient list means everyone in the conversation, which for
-        // a one-to-one DM is the one person there is.
-        .json(&json!({ "recipients": Value::Null }))
-        .send()
-        .await
-        .context("ringing")?;
+    let resp = send_write(
+        http_client()
+            .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
+            .header("Authorization", &cfg.token)
+            // A null recipient list means everyone in the conversation, which
+            // for a one-to-one DM is the one person there is.
+            .json(&json!({ "recipients": Value::Null })),
+    )
+    .await
+    .context("ringing")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -6267,12 +6394,13 @@ pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Resul
 /// Stops a call ringing, for hanging up before it is answered.
 pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let _ = http_client()
+    let _ = send_write(
+        http_client()
         .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "recipients": Value::Null }))
-        .send()
-        .await;
+        )
+    .await;
     Ok(())
 }
 
