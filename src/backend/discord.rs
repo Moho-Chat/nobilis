@@ -1134,6 +1134,36 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
     Ok(())
 }
 
+/// Blocks somebody, or lifts it.
+///
+/// A relationship of type 2, which is what Discord's own "Block" does: it is
+/// account-wide, it follows to every client, and - unlike an ignore kept here
+/// - the person is told, in the sense that their messages to you stop being
+/// delivered and their friend requests stop arriving.
+///
+/// The gateway's own RELATIONSHIP_ADD says it happened, the same way it does
+/// for a friend; this only has to make the request.
+pub async fn set_blocked(state: &AppState, account_id: &str, user_id: &str, blocked: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let http = http_client();
+    let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
+    let doing = if blocked { "blocking them" } else { "unblocking them" };
+    let request = if blocked {
+        http.put(url).json(&json!({ "type": 2 }))
+    } else {
+        // The same DELETE that unfriends: what it undoes is whichever
+        // relationship you were in.
+        http.delete(url)
+    };
+    let resp = send_write(request.header("Authorization", &cfg.token)).await.context(doing)?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, doing));
+    }
+    Ok(())
+}
+
 /// Creates a brand-new guild owned by this account - Discord's own "Create
 /// My Own" server flow, same endpoint real clients use. Discord auto-
 /// creates a default #general channel; the gateway's own GUILD_CREATE

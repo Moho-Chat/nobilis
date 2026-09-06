@@ -3163,6 +3163,24 @@ impl Runtime {
         html: Option<String>,
         style: Option<model::SenderStyle>,
     ) -> bool {
+        // Somebody being ignored, on a service that will not do it for us.
+        // Here rather than in each backend because this is the one place
+        // every message passes, and here rather than in a window because a
+        // window can hide a line and cannot stop it counting as unread,
+        // notifying, or being written into the log.
+        //
+        // Never our own messages, whatever the list says: ignoring yourself
+        // would be a way to lose what you just typed.
+        if kind != "system" && !state.ignores.for_account(account_id).is_empty() {
+            let own = self
+                .irc_current_nick(account_id)
+                .or_else(|| self.own_identity(account_id))
+                .unwrap_or_default();
+            let is_own = !own.is_empty() && from == own;
+            if !is_own && crate::ignores::is_ignored(&state.ignores.for_account(account_id), from, sender_id.as_deref()) {
+                return false;
+            }
+        }
         let buffer = self.ensure_buffer(state, account_id, buffer_name, buffer_kind);
         let own_nick = self
             .irc_current_nick(account_id)

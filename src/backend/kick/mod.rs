@@ -1926,6 +1926,7 @@ mod tests {
             voice_prefs: std::sync::Arc::new(crate::backend::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
+            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
         }
     }
 

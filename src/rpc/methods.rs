@@ -28,6 +28,38 @@ fn kick_credential(state: &AppState, account_id: &str) -> std::result::Result<(r
     Ok((http, token))
 }
 
+/// Stops somebody's messages arriving, on whichever service they are on.
+///
+/// One place rather than two, because the menu entry and the typed command
+/// are the same request. Answers with where the ignore holds: "account" when
+/// the service itself was told and it follows the account everywhere, "window"
+/// when there was nobody to tell and this is moho declining to show what still
+/// arrives.
+async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored: bool) -> anyhow::Result<&'static str> {
+    match crate::model::service_of(account_id) {
+        // The homeserver keeps the list and stops sending the messages, so
+        // there is nothing to keep here.
+        "matrix" => {
+            backend::matrix::set_ignored_user(state, account_id, target, ignored).await?;
+            Ok("account")
+        }
+        // Discord has a real block. It is told as well as recorded, because a
+        // block is account-wide and people expect it to hold in the phone app
+        // too - and recorded as well as told, because the gateway keeps
+        // delivering what a blocked person says and it is this client that
+        // has to stop showing it.
+        "discord" => {
+            backend::discord::set_blocked(state, account_id, target, ignored).await?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
+        _ => {
+            state.ignores.set(account_id, target, ignored);
+            Ok("window")
+        }
+    }
+}
+
 pub async fn dispatch(
     state: &AppState,
     method: &str,
@@ -390,6 +422,7 @@ pub async fn dispatch(
                 // they would come back with an account added under the same
                 // name later.
                 state.highlights.forget(id);
+                state.ignores.forget(id);
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
@@ -2205,6 +2238,42 @@ pub async fn dispatch(
                 .get_buffer(buffer_id)
                 .and_then(|b| crate::commands::rewrite(crate::model::service_of(&b.account_id), body));
             let body: &str = rewritten.as_deref().unwrap_or(body);
+            // Not hearing from somebody, typed rather than clicked. Handled
+            // here rather than in each backend because the answer is the same
+            // on all of them and only one of them - IRC - has ever had the
+            // command: it is the same list the menu writes to.
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                if let Some(rest) = body.strip_prefix("/ignore").or_else(|| body.strip_prefix("/unignore")) {
+                    let ignoring = body.starts_with("/ignore");
+                    let target = rest.trim();
+                    let line = if target.is_empty() {
+                        // Asking rather than setting, which is what a bare
+                        // /ignore means in the clients that have one.
+                        let list = state.ignores.for_account(&buffer.account_id);
+                        if list.is_empty() {
+                            "ignoring nobody - /ignore <name> adds somebody".to_string()
+                        } else {
+                            format!("ignoring: {}", list.join(", "))
+                        }
+                    } else {
+                        // The same call the menu entry makes, so a typed
+                        // ignore and a clicked one cannot mean different
+                        // things - including telling Matrix and Discord,
+                        // which have lists of their own.
+                        match apply_ignore(state, &buffer.account_id, target, ignoring).await {
+                            Err(e) => return (None, Some(format!("{e:#}"))),
+                            Ok("account") if ignoring => format!("ignoring {target} - on this account everywhere"),
+                            Ok(_) if ignoring => format!("ignoring {target} - in moho, since this service has no list of its own"),
+                            Ok(_) => format!("no longer ignoring {target}"),
+                        }
+                    };
+                    state.runtime.record_message(
+                        state, &buffer.account_id, &buffer.name, &buffer.kind, "*", &line, false, "system",
+                        None, None, false, None, Vec::new(), Vec::new(), None,
+                    );
+                    return (Some(ok_node()), None);
+                }
+            }
             match state.runtime.get_buffer(buffer_id) {
                 None => (None, Some("sendMessage requires a known \"bufferId\" and \"body\"".to_string())),
                 Some(buffer) if buffer.account_id.starts_with("discord:") => match state.accounts.get_discord(&buffer.account_id) {
@@ -3552,6 +3621,37 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // Not hearing from somebody, on whichever service they are on.
+        //
+        // One method rather than one per backend, because the person doing it
+        // is answering the same question everywhere - and the difference in
+        // what it costs them is worth saying out loud, which is what the
+        // answer carries back.
+        "setIgnored" => {
+            let (account_id, target) = match (p_str_opt(params, "accountId"), p_str_opt(params, "target")) {
+                (Some(a), Some(t)) => (a, t),
+                _ => return (None, Some("setIgnored requires \"accountId\" and \"target\"".to_string())),
+            };
+            let ignored = params.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
+            match apply_ignore(state, account_id, target, ignored).await {
+                Ok(scope) => (Some(serde_json::json!({ "scope": scope })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "listIgnored" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("listIgnored requires \"accountId\"".to_string()));
+            };
+            if crate::model::service_of(account_id) == "matrix" {
+                // The homeserver's list, which the sync already keeps here.
+                let mut users: Vec<String> = state.runtime.matrix_ignored(account_id).into_iter().collect();
+                users.sort();
+                return (Some(serde_json::json!(users)), None);
+            }
+            (Some(serde_json::json!(state.ignores.for_account(account_id))), None)
         }
 
         // Asking to be let into a room that is asked rather than entered.

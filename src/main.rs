@@ -3,6 +3,7 @@ mod backend;
 mod commands;
 mod events;
 mod highlights;
+mod ignores;
 mod ipc;
 mod model;
 mod net;
@@ -213,6 +214,7 @@ async fn main() -> Result<()> {
         voice_prefs: Arc::new(backend::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
         dcc_prefs: Arc::new(backend::irc_dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
         highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
+        ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };
 
     // Reconnect every saved account, same as

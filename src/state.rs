@@ -35,4 +35,7 @@ pub struct AppState {
     /// name. Here rather than in a window because this is where a message is
     /// decided to be a highlight - see highlights.rs.
     pub highlights: Arc<crate::highlights::HighlightStore>,
+    /// People whose messages should not arrive, on the services with no
+    /// server-side list of their own - see ignores.rs.
+    pub ignores: Arc<crate::ignores::IgnoreStore>,
 }

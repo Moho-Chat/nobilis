@@ -27,6 +27,9 @@ pub struct Builtin {
 const IRC: &[&str] = &["irc"];
 const IRC_AND_MATRIX: &[&str] = &["irc", "matrix"];
 const MATRIX: &[&str] = &["matrix"];
+/// Everywhere, including the services with no list of their own - moho keeps
+/// one for those.
+const EVERY: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat"];
 /// The ones that are only text, and so work wherever this daemon does the
 /// sending itself.
 ///
@@ -57,6 +60,13 @@ pub const BUILTINS: &[Builtin] = &[
         description: "Send a place",
         services: MATRIX,
     },
+    Builtin {
+        name: "ignore",
+        usage: "[name]",
+        description: "Stop hearing from somebody, or list who is ignored",
+        services: EVERY,
+    },
+    Builtin { name: "unignore", usage: "<name>", description: "Hear from somebody again", services: EVERY },
     Builtin { name: "notify", usage: "[nick]", description: "Watch for somebody arriving, or list who is watched", services: IRC },
     Builtin { name: "unnotify", usage: "<nick>", description: "Stop watching for somebody", services: IRC },
     Builtin { name: "whowas", usage: "<nick>", description: "Look up somebody who has left", services: IRC },
@@ -216,14 +226,21 @@ mod tests {
         }
     }
 
-    /// Sneedchat's own command, and only its own: the site reads a message
-    /// for commands before anybody else does, so four invented here would
-    /// mean the same typing doing different things in different clients.
+    /// Sneedchat's own command, and nothing invented for it to send: the site
+    /// reads a message for commands before anybody else does, so a command
+    /// this client made up would be posted as public text.
+    ///
+    /// `/ignore` is the one exception and is not an exception to that rule:
+    /// the daemon acts on it and returns before anything is sent, so nothing
+    /// of it ever reaches the site.
     #[test]
     fn sneedchat_is_offered_its_own_command_and_nothing_invented() {
         let names: Vec<&str> = matching("sneedchat", "").iter().map(|c| c.name).collect();
-        assert_eq!(names, vec!["w"]);
+        assert_eq!(names, vec!["ignore", "unignore", "w"]);
         assert_eq!(super::rewrite("sneedchat", "/tableflip"), None);
+        // And no rewrite for the ones it does offer, which is what would put
+        // them on the wire.
+        assert_eq!(super::rewrite("sneedchat", "/ignore somebody"), None);
     }
 
     #[test]

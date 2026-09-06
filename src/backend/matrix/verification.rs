@@ -537,6 +537,7 @@ mod tests {
             voice_prefs: Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
             highlights: Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
+            ignores: Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
         let config = MatrixAccountConfig {
             homeserver_url: homeserver.to_string(),
