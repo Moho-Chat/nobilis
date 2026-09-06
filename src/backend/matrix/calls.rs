@@ -111,3 +111,179 @@ pub async fn turn_servers(state: &AppState, account_id: &str) -> anyhow::Result<
         }
     }
 }
+
+/// How long a published membership stands before it is treated as stale.
+///
+/// A client that is killed mid-call never withdraws its membership, so the
+/// state event would say somebody is in a call for ever. Every client that
+/// implements MSC3401 stamps an expiry and refreshes it while it is still
+/// there; anything past its expiry is somebody's crash, not a participant.
+pub const MEMBERSHIP_TTL_MS: i64 = 90_000;
+
+/// The event that says who is in a room's call.
+pub const EVENT_MEMBER: &str = "m.call.member";
+
+/// Says this account is in the room's call, or is no longer.
+///
+/// One state event per user, keyed by user id, holding a list of memberships -
+/// one per device, since the same person may be in a call from a phone and a
+/// desktop and only one of those should stop when the other leaves.
+///
+/// Withdrawing sends the remaining memberships rather than empty content, for
+/// the same reason: another device of this account may still be in the call.
+pub async fn set_membership(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    device_id: &str,
+    joined: bool,
+) -> anyhow::Result<()> {
+    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .ok_or_else(|| anyhow::anyhow!("no known Matrix room for this buffer"))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let mut memberships: Vec<Value> = state
+        .runtime
+        .matrix_call_members(account_id, &room_id)
+        .into_iter()
+        .filter(|m| m["user_id"].as_str() == Some(account.user_id.as_str()))
+        .filter_map(|m| m["membership"].clone().into())
+        // This device's own entry is rewritten below either way.
+        .filter(|m: &Value| m["device_id"].as_str() != Some(device_id))
+        .filter(|m: &Value| m["expires_ts"].as_i64().unwrap_or(0) > now)
+        .collect();
+    if joined {
+        memberships.push(json!({
+            "application": "m.call",
+            "call_id": "",
+            "scope": "m.room",
+            "device_id": device_id,
+            "expires_ts": now + MEMBERSHIP_TTL_MS,
+            // No focus: this is a mesh between the people in the room rather
+            // than a conference on somebody's server. See the module note.
+            "foci_active": [],
+        }));
+    }
+    // Whether everybody in the room may join a call at all.
+    //
+    // A membership is a *state* event, and a room's default is that only
+    // moderators may send those - so a call started in an ordinary room is
+    // one nobody else can join, and they find out with a bare "not
+    // authorized". Where this account can change the permissions, it lowers
+    // that one event to what everybody has; where it cannot, the call still
+    // works for whoever may already send it.
+    if joined {
+        allow_everybody_to_join(state, account_id, &room_id).await;
+    }
+
+    let result = super::put_room_state(
+        state,
+        account_id,
+        &room_id,
+        EVENT_MEMBER,
+        &account.user_id,
+        json!({ "memberships": memberships }),
+    )
+    .await;
+    if let Err(e) = &result {
+        // The refusal that has an explanation worth giving.
+        if e.to_string().contains("M_FORBIDDEN") {
+            anyhow::bail!(
+                "this room does not let its members join calls - somebody who can change the room's \
+                 permissions has to allow the m.call.member event"
+            );
+        }
+    }
+    result
+}
+
+/// Lets ordinary members join this room's calls, where we may say so.
+///
+/// One key in the power levels: `events["m.call.member"] = 0`. Without it the
+/// room's `state_default` applies, which is 50 - a moderator - and a call in
+/// an ordinary room is a call of one.
+///
+/// Best-effort and silent on refusal: somebody without the power to change
+/// permissions can still be in a call, and failing to start one because the
+/// room could not be reconfigured would be worse than a call only some people
+/// can join.
+async fn allow_everybody_to_join(state: &AppState, account_id: &str, room_id: &str) {
+    let Some(levels) = state.runtime.matrix_power_levels(account_id, room_id) else { return };
+    if levels["events"][EVENT_MEMBER].as_i64() == Some(0) {
+        return;
+    }
+    let mut next = levels.clone();
+    next["events"][EVENT_MEMBER] = json!(0);
+    match super::put_room_state(state, account_id, room_id, "m.room.power_levels", "", next).await {
+        Ok(()) => tracing::info!("matrix[{account_id}]: {room_id} now lets its members join calls"),
+        Err(e) => tracing::debug!("matrix[{account_id}]: cannot open {room_id} to calls: {e:#}"),
+    }
+}
+
+/// Reads one `m.call.member` state event into the memberships it carries.
+///
+/// Tolerant, and expiry-aware: a membership past its stamp is somebody whose
+/// client died, and treating it as a participant would leave a tile in the
+/// grid for somebody who left hours ago.
+pub fn read_memberships(user_id: &str, content: &Value, now_ms: i64) -> Vec<Value> {
+    content["memberships"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|m| m["application"].as_str().unwrap_or("m.call") == "m.call")
+                .filter(|m| m["expires_ts"].as_i64().unwrap_or(0) > now_ms)
+                .map(|m| json!({ "user_id": user_id, "membership": m }))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Who to call, and who to wait for.
+///
+/// Both ends of every pair see each other arrive, and if both call, both
+/// answer, and the call collides with itself. So the rule is one line and the
+/// same on both sides: the smaller id calls the larger. It has to be a
+/// property of the pair rather than of who arrived first, because "first" is
+/// not something two clients can agree on.
+pub fn should_offer(own_key: &str, their_key: &str) -> bool {
+    own_key < their_key
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    #[test]
+    fn a_membership_past_its_stamp_is_not_a_participant() {
+        let content = json!({ "memberships": [
+            { "application": "m.call", "device_id": "HERE", "expires_ts": 2_000 },
+            { "application": "m.call", "device_id": "GONE", "expires_ts": 500 },
+        ]});
+        let live = read_memberships("@a:example.org", &content, 1_000);
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["membership"]["device_id"], "HERE");
+        assert_eq!(live[0]["user_id"], "@a:example.org");
+    }
+
+    #[test]
+    fn something_that_is_not_a_call_is_not_read_as_one() {
+        let content = json!({ "memberships": [
+            { "application": "m.whiteboard", "device_id": "X", "expires_ts": 9_000 },
+        ]});
+        assert!(read_memberships("@a:example.org", &content, 1_000).is_empty());
+        assert!(read_memberships("@a:example.org", &json!({}), 1_000).is_empty());
+    }
+
+    #[test]
+    fn exactly_one_end_of_every_pair_offers() {
+        // Whichever way round the two clients ask, they must not agree.
+        assert!(should_offer("@a:example.org|AAA", "@b:example.org|BBB"));
+        assert!(!should_offer("@b:example.org|BBB", "@a:example.org|AAA"));
+        // Including two devices of the same person, which is the case that
+        // makes a user-id comparison alone wrong.
+        assert!(should_offer("@a:example.org|AAA", "@a:example.org|ZZZ"));
+        assert!(!should_offer("@a:example.org|ZZZ", "@a:example.org|AAA"));
+    }
+}

@@ -311,6 +311,28 @@ pub async fn dispatch(
                 // read something new.
                 backend::matrix::replay_read_receipts(state, buffer_id);
 
+                // A call already happening in this room. Replayed for the
+                // same reason the roster is: it is state rather than news, so
+                // a window opened after it started would show no sign of it
+                // until somebody joined or left - which on a call of two
+                // people already talking is never.
+                if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
+                    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+                    let now = chrono::Utc::now().timestamp_millis();
+                    let members: Vec<serde_json::Value> = state
+                        .runtime
+                        .matrix_call_members(&account_id, &room_id)
+                        .into_iter()
+                        .filter(|m| m["membership"]["expires_ts"].as_i64().unwrap_or(0) > now)
+                        .collect();
+                    if !members.is_empty() {
+                        state.events.emit(
+                            "matrixCallMembers",
+                            serde_json::json!({ "accountId": account_id, "bufferId": buffer_id, "members": members }),
+                        );
+                    }
+                }
+
                 // And what a Kick channel is broadcasting, which changes while
                 // nobody is looking: a viewer count from an hour ago is worse
                 // than none, so opening the channel asks again.
@@ -3621,6 +3643,59 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // Joining a room's call, or leaving it. The membership is state in
+        // the room, so everybody else in it learns there is a call to join.
+        "setMatrixCallMembership" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setMatrixCallMembership requires \"bufferId\"".to_string()));
+            };
+            let joined = params.get("joined").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(account) = state.accounts.get_matrix(&buffer.account_id) else {
+                return (None, Some("account not connected".to_string()));
+            };
+            match backend::matrix::calls::set_membership(state, &buffer.account_id, buffer_id, &account.device_id, joined).await {
+                Ok(()) => (
+                    Some(serde_json::json!({
+                        "userId": account.user_id,
+                        "deviceId": account.device_id,
+                        // The room, which is what both ends of a call have in
+                        // common: each account names the same room by its own
+                        // buffer id, so a conference named after the buffer
+                        // would be two conferences that never meet.
+                        "roomId": state.runtime.get_matrix_room(buffer_id),
+                    })),
+                    None,
+                ),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "listMatrixCallMembers" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixCallMembers requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+                return (Some(serde_json::json!([])), None);
+            };
+            let now = chrono::Utc::now().timestamp_millis();
+            // Filtered on the way out as well as on the way in: a membership
+            // read an hour ago may have expired since, and nobody refreshes
+            // somebody else's.
+            let live: Vec<serde_json::Value> = state
+                .runtime
+                .matrix_call_members(&buffer.account_id, &room_id)
+                .into_iter()
+                .filter(|m| m["membership"]["expires_ts"].as_i64().unwrap_or(0) > now)
+                .collect();
+            (Some(serde_json::json!(live)), None)
         }
 
         // Not hearing from somebody, on whichever service they are on.

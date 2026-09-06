@@ -55,6 +55,28 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                     );
                 }
             }
+            // Who is in this room's call. A state event per person, and the
+            // one thing a client needs to know before it can join one: a
+            // group call has no invitation, only people already in it.
+            "m.call.member" => {
+                let who = event["state_key"].as_str().unwrap_or_default();
+                let live = crate::backend::matrix::calls::read_memberships(
+                    who,
+                    &event["content"],
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                let everybody = state.runtime.set_matrix_call_members(account_id, room_id, who, live);
+                if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
+                    state.events.emit(
+                        "matrixCallMembers",
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "bufferId": buffer_id,
+                            "members": everybody,
+                        }),
+                    );
+                }
+            }
             "m.room.avatar" => {
                 if let Some(mxc) = event["content"]["url"].as_str() {
                     if let Some(path) = cached_media_path(homeserver_url, access_token, mxc, "").await {

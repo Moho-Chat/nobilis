@@ -432,6 +432,12 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Who is in a room's call, per account and room.
+    ///
+    /// Read from `m.call.member` state rather than tracked here: the state is
+    /// the truth, this is only the copy the client is told about without
+    /// re-reading the room every time somebody asks.
+    matrix_call_members: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Sticker packs, per account: pack key -> the images it offers.
     ///
     /// One flat table rather than per-room, because a picker offers everything
@@ -836,6 +842,7 @@ impl Runtime {
             irc_caps: Mutex::new(HashMap::new()),
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
             matrix_stickers: Mutex::new(HashMap::new()),
+            matrix_call_members: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2343,6 +2350,15 @@ impl Runtime {
         self.matrix_room_avatars.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
     }
 
+    /// This room's power levels, as the state last said.
+    pub fn matrix_power_levels(&self, account_id: &str, room_id: &str) -> Option<Value> {
+        self.matrix_power_levels
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
+    }
+
     pub fn set_matrix_power_levels(&self, account_id: &str, room_id: &str, content: Value) {
         self.matrix_power_levels.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), content);
     }
@@ -2917,6 +2933,35 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    /// Everybody currently in this room's call, as the state last said.
+    pub fn matrix_call_members(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
+        self.matrix_call_members
+            .lock()
+            .unwrap()
+            .get(&format!("{account_id}|{room_id}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Replaces one person's memberships in a room, and answers with everybody
+    /// who is in the call afterwards.
+    ///
+    /// Per user because that is how the state is keyed: one event per person,
+    /// listing the devices of theirs that are in the call.
+    pub fn set_matrix_call_members(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        memberships: Vec<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        let mut all = self.matrix_call_members.lock().unwrap();
+        let room = all.entry(format!("{account_id}|{room_id}")).or_default();
+        room.retain(|m| m["user_id"].as_str() != Some(user_id));
+        room.extend(memberships);
+        room.clone()
     }
 
     /// Records one sticker pack, replacing whatever was under that key.
