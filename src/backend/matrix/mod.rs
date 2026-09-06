@@ -28,6 +28,7 @@ pub mod http;
 pub mod markup;
 pub mod moderation;
 pub mod polls;
+pub mod calls;
 pub mod protocol;
 pub mod roomstate;
 pub mod rooms;
@@ -706,6 +707,9 @@ async fn handle_timeline_event(
         && !polls::is_poll_event(outer_type)
         // And a verification with another person travels through the room.
         && !outer_type.starts_with("m.key.verification.")
+        // A call is signalled through the room like anything else: the offer,
+        // the answer and the network candidates are all events in it.
+        && !outer_type.starts_with("m.call.")
     {
         // Membership/name changes were already folded into naming in
         // process_sync_response; anything else (typing, receipts, other
@@ -791,6 +795,15 @@ async fn handle_timeline_event(
         if let Err(e) = session.receive_room_verification(&event, room_id).await {
             tracing::debug!("matrix[{account_id}]: verification event {event_id}: {e:#}");
         }
+        return;
+    }
+
+    // A call: somebody ringing, answering, hanging up, or telling us how to
+    // reach them. Handed to the client rather than rendered, because the
+    // media is the client's - it has a WebRTC stack and this daemon does not.
+    // See calls::handle.
+    if effective_type.starts_with("m.call.") {
+        calls::handle(state, account_id, buffer_id, own_user_id, &effective_type, sender, &content);
         return;
     }
 
@@ -3190,6 +3203,52 @@ pub async fn edit_message(state: &AppState, account_id: &str, buffer_id: &str, a
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
     http::put_json(&url, access_token, body_json).await.context("sending edit")?;
+    Ok(())
+}
+
+/// Sends an event of whatever type into a room.
+///
+/// Unlike `send_room_event` below - which is for the things that are messages
+/// without being chat, and always sends `m.room.message` - this carries its
+/// own type all the way through, including into the encryption, where the
+/// type is part of what gets encrypted. That distinction is not academic: a
+/// call event sent as a message would arrive as a blank line in the log
+/// rather than as a ringing telephone.
+///
+/// Encrypted where the room is, for the reason everything else here is: a
+/// room that hides what is said in it should not make an exception.
+pub async fn send_typed_event(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    event_type: &str,
+    content: Value,
+) -> Result<()> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let (sent_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, &access_token, &room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, event_type, content)
+            .await
+            .context("encrypting the event")?;
+        (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
+    } else {
+        (event_type.to_string(), content)
+    };
+
+    let txn_id = model::next_message_id();
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/send/{sent_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
+    );
+    http::put_json(&url, &access_token, body_json).await.context("sending the event")?;
     Ok(())
 }
 

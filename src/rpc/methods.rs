@@ -1253,6 +1253,44 @@ pub async fn dispatch(
             }
         }
 
+        // One end of a Matrix call, signalled through the room.
+        //
+        // The media never comes near this daemon: the client has a WebRTC
+        // stack and this process does not, so what crosses here is the offer,
+        // the answer, the network candidates and the hangup - see
+        // backend/matrix/calls.rs.
+        "sendMatrixCallEvent" => {
+            let (buffer_id, event_type) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "type")) {
+                (Some(b), Some(t)) => (b, t),
+                _ => return (None, Some("sendMatrixCallEvent requires \"bufferId\" and \"type\"".to_string())),
+            };
+            if !event_type.starts_with("m.call.") {
+                return (None, Some("that is not a call event".to_string()));
+            }
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let Some(content) = params.get("content").filter(|c| c.is_object()).cloned() else {
+                return (None, Some("sendMatrixCallEvent requires \"content\"".to_string()));
+            };
+            match backend::matrix::calls::send(state, &buffer.account_id, buffer_id, event_type, content).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Where to reach this homeserver's relay, for a call between two
+        // networks that will not talk to each other directly.
+        "matrixTurnServers" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("matrixTurnServers requires \"accountId\"".to_string()));
+            };
+            match backend::matrix::calls::turn_servers(state, account_id).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The threads a Discord channel or forum is holding.
         //
         // Asked for when it is opened rather than at connect: a guild can be
