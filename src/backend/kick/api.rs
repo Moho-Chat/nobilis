@@ -63,6 +63,12 @@ pub struct Channel {
     /// How many people follow the channel - the one number about a channel
     /// that means something while it is offline.
     pub followers: Option<u64>,
+    /// Where the video is, when there is any: a signed Amazon IVS playlist,
+    /// fetched anonymously because the token is already in the query string.
+    /// Present on the channel whether or not it is live, and stale the moment
+    /// the token expires - which is why it rides the refresh rather than
+    /// being asked for once.
+    pub playback_url: Option<String>,
 }
 
 /// A stream in progress, as the channel endpoint describes it.
@@ -88,6 +94,8 @@ struct ChannelJson {
     /// channels that happened to be sent that way would not connect at all.
     #[serde(default, deserialize_with = "loose_number")]
     followers_count: Option<u64>,
+    #[serde(default)]
+    playback_url: Option<String>,
 }
 
 /// A count that may arrive as a number or as a string containing one.
@@ -205,6 +213,10 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
         followers_only: json.chatroom.followers_mode,
         live,
         followers: json.followers_count,
+        // Empty is the same as absent here: Kick sends "" for a channel that
+        // has never streamed, and a player pointed at "" is a player pointed
+        // at this page.
+        playback_url: json.playback_url.filter(|u| !u.trim().is_empty()),
         slug,
     })
 }

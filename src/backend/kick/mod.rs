@@ -1065,6 +1065,11 @@ fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, fo
         "viewers": channel.live.as_ref().and_then(|l| l.viewers),
         "startedTs": channel.live.as_ref().and_then(|l| l.started_ts),
         "followers": channel.followers,
+        // Where the picture is. On the stream event rather than fetched by
+        // whoever wants to watch, because every frontend that shows video
+        // needs it and the refresh already running is what replaces the
+        // signed token before it expires.
+        "playbackUrl": channel.playback_url,
         // Absent rather than false for an account that is not signed in:
         // "not following" and "cannot say" are different, and a button that
         // offers to follow when it cannot is a button that fails when pressed.
@@ -2177,6 +2182,7 @@ mod tests {
             followers_only: false,
             live: None,
             followers: None,
+            playback_url: None,
         });
         w
     }
@@ -2308,10 +2314,12 @@ mod tests {
         w.add(&api::Channel {
             id: 999, chatroom_id: 111, slug: "first".into(), username: "first".into(),
             avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
+            playback_url: None,
         });
         w.add(&api::Channel {
             id: 222, chatroom_id: 999, slug: "second".into(), username: "second".into(),
             avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
+            playback_url: None,
         });
         // 999 is first's channel and second's chatroom. Which one is meant is
         // never a guess - the subscription name says which kind it is.
