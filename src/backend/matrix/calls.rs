@@ -121,7 +121,40 @@ pub async fn turn_servers(state: &AppState, account_id: &str) -> anyhow::Result<
 pub const MEMBERSHIP_TTL_MS: i64 = 90_000;
 
 /// The event that says who is in a room's call.
-pub const EVENT_MEMBER: &str = "m.call.member";
+///
+/// The unstable name, deliberately: this is what Element writes and reads
+/// today, and a call is only worth being in if the client most people use can
+/// see that you are in it. `m.rtc.member` is where this is going - sticky
+/// events, MSC4143 - and is read below as well, so a room where Element has
+/// already moved on is still understood.
+pub const EVENT_MEMBER: &str = "org.matrix.msc3401.call.member";
+
+/// Where the membership event is going: MSC4143's own name for it.
+pub const EVENT_MEMBER_NEXT: &str = "org.matrix.msc4143.rtc.member";
+
+/// What moho puts in `foci_preferred` to mean "I am on the mesh".
+///
+/// Element's clients read the transports in a membership and connect to the
+/// one they can use. This is not one of them, on purpose: a moho participant
+/// says what it actually offers rather than claiming a LiveKit focus it
+/// cannot serve, and a client that does not understand it ignores it rather
+/// than dialling nothing.
+pub const TRANSPORT_MESH: &str = "moho.mesh";
+
+/// The state key Element uses for a per-device membership.
+///
+/// `_@user:server_DEVICEID_m.call`, with the leading underscore because an
+/// ordinary room refuses a state key starting with `@` from anybody but its
+/// owner - and the whole point of the key is that it is per device. Rooms on
+/// the MSC3757 versions restrict it properly and take the bare form.
+pub fn membership_state_key(user_id: &str, device_id: &str, room_version: &str) -> String {
+    let key = format!("{user_id}_{device_id}_m.call");
+    if room_version.starts_with("org.matrix.msc3757") || room_version.starts_with("org.matrix.msc3779") {
+        key
+    } else {
+        format!("_{key}")
+    }
+}
 
 /// Says this account is in the room's call, or is no longer.
 ///
@@ -144,55 +177,47 @@ pub async fn set_membership(
         .get_matrix_room(buffer_id)
         .ok_or_else(|| anyhow::anyhow!("no known Matrix room for this buffer"))?;
     let now = chrono::Utc::now().timestamp_millis();
-    let mut memberships: Vec<Value> = state
-        .runtime
-        .matrix_call_members(account_id, &room_id)
-        .into_iter()
-        .filter(|m| m["user_id"].as_str() == Some(account.user_id.as_str()))
-        .filter_map(|m| m["membership"].clone().into())
-        // This device's own entry is rewritten below either way.
-        .filter(|m: &Value| m["device_id"].as_str() != Some(device_id))
-        .filter(|m: &Value| m["expires_ts"].as_i64().unwrap_or(0) > now)
-        .collect();
-    if joined {
-        memberships.push(json!({
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let state_key = membership_state_key(&account.user_id, device_id, &version);
+
+    // One event per device, so leaving on the desktop does not take the phone
+    // out of the call with it - which is why the state key carries the device
+    // and the content describes only this one.
+    let content = if joined {
+        // Everybody may join a call at all: a membership is a *state* event,
+        // and a room's default is that only moderators may send those. Element
+        // needs this as much as moho does - it is why a call in an ordinary
+        // room is one nobody else can join.
+        allow_everybody_to_join(state, account_id, &room_id).await;
+        json!({
             "application": "m.call",
             "call_id": "",
             "scope": "m.room",
             "device_id": device_id,
-            "expires_ts": now + MEMBERSHIP_TTL_MS,
-            // No focus: this is a mesh between the people in the room rather
-            // than a conference on somebody's server. See the module note.
-            "foci_active": [],
-        }));
-    }
-    // Whether everybody in the room may join a call at all.
-    //
-    // A membership is a *state* event, and a room's default is that only
-    // moderators may send those - so a call started in an ordinary room is
-    // one nobody else can join, and they find out with a bare "not
-    // authorized". Where this account can change the permissions, it lowers
-    // that one event to what everybody has; where it cannot, the call still
-    // works for whoever may already send it.
-    if joined {
-        allow_everybody_to_join(state, account_id, &room_id).await;
-    }
+            // What the SFU-based clients key their media participant on.
+            "membershipID": format!("{}:{}", account.user_id, device_id),
+            "created_ts": now,
+            "expires": MEMBERSHIP_TTL_MS,
+            // What this end can actually be reached on. Not a LiveKit focus,
+            // because moho has no SFU to offer and claiming one would send
+            // everybody else to dial nothing; a client that does not know
+            // this transport ignores it, which is the honest outcome.
+            "focus_active": { "type": TRANSPORT_MESH },
+            "foci_preferred": [{ "type": TRANSPORT_MESH }],
+        })
+    } else {
+        // Leaving is an empty membership rather than a deleted event, because
+        // Matrix has no delete - and empty is how every client reads "gone".
+        json!({})
+    };
 
-    let result = super::put_room_state(
-        state,
-        account_id,
-        &room_id,
-        EVENT_MEMBER,
-        &account.user_id,
-        json!({ "memberships": memberships }),
-    )
-    .await;
+    let result = super::put_room_state(state, account_id, &room_id, EVENT_MEMBER, &state_key, content).await;
     if let Err(e) = &result {
         // The refusal that has an explanation worth giving.
         if e.to_string().contains("M_FORBIDDEN") {
             anyhow::bail!(
                 "this room does not let its members join calls - somebody who can change the room's \
-                 permissions has to allow the m.call.member event"
+                 permissions has to allow the {EVENT_MEMBER} event"
             );
         }
     }
@@ -222,25 +247,80 @@ async fn allow_everybody_to_join(state: &AppState, account_id: &str, room_id: &s
     }
 }
 
-/// Reads one `m.call.member` state event into the memberships it carries.
+/// Reads one membership state event into what it says.
 ///
-/// Tolerant, and expiry-aware: a membership past its stamp is somebody whose
-/// client died, and treating it as a participant would leave a tile in the
-/// grid for somebody who left hours ago.
-pub fn read_memberships(user_id: &str, content: &Value, now_ms: i64) -> Vec<Value> {
-    content["memberships"]
+/// Two shapes, because Matrix is between them: the session shape Element
+/// writes today (`org.matrix.msc3401.call.member`, one event per device,
+/// `expires` as a duration from `created_ts`) and the MSC4143 shape it is
+/// moving to (`m.rtc.member`, a `member` object and `transports`). Reading
+/// both costs a branch and means a room where half the people are on a newer
+/// Element is still a room where moho can see the call.
+///
+/// Expiry-aware either way: a membership past its stamp is somebody whose
+/// client died, and treating it as a participant leaves a tile in the grid
+/// for somebody who left hours ago.
+pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Value> {
+    // Gone: an empty content is how every client spells "no longer here",
+    // since Matrix state cannot be deleted.
+    if content.as_object().is_none_or(|c| c.is_empty()) {
+        return None;
+    }
+    // The MSC4143 shape.
+    if let Some(member) = content.get("member").and_then(|m| m.as_object()) {
+        let device = member.get("device_id").and_then(|d| d.as_str()).unwrap_or_default();
+        let transports: Vec<String> = content["transports"]["published"]
+            .as_array()
+            .map(|list| list.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        return Some(json!({
+            "user_id": member.get("user_id").and_then(|u| u.as_str()).unwrap_or(user_id),
+            "membership": { "device_id": device, "expires_ts": now_ms + MEMBERSHIP_TTL_MS },
+            "transports": transports,
+        }));
+    }
+    // The session shape. `expires` is a duration and `created_ts` the moment
+    // it started, which is not the same as a stamp and reads differently.
+    if content["application"].as_str().unwrap_or("m.call") != "m.call" {
+        return None;
+    }
+    let created = content["created_ts"].as_i64().unwrap_or(now_ms);
+    let expires_ts = match content["expires"].as_i64() {
+        Some(duration) => created + duration,
+        // A membership with no expiry at all: believed for as long as one of
+        // ours would be, rather than for ever.
+        None => created + MEMBERSHIP_TTL_MS,
+    };
+    if expires_ts <= now_ms {
+        return None;
+    }
+    let transports: Vec<String> = content["foci_preferred"]
         .as_array()
-        .map(|list| {
-            list.iter()
-                .filter(|m| m["application"].as_str().unwrap_or("m.call") == "m.call")
-                .filter(|m| m["expires_ts"].as_i64().unwrap_or(0) > now_ms)
-                .map(|m| json!({ "user_id": user_id, "membership": m }))
-                .collect()
-        })
-        .unwrap_or_default()
+        .map(|list| list.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Some(json!({
+        "user_id": user_id,
+        "membership": {
+            "device_id": content["device_id"].as_str().unwrap_or_default(),
+            "expires_ts": expires_ts,
+        },
+        "transports": transports,
+    }))
 }
 
-/// Who to call, and who to wait for.
+/// What a call needs from whoever wants to join it.
+///
+/// Read from the participants rather than decided here: a call where anybody
+/// offers a LiveKit focus is a call held on that server, and one where
+/// everybody is on the mesh is a call held between the people in it. moho can
+/// be in the second kind and not yet the first, and the difference has to be
+/// said rather than discovered by joining and hearing nothing.
+pub fn needs_a_focus(members: &[Value]) -> bool {
+    members
+        .iter()
+        .any(|m| m["transports"].as_array().is_some_and(|t| t.iter().any(|t| t.as_str() == Some("livekit"))))
+}
+
+/// Who to call, and who to wait for./// Who to call, and who to wait for.
 ///
 /// Both ends of every pair see each other arrive, and if both call, both
 /// answer, and the call collides with itself. So the rule is one line and the
@@ -255,25 +335,89 @@ pub fn should_offer(own_key: &str, their_key: &str) -> bool {
 mod member_tests {
     use super::*;
 
+    /// Exactly what Element writes today, out of matrix-js-sdk's
+    /// `SessionMembershipData`. If this stops being read, moho stops being
+    /// able to see the calls most people are in.
+    fn element_membership(created: i64, expires: i64) -> Value {
+        json!({
+            "application": "m.call",
+            "call_id": "",
+            "scope": "m.room",
+            "device_id": "ELEMENTDEV",
+            "membershipID": "@them:example.org:ELEMENTDEV",
+            "created_ts": created,
+            "expires": expires,
+            "focus_active": { "type": "livekit", "focus_selection": "oldest_membership" },
+            "foci_preferred": [{
+                "type": "livekit",
+                "livekit_service_url": "https://livekit-jwt.call.matrix.org",
+                "livekit_alias": "!room:example.org"
+            }],
+        })
+    }
+
+    #[test]
+    fn elements_own_membership_is_read() {
+        let read = read_membership("@them:example.org", &element_membership(1_000, 4_000), 2_000).unwrap();
+        assert_eq!(read["user_id"], "@them:example.org");
+        assert_eq!(read["membership"]["device_id"], "ELEMENTDEV");
+        // created_ts + expires, because `expires` is a duration rather than a
+        // stamp - reading it as a stamp would expire everybody immediately.
+        assert_eq!(read["membership"]["expires_ts"], 5_000);
+        assert_eq!(read["transports"][0], "livekit");
+    }
+
     #[test]
     fn a_membership_past_its_stamp_is_not_a_participant() {
-        let content = json!({ "memberships": [
-            { "application": "m.call", "device_id": "HERE", "expires_ts": 2_000 },
-            { "application": "m.call", "device_id": "GONE", "expires_ts": 500 },
-        ]});
-        let live = read_memberships("@a:example.org", &content, 1_000);
-        assert_eq!(live.len(), 1);
-        assert_eq!(live[0]["membership"]["device_id"], "HERE");
-        assert_eq!(live[0]["user_id"], "@a:example.org");
+        // Created long ago and short-lived: somebody whose client died.
+        assert!(read_membership("@them:example.org", &element_membership(1_000, 500), 9_000).is_none());
+        // And an emptied event, which is how leaving is spelled.
+        assert!(read_membership("@them:example.org", &json!({}), 1_000).is_none());
+    }
+
+    #[test]
+    fn the_newer_shape_is_read_too() {
+        let content = json!({
+            "member": { "id": "abc", "user_id": "@them:example.org", "device_id": "NEWDEV" },
+            "slot_id": "m.call#ROOM",
+            "application": { "type": "m.call" },
+            "transports": { "published": [{ "type": "m.livekit" }] },
+        });
+        let read = read_membership("@ignored:example.org", &content, 1_000).unwrap();
+        assert_eq!(read["user_id"], "@them:example.org");
+        assert_eq!(read["membership"]["device_id"], "NEWDEV");
     }
 
     #[test]
     fn something_that_is_not_a_call_is_not_read_as_one() {
-        let content = json!({ "memberships": [
-            { "application": "m.whiteboard", "device_id": "X", "expires_ts": 9_000 },
-        ]});
-        assert!(read_memberships("@a:example.org", &content, 1_000).is_empty());
-        assert!(read_memberships("@a:example.org", &json!({}), 1_000).is_empty());
+        let content = json!({ "application": "m.whiteboard", "device_id": "X", "expires": 9_000 });
+        assert!(read_membership("@a:example.org", &content, 1_000).is_none());
+    }
+
+    #[test]
+    fn a_call_with_a_focus_in_it_is_not_a_mesh() {
+        let livekit = read_membership("@them:example.org", &element_membership(1_000, 9_000), 2_000).unwrap();
+        let mesh = json!({ "transports": ["moho.mesh"] });
+        assert!(needs_a_focus(&[livekit.clone()]));
+        assert!(!needs_a_focus(&[mesh.clone()]));
+        // One person on an SFU makes it an SFU call: everybody has to be
+        // where the media is.
+        assert!(needs_a_focus(&[mesh, livekit]));
+    }
+
+    #[test]
+    fn the_state_key_is_the_one_element_writes() {
+        // Prefixed on an ordinary room, because a key starting with `@` is
+        // reserved for its owner and this one has to be per device.
+        assert_eq!(
+            membership_state_key("@me:example.org", "DEV", "10"),
+            "_@me:example.org_DEV_m.call"
+        );
+        // And bare where the room version restricts it properly.
+        assert_eq!(
+            membership_state_key("@me:example.org", "DEV", "org.matrix.msc3757.10"),
+            "@me:example.org_DEV_m.call"
+        );
     }
 
     #[test]

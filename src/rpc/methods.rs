@@ -3658,6 +3658,29 @@ pub async fn dispatch(
             let Some(account) = state.accounts.get_matrix(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
+            // A call held on somebody's SFU is not one moho can be in yet:
+            // its media never goes peer to peer, and joining it would put
+            // this account in the participant list and send nothing. Said
+            // before joining rather than discovered by silence afterwards.
+            if joined {
+                if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
+                    let members = state.runtime.matrix_call_members(&buffer.account_id, &room_id);
+                    if backend::matrix::calls::needs_a_focus(&members) {
+                        return (
+                            None,
+                            Some(
+                                concat!(
+                                    "this call runs through a media server, which is what Element's own ",
+                                    "calls use - moho cannot join one yet. It can hold a call between the ",
+                                    "people in the room, which is what it offers where no media server is ",
+                                    "in use."
+                                )
+                                .to_string(),
+                            ),
+                        );
+                    }
+                }
+            }
             match backend::matrix::calls::set_membership(state, &buffer.account_id, buffer_id, &account.device_id, joined).await {
                 Ok(()) => (
                     Some(serde_json::json!({

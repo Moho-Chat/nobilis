@@ -55,17 +55,30 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                     );
                 }
             }
+            // Which version of the room this is, which decides one thing
+            // here: whether a per-device state key may be written as the
+            // user's own or has to be prefixed to be allowed at all.
+            "m.room.create" => {
+                if let Some(version) = event["content"]["room_version"].as_str() {
+                    state.runtime.set_matrix_room_version(account_id, room_id, version);
+                }
+            }
             // Who is in this room's call. A state event per person, and the
             // one thing a client needs to know before it can join one: a
             // group call has no invitation, only people already in it.
-            "m.call.member" => {
-                let who = event["state_key"].as_str().unwrap_or_default();
-                let live = crate::backend::matrix::calls::read_memberships(
+            "org.matrix.msc3401.call.member" | "org.matrix.msc4143.rtc.member" | "m.rtc.member" | "m.call.member" => {
+                // The state key carries the device as well as the person, and
+                // may be prefixed to get past a room that reserves `@` keys -
+                // so who this is about comes out of the key rather than being
+                // it. The sender is the authority either way.
+                let key = event["state_key"].as_str().unwrap_or_default();
+                let who = event["sender"].as_str().unwrap_or(key);
+                let live = crate::backend::matrix::calls::read_membership(
                     who,
                     &event["content"],
                     chrono::Utc::now().timestamp_millis(),
                 );
-                let everybody = state.runtime.set_matrix_call_members(account_id, room_id, who, live);
+                let everybody = state.runtime.set_matrix_call_membership(account_id, room_id, key, live);
                 if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
                     state.events.emit(
                         "matrixCallMembers",

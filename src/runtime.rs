@@ -432,6 +432,9 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Which version each room is, by account and room - see
+    /// `calls::membership_state_key` for the one decision it feeds.
+    matrix_room_versions: Mutex<HashMap<String, String>>,
     /// Who is in a room's call, per account and room.
     ///
     /// Read from `m.call.member` state rather than tracked here: the state is
@@ -843,6 +846,7 @@ impl Runtime {
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
             matrix_stickers: Mutex::new(HashMap::new()),
             matrix_call_members: Mutex::new(HashMap::new()),
+            matrix_room_versions: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2935,6 +2939,17 @@ impl Runtime {
         self.irc_caps.lock().unwrap().remove(account_id);
     }
 
+    pub fn matrix_room_version(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_room_versions.lock().unwrap().get(&format!("{account_id}|{room_id}")).cloned()
+    }
+
+    pub fn set_matrix_room_version(&self, account_id: &str, room_id: &str, version: &str) {
+        self.matrix_room_versions
+            .lock()
+            .unwrap()
+            .insert(format!("{account_id}|{room_id}"), version.to_string());
+    }
+
     /// Everybody currently in this room's call, as the state last said.
     pub fn matrix_call_members(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
         self.matrix_call_members
@@ -2945,22 +2960,27 @@ impl Runtime {
             .unwrap_or_default()
     }
 
-    /// Replaces one person's memberships in a room, and answers with everybody
-    /// who is in the call afterwards.
+    /// Replaces one membership in a room, and answers with everybody in the
+    /// call afterwards.
     ///
-    /// Per user because that is how the state is keyed: one event per person,
-    /// listing the devices of theirs that are in the call.
-    pub fn set_matrix_call_members(
+    /// Keyed by the state key rather than by the person, because that is what
+    /// the event is keyed by: one per device, so somebody in a call from a
+    /// phone and a desktop is two participants and leaving on one leaves the
+    /// other there.
+    pub fn set_matrix_call_membership(
         &self,
         account_id: &str,
         room_id: &str,
-        user_id: &str,
-        memberships: Vec<serde_json::Value>,
+        state_key: &str,
+        membership: Option<serde_json::Value>,
     ) -> Vec<serde_json::Value> {
         let mut all = self.matrix_call_members.lock().unwrap();
         let room = all.entry(format!("{account_id}|{room_id}")).or_default();
-        room.retain(|m| m["user_id"].as_str() != Some(user_id));
-        room.extend(memberships);
+        room.retain(|m| m["state_key"].as_str() != Some(state_key));
+        if let Some(mut membership) = membership {
+            membership["state_key"] = serde_json::json!(state_key);
+            room.push(membership);
+        }
         room.clone()
     }
 
