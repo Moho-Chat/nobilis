@@ -1836,11 +1836,17 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
     // Their standing in this room, from what the sync already carries.
     if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
         if let Some(levels) = state.runtime.get_matrix_power_levels(account_id, &room_id) {
-            let level = moderation::user_power_level(&levels, user_id);
+            let creators = state.runtime.matrix_room_creators(account_id, &room_id);
+            let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+            let level = moderation::effective_power(&levels, user_id, &creators, &version);
             // Matrix's own conventional names for the two ranks anybody
             // recognises. A room can set any number, so a level that is
             // neither is reported as itself rather than rounded to a word.
             let role = match level {
+                // The room's own creator, who from version 12 outranks every
+                // number rather than holding a large one - so it is named
+                // rather than printed, which would be a wall of digits.
+                moderation::CREATOR_POWER => Some("Owner".to_string()),
                 100 => Some("Admin".to_string()),
                 50 => Some("Moderator".to_string()),
                 0 => None,

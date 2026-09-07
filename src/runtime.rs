@@ -432,6 +432,12 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Who made each room, by account and room.
+    ///
+    /// From room version 12 this is where a room's owner is recorded rather
+    /// than in the power levels, so without it the client cannot tell an
+    /// owner from a stranger - see `moderation::effective_power`.
+    matrix_room_creators: Mutex<HashMap<String, Vec<String>>>,
     /// Which version each room is, by account and room - see
     /// `calls::membership_state_key` for the one decision it feeds.
     matrix_room_versions: Mutex<HashMap<String, String>>,
@@ -847,6 +853,7 @@ impl Runtime {
             matrix_stickers: Mutex::new(HashMap::new()),
             matrix_call_members: Mutex::new(HashMap::new()),
             matrix_room_versions: Mutex::new(HashMap::new()),
+            matrix_room_creators: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2937,6 +2944,23 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    /// Who made this room, as its create event said.
+    pub fn matrix_room_creators(&self, account_id: &str, room_id: &str) -> Vec<String> {
+        self.matrix_room_creators
+            .lock()
+            .unwrap()
+            .get(&format!("{account_id}|{room_id}"))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_matrix_room_creators(&self, account_id: &str, room_id: &str, creators: Vec<String>) {
+        if creators.is_empty() {
+            return;
+        }
+        self.matrix_room_creators.lock().unwrap().insert(format!("{account_id}|{room_id}"), creators);
     }
 
     pub fn matrix_room_version(&self, account_id: &str, room_id: &str) -> Option<String> {

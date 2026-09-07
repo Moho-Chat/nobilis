@@ -62,6 +62,13 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                 if let Some(version) = event["content"]["room_version"].as_str() {
                     state.runtime.set_matrix_room_version(account_id, room_id, version);
                 }
+                // And who owns it, which from room version 12 is recorded
+                // here rather than in the power levels.
+                state.runtime.set_matrix_room_creators(
+                    account_id,
+                    room_id,
+                    crate::backend::matrix::moderation::creators_of(event),
+                );
             }
             // Who is in this room's call. A state event per person, and the
             // one thing a client needs to know before it can join one: a
@@ -167,6 +174,11 @@ pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, o
 
     let members = state.runtime.get_matrix_room_members(account_id, room_id);
     let power_levels = state.runtime.get_matrix_power_levels(account_id, room_id).unwrap_or_else(|| serde_json::json!({}));
+    // Who made the room, and under which version - because from version 12
+    // the owner holds no power-level entry at all and would otherwise be
+    // drawn in the member list as an ordinary member.
+    let creators = state.runtime.matrix_room_creators(account_id, room_id);
+    let room_version = state.runtime.matrix_room_version(account_id, room_id).unwrap_or_default();
 
     let member_list: Vec<Value> = members
         .iter()
@@ -187,7 +199,7 @@ pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, o
                 // online and offline at all, rather than having to know which
                 // protocols report presence.
                 "status": if online { "online" } else { "offline" },
-                "powerLevel": moderation::user_power_level(&power_levels, user_id),
+                "powerLevel": moderation::effective_power(&power_levels, user_id, &creators, &room_version),
             })
         })
         .collect();
