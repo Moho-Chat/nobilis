@@ -3759,6 +3759,49 @@ pub async fn dispatch(
             (Some(serde_json::json!(live)), None)
         }
 
+        // A form a bot asked for, filled in and sent back.
+        "submitDiscordModal" => {
+            let (buffer_id, custom_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "customId")) {
+                (Some(b), Some(c)) => (b, c),
+                _ => return (None, Some("submitDiscordModal requires \"bufferId\" and \"customId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let application_id = p_str(params, "applicationId", "");
+            if application_id.is_empty() {
+                return (None, Some("that form does not say which bot it belongs to".to_string()));
+            }
+            let values: Vec<(String, String)> = params
+                .get("values")
+                .and_then(|v| v.as_array())
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|entry| {
+                            Some((
+                                entry["customId"].as_str()?.to_string(),
+                                entry["value"].as_str().unwrap_or("").to_string(),
+                            ))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            match backend::discord::submit_modal(
+                state,
+                &buffer.account_id,
+                buffer_id,
+                application_id,
+                custom_id,
+                p_str(params, "id", ""),
+                &values,
+            )
+            .await
+            {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Not hearing from somebody, on whichever service they are on.
         //
         // One method rather than one per backend, because the person doing it

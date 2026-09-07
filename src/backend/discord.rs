@@ -2167,6 +2167,13 @@ fn extract_body(d: &Value) -> Option<String> {
     if !content.is_empty() {
         parts.push(content.to_string());
     }
+    // A forwarded message carries nothing of its own: the thing forwarded is
+    // in `message_snapshots`, and `content` is empty or a line somebody added
+    // above it. Reading only `content` is why a forward arrived as a name
+    // with nothing under it.
+    for quoted in forwarded_text(d) {
+        parts.push(quoted);
+    }
     // A poll is the message when there is one, and a sticker this client
     // cannot draw is at least a message that arrived.
     if let Some(poll) = extract_poll(d) {
@@ -2722,6 +2729,128 @@ fn is_empty_message(body: &str, embeds: &[Embed], attachments: &[Attachment]) ->
 }
 
 #[cfg(test)]
+mod modal_tests {
+    use super::modal_fields;
+    use serde_json::json;
+
+    /// A modal as Discord sends one: fields are text inputs nested inside
+    /// action rows, style 1 for a line and 2 for a box.
+    #[test]
+    fn a_form_is_read_into_its_fields() {
+        let modal = json!({
+            "title": "Report a thing",
+            "custom_id": "report_form",
+            "components": [
+                { "type": 1, "components": [
+                    { "type": 4, "custom_id": "subject", "label": "Subject", "style": 1, "required": true, "max_length": 100 }
+                ]},
+                { "type": 1, "components": [
+                    { "type": 4, "custom_id": "details", "label": "What happened", "style": 2, "required": false,
+                      "placeholder": "as much as you like" }
+                ]}
+            ]
+        });
+        let fields = modal_fields(&modal);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["customId"], "subject");
+        assert_eq!(fields[0]["long"], false);
+        assert_eq!(fields[0]["required"], true);
+        assert_eq!(fields[0]["maxLength"], 100);
+        // The second is a paragraph, which is a different box to draw.
+        assert_eq!(fields[1]["long"], true);
+        assert_eq!(fields[1]["required"], false);
+        assert_eq!(fields[1]["placeholder"], "as much as you like");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_text_input_is_left_alone() {
+        // Discord has begun putting other things in modals; a client that
+        // drew a button as a text box would be worse than one that ignored
+        // it, since the form would send a field the bot never asked for.
+        let modal = json!({
+            "components": [
+                { "type": 1, "components": [ { "type": 2, "custom_id": "press", "label": "Press" } ] },
+                { "type": 1, "components": [ { "type": 4, "custom_id": "name", "label": "Name", "style": 1 } ] }
+            ]
+        });
+        let fields = modal_fields(&modal);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["customId"], "name");
+    }
+
+    #[test]
+    fn a_form_with_nothing_in_it_is_no_fields_rather_than_an_error() {
+        assert!(modal_fields(&json!({})).is_empty());
+        assert!(modal_fields(&json!({ "components": [] })).is_empty());
+    }
+}
+
+mod forwarded_tests {
+    use super::{extract_attachments, extract_body, forwarded_attachments};
+    use serde_json::json;
+
+    /// A forward as Discord actually sends one: nothing in `content`, and
+    /// the message itself under `message_snapshots`.
+    fn forward(content: &str) -> serde_json::Value {
+        json!({
+            "content": content,
+            "message_snapshots": [{
+                "message": {
+                    "content": "the thing that was forwarded",
+                    "attachments": [],
+                    "embeds": []
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn a_forward_is_the_message_it_carries() {
+        // The bug: this arrived as an author with nothing under them.
+        let body = extract_body(&forward("")).expect("a forward is not an empty message");
+        assert_eq!(body, "> the thing that was forwarded");
+    }
+
+    #[test]
+    fn a_comment_above_a_forward_keeps_its_place() {
+        let body = extract_body(&forward("look at this")).unwrap();
+        assert_eq!(body, "look at this\n> the thing that was forwarded");
+    }
+
+    #[test]
+    fn a_forwarded_picture_arrives_as_a_picture() {
+        let d = json!({
+            "content": "",
+            "message_snapshots": [{
+                "message": {
+                    "content": "",
+                    "attachments": [{
+                        "url": "https://cdn.discordapp.com/a.png",
+                        "filename": "a.png",
+                        "content_type": "image/png",
+                        "size": 100
+                    }]
+                }
+            }]
+        });
+        let atts = forwarded_attachments(&d);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].kind, "image");
+        // The message is not left blank either, since a client that draws no
+        // attachment would otherwise show nothing at all.
+        assert_eq!(extract_body(&d).as_deref(), Some("> (forwarded 1 attachment)"));
+        // And the message's own attachments are untouched by this.
+        assert!(extract_attachments(&d).is_empty());
+    }
+
+    #[test]
+    fn a_message_that_forwards_nothing_is_unchanged() {
+        let plain = json!({ "content": "hello", "attachments": [], "embeds": [] });
+        assert_eq!(extract_body(&plain).as_deref(), Some("hello"));
+        assert!(forwarded_attachments(&plain).is_empty());
+    }
+}
+
 mod sticker_and_poll_tests {
     use super::{extract_body, extract_poll, extract_stickers, is_empty_message};
     use serde_json::json;
@@ -2849,6 +2978,56 @@ fn undrawable_sticker_names(d: &Value) -> Vec<String> {
         .flatten()
         .filter(|s| s["format_type"].as_i64() == Some(3))
         .filter_map(|s| s["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// What was forwarded, as lines quoting it.
+///
+/// Discord puts the forwarded message in `message_snapshots` - a copy of it
+/// taken at the moment of forwarding, deliberately frozen, which is why it
+/// carries no author: a forward is the *message*, not the person. So it is
+/// rendered as a quote rather than attributed to somebody who is not named.
+///
+/// Recursive in the protocol and not here: a forward of a forward carries
+/// its own snapshot, and one level is what Discord itself draws.
+fn forwarded_text(d: &Value) -> Vec<String> {
+    let Some(snapshots) = d["message_snapshots"].as_array() else { return Vec::new() };
+    snapshots
+        .iter()
+        .filter_map(|snapshot| {
+            let message = &snapshot["message"];
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
+                // Quoted, because that is what it is: something said
+                // elsewhere, brought here.
+                parts.extend(text.lines().map(|line| format!("> {line}")));
+            }
+            // What came with it. The pictures themselves are lifted into the
+            // message's own attachments below; this is for the case where a
+            // forward is *only* a picture, so the line is not empty.
+            let files = message["attachments"].as_array().map(|a| a.len()).unwrap_or(0);
+            if parts.is_empty() && files > 0 {
+                parts.push(format!("> (forwarded {files} attachment{})", if files == 1 { "" } else { "s" }));
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            Some(parts.join("\n"))
+        })
+        .collect()
+}
+
+/// The files inside a forwarded message, as attachments of this one.
+///
+/// A forwarded picture is a picture: it belongs in the message the way any
+/// other attachment does, rather than being described in words while the
+/// image itself is dropped.
+fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
+    d["message_snapshots"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|snapshot| extract_attachments(&snapshot["message"]))
         .collect()
 }
 
@@ -2992,6 +3171,9 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
         let embeds = extract_embeds(msg);
         let mut attachments = extract_attachments(msg);
         attachments.extend(extract_stickers(msg));
+        // A forwarded picture is a picture, and belongs in the message the
+        // way any other attachment does.
+        attachments.extend(forwarded_attachments(msg));
         let body = extract_body(msg).unwrap_or_default();
         if is_empty_message(&body, &embeds, &attachments) {
             continue;
@@ -3572,6 +3754,10 @@ async fn interact(state: &AppState, account_id: &str, buffer_id: &str, kind: i64
     if let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) {
         payload["guild_id"] = json!(guild_id);
     }
+    // Where this was done, for the answer that may not say. A modal arrives
+    // as its own dispatch moments later and does not always name the channel
+    // it belongs to; the conversation somebody just acted in is the answer.
+    state.runtime.set_discord_last_interaction(account_id, buffer_id);
     let resp = send_write(
         http_client()
         .post(format!("{API_BASE}/interactions"))
@@ -3588,6 +3774,71 @@ async fn interact(state: &AppState, account_id: &str, buffer_id: &str, kind: i64
     // Nothing comes back but a 204: whatever the bot does about it arrives as
     // an ordinary message, or as an edit to the one that was pressed.
     Ok(())
+}
+
+/// A form a bot asked for, in the shape a window can draw.
+///
+/// Discord's third answer to a command, after "here is a message" and "here
+/// are some buttons": a modal - a little form to fill in and send back. The
+/// fields are text inputs inside action rows, the same nesting messages use,
+/// and the only two kinds are one line and several.
+pub fn modal_fields(modal: &Value) -> Vec<Value> {
+    modal["components"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        // An action row holds the field; a field outside one is not a shape
+        // Discord sends, but reading both costs nothing.
+        .flat_map(|row| {
+            row["components"]
+                .as_array()
+                .map(|inner| inner.to_vec())
+                .unwrap_or_else(|| vec![row.clone()])
+        })
+        .filter(|field| field["type"].as_i64() == Some(4))
+        .filter_map(|field| {
+            let custom_id = field["custom_id"].as_str()?.to_string();
+            Some(json!({
+                "customId": custom_id,
+                "label": field["label"].as_str().unwrap_or("").to_string(),
+                // Style 2 is Discord's "paragraph": a box rather than a line.
+                "long": field["style"].as_i64() == Some(2),
+                "placeholder": field["placeholder"].as_str().unwrap_or(""),
+                "value": field["value"].as_str().unwrap_or(""),
+                "required": field["required"].as_bool().unwrap_or(true),
+                "minLength": field["min_length"].as_i64(),
+                "maxLength": field["max_length"].as_i64(),
+            }))
+        })
+        .collect()
+}
+
+/// Sends a filled-in form back.
+///
+/// Interaction type 5, carrying the fields in the nesting they arrived in -
+/// each value inside the action row it belongs to, which is what Discord
+/// validates against the modal it sent.
+pub async fn submit_modal(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    application_id: &str,
+    custom_id: &str,
+    modal_id: &str,
+    values: &[(String, String)],
+) -> Result<()> {
+    let rows: Vec<Value> = values
+        .iter()
+        .map(|(field, value)| {
+            json!({ "type": 1, "components": [{ "type": 4, "custom_id": field, "value": value }] })
+        })
+        .collect();
+    let data = json!({
+        "id": modal_id,
+        "custom_id": custom_id,
+        "components": rows,
+    });
+    interact(state, account_id, buffer_id, 5, application_id, data).await
 }
 
 /// Runs one of the commands `list_commands` offered.
@@ -4648,6 +4899,9 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let embeds = extract_embeds(d);
                         let mut attachments = extract_attachments(d);
                         attachments.extend(extract_stickers(d));
+                        // A forwarded picture is a picture, and belongs in the message the
+                        // way any other attachment does.
+                        attachments.extend(forwarded_attachments(d));
                         let body = extract_body(d).unwrap_or_default();
                         if is_empty_message(&body, &embeds, &attachments) {
                             continue;
@@ -4723,6 +4977,9 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         let embeds = extract_embeds(d);
                         let mut attachments = extract_attachments(d);
                         attachments.extend(extract_stickers(d));
+                        // A forwarded picture is a picture, and belongs in the message the
+                        // way any other attachment does.
+                        attachments.extend(forwarded_attachments(d));
                         let body = extract_body(d).unwrap_or_default();
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);
@@ -4794,6 +5051,61 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                     // a lazy view Discord only sends when asked, so asking
                     // again is the whole of keeping it right - and only for a
                     // guild whose list is actually on screen.
+                    // A bot answering a command with a form rather than a
+                    // message. Passed straight up: the window draws it, and
+                    // whatever comes back goes out as an interaction of its
+                    // own - see submit_modal.
+                    "INTERACTION_MODAL_CREATE" => {
+                        let modal = if d["modal"].is_object() { &d["modal"] } else { d };
+                        let channel = modal["channel_id"].as_str().or_else(|| d["channel_id"].as_str());
+                        // Where it belongs. A modal names its channel; where
+                        // it does not, it belongs to whatever this account
+                        // last asked for - which is the command that opened
+                        // it, moments ago.
+                        let buffer_id = channel
+                            .and_then(|c| state.runtime.discord_buffer_for_channel(&account_id, c))
+                            .or_else(|| state.runtime.discord_last_interaction(&account_id));
+                        if let Some(buffer_id) = buffer_id {
+                            state.events.emit(
+                                "discordModal",
+                                json!({
+                                    "accountId": account_id,
+                                    "bufferId": buffer_id,
+                                    "id": modal["id"],
+                                    "customId": modal["custom_id"],
+                                    "applicationId": modal["application_id"].as_str().or_else(|| d["application_id"].as_str()),
+                                    "title": modal["title"].as_str().unwrap_or("Fill this in"),
+                                    "fields": modal_fields(modal),
+                                }),
+                            );
+                        }
+                    }
+
+                    // Somebody pinned or unpinned something. Discord says
+                    // only that the list changed, never what it changed to -
+                    // so the list is asked for again, which also tells every
+                    // window watching the conversation.
+                    //
+                    // Only for a channel this client is actually showing: a
+                    // pin in a guild's four hundredth channel is not news
+                    // worth a request, and the list is fetched on opening a
+                    // conversation anyway.
+                    "CHANNEL_PINS_UPDATE" => {
+                        if let Some(channel_id) = d["channel_id"].as_str() {
+                            if let Some(buffer_id) = state.runtime.discord_buffer_for_channel(&account_id, channel_id) {
+                                let state = state.clone();
+                                let account_id = account_id.clone();
+                                // In its own task: the gateway loop must keep
+                                // reading, and this is an HTTP round trip.
+                                tokio::spawn(async move {
+                                    if let Err(e) = list_pinned(&state, &account_id, &buffer_id).await {
+                                        tracing::debug!("discord[{account_id}]: re-reading pins for {buffer_id}: {e:#}");
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {
                         let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         if let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) {

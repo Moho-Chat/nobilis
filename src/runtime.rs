@@ -432,6 +432,9 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// The conversation each Discord account last acted in, for an answer
+    /// that arrives without saying where it belongs - see the modal dispatch.
+    discord_last_interaction: Mutex<HashMap<String, String>>,
     /// Who made each room, by account and room.
     ///
     /// From room version 12 this is where a room's owner is recorded rather
@@ -854,6 +857,7 @@ impl Runtime {
             matrix_call_members: Mutex::new(HashMap::new()),
             matrix_room_versions: Mutex::new(HashMap::new()),
             matrix_room_creators: Mutex::new(HashMap::new()),
+            discord_last_interaction: Mutex::new(HashMap::new()),
             matrix_rooms: Mutex::new(HashMap::new()),
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
@@ -2944,6 +2948,14 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+    }
+
+    pub fn discord_last_interaction(&self, account_id: &str) -> Option<String> {
+        self.discord_last_interaction.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn set_discord_last_interaction(&self, account_id: &str, buffer_id: &str) {
+        self.discord_last_interaction.lock().unwrap().insert(account_id.to_string(), buffer_id.to_string());
     }
 
     /// Who made this room, as its create event said.
