@@ -3724,7 +3724,8 @@ async fn try_sso_login(state: &AppState, login_id: &str, homeserver_url: &str, p
         device_id: login.device_id,
         next_batch: None,
         display_name: None,
-    };
+            rtc_focus_url: None,
+        };
     let saved = state.accounts.add_matrix(config)?;
     let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
@@ -3813,7 +3814,8 @@ async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, usern
         device_id: String::new(),
         next_batch: None,
         display_name: None,
-    };
+            rtc_focus_url: None,
+        };
     state.accounts.add_matrix(pending.clone())?;
 
     let login = auth::login(homeserver_url, username, password, None).await.context("logging in")?;
@@ -3826,7 +3828,8 @@ async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, usern
         device_id: login.device_id,
         next_batch: None,
         display_name: None,
-    };
+            rtc_focus_url: None,
+        };
     let saved = state.accounts.add_matrix(config)?;
     // The placeholder above was keyed on whatever was typed, and the server
     // answers with the canonical user id - "salastil" against "@salastil:
@@ -4035,6 +4038,7 @@ mod tests {
             device_id: login.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();
@@ -4152,6 +4156,7 @@ mod tests {
             device_id: login.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();
@@ -4263,6 +4268,7 @@ mod tests {
             device_id: login_a.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved_a = state.accounts.add_matrix(config_a).expect("add_matrix failed");
         let account_id_a = saved_a.account_id();
@@ -4419,6 +4425,7 @@ mod tests {
             device_id: login.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();
@@ -4574,6 +4581,7 @@ mod tests {
             device_id: login.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();

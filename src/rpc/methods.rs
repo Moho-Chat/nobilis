@@ -3658,30 +3658,42 @@ pub async fn dispatch(
             let Some(account) = state.accounts.get_matrix(&buffer.account_id) else {
                 return (None, Some("account not connected".to_string()));
             };
-            // A call held on somebody's SFU is not one moho can be in yet:
-            // its media never goes peer to peer, and joining it would put
-            // this account in the participant list and send nothing. Said
-            // before joining rather than discovered by silence afterwards.
-            if joined {
-                if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
-                    let members = state.runtime.matrix_call_members(&buffer.account_id, &room_id);
-                    if backend::matrix::calls::needs_a_focus(&members) {
-                        return (
-                            None,
-                            Some(
-                                concat!(
-                                    "this call runs through a media server, which is what Element's own ",
-                                    "calls use - moho cannot join one yet. It can hold a call between the ",
-                                    "people in the room, which is what it offers where no media server is ",
-                                    "in use."
-                                )
-                                .to_string(),
-                            ),
-                        );
+            let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+                return (None, Some("that conversation is not a Matrix room".to_string()));
+            };
+
+            // Which kind of call this is. A media server where the call
+            // already runs on one, or where this account has one to offer;
+            // otherwise a mesh between the people in the room. Decided before
+            // joining, because it decides what the membership says.
+            let focus = if joined {
+                backend::matrix::calls::find_focus(state, &buffer.account_id, &room_id).await
+            } else {
+                None
+            };
+            // And the way in, which is a token rather than a promise: asked
+            // for here so that failing to get one fails the join rather than
+            // leaving this account listed in a call it never reached.
+            let media = match (&focus, joined) {
+                (Some(focus), true) => {
+                    match backend::matrix::calls::rtc_token(state, &buffer.account_id, &room_id, focus).await {
+                        Ok(token) => Some(token),
+                        Err(e) => return (None, Some(format!("{e:#}"))),
                     }
                 }
-            }
-            match backend::matrix::calls::set_membership(state, &buffer.account_id, buffer_id, &account.device_id, joined).await {
+                _ => None,
+            };
+
+            match backend::matrix::calls::set_membership(
+                state,
+                &buffer.account_id,
+                buffer_id,
+                &account.device_id,
+                joined,
+                focus.clone(),
+            )
+            .await
+            {
                 Ok(()) => (
                     Some(serde_json::json!({
                         "userId": account.user_id,
@@ -3690,13 +3702,23 @@ pub async fn dispatch(
                         // common: each account names the same room by its own
                         // buffer id, so a conference named after the buffer
                         // would be two conferences that never meet.
-                        "roomId": state.runtime.get_matrix_room(buffer_id),
+                        "roomId": room_id,
+                        // Where the media goes. Absent means the mesh.
+                        "media": media,
+                        "encrypted": state.runtime.is_matrix_room_encrypted(buffer_id),
                     })),
                     None,
                 ),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
+
+        // Where this account's room calls go, for a homeserver that names no
+        // media server of its own.
+        "setMatrixRtcFocus" => match p_str_opt(params, "accountId") {
+            None => (None, Some("setMatrixRtcFocus requires \"accountId\"".to_string())),
+            Some(id) => account_mutation_result(state.accounts.set_matrix_rtc_focus(id, p_str(params, "url", ""))),
+        },
 
         "listMatrixCallMembers" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {

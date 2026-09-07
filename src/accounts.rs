@@ -199,6 +199,15 @@ pub struct MatrixAccountConfig {
     pub next_batch: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// A media server to hold calls on, where the homeserver names none.
+    ///
+    /// A Matrix room call runs either between the people in it or through an
+    /// SFU, and which one is a property of the homeserver: a server set up for
+    /// calls publishes `org.matrix.msc4143.rtc_foci` in its `.well-known`.
+    /// Plenty do not, so this is the same manual fallback Element carries -
+    /// name a LiveKit JWT service here and calls go through it.
+    #[serde(default)]
+    pub rtc_focus_url: Option<String>,
 }
 
 impl MatrixAccountConfig {
@@ -603,6 +612,23 @@ impl AccountStore {
     /// Replaces the watch list. Comma-separated, same shape as autojoin.
     pub fn set_irc_notify(&self, account_id: &str, nicks_csv: &str) -> Result<bool> {
         self.mutate(account_id, |a| a.notify = nicks_csv.to_string())
+    }
+
+    /// Names the media server this account's room calls go through.
+    ///
+    /// Empty clears it, which puts calls back on the mesh between the people
+    /// in the room - that being what works with no infrastructure at all.
+    pub fn set_matrix_rtc_focus(&self, account_id: &str, url: &str) -> Result<bool> {
+        let mut matrix = self.matrix.lock().unwrap();
+        match matrix.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                let url = url.trim();
+                a.rtc_focus_url = if url.is_empty() { None } else { Some(url.to_string()) };
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
     }
 
     pub fn set_nickserv_password(&self, account_id: &str, password: &str) -> Result<bool> {

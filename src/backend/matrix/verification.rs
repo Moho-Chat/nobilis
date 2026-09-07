@@ -547,6 +547,7 @@ mod tests {
             device_id: login.device_id.clone(),
             next_batch: None,
             display_name: None,
+            rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();

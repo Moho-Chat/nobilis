@@ -23,6 +23,7 @@
 
 use serde_json::{json, Value};
 
+use anyhow::Context;
 use crate::state::AppState;
 
 /// Events a client has to see to be one end of a call.
@@ -170,6 +171,8 @@ pub async fn set_membership(
     buffer_id: &str,
     device_id: &str,
     joined: bool,
+    // The media server this end is on, where it is on one.
+    focus: Option<Value>,
 ) -> anyhow::Result<()> {
     let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let room_id = state
@@ -198,12 +201,13 @@ pub async fn set_membership(
             "membershipID": format!("{}:{}", account.user_id, device_id),
             "created_ts": now,
             "expires": MEMBERSHIP_TTL_MS,
-            // What this end can actually be reached on. Not a LiveKit focus,
-            // because moho has no SFU to offer and claiming one would send
-            // everybody else to dial nothing; a client that does not know
-            // this transport ignores it, which is the honest outcome.
-            "focus_active": { "type": TRANSPORT_MESH },
-            "foci_preferred": [{ "type": TRANSPORT_MESH }],
+            // What this end is actually on. A media server where the call
+            // has one - which is what makes this membership legible to
+            // Element, since that is the only transport its clients speak -
+            // and the mesh where there is none, which a client that does not
+            // know it ignores rather than dialling nothing.
+            "focus_active": focus.clone().unwrap_or_else(|| json!({ "type": TRANSPORT_MESH })),
+            "foci_preferred": [focus.clone().unwrap_or_else(|| json!({ "type": TRANSPORT_MESH }))],
         })
     } else {
         // Leaving is an empty membership rather than a deleted event, because
@@ -293,10 +297,8 @@ pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Va
     if expires_ts <= now_ms {
         return None;
     }
-    let transports: Vec<String> = content["foci_preferred"]
-        .as_array()
-        .map(|list| list.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect())
-        .unwrap_or_default();
+    let foci = content["foci_preferred"].as_array().cloned().unwrap_or_default();
+    let transports: Vec<String> = foci.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect();
     Some(json!({
         "user_id": user_id,
         "membership": {
@@ -304,20 +306,90 @@ pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Va
             "expires_ts": expires_ts,
         },
         "transports": transports,
+        // The media server this participant is on, where they are on one:
+        // everybody in a call has to be where the media already is, so this
+        // is what a client joining afterwards has to use.
+        "focus": foci.iter().find(|f| f["type"].as_str() == Some("livekit")).cloned().unwrap_or(Value::Null),
     }))
 }
 
-/// What a call needs from whoever wants to join it.
+/// Where the media server is, if there is one to use.
 ///
-/// Read from the participants rather than decided here: a call where anybody
-/// offers a LiveKit focus is a call held on that server, and one where
-/// everybody is on the mesh is a call held between the people in it. moho can
-/// be in the second kind and not yet the first, and the difference has to be
-/// said rather than discovered by joining and hearing nothing.
-pub fn needs_a_focus(members: &[Value]) -> bool {
-    members
+/// Three places, in the order that answers the question best:
+///
+/// 1. The call itself. A call already running names its focus in every
+///    membership, and everybody has to be where the media already is - this
+///    is what makes joining *Element's* call possible rather than starting a
+///    second one beside it.
+/// 2. This account's own setting, for a homeserver that publishes nothing.
+///    Element has the same fallback for the same reason.
+/// 3. The homeserver's `.well-known`, which is where a server that has been
+///    set up for calls says so.
+pub async fn find_focus(state: &AppState, account_id: &str, room_id: &str) -> Option<Value> {
+    let members = state.runtime.matrix_call_members(account_id, room_id);
+    if let Some(focus) = members.iter().find_map(|m| m["focus"].as_object()) {
+        return Some(Value::Object(focus.clone()));
+    }
+    let account = state.accounts.get_matrix(account_id)?;
+    if let Some(url) = account.rtc_focus_url.as_deref().filter(|u| !u.trim().is_empty()) {
+        return Some(json!({ "type": "livekit", "livekit_service_url": url.trim() }));
+    }
+    // The homeserver's own answer. Fetched rather than remembered: it changes
+    // when somebody sets a server up for calls, which is exactly when a
+    // client that cached "none" would be wrong.
+    let base = account.homeserver_url.trim_end_matches('/');
+    let host = base.split("://").nth(1).unwrap_or(base).split('/').next().unwrap_or(base);
+    let well_known = super::http::get_json(&format!("https://{host}/.well-known/matrix/client"), "").await.ok()?;
+    well_known["org.matrix.msc4143.rtc_foci"]
+        .as_array()?
         .iter()
-        .any(|m| m["transports"].as_array().is_some_and(|t| t.iter().any(|t| t.as_str() == Some("livekit"))))
+        .find(|f| f["type"].as_str() == Some("livekit"))
+        .cloned()
+}
+
+/// Trades this account's identity for a way into the media server.
+///
+/// The server beside a LiveKit SFU does not take a Matrix access token - it
+/// would have no way to check one. It takes an OpenID token, which is the
+/// homeserver saying "this really is who they claim to be" in a form a third
+/// party can verify by asking the homeserver back. That is exchanged for a
+/// LiveKit URL and a JWT good for one room.
+pub async fn rtc_token(state: &AppState, account_id: &str, room_id: &str, focus: &Value) -> anyhow::Result<Value> {
+    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let openid = super::http::post_json(
+        &format!(
+            "{base}/_matrix/client/v3/user/{}/openid/request_token",
+            url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+        ),
+        Some(&account.access_token),
+        json!({}),
+    )
+    .await
+    .context("asking the homeserver to vouch for this account")?;
+
+    let service = focus["livekit_service_url"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("that call's media server has no address"))?
+        .trim_end_matches('/');
+    // The room as the media server knows it. The call names its own alias
+    // where it has one, since everybody has to land in the same LiveKit room.
+    let alias = focus["livekit_alias"].as_str().unwrap_or(room_id);
+    let answer = super::http::post_json(
+        &format!("{service}/sfu/get"),
+        None,
+        json!({ "room": alias, "openid_token": openid, "device_id": account.device_id }),
+    )
+    .await
+    .context("asking the media server for a way in")?;
+    if answer["jwt"].as_str().unwrap_or_default().is_empty() {
+        anyhow::bail!("the media server would not let this account in");
+    }
+    Ok(json!({
+        "url": answer["url"],
+        "jwt": answer["jwt"],
+        "identity": format!("{}:{}", account.user_id, account.device_id),
+    }))
 }
 
 /// Who to call, and who to wait for./// Who to call, and who to wait for.
@@ -376,6 +448,17 @@ mod member_tests {
     }
 
     #[test]
+    fn a_membership_carries_the_media_server_it_is_on() {
+        let read = read_membership("@them:example.org", &element_membership(1_000, 9_000), 2_000).unwrap();
+        // Everybody in a call has to be where the media already is, so this
+        // is what a client joining afterwards connects to.
+        assert_eq!(read["focus"]["livekit_service_url"], "https://livekit-jwt.call.matrix.org");
+        let mesh = json!({ "application": "m.call", "device_id": "D", "created_ts": 1_000, "expires": 9_000,
+                           "foci_preferred": [{ "type": "moho.mesh" }] });
+        assert!(read_membership("@a:example.org", &mesh, 2_000).unwrap()["focus"].is_null());
+    }
+
+    #[test]
     fn the_newer_shape_is_read_too() {
         let content = json!({
             "member": { "id": "abc", "user_id": "@them:example.org", "device_id": "NEWDEV" },
@@ -392,17 +475,6 @@ mod member_tests {
     fn something_that_is_not_a_call_is_not_read_as_one() {
         let content = json!({ "application": "m.whiteboard", "device_id": "X", "expires": 9_000 });
         assert!(read_membership("@a:example.org", &content, 1_000).is_none());
-    }
-
-    #[test]
-    fn a_call_with_a_focus_in_it_is_not_a_mesh() {
-        let livekit = read_membership("@them:example.org", &element_membership(1_000, 9_000), 2_000).unwrap();
-        let mesh = json!({ "transports": ["moho.mesh"] });
-        assert!(needs_a_focus(&[livekit.clone()]));
-        assert!(!needs_a_focus(&[mesh.clone()]));
-        // One person on an SFU makes it an SFU call: everybody has to be
-        // where the media is.
-        assert!(needs_a_focus(&[mesh, livekit]));
     }
 
     #[test]
