@@ -257,7 +257,13 @@ async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &s
         // crypto::receive_sync_changes's doc comment (a room key
         // delivered in this batch can be lost on a crash between the
         // two otherwise).
-        crypto::receive_sync_changes(&session, &resp).await;
+        let to_device = crypto::receive_sync_changes(&session, &resp).await;
+        // A call's media keys arrive this way rather than in the room: they
+        // are for the people in the call now, not for anybody who will ever
+        // read it back. See calls::handle_key_event.
+        for event in &to_device {
+            calls::handle_key_event(state, account_id, event);
+        }
         // Receiving those changes can itself produce new outgoing
         // requests (e.g. claiming one-time keys to establish a session
         // with a device that just sent us a room key) - send those too

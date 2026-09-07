@@ -553,6 +553,88 @@ impl CryptoSession {
         Ok(())
     }
 
+    /// Sends one event straight to named devices, encrypted to each of them.
+    ///
+    /// Not a room event: this goes to devices rather than to a room, which is
+    /// what a call's media keys need - they are for the people in the call
+    /// right now, not for anybody who will ever read the room. Element's own
+    /// key transport is exactly this, so matching it is what makes a call
+    /// with moho and Element in it audible to both.
+    ///
+    /// Olm to each device individually. A device with no session yet gets one
+    /// claimed first, which is the same dance sharing a room key does.
+    pub async fn send_to_device_encrypted(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        event_type: &str,
+        content: &Value,
+        targets: &[(OwnedUserId, String)],
+    ) -> Result<usize> {
+        if targets.is_empty() {
+            return Ok(0);
+        }
+        let users: Vec<OwnedUserId> = {
+            let mut users: Vec<OwnedUserId> = targets.iter().map(|(user, _)| user.clone()).collect();
+            users.sort();
+            users.dedup();
+            users
+        };
+        // A concrete `Vec<&UserId>`, not an iterator adaptor, for the reason
+        // ensure_keys_shared spells out above: the adaptor's type defeats
+        // rustc's Send inference once this whole chain is inside a spawn.
+        let members: Vec<&UserId> = users.iter().map(|u| u.as_ref()).collect();
+        self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+
+        let _guard = self.outgoing_lock.lock().await;
+        if let Some((request_id, claim_request)) =
+            self.machine.get_missing_sessions(members.iter().copied()).await.context("get_missing_sessions")?
+        {
+            self.send_keys_claim(homeserver_url, access_token, &request_id, &claim_request).await?;
+        }
+
+        // The devices as the machine knows them. One we have never heard of
+        // is skipped rather than failing the send: a call carries on for
+        // everybody else while one person's new phone is still unknown.
+        let mut devices = Vec::new();
+        for (user, device_id) in targets {
+            let id: OwnedDeviceId = device_id.as_str().into();
+            match self.machine.get_device(user, &id, None).await {
+                // Deref: a `Device` is its data plus who is asking, and what
+                // the encryptor wants is the data.
+                Ok(Some(device)) => devices.push((*device).clone()),
+                Ok(None) => tracing::debug!("matrix crypto: no such device {user}/{device_id} for a call key"),
+                Err(e) => tracing::debug!("matrix crypto: looking up {user}/{device_id}: {e}"),
+            }
+        }
+        if devices.is_empty() {
+            return Ok(0);
+        }
+        let sent = devices.len();
+        let (requests, withheld) = self
+            .machine
+            .encrypt_content_for_devices(
+                devices,
+                event_type,
+                content,
+                // Every device in the call, verified or not. A call's key is
+                // not a secret kept from unverified devices - the people in
+                // the room are the people in the call, and refusing to send
+                // to somebody's unverified phone would mean they sit in the
+                // call hearing nothing.
+                matrix_sdk_crypto::CollectStrategy::AllDevices,
+            )
+            .await
+            .context("encrypting a call key for its devices")?;
+        for (device, code) in &withheld {
+            tracing::debug!("matrix crypto: call key withheld from {}: {code}", device.device_id());
+        }
+        for req in &requests {
+            self.send_to_device_request(homeserver_url, access_token, &req.txn_id, req).await.context("sending a call key")?;
+        }
+        Ok(sent)
+    }
+
     /// Encrypts an arbitrary event (any type - `m.room.message` for a
     /// plain send/edit, `m.reaction` for a reaction) for the room, once
     /// ensure_keys_shared has already run for the same room/members.
@@ -670,7 +752,7 @@ fn raw_nested_map<T>(value: &Value) -> BTreeMap<OwnedUserId, BTreeMap<OwnedDevic
 /// requirement: this MUST happen before the sync's `next_batch` token is
 /// persisted, or a room key delivered in this batch can be lost on a
 /// crash between the two (see mod.rs's run_sync).
-pub async fn receive_sync_changes(session: &CryptoSession, sync_response: &Value) {
+pub async fn receive_sync_changes(session: &CryptoSession, sync_response: &Value) -> Vec<Value> {
     let to_device_events = sync_response["to_device"]["events"].as_array().cloned().unwrap_or_default();
     let to_device_events: Vec<Raw<ruma_events::AnyToDeviceEvent>> =
         to_device_events.into_iter().filter_map(|e| Raw::from_json_string(e.to_string()).ok()).collect();
@@ -688,8 +770,19 @@ pub async fn receive_sync_changes(session: &CryptoSession, sync_response: &Value
         unused_fallback_keys: unused_fallback_keys.as_deref(),
         next_batch_token: sync_response["next_batch"].as_str().map(String::from),
     };
-    if let Err(e) = session.machine.receive_sync_changes(changes, &decryption_settings()).await {
-        tracing::warn!("matrix crypto: receive_sync_changes failed: {e}");
+    match session.machine.receive_sync_changes(changes, &decryption_settings()).await {
+        // The decrypted to-device events, which used to be thrown away.
+        // Almost all of them are the machine's own business - room keys,
+        // verification - but a call's media keys arrive this way too, and
+        // they are the client's.
+        Ok((events, _room_keys)) => events
+            .into_iter()
+            .filter_map(|event| event.to_raw().deserialize_as::<Value>().ok())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("matrix crypto: receive_sync_changes failed: {e}");
+            Vec::new()
+        }
     }
 }
 

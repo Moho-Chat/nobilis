@@ -3713,6 +3713,22 @@ pub async fn dispatch(
             }
         }
 
+        // This end's own media key, handed to the devices in the call.
+        "sendMatrixCallKey" => {
+            let (buffer_id, key) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "key")) {
+                (Some(b), Some(k)) => (b, k),
+                _ => return (None, Some("sendMatrixCallKey requires \"bufferId\" and \"key\"".to_string())),
+            };
+            let index = params.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::calls::send_key(state, &buffer.account_id, buffer_id, key, index).await {
+                Ok(sent) => (Some(serde_json::json!({ "sentTo": sent })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Where this account's room calls go, for a homeserver that names no
         // media server of its own.
         "setMatrixRtcFocus" => match p_str_opt(params, "accountId") {

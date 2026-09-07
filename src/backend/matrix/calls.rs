@@ -313,6 +313,93 @@ pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Va
     }))
 }
 
+/// The event Element uses to hand a call's media keys around.
+pub const EVENT_KEYS: &str = "io.element.call.encryption_keys";
+
+/// One media key, arriving from somebody else's device.
+///
+/// A call on a media server is encrypted end to end by encrypting the media
+/// itself: the server forwards frames it cannot read, and the keys travel over
+/// Matrix instead - to the devices in the call, one at a time, Olm-encrypted.
+/// So this is the other half of a call being private, and without it a client
+/// is connected to everybody and audible to nobody.
+pub fn handle_key_event(state: &AppState, account_id: &str, event: &Value) {
+    if event["type"].as_str() != Some(EVENT_KEYS) {
+        return;
+    }
+    let content = &event["content"];
+    let Some(room_id) = content["room_id"].as_str() else { return };
+    let Some(key) = content["keys"]["key"].as_str() else { return };
+    let Some(sender) = event["sender"].as_str() else { return };
+    // Whose device it is. Claimed by the sender rather than proven, which is
+    // what Element does too - the Olm session is what proves the account, and
+    // the device id only says which of their devices to draw it against.
+    let device = content["member"]["claimed_device_id"].as_str().unwrap_or_default();
+    let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else { return };
+    state.events.emit(
+        "matrixCallKey",
+        json!({
+            "accountId": account_id,
+            "bufferId": buffer_id,
+            "userId": sender,
+            "deviceId": device,
+            "key": key,
+            "index": content["keys"]["index"].as_i64().unwrap_or(0),
+        }),
+    );
+}
+
+/// Hands this end's own media key to everybody else in the call.
+///
+/// One event per device rather than one per person: two devices of the same
+/// account are two participants on the media server, and a key that reached
+/// only one of them leaves the other in the call hearing static.
+pub async fn send_key(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    key: &str,
+    index: i64,
+) -> anyhow::Result<usize> {
+    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .ok_or_else(|| anyhow::anyhow!("no known Matrix room for this buffer"))?;
+    let session = state.runtime.get_matrix_machine(account_id).ok_or_else(|| anyhow::anyhow!("this account has no encryption set up"))?;
+
+    let now = chrono::Utc::now().timestamp_millis();
+    let targets: Vec<(ruma_common::OwnedUserId, String)> = state
+        .runtime
+        .matrix_call_members(account_id, &room_id)
+        .into_iter()
+        .filter_map(|m| {
+            let user = m["user_id"].as_str()?;
+            let device = m["membership"]["device_id"].as_str()?;
+            // Not this device: it has the key already, being where it was
+            // made.
+            if user == account.user_id && device == account.device_id {
+                return None;
+            }
+            Some((ruma_common::OwnedUserId::try_from(user).ok()?, device.to_string()))
+        })
+        .collect();
+
+    let content = json!({
+        "keys": { "index": index, "key": key },
+        "room_id": room_id,
+        "member": {
+            "claimed_device_id": account.device_id,
+            "id": format!("{}:{}", account.user_id, account.device_id),
+        },
+        "session": { "call_id": "", "application": "m.call", "scope": "m.room" },
+        "sent_ts": now,
+    });
+    session
+        .send_to_device_encrypted(&account.homeserver_url, &account.access_token, EVENT_KEYS, &content, &targets)
+        .await
+}
+
 /// Where the media server is, if there is one to use.
 ///
 /// Three places, in the order that answers the question best:
