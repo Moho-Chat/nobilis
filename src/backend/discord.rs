@@ -2786,7 +2786,7 @@ mod modal_tests {
 }
 
 mod forwarded_tests {
-    use super::{extract_attachments, extract_body, forwarded_attachments};
+    use super::{extract_attachments, extract_body, extract_reply, forwarded_attachments};
     use serde_json::json;
 
     /// A forward as Discord actually sends one: nothing in `content`, and
@@ -2805,16 +2805,18 @@ mod forwarded_tests {
     }
 
     #[test]
-    fn a_forward_is_the_message_it_carries() {
-        // The bug: this arrived as an author with nothing under them.
+    fn a_forward_says_that_it_is_one() {
+        // The bug: this arrived as an author with nothing under them. And
+        // then: as a quote that read like somebody quoting, rather than as a
+        // message brought here from somewhere else.
         let body = extract_body(&forward("")).expect("a forward is not an empty message");
-        assert_eq!(body, "> the thing that was forwarded");
+        assert_eq!(body, "Forwarded\n> the thing that was forwarded");
     }
 
     #[test]
     fn a_comment_above_a_forward_keeps_its_place() {
         let body = extract_body(&forward("look at this")).unwrap();
-        assert_eq!(body, "look at this\n> the thing that was forwarded");
+        assert_eq!(body, "look at this\nForwarded\n> the thing that was forwarded");
     }
 
     #[test]
@@ -2838,9 +2840,30 @@ mod forwarded_tests {
         assert_eq!(atts[0].kind, "image");
         // The message is not left blank either, since a client that draws no
         // attachment would otherwise show nothing at all.
-        assert_eq!(extract_body(&d).as_deref(), Some("> (forwarded 1 attachment)"));
+        assert_eq!(extract_body(&d).as_deref(), Some("Forwarded\n> (forwarded 1 attachment)"));
         // And the message's own attachments are untouched by this.
         assert!(extract_attachments(&d).is_empty());
+    }
+
+    #[test]
+    fn a_forward_is_not_a_reply() {
+        // What produced the arrow: a forward has a message_reference, so it
+        // was read as a reply to a message Discord never resolves - drawn as
+        // "replying to" with no author and no text beside it.
+        let d = json!({
+            "content": "",
+            "message_reference": { "type": 1, "channel_id": "1", "message_id": "2" },
+            "message_snapshots": [{ "message": { "content": "brought from elsewhere", "attachments": [] } }]
+        });
+        assert!(extract_reply(&d).is_none());
+        // An actual reply still is one.
+        let reply = json!({
+            "content": "yes",
+            "message_reference": { "type": 0, "message_id": "2" },
+            "referenced_message": { "content": "the question", "author": { "username": "asker" } }
+        });
+        let preview = extract_reply(&reply).expect("a reply is still a reply");
+        assert_eq!(preview.from, "asker");
     }
 
     #[test]
@@ -2996,7 +3019,13 @@ fn forwarded_text(d: &Value) -> Vec<String> {
         .iter()
         .filter_map(|snapshot| {
             let message = &snapshot["message"];
-            let mut parts: Vec<String> = Vec::new();
+            // Said outright, because a quoted line on its own reads as
+            // somebody quoting rather than as a message brought here from
+            // somewhere else - and the difference is the whole of what a
+            // forward is. Who wrote it is not in the snapshot: Discord sends
+            // the message without an author, deliberately, so the name is
+            // filled in afterwards where it can be read - see name_forward.
+            let mut parts: Vec<String> = vec![FORWARD_MARK.to_string()];
             if let Some(text) = message["content"].as_str().filter(|t| !t.is_empty()) {
                 // Quoted, because that is what it is: something said
                 // elsewhere, brought here.
@@ -3006,15 +3035,86 @@ fn forwarded_text(d: &Value) -> Vec<String> {
             // message's own attachments below; this is for the case where a
             // forward is *only* a picture, so the line is not empty.
             let files = message["attachments"].as_array().map(|a| a.len()).unwrap_or(0);
-            if parts.is_empty() && files > 0 {
+            // Only where the forward has no words: the mark is already there,
+            // so "nothing but the mark" is what an empty one looks like.
+            if parts.len() == 1 && files > 0 {
                 parts.push(format!("> (forwarded {files} attachment{})", if files == 1 { "" } else { "s" }));
             }
-            if parts.is_empty() {
+            // The mark alone is not a message; something has to have been
+            // forwarded for this to be one.
+            if parts.len() < 2 {
                 return None;
             }
             Some(parts.join("\n"))
         })
         .collect()
+}
+
+/// What a forward says before anybody has looked up who wrote it.
+pub const FORWARD_MARK: &str = "Forwarded";
+
+/// Fills in who wrote the forwarded message, and where from.
+///
+/// Discord's snapshot carries the message and not its author - so the only
+/// way to say whose words these are is to read the original, which this
+/// account can do exactly when it can see where the message came from. Where
+/// it cannot, the line stays as it was: "Forwarded" and no claim about who.
+///
+/// Done afterwards rather than before, so a forward appears at once and gains
+/// its attribution a moment later, the same way a late link preview does.
+pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, reference: &Value, body: &str) {
+    let (Some(source_channel), Some(source_message)) =
+        (reference["channel_id"].as_str(), reference["message_id"].as_str())
+    else {
+        return;
+    };
+    let Some(cfg) = state.accounts.get_discord(account_id) else { return };
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{source_channel}/messages?limit=1&around={source_message}"))
+        .header("Authorization", &cfg.token)
+        .send()
+        .await;
+    // A source this account cannot see is the ordinary case for a forward
+    // out of somebody else's server, and not worth a word to anybody.
+    let Ok(resp) = resp else { return };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(found) = resp.json::<Value>().await else { return };
+    let original = found
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["id"].as_str() == Some(source_message));
+    let Some(original) = original else { return };
+    let author = &original["author"];
+    let Some(name) = author["global_name"]
+        .as_str()
+        .filter(|n| !n.is_empty())
+        .or_else(|| author["username"].as_str())
+        .filter(|n| !n.is_empty())
+    else {
+        return;
+    };
+    // And where from, where that is a place with a name. A direct message is
+    // named as one rather than by its id, which would mean nothing to anybody.
+    // Where from, where that is somewhere this client knows the name of. A
+    // buffer's name is what a person calls the place; a channel id is not.
+    let place = match state
+        .runtime
+        .discord_buffer_for_channel(account_id, source_channel)
+        .and_then(|buffer| state.runtime.get_buffer(&buffer))
+        .map(|buffer| buffer.name)
+    {
+        Some(name) => format!(" in {}", name.rsplit('/').next().unwrap_or(&name).to_string()),
+        None if original["guild_id"].is_null() => " from a direct message".to_string(),
+        None => String::new(),
+    };
+    let named = format!("{FORWARD_MARK} from {name}{place}");
+    let next = body.replacen(FORWARD_MARK, &named, 1);
+    if next != body {
+        state.runtime.update_message_body_only(state, buffer_id, msg_id, &next);
+    }
 }
 
 /// The files inside a forwarded message, as attachments of this one.
@@ -3146,6 +3246,13 @@ fn mentions_own_user(d: &Value, own_user_id: &str) -> bool {
 /// gets deleted. `id` is what the frontend's "jump to" click targets if
 /// the original happens to already be loaded.
 fn extract_reply(d: &Value) -> Option<ReplyPreview> {
+    // A forward carries a reference too - to the message it brought here -
+    // and it is not a reply to it. Read as one, it drew the arrow a reply
+    // gets with nothing beside it, since a forward resolves no referenced
+    // message: type 1 is Discord's own word for the difference.
+    if d["message_reference"]["type"].as_i64() == Some(1) || d["message_snapshots"].is_array() {
+        return None;
+    }
     let reply_id = d["message_reference"]["message_id"].as_str()?;
     let referenced = &d["referenced_message"];
     if referenced.is_null() {
@@ -3192,6 +3299,21 @@ fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value],
             continue;
         }
         note_components(state, buffer_id, msg_id, msg);
+        // Who wrote a message somebody forwarded, which the snapshot does not
+        // carry. Backfill needs this as much as the live path: a conversation
+        // read for the first time is all history, and a forward in it would
+        // otherwise never say whose words it holds.
+        if msg["message_snapshots"].is_array() {
+            let state = state.clone();
+            let account_id = buffer_id.split('|').next().unwrap_or_default().to_string();
+            let buffer = buffer_id.to_string();
+            let msg_id = msg_id.to_string();
+            let reference = msg["message_reference"].clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                name_forward(&state, &account_id, &buffer, &msg_id, &reference, &body).await;
+            });
+        }
         // Backfilled messages need previews as much as live ones do - more so,
         // since a channel read for the first time is all history and none of it
         // would otherwise survive its links expiring.
@@ -4938,7 +5060,23 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                         // The author's id travels with the message. It is what a profile
                         // lookup asks Discord about - a display name is not something
                         // the API accepts - and what a moderation action would need.
-                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id, is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
+                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id.clone(), is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
+                        // Who wrote a forwarded message, which the snapshot
+                        // does not say. A read of the original, so it happens
+                        // after the message is already on screen rather than
+                        // holding it up.
+                        if d["message_snapshots"].is_array() {
+                            if let Some(msg_id) = real_msg_id {
+                                let state = state.clone();
+                                let account_id = account_id.clone();
+                                let buffer_id = model::buffer_id(&account_id, &buffer_name);
+                                let reference = d["message_reference"].clone();
+                                let body = body.clone();
+                                tokio::spawn(async move {
+                                    name_forward(&state, &account_id, &buffer_id, &msg_id, &reference, &body).await;
+                                });
+                            }
+                        }
                         // The buttons under it, if it has any. After the
                         // message rather than with it: they are written onto
                         // the row that was just made, and a great many bot
