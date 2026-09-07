@@ -201,12 +201,22 @@ pub async fn set_membership(
             "membershipID": format!("{}:{}", account.user_id, device_id),
             "created_ts": now,
             "expires": MEMBERSHIP_TTL_MS,
-            // What this end is actually on. A media server where the call
-            // has one - which is what makes this membership legible to
-            // Element, since that is the only transport its clients speak -
-            // and the mesh where there is none, which a client that does not
-            // know it ignores rather than dialling nothing.
-            "focus_active": focus.clone().unwrap_or_else(|| json!({ "type": TRANSPORT_MESH })),
+            // Two different things, which is easy to get wrong and was:
+            // `focus_active` says *how* everybody should agree on a server -
+            // "whichever the oldest membership named" - while the server
+            // itself belongs in `foci_preferred`. Writing the address into
+            // both leaves a client looking for a selection strategy and
+            // finding a URL, so it cannot decide where the call is being
+            // held and does not join.
+            "focus_active": match &focus {
+                Some(_) => json!({ "type": "livekit", "focus_selection": "oldest_membership" }),
+                None => json!({ "type": TRANSPORT_MESH }),
+            },
+            // What this end is actually reachable on. A media server where
+            // the call has one - which is what makes this membership legible
+            // to Element, since that is the only transport its clients speak
+            // - and the mesh where there is none, which a client that does
+            // not know it ignores rather than dialling nothing.
             "foci_preferred": [focus.clone().unwrap_or_else(|| json!({ "type": TRANSPORT_MESH }))],
         })
     } else {
@@ -239,8 +249,35 @@ pub async fn set_membership(
 /// room could not be reconfigured would be worse than a call only some people
 /// can join.
 async fn allow_everybody_to_join(state: &AppState, account_id: &str, room_id: &str) {
-    let Some(levels) = state.runtime.matrix_power_levels(account_id, room_id) else { return };
+    let Some(account) = state.accounts.get_matrix(account_id) else { return };
+    let base = account.homeserver_url.trim_end_matches('/');
+    let encoded = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    // Read from the server, not from the cache.
+    //
+    // This is a read-modify-write of the event that governs *everything* a
+    // room permits, and writing it back means writing the whole thing: any
+    // key missing from what is sent is a key removed from the room. The
+    // cached copy is only as complete as whatever sync last carried, and a
+    // partial copy written back here took the `users` map with it - which
+    // silently stripped the room's own admin of their power. Fetched fresh,
+    // and not written at all if the fetch fails.
+    let Ok(levels) = super::http::get_json(
+        &format!("{base}/_matrix/client/v3/rooms/{encoded}/state/m.room.power_levels/"),
+        &account.access_token,
+    )
+    .await
+    else {
+        tracing::debug!("matrix[{account_id}]: cannot read {room_id}'s permissions, leaving them alone");
+        return;
+    };
+    // Nothing to change, and nothing that could go wrong by not trying.
     if levels["events"][EVENT_MEMBER].as_i64() == Some(0) {
+        return;
+    }
+    // A sanity check on what came back, because writing a power-levels event
+    // that is missing its own shape is how a room loses its moderators.
+    if !levels.is_object() || levels["users_default"].is_null() && levels["users"].is_null() {
+        tracing::debug!("matrix[{account_id}]: {room_id}'s permissions do not look like permissions, leaving them alone");
         return;
     }
     let mut next = levels.clone();
@@ -459,27 +496,80 @@ pub async fn rtc_token(state: &AppState, account_id: &str, room_id: &str, focus:
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("that call's media server has no address"))?
         .trim_end_matches('/');
-    // The room as the media server knows it. The call names its own alias
-    // where it has one, since everybody has to land in the same LiveKit room.
-    let alias = focus["livekit_alias"].as_str().unwrap_or(room_id);
-    let answer = super::http::post_json(
-        &format!("{service}/sfu/get"),
-        None,
-        json!({ "room": alias, "openid_token": openid, "device_id": account.device_id }),
-    )
-    .await
-    .context("asking the media server for a way in")?;
+
+    // The newer endpoint first, because the room it puts you in is derived
+    // differently from the old one's - `sha256(json([room_id, slot_id]))`
+    // against a hash of the room alone - and two clients that derive it
+    // differently sit in two different rooms on the same server, each alone.
+    // Element uses this one, so moho has to.
+    let member_id = format!("{}:{}", account.user_id, account.device_id);
+    let modern = json!({
+        "room_id": room_id,
+        // What Element calls a room-scoped call. The `#ROOM` is not
+        // decoration: it is half of what the room name is hashed from.
+        "slot_id": SLOT_ROOM_CALL,
+        "openid_token": openid,
+        "member": {
+            "id": member_id,
+            "claimed_user_id": account.user_id,
+            "claimed_device_id": account.device_id,
+        },
+    });
+    let answer = match super::http::post_json(&format!("{service}/get_token"), None, modern).await {
+        Ok(answer) if !answer["jwt"].as_str().unwrap_or_default().is_empty() => answer,
+        // An older service that has only the endpoint before it. Worth
+        // falling back to: it works, and the only cost is that a call held
+        // through it cannot be shared with a client using the newer one.
+        first => {
+            if let Err(e) = &first {
+                tracing::debug!("matrix[{account_id}]: media server has no /get_token ({e:#}), trying the older way");
+            }
+            let legacy = json!({
+                "room": focus["livekit_alias"].as_str().unwrap_or(room_id),
+                "openid_token": openid_again(state, account_id).await?,
+                "device_id": account.device_id,
+            });
+            super::http::post_json(&format!("{service}/sfu/get"), None, legacy)
+                .await
+                .context("asking the media server for a way in")?
+        }
+    };
     if answer["jwt"].as_str().unwrap_or_default().is_empty() {
         anyhow::bail!("the media server would not let this account in");
     }
     Ok(json!({
         "url": answer["url"],
         "jwt": answer["jwt"],
-        "identity": format!("{}:{}", account.user_id, account.device_id),
+        "identity": member_id,
     }))
 }
 
-/// Who to call, and who to wait for./// Who to call, and who to wait for.
+/// The slot a room's own call lives in.
+///
+/// Element's name for it, and half of what the media server hashes the room
+/// name from - so it is not a label but part of the address.
+pub const SLOT_ROOM_CALL: &str = "m.call#ROOM";
+
+/// A second OpenID token, for the second attempt.
+///
+/// These are single-use in practice: the service redeems the token against the
+/// homeserver, and a token already redeemed will not verify again.
+async fn openid_again(state: &AppState, account_id: &str) -> anyhow::Result<Value> {
+    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    super::http::post_json(
+        &format!(
+            "{base}/_matrix/client/v3/user/{}/openid/request_token",
+            url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
+        ),
+        Some(&account.access_token),
+        json!({}),
+    )
+    .await
+    .context("asking the homeserver to vouch for this account")
+}
+
+/// Who to call, and who to wait for./// Who to call, and who to wait for./// Who to call, and who to wait for.
 ///
 /// Both ends of every pair see each other arrive, and if both call, both
 /// answer, and the call collides with itself. So the rule is one line and the
