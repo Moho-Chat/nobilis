@@ -177,9 +177,82 @@ fn init_logging() {
     tracing_subscriber::fmt().with_max_level(level).init();
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+
+/// Stops a long-running daemon from keeping every byte it has ever needed.
+///
+/// glibc gives each thread that allocates its own arena, up to eight per core,
+/// and never gives an arena's free pages back to the system on its own. A
+/// process with a tokio worker per core - thirty-three of them on the machine
+/// this was measured on - therefore spreads its allocation over dozens of
+/// arenas, and its resident size becomes the high-water mark of everything it
+/// has ever done at once rather than what it is holding. Measured on a daemon
+/// that had been up half a day: fourteen megabytes in the main heap and two
+/// hundred and seventy-seven megabytes across a hundred and forty-seven
+/// anonymous mappings, thirty-two of them full-size arenas.
+///
+/// This is the half that has to happen before there is a second thread to have
+/// an arena - which is why main is not `#[tokio::main]` any more. The macro
+/// builds the runtime, and therefore every worker thread, before a line of the
+/// body runs; setting the cap in there set it after the arenas it was meant to
+/// prevent had already been handed out. Measured that way round too: still
+/// thirty-two of them.
+///
+/// Linux and glibc only. A musl build has neither symbol and needs neither -
+/// its allocator returns memory as it goes.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn cap_malloc_arenas() {
+    // SAFETY: mallopt takes two ints and touches nothing of ours. Fewer arenas
+    // mean more threads sharing one, which a daemon that spends its life
+    // waiting on sockets can afford - and glibc's per-thread cache still
+    // absorbs the small allocations without reaching an arena at all.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 4);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn cap_malloc_arenas() {}
+
+/// And the half that hands the free pages back, once the runtime exists.
+///
+/// Capping the arenas stops the spread; nothing in glibc returns what is
+/// already free inside one. `malloc_trim` walks them releasing whole free
+/// pages - a few milliseconds, and nothing else in the process notices.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_the_heap_periodically() {
+    tokio::spawn(async {
+        // Not on startup and not often: the point is what a long day leaves
+        // behind, and trimming what a busy minute is about to reuse would be
+        // work for nothing.
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(300));
+        every.tick().await;
+        loop {
+            every.tick().await;
+            // SAFETY: releases free pages held by the allocator; nothing that
+            // is still allocated moves or is touched.
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        }
+    });
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_the_heap_periodically() {}
+
+/// The runtime, built by hand so the allocator can be spoken to first.
+fn main() -> Result<()> {
+    cap_malloc_arenas();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the async runtime")?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     init_logging();
+    trim_the_heap_periodically();
 
     // Both the `irc` crate's tls-rust feature and the Discord backend's
     // websocket/HTTP clients pull in rustls, but via different transitive

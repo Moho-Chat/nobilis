@@ -813,6 +813,34 @@ fn rename_own_mentions_html(html: &str, nick: &str, alias: &str) -> String {
     out
 }
 
+/// How many of somebody-else's details to keep in a lookaside table.
+///
+/// Every map below that is keyed by something the network hands out - a
+/// member, a reaction event - grows with how much has happened rather than
+/// with how much is being used, and a daemon left running for a week is a
+/// daemon holding a week of them. They are caches with a miss path, so the
+/// answer is a ceiling rather than bookkeeping: past it, most of the table
+/// goes and is learned again on demand.
+const CACHE_LIMIT: usize = 5_000;
+
+/// Drops most of a cache once it is over its ceiling.
+///
+/// Which entries go is not chosen. A HashMap has no order to call oldest, and
+/// keeping one would cost a second structure on every insert to save a lookup
+/// that already knows how to fail - so the trade is deliberate: this may drop
+/// something in use, and what happens then is one more request.
+fn cap_cache<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, limit: usize) {
+    if map.len() < limit {
+        return;
+    }
+    let keep = limit * 3 / 4;
+    let mut kept = 0usize;
+    map.retain(|_, _| {
+        kept += 1;
+        kept <= keep
+    });
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self {
@@ -1982,15 +2010,18 @@ impl Runtime {
     /// can find its event id by (buffer, message, emoji) without a
     /// reverse scan.
     pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool) {
-        self.matrix_reaction_targets
-            .lock()
-            .unwrap()
-            .insert(event_id.to_string(), (buffer_id.to_string(), msg_id.to_string(), emoji.to_string(), is_me));
+        {
+            let mut targets = self.matrix_reaction_targets.lock().unwrap();
+            // One entry per reaction seen, and only a redaction takes one out
+            // again - which most reactions never get. Left alone it is a list
+            // of everything anybody has ever reacted with in front of us.
+            cap_cache(&mut targets, CACHE_LIMIT);
+            targets.insert(event_id.to_string(), (buffer_id.to_string(), msg_id.to_string(), emoji.to_string(), is_me));
+        }
         if is_me {
-            self.matrix_own_reactions
-                .lock()
-                .unwrap()
-                .insert((buffer_id.to_string(), msg_id.to_string(), emoji.to_string()), event_id.to_string());
+            let mut mine = self.matrix_own_reactions.lock().unwrap();
+            cap_cache(&mut mine, CACHE_LIMIT);
+            mine.insert((buffer_id.to_string(), msg_id.to_string(), emoji.to_string()), event_id.to_string());
         }
     }
 
@@ -2106,10 +2137,13 @@ impl Runtime {
     /// it as one would re-read every guild on the first member update after
     /// connecting.
     pub fn remember_discord_member(&self, guild_id: &str, user_id: &str, member: &serde_json::Value) {
-        self.discord_members
-            .lock()
-            .unwrap()
-            .insert((guild_id.to_string(), user_id.to_string()), member.clone());
+        let mut members = self.discord_members.lock().unwrap();
+        // A member window scrolled through a large guild is thousands of these,
+        // each a JSON object, and every one of them stayed for the life of the
+        // process. What they answer - when somebody joined - is asked about
+        // whoever is on screen, so a ceiling costs a re-read at worst.
+        cap_cache(&mut members, CACHE_LIMIT);
+        members.insert((guild_id.to_string(), user_id.to_string()), member.clone());
     }
 
     pub fn discord_member(&self, guild_id: &str, user_id: &str) -> Option<serde_json::Value> {
@@ -3520,6 +3554,22 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_cache_stops_at_its_ceiling() {
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        for i in 0..20 {
+            cap_cache(&mut map, 10);
+            map.insert(i, i);
+        }
+        // Never past the ceiling, and never emptied outright - a cache that
+        // threw everything away each time it filled would miss on everything
+        // that had just been learned.
+        assert!(map.len() <= 10, "len was {}", map.len());
+        assert!(map.len() >= 7, "len was {}", map.len());
+        // And the newest insert is always there to be found.
+        assert_eq!(map.get(&19), Some(&19));
+    }
     use super::*;
 
     /// Two accounts can be in the same room, and each has its own buffer for
