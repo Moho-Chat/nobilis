@@ -1702,8 +1702,7 @@ fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::Reply
         id: original.id.clone(),
         from,
         body: original.content.clone().unwrap_or_default(),
-        thread: false,
-    })
+        thread: false, forwarded: false })
 }
 
 /// One line for something somebody did in a channel, or None if this event is

@@ -244,6 +244,15 @@ pub struct ReplyPreview {
     /// is somewhere, and only the second can be opened and continued.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread: bool,
+    /// Whether this names a message brought here rather than one answered.
+    ///
+    /// Discord says a reply and a forward the same way - a reference to
+    /// another message - and only the reference's own type tells them apart.
+    /// Read as a reply, a forward drew the arrow a reply gets with nothing
+    /// beside it, which is how a forwarded message announced itself as
+    /// something else entirely.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forwarded: bool,
 }
 
 /// How a service says a sender should look.

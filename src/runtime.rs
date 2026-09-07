@@ -3459,6 +3459,19 @@ impl Runtime {
         }
     }
 
+    /// Says who wrote the message a forward brought here, once that has been
+    /// looked up - the row above it says "Forwarded" until then.
+    pub fn rename_reply_preview(&self, state: &AppState, buffer_id: &str, msg_id: &str, from: &str) {
+        match state.store.rename_reply_from(buffer_id, msg_id, from) {
+            Ok(true) => state.events.emit(
+                "messageReplyRenamed",
+                json!({ "bufferId": buffer_id, "id": msg_id, "from": from }),
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to name a forwarded message: {e}"),
+        }
+    }
+
     /// Discord's MESSAGE_DELETE - removes the row and tells clients to
     /// drop it from view, same as Discord's own clients (no tombstone).
     pub fn delete_message(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
