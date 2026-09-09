@@ -2616,11 +2616,15 @@ pub async fn dispatch(
 
         // A session obtained by signing in somewhere with a screen.
         //
-        // The forum's login form now carries a CAPTCHA, so a stored password
-        // is no longer a way in on its own. The client opens the site's own
-        // login page in a browser window, a person answers the verification
-        // there, and what comes back is the session cookies - which is all
-        // the daemon ever wanted from a password anyway.
+        // Not the only way in: the CAPTCHA the forum's login form carries is
+        // answered by the daemon itself (see backend/sneedchat/captcha.rs), so
+        // a stored password works again. This stays for the case that one
+        // cannot cover - the same service can ask for a browser fingerprint
+        // check instead of a proof of work, and nothing headless can produce
+        // one. The client opens the site's own login page in a browser window,
+        // a person answers the verification there, and what comes back is the
+        // session cookies - which is all the daemon ever wanted from a
+        // password anyway.
         //
         // Takes the cookies as the header a browser would send: one string,
         // the shape the value already has wherever it came from.
