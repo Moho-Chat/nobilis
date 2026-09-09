@@ -1126,7 +1126,7 @@ pub async fn dispatch(
         // Reported from the daemon because that is where audio is handled -
         // the voice connection and its encoder live here, so the devices do
         // too.
-        "listAudioDevices" => match backend::audio::list_devices() {
+        "listAudioDevices" => match crate::audio::list_devices() {
             Ok(devices) => (Some(serde_json::to_value(devices).unwrap()), None),
             Err(e) => (None, Some(e.to_string())),
         },
@@ -1892,7 +1892,7 @@ pub async fn dispatch(
         // first state rather than a different kind of thing.
         "listTransfers" => {
             let rows: Vec<Value> =
-                state.runtime.dcc_transfers().iter().map(backend::irc_dcc::transfer_json).collect();
+                state.runtime.dcc_transfers().iter().map(backend::irc::dcc::transfer_json).collect();
             (Some(serde_json::json!(rows)), None)
         }
 
@@ -1904,7 +1904,7 @@ pub async fn dispatch(
                     (Some(a), Some(n), Some(p)) => (a, n, p),
                     _ => return (None, Some("sendFile requires \"accountId\", \"nick\" and \"path\"".to_string())),
                 };
-            match backend::irc_dcc::offer_file(state, account_id, nick, path).await {
+            match backend::irc::dcc::offer_file(state, account_id, nick, path).await {
                 Ok(id) => (Some(serde_json::json!({ "id": id })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -1914,7 +1914,7 @@ pub async fn dispatch(
             let Some(id) = p_str_opt(params, "id") else {
                 return (None, Some("acceptTransfer requires \"id\"".to_string()));
             };
-            backend::irc_dcc::accept(state, id);
+            backend::irc::dcc::accept(state, id);
             (Some(Value::Bool(true)), None)
         }
 
@@ -1924,7 +1924,7 @@ pub async fn dispatch(
             let Some(id) = p_str_opt(params, "id") else {
                 return (None, Some("cancelTransfer requires \"id\"".to_string()));
             };
-            backend::irc_dcc::cancel(state, id, "declined");
+            backend::irc::dcc::cancel(state, id, "declined");
             (Some(Value::Bool(true)), None)
         }
 
@@ -1975,12 +1975,12 @@ pub async fn dispatch(
             let Some(kind) = p_str_opt(params, "kind") else {
                 return (None, Some("setVoiceDevice requires \"kind\"".to_string()));
             };
-            let device_id = p_str_opt(params, "deviceId").unwrap_or(backend::audio::DEFAULT_ID).to_string();
+            let device_id = p_str_opt(params, "deviceId").unwrap_or(crate::audio::DEFAULT_ID).to_string();
             if kind != "input" && kind != "output" {
                 return (None, Some(format!("unknown device kind {kind:?}")));
             }
             if kind == "input" && !device_id.is_empty() {
-                if let Err(e) = backend::audio::route_input(&device_id) {
+                if let Err(e) = crate::audio::route_input(&device_id) {
                     return (None, Some(e.to_string()));
                 }
             }
@@ -2018,7 +2018,7 @@ pub async fn dispatch(
             let mic_muted = prefs.mic_muted || prefs.deafened;
             for account_id in state.voice.connected_accounts() {
                 state.voice.set_mic_muted(&account_id, mic_muted);
-                backend::audio::set_playback_muted(prefs.deafened);
+                crate::audio::set_playback_muted(prefs.deafened);
                 backend::discord::announce_voice_flags(state, &account_id, mic_muted, prefs.deafened);
             }
             state.events.emit("voicePrefsChanged", serde_json::to_value(&prefs).unwrap());
@@ -2090,7 +2090,7 @@ pub async fn dispatch(
             let guild_id = p_str_opt(params, "guildId");
             // Both default to the cautious setting, so a caller that says
             // nothing gets an empty channel and a closed microphone.
-            let options = backend::discord_voice::VoiceOptions {
+            let options = backend::discord::voice::VoiceOptions {
                 solo: params.get("soloOnly").and_then(|v| v.as_bool()).unwrap_or(true),
                 transmit: params.get("transmit").and_then(|v| v.as_bool()).unwrap_or(false),
             };

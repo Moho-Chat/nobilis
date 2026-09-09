@@ -1,6 +1,17 @@
+//!
+//! Two things this protocol carries are big enough to file beside it. `dcc`
+//! is IRC's own file transfer - a second connection, made directly between
+//! two clients, that the chat connection only introduces. `sasl` is how a
+//! client proves who it is during registration. `nickserv` is the bot every
+//! network has for owning a nickname. None of the three is anything but IRC,
+//! which is what makes them modules of it.
+pub mod dcc;
+pub mod nickserv;
+pub mod sasl;
+
 use crate::accounts::IrcAccountConfig;
 use crate::model::MemberRank;
-use crate::nickserv::NickservWait;
+use nickserv::NickservWait;
 use crate::runtime::{ConnState, IrcHandle};
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Result};
@@ -241,7 +252,7 @@ async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<()> {
     // transfer starts: turning Tor off in settings does not move a connection
     // that is already established, and a transfer must follow the connection
     // rather than the setting.
-    state.runtime.set_irc_transport(&account_id, Some(super::irc_dcc::transport_for(config)));
+    state.runtime.set_irc_transport(&account_id, Some(dcc::transport_for(config)));
 
     let result = async {
         while let Some(msg) = stream.next().await.transpose()? {
@@ -592,7 +603,7 @@ async fn attempt_sasl(
             sender.send_sasl(payload).map_err(anyhow::Error::from)?;
         }
         SaslMechanism::ScramSha256 => {
-            let mut scram = crate::backend::irc_sasl::Scram::new(&user, &pass, &crate::backend::irc_sasl::nonce());
+            let mut scram = crate::backend::irc::sasl::Scram::new(&user, &pass, &crate::backend::irc::sasl::nonce());
             expect_challenge(stream, "+").await?;
             sender
                 .send_sasl(base64::engine::general_purpose::STANDARD.encode(scram.client_first()))
@@ -1420,8 +1431,8 @@ async fn handle_message(
             // Before it is treated as something somebody said. A file offer
             // is CTCP, and recording it as a message put a line of control
             // characters in the log where the offer should have been.
-            if let Some(dcc) = super::irc_dcc::parse_dcc(&body) {
-                super::irc_dcc::incoming(state, account_id, &from, &buffer_name, kind, dcc).await;
+            if let Some(dcc) = dcc::parse_dcc(&body) {
+                dcc::incoming(state, account_id, &from, &buffer_name, kind, dcc).await;
                 return;
             }
             if let Some(action_body) = strip_action(&body) {

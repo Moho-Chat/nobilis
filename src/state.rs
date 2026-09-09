@@ -26,11 +26,11 @@ pub struct AppState {
     /// waits on this alongside SIGTERM and runs the identical clean exit.
     pub shutdown: Arc<Notify>,
     /// Live Discord voice connections and half-built handshakes.
-    pub voice: Arc<crate::backend::discord_voice::VoiceState>,
+    pub voice: Arc<crate::backend::discord::voice::VoiceState>,
     /// Which sound devices voice uses, and whether it is silenced. Persisted,
     /// so a deliberate mute is still in force after a restart.
-    pub voice_prefs: Arc<crate::backend::audio::VoicePrefsStore>,
-    pub dcc_prefs: Arc<crate::backend::irc_dcc::DccPrefsStore>,
+    pub voice_prefs: Arc<crate::audio::VoicePrefsStore>,
+    pub dcc_prefs: Arc<crate::backend::irc::dcc::DccPrefsStore>,
     /// The words that make a message worth being told about, besides your
     /// name. Here rather than in a window because this is where a message is
     /// decided to be a highlight - see highlights.rs.

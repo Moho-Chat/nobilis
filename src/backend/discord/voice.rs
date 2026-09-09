@@ -89,9 +89,9 @@ pub struct VoiceState {
     options: Mutex<HashMap<String, VoiceOptions>>,
     /// The running microphone stream, held here because dropping it stops the
     /// capture; the driver reads from the buffer it feeds.
-    captures: Mutex<HashMap<String, crate::backend::audio::Capture>>,
+    captures: Mutex<HashMap<String, crate::audio::Capture>>,
     /// The speakers this session plays other people through.
-    playbacks: Mutex<HashMap<String, Arc<crate::backend::audio::Playback>>>,
+    playbacks: Mutex<HashMap<String, Arc<crate::audio::Playback>>>,
     /// Who is talking right now, per account.
     speaking: Mutex<HashMap<String, Arc<SpeakingTracker>>>,
 }
@@ -332,7 +332,7 @@ mod speaking_tests {
 struct Speakers {
     /// None on a machine whose audio output would not open. The call still
     /// runs - you can talk, and you can see who else is - it is just silent.
-    playback: Option<Arc<crate::backend::audio::Playback>>,
+    playback: Option<Arc<crate::audio::Playback>>,
     tracker: Arc<SpeakingTracker>,
 }
 
@@ -589,8 +589,8 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
     );
 
     let prefs = state.voice_prefs.get();
-    crate::backend::audio::set_playback_muted(prefs.deafened);
-    let playback = match crate::backend::audio::start_playback(prefs.output.as_deref()) {
+    crate::audio::set_playback_muted(prefs.deafened);
+    let playback = match crate::audio::start_playback(prefs.output.as_deref()) {
         Ok(playback) => {
             let playback = Arc::new(playback);
             state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback.clone());
@@ -636,8 +636,8 @@ fn start_transmitting(
     driver: &mut Driver,
     device_id: Option<&str>,
     muted: bool,
-) -> Result<crate::backend::audio::Capture> {
-    use crate::backend::audio::{self, MicSource, TARGET_CHANNELS, TARGET_RATE};
+) -> Result<crate::audio::Capture> {
+    use crate::audio::{self, MicSource, TARGET_CHANNELS, TARGET_RATE};
 
     let (source, sink) = MicSource::new();
     let capture = audio::start_capture(device_id, sink)?;

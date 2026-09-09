@@ -68,7 +68,7 @@ pub struct DccTransfer {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The offer itself, kept so accepting does not have to read anything
     /// off the network a second time. Dropped once it is settled.
-    pub offer: Option<crate::backend::irc_dcc::DccSend>,
+    pub offer: Option<crate::backend::irc::dcc::DccSend>,
     /// When it started, so the order survives being written down and read
     /// back - a list kept only in memory can rely on its own order, and one
     /// that outlives the process cannot.

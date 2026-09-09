@@ -1,4 +1,5 @@
 mod accounts;
+mod audio;
 mod backend;
 mod commands;
 mod events;
@@ -7,7 +8,6 @@ mod ignores;
 mod ipc;
 mod model;
 mod net;
-mod nickserv;
 mod profile;
 mod rpc;
 mod runtime;
@@ -283,9 +283,9 @@ async fn run() -> Result<()> {
         runtime: Arc::new(Runtime::new()),
         tor: Arc::new(net::tor::TorManager::new(&opts.data_dir)),
         shutdown: Arc::new(tokio::sync::Notify::new()),
-        voice: Arc::new(backend::discord_voice::VoiceState::new()),
-        voice_prefs: Arc::new(backend::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
-        dcc_prefs: Arc::new(backend::irc_dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
+        voice: Arc::new(backend::discord::voice::VoiceState::new()),
+        voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
+        dcc_prefs: Arc::new(backend::irc::dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
         highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
         ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };
@@ -312,7 +312,7 @@ async fn run() -> Result<()> {
 
     // What was going on last time, before anything is served: a window that
     // connects immediately should see the same list it was looking at.
-    backend::irc_dcc::restore_transfers(&state);
+    backend::irc::dcc::restore_transfers(&state);
 
     tokio::spawn(run_housekeeping(state.clone()));
 

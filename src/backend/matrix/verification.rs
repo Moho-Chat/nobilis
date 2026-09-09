@@ -533,9 +533,9 @@ mod tests {
             runtime: Arc::new(crate::runtime::Runtime::new()),
             tor: Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            voice: Arc::new(crate::backend::discord_voice::VoiceState::new()),
-            voice_prefs: Arc::new(crate::backend::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
-            dcc_prefs: Arc::new(crate::backend::irc_dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            voice: Arc::new(crate::backend::discord::voice::VoiceState::new()),
+            voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
+            dcc_prefs: Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
             highlights: Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };

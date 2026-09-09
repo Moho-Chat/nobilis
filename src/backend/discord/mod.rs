@@ -16,6 +16,12 @@
 //! technically alive, no dispatches ever arriving again, no error to
 //! surface) often enough in a long-running session that a human had to
 //! notice and manually reconnect every time - not viable long-term.
+//!
+//! The `voice` module beside this one is the other half of the same
+//! connection rather than a service of its own: this gateway negotiates a
+//! voice session and hands it over.
+pub mod voice;
+
 use crate::accounts::DiscordAccountConfig;
 use crate::model::{self, Attachment, Embed, Reaction, ReplyPreview};
 use crate::runtime::ConnState;
@@ -5326,7 +5332,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                                     "sessionId": d["session_id"].as_str()
                                 }),
                             );
-                            super::discord_voice::note_voice_state(
+                            voice::note_voice_state(
                                 state,
                                 &account_id,
                                 d["guild_id"].as_str(),
@@ -5387,7 +5393,7 @@ async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &
                                 "hasToken": d["token"].as_str().is_some()
                             }),
                         );
-                        super::discord_voice::note_voice_server(
+                        voice::note_voice_server(
                             state,
                             &account_id,
                             d["guild_id"].as_str(),
@@ -6743,7 +6749,7 @@ pub fn join_voice(
     account_id: &str,
     guild_id: Option<&str>,
     channel_id: &str,
-    options: super::discord_voice::VoiceOptions,
+    options: voice::VoiceOptions,
 ) -> Result<()> {
     let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
     let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
@@ -6870,7 +6876,7 @@ pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringi
 /// in the channel waiting, and ringing them back would make their client
 /// chime at a call they started.
 pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let options = super::discord_voice::VoiceOptions { solo: false, transmit: true };
+    let options = voice::VoiceOptions { solo: false, transmit: true };
     join_voice(state, account_id, None, channel_id, options)?;
     // Answered, so it is no longer ringing - said here rather than waiting for
     // Discord to say it, since the person who pressed the button should not
@@ -6902,7 +6908,7 @@ pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) 
 pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     // Never solo-only: a call whose whole purpose is somebody else joining
     // cannot also refuse to be joined.
-    let options = super::discord_voice::VoiceOptions { solo: false, transmit: true };
+    let options = voice::VoiceOptions { solo: false, transmit: true };
     join_voice(state, account_id, None, channel_id, options)?;
     ring(state, account_id, channel_id).await
 }
