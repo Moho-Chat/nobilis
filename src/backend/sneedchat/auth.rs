@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use hyper::Method;
 
 use super::form;
+use super::captcha;
 use super::http::{CookieJar, HttpClient, Response};
 use super::pow;
 use super::totp;
@@ -122,17 +123,48 @@ impl Session {
     /// Drop the session cookie and obtain a new one, logging in again if the
     /// refreshed session comes back unauthenticated (the login itself
     /// expired, not just the session cookie).
+    ///
+    /// The old cookie is kept until a better one exists. Dropping it is the
+    /// whole point - a chat connection downgraded to a guest is repaired by
+    /// minting a fresh session from the remember-me cookie, and the forum
+    /// page can say "signed in" while the chat disagrees - but dropping it
+    /// with nothing to put back is how a working account becomes a locked-out
+    /// one: the fallback is the login form, and a login form can be refused
+    /// for reasons that have nothing to do with this account. So a failed
+    /// re-login leaves the session exactly as good as it was, and the next
+    /// attempt starts from there rather than from nothing.
     pub async fn refresh(&self, creds: &Credentials, two_factor: &TwoFactor) -> Result<()> {
+        let previous = self.http.jar.get(SESSION_COOKIE);
+        let put_back = || {
+            if let Some(value) = &previous {
+                self.http.jar.set(SESSION_COOKIE, value);
+            }
+        };
+
         self.http.jar.remove(SESSION_COOKIE);
-        let resp = self.fetch(&self.base).await?;
+        let resp = match self.fetch(&self.base).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                put_back();
+                return Err(e);
+            }
+        };
         if !(200..400).contains(&resp.status) {
+            put_back();
             bail!("session refresh got HTTP {}", resp.status);
         }
-        if !logged_in_marker(&resp.body) {
-            tracing::info!("refreshed session is not authenticated; logging in again");
-            self.log_in(creds, two_factor).await?;
+        if logged_in_marker(&resp.body) {
+            return Ok(());
         }
-        Ok(())
+
+        tracing::info!("refreshed session is not authenticated; logging in again");
+        match self.log_in(creds, two_factor).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                put_back();
+                Err(e)
+            }
+        }
     }
 
     /// `Cookie` header for the websocket handshake.
@@ -165,6 +197,7 @@ impl Session {
         // "Stay logged in" - without it the session is short and nobilis
         // would be logging in again constantly.
         form::set(&mut fields, "remember", "1");
+        self.answer_captcha(&page.body, &mut fields).await?;
 
         tokio::time::sleep(FORM_DWELL).await;
 
@@ -185,7 +218,8 @@ impl Session {
         tracing::info!("two-factor challenge, provider {provider}");
 
         let code = two_factor.code(&provider).context("obtaining the two-factor code")?;
-        let fields = two_step_fields(&page.body, &code)?;
+        let mut fields = two_step_fields(&page.body, &code)?;
+        self.answer_captcha(&page.body, &mut fields).await?;
 
         let resp = self.post(&format!("{}/login/two-step", self.base), &fields).await?;
         match outcome(&resp)? {
@@ -193,6 +227,23 @@ impl Session {
             Outcome::TwoFactor(_) => bail!("two-factor step failed: the code was not accepted"),
             Outcome::Rejected(why) => bail!("two-factor step failed: {why}"),
         }
+    }
+
+    /// Fills in the captcha's answer, where the page asks for one.
+    ///
+    /// The field is added rather than filled: the widget's own hidden input is
+    /// created by its JavaScript when it solves, so it is not in the HTML this
+    /// reads and there is nothing here to overwrite. A page with no widget on
+    /// it needs nothing, which is every form on the site bar this one.
+    async fn answer_captcha(&self, page: &str, fields: &mut Vec<(String, String)>) -> Result<()> {
+        let Some(key) = captcha::site_key(page) else {
+            return Ok(());
+        };
+        let token = captcha::solve(&self.http, &self.base, &key)
+            .await
+            .context("answering the sign-in captcha")?;
+        form::set(fields, captcha::TOKEN_FIELD, token);
+        Ok(())
     }
 
     /// Verify the session really is authenticated rather than trusting a

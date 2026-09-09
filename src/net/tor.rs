@@ -53,7 +53,44 @@ pub struct TorManager {
     client: tokio::sync::RwLock<Option<Result<Arc<TorClient<PreferredRuntime>>, String>>>,
     cache_dir: std::path::PathBuf,
     state_dir: std::path::PathBuf,
+    /// How many connection attempts in a row have failed inside Tor, and when
+    /// this last resorted to throwing the directories away. See `stumbled`.
+    trouble: tokio::sync::Mutex<Trouble>,
 }
+
+#[derive(Default)]
+struct Trouble {
+    in_a_row: u32,
+    last_wipe: Option<std::time::Instant>,
+}
+
+/// What a run of failures was met with, for the line a person reads.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Recovery {
+    /// Not enough failures yet to call it anything but the network.
+    Waited,
+    /// The client was thrown away; the next attempt bootstraps a new one.
+    NewClient,
+    /// And so were the directories it remembers the network with.
+    FromScratch,
+}
+
+/// Failures before the client is rebuilt, and before its directories go too.
+///
+/// Both are deliberately small. The failure this exists for is instant - a
+/// second per attempt, not a timeout - so three of them is a few seconds of
+/// evidence, and the escalation costs a bootstrap rather than anything a
+/// person notices.
+const STUMBLES_BEFORE_NEW_CLIENT: u32 = 3;
+const STUMBLES_BEFORE_FROM_SCRATCH: u32 = 6;
+/// How long to leave the directories alone after wiping them once.
+///
+/// Wiping means a cold bootstrap and, more to the point, a new set of guard
+/// relays - the small fixed set of first hops that a Tor client deliberately
+/// keeps in order to be harder to watch. Rotating those on a schedule the
+/// network could provoke is not something to do every minute; if the site is
+/// simply unreachable, waiting is the honest answer.
+const WIPE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(900);
 
 impl TorManager {
     pub fn new(data_dir: &std::path::Path) -> Self {
@@ -61,6 +98,7 @@ impl TorManager {
             client: tokio::sync::RwLock::new(None),
             cache_dir: data_dir.join("tor-cache"),
             state_dir: data_dir.join("tor-state"),
+            trouble: tokio::sync::Mutex::new(Trouble::default()),
         }
     }
 
@@ -105,6 +143,70 @@ impl TorManager {
     pub async fn restart(&self) {
         *self.client.write().await = None;
     }
+
+    /// A connection through Tor worked. Forgets the failures before it.
+    pub async fn note_success(&self) {
+        self.trouble.lock().await.in_a_row = 0;
+    }
+
+    /// A connection failed inside Tor, and this decides what to do about it.
+    ///
+    /// The reason this exists: a client whose hidden-service lookups have gone
+    /// bad fails in about a second, and fails that way every time. A retry
+    /// loop cannot tell that from a site being down, so it backs off to a
+    /// minute and settles there - and stays there, because nothing in the loop
+    /// can repair Tor. Observed on a real account: hours of a one-second
+    /// failure repeating, with a working session sitting unused behind it, and
+    /// the only way out a settings button nobody knew to press.
+    ///
+    /// So the loop is given a way out. First the client, which costs a
+    /// bootstrap; then the directories, which costs a cold one. Both are what
+    /// that settings button does, arrived at by the daemon noticing rather
+    /// than by a person guessing - and measured on that same account, it was
+    /// the second that fixed it.
+    pub async fn stumbled(&self) -> Recovery {
+        let mut trouble = self.trouble.lock().await;
+        trouble.in_a_row += 1;
+        let can_wipe = trouble.last_wipe.is_none_or(|at| at.elapsed() > WIPE_COOLDOWN);
+
+        if trouble.in_a_row >= STUMBLES_BEFORE_FROM_SCRATCH && can_wipe {
+            trouble.in_a_row = 0;
+            trouble.last_wipe = Some(std::time::Instant::now());
+            // Order matters: the client is holding these open, so it goes
+            // first. A directory that will not delete is not fatal - the
+            // fresh client is still worth having, and saying so beats
+            // failing the recovery over a file.
+            self.restart().await;
+            for dir in [&self.cache_dir, &self.state_dir] {
+                if dir.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(dir) {
+                        tracing::warn!("could not clear {}: {e}", dir.display());
+                    }
+                }
+            }
+            tracing::warn!("Tor has failed {STUMBLES_BEFORE_FROM_SCRATCH} times running; starting it from scratch");
+            return Recovery::FromScratch;
+        }
+
+        if trouble.in_a_row == STUMBLES_BEFORE_NEW_CLIENT {
+            self.restart().await;
+            tracing::warn!("Tor has failed {STUMBLES_BEFORE_NEW_CLIENT} times running; rebuilding the client");
+            return Recovery::NewClient;
+        }
+
+        Recovery::Waited
+    }
+}
+
+/// Whether a failure was Tor's own rather than the thing on the other end.
+///
+/// Asked of the whole chain rather than the message: everything the embedded
+/// client reports arrives as an `arti_client::Error` somewhere under whatever
+/// context the caller added, and a connection made through a SOCKS proxy or
+/// straight out has nothing of the sort in it - which is exactly the
+/// distinction, since throwing away Arti's directories helps only the first.
+pub fn is_tor_failure(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.downcast_ref::<arti_client::Error>().is_some())
 }
 
 async fn bootstrap(cache_dir: &std::path::Path, state_dir: &std::path::Path) -> Result<Arc<TorClient<PreferredRuntime>>> {
@@ -189,6 +291,45 @@ mod tests {
     use super::*;
 
     /// Phase-1 go/no-go spike for the Sneedchat plan: does embedded Tor
+    /// The escalation ladder, without a network in sight.
+    ///
+    /// What matters here is that it escalates at all and then stops: a
+    /// recovery that fired on every failure would rotate the guard set
+    /// whenever the site went down, and one that fired once and never again
+    /// would leave the client stuck exactly the way this exists to prevent.
+    #[tokio::test]
+    async fn trouble_escalates_and_then_holds_off() {
+        let dir = std::env::temp_dir().join(format!("nobilis-tor-ladder-{}", std::process::id()));
+        let manager = TorManager::new(&dir);
+
+        // A couple of failures is the network's business, not ours.
+        assert_eq!(manager.stumbled().await, Recovery::Waited);
+        assert_eq!(manager.stumbled().await, Recovery::Waited);
+        // The third says the client itself is suspect.
+        assert_eq!(manager.stumbled().await, Recovery::NewClient);
+        for _ in 0..2 {
+            assert_eq!(manager.stumbled().await, Recovery::Waited);
+        }
+        // And the sixth stops believing its directories.
+        assert_eq!(manager.stumbled().await, Recovery::FromScratch);
+
+        // Having just wiped, it will not wipe again on the next run of
+        // failures - it climbs to the client and stays there.
+        for _ in 0..2 {
+            assert_eq!(manager.stumbled().await, Recovery::Waited);
+        }
+        assert_eq!(manager.stumbled().await, Recovery::NewClient);
+        for _ in 0..2 {
+            assert_eq!(manager.stumbled().await, Recovery::Waited);
+        }
+        assert_eq!(manager.stumbled().await, Recovery::Waited, "wiped twice inside the cooldown");
+
+        // A connection that works clears the slate behind it.
+        manager.note_success().await;
+        assert_eq!(manager.stumbled().await, Recovery::Waited);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// actually bootstrap and reach the real hidden service from *this*
     /// environment? Bootstrap needs to reach Tor directory authorities and
     /// relays on arbitrary ports - a sandboxed network egress policy could

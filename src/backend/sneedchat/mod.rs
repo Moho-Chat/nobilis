@@ -14,6 +14,7 @@
 //! backend::discord::run_gateway_with_retry's shape.
 
 pub mod auth;
+pub mod captcha;
 pub mod form;
 pub mod http;
 pub mod pow;
@@ -74,19 +75,40 @@ async fn run_with_retry(state: &AppState, config: &SneedChatAccountConfig, accou
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         let result = std::panic::AssertUnwindSafe(run(state, config, account_id)).catch_unwind().await;
-        let detail = match result {
-            Ok(Ok(())) => "connection ended".to_string(),
+        let (mut detail, inside_tor) = match result {
+            Ok(Ok(())) => ("connection ended".to_string(), false),
             Ok(Err(e)) => {
                 tracing::warn!("sneedchat[{account_id}]: {e:#}");
-                format!("{e:#}")
+                (format!("{e:#}"), crate::net::tor::is_tor_failure(&e))
             }
             Err(_) => {
                 tracing::error!("sneedchat[{account_id}]: connection task panicked");
-                "internal error (see nobilis logs)".to_string()
+                ("internal error (see nobilis logs)".to_string(), false)
             }
         };
         state.runtime.clear_sneedchat_senders(account_id);
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+
+        // A failure inside Tor is one this loop can do something about, and a
+        // run of them is one it must: retrying the same broken client is what
+        // turns a bad hour into a bad week. What it decides to do is the Tor
+        // manager's business - see `stumbled` - but the loop stops waiting a
+        // minute afterwards, because whatever just happened is a new thing to
+        // try rather than another go at the old one.
+        if inside_tor {
+            match state.tor.stumbled().await {
+                crate::net::tor::Recovery::Waited => {}
+                crate::net::tor::Recovery::NewClient => {
+                    detail.push_str(" - restarting Tor");
+                    delay = RECONNECT_INITIAL_DELAY;
+                }
+                crate::net::tor::Recovery::FromScratch => {
+                    detail.push_str(" - restarting Tor from scratch");
+                    delay = RECONNECT_INITIAL_DELAY;
+                }
+            }
+        }
+
         state.runtime.report_progress(state, account_id, &format!("{detail} - reconnecting in {}s...", delay.as_secs()));
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(RECONNECT_MAX_DELAY);
@@ -151,9 +173,14 @@ fn remember_session(state: &AppState, account_id: &str, session: &Session) {
 /// properly") reads like something the person did wrong.
 fn no_way_in(e: anyhow::Error) -> anyhow::Error {
     let text = format!("{e:#}");
+    // The captcha on the sign-in form is answered rather than surrendered to
+    // (see captcha.rs), so this is no longer "moho cannot do this" - it is
+    // one attempt that did not work. Which still needs saying in a sentence
+    // that names the way out, because the way out is the same one.
     if text.to_lowercase().contains("captcha") {
-        return anyhow!(
-            "the forum now asks for a CAPTCHA when signing in, which moho cannot answer -              use \"Sign in with a browser\" in Accounts to complete it yourself"
+        return anyhow::anyhow!(
+            "could not get past the sign-in captcha ({text}) - if this keeps happening, \
+             use \"Sign in with a browser\" in Accounts to complete it yourself"
         );
     }
     e
@@ -424,6 +451,10 @@ async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str
     state.runtime.report_progress(state, account_id, "logging in...");
     restore_session(&session, config);
     session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
+    // Reaching the site at all is what this records: whatever Tor was doing
+    // before, it is working now, and the count of failures behind it is no
+    // longer evidence of anything.
+    state.tor.note_success().await;
     remember_session(state, account_id, &session);
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
@@ -1975,6 +2006,176 @@ mod live_probe {
             let lower = line.to_lowercase();
             if lower.contains("room") || lower.contains("chat.ws") || lower.contains("channel") {
                 println!("{i}: {}", line.trim().chars().take(400).collect::<String>());
+            }
+        }
+    }
+
+    /// Whether the session this account already holds is still good.
+    ///
+    /// The login form is a fallback: cookies captured earlier are restored
+    /// into the jar and the site is asked who it thinks we are, and only a
+    /// "nobody" sends this anywhere near a password. So when logging in
+    /// starts failing, the question before "why can we not log in" is "why
+    /// are we logging in at all" - which is this. Pass the cookies the way
+    /// the account stores them:
+    ///   SNEEDCHAT_COOKIES='xf_user=…; xf_session=…' \
+    ///     cargo test --release -- --ignored --nocapture sneedchat_session_probe
+    #[tokio::test]
+    #[ignore]
+    async fn sneedchat_session_probe() {
+        let Ok(cookies) = std::env::var("SNEEDCHAT_COOKIES") else {
+            println!("SNEEDCHAT_COOKIES not set, skipping");
+            return;
+        };
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join("nobilis-tor-spike");
+        let manager = TorManager::new(&dir);
+        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
+
+        let jar = CookieJar::new();
+        for pair in cookies.split(';') {
+            let Some((name, value)) = pair.trim().split_once('=') else { continue };
+            println!("restoring cookie {name} ({} chars)", value.len());
+            jar.set(name.trim(), value.trim());
+        }
+
+        let base = format!("https://{}", super::DEFAULT_ONION);
+        let session = Session::new(Transport::Tor(client), base, super::DEFAULT_USER_AGENT.to_string());
+        session.http.jar.restore(jar.snapshot());
+
+        match session.is_authenticated().await {
+            Ok(true) => println!("SESSION IS STILL GOOD - the site says we are logged in, user id {:?}", session.user_id()),
+            Ok(false) => println!("SESSION IS DEAD - the site does not know us, which is why a login is attempted"),
+            Err(e) => println!("could not tell: {e:#}"),
+        }
+    }
+
+    /// What the login page's captcha demands, and whether it can be answered
+    /// without a browser.
+    ///
+    /// The login form carries a Tartarus (`.ttrs`) captcha whose widget is a
+    /// SHA-256 proof of work in several rounds - the same shape as the gate in
+    /// `pow.rs`, and answerable the same way, *unless* the server asks for a
+    /// Monocle browser assessment instead, which nothing headless can produce.
+    /// This asks it and prints the answer. Not run by default:
+    ///   cargo test --release -- --ignored --nocapture sneedchat_captcha_probe
+    #[tokio::test]
+    #[ignore]
+    async fn sneedchat_captcha_probe() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join("nobilis-tor-spike");
+        let manager = TorManager::new(&dir);
+        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
+        let http = HttpClient::new(Transport::Tor(client), CookieJar::new(), super::DEFAULT_USER_AGENT.to_string());
+        let base = format!("https://{}", super::DEFAULT_ONION);
+
+        // The login page first, both for the site key and for the clearance
+        // cookie the gate hands out - the captcha lives behind the same gate.
+        let login = format!("{base}/login/");
+        let mut page = http.get(&login).await.expect("GET /login/ failed");
+        if page.status == pow::GATE_STATUS {
+            pow::clear(&http, &login, 8).await.expect("failed to clear the gate");
+            page = http.get(&login).await.expect("GET after clearing gate failed");
+        }
+        let sitekey = page
+            .body
+            .split("data-sitekey=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("no data-sitekey on the login page")
+            .to_string();
+        println!("sitekey: {sitekey}");
+
+        // The widget opens with a GET of `<apiBase>/start?key=...`; every
+        // later step is a POST to /verify with the nonce it found.
+        let url = format!("{base}/.ttrs/captcha/start?key={sitekey}");
+        match http.get(&url).await {
+            Ok(resp) => println!("GET /.ttrs/captcha/start -> HTTP {}\n{}", resp.status, resp.body.chars().take(1500).collect::<String>()),
+            Err(e) => println!("GET /.ttrs/captcha/start -> {e:#}"),
+        }
+    }
+
+    /// Anything the site serves, through Tor, printed.
+    ///
+    /// A diagnosis tool rather than a check: when the site changes something,
+    /// the question is usually "what does it actually send now", and reaching
+    /// a `.onion` from a shell is not something this machine can otherwise
+    /// do. Give it a path:
+    ///   SNEEDCHAT_PATH=/login/ cargo test --release -- --ignored --nocapture sneedchat_fetch_probe
+    #[tokio::test]
+    #[ignore]
+    async fn sneedchat_fetch_probe() {
+        let Ok(path) = std::env::var("SNEEDCHAT_PATH") else {
+            println!("SNEEDCHAT_PATH not set, skipping");
+            return;
+        };
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join("nobilis-tor-spike");
+        let manager = TorManager::new(&dir);
+        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
+
+        let http = HttpClient::new(Transport::Tor(client), CookieJar::new(), super::DEFAULT_USER_AGENT.to_string());
+        let url = format!("https://{}{}", super::DEFAULT_ONION, path);
+        let mut resp = http.get(&url).await.expect("GET failed");
+        if resp.status == pow::GATE_STATUS {
+            pow::clear(&http, &url, 8).await.expect("failed to clear the gate");
+            resp = http.get(&url).await.expect("GET after clearing gate failed");
+        }
+        println!("HTTP {} body {} bytes", resp.status, resp.body.len());
+        println!("{}", resp.body);
+    }
+
+    /// What the login form actually asks for.
+    ///
+    /// The login is posted by echoing the form's own fields back with the
+    /// username and password filled in, so a field the site adds is a field
+    /// this client sends empty. When a login starts being refused for a
+    /// reason that is not the password, this is the thing to look at first -
+    /// it prints every input on the form and every captcha provider named
+    /// anywhere on the page. Not run by default:
+    ///   cargo test --release -- --ignored --nocapture sneedchat_login_form_probe
+    #[tokio::test]
+    #[ignore]
+    async fn sneedchat_login_form_probe() {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join("nobilis-tor-spike");
+        let manager = TorManager::new(&dir);
+        let client = manager.get_or_bootstrap(|msg| println!("progress: {msg}")).await.expect("Tor bootstrap failed");
+
+        let http = HttpClient::new(Transport::Tor(client), CookieJar::new(), super::DEFAULT_USER_AGENT.to_string());
+        let url = format!("https://{}/login/", super::DEFAULT_ONION);
+        let mut resp = http.get(&url).await.expect("GET /login/ failed");
+        if resp.status == pow::GATE_STATUS {
+            pow::clear(&http, &url, 8).await.expect("failed to clear the gate");
+            resp = http.get(&url).await.expect("GET after clearing gate failed");
+        }
+        println!("HTTP {} body {} bytes", resp.status, resp.body.len());
+
+        match super::form::form_section(&resp.body, "/login/login") {
+            Some(section) => {
+                println!("--- fields the form carries ---");
+                for (name, value) in super::form::inputs(section) {
+                    let shown = if value.len() > 24 { format!("{}… ({} chars)", &value[..24], value.len()) } else { value };
+                    println!("  {name} = {shown:?}");
+                }
+            }
+            None => println!("!! no /login/login form section found - the layout has changed"),
+        }
+
+        println!("--- captcha markers anywhere on the page ---");
+        for marker in [
+            "recaptcha", "hcaptcha", "turnstile", "captcha_question", "captcha",
+            "data-sitekey", "cf-challenge", "friendly-challenge",
+        ] {
+            let hits = resp.body.to_lowercase().matches(marker).count();
+            if hits > 0 {
+                println!("  {marker}: {hits}");
+            }
+        }
+        for line in resp.body.lines() {
+            let lower = line.to_lowercase();
+            if lower.contains("captcha") || lower.contains("sitekey") || lower.contains("turnstile") {
+                println!("  > {}", line.trim().chars().take(300).collect::<String>());
             }
         }
     }
