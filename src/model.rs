@@ -522,6 +522,43 @@ pub enum MemberRank {
 ///
 /// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
 /// except IRC, whose ids are "nick@host" and predate the convention. That
+
+/// Whether this kind of line is the room reporting itself rather than
+/// somebody speaking.
+///
+/// Somebody arrived, somebody left, the topic changed, a nick changed. Nobody
+/// typed these and nobody can be addressed in one - which matters because
+/// they are written *about* people and therefore contain their names. A quit
+/// line says "Salastil has quit", and a client looking for your name in every
+/// line will find it there.
+///
+/// Found the hard way: closing the client sends a QUIT, the server reports it
+/// back in every channel, and every one of those became a notification and an
+/// entry in the mentions inbox - a farewell from yourself, once per channel,
+/// every time you shut the thing down.
+///
+/// A list of what to exclude rather than of what to include, deliberately:
+/// the kinds that are neither speech nor membership - a subscription, a raid,
+/// a moderator's action - are somebody doing something to somebody, and
+/// whether those should carry a mention is a separate question from this one.
+/// Left as they were.
+pub fn is_room_event(kind: &str) -> bool {
+    matches!(
+        kind,
+        "join"
+            | "part"
+            | "quit"
+            | "nick"
+            | "mode"
+            | "topic"
+            | "system"
+            | "matrixJoin"
+            | "matrixInvite"
+            | "matrixKick"
+            | "matrixQuit"
+    )
+}
+
 /// exception is why this exists rather than each caller splitting on a colon.
 pub fn service_of(account_id: &str) -> &'static str {
     match account_id.split_once(':').map(|(prefix, _)| prefix) {

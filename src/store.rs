@@ -141,6 +141,19 @@ impl Store {
             let _ = conn.execute(stmt, []);
         }
 
+        // Every arrival and departure that happened to contain your name was
+        // recorded as a mention of you - see model::is_room_event for how, and
+        // for the shutdown that made it obvious. New ones no longer are; these
+        // are the ones already written down, and they are the difference
+        // between a mentions inbox and a list of everyone who has ever walked
+        // past you. Measured on the store that reported this: 486 of them
+        // against 48 real mentions.
+        let _ = conn.execute(
+            "UPDATE messages SET is_highlight = 0 WHERE is_highlight = 1 AND kind IN \
+             ('join','part','quit','nick','mode','topic','system','matrixJoin','matrixInvite','matrixKick','matrixQuit')",
+            [],
+        );
+
         // Sneedchat's account ids used to be spelled "sockchat:", after the
         // implementation this backend was written by studying rather than
         // after the chat itself. Buffer ids are built from the account id, so

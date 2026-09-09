@@ -3327,19 +3327,23 @@ impl Runtime {
         // a Discord mention (the body still has `<@id>` tokens, not the
         // account's nick, by the time this runs). IRC has no such
         // structured signal, so it always relies on the substring check.
+        // The room reporting itself is not somebody addressing you, however
+        // much of your name is in it - see model::is_room_event.
+        let spoken = !model::is_room_event(kind);
         let is_highlight = force_highlight
-            || (!own_nick.is_empty()
+            || (spoken
+                && !own_nick.is_empty()
                 && from != own_nick
                 && body.to_lowercase().contains(&own_nick.to_lowercase()))
             // Being addressed with everybody else still counts as being
             // addressed. Only where the service acts on the word: "@everyone"
             // on IRC is somebody typing a phrase, and highlighting it would be
             // this client inventing a mention the network does not have.
-            || (from != own_nick && mentions_the_room(model::service_of(account_id), body))
+            || (spoken && from != own_nick && mentions_the_room(model::service_of(account_id), body))
             // And the words somebody asked to be told about, which is the
             // same question asked about a different list - your name is
             // simply the one word everybody has.
-            || (from != own_nick && matches_keyword(body, &state.highlights.for_account(account_id)));
+            || (spoken && from != own_nick && matches_keyword(body, &state.highlights.for_account(account_id)));
         let is_own = !own_nick.is_empty() && from == own_nick;
         // Everything above this line reads the real nick, and everything
         // below it reads what you asked to be called. The order is the whole
@@ -3436,7 +3440,7 @@ impl Runtime {
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
-        if from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
+        if spoken && from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
             && !self.is_silenced(&buffer.id)
         {
             state.events.emit(
@@ -3571,6 +3575,63 @@ mod tests {
         assert_eq!(map.get(&19), Some(&19));
     }
     use super::*;
+
+    /// Closing the client used to say goodbye to you, once per channel.
+    ///
+    /// A quit line is written *about* whoever left, so it contains their name -
+    /// and the check for "does this mention me" is a substring search for your
+    /// nick. Shutting down sends a QUIT, the server reports it back in every
+    /// channel you were in, and every one of those arrived as a notification
+    /// and an entry in the mentions inbox.
+    #[test]
+    fn a_room_event_that_names_you_is_not_a_mention() {
+        let dir = std::env::temp_dir().join(format!("nobilis-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let state = AppState {
+            store: std::sync::Arc::new(crate::store::Store::open(&dir.join("scrollback.db")).expect("store")),
+            accounts: std::sync::Arc::new(crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts")),
+            events: crate::events::EventBus::new(),
+            runtime: std::sync::Arc::new(Runtime::new()),
+            tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&dir)),
+            shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
+            voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
+            dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
+            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
+        };
+        let account = "irc:tester";
+        state.runtime.set_own_identity(account, "Salastil");
+
+        let say = |from: &str, body: &str, kind: &str| {
+            state.runtime.record_message(
+                &state, account, "#room", "channel", from, body, false, kind,
+                None, None, false, None, Vec::new(), Vec::new(), None,
+            );
+        };
+        // Exactly as backend/irc/incoming.rs writes them: the room speaking
+        // about somebody, under a placeholder sender.
+        say("*", "Salastil has quit (Client closed the connection)", "part");
+        say("*", "Salastil entered the room", "join");
+        // And somebody actually talking to you.
+        say("stranger", "Salastil: are you about?", "chat");
+
+        let rows = state
+            .store
+            .get_backlog(&crate::model::buffer_id(account, "#room"), 0, 10)
+            .expect("backlog");
+        let flagged: Vec<(&str, bool)> = rows.iter().map(|m| (m.body.as_str(), m.is_highlight)).collect();
+        assert_eq!(
+            flagged,
+            vec![
+                ("Salastil has quit (Client closed the connection)", false),
+                ("Salastil entered the room", false),
+                ("Salastil: are you about?", true),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Two accounts can be in the same room, and each has its own buffer for
     /// it. An unscoped answer let one account's space registration delete the
