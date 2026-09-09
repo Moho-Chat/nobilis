@@ -201,3 +201,27 @@ pub const SMILIES: &[Smilie] = &[
     Smilie { label: "Juice!", file: "styles_custom_emotes_bmj_juicy.gif", aliases: &[":juice:"] },
     Smilie { label: "Ross, the Destroyer of Juice", file: "styles_custom_emotes_bmj_ross_hq.png", aliases: &[":ross:"] },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn smilie_bundled_files_are_unique_across_the_table() {
+        use std::collections::HashSet;
+        let names: HashSet<&str> = SMILIES.iter().map(|s| s.file).collect();
+        assert_eq!(names.len(), SMILIES.len(), "two distinct smilies point at the same bundled asset file");
+    }
+
+    // Catches a typo'd filename or a missing/forgotten `git add` for a
+    // bundled asset at test time rather than as a silent broken image the
+    // first time someone actually opens the emoji picker or hits that
+    // shortcode in a live message.
+    #[test]
+    fn smilie_bundled_files_all_exist_on_disk() {
+        let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/sneedchat-smilies");
+        for s in SMILIES {
+            assert!(assets_dir.join(s.file).is_file(), "missing bundled asset for {:?}: {}", s.label, s.file);
+        }
+    }
+}
