@@ -63,7 +63,9 @@ pub use commands::*;
 pub use gateway::*;
 pub use guilds::*;
 pub use history::*;
-pub use http::*;
+// Not `pub use`: nothing in `http` is for outside this folder. The plain
+// import is what puts it in reach of the files beside it.
+use http::*;
 pub use login::*;
 pub use media::*;
 pub use messages::*;

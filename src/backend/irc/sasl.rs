@@ -20,6 +20,7 @@
 //! RFC 4231's vectors; PBKDF2 on top of it is a loop, checked against
 //! RFC 7677's.
 
+use super::*;
 use anyhow::{anyhow, bail, Result};
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -298,5 +299,275 @@ mod tests {
         assert_ne!(a, b);
         assert!(!a.contains(','), "a comma would end the field early");
         assert_eq!(a.len(), 24);
+    }
+}
+
+/// Registers with SASL, saying whether the account actually authenticated.
+///
+/// `false` means the server does not offer SASL and registration finished the
+/// ordinary way instead. It is not a failure: plenty of small networks have
+/// never implemented it, and refusing to connect to one because a checkbox was
+/// ticked would be worse than connecting the way every other client does. The
+/// caller uses the answer to decide whether NickServ still has a job to do.
+///
+/// A server that *does* offer SASL and then rejects the credentials is a real
+/// error and stays one. That is a wrong password, and quietly carrying on
+/// unauthenticated is how somebody ends up sitting in a channel under an
+/// unregistered nick believing they are identified.
+pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<bool> {
+    // SASL PLAIN is the password with base64 wrapped round it - an encoding,
+    // not a cipher. On a cleartext link it is the password in the clear to
+    // anything on the path, which is worse than NickServ only in that the
+    // person doing it believes "SASL" means it is protected.
+    if !sasl_transport_ok(config.ssl, config.allow_plaintext_sasl) {
+        bail!(
+            "refusing to send SASL credentials over an unencrypted connection to {} - \
+             turn on TLS, or allow plaintext SASL for this account if the network really has no TLS port",
+            config.host
+        );
+    }
+
+    state.runtime.report_progress(state, account_id, "Requesting SASL capability...");
+    sender.send_cap_req(&[Capability::Sasl])?;
+    // NAK and the timeout mean the same thing here - this server has no SASL -
+    // and both are answered by registering normally. Watching for NAK as well
+    // as ACK is what turns the common case from a 20-second stall into an
+    // immediate answer.
+    let offered = wait_for(stream, |m| {
+        matches!(
+            &m.command,
+            Command::CAP(_, CapSubCommand::ACK, _, _) | Command::CAP(_, CapSubCommand::NAK, _, _)
+        )
+    })
+    .await
+    .ok()
+    .is_some_and(|m| matches!(&m.command, Command::CAP(_, CapSubCommand::ACK, _, _)));
+
+    if !offered {
+        state.runtime.report_progress(state, account_id, "Server has no SASL; registering normally...");
+        end_cap_and_register(sender, config)?;
+        return Ok(false);
+    }
+
+    // Strongest first. A server that will not take the one we chose says so
+    // with 908 and lists what it does take, so the fallback is the server's
+    // own answer rather than a guess made here.
+    let mut tried: Vec<SaslMechanism> = Vec::new();
+    let mut next = Some(preferred_mechanism(config));
+    while let Some(mechanism) = next {
+        tried.push(mechanism);
+        match attempt_sasl(state, account_id, sender, stream, config, mechanism).await {
+            Ok(()) => {
+                end_cap_and_register(sender, config)?;
+                return Ok(true);
+            }
+            Err(SaslRefusal::Fatal(e)) => return Err(e),
+            Err(SaslRefusal::TryAnother(offered)) => {
+                // Only what the server named, only what we can actually do,
+                // and never one already tried - or a server that keeps
+                // offering the same mechanism would loop forever.
+                next = offered
+                    .iter()
+                    .filter_map(|name| SaslMechanism::parse(name))
+                    .find(|m| !tried.contains(m));
+                if next.is_none() {
+                    bail!(
+                        "SASL authentication failed - the server accepts {}, and this account is set up for {}",
+                        if offered.is_empty() { "nothing this client speaks".to_string() } else { offered.join(", ") },
+                        tried.iter().map(|m| m.name()).collect::<Vec<_>>().join(", ")
+                    );
+                }
+                state.runtime.report_progress(
+                    state,
+                    account_id,
+                    &format!("Server refused {}; trying {}...", tried.last().unwrap().name(), next.unwrap().name()),
+                );
+            }
+        }
+    }
+    bail!("SASL authentication failed - check the SASL username and password for this account")
+}
+
+/// Which mechanism this account should lead with.
+///
+/// A certificate is a deliberate act, so its presence is taken as meaning it:
+/// somebody who went and configured one wants EXTERNAL, and falling back to
+/// sending the password would defeat the point of having set it up.
+///
+/// Otherwise PLAIN, which is not the strongest and is the right default
+/// anyway. SCRAM-SHA-256 is barely deployed on IRC - Ergo has it; Libera,
+/// Rizon and most of the rest offer PLAIN and EXTERNAL and nothing else - and
+/// the spec only *recommends* that a server answer an unknown mechanism with
+/// the list of ones it has. Leading with SCRAM would therefore break SASL
+/// outright on the networks people actually use, on servers that decline to
+/// say why. So SCRAM is there for whoever names it, and the 908 fallback picks
+/// it up automatically on servers that do advertise properly.
+pub(super) fn preferred_mechanism(config: &IrcAccountConfig) -> SaslMechanism {
+    if let Some(named) = config.sasl_mechanism.as_deref().and_then(SaslMechanism::parse) {
+        return named;
+    }
+    if config.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        return SaslMechanism::External;
+    }
+    SaslMechanism::Plain
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SaslMechanism {
+    External,
+    ScramSha256,
+    Plain,
+}
+
+impl SaslMechanism {
+    fn name(self) -> &'static str {
+        match self {
+            Self::External => "EXTERNAL",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::Plain => "PLAIN",
+        }
+    }
+
+    pub(super) fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_uppercase().as_str() {
+            "EXTERNAL" => Some(Self::External),
+            "SCRAM-SHA-256" | "SCRAM_SHA_256" | "SCRAM-SHA256" => Some(Self::ScramSha256),
+            "PLAIN" => Some(Self::Plain),
+            _ => None,
+        }
+    }
+}
+
+/// Why one mechanism did not work.
+///
+/// The distinction is the whole point: a refusal that names other mechanisms
+/// is worth answering with one of them, while a wrong password is not - and
+/// retrying PLAIN after SCRAM already established the password is wrong would
+/// send that password in the clear for no reason.
+pub(super) enum SaslRefusal {
+    Fatal(anyhow::Error),
+    TryAnother(Vec<String>),
+}
+
+impl From<anyhow::Error> for SaslRefusal {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+pub(super) async fn attempt_sasl(
+    state: &AppState,
+    account_id: &str,
+    sender: &Sender,
+    stream: &mut ClientStream,
+    config: &IrcAccountConfig,
+    mechanism: SaslMechanism,
+) -> std::result::Result<(), SaslRefusal> {
+    state.runtime.report_progress(state, account_id, &format!("Starting SASL {}...", mechanism.name()));
+    sender.send(Command::AUTHENTICATE(mechanism.name().to_string())).map_err(anyhow::Error::from)?;
+
+    let user = config.sasl_user.clone().unwrap_or_else(|| config.nick.clone());
+    let pass = config.password.clone().unwrap_or_default();
+
+    match mechanism {
+        // Nothing to send but the authorisation identity, and an empty one
+        // means "whoever the certificate says".
+        SaslMechanism::External => {
+            expect_challenge(stream, "+").await?;
+            sender.send_sasl("+").map_err(anyhow::Error::from)?;
+        }
+        SaslMechanism::Plain => {
+            expect_challenge(stream, "+").await?;
+            let payload = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
+            sender.send_sasl(payload).map_err(anyhow::Error::from)?;
+        }
+        SaslMechanism::ScramSha256 => {
+            let mut scram = crate::backend::irc::sasl::Scram::new(&user, &pass, &crate::backend::irc::sasl::nonce());
+            expect_challenge(stream, "+").await?;
+            sender
+                .send_sasl(base64::engine::general_purpose::STANDARD.encode(scram.client_first()))
+                .map_err(anyhow::Error::from)?;
+
+            let server_first = read_challenge(stream).await?;
+            let client_final = scram.client_final(&server_first).map_err(SaslRefusal::Fatal)?;
+            sender
+                .send_sasl(base64::engine::general_purpose::STANDARD.encode(client_final))
+                .map_err(anyhow::Error::from)?;
+
+            let server_final = read_challenge(stream).await?;
+            // Checked before the success numeric is believed: a server that
+            // cannot prove it knew the password is not one to be logged in to,
+            // whatever it says next.
+            scram.verify(&server_final).map_err(SaslRefusal::Fatal)?;
+            sender.send_sasl("+").map_err(anyhow::Error::from)?;
+        }
+    }
+
+    let result = wait_for(stream, |m| {
+        matches!(
+            &m.command,
+            Command::Response(Response::RPL_SASLSUCCESS, _)
+                | Command::Response(Response::ERR_SASLFAIL, _)
+                | Command::Response(Response::ERR_SASLTOOLONG, _)
+                | Command::Response(Response::ERR_SASLABORT, _)
+                | Command::Response(Response::RPL_SASLMECHS, _)
+        )
+    })
+    .await
+    .map_err(|_| SaslRefusal::Fatal(anyhow!("timed out waiting for SASL result")))?;
+
+    match &result.command {
+        Command::Response(Response::RPL_SASLSUCCESS, _) => Ok(()),
+        // The server listing what it does take, which is the one refusal
+        // worth answering with a different mechanism.
+        Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
+            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+        )),
+        _ => Err(SaslRefusal::Fatal(anyhow!(
+            "SASL {} was refused - check the SASL username and password for this account",
+            mechanism.name()
+        ))),
+    }
+}
+
+/// Waits for the server's `AUTHENTICATE` and insists it is what was expected.
+pub(super) async fn expect_challenge(stream: &mut ClientStream, wanted: &str) -> std::result::Result<(), SaslRefusal> {
+    let got = read_challenge(stream).await?;
+    if got != wanted {
+        return Err(SaslRefusal::Fatal(anyhow!("server answered AUTHENTICATE with {got:?} rather than {wanted:?}")));
+    }
+    Ok(())
+}
+
+/// The server's next `AUTHENTICATE` payload, decoded.
+///
+/// A bare `+` means "nothing", and is passed through as itself rather than
+/// decoded - it is not base64 for an empty string, it is the protocol's way of
+/// writing one.
+pub(super) async fn read_challenge(stream: &mut ClientStream) -> std::result::Result<String, SaslRefusal> {
+    let message = wait_for(stream, |m| {
+        matches!(
+            &m.command,
+            Command::AUTHENTICATE(_)
+                | Command::Response(Response::ERR_SASLFAIL, _)
+                | Command::Response(Response::RPL_SASLMECHS, _)
+        )
+    })
+    .await
+    .map_err(|_| SaslRefusal::Fatal(anyhow!("server stopped answering during SASL")))?;
+
+    match &message.command {
+        Command::AUTHENTICATE(payload) if payload == "+" => Ok("+".to_string()),
+        Command::AUTHENTICATE(payload) => base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not base64: {e}")))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not text: {e}")))
+            }),
+        Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
+            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+        )),
+        _ => Err(SaslRefusal::Fatal(anyhow!("SASL was refused before it finished"))),
     }
 }
