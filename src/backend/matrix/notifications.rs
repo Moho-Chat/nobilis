@@ -119,7 +119,7 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
     } else {
         http::delete_json(&url, &account.access_token).await.context("unmuting the room")?;
     }
-    state.runtime.set_silenced(buffer_id, muted);
+    state.runtime.set_silenced(state, buffer_id, muted);
 
     // The rules are cached; re-read rather than patch the copy, so what is
     // held is what the server actually has.

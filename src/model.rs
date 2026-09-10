@@ -172,6 +172,17 @@ pub struct Buffer {
     /// before the channel was ever seen still reads correctly once it is.
     #[serde(rename = "remoteId", skip_serializing_if = "Option::is_none")]
     pub remote_id: Option<String>,
+    /// Muted on the account itself rather than in this window.
+    ///
+    /// A Discord guild or channel silenced in the official client, a Matrix
+    /// room silenced by a push rule - the setting travels with the account, so
+    /// every device signed in to it is already honouring it and this one
+    /// should too. Carried separately from a frontend's own mute because the
+    /// two are not the same offer: this one was made somewhere else and
+    /// cannot be undone from here, and a client that drew them identically
+    /// would put an un-mute in front of somebody that does nothing.
+    #[serde(rename = "serverMuted", default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_muted: bool,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -670,6 +681,7 @@ mod tests {
             channel_modes: None,
             group_id: None,
             remote_id: None,
+            server_muted: false,
         }
     }
 

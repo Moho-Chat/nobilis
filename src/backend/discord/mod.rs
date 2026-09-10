@@ -33,6 +33,7 @@
 //! - `media` - thumbnails, and re-signing links Discord expires
 //! - `commands` - slash commands and the interactions that answer them
 //! - `polls` - the card a poll is drawn on, and answering one
+//! - `mutes` - what this account has silenced on Discord itself
 //! - `search` - Discord's own index, asked with its own filters
 //! - `calls` - ringing and being rung; `voice` is the audio itself
 //!
@@ -54,6 +55,7 @@ pub mod http;
 pub mod login;
 pub mod media;
 pub mod messages;
+pub mod mutes;
 pub mod people;
 pub mod polls;
 pub mod presence;

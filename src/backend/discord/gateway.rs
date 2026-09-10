@@ -331,6 +331,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             }
                         }
 
+                        // What this account has silenced on Discord itself.
+                        // Read before the guilds arrive, and applied again as
+                        // each one does - see `mutes::apply`.
+                        if !d["user_guild_settings"].is_null() {
+                            mutes::note_settings(state, &account_id, &d["user_guild_settings"]);
+                        }
+
                         // Friends list: READY's own `relationships` array
                         // (type 1 = friend - 2/3/4 are blocked/incoming-
                         // request/outgoing-request, not shown here) plus
@@ -430,10 +437,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             Err(e) => tracing::warn!("discord[{account_id}]: fetching /users/@me/channels: {e}"),
                         }
 
+                        // The direct messages now exist, so the settings
+                        // read at the top of READY have somewhere to land.
+                        mutes::apply(state, &account_id);
+
                         spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_dm_buffers);
                     }
                     "GUILD_CREATE" => {
                         register_guild_channels(state, config, d, channel_map).await;
+                        // The channels this guild's settings were about now
+                        // exist. READY carried the mutes before any of them
+                        // did, so this is where most of them actually land.
+                        mutes::apply(state, &account_id);
                         // Kept so a channel created later can be placed
                         // without re-fetching the guild: naming it and
                         // deciding whether this account may see it both
@@ -522,6 +537,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 let mut one = guild.clone();
                                 one["channels"] = serde_json::Value::Array(vec![d.clone()]);
                                 register_guild_channels(state, config, &one, channel_map).await;
+                                // A channel made while connected inherits its
+                                // guild's mute, which is already known - so
+                                // it arrives quiet rather than becoming quiet
+                                // after the first thing said in it.
+                                mutes::apply(state, &account_id);
                                 // An update can also be a permission change,
                                 // which can take access away as easily as
                                 // give it - and taking it away means removing
@@ -538,6 +558,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             None => {
                                 let presences: HashMap<&str, &str> = HashMap::new();
                                 register_dm_channel(state, &account_id, d, channel_map, &presences);
+                                mutes::apply(state, &account_id);
                             }
                         }
                     }
@@ -933,6 +954,12 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 });
                             }
                         }
+                    }
+
+                    // A server or a channel muted - or unmuted - in another
+                    // client. One entry, carrying that guild's whole setting.
+                    "USER_GUILD_SETTINGS_UPDATE" => {
+                        mutes::note_settings(state, &account_id, d);
                     }
 
                     "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {

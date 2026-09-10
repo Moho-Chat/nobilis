@@ -263,7 +263,7 @@ pub(super) async fn handle_timeline_event(
         Some(rules) => push_rule_verdict(&rules, room_id, &body),
         None => (false, false),
     };
-    state.runtime.set_silenced(buffer_id, muted);
+    state.runtime.set_silenced(state, buffer_id, muted);
     let mentioned = mentioned || keyword;
 
     if reply_to.is_some() {

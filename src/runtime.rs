@@ -38,6 +38,26 @@ impl VoiceFlags {
     }
 }
 
+/// What one Discord account has silenced in one guild - or, under the key
+/// "@me", in its direct messages.
+///
+/// The guild's own flag and its channel overrides are one thing because
+/// Discord sends them as one: the whole entry arrives together and replaces
+/// what was there, so holding half of it separately would be holding a half
+/// that can go stale on its own.
+#[derive(Clone, Debug, Default)]
+pub struct DiscordMute {
+    /// The guild itself. A muted guild silences everything under it.
+    pub muted: bool,
+    /// channel id -> muted, for the channels given a setting of their own.
+    ///
+    /// Only an override that says *muted* matters here. Discord's own client
+    /// treats a muted guild as silencing everything in it - an unmuted
+    /// channel inside one is still quiet - so the two are read as an "or"
+    /// rather than the channel overruling the guild.
+    pub channels: HashMap<String, bool>,
+}
+
 /// A file somebody has offered, from the moment it is offered to the moment
 /// it is on disk or has failed.
 #[derive(Clone, Debug)]
@@ -661,6 +681,16 @@ pub struct Runtime {
     /// Per account rather than per channel: away is a property of the person,
     /// and the same nick in three channels is away in all of them.
     irc_away: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// (account, guild id or "@me" for direct messages) -> what that account
+    /// has silenced on Discord itself.
+    ///
+    /// Kept whole per entry rather than flattened into one set of buffer ids,
+    /// because Discord sends it that way and updates it that way: an entry
+    /// arrives carrying a guild's own flag and every channel override in it,
+    /// and replaces what was there. Applying it to buffers is a separate step
+    /// (see `backend::discord::mutes`) since the settings routinely arrive in
+    /// READY before the channels they are about.
+    discord_mutes: Mutex<HashMap<(String, String), DiscordMute>>,
     /// account -> the room catalogue last read off the site.
     ///
     /// Cached because reading it costs a Tor round trip and a proof-of-work
@@ -919,6 +949,7 @@ impl Runtime {
             silenced: Mutex::new(std::collections::HashSet::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
+            discord_mutes: Mutex::new(HashMap::new()),
             irc_splits: Mutex::new(HashMap::new()),
             irc_whois: Mutex::new(HashMap::new()),
             irc_away: Mutex::new(HashMap::new()),
@@ -1192,6 +1223,9 @@ impl Runtime {
             channel_modes: None,
             group_id: Some(model::account_group_id(account_id)),
             remote_id: None,
+            // Whichever backend knows says so; a buffer is not muted until
+            // the service tells us it is.
+            server_muted: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -1810,6 +1844,37 @@ impl Runtime {
     /// buffer alone - so answering the question guild-wide meant one account
     /// being kicked took the other account's channels with it, and one
     /// account's permission check could delete the other's buffers.
+    /// Records what an account has muted in one guild, replacing whatever was
+    /// held for it. Discord sends an entry whole, both in READY and in an
+    /// update, so a merge would only ever preserve an override that has since
+    /// been taken off.
+    pub fn set_discord_mute(&self, account_id: &str, guild_key: &str, mute: DiscordMute) {
+        self.discord_mutes
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), guild_key.to_string()), mute);
+    }
+
+    /// Whether this account has silenced a channel on Discord - because the
+    /// channel is muted, or because the guild holding it is.
+    pub fn discord_muted(&self, account_id: &str, guild_key: &str, channel_id: &str) -> bool {
+        let mutes = self.discord_mutes.lock().unwrap();
+        let Some(entry) = mutes.get(&(account_id.to_string(), guild_key.to_string())) else { return false };
+        entry.muted || entry.channels.get(channel_id).copied().unwrap_or(false)
+    }
+
+    /// Every guild this account has settings for, so they can all be applied
+    /// at once when the channels they name finally exist.
+    pub fn discord_mute_keys(&self, account_id: &str) -> Vec<String> {
+        self.discord_mutes
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(account, _)| account == account_id)
+            .map(|(_, guild)| guild.clone())
+            .collect()
+    }
+
     pub fn discord_buffers_in_guild(&self, account_id: &str, guild_id: &str) -> Vec<String> {
         let prefix = format!("{account_id}|");
         self.discord_guild_id
@@ -2623,12 +2688,33 @@ impl Runtime {
     /// Marks a buffer as one the service says should stay quiet. Unlike a
     /// local mute this comes from the account itself, so it holds wherever
     /// that account is signed in.
-    pub fn set_silenced(&self, buffer_id: &str, silenced: bool) {
-        let mut all = self.silenced.lock().unwrap();
-        if silenced {
-            all.insert(buffer_id.to_string());
-        } else {
-            all.remove(buffer_id);
+    ///
+    /// Two things follow from it, which is why this is one call rather than
+    /// two: nothing here announces itself, and the buffer says so on the wire
+    /// so a client can draw the row muted without having asked for it. A
+    /// client that only learned the first would show an ordinary-looking
+    /// channel that never makes a sound, which reads as a bug.
+    pub fn set_silenced(&self, state: &AppState, buffer_id: &str, silenced: bool) {
+        {
+            let mut all = self.silenced.lock().unwrap();
+            if silenced {
+                all.insert(buffer_id.to_string());
+            } else {
+                all.remove(buffer_id);
+            }
+        }
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.server_muted != silenced => {
+                    b.server_muted = silenced;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
