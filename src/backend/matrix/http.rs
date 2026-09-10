@@ -102,6 +102,27 @@ struct MatrixError {
     error: String,
 }
 
+/// What a user-interactive endpoint said.
+///
+/// A 401 here is not a failure: it is the server listing the stages it wants
+/// and handing back a session to carry between them. Treating it as an error -
+/// which `handle_response` rightly does everywhere else - throws away the one
+/// part of the answer that says how to continue.
+pub enum Attempt {
+    Done(Value),
+    NeedsAuth(Value),
+}
+
+/// A POST whose 401 is an answer rather than a failure.
+pub async fn post_json_uia(url: &str, body: Value) -> Result<Attempt> {
+    let resp = http_client().post(url).json(&body).send().await.context("request failed")?;
+    if resp.status().as_u16() == 401 {
+        let challenge: Value = resp.json().await.context("invalid JSON in the authentication challenge")?;
+        return Ok(Attempt::NeedsAuth(challenge));
+    }
+    handle_response(resp).await.map(Attempt::Done)
+}
+
 pub async fn post_json(url: &str, token: Option<&str>, body: Value) -> Result<Value> {
     let mut req = http_client().post(url).json(&body);
     if let Some(token) = token {

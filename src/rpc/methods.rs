@@ -2960,6 +2960,19 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Making one, rather than signing in to one that exists. Reports
+        // through the same events a login does, so a client that can follow a
+        // sign-in follows this with nothing new.
+        "registerMatrixAccount" => {
+            let (homeserver_url, username, password) = match (p_str_opt(params, "homeserverUrl"), p_str_opt(params, "username"), p_str_opt(params, "password")) {
+                (Some(h), Some(u), Some(p)) => (h.to_string(), u.to_string(), p.to_string()),
+                _ => return (None, Some("registerMatrixAccount requires \"homeserverUrl\", \"username\" and \"password\"".to_string())),
+            };
+            let login_id = format!("matrix-register-{}", crate::model::next_message_id());
+            backend::matrix::start_registration(state.clone(), login_id.clone(), homeserver_url, username, password);
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
         // How a homeserver lets people sign in, asked before anything is
         // typed: a server offering only SSO has no password to take, and a
         // form demanding one there is a form nobody can complete.

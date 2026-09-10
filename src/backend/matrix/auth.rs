@@ -12,6 +12,7 @@
 //! what looks like a stranger.
 
 use super::*;
+use anyhow::bail;
 use super::http::post_json;
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -139,6 +140,107 @@ mod tests {
 pub async fn login_flows(homeserver_url: &str) -> Result<Vec<String>> {
     let resolved = http::resolve_homeserver(homeserver_url).await?;
     flows_at(&resolved).await
+}
+
+/// Makes a new account on a homeserver.
+///
+/// Adding a Matrix account meant already having one, made in Element or on a
+/// homeserver's own page. This is the door that was missing.
+///
+/// Registration is user-interactive auth, which means the first attempt is
+/// *expected* to be refused: the server answers 401 with the stages it wants
+/// and a session to carry between them. Most homeservers that allow open
+/// registration at all ask only for `m.login.dummy`, which is a stage that
+/// exists precisely so a flow can have no stages - and that is the one this
+/// completes.
+///
+/// The rest are named rather than attempted. A captcha cannot be answered
+/// from here (see the Discord backend for what answering one honestly costs),
+/// an email or SMS stage needs a message read elsewhere and a token typed
+/// back, and terms need reading rather than agreeing to on somebody's behalf.
+/// Where one of those is required this says which, and says where it can be
+/// done instead - which is a better answer than a 401 shown as an error.
+pub async fn register(homeserver_url: &str, username: &str, password: &str) -> Result<(String, String, String)> {
+    let resolved = http::resolve_homeserver(homeserver_url).await?;
+    let base = resolved.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/register");
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+        // A device this client will use, named the way the login path names
+        // one, so the new account's device list reads the same as any other.
+        "initial_device_display_name": "moho",
+        // Deliberately not `inhibit_login`: the point of registering here is
+        // to end up signed in, and asking the server to register *without*
+        // logging in would mean immediately logging in again.
+    });
+
+    let challenge = match http::post_json_uia(&url, body.clone()).await? {
+        // A homeserver with no stages at all answers the first attempt.
+        http::Attempt::Done(answer) => answer,
+        http::Attempt::NeedsAuth(challenge) => {
+            let session = challenge["session"].as_str().context("registration was refused with no session to continue")?;
+            let stage = dummy_stage(&challenge)?;
+            let mut authed = body;
+            if let Some(object) = authed.as_object_mut() {
+                object.insert("auth".to_string(), serde_json::json!({ "type": stage, "session": session }));
+            }
+            match http::post_json_uia(&url, authed).await? {
+                http::Attempt::Done(answer) => answer,
+                // Asked again after the one stage this can complete, which
+                // means the flow needed more than it advertised.
+                http::Attempt::NeedsAuth(_) => bail!("this homeserver wants more to register than can be done from here"),
+            }
+        }
+    };
+
+    let user_id = challenge["user_id"].as_str().context("the homeserver registered no user id")?.to_string();
+    let access_token = challenge["access_token"].as_str().context("the homeserver returned no access token")?.to_string();
+    let device_id = challenge["device_id"].as_str().unwrap_or_default().to_string();
+    Ok((user_id, access_token, device_id))
+}
+
+/// The one registration stage a client can complete on its own.
+///
+/// `m.login.dummy` exists so a flow can have no stages, and it is what an open
+/// homeserver asks for. Anything else needs a person somewhere else - a
+/// captcha, a message to read, terms to agree to - so this names what was
+/// wanted rather than pretending to satisfy it.
+fn dummy_stage(challenge: &Value) -> Result<&'static str> {
+    let flows = challenge["flows"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let doable = flows.iter().any(|flow| {
+        flow["stages"].as_array().is_some_and(|stages| stages.len() == 1 && stages[0].as_str() == Some("m.login.dummy"))
+    });
+    if doable {
+        return Ok("m.login.dummy");
+    }
+    let wanted: Vec<String> = flows
+        .iter()
+        .filter_map(|flow| flow["stages"].as_array())
+        .flatten()
+        .filter_map(|s| s.as_str().map(readable_stage))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if wanted.is_empty() {
+        bail!("this homeserver is not accepting new accounts");
+    }
+    bail!(
+        "this homeserver asks for {} to register, which has to be done on its own page - \
+         sign up there and then add the account here",
+        wanted.join(" and ")
+    )
+}
+
+fn readable_stage(stage: &str) -> String {
+    match stage {
+        "m.login.recaptcha" => "a captcha".to_string(),
+        "m.login.email.identity" => "an email address".to_string(),
+        "m.login.msisdn" => "a phone number".to_string(),
+        "m.login.terms" => "agreeing to its terms".to_string(),
+        "m.login.registration_token" => "an invitation token".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Signs in through the homeserver's own web login.
@@ -270,6 +372,57 @@ pub(super) async fn wait_for_sso_token(listener: tokio::net::TcpListener) -> Res
             return Ok(token);
         }
     }
+}
+
+/// Makes an account and signs in with it, reporting progress the same way a
+/// login does.
+///
+/// The same shape as `start_login` on purpose: a client that can already
+/// follow a sign-in follows this with no new machinery, and what somebody sees
+/// is a form that either works or explains itself.
+pub fn start_registration(state: AppState, login_id: String, homeserver_url: String, username: String, password: String) {
+    tokio::spawn(async move {
+        let result =
+            std::panic::AssertUnwindSafe(try_registration(&state, &login_id, &homeserver_url, &username, &password)).catch_unwind().await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => "internal error (see nobilis logs)".to_string(),
+        };
+        tracing::warn!("matrix registration[{login_id}]: {error}");
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
+    });
+}
+
+async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str) -> Result<()> {
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
+    let homeserver_url = &http::resolve_homeserver(homeserver_url).await?;
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "making the account..." }));
+
+    // Nothing is stored before it works, unlike the login path. A login saves
+    // a placeholder so a wrong password leaves something to correct; there is
+    // no equivalent here, because a registration that failed left no account
+    // to retry against - the name may now be taken, by us, or not exist at
+    // all, and guessing which would be storing a guess.
+    let (user_id, access_token, device_id) = register(homeserver_url, username, password).await?;
+
+    let config = MatrixAccountConfig {
+        homeserver_url: homeserver_url.to_string(),
+        user_id,
+        password: password.to_string(),
+        access_token,
+        device_id,
+        next_batch: None,
+        display_name: None,
+        rtc_focus_url: None,
+    };
+    let saved = state.accounts.add_matrix(config)?;
+    state.events.emit(
+        "matrixLoginResult",
+        serde_json::json!({ "loginId": login_id, "success": true, "accountId": saved.account_id() }),
+    );
+    spawn(state.clone(), saved);
+    Ok(())
 }
 
 pub fn start_login(state: AppState, login_id: String, homeserver_url: String, username: String, password: String) {
