@@ -260,6 +260,44 @@ pub async fn start_user_verification(state: &AppState, account_id: &str, user_id
 
 /// Accepts or declines an incoming verification request (one the *other*
 /// session started - see tick's incoming-request scan below).
+/// The QR code for a verification, as an SVG to draw.
+///
+/// The method Element offers first and the one most people use: point one
+/// device at the other rather than reading seven pictures aloud in the same
+/// order. Until this existed, verifying moho from Element meant Element
+/// offering to scan and moho having nothing to be scanned.
+///
+/// This is the showing half only. Scanning one needs a camera or a picture to
+/// read, which is its own piece of work - and the showing half is the useful
+/// one on a desktop, because the device with the camera is the phone.
+///
+/// Answers None rather than an error where a code cannot be made. That is the
+/// ordinary case for a reason worth knowing: a QR code proves an identity the
+/// other side can already check, so it needs cross-signing set up. Without it
+/// there is nothing to encode, and emoji remain the way through.
+pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) -> Result<Option<String>> {
+    let Some(v) = state.runtime.get_matrix_verification(verification_id) else {
+        bail!("no such verification");
+    };
+    if v.account_id != account_id {
+        bail!("that verification belongs to another account");
+    }
+    let Some(qr) = v.request.generate_qr_code().await.context("making the QR code")? else {
+        return Ok(None);
+    };
+    let code = qr.to_qr_code().context("encoding the QR code")?;
+    // SVG rather than a bitmap: the daemon has no idea how large this will be
+    // drawn, and a QR code scaled up from a fixed grid of pixels is a QR code
+    // a camera has to work harder to read.
+    let svg = code
+        .render()
+        .min_dimensions(240, 240)
+        .dark_color(qrcode::render::svg::Color("#000000"))
+        .light_color(qrcode::render::svg::Color("#ffffff"))
+        .build();
+    Ok(Some(svg))
+}
+
 pub async fn respond_to_request(state: &AppState, account_id: &str, verification_id: &str, accept: bool) -> Result<()> {
     let (config, session) = account_session(state, account_id).await?;
     let v = state.runtime.get_matrix_verification(verification_id).context("no such verification")?;

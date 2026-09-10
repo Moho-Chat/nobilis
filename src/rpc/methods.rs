@@ -3464,6 +3464,21 @@ pub async fn dispatch(
             }
         }
 
+        // The QR code for a verification in progress, drawn so another device
+        // can scan it. None where one cannot be made, which is the ordinary
+        // case without cross-signing - a code proves an identity the other
+        // side can already check, and without one there is nothing to encode.
+        "matrixVerificationQrCode" => {
+            let (account_id, verification_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "verificationId")) {
+                (Some(a), Some(v)) => (a, v),
+                _ => return (None, Some("matrixVerificationQrCode requires \"accountId\" and \"verificationId\"".to_string())),
+            };
+            match backend::matrix::verification::qr_code(state, account_id, verification_id).await {
+                Ok(svg) => (Some(serde_json::json!({ "svg": svg })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "respondMatrixVerification" => {
             let (account_id, verification_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "verificationId")) {
                 (Some(a), Some(v)) => (a, v),

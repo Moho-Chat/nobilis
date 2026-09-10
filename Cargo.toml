@@ -40,6 +40,8 @@ sha2 = "0.10"
 # The login captcha's proof of work; see backend/sneedchat/captcha.rs.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 rand = "0.8"
+# `image` for reading Discord's login code, `svg` (a default) for drawing
+# Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -66,7 +68,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 # `experimental-send-custom-to-device` is what lets a call's media keys be
 # sent straight to the devices in the call, Olm-encrypted, which is how
 # Element distributes them - see backend/matrix/crypto.rs.
-matrix-sdk-crypto = { version = "0.18", features = ["experimental-send-custom-to-device"] }
+# `qrcode` is what lets a verification be done by scanning rather than by
+# reading emoji aloud - the method Element offers first and most people use.
+matrix-sdk-crypto = { version = "0.18", features = ["experimental-send-custom-to-device", "qrcode"] }
 # Pinned to exactly what matrix-sdk-crypto 0.18 resolves to, for the same
 # reason the ruma crates below are: this is where its own response types live
 # - the verification state a decrypted message carries among them - and a
