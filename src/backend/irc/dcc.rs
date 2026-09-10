@@ -1,8 +1,9 @@
 //! Receiving a file over DCC, which on IRC is how XDCC bots hand one over.
 //!
-//! Beside `irc.rs` the way `discord_voice.rs` sits beside `discord.rs`: it is
-//! a second protocol that rides on the first, with its own sockets and its own
-//! state, and folding it into the message loop would bury it.
+//! Its own file beside the rest of `irc/`, the way `voice.rs` sits beside the
+//! rest of `discord/`: it is a second protocol that rides on the first, with
+//! its own sockets and its own state, and folding it into the message loop
+//! would bury it.
 //!
 //! Everything in an offer is chosen by whoever sent it - the name, the size,
 //! the address, the port - so the whole module is written against that. Three

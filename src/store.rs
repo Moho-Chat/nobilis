@@ -368,7 +368,7 @@ impl Store {
             // (never seen on this message before) is a rare first-add,
             // and the next full backlog fetch/reconnect re-syncs it with
             // the real value from the message's own snapshot (see
-            // extract_reactions in backend/discord.rs, which does know
+            // extract_reactions in backend/discord/messages.rs, which does know
             // it) - not worth widening this incremental-update path just
             // for that narrow a window.
             reactions.push(Reaction { emoji: emoji.to_string(), count: 1, me: is_me, animated: false });
@@ -381,7 +381,7 @@ impl Store {
     }
 
     /// Whether this buffer has ever recorded anything - the seed-once guard
-    /// for Discord's history backfill (see backend/discord.rs): a buffer
+    /// for Discord's history backfill (see backend/discord/history.rs): a buffer
     /// with any messages already (from a prior backfill or from having
     /// seen live traffic) is left alone rather than re-fetched, since
     /// there's no per-message dedup against Discord's own message ids here.

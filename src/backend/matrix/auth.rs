@@ -130,7 +130,7 @@ mod tests {
     }
 }
 
-/// Kicks off a login attempt in the background - see backend/discord.rs's
+/// Kicks off a login attempt in the background - see backend/discord/login.rs's
 /// start_qr_login/backend/sneedchat's start_login for the identical
 /// async-kickoff shape. Progress/result arrive via matrixLoginStatus/
 /// matrixLoginResult events tagged with `login_id`, not the RPC response

@@ -195,7 +195,7 @@ pub async fn dispatch(
                 // worth trying to pull more from Discord first, since the
                 // initial fetch is already covered by the backfill that
                 // runs when the buffer is first discovered (see backend/
-                // discord.rs's backfill_channel_history).
+                // discord/history.rs's backfill_channel_history).
                 if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
                     if let (Some(channel_id), Some(cfg)) =
                         (state.runtime.get_discord_channel(buffer_id), state.accounts.get_discord(&buffer.account_id))
@@ -963,7 +963,7 @@ pub async fn dispatch(
         }
 
         // Synchronous read of the in-memory snapshot built at READY and kept
-        // current by PRESENCE_UPDATE (see backend/discord.rs) - no network
+        // current by PRESENCE_UPDATE (see backend/discord/presence.rs) - no network
         // round trip needed here, unlike listMatrixDevices.
         "listDiscordFriends" => match p_str_opt(params, "accountId") {
             None => (None, Some("listDiscordFriends requires \"accountId\"".to_string())),
@@ -1035,7 +1035,7 @@ pub async fn dispatch(
         }
 
         // Fallback for a Discord attachment link whose signed `ex=`/`is=`/
-        // `hm=` query string has expired (see backend/discord.rs's
+        // `hm=` query string has expired (see backend/discord/media.rs's
         // message_link doc comment for why this backend can't just
         // silently re-sign one the way a real client does) - opens the
         // real message in an actual Discord client/web session instead,
@@ -2639,7 +2639,7 @@ pub async fn dispatch(
         // QR login is inherently async/multi-step - this just kicks it off
         // and returns immediately; progress and the eventual result arrive
         // via discordLoginQr/discordLoginScanned/discordLoginResult events
-        // tagged with this loginId (see backend/discord.rs).
+        // tagged with this loginId (see backend/discord/login.rs).
         // An optional "accountId" re-authenticates that existing account
         // instead of adding a new one - the usual reason to run this again is
         // a token Discord revoked, not a second account. Logging into a

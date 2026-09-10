@@ -2,7 +2,7 @@
 //!
 //! Here rather than in a window because the commands are the daemon's: each
 //! backend parses the ones it implements out of a message that starts with a
-//! slash (see `backend/irc.rs`'s `send_message` and `backend/matrix/mod.rs`),
+//! slash (see `backend/irc/send.rs`'s `send_message` and `backend/matrix/send.rs`),
 //! so this table is the same list read from the other end. A client that held
 //! its own copy would be a second list to keep in step, and it would be the
 //! one that drifted.

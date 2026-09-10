@@ -1,6 +1,6 @@
 //! Discord voice connections.
 //!
-//! The main gateway (see discord.rs) negotiates a voice session and hands over
+//! The main gateway (see gateway.rs) negotiates a voice session and hands over
 //! two halves of a handshake: a session id on VOICE_STATE_UPDATE, and an
 //! endpoint plus token on VOICE_SERVER_UPDATE. They arrive in either order and
 //! neither is usable alone, so this waits for both and then opens the actual

@@ -63,7 +63,7 @@ pub struct IrcAccountConfig {
     /// Tunnel this connection through a SOCKS5 proxy - disabled by default.
     /// Unlike Sneedchat's embedded-Arti transport, the `irc` crate's proxy
     /// support only knows how to dial an *external* SOCKS5 proxy (see
-    /// backend/irc.rs's connection setup and net/tor.rs's doc comment on
+    /// backend/irc/connect.rs's setup and net/tor.rs's doc comment on
     /// why an in-process Arti client can't be handed to it directly) - so
     /// this requires a real Tor daemon or Tor Browser already running and
     /// listening at `tor_proxy` (defaults to the standard system Tor port).
@@ -84,7 +84,7 @@ impl IrcAccountConfig {
 }
 
 /// Discord account shape - unlike IRC/XMPP this has no user-chosen
-/// identifier at creation time (see backend/discord.rs's QR remote-auth
+/// identifier at creation time (see backend/discord/login.rs's QR remote-auth
 /// flow): `user_id`/`username` are learned from Discord's own API only
 /// after a successful login, and `token` is the raw user token that flow
 /// produces (used as-is in the `Authorization` header - Discord user
@@ -97,7 +97,7 @@ pub struct DiscordAccountConfig {
     pub display_name: Option<String>,
     pub token: String,
     /// Captured once at login from /users/@me's `avatar` hash (see
-    /// backend/discord.rs's run_qr_login) - not refreshed on later
+    /// backend/discord/login.rs's run_qr_login) - not refreshed on later
     /// reconnects, same precedent as `username` above.
     #[serde(default)]
     pub avatar_url: Option<String>,
@@ -653,7 +653,7 @@ impl AccountStore {
     }
 
     /// Opportunistic refresh, called on every gateway READY (see
-    /// backend/discord.rs's run_gateway) rather than only at initial QR
+    /// backend/discord/gateway.rs's run_gateway) rather than only at initial QR
     /// login - accounts added before this feature existed have no
     /// avatar_url yet, and a user's real Discord avatar can change over
     /// time anyway. Idempotent/cheap enough to just always persist rather

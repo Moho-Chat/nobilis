@@ -1,6 +1,6 @@
 //! Client-Server API event-type constants + small per-event extraction
 //! helpers. Plain `serde_json::Value` + manual field access throughout
-//! (matching backend/discord.rs's own style for gateway payloads) rather
+//! (matching backend/discord/gateway.rs's own style for payloads) rather
 //! than fully-typed structs - `/sync`'s per-room maps are keyed by dynamic
 //! room ids and its timeline mixes a couple dozen distinct event types, so
 //! a hand-rolled typed model would need to enumerate exhaustively for no

@@ -6,7 +6,7 @@
 //! incremental `/sync` responses carry no naming-relevant state at all
 //! (re-deriving from an empty/partial delta would wrongly fall back to
 //! the raw room id) and because live room renames aren't tracked, the
-//! same accepted limitation backend/discord.rs's own channel-name-as-
+//! same accepted limitation backend/discord/guilds.rs's own channel-name-as-
 //! buffer-name design already has for a renamed Discord channel.
 
 use serde_json::Value;

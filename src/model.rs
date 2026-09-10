@@ -281,13 +281,13 @@ pub struct SenderStyle {
 /// One emoji's reaction tally on a message. `me` is whether *this*
 /// account is among the reactors - Discord's REACTION_ADD/REMOVE events
 /// are per-user, so this is accumulated incrementally rather than
-/// snapshotted (see backend/discord.rs's reaction handling).
+/// snapshotted (see backend/discord/messages.rs's reaction handling).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Reaction {
     pub emoji: String,
     pub count: i64,
     pub me: bool,
-    /// Only meaningful for a custom Discord emoji (see backend/discord.rs's
+    /// Only meaningful for a custom Discord emoji (see backend/discord/messages.rs's
     /// extract_reactions) - whether the frontend should build its CDN
     /// image URL with a `.gif` extension instead of `.png`. Always false
     /// for a plain Unicode emoji, which the frontend renders as text and
@@ -298,7 +298,7 @@ pub struct Reaction {
 
 /// A Discord rich embed (title/description/color/timestamp box - a
 /// webhook's or bot's own formatted content, distinct from the plain
-/// `body` text) - see backend/discord.rs's extract_embeds. `color` is
+/// `body` text) - see backend/discord/messages.rs's extract_embeds. `color` is
 /// Discord's own decimal RGB value (e.g. 15844367); the frontend renders
 /// it as a colored accent bar down the embed's left edge, same as
 /// Discord's own client does, and re-renders it live if a later edit
@@ -452,7 +452,7 @@ pub struct Message {
     #[serde(rename = "isOwn", default)]
     pub is_own: bool,
     /// The sender's real avatar image URL (Discord only - see backend/
-    /// discord.rs's author_avatar_url; IRC/XMPP have no such concept).
+    /// discord/messages.rs's author_avatar_url; IRC/XMPP have no such concept).
     /// Covers the account's own messages too, same mechanism, no special
     /// casing - Discord's gateway echo of a self-sent message carries the
     /// full `author` object same as anyone else's.

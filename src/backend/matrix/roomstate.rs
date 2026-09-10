@@ -18,7 +18,7 @@
 //!
 //! emit_matrix_presence builds and broadcasts a room's current userlist
 //! (see runtime.rs's presence/get_presence, the same wire mechanism
-//! backend/irc.rs's emit_presence already uses) from whatever's currently
+//! backend/irc/presence.rs's emit_presence already uses) from whatever's currently
 //! cached: the joined-member roster, power levels (sort key), and presence
 //! (online/offline split) - called any time one of those three changes.
 

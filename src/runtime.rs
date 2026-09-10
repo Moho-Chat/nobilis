@@ -214,7 +214,7 @@ pub enum ConnState {
     /// revoked/invalidated token, not a network hiccup), so retrying with
     /// the same stored credential can never succeed. The retry loop stops
     /// entirely rather than backing off and trying again (see
-    /// backend/discord.rs's run_gateway_with_retry) - the only way out is
+    /// backend/discord/gateway.rs's run_gateway_with_retry) - the only way out is
     /// a fresh login, which upserts the existing account in place (same
     /// account id, same buffers/scrollback) rather than creating a new one.
     AuthFailed,
@@ -232,7 +232,7 @@ impl ConnState {
 }
 
 /// Per-connected-account handle the RPC layer uses to act on a live IRC
-/// connection (join/part/send) - see backend/irc.rs for what populates
+/// connection (join/part/send) - see backend/irc/connect.rs for what populates
 /// this. `nick` is the *current* nick (may differ from the account's
 /// configured nick after a collision-driven rename, though that's not
 /// handled yet - out of scope for this milestone).
@@ -275,7 +275,7 @@ pub struct Runtime {
     /// immediately reconnecting a couple of times in a row was enough to
     /// trigger it against both Libera and Rizon). This isn't something a
     /// bigger timeout fixes - the fix is not re-triggering it, by pacing
-    /// out attempts on our own end. See backend/irc.rs's spawn().
+    /// out attempts on our own end. See backend/irc/connect.rs's spawn().
     last_connect_attempt: Mutex<HashMap<String, std::time::Instant>>,
     /// Guards against a real race: disconnect() on an already-connected
     /// account only sends QUIT and returns immediately - it does not wait
@@ -385,7 +385,7 @@ pub struct Runtime {
     /// client" deep link (see rpc/methods.rs's getDiscordMessageLink) -
     /// the fallback for an attachment link whose signature expired, since
     /// this backend has no way to silently re-sign one itself (see
-    /// backend/discord.rs's message_link doc comment).
+    /// backend/discord/messages.rs's message_link doc comment).
     discord_guild_id: Mutex<HashMap<String, String>>,
     /// Guards backend::discord::extend_history against running twice at
     /// once for the same buffer - getBacklog can be called concurrently by
@@ -396,14 +396,15 @@ pub struct Runtime {
     /// same page of Discord history twice (no per-message dedup here).
     discord_history_inflight: Mutex<HashSet<String>>,
     /// Discord-specific: buffer id -> that channel's guild's usable custom
-    /// emoji ({id, name, animated}) - see backend/discord.rs's
+    /// emoji ({id, name, animated}) - see backend/discord/guilds.rs's
     /// register_guild_channels, populated straight from GUILD_CREATE with
     /// no extra request needed. Empty/absent for IRC and any Discord DM.
     discord_buffer_emojis: Mutex<HashMap<String, Vec<serde_json::Value>>>,
     /// Discord-specific: account id -> friends list ({userId, username,
     /// globalName, avatarUrl, status}), seeded from READY's `relationships`
     /// (type 1 = friend) + `presences`, kept current by live PRESENCE_UPDATE
-    /// dispatches - see backend/discord.rs's READY/PRESENCE_UPDATE handling.
+    /// dispatches - see backend/discord/gateway.rs's READY and
+    /// backend/discord/presence.rs's PRESENCE_UPDATE handling.
     /// Read synchronously by listDiscordFriends (no network round trip
     /// needed at query time, unlike Matrix's listMatrixDevices).
     discord_friends: Mutex<HashMap<String, Vec<serde_json::Value>>>,
@@ -632,10 +633,9 @@ pub struct Runtime {
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
     /// unlike matrix_member_avatars above which deliberately keeps stale
-    /// data around). This is the actual roster userlist.rs builds from,
-    /// combined with matrix_power_levels (for sort order) and
-    /// matrix_presence (for the online/offline split) - see emit_matrix_
-    /// presence.
+    /// data around). This is the roster roomstate.rs's emit_matrix_presence
+    /// builds from, combined with matrix_power_levels (for sort order) and
+    /// matrix_presence (for the online/offline split).
     matrix_room_members: Mutex<HashMap<(String, String), HashMap<String, String>>>,
     /// Matrix-specific: (account id, room id) -> {user id -> the newest
     /// event id they have a public read receipt against}. Only one entry per
@@ -1930,7 +1930,7 @@ impl Runtime {
     }
 
     /// Replaces this account's whole friends snapshot - called once from
-    /// READY (see backend/discord.rs), never incrementally, since that's
+    /// READY (see backend/discord/gateway.rs), never incrementally, since that's
     /// the only point a full, authoritative relationships list exists.
     /// Live changes after that are per-user PRESENCE_UPDATE patches via
     /// update_discord_presence below, not further full replaces.
@@ -1946,7 +1946,7 @@ impl Runtime {
     /// dispatch. Returns false (no-op) for a user_id not already in the
     /// friends list (a guild-mate's presence, not a friend's - Discord's
     /// gateway sends PRESENCE_UPDATE for both once subscribed) or when the
-    /// status didn't actually change, so backend/discord.rs can skip
+    /// status didn't actually change, so backend/discord/presence.rs can skip
     /// emitting a redundant discordPresenceUpdate event.
     pub fn update_discord_presence(&self, account_id: &str, user_id: &str, status: &str) -> bool {
         let mut friends = self.discord_friends.lock().unwrap();
@@ -3504,7 +3504,7 @@ impl Runtime {
             .or_else(|| self.own_identity(account_id))
             .unwrap_or_default();
         // `force_highlight` is Discord's own resolved-mentions answer (see
-        // backend/discord.rs's mentions_own_user) - authoritative when
+        // backend/discord/messages.rs's mentions_own_user) - authoritative when
         // present, since the nick-substring fallback below can never match
         // a Discord mention (the body still has `<@id>` tokens, not the
         // account's nick, by the time this runs). IRC has no such

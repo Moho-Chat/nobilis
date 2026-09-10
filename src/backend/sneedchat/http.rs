@@ -2,7 +2,7 @@
 //!
 //! Ported from sneedchat-rs's `net/http.rs`
 //! (<https://gitgud.io/jcmoon/sneedchat-rs>). `reqwest` (already used by
-//! `backend/discord.rs`) cannot use an in-process Arti stream as its
+//! `backend/discord/http.rs`) cannot use an in-process Arti stream as its
 //! connector - it only knows how to dial its own connector or a SOCKS5
 //! proxy *URL* - so rather than run two different transport stacks for this
 //! one backend, hyper is driven directly. The surface needed is small: GET

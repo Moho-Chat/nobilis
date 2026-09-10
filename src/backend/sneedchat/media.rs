@@ -166,7 +166,7 @@ pub(super) async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> 
 /// Cached permanently per user id for this daemon's lifetime, not
 /// re-checked on every message - an avatar changing later isn't picked
 /// up until the cache file is manually cleared, the same precedent
-/// backend/discord.rs's own avatar_url handling already set ("captured
+/// backend/discord/messages.rs's own avatar_url handling already set ("captured
 /// once at login... not refreshed on later reconnects").
 pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, raw_avatar_url: &str) -> Option<String> {
     if raw_avatar_url.is_empty() {
