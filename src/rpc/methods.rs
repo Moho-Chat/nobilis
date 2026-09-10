@@ -969,6 +969,31 @@ pub async fn dispatch(
             }
         }
 
+        // An invite to the conversation on screen, as a link to paste.
+        //
+        // The options are Discord's own and so are the defaults: a day,
+        // unlimited uses, and full membership. Zero means "never" for the
+        // expiry and "no limit" for the uses, which is Discord's convention -
+        // passed through rather than translated.
+        "createDiscordInvite" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("createDiscordInvite requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("discord:") {
+                return (None, Some("that is not a Discord conversation".to_string()));
+            }
+            let max_age = params.get("maxAge").and_then(|v| v.as_i64()).unwrap_or(86_400);
+            let max_uses = params.get("maxUses").and_then(|v| v.as_i64()).unwrap_or(0);
+            let temporary = params.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false);
+            match backend::discord::create_invite(state, &buffer.account_id, buffer_id, max_age, max_uses, temporary).await {
+                Ok(link) => (Some(serde_json::json!({ "invite": link })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "createDiscordGuild" => {
             let (account_id, name) = match (p_str_opt(params, "accountId"), p_str_opt(params, "name")) {
                 (Some(a), Some(n)) => (a, n),

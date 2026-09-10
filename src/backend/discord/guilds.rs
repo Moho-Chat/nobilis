@@ -26,6 +26,59 @@ pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Res
     Ok(())
 }
 
+/// Makes an invite to a conversation, and returns the link.
+///
+/// The other half of `join_guild`, which has been here on its own: this
+/// client could accept an invite somebody else made but not make one, so
+/// inviting anybody meant opening the official client for a link.
+///
+/// The three options are Discord's own, and the defaults are its defaults: a
+/// day, unlimited uses, and full membership. Zero means "never" for the
+/// expiry and "no limit" for the uses, which is Discord's convention and not
+/// this client's - it is passed through rather than translated, so what the
+/// official client offers is what is offered here.
+///
+/// Works for a group DM as well as a guild channel. Discord treats both as a
+/// channel somebody can be invited to, and so does this.
+pub async fn create_invite(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    max_age: i64,
+    max_uses: i64,
+    temporary: bool,
+) -> Result<String> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this conversation")?;
+    let resp = send_write(
+        http_client()
+            .post(format!("{API_BASE}/channels/{channel_id}/invites"))
+            .header("Authorization", &cfg.token)
+            .json(&json!({
+                "max_age": max_age,
+                "max_uses": max_uses,
+                "temporary": temporary,
+            })),
+    )
+    .await
+    .context("making an invite")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "making an invite"));
+    }
+    let answer: Value = resp.json().await.context("reading the invite back")?;
+    // The code is what Discord returns; the link is what a person pastes,
+    // and building it here means every caller does not have to know the
+    // domain. `discord.gg` rather than `discord.com/invite` because that is
+    // the short form the official client copies.
+    let code = answer["code"].as_str().context("Discord made an invite with no code in it")?;
+    Ok(format!("https://discord.gg/{code}"))
+}
+
 /// Creates a brand-new guild owned by this account - Discord's own "Create
 /// My Own" server flow, same endpoint real clients use. Discord auto-
 /// creates a default #general channel; the gateway's own GUILD_CREATE
