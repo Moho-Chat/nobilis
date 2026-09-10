@@ -235,6 +235,13 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
         // before moving on, same as the tutorial's sync() sketch.
         session.process_outgoing_requests(&config.homeserver_url, &access_token).await;
 
+        // A key that has just arrived may open messages already on screen as
+        // "unable to decrypt". Here rather than inside the to-device handler
+        // because a session can turn up without having been asked for - from
+        // a backup restore, an import, or somebody else's device deciding to
+        // share - and this is the one place all three have already landed.
+        relock::retry_locked(state, &session, account_id).await;
+
         verification::tick(state, account_id, &session, &user_id, &config.homeserver_url, &access_token).await;
         session.run_pending_backup(&config.homeserver_url, &access_token).await;
 

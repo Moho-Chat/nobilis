@@ -118,6 +118,29 @@ impl CryptoSession {
         }
     }
 
+    /// Asks whoever has the key for a message this client cannot read.
+    ///
+    /// The one thing that makes an undecryptable message recoverable rather
+    /// than permanent. Sent to our own other devices and to the sender's,
+    /// any of which may still hold the Megolm session - and answered, if it
+    /// is answered, by a forwarded key arriving as a to-device event on some
+    /// later sync.
+    ///
+    /// The cancellation is sent first where there is one: it withdraws an
+    /// earlier request for the same session, so a room full of unreadable
+    /// history asks once per session rather than once per message.
+    pub async fn request_room_key(&self, homeserver_url: &str, access_token: &str, event: &Value, room_id: &RoomId) -> Result<()> {
+        let raw: Raw<matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent> =
+            Raw::from_json_string(event.to_string()).context("re-serializing event to ask for its key")?;
+        let (cancel, request) = self.machine.request_room_key(&raw, room_id).await.context("request_room_key")?;
+        if let Some(cancel) = cancel {
+            if let Err(e) = self.send_one(homeserver_url, access_token, &cancel).await {
+                tracing::debug!("matrix crypto: withdrawing the older key request: {e:#}");
+            }
+        }
+        self.send_one(homeserver_url, access_token, &request).await
+    }
+
     /// Dispatches one `OutgoingVerificationRequest` - the kind returned
     /// directly by imperative verification calls (`request_verification()`,
     /// `VerificationRequest::accept()`/`start_sas()`, `Sas::confirm()`/

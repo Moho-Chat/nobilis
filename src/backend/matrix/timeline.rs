@@ -106,13 +106,20 @@ pub(super) async fn handle_timeline_event(
                 (t, decrypted["content"].clone(), false)
             }
             Err(e) => {
-                // A real, common race: the Megolm session for this
-                // message hasn't arrived yet (key-share to-device events
-                // can lag the timeline event referencing them). v1 shows
-                // an honest placeholder rather than retry-on-later-key-
-                // arrival (request_room_key) - see the plan's Open
-                // decisions for why that's deferred to a later pass.
+                // A real, common race: the Megolm session for this message
+                // has not arrived yet - key-share to-device events lag the
+                // timeline event referencing them, a room joined today has
+                // history from before this device existed, and a backup
+                // restores sessions minutes after the messages needing them
+                // are already on screen.
+                //
+                // The placeholder is still written, because something has to
+                // be. What is new is that the event is kept and its key asked
+                // for, so the placeholder is a state rather than a verdict:
+                // see `relock`. Before this it was permanent, and a restored
+                // backup fixed nothing that was already displayed.
                 tracing::debug!("matrix[{account_id}]: failed to decrypt event {event_id} in {room_id}: {e:#}");
+                relock::note_locked(session, homeserver_url, access_token, account_id, buffer_id, room_id, event_id, event).await;
                 (protocol::EVENT_ROOM_MESSAGE.to_string(), Value::Null, true)
             }
         }

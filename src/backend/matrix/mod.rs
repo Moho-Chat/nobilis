@@ -50,6 +50,7 @@ pub mod notifications;
 pub mod probes;
 pub mod profile;
 pub mod receipts;
+pub mod relock;
 pub mod send;
 pub mod sync;
 pub mod timeline;
@@ -60,6 +61,9 @@ pub use media::*;
 pub use notifications::*;
 pub use profile::*;
 pub use receipts::*;
+// Not `pub use`: this is asked and answered inside the sync loop, and its
+// names would say nothing useful in the backend's namespace.
+use relock::*;
 pub use send::*;
 pub use sync::*;
 // Not `pub use`: an event's handling is this folder's business alone, but

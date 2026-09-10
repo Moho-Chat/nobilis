@@ -1250,7 +1250,14 @@ pub async fn dispatch(
                 Err(e) => return (None, Some(format!("could not read the file: {e}"))),
             };
             match session.import_room_keys(&text, p_str(params, "passphrase", "")).await {
-                Ok((imported, total)) => (Some(serde_json::json!({ "imported": imported, "total": total })), None),
+                Ok((imported, total)) => {
+                    // The messages those keys are for may already be on
+                    // screen saying they cannot be read. Importing keys and
+                    // leaving them that way is the same failure this was
+                    // meant to fix, one step further along.
+                    backend::matrix::relock::retry_locked(state, &session, account_id).await;
+                    (Some(serde_json::json!({ "imported": imported, "total": total })), None)
+                }
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
@@ -3489,7 +3496,16 @@ pub async fn dispatch(
                 _ => return (None, Some("restoreMatrixRecoveryKey requires \"accountId\" and \"recoveryKey\"".to_string())),
             };
             match backend::matrix::backup::restore_from_recovery_key(state, account_id, recovery_key).await {
-                Ok(summary) => (Some(serde_json::json!({ "restoredKeys": summary.imported_keys, "totalKeys": summary.total_keys })), None),
+                Ok(summary) => {
+                    // Restoring a backup is the commonest moment for a
+                    // roomful of "unable to decrypt" to become readable, and
+                    // the one where somebody is watching to see whether it
+                    // worked.
+                    if let Some(session) = state.runtime.get_matrix_machine(account_id) {
+                        backend::matrix::relock::retry_locked(state, &session, account_id).await;
+                    }
+                    (Some(serde_json::json!({ "restoredKeys": summary.imported_keys, "totalKeys": summary.total_keys })), None)
+                }
                 Err(e) => (None, Some(e.to_string())),
             }
         }
