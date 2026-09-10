@@ -216,7 +216,7 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     // changes after the initial NAMREPLY aren't tracked live in this
     // milestone - a rejoin/NAMES refresh corrects it; see project plan's
     // note on NickList polish being pre-existing follow-up work).
-    let mut channels: HashMap<String, HashMap<String, MemberRank>> = HashMap::new();
+    let mut channels: HashMap<String, HashMap<String, Who>> = HashMap::new();
 
     // Whether the people we hold conversations with are actually connected.
     //
@@ -349,7 +349,7 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         // above are still worth asking for, and they have to be requested
         // before CAP END like any other.
         state.runtime.report_progress(state, &account_id, "Registering (NICK/USER)...");
-        end_cap_and_register(&sender, config)?;
+        end_cap_and_register(&sender, &mut stream, config).await?;
     }
 
     state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
@@ -475,6 +475,37 @@ pub(super) const WANTED_CAPS: &[&str] = &[
     // refusal into an answer about *this* message rather than a numeric that
     // arrived at about the same time.
     "labeled-response",
+    // The roster, filled in on arrival. NAMES answers `nick!user@host`
+    // instead of a bare nick, so joining a channel says who everybody is
+    // rather than only what they are called - and costs no round trip at all.
+    "userhost-in-names",
+    // Which account each message came from. `account-notify` and
+    // `extended-join` already say who is identified at the moment they join
+    // or change it; this is the per-message half, which is what survives a
+    // netsplit or a client that was not watching at the time.
+    "account-tag",
+    // The network's own word for "this one is a program", rather than this
+    // client guessing from a name.
+    "bot-mode",
+    // A realname that can be changed without reconnecting. Without it the
+    // field is fixed by USER at registration, and changing it means dropping
+    // every channel and every query to say a different sentence about
+    // yourself.
+    "setname",
+    // Somebody else being invited to a channel we are in. An INVITE addressed
+    // to us arrives regardless; this is the one the capability exists for.
+    "invite-notify",
+    // The server's own word that everything here is UTF-8, which is one
+    // fewer thing to guess at on malformed bytes.
+    "utf8-only",
+    // Refusals in a form that can be read rather than matched. FAIL, WARN and
+    // NOTE carry a code and a sentence, which is what a modern server uses
+    // for anything without a numeric of its own.
+    "standard-replies",
+    // The notify list, answered with the same detail everything else carries
+    // - who they are identified as and whether they are away, rather than a
+    // bare "they are online".
+    "extended-monitor",
 ];
 
 /// The capabilities named by a CAP ACK, from whichever field they arrived in.
@@ -494,18 +525,39 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
 /// both owe the server a CAP END: having asked for capabilities, registration
 /// does not proceed until we say we are finished asking, and a server left
 /// waiting for that just sits there until the establish timeout fires.
-pub(super) fn end_cap_and_register(sender: &Sender, config: &IrcAccountConfig) -> Result<()> {
-    // One REQ per capability, and no waiting on the replies.
+pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<()> {
+    // Ask what this server has before asking it for anything.
     //
-    // Separate lines because a CAP REQ is atomic: a server that does not
-    // know one name in the list refuses the whole line, so bundling these
-    // with sasl would mean an old server dropping SASL over multi-prefix.
-    // And no waiting because there is nothing to decide - a granted
-    // capability changes what arrives, which is visible in what arrives.
-    // Sent here rather than earlier so they cannot be confused with the
-    // ACK/NAK the SASL exchange above is watching for.
-    for cap in WANTED_CAPS {
-        sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some((*cap).to_string())))?;
+    // This used to send one REQ per capability and not wait for the answers,
+    // on the reasoning that a CAP REQ is atomic - a server that does not know
+    // one name refuses the whole line - so a line each meant an old server
+    // could refuse one capability without taking the rest with it.
+    //
+    // That reasoning is sound and the conclusion was wrong, in a way that
+    // only showed up once the list got long. Twenty REQ lines is twenty lines
+    // into a server's flood protection: Libera answers them about one a
+    // second, so RPL_WELCOME arrived after the registration timeout had
+    // already given up, and the account simply failed to connect.
+    //
+    // Asking first fixes both problems at once. Only advertised capabilities
+    // are requested, so nothing can be refused for being unknown, and they
+    // go in one line because there is no longer a reason to spread them out.
+    // A server that answers no LS at all gets the old behaviour, since
+    // something that ancient is exactly the case the atomicity worry was
+    // about.
+    let offered = offered_caps(sender, stream).await;
+    match offered {
+        Some(offered) => {
+            let wanted: Vec<&str> = WANTED_CAPS.iter().copied().filter(|cap| offered.iter().any(|o| o == cap)).collect();
+            if !wanted.is_empty() {
+                sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(wanted.join(" "))))?;
+            }
+        }
+        None => {
+            for cap in WANTED_CAPS {
+                sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some((*cap).to_string())))?;
+            }
+        }
     }
     sender.send(Command::CAP(None, CapSubCommand::END, None, None))?;
     // A server password is not a SASL credential: it goes in PASS, before
@@ -524,6 +576,40 @@ pub(super) fn end_cap_and_register(sender: &Sender, config: &IrcAccountConfig) -
         config.realname.clone().unwrap_or_else(|| config.nick.clone()),
     ))?;
     Ok(())
+}
+
+/// What the server says it can do, or nothing if it will not say.
+///
+/// `CAP LS 302` may answer over several lines, each but the last marked with
+/// a `*` in the parameter before the list. They are gathered until the one
+/// without it, because a capability named on a continuation line is as real
+/// as one named on the first.
+///
+/// A server too old to answer at all is not an error: it times out, this
+/// returns None, and the caller falls back to asking for everything the way
+/// it always did.
+pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
+    if sender.send_cap_ls(NegotiationVersion::V302).is_err() {
+        return None;
+    }
+    let mut offered: Vec<String> = Vec::new();
+    loop {
+        let msg = wait_for(stream, |m| matches!(&m.command, Command::CAP(_, CapSubCommand::LS, _, _))).await.ok()?;
+        let Command::CAP(_, _, ref param, ref suffix) = msg.command else { return None };
+        // A multiline answer puts "*" where a single-line one puts the list,
+        // so the list is whichever field is not the continuation marker.
+        let more = param.as_deref() == Some("*");
+        let list = if more { suffix.as_deref().unwrap_or("") } else { cap_list(param.as_deref(), suffix.as_deref()) };
+        for cap in list.split_whitespace() {
+            // `cap=value` advertises a capability with parameters - SASL
+            // names its mechanisms this way. The name is what is requested.
+            offered.push(cap.split('=').next().unwrap_or(cap).to_string());
+        }
+        if !more {
+            tracing::debug!("irc: server offers {} capabilities: {}", offered.len(), offered.join(" "));
+            return Some(offered);
+        }
+    }
 }
 
 pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<()> {
@@ -784,6 +870,35 @@ mod quit_tests {
 mod cap_tests {
     use super::cap_list;
     use irc::proto::{CapSubCommand, Command, Message};
+
+    /// Which field of a CAP LS line holds the list, and which holds the "*"
+    /// that says another line is coming.
+    ///
+    /// Read by content rather than position, because a live network is what
+    /// proved position wrong: looking for the star in one field only meant
+    /// the last continuation line was taken for the whole answer, and every
+    /// capability advertised after it was silently never requested. Libera
+    /// offers nineteen; this client was seeing nine of them.
+    #[test]
+    fn a_multiline_offer_is_read_to_the_end() {
+        // Both orderings of (param, suffix), because both occur.
+        for (param, suffix) in [(Some("*"), Some("a b")), (Some("a b"), Some("*"))] {
+            let fields = [param, suffix];
+            let more = fields.iter().any(|f| f.map(str::trim) == Some("*"));
+            let caps: Vec<&str> = fields
+                .into_iter()
+                .flatten()
+                .filter(|f| f.trim() != "*")
+                .flat_map(str::split_whitespace)
+                .collect();
+            assert!(more, "a line carrying a star has more to come");
+            assert_eq!(caps, vec!["a", "b"]);
+        }
+
+        // The final line carries no star and is the end of the answer.
+        let fields = [None, Some("c d")];
+        assert!(!fields.iter().any(|f| f.map(str::trim) == Some("*")));
+    }
 
     /// Where the granted capabilities actually live in a parsed CAP ACK.
     ///

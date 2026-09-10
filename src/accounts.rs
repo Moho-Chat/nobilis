@@ -782,6 +782,16 @@ impl AccountStore {
         })
     }
 
+    /// The realname this IRC account registers with, changed while connected.
+    ///
+    /// Written down as well as sent, because `SETNAME` changes it on this
+    /// connection only - the next registration sends `USER` again with
+    /// whatever is stored, and would quietly revert it.
+    pub fn set_irc_realname(&self, account_id: &str, realname: &str) -> Result<bool> {
+        let value = (!realname.is_empty()).then(|| realname.to_string());
+        self.mutate(account_id, |a| a.realname = value.clone())
+    }
+
     fn mutate(&self, account_id: &str, f: impl FnOnce(&mut IrcAccountConfig)) -> Result<bool> {
         let mut irc = self.irc.lock().unwrap();
         match irc.get_mut(account_id) {

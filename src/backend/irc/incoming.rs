@@ -73,7 +73,7 @@ pub(super) async fn handle_message(
     sender: &Sender,
     msg: Message,
     nickserv_wait: &Option<NickservWait>,
-    channels: &mut HashMap<String, HashMap<String, MemberRank>>,
+    channels: &mut HashMap<String, HashMap<String, Who>>,
 ) {
     let from = msg.source_nickname().unwrap_or("").to_string();
     // Kept because the match below moves `msg.command`, and telling a service
@@ -87,6 +87,14 @@ pub(super) async fn handle_message(
     // Carried alongside, because everything below matches on `msg.command`
     // and would otherwise have moved the message out from under it.
     let msg_id = message_id(&msg);
+    // Who the network says this came from, as opposed to what they are
+    // calling themselves. `account-tag` puts the services account on every
+    // line, which is the half that survives a netsplit or a client that was
+    // not watching when they identified; `bot-mode` marks a program as one.
+    // Both are learned here rather than per arm, so a NOTICE from a bot
+    // teaches the roster as much as a PRIVMSG does.
+    let tagged_account = message_tag(&msg, "account").map(str::to_string);
+    let tagged_bot = message_tag(&msg, "bot").is_some();
     // Anything carrying one of our labels is the server accounting for a send
     // - the echo of it, or a refusal - so the send is no longer outstanding.
     settle_send(&msg);
@@ -94,6 +102,30 @@ pub(super) async fn handle_message(
     // as well as on the ISON tick so that on a busy connection it happens at
     // once; the map is empty except between a send and its echo.
     sweep_pending_sends(state);
+
+    // Fold what the tags said into every roster this person is in. Before
+    // the dispatch, so a line that is about to open a conversation has
+    // already taught the member list who sent it.
+    if !from.is_empty() && (tagged_account.is_some() || tagged_bot) {
+        let host = userhost_of(prefix.as_ref());
+        let mut touched: Vec<String> = Vec::new();
+        for (channel, members) in channels.iter_mut() {
+            let Some(who) = members.get_mut(&from) else { continue };
+            let before = who.clone();
+            who.learn(host.as_deref(), tagged_account.as_deref(), tagged_bot.then_some(true));
+            if *who != before {
+                touched.push(channel.clone());
+            }
+        }
+        // Redrawn only where something actually changed: every message
+        // carries these tags, and re-emitting an identical roster on each
+        // one would be a presence event per line of chat.
+        for channel in touched {
+            if let Some(members) = channels.get(&channel) {
+                emit_presence(state, account_id, &channel, members);
+            }
+        }
+    }
 
     match msg.command {
         Command::PRIVMSG(target, body) => {
@@ -155,9 +187,14 @@ pub(super) async fn handle_message(
             }
         }
 
-        Command::JOIN(channel, _, _) => {
+        Command::JOIN(channel, account, _) => {
             let members = channels.entry(channel.clone()).or_default();
-            members.insert(from.clone(), MemberRank::None);
+            let who = members.entry(from.clone()).or_default();
+            // `extended-join` puts the services account on the JOIN itself,
+            // and the hostmask is on every line's prefix whether or not any
+            // capability was granted - so somebody arriving is known as soon
+            // as they arrive rather than after a WHOIS.
+            who.learn(userhost_of(prefix.as_ref()).as_deref(), account.as_deref(), None);
             if from == own_nick {
                 state.runtime.ensure_buffer(state, account_id, &channel, "channel");
                 // What was said before we arrived. Asked for on join rather
@@ -180,6 +217,12 @@ pub(super) async fn handle_message(
                         let _ = sender.send(chathistory_latest(&channel));
                     }
                 }
+                // Who is actually in here. NAMES answers with names and, where
+                // `userhost-in-names` was granted, hostmasks - but never the
+                // services account, and never who is away. WHO answers all
+                // three, so it is asked once per channel on arrival rather
+                // than per person on demand.
+                who::ask(state, account_id, &channel);
             }
             if from != own_nick {
                 let line = format!("{from} entered the room");
@@ -251,7 +294,7 @@ pub(super) async fn handle_message(
                     }
                     let Some(rank) = rank_from_mode(mode) else { continue };
                     let Some(slot) = members.get_mut(target.as_str()) else { continue };
-                    *slot = if granting { rank } else { MemberRank::None };
+                    slot.rank = if granting { rank } else { MemberRank::None };
                     changed = true;
                     let body = format!(
                         "{from} {} {} {} {target}",
@@ -330,8 +373,10 @@ pub(super) async fn handle_message(
 
         Command::NICK(new_nick) => {
             for (channel, members) in channels.iter_mut() {
-                if let Some(rank) = members.remove(&from) {
-                    members.insert(new_nick.clone(), rank);
+                // The record follows the name: a nick change is the same
+                // person, so their host, account and bot mark come with them.
+                if let Some(who) = members.remove(&from) {
+                    members.insert(new_nick.clone(), who);
                     let line = format!("{from} is now known as {new_nick}");
                     state.runtime.record_message(state, account_id, channel, "channel", "*", &line, false, "nick", None, None, false, None, Vec::new(), Vec::new(), None);
                     emit_presence(state, account_id, channel, members);
@@ -486,13 +531,35 @@ pub(super) async fn handle_message(
             }
         }
 
+        // Who somebody is, as opposed to what they are called. Both reply
+        // shapes land in the same place: what differs is which fields the
+        // server had room for, and `Seen` is what is left once that is
+        // resolved.
+        Command::Response(Response::RPL_WHOREPLY, ref args) => {
+            note_seen(state, account_id, channels, who::read_who(args));
+        }
+
+        Command::Raw(ref cmd, ref args) if cmd == "354" => {
+            note_seen(state, account_id, channels, who::read_whox(args));
+        }
+
         Command::Response(Response::RPL_NAMREPLY, args) => {
             // args: [nick, symbol, channel, "name1 @name2 +name3 ..."]
             if let (Some(channel), Some(names)) = (args.get(2), args.get(3)) {
                 let members = channels.entry(channel.clone()).or_default();
                 for raw in names.split_whitespace() {
-                    let (rank, nick) = parse_prefixed_nick(raw);
-                    members.insert(nick.to_string(), rank);
+                    let (rank, entry) = parse_prefixed_nick(raw);
+                    // With `userhost-in-names` the entry is `nick!user@host`
+                    // rather than a bare nick, so the roster is filled in on
+                    // join with no WHO and no round trip. Without it, split
+                    // finds nothing and this is the bare nick it always was.
+                    let (nick, host) = match entry.split_once('!') {
+                        Some((nick, userhost)) => (nick, Some(userhost)),
+                        None => (entry, None),
+                    };
+                    let who = members.entry(nick.to_string()).or_default();
+                    who.rank = rank;
+                    who.learn(host, None, None);
                 }
                 emit_presence(state, account_id, channel, members);
             }
@@ -522,6 +589,13 @@ pub(super) async fn handle_message(
         // nobilis_buffer_kind) - libpurple's own irc_msg_default() fallback
         // numeric handler wrote to this same buffer for the same reason.
         Command::Response(code, args) if is_connection_banner(code) => {
+            // What this server will accept, as opposed to what it was asked
+            // to send. Recorded as well as shown, because WHOX is announced
+            // here and nowhere else - it is the one ratified IRCv3 extension
+            // with no capability of its own to negotiate.
+            if code == Response::RPL_ISUPPORT && args.len() > 2 {
+                state.runtime.note_irc_isupport(account_id, &args[1..args.len() - 1].join(" "));
+            }
             if let Some(text) = banner_text(code, &args) {
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
                 state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
@@ -541,6 +615,53 @@ pub(super) async fn handle_message(
             let caps = cap_list(param.as_deref(), suffix.as_deref());
             tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
             state.runtime.grant_irc_caps(account_id, caps);
+        }
+
+        // Somebody's realname changed without them reconnecting, which is
+        // the whole point of `setname`. Reported where they can be seen; a
+        // realname is not shown in a roster, so this is the only place the
+        // change is ever visible.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("SETNAME") => {
+            let name = args.last().map(String::as_str).unwrap_or("");
+            if !from.is_empty() && !name.is_empty() {
+                let body = format!("{from} is now {name}");
+                for (channel, members) in channels.iter() {
+                    if members.contains_key(&from) {
+                        state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "nick", None, None, false, None, Vec::new(), Vec::new(), None);
+                    }
+                }
+            }
+        }
+
+        // The server explaining itself in words rather than in a numeric.
+        //
+        // `FAIL`, `WARN` and `NOTE` are what a modern server uses for
+        // anything without a numeric of its own - `<command> <code> [context]
+        // :<description>`. Three weights, kept apart: a FAIL is a refusal
+        // somebody needs to see, a WARN is worth showing, a NOTE is the
+        // server being chatty.
+        Command::Raw(ref cmd, ref args)
+            if matches!(cmd.to_ascii_uppercase().as_str(), "FAIL" | "WARN" | "NOTE") =>
+        {
+            let weight = cmd.to_ascii_uppercase();
+            // The description is the trailing parameter; everything between
+            // the code and it is context the server thought worth naming.
+            let description = args.last().map(String::as_str).unwrap_or("");
+            let about = args.first().map(String::as_str).unwrap_or("");
+            let body = match weight.as_str() {
+                "FAIL" if about.is_empty() => description.to_string(),
+                "FAIL" => format!("{about} failed: {description}"),
+                "WARN" => format!("{description}"),
+                _ => description.to_string(),
+            };
+            if body.is_empty() {
+                return;
+            }
+            // A NOTE is not worth interrupting a conversation with; the other
+            // two are about something somebody just tried to do.
+            let kind = if weight == "NOTE" { "system" } else { "error" };
+            let host = server_buffer(account_id);
+            state.runtime.record_message(state, account_id, host, "server", "*", &body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
         }
 
         // What modes a channel currently has, in answer to a bare /mode.
@@ -581,10 +702,24 @@ pub(super) async fn handle_message(
         }
 
         // Somebody asked us to join something.
-        Command::INVITE(_, channel) => {
-            let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-            let body = format!("{from} invites you to {channel}");
-            state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, true, None, Vec::new(), Vec::new(), None);
+        // An invite. Addressed to us it arrives whatever the server offers;
+        // addressed to somebody else it arrives only with `invite-notify`,
+        // and that one goes to the channel it is about rather than to the
+        // server tab, because it is news about a room we are in.
+        //
+        // Filed as a room event either way - a line written *about* somebody
+        // is not a line addressed to them, which is the same rule quit and
+        // part lines follow.
+        Command::INVITE(ref who, ref channel) => {
+            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            if who.eq_ignore_ascii_case(&own) {
+                let host = server_buffer(account_id);
+                let body = format!("{from} invites you to {channel}");
+                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, true, None, Vec::new(), Vec::new(), None);
+            } else if channels.contains_key(channel.as_str()) {
+                let body = format!("{from} invited {who} to {channel}");
+                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
         }
         // Confirmation that ours went out.
         Command::Response(Response::RPL_INVITING, args) => {
@@ -699,12 +834,63 @@ pub(super) fn message_id(msg: &Message) -> Option<String> {
         .map(str::to_string)
 }
 
+/// One message tag's value, where the server sent it.
+///
+/// A tag present with no value ("bot") and a tag present with an empty value
+/// are the same thing on the wire, and both mean "this is set" - which is why
+/// the emptiness test is left to callers rather than done here. `account`
+/// wants a non-empty name; `bot` wants only to know the tag was there.
+pub(super) fn message_tag<'a>(msg: &'a Message, name: &str) -> Option<&'a str> {
+    let tags = msg.tags.as_ref()?;
+    tags.iter().find(|tag| tag.0 == name).map(|tag| tag.1.as_deref().unwrap_or(""))
+}
+
 pub(super) fn server_time(msg: &Message) -> Option<i64> {
     let tags = msg.tags.as_ref()?;
     // Tag is a tuple struct of (name, value); matched by field rather than
     // by pattern to save importing it for one line.
     let raw = tags.iter().find(|tag| tag.0 == "time")?.1.as_deref()?;
     Some(chrono::DateTime::parse_from_rfc3339(raw).ok()?.timestamp())
+}
+
+/// Folds one WHO answer into the roster it is about.
+///
+/// Also records the away flag, which is the same fact `away-notify` reports
+/// and is worth taking from here too: a channel joined mid-session is full of
+/// people whose away state nobody has announced since before we arrived.
+pub(super) fn note_seen(
+    state: &AppState,
+    account_id: &str,
+    channels: &mut HashMap<String, HashMap<String, Who>>,
+    seen: Option<who::Seen>,
+) {
+    let Some(seen) = seen else { return };
+    state.runtime.set_irc_away(account_id, &seen.nick, seen.away);
+    let Some(members) = channels.get_mut(&seen.channel) else { return };
+    let entry = members.entry(seen.nick.clone()).or_default();
+    entry.learn(Some(&seen.host), seen.account.as_deref(), Some(seen.bot));
+    emit_presence(state, account_id, &seen.channel, members);
+}
+
+/// The buffer an account's server messages go to.
+///
+/// An IRC account id is `nick@host` and the server tab is named for the host,
+/// which is a fact this file was repeating inline everywhere it needed one.
+pub(super) fn server_buffer(account_id: &str) -> &str {
+    account_id.split_once('@').map(|(_, host)| host).unwrap_or(account_id)
+}
+
+/// The `user@host` off a line's prefix.
+///
+/// Every line from a person carries one whether or not any capability was
+/// granted, which makes it the cheapest source of a hostmask there is - it
+/// just only ever covers people who have said or done something. WHO and
+/// `userhost-in-names` are what cover the rest of the room.
+pub(super) fn userhost_of(prefix: Option<&Prefix>) -> Option<String> {
+    match prefix {
+        Some(Prefix::Nickname(_, user, host)) if !host.is_empty() => Some(format!("{user}@{host}")),
+        _ => None,
+    }
 }
 
 /// Splits "@+nick" into the rank it carries and the nick itself.
@@ -868,4 +1054,22 @@ mod tests {
         // connection that had no encryption to begin with.
         assert!(sasl_transport_ok(true, true));
     }
+
+    /// `userhost-in-names` turns each NAMES entry into `nick!user@host`, so
+    /// the split has to happen before the name is used as a key - otherwise
+    /// every member is filed under a name nothing else will ever match, and
+    /// the roster fills up with strangers who never speak.
+    #[test]
+    fn a_names_entry_may_carry_the_hostmask_too() {
+        let (rank, entry) = parse_prefixed_nick("@ada!ada@example.org");
+        assert_eq!(rank, MemberRank::Op);
+        assert_eq!(entry.split_once('!'), Some(("ada", "ada@example.org")));
+
+        // And without the capability it is the bare nick it always was.
+        let (rank, entry) = parse_prefixed_nick("+bob");
+        assert_eq!(rank, MemberRank::Voice);
+        assert_eq!(entry.split_once('!'), None);
+        assert_eq!(entry, "bob");
+    }
+
 }

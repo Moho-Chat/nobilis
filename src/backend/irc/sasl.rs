@@ -345,7 +345,7 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
 
     if !offered {
         state.runtime.report_progress(state, account_id, "Server has no SASL; registering normally...");
-        end_cap_and_register(sender, config)?;
+        end_cap_and_register(sender, stream, config).await?;
         return Ok(false);
     }
 
@@ -358,7 +358,7 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
         tried.push(mechanism);
         match attempt_sasl(state, account_id, sender, stream, config, mechanism).await {
             Ok(()) => {
-                end_cap_and_register(sender, config)?;
+                end_cap_and_register(sender, stream, config).await?;
                 return Ok(true);
             }
             Err(SaslRefusal::Fatal(e)) => return Err(e),

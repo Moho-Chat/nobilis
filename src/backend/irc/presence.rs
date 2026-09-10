@@ -238,7 +238,7 @@ pub(super) fn irc_profile(
     account_id: &str,
     nick: &str,
     whois: serde_json::Value,
-    channels: &HashMap<String, HashMap<String, MemberRank>>,
+    channels: &HashMap<String, HashMap<String, Who>>,
 ) -> serde_json::Value {
     let mut profile = crate::profile::pending("irc", account_id, nick);
     profile["pending"] = json!(false);
@@ -267,10 +267,10 @@ pub(super) fn irc_profile(
     let mut roles: Vec<String> = Vec::new();
     let mut moderator = false;
     for (channel, members) in channels {
-        if let Some(rank) = members.get(nick) {
-            if let Some(word) = rank.title() {
+        if let Some(who) = members.get(nick) {
+            if let Some(word) = who.rank.title() {
                 roles.push(format!("{word} in {channel}"));
-                moderator |= rank.can_moderate();
+                moderator |= who.rank.can_moderate();
             }
         }
     }
@@ -317,13 +317,67 @@ pub(super) fn schedule_split_report(state: AppState, account_id: String, channel
     });
 }
 
+/// What is known about somebody in a channel.
+///
+/// A rank on its own was enough while a roster was a list of names with
+/// prefixes on them. Four ratified capabilities each add a fact about the
+/// *person* rather than about their standing in the room, so the entry became
+/// a record: `userhost-in-names` and `whox` give a hostmask, `account-tag`
+/// and `extended-join` give the services account, and `bot-mode` says this
+/// one is a program.
+///
+/// Every field but the rank is optional and stays that way. A network that
+/// grants none of those capabilities produces exactly the roster it always
+/// did, and a field nobody filled in is absent rather than guessed at.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct Who {
+    pub rank: MemberRank,
+    /// `user@host` as the network writes it. What an ignore or a ban wants,
+    /// and the reason there is a WHO at all.
+    pub host: Option<String>,
+    /// The services account this person is identified to.
+    pub account: Option<String>,
+    /// The network says this one is a program.
+    pub bot: bool,
+}
+
+impl Who {
+    /// Somebody who has just arrived and is so far only a rank.
+    pub(super) fn ranked(rank: MemberRank) -> Self {
+        Self { rank, ..Self::default() }
+    }
+
+    /// Fills in what an answer carried, leaving alone what it did not.
+    ///
+    /// Answers arrive in any order and from several sources - NAMES on join,
+    /// a WHO reply moments later, an `account` tag on the first thing
+    /// somebody says - so this merges rather than replaces. A later answer
+    /// that knows less must not erase what an earlier one knew.
+    pub(super) fn learn(&mut self, host: Option<&str>, account: Option<&str>, bot: Option<bool>) {
+        if let Some(host) = host.filter(|h| !h.is_empty()) {
+            self.host = Some(host.to_string());
+        }
+        // "0" and "*" are how the wire says "signed in to nothing", which is
+        // knowledge rather than absence: it clears an account rather than
+        // leaving a stale one in place.
+        match account {
+            Some("0") | Some("*") => self.account = None,
+            Some(account) if !account.is_empty() => self.account = Some(account.to_string()),
+            _ => {}
+        }
+        if let Some(bot) = bot {
+            self.bot = bot;
+        }
+    }
+}
+
 /// Redraws every roster this person appears in.
 ///
 /// Away is a property of the person rather than of a channel, so one AWAY
 /// line moves them in all of them at once - and a roster that was not redrawn
 /// keeps showing them as present, which is precisely the thing away exists to
 /// correct.
-pub(super) fn refresh_rosters_containing(state: &AppState, account_id: &str, nick: &str, channels: &HashMap<String, HashMap<String, MemberRank>>) {
+pub(super) fn refresh_rosters_containing(state: &AppState, account_id: &str, nick: &str, channels: &HashMap<String, HashMap<String, Who>>) {
     for (channel, members) in channels.iter() {
         if members.contains_key(nick) {
             emit_presence(state, account_id, channel, members);
@@ -331,13 +385,18 @@ pub(super) fn refresh_rosters_containing(state: &AppState, account_id: &str, nic
     }
 }
 
-pub(super) fn emit_presence(state: &AppState, account_id: &str, channel: &str, members: &HashMap<String, MemberRank>) {
+pub(super) fn emit_presence(state: &AppState, account_id: &str, channel: &str, members: &HashMap<String, Who>) {
     let buffer_id = crate::model::buffer_id(account_id, channel);
     let member_list: Vec<_> = members
         .iter()
-        .map(|(nick, rank)| json!({
+        .map(|(nick, who)| json!({
             "nick": nick,
-            "prefix": rank.prefix(),
+            "prefix": who.rank.prefix(),
+            // Absent rather than null where the network never said, so a
+            // client can tell "not known" from "known to be nothing".
+            "host": who.host,
+            "account": who.account,
+            "bot": who.bot,
             // Was hardcoded false for everybody, which made the field a
             // decoration rather than a fact. It is the server's answer now -
             // from away-notify where the network has it, and from a WHOIS or
@@ -352,6 +411,55 @@ pub(super) fn emit_presence(state: &AppState, account_id: &str, channel: &str, m
     // change - see Runtime::get_presence and rpc/methods.rs's subscribe.
     state.runtime.set_presence(&buffer_id, member_list.clone());
     state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
+}
+
+#[cfg(test)]
+mod who_tests {
+    use super::*;
+
+    /// Answers arrive from several places in no fixed order - NAMES on join,
+    /// a WHO reply moments later, an `account` tag on the first thing
+    /// somebody says. A later answer that knows less must not erase what an
+    /// earlier one knew, or a roster would flicker between complete and bare.
+    #[test]
+    fn a_later_answer_does_not_erase_an_earlier_one() {
+        let mut who = Who::ranked(MemberRank::Op);
+        who.learn(Some("ada@example.org"), Some("adalovelace"), Some(false));
+        // A plain WHO reply carries no account at all.
+        who.learn(Some("ada@example.org"), None, None);
+        assert_eq!(who.account.as_deref(), Some("adalovelace"));
+        assert_eq!(who.host.as_deref(), Some("ada@example.org"));
+        assert_eq!(who.rank, MemberRank::Op);
+    }
+
+    /// Signing out of services is a fact, not an absence: the wire says so
+    /// with "0" or "*", and a client that treated those as "no answer" would
+    /// keep showing an account somebody has just left.
+    #[test]
+    fn signing_out_clears_the_account() {
+        let mut who = Who::default();
+        who.learn(None, Some("adalovelace"), None);
+        assert_eq!(who.account.as_deref(), Some("adalovelace"));
+
+        who.learn(None, Some("0"), None);
+        assert!(who.account.is_none());
+
+        who.learn(None, Some("adalovelace"), None);
+        who.learn(None, Some("*"), None);
+        assert!(who.account.is_none());
+    }
+
+    /// An empty string is the server having nothing to say, which is not the
+    /// same as it saying there is nothing.
+    #[test]
+    fn nothing_said_changes_nothing() {
+        let mut who = Who::default();
+        who.learn(Some("ada@example.org"), None, None);
+        who.learn(Some(""), Some(""), None);
+        assert_eq!(who.host.as_deref(), Some("ada@example.org"));
+        assert!(who.account.is_none());
+        assert!(!who.bot);
+    }
 }
 
 #[cfg(test)]

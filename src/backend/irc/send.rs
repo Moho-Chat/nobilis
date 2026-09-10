@@ -31,6 +31,27 @@ pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_
                 Ok(())
             }
             "nick" => sender.send(Command::NICK(arg.to_string())).map_err(|e| anyhow!(e)),
+            // The other name you have here. `nick` is what people call you;
+            // this is the sentence about yourself that USER fixed at
+            // registration and that, without `setname`, could only be changed
+            // by dropping the connection and every channel with it.
+            //
+            // Written to the account as well as sent, so the next connection
+            // registers with it rather than reverting to whatever was typed
+            // when the account was made.
+            "setname" => {
+                if arg.is_empty() {
+                    bail!("/setname requires the name to use");
+                }
+                if !state.runtime.irc_has_cap(account_id, "setname") {
+                    bail!("this network cannot change a realname without reconnecting");
+                }
+                sender.send(Command::Raw("SETNAME".to_string(), vec![arg.to_string()]))?;
+                if let Err(e) = state.accounts.set_irc_realname(account_id, arg) {
+                    tracing::debug!("irc[{account_id}]: keeping the new realname: {e:#}");
+                }
+                Ok(())
+            }
             "topic" => sender.send_topic(target_buffer, arg).map_err(|e| anyhow!(e)),
             // Moderator actions - the frontend only offers these in the
             // userlist context menu when the presence data it already has

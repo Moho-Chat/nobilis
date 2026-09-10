@@ -520,8 +520,9 @@ pub fn next_message_id() -> String {
 
 /// "~"/"@"/"%"/"+"/"" by descending rank (daemon/nobilis/model.c's
 /// nobilis_member_prefix).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemberRank {
+    #[default]
     None,
     Voice,
     HalfOp,

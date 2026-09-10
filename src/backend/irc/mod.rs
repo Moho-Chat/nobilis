@@ -12,6 +12,7 @@
 //! - `incoming` - the dispatch over what the server says
 //! - `send` - what this client says, and how it learns the server heard
 //! - `presence` - who is here, via MONITOR, ISON, or a netsplit
+//! - `who` - asking the server who is in a room, and their hostmasks
 //! - `typing` - the one notification IRC learned late
 //! - `history` - CHATHISTORY, where a network has it
 //!
@@ -26,6 +27,7 @@ pub mod connect;
 pub mod history;
 pub mod incoming;
 pub mod presence;
+pub mod who;
 pub mod send;
 pub mod typing;
 pub mod dcc;
@@ -38,6 +40,9 @@ pub use history::*;
 // are wanted by the files beside it.
 use incoming::*;
 pub use presence::*;
+// Not `pub use`: `who` is asked and answered inside this folder, and its
+// names (`ask`, `read_who`) are too plain to sit in the backend's namespace.
+use who::*;
 pub use send::*;
 pub use typing::*;
 pub use sasl::*;

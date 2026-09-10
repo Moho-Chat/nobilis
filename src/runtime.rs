@@ -691,6 +691,8 @@ pub struct Runtime {
     /// (see `backend::discord::mutes`) since the settings routinely arrive in
     /// READY before the channels they are about.
     discord_mutes: Mutex<HashMap<(String, String), DiscordMute>>,
+    /// account -> the RPL_ISUPPORT tokens that server advertised.
+    irc_isupport: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// account -> the room catalogue last read off the site.
     ///
     /// Cached because reading it costs a Tor round trip and a proof-of-work
@@ -949,6 +951,7 @@ impl Runtime {
             silenced: Mutex::new(std::collections::HashSet::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
+            irc_isupport: Mutex::new(HashMap::new()),
             discord_mutes: Mutex::new(HashMap::new()),
             irc_splits: Mutex::new(HashMap::new()),
             irc_whois: Mutex::new(HashMap::new()),
@@ -3068,6 +3071,33 @@ impl Runtime {
 
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+        self.irc_isupport.lock().unwrap().remove(account_id);
+    }
+
+    /// Records the tokens a server advertises in RPL_ISUPPORT.
+    ///
+    /// Kept separately from capabilities because they are a different
+    /// mechanism answering a different question: a capability is negotiated
+    /// and changes what the server sends, while an ISUPPORT token is simply
+    /// announced and describes what the server will accept. WHOX is the one
+    /// that matters here - it is a ratified IRCv3 extension with no CAP of
+    /// its own, advertised this way and no other.
+    pub fn note_irc_isupport(&self, account_id: &str, tokens: &str) {
+        let mut all = self.irc_isupport.lock().unwrap();
+        let known = all.entry(account_id.to_string()).or_default();
+        for token in tokens.split_whitespace() {
+            // `TOKEN=value` and a bare `TOKEN` both count; the name is the
+            // part that answers "does this server do that".
+            known.insert(token.split('=').next().unwrap_or(token).to_ascii_uppercase());
+        }
+    }
+
+    pub fn irc_has_isupport(&self, account_id: &str, token: &str) -> bool {
+        self.irc_isupport
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|tokens| tokens.contains(&token.to_ascii_uppercase()))
     }
 
     pub fn discord_last_interaction(&self, account_id: &str) -> Option<String> {
