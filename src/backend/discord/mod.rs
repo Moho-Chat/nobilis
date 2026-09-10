@@ -32,6 +32,7 @@
 //! - `history` - reading backwards through a conversation
 //! - `media` - thumbnails, and re-signing links Discord expires
 //! - `commands` - slash commands and the interactions that answer them
+//! - `polls` - the card a poll is drawn on, and answering one
 //! - `search` - Discord's own index, asked with its own filters
 //! - `calls` - ringing and being rung; `voice` is the audio itself
 //!
@@ -54,6 +55,7 @@ pub mod login;
 pub mod media;
 pub mod messages;
 pub mod people;
+pub mod polls;
 pub mod presence;
 pub mod search;
 pub mod send;
@@ -70,6 +72,7 @@ pub use login::*;
 pub use media::*;
 pub use messages::*;
 pub use people::*;
+pub use polls::*;
 pub use presence::*;
 pub use search::*;
 pub use send::*;

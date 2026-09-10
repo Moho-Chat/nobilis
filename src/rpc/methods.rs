@@ -3068,6 +3068,25 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
+
+                // Discord's poll is part of a message, so the card's id is
+                // the message id and the vote is addressed to it. Nothing
+                // comes back but an acknowledgement: the recounted tally
+                // arrives as a MESSAGE_UPDATE and redraws the card, the same
+                // as anybody else's vote does.
+                if buffer.account_id.starts_with("discord:") {
+                    let Some(message_id) = state.runtime.live_card(buffer_id, "poll").and_then(|c| c["id"].as_str().map(|s| s.to_string()))
+                    else {
+                        return (None, Some("there is no poll open here".to_string()));
+                    };
+                    let answer = p_str_opt(params, "answerId")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or(option_id);
+                    return match backend::discord::vote_in_poll(state, &buffer.account_id, buffer_id, &message_id, answer).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    };
+                }
             }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));

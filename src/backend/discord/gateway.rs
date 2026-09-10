@@ -759,6 +759,12 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // messages are nothing but their buttons.
                         if let Some(id) = d["id"].as_str() {
                             note_components(state, &thumb_target.0, id, d);
+                            // A poll is drawn on a card as well as written
+                            // into the log: the log records what was asked,
+                            // the card is the thing that can be answered.
+                            if polls::has_poll(d) {
+                                polls::announce(state, &thumb_target.0, id, d);
+                            }
                         }
                         if !thumb_target.1.is_empty() {
                             cache_thumbnails(state.clone(), thumb_target.0, thumb_target.1, thumb_target.2);
@@ -769,6 +775,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
                         let Some(msg_id) = d["id"].as_str() else { continue };
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
+                        // A vote - anybody's - comes back as an update to the
+                        // message carrying the poll, with a recounted
+                        // `results` in it. Before everything below, because
+                        // that update has no edit stamp and no embeds, and
+                        // would otherwise be dropped as nothing having
+                        // happened.
+                        if polls::has_poll(d) {
+                            polls::announce(state, &buffer_id, msg_id, d);
+                        }
                         // No edited_timestamp means nobody edited anything:
                         // this is Discord re-sending the message once it has
                         // finished unfurling a link. That used to be dropped,

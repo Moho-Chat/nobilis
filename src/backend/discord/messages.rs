@@ -747,6 +747,13 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
             continue;
         }
         note_components(state, buffer_id, msg_id, msg);
+        // A poll in the history may still be running - Discord's last hours
+        // or days, so a channel opened for the first time is the commonest
+        // place to meet one. Read oldest first, so the newest still-open poll
+        // is the one left on the card.
+        if polls::has_poll(msg) {
+            polls::announce_if_open(state, buffer_id, msg_id, msg);
+        }
         // Who wrote a message somebody forwarded, which the snapshot does not
         // carry. Backfill needs this as much as the live path: a conversation
         // read for the first time is all history, and a forward in it would
