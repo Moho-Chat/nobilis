@@ -15,6 +15,7 @@
 //! - `who` - asking the server who is in a room, and their hostmasks
 //! - `typing` - the one notification IRC learned late
 //! - `history` - CHATHISTORY, where a network has it
+//! - `drafts` - the IRCv3 drafts that clients ship anyway
 //!
 //! And three that are IRC's own and nothing else's: `dcc`, its direct file
 //! transfer; `sasl`, how a client proves who it is during registration; and
@@ -24,6 +25,7 @@
 //! say `backend::irc::send_message` without knowing which file that is, and
 //! each file opens with `use super::*` to share the import list below.
 pub mod connect;
+pub mod drafts;
 pub mod history;
 pub mod incoming;
 pub mod presence;
@@ -36,6 +38,8 @@ pub mod sasl;
 
 pub use connect::*;
 pub use history::*;
+// Not `pub use`: these are asked and answered inside this folder.
+use drafts::*;
 // Not `pub use`: the dispatch is nobody else's business, but its helpers
 // are wanted by the files beside it.
 use incoming::*;

@@ -127,6 +127,22 @@ pub(super) async fn handle_message(
         }
     }
 
+    // A piece of a multiline message, rather than a message. Held until the
+    // batch closes and then recorded once - without this a paragraph somebody
+    // sent as one thing arrives as four lines, and our own echo of a long
+    // send comes back as its first piece only.
+    if let Some(reference) = message_tag(&msg, "batch").map(str::to_string) {
+        let key = (account_id.to_string(), reference);
+        let mut open = drafts::open_batches().lock().unwrap();
+        if let Some(batch) = open.get_mut(&key) {
+            if let Command::PRIVMSG(_, ref body) = msg.command {
+                let concat = message_tag(&msg, "draft/multiline-concat").is_some();
+                batch.pieces.push((body.clone(), concat));
+                return;
+            }
+        }
+    }
+
     match msg.command {
         Command::PRIVMSG(target, body) => {
             let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
@@ -615,6 +631,96 @@ pub(super) async fn handle_message(
             let caps = cap_list(param.as_deref(), suffix.as_deref());
             tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
             state.runtime.grant_irc_caps(account_id, caps);
+        }
+
+        // The frame around a multiline message. Only multiline batches are
+        // collected: a chathistory batch contains messages that are each
+        // their own message, and folding those together would turn a replayed
+        // conversation into a wall of text.
+        // `Command::BATCH`, not `Raw`: the crate parses this one into a
+        // variant of its own, and a Raw arm for it silently never fires -
+        // which is exactly what happened, and why a 659-byte message came
+        // back as its two pieces after the reassembly was written.
+        Command::BATCH(ref tag, ref sub, ref params) => {
+            let kind = sub.as_ref().map(|s| s.to_str().to_string());
+            let param = params.as_ref().and_then(|p| p.first().cloned());
+            let Some((opening, reference)) = drafts::read_batch_tag(tag) else { return };
+            let key = (account_id.to_string(), reference);
+            if opening {
+                // Case-insensitively: the crate parses the type through an
+                // uppercasing enum, so what a server sent as
+                // `draft/multiline` arrives as `DRAFT/MULTILINE`. Comparing
+                // exactly meant the batch was never opened, every piece fell
+                // through as an ordinary message, and the reassembly below
+                // had nothing to reassemble.
+                if kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("draft/multiline")) {
+                    if let Some(target) = param {
+                        drafts::open_batches()
+                            .lock()
+                            .unwrap()
+                            .insert(key, drafts::Assembling { target, pieces: Vec::new() });
+                    }
+                }
+                return;
+            }
+            let Some(batch) = drafts::open_batches().lock().unwrap().remove(&key) else { return };
+            if batch.pieces.is_empty() {
+                return;
+            }
+            let body = batch.finish();
+            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            let kind = buffer_kind_hint(&batch.target);
+            // Whose conversation it belongs in, by the same rule a single
+            // PRIVMSG follows: a channel is itself, and a direct message is
+            // filed under whoever is not us.
+            let buffer = if is_channel(&batch.target) || from.eq_ignore_ascii_case(&own) {
+                batch.target.clone()
+            } else {
+                from.clone()
+            };
+            state.runtime.record_message_at(state, account_id, &buffer, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+        }
+
+        // A message somebody took back. IRC never had this; every other
+        // service here always did, which is why the entry existed in the menu
+        // and did nothing on this one.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("REDACT") => {
+            let (Some(target), Some(msg_id)) = (args.first(), args.get(1)) else { return };
+            let buffer = if is_channel(target) { target.clone() } else { from.clone() };
+            state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &buffer), msg_id);
+        }
+
+        // Where this conversation has been read up to, according to the
+        // server - which is to say, according to whatever other client of
+        // this account last looked at it.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("MARKREAD") => {
+            if let Some((target, at)) = drafts::read_marker(args) {
+                state.runtime.note_irc_read_marker(state, account_id, &target, at);
+            }
+        }
+
+        // A channel that changed its name. Without this it looks like leaving
+        // one channel and joining another, and the conversation is split in
+        // two with the history stranded in a room nobody is in.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("RENAME") => {
+            let (Some(old_name), Some(new_name)) = (args.first(), args.get(1)) else { return };
+            if let Some(members) = channels.remove(old_name.as_str()) {
+                channels.insert(new_name.clone(), members);
+            }
+            // The buffer's identity is its name, so this is a move rather
+            // than a rename: the old one goes and the new one arrives
+            // carrying what was said. Ordered that way round on purpose -
+            // creating first would briefly show the channel twice.
+            state.runtime.rename_irc_buffer(state, account_id, old_name, new_name);
+            let reason = args.get(2).map(String::as_str).filter(|r| !r.is_empty());
+            let line = match reason {
+                Some(why) => format!("{old_name} is now called {new_name} ({why})"),
+                None => format!("{old_name} is now called {new_name}"),
+            };
+            state.runtime.record_message(state, account_id, new_name, "channel", "*", &line, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            if let Some(members) = channels.get(new_name.as_str()) {
+                emit_presence(state, account_id, new_name, members);
+            }
         }
 
         // Somebody's realname changed without them reconnecting, which is

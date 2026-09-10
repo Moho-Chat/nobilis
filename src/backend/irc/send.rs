@@ -330,6 +330,30 @@ pub(super) fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode
 }
 
 pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
+    // Longer than a line. Without `draft/multiline` the server truncates at
+    // its own limit and the rest is simply gone, which is the one failure
+    // here that loses what somebody wrote - so where the network offers the
+    // capability the message goes as one message in several pieces, and where
+    // it does not the pieces go as separate messages rather than as a cut.
+    let pieces = drafts::split_for_wire(body, drafts::SAFE_LINE);
+    if pieces.len() > 1 {
+        let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
+        if state.runtime.irc_has_cap(account_id, "draft/multiline") {
+            drafts::send_multiline(sender, target, &pieces)?;
+            // Recorded whole, because whole is what was sent - the pieces are
+            // a transport detail and putting them in the log as separate
+            // lines would be showing the reader the envelope.
+            if !state.runtime.irc_has_cap(account_id, "echo-message") {
+                state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+            }
+            return Ok(());
+        }
+        for piece in &pieces {
+            send_plain(state, account_id, sender, target, piece)?;
+        }
+        return Ok(());
+    }
+
     // Where the server echoes what we send, it is the echo that gets written:
     // it carries the server's id and time, and it is proof the message was
     // actually delivered rather than merely handed over. Without the

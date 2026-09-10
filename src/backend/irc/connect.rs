@@ -506,6 +506,23 @@ pub(super) const WANTED_CAPS: &[&str] = &[
     // - who they are identified as and whether they are away, rather than a
     // bare "they are online".
     "extended-monitor",
+    // Four drafts, requested because WeeChat, Halloy and bIRC already ship
+    // them: a draft nobody has built can still change underneath an
+    // implementation, and a draft three clients interoperate on is a protocol
+    // whatever the registry calls it. Each degrades to exactly the old
+    // behaviour where it is not offered. See `drafts.rs`.
+    //
+    // A message longer than a line, sent as one message rather than cut.
+    "draft/multiline",
+    // Taking a message back, which IRC has never had and every other service
+    // here has always had.
+    "draft/message-redaction",
+    // Where this conversation was read up to, kept by the server so a second
+    // client starts where the first left off.
+    "draft/read-marker",
+    // A channel changing its name without becoming a second channel with the
+    // first one's history stranded in it.
+    "draft/channel-rename",
 ];
 
 /// The capabilities named by a CAP ACK, from whichever field they arrived in.

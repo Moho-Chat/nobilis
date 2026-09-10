@@ -836,6 +836,27 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                // IRC keeps a read position too, where the network offers
+                // `draft/read-marker` - so a channel read here is read on the
+                // phone, which is the whole point of the server holding it.
+                Some(buffer) if buffer.account_id.starts_with("irc:") || state.accounts.get_irc(&buffer.account_id).is_some() => {
+                    if state.runtime.irc_has_cap(&buffer.account_id, "draft/read-marker") {
+                        if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
+                            let target = buffer.name.clone();
+                            let at = params
+                                .get("ts")
+                                .and_then(|v| v.as_i64())
+                                .unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64);
+                            // Best-effort, like the Matrix one above: failing
+                            // to say a channel has been read must not make
+                            // reading it look like an error.
+                            if let Err(e) = backend::irc::drafts::mark_read(&sender, &target, at) {
+                                tracing::debug!("irc read marker: {e:#}");
+                            }
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 _ => (Some(ok_node()), None),
             }
         }
@@ -2546,6 +2567,25 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e.to_string())),
                     },
                 },
+                // IRC, where the network offers `draft/message-redaction`.
+                // Every other service here has always had this; IRC is where
+                // the menu entry existed and did nothing.
+                Some(buffer) if state.accounts.get_irc(&buffer.account_id).is_some() => {
+                    if !state.runtime.irc_has_cap(&buffer.account_id, "draft/message-redaction") {
+                        return (None, Some("this network has no way to take a message back".to_string()));
+                    }
+                    let Some(sender) = state.runtime.irc_sender(&buffer.account_id) else {
+                        return (None, Some("account not connected".to_string()));
+                    };
+                    match backend::irc::drafts::redact(&sender, &buffer.name, msg_id, None) {
+                        // Not removed here: the server decides whether this
+                        // was allowed and says so by sending REDACT back,
+                        // which is what removes it. Taking it off screen now
+                        // would be showing a deletion that may not happen.
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
                 Some(_) => (None, Some("deleting isn't supported for this service".to_string())),
             }
         }

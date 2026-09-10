@@ -385,6 +385,26 @@ impl Store {
     /// with any messages already (from a prior backfill or from having
     /// seen live traffic) is left alone rather than re-fetched, since
     /// there's no per-message dedup against Discord's own message ids here.
+    /// Moves everything said in one buffer to another name.
+    ///
+    /// A buffer's identity here is its name, so a channel that renames itself
+    /// is a different buffer as far as storage is concerned - and its history
+    /// would be stranded under a name nobody is in. Returns how many messages
+    /// moved, which is worth logging: a rename that silently moved nothing is
+    /// the shape of this going wrong.
+    pub fn move_buffer(&self, old_id: &str, new_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        // OR IGNORE rather than a plain UPDATE: the destination may already
+        // hold a message with the same id if the server sent anything under
+        // the new name before the rename was processed, and a primary-key
+        // collision would abort the whole move.
+        let moved = conn.execute(
+            "UPDATE OR IGNORE messages SET buffer_id = ?2 WHERE buffer_id = ?1",
+            params![old_id, new_id],
+        )?;
+        Ok(moved)
+    }
+
     pub fn has_messages(&self, buffer_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE buffer_id = ?1)", params![buffer_id], |row| row.get(0))?;

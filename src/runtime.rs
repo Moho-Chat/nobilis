@@ -1167,6 +1167,40 @@ impl Runtime {
         }
     }
 
+    /// Follows a channel that changed its name, carrying its history with it.
+    ///
+    /// The buffer's identity is its name, so this is a move rather than a
+    /// rename: the old buffer goes and a new one arrives holding what was
+    /// said. Done in that order deliberately - creating first would show the
+    /// channel twice for as long as it took to remove the old one.
+    pub fn rename_irc_buffer(&self, state: &AppState, account_id: &str, old_name: &str, new_name: &str) {
+        let old_id = crate::model::buffer_id(account_id, old_name);
+        let new_id = crate::model::buffer_id(account_id, new_name);
+        match state.store.move_buffer(&old_id, &new_id) {
+            Ok(moved) => tracing::debug!("irc[{account_id}]: {old_name} renamed to {new_name}, {moved} messages moved"),
+            Err(e) => tracing::warn!("irc[{account_id}]: moving {old_name} to {new_name}: {e:#}"),
+        }
+        self.remove_buffer(state, &old_id);
+        self.ensure_buffer(state, account_id, new_name, "channel");
+        self.refresh_buffer_activity(state, &new_id);
+    }
+
+    /// Where another client of this account says a conversation was read to.
+    ///
+    /// Passed straight on rather than stored. Which messages count as read is
+    /// a question the frontend owns - it is the thing that knows what is on
+    /// screen - and a daemon that kept a second answer would be keeping one
+    /// that disagrees.
+    pub fn note_irc_read_marker(&self, state: &AppState, account_id: &str, target: &str, at: i64) {
+        state.events.emit(
+            "readMarker",
+            serde_json::json!({
+                "bufferId": crate::model::buffer_id(account_id, target),
+                "ts": at,
+            }),
+        );
+    }
+
     pub fn remove_buffer(&self, state: &AppState, buffer_id: &str) {
         self.buffers.lock().unwrap().remove(buffer_id);
         // And what pointed at it. A Matrix room whose buffer went away but
