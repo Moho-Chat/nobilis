@@ -274,10 +274,9 @@ pub(super) fn handle_event(
             );
         }
 
-        // A poll running on stream. Announced rather than made interactive:
-        // voting goes through the player, and a chat client showing the
-        // question and the options is the part somebody reading chat is
-        // missing - a running poll is otherwise invisible here.
+        // A poll running on stream, written into the log as a line and drawn
+        // on a card that can be voted in - the line is the record of what was
+        // asked, the card is the thing somebody can answer.
         //
         // One line per poll, rewritten as the votes come in. Kick sends this
         // event on every vote, so recording each one put a near-identical

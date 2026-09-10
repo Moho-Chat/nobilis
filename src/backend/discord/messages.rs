@@ -421,10 +421,13 @@ pub(super) fn extract_stickers(d: &Value) -> Vec<Attachment> {
 
 /// A poll, as the text of the question and its options.
 ///
-/// Voting is Discord's own interactive machinery and is not implemented (see
-/// the slash-commands issue), but a poll-only message used to arrive as
-/// nothing - so a channel would go quiet in the middle of a decision being
-/// made. This is what was actually asked, which is the part that matters.
+/// This is the record of what was asked, written into the log. Answering one
+/// is a separate thing in `polls.rs`, which draws the same poll on a card -
+/// the log keeps what was asked, the card is the part that can be acted on.
+///
+/// Worth having on its own even so: a poll-only message used to arrive as
+/// nothing, so a channel would go quiet in the middle of a decision being
+/// made.
 pub(super) fn extract_poll(d: &Value) -> Option<String> {
     let poll = d.get("poll").filter(|p| p.is_object())?;
     let question = poll["question"]["text"].as_str().unwrap_or("Poll");

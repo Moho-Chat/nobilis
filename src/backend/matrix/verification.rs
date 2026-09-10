@@ -1,7 +1,8 @@
-//! Interactive session verification (SAS - "compare emoji") between two of
-//! *our own* logged-in sessions. Self-verification only - no cross-user
-//! identity verification (a materially bigger feature, not what was asked
-//! for). Doesn't change the existing decrypt/share trust model
+//! Interactive verification (SAS - "compare emoji"), between two of *our own*
+//! logged-in sessions and, since `start_user_verification`, with somebody
+//! else's identity as well. What is still absent is QR-code verification:
+//! this compares emoji or it does nothing. Doesn't change the existing
+//! decrypt/share trust model
 //! (`TrustRequirement::Untrusted`/`CollectStrategy::AllDevices` in
 //! crypto.rs stay as-is) - verification here is purely informational/
 //! trust-building for the user.

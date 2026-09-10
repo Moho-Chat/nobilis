@@ -1085,9 +1085,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
 
                     "VOICE_SERVER_UPDATE" => {
-                        // The endpoint and token an audio implementation would
-                        // open its own connection to. Reported rather than
-                        // used: this build establishes the session only.
+                        // The endpoint and token the audio connection is
+                        // opened against. Announced to the client as well as
+                        // used, because a frontend showing a call wants to
+                        // know the session moved even though it is this
+                        // daemon that carries the audio.
                         state.events.emit(
                             "discordVoiceServer",
                             json!({
