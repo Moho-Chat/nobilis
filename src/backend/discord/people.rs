@@ -309,26 +309,27 @@ pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id
 /// `username` accepts either a modern unique username or a legacy
 /// `name#1234` pair; the discriminator half only still means anything for
 /// accounts that never migrated off the old system.
-pub async fn add_friend(state: &AppState, account_id: &str, username: &str) -> Result<()> {
+///
+/// Discord asks for a captcha on this one more than on anything else, so the
+/// answer may be a question rather than a yes: see `send_answerable`. Handed
+/// one, the same request goes out again with it attached.
+pub async fn add_friend(state: &AppState, account_id: &str, username: &str, captcha: Option<&CaptchaAnswer>) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let (name, discriminator) = match username.trim().rsplit_once('#') {
         Some((n, d)) if d.chars().all(|c| c.is_ascii_digit()) && !d.is_empty() => (n, Some(d)),
         _ => (username.trim(), None),
     };
-    let resp = send_write(
-        http_client()
-        .post(format!("{API_BASE}/users/@me/relationships"))
-        .header("Authorization", &cfg.token)
-        .json(&json!({ "username": name, "discriminator": discriminator }))
-        )
+    send_answerable(
+        with_captcha(
+            http_client()
+                .post(format!("{API_BASE}/users/@me/relationships"))
+                .header("Authorization", &cfg.token)
+                .json(&json!({ "username": name, "discriminator": discriminator })),
+            captcha,
+        ),
+        "adding a friend",
+    )
     .await
-        .context("sending Discord friend request")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("{}", discord_error_text(status, &text, "adding a friend"));
-    }
-    Ok(())
 }
 
 /// Answers a friend request: accepts it, or refuses it.

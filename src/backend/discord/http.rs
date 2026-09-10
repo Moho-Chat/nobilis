@@ -113,6 +113,104 @@ pub(super) fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// What Discord wants answered before it will do something.
+///
+/// Not an error, though it arrives as one. Discord refuses certain actions -
+/// adding a friend, joining a server - from anything it scores as automated,
+/// and says so by naming a captcha rather than by saying no. Answered, the
+/// same request goes through.
+///
+/// `rqdata` is hCaptcha's enterprise binding: it ties the challenge to this
+/// account and this action, so a token solved for something else is not a
+/// token for this. It is passed to the widget verbatim and comes back with
+/// `rqtoken` beside it.
+#[derive(Clone, Debug)]
+pub struct CaptchaAsked {
+    pub sitekey: String,
+    pub service: String,
+    pub rqdata: Option<String>,
+    pub rqtoken: Option<String>,
+}
+
+impl CaptchaAsked {
+    /// Reads a captcha demand out of a refusal, if that is what it is.
+    pub fn read(body: &Value) -> Option<Self> {
+        // The demand is `captcha_key`, an array of reasons. Everything else
+        // is optional: a site with no enterprise binding sends no rqdata, and
+        // a very old response names no service.
+        body.get("captcha_key")?;
+        Some(Self {
+            sitekey: body["captcha_sitekey"].as_str().unwrap_or_default().to_string(),
+            service: body["captcha_service"].as_str().unwrap_or("hcaptcha").to_string(),
+            rqdata: body["captcha_rqdata"].as_str().map(str::to_string),
+            rqtoken: body["captcha_rqtoken"].as_str().map(str::to_string),
+        })
+    }
+
+    /// What a client needs to put the widget on screen and come back.
+    pub fn to_question(&self) -> Value {
+        json!({
+            "captcha": {
+                "sitekey": self.sitekey,
+                "service": self.service,
+                "rqdata": self.rqdata,
+                "rqtoken": self.rqtoken,
+            }
+        })
+    }
+}
+
+/// A solved captcha, on its way back to the request that asked for one.
+#[derive(Clone, Debug, Default)]
+pub struct CaptchaAnswer {
+    pub key: String,
+    pub rqtoken: Option<String>,
+}
+
+impl CaptchaAnswer {
+    /// Reads the answer off an RPC's parameters, where one was sent.
+    pub fn from_params(params: &Value) -> Option<Self> {
+        let key = params.get("captchaKey")?.as_str()?.to_string();
+        if key.is_empty() {
+            return None;
+        }
+        Some(Self { key, rqtoken: params.get("captchaRqtoken").and_then(|v| v.as_str()).map(str::to_string) })
+    }
+}
+
+/// Puts a solved captcha on a request, where there is one.
+///
+/// Discord reads it from headers rather than the body, which is what lets the
+/// retry be the same call with two more lines on it rather than a second code
+/// path per action.
+pub(super) fn with_captcha(request: reqwest::RequestBuilder, answer: Option<&CaptchaAnswer>) -> reqwest::RequestBuilder {
+    let Some(answer) = answer else { return request };
+    let request = request.header("X-Captcha-Key", &answer.key);
+    match &answer.rqtoken {
+        Some(rqtoken) => request.header("X-Captcha-Rqtoken", rqtoken),
+        None => request,
+    }
+}
+
+/// Runs a write that Discord may want a captcha for.
+///
+/// Three outcomes rather than two: it worked, Discord asked a question, or it
+/// failed. The question is not an error - it is the client's turn - so it
+/// comes back as a value for the caller to hand on.
+pub(super) async fn send_answerable(request: reqwest::RequestBuilder, doing: &str) -> Result<Value> {
+    let resp = send_write(request).await?;
+    if resp.status().is_success() {
+        return Ok(json!({ "ok": true }));
+    }
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if let Some(asked) = CaptchaAsked::read(&parsed) {
+        return Ok(asked.to_question());
+    }
+    bail!("{}", discord_error_text(status, &text, doing));
+}
+
 /// Discord's per-field complaints, flattened into one line.
 ///
 /// "Invalid Form Body" on its own says nothing a person can act on; the thing
@@ -131,11 +229,11 @@ pub(super) fn http_client() -> &'static reqwest::Client {
 /// instead, is the only honest response.
 pub(super) fn discord_error_text(status: reqwest::StatusCode, body: &str, doing: &str) -> String {
     let parsed: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    // Only reached where the caller had no way to offer the challenge - a
+    // write that does not go through `send_answerable`. Where one does, the
+    // captcha is a question the client answers rather than a refusal.
     if parsed.get("captcha_key").is_some() {
-        return format!(
-            "Discord asked for a captcha before {doing}. That cannot be answered from here - \
-             do it in Discord's own app or on discord.com, and it will work here afterwards."
-        );
+        return format!("Discord asked for a captcha before {doing}, and this action has no way to show one.");
     }
     if let Some(message) = parsed.get("message").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) {
         return message.to_string();
@@ -203,18 +301,80 @@ mod pacing_tests {
 }
 
 #[cfg(test)]
+mod captcha_tests {
+    use super::*;
+
+    /// The enterprise shape, which is what Discord actually sends: a sitekey
+    /// to render and an `rqdata` binding the challenge to this account and
+    /// this action. Losing the binding would mean solving the right puzzle
+    /// and being told no.
+    #[test]
+    fn a_refusal_carrying_a_challenge_is_a_question() {
+        let body: Value = serde_json::from_str(
+            r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"4c672d35","captcha_service":"hcaptcha",
+                "captcha_rqdata":"bound-to-this","captcha_rqtoken":"rq-1"}"#,
+        )
+        .unwrap();
+        let asked = CaptchaAsked::read(&body).expect("a challenge");
+        assert_eq!(asked.sitekey, "4c672d35");
+        assert_eq!(asked.rqdata.as_deref(), Some("bound-to-this"));
+        assert_eq!(asked.rqtoken.as_deref(), Some("rq-1"));
+
+        let question = asked.to_question();
+        assert_eq!(question["captcha"]["sitekey"], "4c672d35");
+        assert_eq!(question["captcha"]["rqdata"], "bound-to-this");
+    }
+
+    /// Without the enterprise binding there is still a challenge to show, and
+    /// the two optional halves are absent rather than empty strings.
+    #[test]
+    fn a_plain_challenge_is_still_a_challenge() {
+        let body: Value = serde_json::from_str(r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"abc"}"#).unwrap();
+        let asked = CaptchaAsked::read(&body).expect("a challenge");
+        // Named even when Discord does not name it: hcaptcha is what it is.
+        assert_eq!(asked.service, "hcaptcha");
+        assert!(asked.rqdata.is_none());
+        assert!(asked.rqtoken.is_none());
+    }
+
+    /// An ordinary refusal must not be read as a question, or every failure
+    /// would put a captcha on screen.
+    #[test]
+    fn an_ordinary_refusal_is_not_a_question() {
+        let body: Value = serde_json::from_str(r#"{"message":"You are being rate limited.","code":20016}"#).unwrap();
+        assert!(CaptchaAsked::read(&body).is_none());
+        assert!(CaptchaAsked::read(&Value::Null).is_none());
+    }
+
+    /// The answer only counts when there is one. An absent or empty
+    /// `captchaKey` is no answer, not an empty answer - sending a blank
+    /// header would fail the request in a way nothing could explain.
+    #[test]
+    fn an_answer_is_read_only_when_there_is_one() {
+        let with = serde_json::json!({ "captchaKey": "P1_eyJ0", "captchaRqtoken": "rq-1" });
+        let answer = CaptchaAnswer::from_params(&with).expect("an answer");
+        assert_eq!(answer.key, "P1_eyJ0");
+        assert_eq!(answer.rqtoken.as_deref(), Some("rq-1"));
+
+        assert!(CaptchaAnswer::from_params(&serde_json::json!({})).is_none());
+        assert!(CaptchaAnswer::from_params(&serde_json::json!({ "captchaKey": "" })).is_none());
+    }
+}
+
+#[cfg(test)]
 mod error_tests {
     use super::*;
 
-    /// A captcha is not a failure that retrying fixes, and it is the one
-    /// answer that has to say what to do instead.
+    /// A captcha reaching this function at all means the action had no way to
+    /// show one - `send_answerable` turns it into a question everywhere that
+    /// can. What is left to do is say so in a sentence rather than dump the
+    /// body, which still names the action so it is clear what was refused.
     #[test]
-    fn a_captcha_is_explained_rather_than_dumped() {
+    fn a_captcha_with_nowhere_to_go_is_explained_rather_than_dumped() {
         let body = r#"{"captcha_key":["captcha-required"],"captcha_sitekey":"abc","captcha_service":"hcaptcha"}"#;
         let text = discord_error_text(reqwest::StatusCode::BAD_REQUEST, body, "adding a friend");
         assert!(text.contains("captcha"), "got {text}");
         assert!(text.contains("adding a friend"), "got {text}");
-        assert!(text.contains("discord.com"), "should say where it can be done: {text}");
         // The raw body is not what somebody reads.
         assert!(!text.contains("captcha_sitekey"), "got {text}");
     }

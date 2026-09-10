@@ -7,23 +7,24 @@
 
 use super::*;
 
-pub async fn join_guild(state: &AppState, account_id: &str, invite: &str) -> Result<()> {
+/// Accepts an invite.
+///
+/// Discord commonly wants a captcha for this, so the answer may be a question
+/// rather than a yes - see `send_answerable`.
+pub async fn join_guild(state: &AppState, account_id: &str, invite: &str, captcha: Option<&CaptchaAnswer>) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let code = invite.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(invite.trim());
-    let resp = send_write(
-        http_client()
-        .post(format!("{API_BASE}/invites/{code}"))
-        .header("Authorization", &cfg.token)
-        .json(&json!({}))
-        )
+    send_answerable(
+        with_captcha(
+            http_client()
+                .post(format!("{API_BASE}/invites/{code}"))
+                .header("Authorization", &cfg.token)
+                .json(&json!({})),
+            captcha,
+        ),
+        "joining that server",
+    )
     .await
-        .context("accepting Discord invite")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("{}", discord_error_text(status, &text, "joining that server"));
-    }
-    Ok(())
 }
 
 /// Makes an invite to a conversation, and returns the link.
@@ -47,13 +48,14 @@ pub async fn create_invite(
     max_age: i64,
     max_uses: i64,
     temporary: bool,
-) -> Result<String> {
+    captcha: Option<&CaptchaAnswer>,
+) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .context("no known Discord channel for this conversation")?;
-    let resp = send_write(
+    let resp = send_write(with_captcha(
         http_client()
             .post(format!("{API_BASE}/channels/{channel_id}/invites"))
             .header("Authorization", &cfg.token)
@@ -62,12 +64,19 @@ pub async fn create_invite(
                 "max_uses": max_uses,
                 "temporary": temporary,
             })),
-    )
+        captcha,
+    ))
     .await
     .context("making an invite")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        // Not known to be captcha'd for a member who already holds the
+        // permission, but it costs one branch to be ready if it ever is.
+        if let Some(asked) = CaptchaAsked::read(&parsed) {
+            return Ok(asked.to_question());
+        }
         bail!("{}", discord_error_text(status, &text, "making an invite"));
     }
     let answer: Value = resp.json().await.context("reading the invite back")?;
@@ -76,7 +85,7 @@ pub async fn create_invite(
     // domain. `discord.gg` rather than `discord.com/invite` because that is
     // the short form the official client copies.
     let code = answer["code"].as_str().context("Discord made an invite with no code in it")?;
-    Ok(format!("https://discord.gg/{code}"))
+    Ok(json!({ "invite": format!("https://discord.gg/{code}") }))
 }
 
 /// Creates a brand-new guild owned by this account - Discord's own "Create

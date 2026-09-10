@@ -862,14 +862,20 @@ pub async fn dispatch(
             }
         }
 
+        // Any of the three below may answer with a captcha rather than with a
+        // yes. That is not an error - it is Discord's turn asking a question,
+        // and the client can put it on screen - so it comes back as a result
+        // carrying the challenge, and the same call is made again with the
+        // answer in `captchaKey`.
         "joinDiscordGuild" => {
             let (account_id, invite) = match (p_str_opt(params, "accountId"), p_str_opt(params, "invite")) {
                 (Some(a), Some(i)) => (a, i),
                 _ => return (None, Some("joinDiscordGuild requires \"accountId\" and \"invite\"".to_string())),
             };
-            match backend::discord::join_guild(state, account_id, invite).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+            let answer = backend::discord::CaptchaAnswer::from_params(params);
+            match backend::discord::join_guild(state, account_id, invite, answer.as_ref()).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -948,9 +954,10 @@ pub async fn dispatch(
                 (Some(a), Some(u)) => (a, u),
                 _ => return (None, Some("addDiscordFriend requires \"accountId\" and \"username\"".to_string())),
             };
-            match backend::discord::add_friend(state, account_id, username).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+            let answer = backend::discord::CaptchaAnswer::from_params(params);
+            match backend::discord::add_friend(state, account_id, username, answer.as_ref()).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -988,8 +995,9 @@ pub async fn dispatch(
             let max_age = params.get("maxAge").and_then(|v| v.as_i64()).unwrap_or(86_400);
             let max_uses = params.get("maxUses").and_then(|v| v.as_i64()).unwrap_or(0);
             let temporary = params.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false);
-            match backend::discord::create_invite(state, &buffer.account_id, buffer_id, max_age, max_uses, temporary).await {
-                Ok(link) => (Some(serde_json::json!({ "invite": link })), None),
+            let answer = backend::discord::CaptchaAnswer::from_params(params);
+            match backend::discord::create_invite(state, &buffer.account_id, buffer_id, max_age, max_uses, temporary, answer.as_ref()).await {
+                Ok(v) => (Some(v), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
