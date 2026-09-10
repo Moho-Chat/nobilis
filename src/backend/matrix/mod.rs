@@ -52,6 +52,7 @@ pub mod profile;
 pub mod receipts;
 pub mod relock;
 pub mod send;
+pub mod server;
 pub mod sync;
 pub mod timeline;
 
@@ -65,6 +66,7 @@ pub use receipts::*;
 // names would say nothing useful in the backend's namespace.
 use relock::*;
 pub use send::*;
+pub use server::*;
 pub use sync::*;
 // Not `pub use`: an event's handling is this folder's business alone, but
 // the files beside it want the helpers.

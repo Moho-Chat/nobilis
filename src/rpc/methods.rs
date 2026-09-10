@@ -1268,7 +1268,20 @@ pub async fn dispatch(
         "matrixOwnProfile" => match p_str_opt(params, "accountId") {
             None => (None, Some("matrixOwnProfile requires \"accountId\"".to_string())),
             Some(account_id) => match backend::matrix::own_profile(state, account_id).await {
-                Ok(profile) => (Some(profile), None),
+                Ok(mut profile) => {
+                    // What this homeserver will let the account change, read
+                    // from `/capabilities` on connect. Reported so a field
+                    // the server would refuse can be shown as fixed rather
+                    // than offered and then rejected - "absent means
+                    // permitted", so a server that says nothing changes
+                    // nothing here.
+                    if let Some(facts) = state.runtime.matrix_server_facts(account_id) {
+                        profile["canChangeName"] = serde_json::json!(facts.can_change_displayname);
+                        profile["canChangeAvatar"] = serde_json::json!(facts.can_change_avatar);
+                        profile["canChangePassword"] = serde_json::json!(facts.can_change_password);
+                    }
+                    (Some(profile), None)
+                }
                 Err(e) => (None, Some(format!("{e:#}"))),
             },
         },
@@ -1277,6 +1290,13 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("setMatrixProfileName requires \"accountId\"".to_string()));
             };
+            // Refused here rather than by the homeserver, where it can be
+            // said in words. A locked-down server answers the attempt with a
+            // 403 that reaches somebody as an error about a thing they were
+            // invited to do.
+            if state.runtime.matrix_server_facts(account_id).is_some_and(|f| !f.can_change_displayname) {
+                return (None, Some("this homeserver does not allow changing your display name".to_string()));
+            }
             match backend::matrix::set_own_display_name(state, account_id, p_str(params, "name", "")).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -1288,6 +1308,9 @@ pub async fn dispatch(
                 (Some(a), Some(p)) => (a, p),
                 _ => return (None, Some("setMatrixProfileAvatar requires \"accountId\" and \"path\"".to_string())),
             };
+            if state.runtime.matrix_server_facts(account_id).is_some_and(|f| !f.can_change_avatar) {
+                return (None, Some("this homeserver does not allow changing your avatar".to_string()));
+            }
             match backend::matrix::set_own_avatar(state, account_id, path).await {
                 Ok(url) => (Some(serde_json::json!({ "avatarUrl": url })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),

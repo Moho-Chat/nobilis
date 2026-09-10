@@ -691,6 +691,8 @@ pub struct Runtime {
     /// (see `backend::discord::mutes`) since the settings routinely arrive in
     /// READY before the channels they are about.
     discord_mutes: Mutex<HashMap<(String, String), DiscordMute>>,
+    /// account -> what its homeserver says it can do.
+    matrix_server_facts: Mutex<HashMap<String, crate::backend::matrix::server::ServerFacts>>,
     /// account -> the RPL_ISUPPORT tokens that server advertised.
     irc_isupport: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// Channel buffers whose roster has been asked for on this connection.
@@ -953,6 +955,7 @@ impl Runtime {
             silenced: Mutex::new(std::collections::HashSet::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
+            matrix_server_facts: Mutex::new(HashMap::new()),
             irc_isupport: Mutex::new(HashMap::new()),
             irc_rostered: Mutex::new(std::collections::HashSet::new()),
             discord_mutes: Mutex::new(HashMap::new()),
@@ -3145,6 +3148,14 @@ impl Runtime {
             // part that answers "does this server do that".
             known.insert(token.split('=').next().unwrap_or(token).to_ascii_uppercase());
         }
+    }
+
+    pub fn set_matrix_server_facts(&self, account_id: &str, facts: crate::backend::matrix::server::ServerFacts) {
+        self.matrix_server_facts.lock().unwrap().insert(account_id.to_string(), facts);
+    }
+
+    pub fn matrix_server_facts(&self, account_id: &str) -> Option<crate::backend::matrix::server::ServerFacts> {
+        self.matrix_server_facts.lock().unwrap().get(account_id).cloned()
     }
 
     pub fn irc_has_isupport(&self, account_id: &str, token: &str) -> bool {

@@ -119,6 +119,13 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
         crypto::CryptoSession::open(&config_dir(), account_id, &user_id, device_id_ruma).await.context("opening crypto store")?,
     );
     state.runtime.set_matrix_machine(account_id, session.clone());
+    // What this homeserver says it can do, before anything asks it to. Read
+    // once because both answers are properties of the server rather than of
+    // the moment - a homeserver that changes either has been restarted, which
+    // reconnects this account anyway.
+    state
+        .runtime
+        .set_matrix_server_facts(account_id, server::read_facts(&config.homeserver_url, &access_token).await);
     backup::reactivate_on_connect(state, account_id, &session).await;
 
     // A resumed connection (next_batch already persisted) only ever gets
