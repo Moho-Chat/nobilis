@@ -46,6 +46,36 @@ pub(super) fn ask(state: &AppState, account_id: &str, channel: &str) {
     }
 }
 
+/// Asks for a channel's roster: who is in it, and who they are.
+///
+/// Both questions, because they are two commands and one answer is half of
+/// what a member list needs - NAMES gives names and ranks, WHO gives
+/// hostmasks, accounts and who is away.
+///
+/// Asked when a conversation is opened rather than when it is joined. An
+/// account that autojoins twenty channels was fetching twenty member lists at
+/// connect, every one about a room nobody had looked at; `no-implicit-names`
+/// is the capability that stops the *server* volunteering the first half, and
+/// this is the client half of the same decision.
+///
+/// Once per channel per connection. After that the roster keeps itself
+/// current from the joins, parts and nick changes that arrive anyway.
+pub fn ask_roster(state: &AppState, account_id: &str, channel: &str) {
+    // Before the "asked" mark, not after. A conversation can be opened while
+    // its account is still connecting - the buffer exists from scrollback and
+    // the socket does not - and marking that as asked would mean the roster
+    // was never fetched at all: the one chance to ask spent on a connection
+    // that could not carry it.
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return };
+    if !state.runtime.irc_roster_needed(&crate::model::buffer_id(account_id, channel)) {
+        return;
+    }
+    if let Err(e) = sender.send(Command::Raw("NAMES".to_string(), vec![channel.to_string()])) {
+        tracing::debug!("irc[{account_id}]: asking who is in {channel}: {e}");
+    }
+    ask(state, account_id, channel);
+}
+
 /// What one WHO reply says about one person.
 pub(super) struct Seen {
     pub channel: String,

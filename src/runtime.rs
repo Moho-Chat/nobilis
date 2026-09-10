@@ -693,6 +693,8 @@ pub struct Runtime {
     discord_mutes: Mutex<HashMap<(String, String), DiscordMute>>,
     /// account -> the RPL_ISUPPORT tokens that server advertised.
     irc_isupport: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Channel buffers whose roster has been asked for on this connection.
+    irc_rostered: Mutex<std::collections::HashSet<String>>,
     /// account -> the room catalogue last read off the site.
     ///
     /// Cached because reading it costs a Tor round trip and a proof-of-work
@@ -952,6 +954,7 @@ impl Runtime {
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
             irc_isupport: Mutex::new(HashMap::new()),
+            irc_rostered: Mutex::new(std::collections::HashSet::new()),
             discord_mutes: Mutex::new(HashMap::new()),
             irc_splits: Mutex::new(HashMap::new()),
             irc_whois: Mutex::new(HashMap::new()),
@@ -3106,6 +3109,24 @@ impl Runtime {
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
         self.irc_isupport.lock().unwrap().remove(account_id);
+        // Rosters are per connection: a reconnect rejoins every channel and
+        // the answers from the last session are about people who may not be
+        // there any more.
+        let prefix = format!("{account_id}|");
+        self.irc_rostered.lock().unwrap().retain(|id| !id.starts_with(&prefix));
+    }
+
+    /// Whether this channel's roster still needs asking for, and marks it
+    /// asked.
+    ///
+    /// Asked when a conversation is opened rather than when it is joined,
+    /// which is what `no-implicit-names` is for: an account that autojoins
+    /// twenty channels was fetching twenty member lists at connect, every one
+    /// of them about a room nobody had looked at yet. True exactly once per
+    /// channel per connection - the roster stays current after that from the
+    /// joins and parts that arrive anyway.
+    pub fn irc_roster_needed(&self, buffer_id: &str) -> bool {
+        self.irc_rostered.lock().unwrap().insert(buffer_id.to_string())
     }
 
     /// Records the tokens a server advertises in RPL_ISUPPORT.

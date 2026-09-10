@@ -7,7 +7,7 @@
 
 use super::*;
 
-pub(super) fn is_channel(target: &str) -> bool {
+pub fn is_channel(target: &str) -> bool {
     target.starts_with(['#', '&', '+', '!'])
 }
 
@@ -233,12 +233,11 @@ pub(super) async fn handle_message(
                         let _ = sender.send(chathistory_latest(&channel));
                     }
                 }
-                // Who is actually in here. NAMES answers with names and, where
-                // `userhost-in-names` was granted, hostmasks - but never the
-                // services account, and never who is away. WHO answers all
-                // three, so it is asked once per channel on arrival rather
-                // than per person on demand.
-                who::ask(state, account_id, &channel);
+                // Deliberately not asking who is in here yet. That happens
+                // when the conversation is opened - see `who::ask_roster` and
+                // the `no-implicit-names` capability - because joining a
+                // channel and reading one are different things, and an
+                // autojoin list is mostly the first without the second.
             }
             if from != own_nick {
                 let line = format!("{from} entered the room");

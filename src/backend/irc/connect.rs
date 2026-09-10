@@ -506,6 +506,11 @@ pub(super) const WANTED_CAPS: &[&str] = &[
     // - who they are identified as and whether they are away, rather than a
     // bare "they are online".
     "extended-monitor",
+    // The server stops volunteering a member list on join, because this
+    // client asks for one when a conversation is opened instead. An account
+    // that autojoins twenty channels was being sent twenty member lists at
+    // connect, every one of them about a room nobody had looked at yet.
+    "no-implicit-names",
     // Four drafts, requested because WeeChat, Halloy and bIRC already ship
     // them: a draft nobody has built can still change underneath an
     // implementation, and a draft three clients interoperate on is a protocol

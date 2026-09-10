@@ -1166,7 +1166,23 @@ pub async fn dispatch(
         "requestMemberList" => match p_str_opt(params, "bufferId") {
             None => (None, Some("requestMemberList requires \"bufferId\"".to_string())),
             Some(buffer_id) => {
-                let asked = backend::discord::request_member_list(state, buffer_id);
+                // Two services answer this, for the same reason and by
+                // different means. Discord sends a member list only for the
+                // channel being looked at; IRC could be sent one for every
+                // channel on join and asks `no-implicit-names` for it not to
+                // be. Either way this is the moment somebody opened the
+                // conversation, which is the only moment either wants.
+                let asked = match state.runtime.get_buffer(buffer_id) {
+                    Some(buffer) if state.accounts.get_irc(&buffer.account_id).is_some() => {
+                        if crate::backend::irc::incoming::is_channel(&buffer.name) {
+                            backend::irc::who::ask_roster(state, &buffer.account_id, &buffer.name);
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => backend::discord::request_member_list(state, buffer_id),
+                };
                 (Some(serde_json::json!({ "requested": asked })), None)
             }
         },
