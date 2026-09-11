@@ -3115,6 +3115,17 @@ pub async fn dispatch(
         // not being changed are read back from what the channel already is
         // rather than guessed - a caller turning on slow mode must not
         // silently turn off followers-only on the way.
+        //
+        // **Deliberately has no caller, and should not grow one.** Setting a
+        // channel's chat mode is a broadcaster's own setting and belongs in
+        // Kick's dashboard, which is where it is done and where the rest of
+        // the settings beside it live (#167). Reading it is a different
+        // question and is done: `ChatroomUpdatedEvent` keeps the mode current
+        // (backend/kick/chat.rs) so this client can say why a message will
+        // not send. Kept rather than deleted because it works and the
+        // decision is about scope rather than about the code - and named here
+        // so a later sweep for unreachable methods finds the reason instead
+        // of re-filing the finding.
         "setKickChatMode" => {
             let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
                 (Some(a), Some(b)) => (a, b),
