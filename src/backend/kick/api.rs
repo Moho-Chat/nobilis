@@ -1627,6 +1627,31 @@ pub async fn vote_prediction(
     Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
 }
 
+/// What a channel currently has pinned above its chat.
+///
+/// Authenticated, and answered `401 Unauthenticated` without a token Kick
+/// still accepts - which is why every caller treats a failure as "no pin
+/// known yet" rather than as an error. The pin arrives over the socket as soon
+/// as it next changes regardless, so the cost of failing here is a stale
+/// absence rather than a missing feature.
+///
+/// The response is handed back raw. Kick documents none of this and the
+/// wrapping has moved before; `pins::read` looks for the message at every
+/// depth it has been seen at rather than committing this signature to one.
+pub async fn pinned_message(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Result<serde_json::Value> {
+    let mut req = http
+        .get(format!("{API_ROOT}/api/v2/channels/{slug}/pinned-message"))
+        .header("Accept", "application/json");
+    if let Some(token) = token.filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(token);
+    }
+    let res = req.send().await.context("asking Kick what is pinned")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about the pinned message", res.status());
+    }
+    res.json().await.context("reading Kick's answer about the pinned message")
+}
+
 /// The smallest bet Kick accepts, which its own form enforces.
 pub const MIN_PREDICTION_BET: i64 = 10;
 

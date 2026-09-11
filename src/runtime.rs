@@ -691,6 +691,12 @@ pub struct Runtime {
     /// (see `backend::discord::mutes`) since the settings routinely arrive in
     /// READY before the channels they are about.
     discord_mutes: Mutex<HashMap<(String, String), DiscordMute>>,
+    /// buffer -> the message that channel has pinned above its chat.
+    ///
+    /// Kept because it is standing state rather than an event: a window
+    /// opening an hour after the pin was set still has to be told about it,
+    /// the same reason a live poll card is held rather than only broadcast.
+    kick_pins: Mutex<HashMap<String, crate::backend::kick::pins::Pin>>,
     /// account -> what its homeserver says it can do.
     matrix_server_facts: Mutex<HashMap<String, crate::backend::matrix::server::ServerFacts>>,
     /// account -> the RPL_ISUPPORT tokens that server advertised.
@@ -955,6 +961,7 @@ impl Runtime {
             silenced: Mutex::new(std::collections::HashSet::new()),
             sneedchat_motds: Mutex::new(HashMap::new()),
             sneedchat_rooms: Mutex::new(HashMap::new()),
+            kick_pins: Mutex::new(HashMap::new()),
             matrix_server_facts: Mutex::new(HashMap::new()),
             irc_isupport: Mutex::new(HashMap::new()),
             irc_rostered: Mutex::new(std::collections::HashSet::new()),
@@ -3148,6 +3155,17 @@ impl Runtime {
             // part that answers "does this server do that".
             known.insert(token.split('=').next().unwrap_or(token).to_ascii_uppercase());
         }
+    }
+
+    pub fn kick_pin(&self, buffer_id: &str) -> Option<crate::backend::kick::pins::Pin> {
+        self.kick_pins.lock().unwrap().get(buffer_id).cloned()
+    }
+
+    pub fn set_kick_pin(&self, buffer_id: &str, pin: Option<crate::backend::kick::pins::Pin>) {
+        match pin {
+            Some(pin) => self.kick_pins.lock().unwrap().insert(buffer_id.to_string(), pin),
+            None => self.kick_pins.lock().unwrap().remove(buffer_id),
+        };
     }
 
     pub fn set_matrix_server_facts(&self, account_id: &str, facts: crate::backend::matrix::server::ServerFacts) {

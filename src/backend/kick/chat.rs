@@ -334,6 +334,29 @@ pub(super) fn handle_event(
             }
         }
 
+        // The one line a channel wants everybody to have read.
+        //
+        // Matched by shape rather than by exact name, unlike the subscription
+        // events below. Those are matched exactly because three of them mean
+        // the same thing and had to be told apart; these are the opposite
+        // case - Kick documents neither, the names come from the wrappers
+        // that reverse-engineered this socket, and a rename would silently
+        // turn the feature off. Any event about a pin is handled, and its
+        // direction is read from the name.
+        e if pins::is_pin_event(e) => {
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let buffer_id = crate::model::buffer_id(account_id, &slug);
+            if pins::is_unpin(e) {
+                pins::announce(state, &buffer_id, None);
+            } else if let Some(pin) = pins::read(&payload) {
+                pins::announce(state, &buffer_id, Some(pin));
+            }
+            // A pin event carrying nothing readable is left alone rather than
+            // treated as an unpin: the shape having moved on is not the
+            // channel having taken its pin down, and clearing on it would
+            // wipe a pin that is still up.
+        }
+
         // A moderator emptying the room.
         e if e.ends_with("ChatroomClearEvent") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {

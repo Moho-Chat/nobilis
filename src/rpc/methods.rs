@@ -363,6 +363,10 @@ pub async fn dispatch(
                 // ids meant the poll and the prediction running right now
                 // were never asked about at all. The refreshers wait for the
                 // channel themselves.
+                // What this channel already has pinned, for a window that has
+                // just opened it. Held rather than only broadcast, the same
+                // way a live poll card is.
+                backend::kick::pins::replay(state, buffer_id);
                 if state.runtime.get_buffer(buffer_id).is_some_and(|b| b.account_id.starts_with("kick:")) {
                     let (state, buffer_id) = (state.clone(), buffer_id.to_string());
                     tokio::spawn(async move {
@@ -372,6 +376,10 @@ pub async fn dispatch(
                         // broadcast does: what this account has riding on it
                         // and what it has left to bet.
                         backend::kick::refresh_prediction(&state, &buffer_id).await;
+                        // And what the channel has pinned, which the socket
+                        // only reports when it changes - a pin set before you
+                        // arrived is the ordinary case.
+                        backend::kick::pins::refresh_pin(&state, &buffer_id).await;
                     });
                 }
                 (Some(ok_node()), None)
