@@ -193,6 +193,63 @@ fn valid(latitude: f64, longitude: f64) -> bool {
 }
 
 #[cfg(test)]
+mod place_tests {
+    use super::*;
+
+    /// The three shapes anybody actually has to hand. Nobody types
+    /// coordinates from memory - they copy a link - and the composer's own
+    /// help text promises each of these works, so each is checked here rather
+    /// than being a claim in a placeholder.
+    #[test]
+    fn a_place_is_read_however_it_was_pasted() {
+        assert_eq!(parse_place("51.5, -0.12"), Some((51.5, -0.12)));
+        // However it is spaced, and however it was written down.
+        assert_eq!(parse_place("51.5,-0.12"), Some((51.5, -0.12)));
+        assert_eq!(parse_place("  51.5 , -0.12  "), Some((51.5, -0.12)));
+        // A `geo:` URI, so a location received here can be sent on.
+        assert_eq!(parse_place("geo:51.5,-0.12"), Some((51.5, -0.12)));
+        assert_eq!(parse_place("geo:51.5,-0.12;u=35"), Some((51.5, -0.12)));
+    }
+
+    /// OpenStreetMap puts the zoom level first, which is the trap: "the first
+    /// two numbers in this URL" reads a zoom of 15 as a latitude and lands the
+    /// pin in the Atlantic.
+    #[test]
+    fn a_map_link_is_read_by_its_own_layout() {
+        assert_eq!(parse_place("https://www.openstreetmap.org/#map=15/51.5/-0.12"), Some((51.5, -0.12)));
+        assert_eq!(parse_place("https://www.google.com/maps/@51.5,-0.12,15z"), Some((51.5, -0.12)));
+        assert_eq!(parse_place("https://maps.google.com/?q=51.5,-0.12"), Some((51.5, -0.12)));
+    }
+
+    /// Two numbers that parse are not necessarily a place. Somewhere off the
+    /// Earth is a mistake worth refusing rather than pinning.
+    #[test]
+    fn something_that_is_not_a_place_is_not_one() {
+        assert!(parse_place("").is_none());
+        assert!(parse_place("the pub").is_none());
+        assert!(parse_place("91.0, 0.0").is_none());
+        assert!(parse_place("0.0, 181.0").is_none());
+    }
+
+    /// Coordinates are written with a space after the comma as often as not,
+    /// so "the first word" is half a place and "everything" is a place with a
+    /// name stuck to it. Longest run that still parses wins.
+    #[test]
+    fn a_name_after_the_place_is_the_name() {
+        let (place, label) = split_place_and_label("51.5, -0.12 the pub").expect("a place");
+        assert_eq!(parse_place(&place), Some((51.5, -0.12)));
+        assert_eq!(label, "the pub");
+
+        // And a place with nothing after it has no name rather than a blank one.
+        let (place, label) = split_place_and_label("51.5,-0.12").expect("a place");
+        assert_eq!(parse_place(&place), Some((51.5, -0.12)));
+        assert!(label.is_empty());
+
+        assert!(split_place_and_label("just some words").is_none());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
