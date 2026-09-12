@@ -3116,6 +3116,20 @@ impl Runtime {
         }
     }
 
+    /// Takes back capabilities the server has withdrawn (`CAP DEL`).
+    ///
+    /// No acknowledgement is involved, which is what separates this from
+    /// `grant_irc_caps`: a `CAP DEL` is the server stating a fact, not
+    /// offering something to be asked for, so the capability is gone the
+    /// moment the line arrives and nothing is sent back.
+    pub fn revoke_irc_caps(&self, account_id: &str, caps: &str) {
+        let mut all = self.irc_caps.lock().unwrap();
+        let Some(granted) = all.get_mut(account_id) else { return };
+        for cap in caps.split_whitespace() {
+            granted.remove(cap.split('=').next().unwrap_or(cap));
+        }
+    }
+
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
         self.irc_isupport.lock().unwrap().remove(account_id);
@@ -4131,6 +4145,50 @@ mod keyword_tests {
         assert!(matches_keyword("(moho)", &words(&["moho"])));
         assert!(matches_keyword("moho: any news", &words(&["moho"])));
         assert!(matches_keyword("@moho", &words(&["moho"])));
+    }
+}
+
+#[cfg(test)]
+mod irc_cap_tests {
+    use super::Runtime;
+
+    /// A `CAP DEL` is the server stating a fact, so the capability is gone
+    /// the moment it arrives - no acknowledgement, and nothing left behind.
+    ///
+    /// This is the half that matters: before it, moho went on believing it
+    /// held a capability the server had withdrawn, and kept using it.
+    #[test]
+    fn a_withdrawn_capability_stops_being_held() {
+        let rt = Runtime::new();
+        rt.grant_irc_caps("a", "server-time away-notify chghost");
+        assert!(rt.irc_has_cap("a", "away-notify"));
+
+        rt.revoke_irc_caps("a", "away-notify");
+        assert!(!rt.irc_has_cap("a", "away-notify"));
+        // And only that one.
+        assert!(rt.irc_has_cap("a", "server-time"));
+        assert!(rt.irc_has_cap("a", "chghost"));
+    }
+
+    /// Withdrawn by name, whatever value it was granted with.
+    #[test]
+    fn a_value_does_not_stop_a_capability_being_withdrawn() {
+        let rt = Runtime::new();
+        rt.grant_irc_caps("a", "sasl=PLAIN,EXTERNAL");
+        assert!(rt.irc_has_cap("a", "sasl"));
+        rt.revoke_irc_caps("a", "sasl=PLAIN");
+        assert!(!rt.irc_has_cap("a", "sasl"));
+    }
+
+    /// A `CAP DEL` for an account that never negotiated anything, and for a
+    /// capability never held, are both nothing rather than a panic.
+    #[test]
+    fn withdrawing_what_was_never_held_is_quiet() {
+        let rt = Runtime::new();
+        rt.revoke_irc_caps("nobody", "away-notify");
+        rt.grant_irc_caps("a", "server-time");
+        rt.revoke_irc_caps("a", "batch");
+        assert!(rt.irc_has_cap("a", "server-time"));
     }
 }
 

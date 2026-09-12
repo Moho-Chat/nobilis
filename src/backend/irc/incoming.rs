@@ -632,6 +632,41 @@ pub(super) async fn handle_message(
             state.runtime.grant_irc_caps(account_id, caps);
         }
 
+        // Something became available after registration.
+        //
+        // Asking `CAP LS 302` turns on `cap-notify`, which is what entitles a
+        // server to send this at all - so a connection that negotiated at all
+        // is one that can be told, later, that history was switched on, or
+        // that a module offering `chghost` was loaded. Before this the
+        // capability set was whatever was true in the first second of the
+        // connection, for the life of the connection.
+        //
+        // Only what was wanted in the first place is asked for (and not
+        // `sasl`, which `caps_worth_requesting` explains). Nothing is recorded
+        // here: the ACK above is what records a capability, and a `NEW` the
+        // server then refuses should leave us exactly where we were.
+        Command::CAP(_, CapSubCommand::NEW, ref param, ref suffix) => {
+            let offered = cap_list(param.as_deref(), suffix.as_deref());
+            let wanted = super::connect::caps_worth_requesting(offered);
+            if wanted.is_empty() {
+                return;
+            }
+            tracing::debug!("irc[{account_id}]: newly offered, requesting: {}", wanted.join(" "));
+            let _ = sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(wanted.join(" "))));
+        }
+
+        // Something was taken away.
+        //
+        // The half that matters more than `NEW`: without it moho goes on
+        // believing it holds a capability the server has withdrawn, and keeps
+        // using it - sending a tag the server no longer reads, or asking for
+        // history from a server that just turned it off.
+        Command::CAP(_, CapSubCommand::DEL, ref param, ref suffix) => {
+            let caps = cap_list(param.as_deref(), suffix.as_deref());
+            tracing::debug!("irc[{account_id}]: capabilities withdrawn: {caps}");
+            state.runtime.revoke_irc_caps(account_id, caps);
+        }
+
         // The frame around a multiline message. Only multiline batches are
         // collected: a chathistory batch contains messages that are each
         // their own message, and folding those together would turn a replayed

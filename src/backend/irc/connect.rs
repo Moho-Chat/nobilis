@@ -541,6 +541,31 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
     param.or(suffix).unwrap_or("")
 }
 
+/// Which of a `CAP NEW` offer are worth asking for.
+///
+/// The intersection with `WANTED_CAPS`, because a server offering something
+/// this daemon does not understand should not be answered with a request it
+/// would then have to honour. Values are stripped the same way `grant_irc_caps`
+/// strips them: a server may offer `sasl=PLAIN,EXTERNAL`, and the name is what
+/// is being asked for.
+///
+/// `sasl` is deliberately not among them, and it is the interesting omission.
+/// It is not in `WANTED_CAPS` at all - the handshake in `sasl.rs` requests it
+/// on its own, before registration, and drives the exchange by reading the
+/// stream directly. Asking for it again here would record the capability as
+/// held without authenticating anything, which is worse than not asking:
+/// `irc_has_cap(.., "sasl")` would then be true for a connection that is not
+/// signed in. Re-authenticating an already-registered connection needs a state
+/// machine in the router rather than a blocking read, and is its own piece of
+/// work.
+pub(super) fn caps_worth_requesting(offered: &str) -> Vec<&str> {
+    offered
+        .split_whitespace()
+        .map(|cap| cap.split('=').next().unwrap_or(cap))
+        .filter(|cap| WANTED_CAPS.contains(cap))
+        .collect()
+}
+
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
 /// Shared by the authenticated path and the fell-back-to-nothing path because
@@ -885,6 +910,44 @@ mod quit_tests {
     #[test]
     fn trims_what_it_is_given() {
         assert_eq!(quit_message(&config(Some("  bye  "))), "bye");
+    }
+}
+
+#[cfg(test)]
+mod cap_new_tests {
+    use super::caps_worth_requesting;
+
+    /// A `CAP NEW` is answered with the intersection, not with everything.
+    ///
+    /// Asking for something never wanted is not harmless: a capability this
+    /// daemon does not understand still changes what the server sends once it
+    /// is granted, and nothing here would know what to do with it.
+    #[test]
+    fn only_what_was_wanted_in_the_first_place_is_asked_for() {
+        let asked = caps_worth_requesting("chghost vendor.example/thing away-notify");
+        assert_eq!(asked, vec!["chghost", "away-notify"]);
+    }
+
+    /// A capability offered with a value is asked for by name.
+    #[test]
+    fn a_capability_offered_with_a_value_is_asked_for_by_name() {
+        assert_eq!(caps_worth_requesting("draft/chathistory=50"), vec!["draft/chathistory"]);
+    }
+
+    /// SASL is left alone on purpose - see `caps_worth_requesting`. Recording
+    /// it as held without running the exchange would make
+    /// `irc_has_cap(.., "sasl")` true for a connection that is not signed in.
+    #[test]
+    fn sasl_is_not_taken_up_here() {
+        assert!(caps_worth_requesting("sasl=PLAIN,EXTERNAL").is_empty());
+    }
+
+    /// An offer of nothing recognisable produces no request, rather than an
+    /// empty `CAP REQ` for a server to puzzle over.
+    #[test]
+    fn an_offer_of_nothing_useful_is_not_answered() {
+        assert!(caps_worth_requesting("vendor.example/one vendor.example/two").is_empty());
+        assert!(caps_worth_requesting("").is_empty());
     }
 }
 
