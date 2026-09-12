@@ -223,7 +223,8 @@ pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user
 /// Recognized image/video file extensions for attachment links - shares
 /// the client's own media-detection list, since this exists for the same
 /// reason: deciding whether a link is worth embedding.
-pub(super) const ATTACHMENT_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "mp4", "webm", "mov", "mkv"];
+pub(super) const ATTACHMENT_EXTS: &[&str] =
+    &["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "mp4", "webm", "mov", "mkv"];
 
 /// Finds the first Kiwi Farms/XenForo attachment URL in `text` - either
 /// host, clearnet or onion (see DEFAULT_ONION) - shaped like
@@ -333,6 +334,19 @@ mod tests {
         assert_eq!(matched, "https://kiwifarms.st/attachments/sam-consent-accident-webp.5648955/");
         assert_eq!(id, "5648955");
         assert_eq!(ext, "webp");
+    }
+
+    /// The format the site's own uploader now hands back for a photograph.
+    /// Recognised by the sniffer and cacheable long before it was on the list
+    /// of extensions worth embedding, so an avif attachment was fetched and
+    /// then shown as a link.
+    #[test]
+    fn an_avif_attachment_is_a_picture_like_any_other() {
+        let (matched, id, ext) =
+            find_attachment_url("https://kiwifarms.st/attachments/a-photo-avif.123/").expect("should match");
+        assert_eq!(matched, "https://kiwifarms.st/attachments/a-photo-avif.123/");
+        assert_eq!(id, "123");
+        assert_eq!(ext, "avif");
     }
 
     #[test]
