@@ -401,6 +401,8 @@ async fn prepare(
         let http = http.clone();
         let state = state.clone();
         let buffer_id = buffer.id.clone();
+        let account_id = account_id.to_string();
+        let slug = channel.slug.clone();
         tokio::spawn(async move {
             let mut words = seventv::global(&http).await;
             // The channel's own on top, so a channel that overrides a global
@@ -408,6 +410,33 @@ async fn prepare(
             words.extend(seventv::for_channel(&http, user_id).await);
             if !words.is_empty() {
                 tracing::debug!("kick[{buffer_id}]: {} 7TV emote(s)", words.len());
+                // Also a place emoji come from, so the picker offers them.
+                // The id is the word itself, because that is literally what
+                // goes in the message - a 7TV emote is a word that happens to
+                // be a picture, which is why it is tied to this buffer: it
+                // means nothing in a channel whose set does not have it.
+                state.runtime.set_emoji_source(
+                    &account_id,
+                    crate::model::EmojiSource {
+                        id: format!("7tv:{slug}"),
+                        name: format!("{slug} · 7TV"),
+                        service: "kick".to_string(),
+                        kind: "text".to_string(),
+                        icon_url: None,
+                        buffers: vec![buffer_id.clone()],
+                        sendable_anywhere: false,
+                        emoji: words
+                            .iter()
+                            .map(|(word, url)| crate::model::EmojiEntry {
+                                id: word.clone(),
+                                name: word.clone(),
+                                url: Some(url.clone()),
+                                animated: false,
+                                locked: false,
+                            })
+                            .collect(),
+                    },
+                );
                 state.runtime.set_kick_word_emotes(&state, &buffer_id, words);
             }
         });

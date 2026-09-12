@@ -457,6 +457,9 @@ pub struct Runtime {
     /// Whether this account's subscription lets it use emoji away from where
     /// they live - Discord Nitro. Absent means no.
     emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
+    /// Matrix emoticons by shortcode, for the send path - see
+    /// backend/matrix/stickers.rs's `inline_emoticons`.
+    matrix_emoticons: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
     /// Discord-specific: account id -> friends list ({userId, username,
     /// globalName, avatarUrl, status}), seeded from READY's `relationships`
     /// (type 1 = friend) + `presences`, kept current by live PRESENCE_UPDATE
@@ -975,6 +978,7 @@ impl Runtime {
             discord_buffer_emojis: Mutex::new(HashMap::new()),
             emoji_catalogue: Mutex::new(HashMap::new()),
             emoji_unrestricted: Mutex::new(std::collections::HashSet::new()),
+            matrix_emoticons: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
@@ -3431,6 +3435,16 @@ impl Runtime {
         } else {
             packs.insert(key.to_string(), stickers);
         }
+    }
+
+    /// This account's emoticons, by shortcode - what the send path needs to
+    /// turn `:name:` into the image it stands for.
+    pub fn set_matrix_emoticons(&self, account_id: &str, by_code: std::collections::BTreeMap<String, String>) {
+        self.matrix_emoticons.lock().unwrap().insert(account_id.to_string(), by_code);
+    }
+
+    pub fn matrix_emoticons(&self, account_id: &str) -> std::collections::BTreeMap<String, String> {
+        self.matrix_emoticons.lock().unwrap().get(account_id).cloned().unwrap_or_default()
     }
 
     /// Every sticker this account has, pack by pack.
