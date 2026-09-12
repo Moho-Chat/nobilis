@@ -34,6 +34,7 @@ pub mod cards;
 pub mod chat;
 pub mod live;
 pub mod pins;
+pub mod seventv;
 pub mod socket;
 #[cfg(test)]
 mod testkit;

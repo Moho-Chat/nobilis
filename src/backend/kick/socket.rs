@@ -380,6 +380,8 @@ async fn prepare(
             channel_id: channel.id,
             history_cursor: None,
             chatroom_id: channel.chatroom_id,
+            user_id: channel.user_id,
+            word_emotes: Default::default(),
             subscribed: false,
             followers_only: channel.followers_only,
             subscribers_only: channel.subscribers_only,
@@ -387,6 +389,29 @@ async fn prepare(
             emotes: Vec::new(),
         },
     );
+
+    // The words this channel talks in that Kick knows nothing about. Fetched
+    // per channel because they are per channel: a 7TV emote is a bare word
+    // that is a picture in one room and ordinary text in the next.
+    //
+    // Best-effort and quiet. Most channels have no 7TV set and answer 404,
+    // which is the ordinary case rather than a failure, and chat reads fine
+    // without them - which is exactly how it read before this existed.
+    if let Some(user_id) = channel.user_id {
+        let http = http.clone();
+        let state = state.clone();
+        let buffer_id = buffer.id.clone();
+        tokio::spawn(async move {
+            let mut words = seventv::global(&http).await;
+            // The channel's own on top, so a channel that overrides a global
+            // name gets its own picture rather than everybody's.
+            words.extend(seventv::for_channel(&http, user_id).await);
+            if !words.is_empty() {
+                tracing::debug!("kick[{buffer_id}]: {} 7TV emote(s)", words.len());
+                state.runtime.set_kick_word_emotes(&state, &buffer_id, words);
+            }
+        });
+    }
 
     // What is on air. A Kick channel is a stream as much as a chat, and moho
     // showed only the chat - so the title, the game and how many people are
@@ -680,12 +705,12 @@ mod tests {
         // by "some id" would deliver one's events into the other's buffer.
         let mut w = Watched::default();
         w.add(&api::Channel {
-            id: 999, chatroom_id: 111, slug: "first".into(), username: "first".into(),
+            id: 999, user_id: None, chatroom_id: 111, slug: "first".into(), username: "first".into(),
             avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
             playback_url: None,
         });
         w.add(&api::Channel {
-            id: 222, chatroom_id: 999, slug: "second".into(), username: "second".into(),
+            id: 222, user_id: None, chatroom_id: 999, slug: "second".into(), username: "second".into(),
             avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
             playback_url: None,
         });
