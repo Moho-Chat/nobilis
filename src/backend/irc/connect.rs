@@ -286,6 +286,32 @@ pub(super) fn proxy_port(config: &IrcAccountConfig) -> u16 {
 /// OVERALL_ESTABLISH_TIMEOUT's doc comment above.
 pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sender, ClientStream, Option<NickservWait>)> {
     let account_id = config.account_id();
+
+    // A network that told us, over TLS, not to come back in plaintext.
+    //
+    // Applied here rather than at the account, because it is not the
+    // account's setting to change: STS exists so that the *next* connection
+    // cannot be talked down to plaintext by somebody in the middle of it, and
+    // a policy that only applied when somebody remembered to tick a box would
+    // protect nobody. The stored port comes with it - a network that moved
+    // its TLS listener said so when it set the policy.
+    //
+    // Overridden into a copy of the account rather than carried alongside it,
+    // so that everything downstream reads one truth. `config.ssl` is not only
+    // used to open the socket: the SASL path refuses to send credentials over
+    // a connection it believes is in the clear, and a flag passed separately
+    // would have left that check reading the old answer on exactly the
+    // connection STS had just upgraded.
+    let mut config = config.clone();
+    if !config.ssl {
+        if let Some(policy) = state.irc_sts.policy(&config.host) {
+            tracing::info!("irc[{account_id}]: STS in force for {}, using TLS on port {}", config.host, policy.port);
+            state.runtime.report_progress(state, &account_id, &format!("{} requires TLS (STS) - connecting on port {} instead", config.host, policy.port));
+            config.ssl = true;
+            config.port = Some(policy.port);
+        }
+    }
+    let config = &config;
     let port = config.port.unwrap_or(if config.ssl { 6697 } else { 6667 });
 
     let irc_config = Config {
@@ -337,6 +363,29 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     let mut stream = client.stream()?;
     let sender = client.sender();
 
+    // On a connection made in the clear, ask what the server offers before
+    // saying anything at all.
+    //
+    // The ordinary STS check lives in `end_cap_and_register`, which on the
+    // SASL path does not run until after the credentials have gone - and a
+    // network that advertises STS is a network saying those credentials
+    // should never have crossed a plaintext socket. `sasl_transport_ok`
+    // already refuses to send them in the clear unless somebody has
+    // explicitly allowed it for this account, so this closes the case where
+    // they have: the allowance was made about the network as it was, and STS
+    // is the network saying it has changed its mind.
+    //
+    // One extra round trip, on plaintext connections only, which are both the
+    // rare case and the one with something to lose. A second `CAP LS` from
+    // `end_cap_and_register` after this is legal and answered again.
+    if !config.ssl {
+        if let Some(raw) = offered_caps_raw(&sender, &mut stream).await {
+            if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
+                bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
+            }
+        }
+    }
+
     // Whether the account is authenticated by the time registration finishes.
     // Ticking the SASL box is a request, not a guarantee: a server with no
     // SASL registers us normally, and then NickServ is still the way in.
@@ -349,7 +398,7 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         // above are still worth asking for, and they have to be requested
         // before CAP END like any other.
         state.runtime.report_progress(state, &account_id, "Registering (NICK/USER)...");
-        end_cap_and_register(&sender, &mut stream, config).await?;
+        end_cap_and_register(state, &sender, &mut stream, config).await?;
     }
 
     state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
@@ -382,6 +431,27 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     );
     state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
     state.runtime.ensure_buffer(state, &account_id, &config.host, "server");
+
+    // Ask to be told what people publish about themselves.
+    //
+    // Only where the network granted it - the capability was requested during
+    // negotiation, and the ACK recording it has arrived by now. Sending this
+    // to a network that has no metadata is an unknown command and an error
+    // reply in the server buffer, which is noise for a feature nobody asked
+    // for. Subscribing rather than asking per person because the point is the
+    // roster: a GET each for everybody in a busy channel is a lot of round
+    // trips to draw one column.
+    if state.runtime.irc_has_cap(&account_id, "draft/metadata") || state.runtime.irc_has_cap(&account_id, "metadata-2") {
+        if let Err(e) = sender.send(Command::Raw(
+            "METADATA".to_string(),
+            std::iter::once("*".to_string())
+                .chain(std::iter::once("SUB".to_string()))
+                .chain(metadata::WANTED_KEYS.iter().map(|k| (*k).to_string()))
+                .collect(),
+        )) {
+            tracing::warn!("irc[{account_id}]: subscribing to metadata failed: {e}");
+        }
+    }
 
     // Keyed on whether SASL actually authenticated rather than on whether it
     // was asked for. A server that turned out not to offer it leaves the
@@ -528,6 +598,13 @@ pub(super) const WANTED_CAPS: &[&str] = &[
     // A channel changing its name without becoming a second channel with the
     // first one's history stranded in it.
     "draft/channel-rename",
+    // The avatar, display name and status a network lets somebody publish.
+    // IRC carries a nick and a realname and nothing else, so this is the only
+    // way a face on an IRC roster is ever anything but a placeholder. Both
+    // spellings, because networks that shipped it first still advertise the
+    // draft one - see metadata.rs.
+    "draft/metadata",
+    "metadata-2",
 ];
 
 /// The capabilities named by a CAP ACK, from whichever field they arrived in.
@@ -541,13 +618,80 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
     param.or(suffix).unwrap_or("")
 }
 
+/// Which of a `CAP NEW` offer are worth asking for.
+///
+/// The intersection with `WANTED_CAPS`, because a server offering something
+/// this daemon does not understand should not be answered with a request it
+/// would then have to honour. Values are stripped the same way `grant_irc_caps`
+/// strips them: a server may offer `sasl=PLAIN,EXTERNAL`, and the name is what
+/// is being asked for.
+///
+/// `sasl` is deliberately not among them, and it is the interesting omission.
+/// It is not in `WANTED_CAPS` at all - the handshake in `sasl.rs` requests it
+/// on its own, before registration, and drives the exchange by reading the
+/// stream directly. Asking for it again here would record the capability as
+/// held without authenticating anything, which is worse than not asking:
+/// `irc_has_cap(.., "sasl")` would then be true for a connection that is not
+/// signed in. Re-authenticating an already-registered connection needs a state
+/// machine in the router rather than a blocking read, and is its own piece of
+/// work.
+pub(super) fn caps_worth_requesting(offered: &str) -> Vec<&str> {
+    offered
+        .split_whitespace()
+        .map(|cap| cap.split('=').next().unwrap_or(cap))
+        .filter(|cap| WANTED_CAPS.contains(cap))
+        .collect()
+}
+
+/// Acts on an `sts=` in a server's `CAP LS`, if there is one.
+///
+/// Which half applies depends on how this connection was made, and the spec is
+/// emphatic about it:
+///
+/// - Over **TLS**, `duration=` is remembered. That is the promise worth
+///   keeping, because it is what stops the *next* connection being talked down
+///   to plaintext by somebody in the middle of it. `duration=0` withdraws the
+///   policy and is obeyed - it is the only way out for a network that turns
+///   TLS off.
+/// - Over **plaintext**, only `port=` counts, and nothing is remembered.
+///   An attacker who can rewrite a plaintext stream can write the policy too,
+///   and a remembered forgery would outlive the attack. The upgrade is left to
+///   the reconnect: the policy is recorded for this host with a short life,
+///   the connection is dropped, and `establish` picks it up on the way back.
+fn note_sts_policy(state: &AppState, config: &IrcAccountConfig, caps: &str) -> Option<u16> {
+    let advert = sts::sts_from_caps(caps)?;
+    let account_id = config.account_id();
+    if config.ssl {
+        let duration = advert.duration?;
+        let port = config.port.unwrap_or(6697);
+        tracing::info!("irc[{account_id}]: STS for {} - TLS on port {port} for {duration}s", config.host);
+        state.irc_sts.remember(&config.host, port, duration);
+        None
+    } else {
+        let port = advert.port?;
+        // A policy learned in the clear is only good enough to get us onto
+        // the encrypted port once, which is why it is stored with a short
+        // life: the duration that actually binds is read from the
+        // advertisement that arrives over TLS, on the connection this one is
+        // about to be replaced by.
+        tracing::info!("irc[{account_id}]: STS offered over plaintext, reconnecting to port {port} over TLS");
+        state.irc_sts.remember(&config.host, port, 60);
+        Some(port)
+    }
+}
+
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
 /// Shared by the authenticated path and the fell-back-to-nothing path because
 /// both owe the server a CAP END: having asked for capabilities, registration
 /// does not proceed until we say we are finished asking, and a server left
 /// waiting for that just sits there until the establish timeout fires.
-pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<()> {
+pub(super) async fn end_cap_and_register(
+    state: &AppState,
+    sender: &Sender,
+    stream: &mut ClientStream,
+    config: &IrcAccountConfig,
+) -> Result<()> {
     // Ask what this server has before asking it for anything.
     //
     // This used to send one REQ per capability and not wait for the answers,
@@ -567,7 +711,21 @@ pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStr
     // A server that answers no LS at all gets the old behaviour, since
     // something that ancient is exactly the case the atomicity worry was
     // about.
-    let offered = offered_caps(sender, stream).await;
+    let raw = offered_caps_raw(sender, stream).await;
+    if let Some(raw) = raw.as_deref() {
+        // An upgrade cannot be done in place: this is the middle of
+        // registration, and the way to a TLS port is a fresh connection. So
+        // the policy is stored and this attempt is abandoned - the reconnect
+        // loop comes straight back, and `establish` reads the policy on the
+        // way in. Registering first and reconnecting after would send NICK,
+        // USER and possibly a server password in the clear, which is the
+        // exact thing the network just asked us not to do.
+        if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
+            bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
+        }
+    }
+    let offered: Option<Vec<String>> =
+        raw.map(|raw| raw.iter().map(|cap| cap.split('=').next().unwrap_or(cap).to_string()).collect());
     match offered {
         Some(offered) => {
             let wanted: Vec<&str> = WANTED_CAPS.iter().copied().filter(|cap| offered.iter().any(|o| o == cap)).collect();
@@ -611,6 +769,22 @@ pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStr
 /// returns None, and the caller falls back to asking for everything the way
 /// it always did.
 pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
+    offered_caps_raw(sender, stream).await.map(|raw| {
+        raw.iter()
+            // `cap=value` advertises a capability with parameters - SASL names
+            // its mechanisms this way, STS its duration and port. The name is
+            // what is requested.
+            .map(|cap| cap.split('=').next().unwrap_or(cap).to_string())
+            .collect()
+    })
+}
+
+/// The offer as the server wrote it, values and all.
+///
+/// Separate from `offered_caps` because two callers want two different things
+/// out of one answer: negotiation wants names to compare against
+/// `WANTED_CAPS`, and STS wants the value it would otherwise have thrown away.
+pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
     if sender.send_cap_ls(NegotiationVersion::V302).is_err() {
         return None;
     }
@@ -623,9 +797,7 @@ pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> 
         let more = param.as_deref() == Some("*");
         let list = if more { suffix.as_deref().unwrap_or("") } else { cap_list(param.as_deref(), suffix.as_deref()) };
         for cap in list.split_whitespace() {
-            // `cap=value` advertises a capability with parameters - SASL
-            // names its mechanisms this way. The name is what is requested.
-            offered.push(cap.split('=').next().unwrap_or(cap).to_string());
+            offered.push(cap.to_string());
         }
         if !more {
             tracing::debug!("irc: server offers {} capabilities: {}", offered.len(), offered.join(" "));
@@ -885,6 +1057,44 @@ mod quit_tests {
     #[test]
     fn trims_what_it_is_given() {
         assert_eq!(quit_message(&config(Some("  bye  "))), "bye");
+    }
+}
+
+#[cfg(test)]
+mod cap_new_tests {
+    use super::caps_worth_requesting;
+
+    /// A `CAP NEW` is answered with the intersection, not with everything.
+    ///
+    /// Asking for something never wanted is not harmless: a capability this
+    /// daemon does not understand still changes what the server sends once it
+    /// is granted, and nothing here would know what to do with it.
+    #[test]
+    fn only_what_was_wanted_in_the_first_place_is_asked_for() {
+        let asked = caps_worth_requesting("chghost vendor.example/thing away-notify");
+        assert_eq!(asked, vec!["chghost", "away-notify"]);
+    }
+
+    /// A capability offered with a value is asked for by name.
+    #[test]
+    fn a_capability_offered_with_a_value_is_asked_for_by_name() {
+        assert_eq!(caps_worth_requesting("draft/chathistory=50"), vec!["draft/chathistory"]);
+    }
+
+    /// SASL is left alone on purpose - see `caps_worth_requesting`. Recording
+    /// it as held without running the exchange would make
+    /// `irc_has_cap(.., "sasl")` true for a connection that is not signed in.
+    #[test]
+    fn sasl_is_not_taken_up_here() {
+        assert!(caps_worth_requesting("sasl=PLAIN,EXTERNAL").is_empty());
+    }
+
+    /// An offer of nothing recognisable produces no request, rather than an
+    /// empty `CAP REQ` for a server to puzzle over.
+    #[test]
+    fn an_offer_of_nothing_useful_is_not_answered() {
+        assert!(caps_worth_requesting("vendor.example/one vendor.example/two").is_empty());
+        assert!(caps_worth_requesting("").is_empty());
     }
 }
 

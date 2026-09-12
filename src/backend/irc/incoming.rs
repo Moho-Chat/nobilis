@@ -632,6 +632,41 @@ pub(super) async fn handle_message(
             state.runtime.grant_irc_caps(account_id, caps);
         }
 
+        // Something became available after registration.
+        //
+        // Asking `CAP LS 302` turns on `cap-notify`, which is what entitles a
+        // server to send this at all - so a connection that negotiated at all
+        // is one that can be told, later, that history was switched on, or
+        // that a module offering `chghost` was loaded. Before this the
+        // capability set was whatever was true in the first second of the
+        // connection, for the life of the connection.
+        //
+        // Only what was wanted in the first place is asked for (and not
+        // `sasl`, which `caps_worth_requesting` explains). Nothing is recorded
+        // here: the ACK above is what records a capability, and a `NEW` the
+        // server then refuses should leave us exactly where we were.
+        Command::CAP(_, CapSubCommand::NEW, ref param, ref suffix) => {
+            let offered = cap_list(param.as_deref(), suffix.as_deref());
+            let wanted = super::connect::caps_worth_requesting(offered);
+            if wanted.is_empty() {
+                return;
+            }
+            tracing::debug!("irc[{account_id}]: newly offered, requesting: {}", wanted.join(" "));
+            let _ = sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(wanted.join(" "))));
+        }
+
+        // Something was taken away.
+        //
+        // The half that matters more than `NEW`: without it moho goes on
+        // believing it holds a capability the server has withdrawn, and keeps
+        // using it - sending a tag the server no longer reads, or asking for
+        // history from a server that just turned it off.
+        Command::CAP(_, CapSubCommand::DEL, ref param, ref suffix) => {
+            let caps = cap_list(param.as_deref(), suffix.as_deref());
+            tracing::debug!("irc[{account_id}]: capabilities withdrawn: {caps}");
+            state.runtime.revoke_irc_caps(account_id, caps);
+        }
+
         // The frame around a multiline message. Only multiline batches are
         // collected: a chathistory batch contains messages that are each
         // their own message, and folding those together would turn a replayed
@@ -726,6 +761,30 @@ pub(super) async fn handle_message(
         // the whole point of `setname`. Reported where they can be seen; a
         // realname is not shown in a roster, so this is the only place the
         // change is ever visible.
+        // Somebody's published facts, as they change.
+        //
+        // `METADATA <target> <key> <visibility> [:<value>]`, which arrives
+        // because of the `METADATA * SUB` sent at registration. The same four
+        // fields come back from an explicit GET as numeric 761, handled just
+        // below by the same parser.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("METADATA") => {
+            if let Some((target, key, value)) = metadata::parse_keyvalue(args) {
+                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+            }
+        }
+
+        // The same thing, as the answer to a GET rather than as news.
+        //
+        // Numerics are addressed to us, so the client's own nick sits in
+        // front of the fields the command form starts with - dropped here,
+        // where it is known to be there, rather than guessed at in the
+        // parser.
+        Command::Raw(ref cmd, ref args) if cmd == "761" => {
+            if let Some((target, key, value)) = metadata::parse_keyvalue(args.get(1..).unwrap_or(&[])) {
+                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+            }
+        }
+
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("SETNAME") => {
             let name = args.last().map(String::as_str).unwrap_or("");
             if !from.is_empty() && !name.is_empty() {

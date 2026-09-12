@@ -453,6 +453,11 @@ pub struct Runtime {
     /// refuses that line. Asking for history from a server that never granted
     /// it is a command it will answer with an error in the server tab.
     irc_caps: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// What people on IRC have published about themselves, by account and
+    /// then by lowercased nick - see backend/irc/metadata.rs. Lowercased
+    /// because IRC nicks are matched case-insensitively and the same person
+    /// is `Alice` in a roster and `alice` in a metadata notification.
+    irc_metadata: Mutex<HashMap<String, HashMap<String, crate::backend::irc::metadata::Metadata>>>,
     /// The conversation each Discord account last acted in, for an answer
     /// that arrives without saying where it belongs - see the modal dispatch.
     discord_last_interaction: Mutex<HashMap<String, String>>,
@@ -922,6 +927,7 @@ impl Runtime {
             matrix_poll_votes: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
+            irc_metadata: Mutex::new(HashMap::new()),
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
             matrix_stickers: Mutex::new(HashMap::new()),
             matrix_call_members: Mutex::new(HashMap::new()),
@@ -3116,8 +3122,59 @@ impl Runtime {
         }
     }
 
+    /// Takes back capabilities the server has withdrawn (`CAP DEL`).
+    ///
+    /// No acknowledgement is involved, which is what separates this from
+    /// `grant_irc_caps`: a `CAP DEL` is the server stating a fact, not
+    /// offering something to be asked for, so the capability is gone the
+    /// moment the line arrives and nothing is sent back.
+    pub fn revoke_irc_caps(&self, account_id: &str, caps: &str) {
+        let mut all = self.irc_caps.lock().unwrap();
+        let Some(granted) = all.get_mut(account_id) else { return };
+        for cap in caps.split_whitespace() {
+            granted.remove(cap.split('=').next().unwrap_or(cap));
+        }
+    }
+
+    /// Records one published fact. An absent value clears the key, which is
+    /// somebody taking their avatar down rather than never having had one.
+    pub fn set_irc_metadata(&self, account_id: &str, nick: &str, key: &str, value: Option<String>) {
+        let mut all = self.irc_metadata.lock().unwrap();
+        let people = all.entry(account_id.to_string()).or_default();
+        let nick = nick.to_ascii_lowercase();
+        match value {
+            Some(v) => {
+                people.entry(nick).or_default().insert(key.to_string(), v);
+            }
+            None => {
+                if let Some(theirs) = people.get_mut(&nick) {
+                    theirs.remove(key);
+                    if theirs.is_empty() {
+                        people.remove(&nick);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Everything this person has published, or nothing.
+    pub fn irc_metadata(&self, account_id: &str, nick: &str) -> crate::backend::irc::metadata::Metadata {
+        self.irc_metadata
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .and_then(|people| people.get(&nick.to_ascii_lowercase()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn clear_irc_caps(&self, account_id: &str) {
         self.irc_caps.lock().unwrap().remove(account_id);
+        // Published facts are per connection in the same way capabilities
+        // are: the next session subscribes again and is told afresh, and
+        // keeping the old answers would show an avatar somebody has since
+        // taken down.
+        self.irc_metadata.lock().unwrap().remove(account_id);
         self.irc_isupport.lock().unwrap().remove(account_id);
         // Rosters are per connection: a reconnect rejoins every channel and
         // the answers from the last session are about people who may not be
@@ -3798,6 +3855,7 @@ mod tests {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
         };
@@ -4131,6 +4189,97 @@ mod keyword_tests {
         assert!(matches_keyword("(moho)", &words(&["moho"])));
         assert!(matches_keyword("moho: any news", &words(&["moho"])));
         assert!(matches_keyword("@moho", &words(&["moho"])));
+    }
+}
+
+#[cfg(test)]
+mod irc_cap_tests {
+    use super::Runtime;
+
+    /// A `CAP DEL` is the server stating a fact, so the capability is gone
+    /// the moment it arrives - no acknowledgement, and nothing left behind.
+    ///
+    /// This is the half that matters: before it, moho went on believing it
+    /// held a capability the server had withdrawn, and kept using it.
+    #[test]
+    fn a_withdrawn_capability_stops_being_held() {
+        let rt = Runtime::new();
+        rt.grant_irc_caps("a", "server-time away-notify chghost");
+        assert!(rt.irc_has_cap("a", "away-notify"));
+
+        rt.revoke_irc_caps("a", "away-notify");
+        assert!(!rt.irc_has_cap("a", "away-notify"));
+        // And only that one.
+        assert!(rt.irc_has_cap("a", "server-time"));
+        assert!(rt.irc_has_cap("a", "chghost"));
+    }
+
+    /// Withdrawn by name, whatever value it was granted with.
+    #[test]
+    fn a_value_does_not_stop_a_capability_being_withdrawn() {
+        let rt = Runtime::new();
+        rt.grant_irc_caps("a", "sasl=PLAIN,EXTERNAL");
+        assert!(rt.irc_has_cap("a", "sasl"));
+        rt.revoke_irc_caps("a", "sasl=PLAIN");
+        assert!(!rt.irc_has_cap("a", "sasl"));
+    }
+
+    /// A `CAP DEL` for an account that never negotiated anything, and for a
+    /// capability never held, are both nothing rather than a panic.
+    #[test]
+    fn withdrawing_what_was_never_held_is_quiet() {
+        let rt = Runtime::new();
+        rt.revoke_irc_caps("nobody", "away-notify");
+        rt.grant_irc_caps("a", "server-time");
+        rt.revoke_irc_caps("a", "batch");
+        assert!(rt.irc_has_cap("a", "server-time"));
+    }
+}
+
+#[cfg(test)]
+mod irc_metadata_tests {
+    use super::Runtime;
+
+    /// The same person is `Alice` in a roster and `alice` in a notification,
+    /// and IRC matches nicks case-insensitively - so one of those must not be
+    /// a different person.
+    #[test]
+    fn a_nick_is_the_same_nick_in_any_case() {
+        let rt = Runtime::new();
+        rt.set_irc_metadata("a", "Alice", "avatar", Some("https://example.net/a.png".into()));
+        assert_eq!(rt.irc_metadata("a", "alice").get("avatar").map(String::as_str), Some("https://example.net/a.png"));
+        assert_eq!(rt.irc_metadata("a", "ALICE").get("avatar").map(String::as_str), Some("https://example.net/a.png"));
+    }
+
+    /// A cleared key is somebody taking their avatar down, and has to leave
+    /// nothing behind rather than an empty string that would render as a
+    /// broken picture.
+    #[test]
+    fn clearing_a_key_removes_it() {
+        let rt = Runtime::new();
+        rt.set_irc_metadata("a", "alice", "avatar", Some("x".into()));
+        rt.set_irc_metadata("a", "alice", "status", Some("away".into()));
+        rt.set_irc_metadata("a", "alice", "avatar", None);
+        let theirs = rt.irc_metadata("a", "alice");
+        assert!(!theirs.contains_key("avatar"));
+        assert_eq!(theirs.get("status").map(String::as_str), Some("away"));
+    }
+
+    /// Published facts are per connection, like capabilities: the next
+    /// session subscribes again and is told afresh, and keeping the old
+    /// answers would show an avatar somebody has since taken down.
+    #[test]
+    fn a_reconnect_forgets_what_was_published() {
+        let rt = Runtime::new();
+        rt.set_irc_metadata("a", "alice", "avatar", Some("x".into()));
+        rt.clear_irc_caps("a");
+        assert!(rt.irc_metadata("a", "alice").is_empty());
+    }
+
+    #[test]
+    fn somebody_who_published_nothing_has_nothing() {
+        let rt = Runtime::new();
+        assert!(rt.irc_metadata("a", "nobody").is_empty());
     }
 }
 
