@@ -3437,6 +3437,57 @@ pub async fn dispatch(
             }
         }
 
+        // What a Kick channel trades for points, and this account's balance.
+        //
+        // Both in one answer because the plaque shows them together and asking
+        // twice would draw a total that does not match the list beside it.
+        "listKickRewards" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listKickRewards requires \"bufferId\"".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let (http, token) = match kick_credential(state, &channel_account(state, buffer_id)) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            let rewards = match backend::kick::api::rewards(&http, &channel.slug).await {
+                Ok(r) => r,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            // Best-effort: a balance that could not be read should not hide
+            // the list of what it could have bought.
+            let points = backend::kick::api::points(&http, &token, &channel.slug).await.ok();
+            (Some(serde_json::json!({ "rewards": rewards, "points": points })), None)
+        }
+
+        "redeemKickReward" => {
+            let (Some(buffer_id), Some(reward_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rewardId")) else {
+                return (None, Some("redeemKickReward requires \"bufferId\" and \"rewardId\"".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let account_id = channel_account(state, buffer_id);
+            // Before anything is sent. A redeem spends points somebody earned
+            // and shouts in a live chat, so a double click must cost nothing.
+            if !backend::kick::api::redeem_allowed(&account_id) {
+                return (None, Some("that was a moment ago - wait a second before redeeming again".to_string()));
+            }
+            let (http, token) = match kick_credential(state, &account_id) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::kick::api::redeem(&http, &token, &channel.slug, reward_id).await {
+                Ok(()) => {
+                    let points = backend::kick::api::points(&http, &token, &channel.slug).await.ok();
+                    (Some(serde_json::json!({ "points": points })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Taking the poll down, which Kick allows the streamer and their
         // moderators and refuses to everybody else.
         "endPoll" => {

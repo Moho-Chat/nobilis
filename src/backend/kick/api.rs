@@ -1722,3 +1722,215 @@ async fn prediction_call(
     }
     serde_json::from_str(&text).context("reading Kick's answer about the prediction")
 }
+
+/// One thing a channel will trade for points.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Reward {
+    pub id: String,
+    pub title: String,
+    pub cost: i64,
+    pub description: Option<String>,
+    /// Turned off by the streamer, or paused while they are away. Both are
+    /// shown rather than hidden - a reward that exists and cannot be had is a
+    /// different thing from one that was never offered, and the list is also
+    /// how somebody learns what this channel does.
+    pub enabled: bool,
+    pub paused: bool,
+    /// Kick asks the redeemer to type something. Not answerable from here
+    /// yet, so these are shown and refused rather than sent half-filled.
+    pub needs_input: bool,
+    pub prompt: Option<String>,
+    pub background_color: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct RewardsEnvelope {
+    #[serde(default)]
+    data: Vec<RewardJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct RewardJson {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    cost: i64,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    is_enabled: bool,
+    #[serde(default)]
+    is_paused: bool,
+    #[serde(default)]
+    is_user_input_required: bool,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    background_color: Option<String>,
+}
+
+/// What a channel offers for points.
+///
+/// Public: no token, because this is the same list anybody reads on the
+/// channel's page, and asking with credentials for something anonymous is a
+/// way to have them refused for no reason.
+pub async fn rewards(http: &reqwest::Client, slug: &str) -> Result<Vec<Reward>> {
+    let res = http
+        .get(format!("{API_ROOT}/api/v2/channels/{slug}/rewards"))
+        .header("Accept", "application/json")
+        .send()
+        .await
+        .context("asking Kick what this channel offers")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about this channel's rewards", res.status());
+    }
+    let body: RewardsEnvelope = res.json().await.context("reading Kick's answer about rewards")?;
+    Ok(body
+        .data
+        .into_iter()
+        .map(|r| Reward {
+            id: r.id,
+            title: r.title,
+            cost: r.cost,
+            description: r.description.filter(|d| !d.trim().is_empty()),
+            enabled: r.is_enabled,
+            paused: r.is_paused,
+            needs_input: r.is_user_input_required,
+            prompt: r.prompt.filter(|p| !p.trim().is_empty()),
+            background_color: r.background_color.filter(|c| !c.trim().is_empty()),
+        })
+        .collect())
+}
+
+/// The least time between one redeem and the next, per account.
+///
+/// Not a guess at Kick's own limit, and deliberately not tuned to sit just
+/// under it. A redeem costs points somebody earned by watching, and every one
+/// of them is a visible event in a live chat - so the failure this guards
+/// against is not a 429, it is a stuck key or a double click spending a
+/// thousand points and spamming the channel twice. Two seconds is far longer
+/// than a person redeeming deliberately will notice and far shorter than any
+/// rate limit worth striking.
+pub const REDEEM_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether enough time has passed since the last redeem, and records this one.
+///
+/// Keyed per account rather than per channel: the limit exists to protect an
+/// account from spending its own points by accident, and points are earned per
+/// channel but the hand on the mouse is the same one.
+pub fn redeem_allowed(account_id: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
+    let mut guard = LAST.lock().unwrap();
+    let seen = guard.get_or_insert_with(HashMap::new);
+    let now = std::time::Instant::now();
+    match seen.get(account_id) {
+        Some(at) if now.duration_since(*at) < REDEEM_MIN_INTERVAL => false,
+        _ => {
+            seen.insert(account_id.to_string(), now);
+            true
+        }
+    }
+}
+
+#[cfg(test)]
+mod redeem_guard_tests {
+    use super::*;
+
+    /// Twenty-six characters of Crockford base32. A UUID here is answered
+    /// 400 by Kick, which is how this was found.
+    #[test]
+    fn a_transaction_id_is_a_ulid() {
+        let id = transaction_id();
+        assert_eq!(id.len(), 26, "{id}");
+        assert!(id.bytes().all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)), "{id}");
+        // No I, L, O or U - that is the point of Crockford's alphabet.
+        assert!(!id.bytes().any(|c| b"ILOU".contains(&c)), "{id}");
+    }
+
+    /// An idempotency key that repeated would make two redeems one.
+    #[test]
+    fn two_redeems_do_not_share_an_id() {
+        assert_ne!(transaction_id(), transaction_id());
+    }
+
+    /// A double click costs nothing. The first goes, the second is refused.
+    #[test]
+    fn a_second_redeem_straight_away_is_refused() {
+        assert!(redeem_allowed("kick:guard-a"));
+        assert!(!redeem_allowed("kick:guard-a"));
+    }
+
+    /// Per account, because the limit protects an account from spending its
+    /// own points - two accounts are two people's points.
+    #[test]
+    fn one_accounts_haste_does_not_block_another() {
+        assert!(redeem_allowed("kick:guard-b"));
+        assert!(redeem_allowed("kick:guard-c"));
+        assert!(!redeem_allowed("kick:guard-b"));
+    }
+}
+
+/// A ULID, which is what Kick wants for a redeem's `transaction_id`.
+///
+/// Found by asking. The endpoint answers 422 "transaction_id is required" to a
+/// body without one, and 400 "Invalid request" to a UUID - it wants the same
+/// shape its own ids are in: 48 bits of millisecond timestamp then 80 random,
+/// written in Crockford's base32, twenty-six characters.
+///
+/// It is an idempotency key, which is why it is generated per call and never
+/// reused: two requests carrying one id are one redeem, and that is Kick's own
+/// guard against a retry spending points twice.
+pub fn transaction_id() -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let mut n: u128 = (millis << 80) | (rand::random::<u128>() & ((1u128 << 80) - 1));
+    let mut out = [0u8; 26];
+    for slot in out.iter_mut().rev() {
+        *slot = ALPHABET[(n & 31) as usize];
+        n >>= 5;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Spends points on one.
+///
+/// Kick's own wording is carried out of a refusal rather than replaced: it is
+/// the half that says *why* - not enough points, the reward is paused,
+/// already redeemed too recently - and a generic failure would send somebody
+/// looking for a reason this already has.
+pub async fn redeem(http: &reqwest::Client, token: &str, slug: &str, reward_id: &str) -> Result<()> {
+    let res = http
+        .post(format!("{API_ROOT}/api/v2/channels/{slug}/rewards/{reward_id}/redeem"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "transaction_id": transaction_id() }))
+        .send()
+        .await
+        .context("redeeming")?;
+    let status = res.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let said = res.text().await.unwrap_or_default();
+    let reason = serde_json::from_str::<serde_json::Value>(&said)
+        .ok()
+        .and_then(|v| {
+            v["message"]
+                .as_str()
+                .or_else(|| v["error"].as_str())
+                .or_else(|| v["errors"][0].as_str())
+                .map(str::to_string)
+        })
+        .filter(|m| !m.trim().is_empty());
+    match reason {
+        Some(why) => bail!("{why}"),
+        None => bail!("Kick answered {status}"),
+    }
+}
