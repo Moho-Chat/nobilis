@@ -4070,6 +4070,18 @@ pub async fn dispatch(
 
         // Where this account's room calls go, for a homeserver that names no
         // media server of its own.
+        // Sliding sync, per account and off by default - see
+        // MatrixAccountConfig::prefer_sliding_sync for why it is a switch
+        // rather than something taken automatically. Turning it either way
+        // clears the stored token, so the next sync starts a fresh stream.
+        "setMatrixSlidingSync" => match p_str_opt(params, "accountId") {
+            None => (None, Some("setMatrixSlidingSync requires \"accountId\"".to_string())),
+            Some(id) => {
+                let on = params.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                account_mutation_result(state.accounts.set_matrix_prefer_sliding_sync(id, on))
+            }
+        },
+
         "setMatrixRtcFocus" => match p_str_opt(params, "accountId") {
             None => (None, Some("setMatrixRtcFocus requires \"accountId\"".to_string())),
             Some(id) => account_mutation_result(state.accounts.set_matrix_rtc_focus(id, p_str(params, "url", ""))),

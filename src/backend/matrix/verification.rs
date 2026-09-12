@@ -586,6 +586,8 @@ mod tests {
             access_token: login.access_token.clone(),
             device_id: login.device_id.clone(),
             next_batch: None,
+            used_sliding_sync: false,
+            prefer_sliding_sync: false,
             display_name: None,
             rtc_focus_url: None,
         };

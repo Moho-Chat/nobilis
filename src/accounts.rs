@@ -197,6 +197,29 @@ pub struct MatrixAccountConfig {
     /// every few seconds on a busy account.
     #[serde(default)]
     pub next_batch: Option<String>,
+    /// Which sync the stored `next_batch` belongs to.
+    ///
+    /// The two are different streams with differently shaped tokens, so a
+    /// homeserver that has switched since last time must not be handed the
+    /// other kind's token - it would be rejected, and the reconnect loop would
+    /// spend its life being rejected. Remembered rather than inferred because
+    /// nothing about a token says which stream it came from.
+    #[serde(default)]
+    pub used_sliding_sync: bool,
+    /// Whether to use sliding sync where the homeserver offers it.
+    ///
+    /// Off by default, and deliberately. Sliding sync replaces the whole of
+    /// how this account talks to its server, and it is a change that cannot be
+    /// half-made: if the translation in sliding.rs is wrong about something,
+    /// the account does not sync at all. Defaulting it on would have switched
+    /// every account on a homeserver that advertises the flag - matrix.org
+    /// among them - on the strength of unit tests against a response this
+    /// daemon wrote itself.
+    ///
+    /// So it is a switch somebody turns on, having been told what it does,
+    /// and turns off again if their account goes quiet.
+    #[serde(default)]
+    pub prefer_sliding_sync: bool,
     #[serde(default)]
     pub display_name: Option<String>,
     /// A media server to hold calls on, where the homeserver names none.
@@ -618,6 +641,41 @@ impl AccountStore {
     ///
     /// Empty clears it, which puts calls back on the mesh between the people
     /// in the room - that being what works with no infrastructure at all.
+    /// Turns sliding sync on or off for this account.
+    ///
+    /// Clears the token with it, for the same reason the kind-changed path
+    /// does: the two are different streams and neither will take the other's
+    /// place-marker.
+    pub fn set_matrix_prefer_sliding_sync(&self, account_id: &str, prefer: bool) -> Result<bool> {
+        let mut matrix = self.matrix.lock().unwrap();
+        match matrix.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                a.prefer_sliding_sync = prefer;
+                a.next_batch = None;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Remembers which sync produced the stored token.
+    pub fn set_matrix_used_sliding_sync(&self, account_id: &str, used: bool) -> Result<bool> {
+        let mut matrix = self.matrix.lock().unwrap();
+        match matrix.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                a.used_sliding_sync = used;
+                // The token this belongs to is cleared with it: the caller
+                // starts a fresh stream, and a stored token from the other
+                // kind would be rejected on every attempt.
+                a.next_batch = None;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
     pub fn set_matrix_rtc_focus(&self, account_id: &str, url: &str) -> Result<bool> {
         let mut matrix = self.matrix.lock().unwrap();
         match matrix.get_mut(account_id) {
@@ -838,6 +896,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
+        sliding_sync: false,
     }
 }
 
@@ -871,6 +930,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         use_tor: false,
         has_key_backup: false,
         rtc_focus_url: None,
+        sliding_sync: false,
     }
 }
 
@@ -903,6 +963,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         use_tor: false,
         has_key_backup: false,
         rtc_focus_url: None,
+        sliding_sync: false,
     }
 }
 
@@ -944,6 +1005,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         use_tor: false,
         has_key_backup: false,
         rtc_focus_url: None,
+        sliding_sync: false,
     }
 }
 
@@ -980,6 +1042,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         use_tor: false,
         has_key_backup,
         rtc_focus_url: a.rtc_focus_url.clone(),
+        sliding_sync: a.prefer_sliding_sync,
     }
 }
 

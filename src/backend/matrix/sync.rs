@@ -184,6 +184,40 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
     // confirmed live as the actual cause of an account showing
     // "connecting" forever despite genuinely being connected and
     // receiving messages the whole time.
+    // Which sync this homeserver speaks, asked once per connection.
+    //
+    // A stored `next_batch` from the other kind is not a token this one can
+    // use - the two are different streams with differently shaped tokens - so
+    // a server that has changed its answer since last time starts fresh
+    // rather than being handed a token it will reject.
+    // Asked for by this account, and offered by its homeserver. Both, in that
+    // order - an account that has not asked never has its server questioned.
+    let use_sliding = config.prefer_sliding_sync
+        && match http::get_json_anonymous(&format!(
+        "{}/_matrix/client/versions",
+        config.homeserver_url.trim_end_matches('/')
+    ))
+    .await
+    {
+        Ok(v) => sliding::supported_in_versions(&v),
+        // A server that will not say is a server to treat as not having it.
+        // Classic sync works everywhere; guessing the other way would break
+        // the connection outright.
+        Err(e) => {
+            tracing::debug!("matrix[{account_id}]: asking which sync: {e}");
+            false
+        }
+    };
+    if use_sliding != config.used_sliding_sync {
+        tracing::info!(
+            "matrix[{account_id}]: sync kind changed to {}, starting a fresh stream",
+            if use_sliding { "sliding" } else { "classic" }
+        );
+        next_batch = None;
+        let _ = state.accounts.set_matrix_used_sliding_sync(account_id, use_sliding);
+    }
+    tracing::info!("matrix[{account_id}]: using {} sync", if use_sliding { "sliding" } else { "classic" });
+
     let mut announced_connected = false;
 
     loop {
@@ -199,8 +233,29 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
             "idle" => "unavailable",
             _ => "online",
         };
-        let url = sync_url(&config.homeserver_url, next_batch.as_deref(), presence);
-        let resp = match http::get_json(&url, &access_token).await {
+        // Sliding sync where the homeserver speaks it, and classic where it
+        // does not. The answer is translated into the classic shape rather
+        // than processed separately - see sliding.rs for why there is one
+        // processor and not two.
+        let raw = if use_sliding {
+            let url = format!(
+                "{}{}{}",
+                config.homeserver_url.trim_end_matches('/'),
+                sliding::SLIDING_PATH,
+                match next_batch.as_deref() {
+                    Some(pos) => format!(
+                        "?timeout={SYNC_LONG_POLL_MS}&pos={}",
+                        url::form_urlencoded::byte_serialize(pos.as_bytes()).collect::<String>()
+                    ),
+                    None => "?timeout=0".to_string(),
+                }
+            );
+            http::post_json(&url, Some(&access_token), sliding::request_body()).await
+        } else {
+            let url = sync_url(&config.homeserver_url, next_batch.as_deref(), presence);
+            http::get_json(&url, &access_token).await
+        };
+        let resp = match raw.map(|v| if use_sliding { sliding::to_classic(&v) } else { v }) {
             Ok(v) => v,
             Err(e) if is_auth_error(&e) => {
                 tracing::info!("matrix[{account_id}]: session rejected, re-logging in");
