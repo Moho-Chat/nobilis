@@ -286,6 +286,7 @@ async fn run() -> Result<()> {
         voice: Arc::new(backend::discord::voice::VoiceState::new()),
         voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
         dcc_prefs: Arc::new(backend::irc::dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
+        irc_sts: Arc::new(backend::irc::sts::StsStore::open(opts.data_dir.join("irc-sts.toml"))),
         highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
         ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };

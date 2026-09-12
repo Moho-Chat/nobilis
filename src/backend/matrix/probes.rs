@@ -65,6 +65,7 @@ mod live {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
@@ -183,6 +184,7 @@ mod live {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
@@ -295,6 +297,7 @@ mod live {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
@@ -452,6 +455,7 @@ mod live {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
@@ -608,6 +612,7 @@ mod live {
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
             voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
             dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };

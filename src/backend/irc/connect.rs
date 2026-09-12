@@ -286,6 +286,32 @@ pub(super) fn proxy_port(config: &IrcAccountConfig) -> u16 {
 /// OVERALL_ESTABLISH_TIMEOUT's doc comment above.
 pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sender, ClientStream, Option<NickservWait>)> {
     let account_id = config.account_id();
+
+    // A network that told us, over TLS, not to come back in plaintext.
+    //
+    // Applied here rather than at the account, because it is not the
+    // account's setting to change: STS exists so that the *next* connection
+    // cannot be talked down to plaintext by somebody in the middle of it, and
+    // a policy that only applied when somebody remembered to tick a box would
+    // protect nobody. The stored port comes with it - a network that moved
+    // its TLS listener said so when it set the policy.
+    //
+    // Overridden into a copy of the account rather than carried alongside it,
+    // so that everything downstream reads one truth. `config.ssl` is not only
+    // used to open the socket: the SASL path refuses to send credentials over
+    // a connection it believes is in the clear, and a flag passed separately
+    // would have left that check reading the old answer on exactly the
+    // connection STS had just upgraded.
+    let mut config = config.clone();
+    if !config.ssl {
+        if let Some(policy) = state.irc_sts.policy(&config.host) {
+            tracing::info!("irc[{account_id}]: STS in force for {}, using TLS on port {}", config.host, policy.port);
+            state.runtime.report_progress(state, &account_id, &format!("{} requires TLS (STS) - connecting on port {} instead", config.host, policy.port));
+            config.ssl = true;
+            config.port = Some(policy.port);
+        }
+    }
+    let config = &config;
     let port = config.port.unwrap_or(if config.ssl { 6697 } else { 6667 });
 
     let irc_config = Config {
@@ -337,6 +363,29 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     let mut stream = client.stream()?;
     let sender = client.sender();
 
+    // On a connection made in the clear, ask what the server offers before
+    // saying anything at all.
+    //
+    // The ordinary STS check lives in `end_cap_and_register`, which on the
+    // SASL path does not run until after the credentials have gone - and a
+    // network that advertises STS is a network saying those credentials
+    // should never have crossed a plaintext socket. `sasl_transport_ok`
+    // already refuses to send them in the clear unless somebody has
+    // explicitly allowed it for this account, so this closes the case where
+    // they have: the allowance was made about the network as it was, and STS
+    // is the network saying it has changed its mind.
+    //
+    // One extra round trip, on plaintext connections only, which are both the
+    // rare case and the one with something to lose. A second `CAP LS` from
+    // `end_cap_and_register` after this is legal and answered again.
+    if !config.ssl {
+        if let Some(raw) = offered_caps_raw(&sender, &mut stream).await {
+            if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
+                bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
+            }
+        }
+    }
+
     // Whether the account is authenticated by the time registration finishes.
     // Ticking the SASL box is a request, not a guarantee: a server with no
     // SASL registers us normally, and then NickServ is still the way in.
@@ -349,7 +398,7 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         // above are still worth asking for, and they have to be requested
         // before CAP END like any other.
         state.runtime.report_progress(state, &account_id, "Registering (NICK/USER)...");
-        end_cap_and_register(&sender, &mut stream, config).await?;
+        end_cap_and_register(state, &sender, &mut stream, config).await?;
     }
 
     state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
@@ -566,13 +615,55 @@ pub(super) fn caps_worth_requesting(offered: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Acts on an `sts=` in a server's `CAP LS`, if there is one.
+///
+/// Which half applies depends on how this connection was made, and the spec is
+/// emphatic about it:
+///
+/// - Over **TLS**, `duration=` is remembered. That is the promise worth
+///   keeping, because it is what stops the *next* connection being talked down
+///   to plaintext by somebody in the middle of it. `duration=0` withdraws the
+///   policy and is obeyed - it is the only way out for a network that turns
+///   TLS off.
+/// - Over **plaintext**, only `port=` counts, and nothing is remembered.
+///   An attacker who can rewrite a plaintext stream can write the policy too,
+///   and a remembered forgery would outlive the attack. The upgrade is left to
+///   the reconnect: the policy is recorded for this host with a short life,
+///   the connection is dropped, and `establish` picks it up on the way back.
+fn note_sts_policy(state: &AppState, config: &IrcAccountConfig, caps: &str) -> Option<u16> {
+    let advert = sts::sts_from_caps(caps)?;
+    let account_id = config.account_id();
+    if config.ssl {
+        let duration = advert.duration?;
+        let port = config.port.unwrap_or(6697);
+        tracing::info!("irc[{account_id}]: STS for {} - TLS on port {port} for {duration}s", config.host);
+        state.irc_sts.remember(&config.host, port, duration);
+        None
+    } else {
+        let port = advert.port?;
+        // A policy learned in the clear is only good enough to get us onto
+        // the encrypted port once, which is why it is stored with a short
+        // life: the duration that actually binds is read from the
+        // advertisement that arrives over TLS, on the connection this one is
+        // about to be replaced by.
+        tracing::info!("irc[{account_id}]: STS offered over plaintext, reconnecting to port {port} over TLS");
+        state.irc_sts.remember(&config.host, port, 60);
+        Some(port)
+    }
+}
+
 /// Closes capability negotiation and sends the ordinary NICK/USER pair.
 ///
 /// Shared by the authenticated path and the fell-back-to-nothing path because
 /// both owe the server a CAP END: having asked for capabilities, registration
 /// does not proceed until we say we are finished asking, and a server left
 /// waiting for that just sits there until the establish timeout fires.
-pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<()> {
+pub(super) async fn end_cap_and_register(
+    state: &AppState,
+    sender: &Sender,
+    stream: &mut ClientStream,
+    config: &IrcAccountConfig,
+) -> Result<()> {
     // Ask what this server has before asking it for anything.
     //
     // This used to send one REQ per capability and not wait for the answers,
@@ -592,7 +683,21 @@ pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStr
     // A server that answers no LS at all gets the old behaviour, since
     // something that ancient is exactly the case the atomicity worry was
     // about.
-    let offered = offered_caps(sender, stream).await;
+    let raw = offered_caps_raw(sender, stream).await;
+    if let Some(raw) = raw.as_deref() {
+        // An upgrade cannot be done in place: this is the middle of
+        // registration, and the way to a TLS port is a fresh connection. So
+        // the policy is stored and this attempt is abandoned - the reconnect
+        // loop comes straight back, and `establish` reads the policy on the
+        // way in. Registering first and reconnecting after would send NICK,
+        // USER and possibly a server password in the clear, which is the
+        // exact thing the network just asked us not to do.
+        if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
+            bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
+        }
+    }
+    let offered: Option<Vec<String>> =
+        raw.map(|raw| raw.iter().map(|cap| cap.split('=').next().unwrap_or(cap).to_string()).collect());
     match offered {
         Some(offered) => {
             let wanted: Vec<&str> = WANTED_CAPS.iter().copied().filter(|cap| offered.iter().any(|o| o == cap)).collect();
@@ -636,6 +741,22 @@ pub(super) async fn end_cap_and_register(sender: &Sender, stream: &mut ClientStr
 /// returns None, and the caller falls back to asking for everything the way
 /// it always did.
 pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
+    offered_caps_raw(sender, stream).await.map(|raw| {
+        raw.iter()
+            // `cap=value` advertises a capability with parameters - SASL names
+            // its mechanisms this way, STS its duration and port. The name is
+            // what is requested.
+            .map(|cap| cap.split('=').next().unwrap_or(cap).to_string())
+            .collect()
+    })
+}
+
+/// The offer as the server wrote it, values and all.
+///
+/// Separate from `offered_caps` because two callers want two different things
+/// out of one answer: negotiation wants names to compare against
+/// `WANTED_CAPS`, and STS wants the value it would otherwise have thrown away.
+pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
     if sender.send_cap_ls(NegotiationVersion::V302).is_err() {
         return None;
     }
@@ -648,9 +769,7 @@ pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> 
         let more = param.as_deref() == Some("*");
         let list = if more { suffix.as_deref().unwrap_or("") } else { cap_list(param.as_deref(), suffix.as_deref()) };
         for cap in list.split_whitespace() {
-            // `cap=value` advertises a capability with parameters - SASL
-            // names its mechanisms this way. The name is what is requested.
-            offered.push(cap.split('=').next().unwrap_or(cap).to_string());
+            offered.push(cap.to_string());
         }
         if !more {
             tracing::debug!("irc: server offers {} capabilities: {}", offered.len(), offered.join(" "));

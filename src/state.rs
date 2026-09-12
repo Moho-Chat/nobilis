@@ -31,6 +31,10 @@ pub struct AppState {
     /// so a deliberate mute is still in force after a restart.
     pub voice_prefs: Arc<crate::audio::VoicePrefsStore>,
     pub dcc_prefs: Arc<crate::backend::irc::dcc::DccPrefsStore>,
+    /// Which IRC networks have told us, over TLS, never to come back in
+    /// plaintext - and until when. Not a setting somebody chose, which is why
+    /// it is here rather than on the account: see backend/irc/sts.rs.
+    pub irc_sts: Arc<crate::backend::irc::sts::StsStore>,
     /// The words that make a message worth being told about, besides your
     /// name. Here rather than in a window because this is where a message is
     /// decided to be a highlight - see highlights.rs.
