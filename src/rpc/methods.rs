@@ -2018,6 +2018,95 @@ pub async fn dispatch(
             }
         }
 
+        // Writing a conversation to disk.
+        //
+        // Six calls rather than one, because the window drives the loop: the
+        // HTML a message becomes is made by the renderer's own formatter, and
+        // an export is meant to be what was on screen rather than a second
+        // opinion about it (see export.rs). So the window walks the range and
+        // renders, and everything that is not formatting is here.
+        "beginExport" => {
+            let (Some(account_id), Some(buffer_id), Some(title), Some(into)) = (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "title"),
+                p_str_opt(params, "into"),
+            ) else {
+                return (None, Some("beginExport requires \"accountId\", \"bufferId\", \"title\" and \"into\"".to_string()));
+            };
+            match crate::export::begin(state, account_id, buffer_id, title, into) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Whether to keep going. The loop is in the window, so this is how
+        // cancel and pause reach it.
+        "exportStatus" => match p_str_opt(params, "id") {
+            Some(id) => match crate::export::status(state, id) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            None => (None, Some("exportStatus requires \"id\"".to_string())),
+        },
+
+        "appendExport" => {
+            let (Some(id), Some(html)) = (p_str_opt(params, "id"), p_str_opt(params, "html")) else {
+                return (None, Some("appendExport requires \"id\" and \"html\"".to_string()));
+            };
+            let done = params.get("done").and_then(Value::as_u64).unwrap_or(0);
+            let total = params.get("total").and_then(Value::as_u64).unwrap_or(0);
+            match crate::export::append(state, id, html, done, total) {
+                Ok(()) => (Some(Value::Bool(true)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Fetching a picture into the folder, paced so a conversation's worth
+        // of them does not read as a scrape.
+        "fetchExportMedia" => {
+            let (Some(id), Some(url)) = (p_str_opt(params, "id"), p_str_opt(params, "url")) else {
+                return (None, Some("fetchExportMedia requires \"id\" and \"url\"".to_string()));
+            };
+            match crate::export::fetch_media(state, id, url).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "finishExport" => {
+            let (Some(id), Some(title)) = (p_str_opt(params, "id"), p_str_opt(params, "title")) else {
+                return (None, Some("finishExport requires \"id\" and \"title\"".to_string()));
+            };
+            match crate::export::finish(state, id, title, p_str(params, "subtitle", "")) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Said by the window when its own half failed, so the row says why
+        // rather than sitting at whatever it had reached.
+        "failExport" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("failExport requires \"id\"".to_string()));
+            };
+            crate::export::fail(state, id, p_str(params, "reason", "the export could not be finished"));
+            (Some(Value::Bool(true)), None)
+        }
+
+        // Only an export can be put down and picked back up - a DCC socket
+        // cannot be, which is why this is not on cancelTransfer's path.
+        "pauseTransfer" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("pauseTransfer requires \"id\"".to_string()));
+            };
+            let paused = params.get("paused").and_then(Value::as_bool).unwrap_or(true);
+            match crate::export::set_paused(state, id, paused) {
+                Ok(()) => (Some(Value::Bool(true)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "acceptTransfer" => {
             let Some(id) = p_str_opt(params, "id") else {
                 return (None, Some("acceptTransfer requires \"id\"".to_string()));

@@ -30,6 +30,9 @@ pub struct TransferRow {
     pub path: Option<String>,
     pub error: Option<String>,
     pub ts: i64,
+    /// "dcc" or "export". Added after the table existed, so every row written
+    /// before it defaults to the only thing it could have been.
+    pub kind: String,
 }
 
 impl Store {
@@ -94,6 +97,7 @@ impl Store {
         // Defensive no-ops for a scrollback.db predating these columns,
         // same as store.c's post-hoc ALTER TABLE. Ignore "duplicate column".
         for stmt in [
+            "ALTER TABLE transfers ADD COLUMN kind TEXT NOT NULL DEFAULT 'dcc'",
             "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'",
             "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
             "ALTER TABLE messages ADD COLUMN reply_to_from TEXT",
@@ -704,8 +708,8 @@ impl Store {
     pub fn record_transfer(&self, t: &TransferRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO transfers (id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO transfers (id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET received = ?8, state = ?9, path = ?10, error = ?11",
             params![
                 t.id,
@@ -720,6 +724,7 @@ impl Store {
                 t.path,
                 t.error,
                 t.ts,
+                t.kind,
             ],
         )?;
         Ok(())
@@ -755,7 +760,7 @@ impl Store {
     pub fn recent_transfers(&self, limit: i64) -> Result<Vec<TransferRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts
+            "SELECT id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts, kind
              FROM transfers ORDER BY ts DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -772,6 +777,7 @@ impl Store {
                 path: row.get(9)?,
                 error: row.get(10)?,
                 ts: row.get(11)?,
+                kind: row.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -1036,6 +1042,7 @@ mod tests {
             path: None,
             error: None,
             ts: 42,
+                    kind: "dcc".to_string(),
         };
         st.record_transfer(&row).unwrap();
         row.received = 100;
