@@ -325,6 +325,8 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
         access_token: login.access_token,
         device_id: login.device_id,
         next_batch: None,
+        used_sliding_sync: false,
+        prefer_sliding_sync: false,
         display_name: None,
             rtc_focus_url: None,
         };
@@ -413,6 +415,8 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
         access_token,
         device_id,
         next_batch: None,
+        used_sliding_sync: false,
+        prefer_sliding_sync: false,
         display_name: None,
         rtc_focus_url: None,
     };
@@ -466,6 +470,8 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         access_token: String::new(),
         device_id: String::new(),
         next_batch: None,
+        used_sliding_sync: false,
+        prefer_sliding_sync: false,
         display_name: None,
             rtc_focus_url: None,
         };
@@ -480,6 +486,8 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         access_token: login.access_token,
         device_id: login.device_id,
         next_batch: None,
+        used_sliding_sync: false,
+        prefer_sliding_sync: false,
         display_name: None,
             rtc_focus_url: None,
         };

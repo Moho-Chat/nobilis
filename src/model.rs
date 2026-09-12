@@ -91,6 +91,9 @@ pub struct Account {
     /// that has not been given one.
     #[serde(rename = "rtcFocusUrl", skip_serializing_if = "Option::is_none")]
     pub rtc_focus_url: Option<String>,
+    /// Matrix only: whether this account uses sliding sync where offered.
+    #[serde(rename = "slidingSync", default)]
+    pub sliding_sync: bool,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on
