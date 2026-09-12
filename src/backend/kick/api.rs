@@ -48,9 +48,6 @@ pub fn client() -> Result<reqwest::Client> {
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub id: u64,
-    /// The person behind the channel. Not `id`: for xqc those are 676 and 668,
-    /// and 7TV answers only to the first.
-    pub user_id: Option<u64>,
     /// The room the websocket subscribes to. Not the same number as `id`
     /// in general, even though it often is for older channels.
     pub chatroom_id: u64,
@@ -87,11 +84,6 @@ pub struct Live {
 #[derive(Deserialize)]
 struct ChannelJson {
     id: u64,
-    /// The person behind the channel, which is a different number from `id`.
-    /// 7TV keys its emote sets by this one - see seventv.rs, where asking with
-    /// the channel id answers 404.
-    #[serde(default)]
-    user_id: Option<u64>,
     slug: String,
     chatroom: ChatroomJson,
     user: Option<UserJson>,
@@ -214,7 +206,6 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
 
     Ok(Channel {
         id: json.id,
-        user_id: json.user_id,
         chatroom_id: json.chatroom.id,
         username: json.user.as_ref().and_then(|u| u.username.clone()).unwrap_or_else(|| json.slug.clone()),
         avatar_url: json.user.and_then(|u| u.profile_pic),

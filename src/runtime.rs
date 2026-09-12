@@ -209,12 +209,6 @@ pub struct KickChannel {
     pub history_cursor: Option<String>,
     /// The room the websocket subscribed to and messages are posted to.
     pub chatroom_id: u64,
-    /// The person behind the channel, which 7TV keys its emote sets by - a
-    /// different number from `channel_id`, and the only one 7TV answers to.
-    pub user_id: Option<u64>,
-    /// Emotes this channel's viewers talk in that Kick knows nothing about,
-    /// by the word that stands for them - see backend/kick/seventv.rs.
-    pub word_emotes: std::collections::BTreeMap<String, String>,
     /// Whether this account is subscribed to this streamer, which decides
     /// only which emotes the picker offers - see backend::kick::emotes.
     pub subscribed: bool,
@@ -3136,20 +3130,6 @@ impl Runtime {
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
-    }
-
-    /// Records a channel's 7TV emotes and tells the windows, which need them
-    /// to turn a word in a message into the picture it stands for.
-    pub fn set_kick_word_emotes(&self, state: &AppState, buffer_id: &str, words: std::collections::BTreeMap<String, String>) {
-        {
-            let mut all = self.kick_channels.lock().unwrap();
-            let Some(channel) = all.get_mut(buffer_id) else { return };
-            channel.word_emotes = words.clone();
-        }
-        state.events.emit(
-            "kickWordEmotes",
-            serde_json::json!({ "bufferId": buffer_id, "emotes": words }),
-        );
     }
 
     pub fn set_kick_history_cursor(&self, buffer_id: &str, cursor: Option<String>) {

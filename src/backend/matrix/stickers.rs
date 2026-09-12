@@ -155,8 +155,8 @@ pub fn escape_html(text: &str) -> String {
 /// it would leave those clients reading an `<img>` tag as words.
 ///
 /// The shortcode is matched with its colons, so a bare word that happens to
-/// share a name with an emoticon is left alone - unlike 7TV, where the bare
-/// word *is* the emote, Matrix's are written deliberately.
+/// share a name with an emoticon is left alone: a Matrix emoticon is written
+/// deliberately, which is what the colons are for.
 pub fn inline_emoticons(html: &str, emoticons: &std::collections::BTreeMap<String, String>) -> String {
     if emoticons.is_empty() || !html.contains(':') {
         return html.to_string();
@@ -395,8 +395,8 @@ mod tests {
         assert_eq!(inline_emoticons("nothing here", &codes()), "nothing here");
     }
 
-    /// Unlike 7TV, where the bare word is the emote, Matrix's are written
-    /// deliberately - so a word that merely shares the name is not one.
+    /// Written deliberately, colons and all - so a word that merely shares
+    /// the name is not one.
     #[test]
     fn a_bare_word_is_not_an_emoticon() {
         assert_eq!(inline_emoticons("the cat sat", &codes()), "the cat sat");

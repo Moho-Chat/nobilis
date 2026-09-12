@@ -58,7 +58,6 @@ pub(super) fn watching_odablock() -> Watched {
     let mut w = Watched::default();
     w.add(&api::Channel {
         id: 2401072,
-        user_id: None,
         chatroom_id: 2393554,
         slug: "odablock".into(),
         username: "odablock".into(),
