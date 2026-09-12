@@ -129,6 +129,68 @@ pub fn read_pack(content: &Value, fallback_name: &str) -> Vec<Sticker> {
         .collect()
 }
 
+/// Escapes text so it can sit inside a formatted body.
+pub fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Turns `:shortcode:` into the image it stands for, inside a formatted body.
+///
+/// `data-mx-emoticon` is what marks an image as an emoticon rather than an
+/// attachment, and it is why a receiving client draws it at line height
+/// instead of full size. Element sends exactly this shape.
+///
+/// Only in the formatted half, never in the plain body: `:shortcode:` there is
+/// precisely the fallback a client with no images should show, and rewriting
+/// it would leave those clients reading an `<img>` tag as words.
+///
+/// The shortcode is matched with its colons, so a bare word that happens to
+/// share a name with an emoticon is left alone - unlike 7TV, where the bare
+/// word *is* the emote, Matrix's are written deliberately.
+pub fn inline_emoticons(html: &str, emoticons: &std::collections::BTreeMap<String, String>) -> String {
+    if emoticons.is_empty() || !html.contains(':') {
+        return html.to_string();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        // The closing colon, on the same line: a colon at the end of a
+        // sentence should not go hunting through the whole message for a
+        // partner.
+        let end = after.find(':').filter(|e| !after[..*e].contains(char::is_whitespace));
+        match end.and_then(|e| emoticons.get(&after[..e]).map(|mxc| (e, mxc))) {
+            Some((e, mxc)) => {
+                let name = &after[..e];
+                out.push_str(&format!(
+                    "<img data-mx-emoticon src=\"{}\" alt=\":{}:\" title=\":{}:\" height=\"32\">",
+                    escape_html(mxc),
+                    escape_html(name),
+                    escape_html(name)
+                ));
+                rest = &after[e + 1..];
+            }
+            None => {
+                out.push(':');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The content of an `m.sticker` event for one of these.
 ///
 /// `info` is left to the caller: a sticker's dimensions are what a client
@@ -306,6 +368,50 @@ mod tests {
                 "elsewhere": { "url": "https://example.org/not-matrix.png" }
             }
         })
+    }
+
+    fn codes() -> std::collections::BTreeMap<String, String> {
+        [("wave".to_string(), "mxc://x/wave".to_string()), ("cat".to_string(), "mxc://x/cat".to_string())]
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn a_shortcode_becomes_the_image_it_stands_for() {
+        let got = inline_emoticons("hello :wave: there", &codes());
+        assert!(got.contains("data-mx-emoticon"), "{got}");
+        assert!(got.contains("mxc://x/wave"), "{got}");
+        assert!(got.starts_with("hello ") && got.ends_with(" there"), "{got}");
+        // The fallback a client with no images shows.
+        assert!(got.contains("alt=\":wave:\""), "{got}");
+    }
+
+    /// A colon ending a sentence must not go hunting through the message for
+    /// a partner and swallow everything between.
+    #[test]
+    fn an_ordinary_colon_is_left_alone() {
+        assert_eq!(inline_emoticons("look: a thing", &codes()), "look: a thing");
+        assert_eq!(inline_emoticons("12:30 and :nope: too", &codes()), "12:30 and :nope: too");
+        assert_eq!(inline_emoticons("nothing here", &codes()), "nothing here");
+    }
+
+    /// Unlike 7TV, where the bare word is the emote, Matrix's are written
+    /// deliberately - so a word that merely shares the name is not one.
+    #[test]
+    fn a_bare_word_is_not_an_emoticon() {
+        assert_eq!(inline_emoticons("the cat sat", &codes()), "the cat sat");
+    }
+
+    #[test]
+    fn two_in_a_row_both_become_pictures() {
+        let got = inline_emoticons(":wave::cat:", &codes());
+        assert_eq!(got.matches("data-mx-emoticon").count(), 2, "{got}");
+    }
+
+    /// An account with no pack pays nothing and changes nothing.
+    #[test]
+    fn no_emoticons_means_the_text_is_untouched() {
+        assert_eq!(inline_emoticons(":wave:", &Default::default()), ":wave:");
     }
 
     /// The same pack, read the other way. One map holds both, and a client

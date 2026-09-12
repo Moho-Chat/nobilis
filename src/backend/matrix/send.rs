@@ -567,7 +567,24 @@ pub async fn send_message(
         // The formatting somebody typed, where they typed any. Sent
         // alongside the plain text rather than instead of it: body stays the
         // fallback for a client that will not render HTML.
-        if let Some(html) = markup::to_html(body) {
+        // The formatting somebody typed, plus any emoji they picked. The two
+        // together, because an emoticon is only an emoticon in the formatted
+        // half: `:shortcode:` in the plain body is exactly the fallback a
+        // client with no images should show, and replacing it there would
+        // leave those clients reading an `<img>` tag as words.
+        let typed = markup::to_html(body);
+        let emoji = state.runtime.matrix_emoticons(account_id);
+        let html = match typed {
+            Some(html) => Some(stickers::inline_emoticons(&html, &emoji)),
+            // Nothing was typed in markup, but an emoticon still needs a
+            // formatted body to live in - so one is made only when there is
+            // actually an emoticon to put in it.
+            None => {
+                let inlined = stickers::inline_emoticons(&stickers::escape_html(body), &emoji);
+                (inlined != stickers::escape_html(body)).then_some(inlined)
+            }
+        };
+        if let Some(html) = html {
             content["format"] = serde_json::json!("org.matrix.custom.html");
             content["formatted_body"] = serde_json::json!(html);
         }

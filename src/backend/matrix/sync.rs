@@ -505,6 +505,12 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
                 // inside a line of text, which is what the emoji picker is
                 // for - so the one pack feeds two places (see #205).
                 let emoticons = stickers::read_emoticons(&event["content"], "your emoji");
+                // Also kept by shortcode, which is what the send path needs to
+                // turn `:name:` into the image on the way out.
+                state.runtime.set_matrix_emoticons(
+                    account_id,
+                    emoticons.iter().map(|e| (e.name.clone(), e.mxc.clone())).collect(),
+                );
                 if !emoticons.is_empty() {
                     state.runtime.set_emoji_source(
                         account_id,
