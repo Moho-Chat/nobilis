@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// One place an account's emoji come from: a Discord guild, a Kick channel,
-/// Sneedchat's own table, 7TV's global set.
+/// Sneedchat's own table, a Matrix emoticon pack.
 ///
 /// A source rather than a flat list because the picker is organised by where
 /// things came from - that is how somebody finds an emote they half remember,
@@ -29,7 +29,8 @@ pub struct EmojiSource {
     /// is the thing a picker cannot guess.
     ///
     /// `"text"` - the entry's `id` is written into the message being composed.
-    /// Discord, Kick, Sneedchat and 7TV all work this way: what is sent is a
+    /// Discord, Kick, Sneedchat and Matrix emoticons all work this way: what
+    /// is sent is a
     /// run of characters the service recognises.
     ///
     /// `"event"` - the entry is sent on its own, immediately, and never
@@ -43,7 +44,8 @@ pub struct EmojiSource {
     #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,
     /// Where these can be sent. Empty means anywhere this account can talk -
-    /// which is what Sneedchat's table and 7TV's global set are - and a
+    /// which is what Sneedchat's table and a Matrix account's own pack are -
+    /// and a
     /// non-empty list names the buffers, for the ones that are tied to a
     /// place unless a subscription says otherwise.
     #[serde(rename = "buffers")]
@@ -58,7 +60,7 @@ pub struct EmojiSource {
 #[derive(Serialize, Clone, Debug)]
 pub struct EmojiEntry {
     /// What goes in the message. Kick's `[emote:id:name]`, Discord's id, a
-    /// 7TV word, a Sneedchat shortcode - whatever this service sends.
+    /// a Sneedchat shortcode, a Matrix `:name:` - whatever this service reads.
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
