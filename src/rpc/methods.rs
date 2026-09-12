@@ -3518,6 +3518,28 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "rewards": rewards, "points": points })), None)
         }
 
+        // Just the balance. Separate from `listKickRewards` because the two
+        // change at different rates: what a channel offers is set up once and
+        // edited rarely, while points tick up the whole time somebody watches.
+        // The plaque polls this once a minute and asks for the rest only when
+        // it is opened.
+        "kickPoints" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("kickPoints requires \"bufferId\"".to_string()));
+            };
+            let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+                return (None, Some("that is not a Kick channel".to_string()));
+            };
+            let (http, token) = match kick_credential(state, &channel_account(state, buffer_id)) {
+                Ok(pair) => pair,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::kick::api::points(&http, &token, &channel.slug).await {
+                Ok(points) => (Some(serde_json::json!({ "points": points })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "redeemKickReward" => {
             let (Some(buffer_id), Some(reward_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rewardId")) else {
                 return (None, Some("redeemKickReward requires \"bufferId\" and \"rewardId\"".to_string()));
