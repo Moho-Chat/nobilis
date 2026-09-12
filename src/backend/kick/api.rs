@@ -74,6 +74,11 @@ pub struct Channel {
 /// A stream in progress, as the channel endpoint describes it.
 #[derive(Clone, Debug, Default)]
 pub struct Live {
+    /// The broadcast's own id, which is not the channel's and changes every
+    /// time somebody goes live. Kick keys watch time by it -
+    /// `private-livestream.<this>` is the channel that earns points, so
+    /// nothing about watching works without it. See watch.rs.
+    pub id: Option<u64>,
     pub title: String,
     pub category: Option<String>,
     pub viewers: Option<u64>,
@@ -112,6 +117,8 @@ where
 
 #[derive(Deserialize)]
 struct LivestreamJson {
+    #[serde(default, deserialize_with = "loose_number")]
+    id: Option<u64>,
     #[serde(default)]
     session_title: Option<String>,
     #[serde(default)]
@@ -198,6 +205,7 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     // `livestream` is null when the channel is offline, which is the honest
     // answer and the one the header draws as "offline" rather than as a blank.
     let live = json.livestream.filter(|l| l.is_live).map(|l| Live {
+        id: l.id,
         title: l.session_title.unwrap_or_default(),
         category: l.categories.into_iter().find_map(|c| c.name),
         viewers: l.viewer_count,
@@ -1654,6 +1662,28 @@ pub async fn pinned_message(http: &reqwest::Client, token: Option<&str>, slug: &
 
 /// The smallest bet Kick accepts, which its own form enforces.
 pub const MIN_PREDICTION_BET: i64 = 10;
+
+/// Who this token belongs to, by Kick's own numbering.
+///
+/// Needed because the realtime service is addressed by user id rather than by
+/// the name anybody types - see watch.rs. Asked once per connection rather
+/// than stored: a token and the account it belongs to can only disagree if
+/// somebody signed in as somebody else, and then the stored one would be the
+/// wrong answer for the life of the file.
+pub async fn own_user_id(http: &reqwest::Client, token: &str) -> Result<u64> {
+    let res = http
+        .get(format!("{API_ROOT}/api/v1/user"))
+        .header("Accept", "application/json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("asking Kick who this account is")?;
+    if !res.status().is_success() {
+        bail!("Kick answered {} about this account", res.status());
+    }
+    let body: serde_json::Value = res.json().await.context("reading Kick's answer")?;
+    body["id"].as_u64().context("Kick named no id for this account")
+}
 
 /// This account's channel points in a channel, which is what a bet spends.
 pub async fn points(http: &reqwest::Client, token: &str, slug: &str) -> Result<i64> {

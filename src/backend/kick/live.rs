@@ -17,6 +17,11 @@ pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::
         "live": channel.live.is_some(),
         "title": channel.live.as_ref().map(|l| l.title.clone()),
         "category": channel.live.as_ref().and_then(|l| l.category.clone()),
+        // The broadcast's own id, which is not the channel's and changes every
+        // time somebody goes live. Watch time is counted on it - see
+        // backend/kick/watch.rs - so it rides the stream event, which is
+        // already the thing that notices going live and going off.
+        "livestreamId": channel.live.as_ref().and_then(|l| l.id),
         "viewers": channel.live.as_ref().and_then(|l| l.viewers),
         "startedTs": channel.live.as_ref().and_then(|l| l.started_ts),
         "followers": channel.followers,

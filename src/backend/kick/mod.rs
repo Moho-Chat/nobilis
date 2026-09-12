@@ -35,6 +35,7 @@ pub mod chat;
 pub mod live;
 pub mod pins;
 pub mod socket;
+pub mod watch;
 #[cfg(test)]
 mod testkit;
 pub mod api;
