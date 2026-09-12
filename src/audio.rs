@@ -659,7 +659,20 @@ mod tests {
         }
     }
 
+    /// Ignored by default, for the same reason as `microphone_delivers_audio`
+    /// below: it needs a sound server to mean anything.
+    ///
+    /// The check it makes is about *routing* - the stream opens on the
+    /// default device and is then moved to the chosen one, and it is the move
+    /// that must fail when the chosen one does not exist. Reaching that point
+    /// requires a default device to open first, so on a machine with no audio
+    /// at all this fails one step earlier with "no default input device" and
+    /// tests nothing it was written to test.
+    ///
+    /// Run it deliberately, on a machine with a microphone:
+    ///   cargo test -- --ignored a_missing_device
     #[test]
+    #[ignore]
     fn a_missing_device_is_an_error_rather_than_a_substitution() {
         // Being recorded on a different microphone than the one chosen is
         // worse than being told the choice did not take, so routing to a
