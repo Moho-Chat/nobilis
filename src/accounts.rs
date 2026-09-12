@@ -220,6 +220,15 @@ pub struct MatrixAccountConfig {
     /// and turns off again if their account goes quiet.
     #[serde(default)]
     pub prefer_sliding_sync: bool,
+    /// Whether this account keeps a dehydrated device - see
+    /// backend/matrix/dehydration.rs.
+    ///
+    /// Only the flag. The key that opens it lives in the account's secret
+    /// storage on the server and is cached by the crypto store, never here:
+    /// writing the recovery code into a config file would put the key to the
+    /// whole safe on disk to save typing it once.
+    #[serde(default)]
+    pub dehydration_enabled: bool,
     #[serde(default)]
     pub display_name: Option<String>,
     /// A media server to hold calls on, where the homeserver names none.
@@ -641,6 +650,19 @@ impl AccountStore {
     ///
     /// Empty clears it, which puts calls back on the mesh between the people
     /// in the room - that being what works with no infrastructure at all.
+    /// Remembers whether this account keeps a dehydrated device.
+    pub fn set_matrix_dehydration(&self, account_id: &str, enabled: bool) -> Result<bool> {
+        let mut matrix = self.matrix.lock().unwrap();
+        match matrix.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                a.dehydration_enabled = enabled;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
     /// Turns sliding sync on or off for this account.
     ///
     /// Clears the token with it, for the same reason the kind-changed path
@@ -897,6 +919,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
+        dehydration: false,
     }
 }
 
@@ -931,6 +954,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
+        dehydration: false,
     }
 }
 
@@ -964,6 +988,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
+        dehydration: false,
     }
 }
 
@@ -1006,6 +1031,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
+        dehydration: false,
     }
 }
 
@@ -1043,6 +1069,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         has_key_backup,
         rtc_focus_url: a.rtc_focus_url.clone(),
         sliding_sync: a.prefer_sliding_sync,
+        dehydration: a.dehydration_enabled,
     }
 }
 

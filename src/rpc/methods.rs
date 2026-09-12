@@ -4070,6 +4070,34 @@ pub async fn dispatch(
 
         // Where this account's room calls go, for a homeserver that names no
         // media server of its own.
+        // Keeping a dehydrated device, so room keys shared while this login
+        // did not exist are not simply lost - see backend/matrix/dehydration.rs.
+        //
+        // Answers with a recovery code only where one had to be made, which is
+        // the single moment it can be shown: it is not stored anywhere this
+        // daemon can read it back.
+        "enableMatrixDehydration" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("enableMatrixDehydration requires \"accountId\"".to_string()));
+            };
+            match backend::matrix::dehydration::enable(state, account_id, p_str_opt(params, "unlockWith")).await {
+                Ok(code) => (Some(serde_json::json!({ "recoveryCode": code })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The one moment the recovery code is needed: a login that has never
+        // run has no cached pickle key, and this is how it gets one.
+        "rehydrateMatrixDevice" => {
+            let (Some(account_id), Some(code)) = (p_str_opt(params, "accountId"), p_str_opt(params, "recoveryCode")) else {
+                return (None, Some("rehydrateMatrixDevice requires \"accountId\" and \"recoveryCode\"".to_string()));
+            };
+            match backend::matrix::dehydration::rehydrate_with_code(state, account_id, code).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Sliding sync, per account and off by default - see
         // MatrixAccountConfig::prefer_sliding_sync for why it is a switch
         // rather than something taken automatically. Turning it either way

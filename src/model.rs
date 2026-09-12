@@ -94,6 +94,9 @@ pub struct Account {
     /// Matrix only: whether this account uses sliding sync where offered.
     #[serde(rename = "slidingSync", default)]
     pub sliding_sync: bool,
+    /// Matrix only: whether this account keeps a dehydrated device.
+    #[serde(rename = "dehydration", default)]
+    pub dehydration: bool,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on

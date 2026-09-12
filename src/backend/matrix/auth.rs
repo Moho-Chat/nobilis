@@ -327,6 +327,7 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
         next_batch: None,
         used_sliding_sync: false,
         prefer_sliding_sync: false,
+        dehydration_enabled: false,
         display_name: None,
             rtc_focus_url: None,
         };
@@ -417,6 +418,7 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
         next_batch: None,
         used_sliding_sync: false,
         prefer_sliding_sync: false,
+        dehydration_enabled: false,
         display_name: None,
         rtc_focus_url: None,
     };
@@ -472,6 +474,7 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         next_batch: None,
         used_sliding_sync: false,
         prefer_sliding_sync: false,
+        dehydration_enabled: false,
         display_name: None,
             rtc_focus_url: None,
         };
@@ -488,6 +491,7 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         next_batch: None,
         used_sliding_sync: false,
         prefer_sliding_sync: false,
+        dehydration_enabled: false,
         display_name: None,
             rtc_focus_url: None,
         };

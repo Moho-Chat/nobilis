@@ -82,6 +82,8 @@ pub mod calls;
 pub mod protocol;
 pub mod roomstate;
 pub mod sliding;
+pub mod dehydration;
+pub mod ssss;
 pub mod stickers;
 pub mod rooms;
 pub mod verification;
