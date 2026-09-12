@@ -445,6 +445,7 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
                     id: guild_id.to_string(),
                     name: guild_name.clone(),
                     service: "discord".to_string(),
+                    kind: "text".to_string(),
                     icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
                     // Named by channel below, once the visible set is known.
                     buffers: Vec::new(),

@@ -509,6 +509,7 @@ async fn prepare(
                         id: format!("kick:{slug}"),
                         name: slug.clone(),
                         service: "kick".to_string(),
+                        kind: "text".to_string(),
                         icon_url: avatar_url.clone(),
                         buffers: vec![buffer_id.clone()],
                         sendable_anywhere: subscribed,

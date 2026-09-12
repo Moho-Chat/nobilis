@@ -6,12 +6,39 @@ use serde::{Deserialize, Serialize};
 /// A source rather than a flat list because the picker is organised by where
 /// things came from - that is how somebody finds an emote they half remember,
 /// and it is the only way to say *why* one cannot be sent here.
+///
+/// ## Adding one
+///
+/// A backend calls `Runtime::set_emoji_source` with one of these and it
+/// appears in every picker, with its own section and its own icon in the jump
+/// strip. There is nothing to register, no list of services to extend, and no
+/// change to the window: a source says where it can be sent, what choosing one
+/// does (`kind`), and which of its entries are locked, and that is everything
+/// the picker asks of it.
+///
+/// The one thing a new service must decide is what goes in `EmojiEntry::id` -
+/// it is written into the message verbatim for a `"text"` source, so it has to
+/// already be in whatever form that service reads.
 #[derive(Serialize, Clone, Debug)]
 pub struct EmojiSource {
     /// Unique within an account. A Discord guild id, a Kick channel slug.
     pub id: String,
     pub name: String,
     pub service: String,
+    /// What choosing one of these does, which is not the same everywhere and
+    /// is the thing a picker cannot guess.
+    ///
+    /// `"text"` - the entry's `id` is written into the message being composed.
+    /// Discord, Kick, Sneedchat and 7TV all work this way: what is sent is a
+    /// run of characters the service recognises.
+    ///
+    /// `"event"` - the entry is sent on its own, immediately, and never
+    /// appears in the composer. A Matrix sticker is this.
+    ///
+    /// Adding a service means adding a source with one of these; nothing in
+    /// the picker needs to learn its name. That is the whole of the contract -
+    /// see `EmojiSource`'s own comment.
+    pub kind: String,
     /// The guild's icon or the channel's avatar, for the jump strip.
     #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
     pub icon_url: Option<String>,

@@ -42,12 +42,54 @@ pub struct Sticker {
 /// a pack of images usable either way, and dropping those would empty most of
 /// the packs people actually have.
 fn is_sticker(image: &Value, pack_usage: &Value) -> bool {
+    has_usage(image, pack_usage, "sticker")
+}
+
+/// Whether an image in a pack is offered for one use.
+///
+/// A pack states a usage and an image may override it; either may say both,
+/// and saying nothing means both. `im.ponies` packs carry stickers and
+/// emoticons in the same map, and they are different things: a sticker is an
+/// event of its own, an emoticon is an image inside a line of text.
+fn has_usage(image: &Value, pack_usage: &Value, want: &str) -> bool {
     let usage = image.get("usage").filter(|u| u.is_array()).unwrap_or(pack_usage);
     match usage.as_array() {
         None => true,
         Some(list) if list.is_empty() => true,
-        Some(list) => list.iter().any(|u| u.as_str() == Some("sticker")),
+        Some(list) => list.iter().any(|u| u.as_str() == Some(want)),
     }
+}
+
+/// The emoticons in a pack - the half `read_pack` leaves behind.
+///
+/// Separate rather than a flag on `read_pack`, because the two are used for
+/// different things and confusing them shows: a sticker sent as an emoticon is
+/// a full-size image in the middle of a sentence, and an emoticon sent as a
+/// sticker is a twenty-pixel picture posted on its own.
+pub fn read_emoticons(content: &Value, fallback_name: &str) -> Vec<Sticker> {
+    let pack_name = content["pack"]["display_name"]
+        .as_str()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or(fallback_name)
+        .to_string();
+    let pack_usage = content["pack"]["usage"].clone();
+    let Some(images) = content["images"].as_object() else { return Vec::new() };
+    images
+        .iter()
+        .filter(|(_, image)| has_usage(image, &pack_usage, "emoticon"))
+        .filter_map(|(shortcode, image)| {
+            let mxc = image["url"].as_str()?;
+            if !mxc.starts_with("mxc://") {
+                return None;
+            }
+            Some(Sticker {
+                name: shortcode.clone(),
+                pack: pack_name.clone(),
+                mxc: mxc.to_string(),
+                body: image["body"].as_str().filter(|b| !b.trim().is_empty()).unwrap_or(shortcode).to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Reads one `im.ponies.*` pack into the stickers it offers.
@@ -264,6 +306,27 @@ mod tests {
                 "elsewhere": { "url": "https://example.org/not-matrix.png" }
             }
         })
+    }
+
+    /// The same pack, read the other way. One map holds both, and a client
+    /// that confuses them shows a full-size sticker mid-sentence or a
+    /// twenty-pixel emoticon posted on its own.
+    #[test]
+    fn the_same_pack_offers_its_emoticons_to_whoever_asks_for_those() {
+        let pack = serde_json::json!({
+            "pack": { "display_name": "mixed" },
+            "images": {
+                "big":   { "url": "mxc://x/1", "usage": ["sticker"] },
+                "small": { "url": "mxc://x/2", "usage": ["emoticon"] },
+                "both":  { "url": "mxc://x/3" }
+            }
+        });
+        let stickers: Vec<String> = read_pack(&pack, "f").into_iter().map(|s| s.name).collect();
+        let emoticons: Vec<String> = read_emoticons(&pack, "f").into_iter().map(|s| s.name).collect();
+        assert!(stickers.contains(&"big".to_string()) && !stickers.contains(&"small".to_string()));
+        assert!(emoticons.contains(&"small".to_string()) && !emoticons.contains(&"big".to_string()));
+        // Saying nothing means both, which is what the spec's default is.
+        assert!(stickers.contains(&"both".to_string()) && emoticons.contains(&"both".to_string()));
     }
 
     #[test]
