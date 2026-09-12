@@ -3,7 +3,7 @@ name = "nobilis"
 version = "0.1.0"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
-license = "AGPL-3.0-or-later"
+license = "GPL-3.0-or-later"
 repository = "https://git.salastil.com/Salastil/nobilis"
 
 [[bin]]

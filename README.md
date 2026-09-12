@@ -102,4 +102,4 @@ State from when this daemon was called `chatd` and lived in the moho repository 
 
 ## Licence
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
