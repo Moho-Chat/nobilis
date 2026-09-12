@@ -3,6 +3,7 @@ mod audio;
 mod backend;
 mod commands;
 mod events;
+mod export;
 mod highlights;
 mod ignores;
 mod ipc;

@@ -30,6 +30,9 @@ pub struct TransferRow {
     pub path: Option<String>,
     pub error: Option<String>,
     pub ts: i64,
+    /// "dcc" or "export". Added after the table existed, so every row written
+    /// before it defaults to the only thing it could have been.
+    pub kind: String,
 }
 
 impl Store {
@@ -94,6 +97,7 @@ impl Store {
         // Defensive no-ops for a scrollback.db predating these columns,
         // same as store.c's post-hoc ALTER TABLE. Ignore "duplicate column".
         for stmt in [
+            "ALTER TABLE transfers ADD COLUMN kind TEXT NOT NULL DEFAULT 'dcc'",
             "ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'",
             "ALTER TABLE messages ADD COLUMN reply_to_id TEXT",
             "ALTER TABLE messages ADD COLUMN reply_to_from TEXT",
@@ -610,6 +614,51 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// A window of conversation between two moments, oldest first.
+    ///
+    /// Paged by time rather than by offset: an export walks forward through a
+    /// range that the backfill beside it may still be adding to, and an OFFSET
+    /// into a table that is growing underneath the reader skips rows. Asking
+    /// for "after the last one I saw" cannot.
+    ///
+    /// `after` is exclusive and `until` inclusive, so passing the last
+    /// timestamp of one page as the `after` of the next neither repeats a
+    /// message nor drops one.
+    pub fn messages_between(&self, buffer_id: &str, after: i64, until: i64, limit: i64) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit > 0 { limit } else { 500 };
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+             FROM messages
+             WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
+             ORDER BY ts ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, after, until, limit], |row| Self::row_to_message(buffer_id, row))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many messages are held for a range, so an export can say how far
+    /// along it is before it starts rather than counting as it goes.
+    pub fn count_between(&self, buffer_id: &str, after: i64, until: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3",
+            params![buffer_id, after, until],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The oldest message held for a buffer, which is where a backfill has to
+    /// start reaching back from.
+    pub fn oldest_message_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT MIN(ts) FROM messages WHERE buffer_id = ?1", params![buffer_id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .unwrap_or(None))
+    }
+
     /// The conversation either side of one moment, oldest first.
     ///
     /// `get_backlog` only ever reads backwards, which is right for scrolling
@@ -704,8 +753,8 @@ impl Store {
     pub fn record_transfer(&self, t: &TransferRow) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO transfers (id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "INSERT INTO transfers (id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET received = ?8, state = ?9, path = ?10, error = ?11",
             params![
                 t.id,
@@ -720,6 +769,7 @@ impl Store {
                 t.path,
                 t.error,
                 t.ts,
+                t.kind,
             ],
         )?;
         Ok(())
@@ -755,7 +805,7 @@ impl Store {
     pub fn recent_transfers(&self, limit: i64) -> Result<Vec<TransferRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts
+            "SELECT id, account_id, outgoing, peer, file_name, raw_name, size, received, state, path, error, ts, kind
              FROM transfers ORDER BY ts DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
@@ -772,6 +822,7 @@ impl Store {
                 path: row.get(9)?,
                 error: row.get(10)?,
                 ts: row.get(11)?,
+                kind: row.get(12)?,
             })
         })?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
@@ -1036,6 +1087,7 @@ mod tests {
             path: None,
             error: None,
             ts: 42,
+                    kind: "dcc".to_string(),
         };
         st.record_transfer(&row).unwrap();
         row.received = 100;

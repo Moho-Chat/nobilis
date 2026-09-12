@@ -731,7 +731,9 @@ pub async fn offer_file(state: &AppState, account_id: &str, nick: &str, path: &s
         state: crate::runtime::DccState::Offered,
         path: Some(path.to_string()),
         error: None,
+        kind: crate::runtime::TransferKind::Dcc,
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offer: None,
         started_at: now_seconds(),
     };
@@ -1010,7 +1012,9 @@ pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &s
         state: crate::runtime::DccState::Offered,
         path: None,
         error: None,
+        kind: crate::runtime::TransferKind::Dcc,
         cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         offer: Some(offer),
         started_at: now_seconds(),
     };
@@ -1147,6 +1151,7 @@ pub fn announce(state: &AppState, t: &crate::runtime::DccTransfer) {
         path: t.path.clone(),
         error: t.error.clone(),
         ts: t.started_at,
+        kind: t.kind.as_str().to_string(),
     }) {
         tracing::debug!("dcc: remembering a transfer: {e}");
     }
@@ -1183,7 +1188,9 @@ pub fn restore_transfers(state: &AppState) {
             state: if interrupted { crate::runtime::DccState::Failed } else { crate::runtime::DccState::from_str(&row.state) },
             path: row.path,
             error: if interrupted { Some("interrupted when moho was last closed".to_string()) } else { row.error },
+            kind: crate::runtime::TransferKind::from_str(&row.kind),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             offer: None,
             started_at: row.ts,
         });
@@ -1206,6 +1213,7 @@ pub fn transfer_json(t: &crate::runtime::DccTransfer) -> serde_json::Value {
         "received": t.received,
         "rate": t.rate,
         "state": t.state.as_str(),
+        "kind": t.kind.as_str(),
         "path": t.path,
         "error": t.error,
     })
@@ -1232,7 +1240,7 @@ fn note(state: &AppState, account_id: &str, buffer: &str, kind: &str, text: &str
     );
 }
 
-fn now_seconds() -> i64 {
+pub fn now_seconds() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 

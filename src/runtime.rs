@@ -84,8 +84,16 @@ pub struct DccTransfer {
     pub path: Option<String>,
     /// Why it failed, or why it was refused.
     pub error: Option<String>,
+    /// What this row is. A DCC file and a conversation export are different
+    /// enough to describe differently and alike enough to belong in one list:
+    /// both are a long job with a size, a rate and a way to stop it, and what
+    /// somebody wants is "what is moving", not two panels of it.
+    pub kind: TransferKind,
     /// Raised to stop a transfer that is already running.
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Raised to hold a transfer where the work can be put down and picked
+    /// up again. A DCC socket cannot; an export between pages can.
+    pub paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The offer itself, kept so accepting does not have to read anything
     /// off the network a second time. Dropped once it is settled.
     pub offer: Option<crate::backend::irc::dcc::DccSend>,
@@ -95,12 +103,42 @@ pub struct DccTransfer {
     pub started_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TransferKind {
+    /// A file over DCC - see backend/irc/dcc.rs.
+    #[default]
+    Dcc,
+    /// A conversation written to disk - see export.rs.
+    Export,
+}
+
+impl TransferKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransferKind::Dcc => "dcc",
+            TransferKind::Export => "export",
+        }
+    }
+
+    /// Anything unrecognised is a DCC file, which is what every row written
+    /// before this field existed is.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "export" => TransferKind::Export,
+            _ => TransferKind::Dcc,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DccState {
     /// Waiting on an answer - or, when sending, waiting for them to accept.
     Offered,
     Receiving,
     Sending,
+    /// Put down, and able to be picked up again. Only reachable for work
+    /// that can be resumed - see `TransferKind::Export`.
+    Paused,
     Done,
     Declined,
     Failed,
@@ -125,6 +163,7 @@ impl DccState {
             DccState::Offered => "offered",
             DccState::Receiving => "receiving",
             DccState::Sending => "sending",
+            DccState::Paused => "paused",
             DccState::Done => "done",
             DccState::Declined => "declined",
             DccState::Failed => "failed",

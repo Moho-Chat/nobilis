@@ -2018,6 +2018,129 @@ pub async fn dispatch(
             }
         }
 
+        // A window of a conversation between two moments, oldest first.
+        //
+        // Paged by time rather than by offset, because an export reads a range
+        // that the paging beside it is still reaching back into - an OFFSET
+        // into a table growing underneath the reader skips rows, and "after
+        // the last one I saw" cannot. Pass the previous page's last timestamp
+        // back as `after`.
+        "getMessageRange" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("getMessageRange requires \"bufferId\"".to_string()));
+            };
+            let after = p_i64(params, "after", 0);
+            let until = p_i64(params, "until", i64::MAX);
+            let limit = p_i64(params, "limit", 500);
+            match state.store.messages_between(buffer_id, after, until, limit) {
+                Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // How much is held for a range, so an export can show a proportion
+        // rather than a count climbing towards nothing.
+        "countMessageRange" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("countMessageRange requires \"bufferId\"".to_string()));
+            };
+            let after = p_i64(params, "after", 0);
+            let until = p_i64(params, "until", i64::MAX);
+            match state.store.count_between(buffer_id, after, until) {
+                Ok(n) => (Some(serde_json::json!({ "count": n, "oldestHeld": state.store.oldest_message_ts(buffer_id).ok().flatten() })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Writing a conversation to disk.
+        //
+        // Six calls rather than one, because the window drives the loop: the
+        // HTML a message becomes is made by the renderer's own formatter, and
+        // an export is meant to be what was on screen rather than a second
+        // opinion about it (see export.rs). So the window walks the range and
+        // renders, and everything that is not formatting is here.
+        "beginExport" => {
+            let (Some(account_id), Some(buffer_id), Some(title), Some(into)) = (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "bufferId"),
+                p_str_opt(params, "title"),
+                p_str_opt(params, "into"),
+            ) else {
+                return (None, Some("beginExport requires \"accountId\", \"bufferId\", \"title\" and \"into\"".to_string()));
+            };
+            match crate::export::begin(state, account_id, buffer_id, title, into) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Whether to keep going. The loop is in the window, so this is how
+        // cancel and pause reach it.
+        "exportStatus" => match p_str_opt(params, "id") {
+            Some(id) => match crate::export::status(state, id) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+            None => (None, Some("exportStatus requires \"id\"".to_string())),
+        },
+
+        "appendExport" => {
+            let (Some(id), Some(html)) = (p_str_opt(params, "id"), p_str_opt(params, "html")) else {
+                return (None, Some("appendExport requires \"id\" and \"html\"".to_string()));
+            };
+            let done = params.get("done").and_then(Value::as_u64).unwrap_or(0);
+            let total = params.get("total").and_then(Value::as_u64).unwrap_or(0);
+            match crate::export::append(state, id, html, done, total) {
+                Ok(()) => (Some(Value::Bool(true)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Fetching a picture into the folder, paced so a conversation's worth
+        // of them does not read as a scrape.
+        "fetchExportMedia" => {
+            let (Some(id), Some(url)) = (p_str_opt(params, "id"), p_str_opt(params, "url")) else {
+                return (None, Some("fetchExportMedia requires \"id\" and \"url\"".to_string()));
+            };
+            match crate::export::fetch_media(state, id, url).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "finishExport" => {
+            let (Some(id), Some(title)) = (p_str_opt(params, "id"), p_str_opt(params, "title")) else {
+                return (None, Some("finishExport requires \"id\" and \"title\"".to_string()));
+            };
+            match crate::export::finish(state, id, title, p_str(params, "subtitle", "")) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Said by the window when its own half failed, so the row says why
+        // rather than sitting at whatever it had reached.
+        "failExport" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("failExport requires \"id\"".to_string()));
+            };
+            crate::export::fail(state, id, p_str(params, "reason", "the export could not be finished"));
+            (Some(Value::Bool(true)), None)
+        }
+
+        // Only an export can be put down and picked back up - a DCC socket
+        // cannot be, which is why this is not on cancelTransfer's path.
+        "pauseTransfer" => {
+            let Some(id) = p_str_opt(params, "id") else {
+                return (None, Some("pauseTransfer requires \"id\"".to_string()));
+            };
+            let paused = params.get("paused").and_then(Value::as_bool).unwrap_or(true);
+            match crate::export::set_paused(state, id, paused) {
+                Ok(()) => (Some(Value::Bool(true)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "acceptTransfer" => {
             let Some(id) = p_str_opt(params, "id") else {
                 return (None, Some("acceptTransfer requires \"id\"".to_string()));
