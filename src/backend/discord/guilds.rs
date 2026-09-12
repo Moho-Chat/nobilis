@@ -419,42 +419,6 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
     let me = own_member(config, guild).await;
     let own_roles = member_role_ids(me.as_ref());
 
-    // This guild's emoji, as a place they come from rather than as a copy on
-    // every channel. The per-channel copy below stays: it answers "what does
-    // this room own", which is what a message being rendered needs, while
-    // this answers "what can this account send", which is what the picker
-    // needs - and with Nitro those are different sets (see #205).
-    if let Some(emojis) = guild["emojis"].as_array() {
-        let entries: Vec<crate::model::EmojiEntry> = emojis
-            .iter()
-            .filter(|e| e["available"].as_bool().unwrap_or(true))
-            .filter_map(|e| {
-                Some(crate::model::EmojiEntry {
-                    id: e["id"].as_str()?.to_string(),
-                    name: e["name"].as_str()?.to_string(),
-                    url: None,
-                    animated: e["animated"].as_bool().unwrap_or(false),
-                    locked: false,
-                })
-            })
-            .collect();
-        if !entries.is_empty() {
-            state.runtime.set_emoji_source(
-                &config.account_id(),
-                crate::model::EmojiSource {
-                    id: guild_id.to_string(),
-                    name: guild_name.clone(),
-                    service: "discord".to_string(),
-                    kind: "text".to_string(),
-                    icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
-                    // Named by channel below, once the visible set is known.
-                    buffers: Vec::new(),
-                    sendable_anywhere: state.runtime.emoji_unrestricted(&config.account_id()),
-                    emoji: entries,
-                },
-            );
-        }
-    }
 
     // Kept where every path that registers a guild passes, rather than in the
     // GUILD_CREATE arm alone: for this kind of account Discord sends the
@@ -673,6 +637,46 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         {
             visible.insert(thread_id.clone());
             new_channels.push((buffer_id, thread_id));
+        }
+    }
+
+    // This guild's emoji, as a place they come from rather than as a copy on
+    // every channel. Registered here rather than beside the per-channel copy
+    // because it needs the buffers, and they are only known once the channels
+    // have been walked: without them every guild's emoji read as usable in
+    // every conversation, which is only true with Nitro.
+    //
+    // The per-channel copy stays. It answers "what does this room own", which
+    // is what rendering a message needs; this answers "what can this account
+    // send", which is what the picker needs, and with Nitro they differ.
+    if let Some(emojis) = guild["emojis"].as_array() {
+        let entries: Vec<crate::model::EmojiEntry> = emojis
+            .iter()
+            .filter(|e| e["available"].as_bool().unwrap_or(true))
+            .filter_map(|e| {
+                Some(crate::model::EmojiEntry {
+                    id: e["id"].as_str()?.to_string(),
+                    name: e["name"].as_str()?.to_string(),
+                    url: None,
+                    animated: e["animated"].as_bool().unwrap_or(false),
+                    locked: false,
+                })
+            })
+            .collect();
+        if !entries.is_empty() {
+            state.runtime.set_emoji_source(
+                &account_id,
+                crate::model::EmojiSource {
+                    id: guild_id.to_string(),
+                    name: guild_name.clone(),
+                    service: "discord".to_string(),
+                    kind: "text".to_string(),
+                    icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
+                    buffers: new_channels.iter().map(|(buffer_id, _)| buffer_id.clone()).collect(),
+                    sendable_anywhere: state.runtime.emoji_unrestricted(&account_id),
+                    emoji: entries,
+                },
+            );
         }
     }
 
