@@ -79,6 +79,7 @@ mod live {
             next_batch: None,
             used_sliding_sync: false,
             prefer_sliding_sync: false,
+            dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
@@ -200,6 +201,7 @@ mod live {
             next_batch: None,
             used_sliding_sync: false,
             prefer_sliding_sync: false,
+            dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
@@ -315,6 +317,7 @@ mod live {
             next_batch: None,
             used_sliding_sync: false,
             prefer_sliding_sync: false,
+            dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
@@ -475,6 +478,7 @@ mod live {
             next_batch: None,
             used_sliding_sync: false,
             prefer_sliding_sync: false,
+            dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
@@ -634,6 +638,7 @@ mod live {
             next_batch: None,
             used_sliding_sync: false,
             prefer_sliding_sync: false,
+            dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };

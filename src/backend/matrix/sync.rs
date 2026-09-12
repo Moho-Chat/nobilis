@@ -127,6 +127,11 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
         .runtime
         .set_matrix_server_facts(account_id, server::read_facts(&config.homeserver_url, &access_token).await);
     backup::reactivate_on_connect(state, account_id, &session).await;
+    // Collect whatever the dehydrated device was sent while this login did not
+    // exist, and leave a fresh one behind. After the backup reactivation
+    // because both put room keys into the same store, and this is the one that
+    // can be skipped: it is quiet and best-effort by design.
+    dehydration::rehydrate_on_connect(state, account_id, &session).await;
 
     // A resumed connection (next_batch already persisted) only ever gets
     // *incremental* `/sync` responses from here on - rooms.join in any
