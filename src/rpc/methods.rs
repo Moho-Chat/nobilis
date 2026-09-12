@@ -94,6 +94,61 @@ pub async fn dispatch(
         // named alongside a URL and a verdict on whether this account may send
         // them - but the question the client is asking is the same one, so it
         // stays one method rather than becoming one per protocol.
+        // Everything this account can send, wherever it came from.
+        //
+        // A different question from `listBufferEmoji`, which answers "what
+        // does this room own" and is what rendering a message needs. This is
+        // what the picker needs, and on every service moho speaks the two
+        // differ: Discord Nitro reaches every guild's emoji from anywhere, a
+        // Kick subscription reaches that channel's emotes across the site.
+        //
+        // `bufferId` is where the answer is *for* - each source comes back
+        // saying whether it can be sent there - rather than what limits it.
+        "listAllEmoji" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listAllEmoji requires \"bufferId\"".to_string()));
+            };
+            let account_id = channel_account(state, buffer_id);
+            let mut sources = state.runtime.emoji_catalogue(&account_id);
+
+            // Sneedchat's table is the same everywhere and belongs to no
+            // room, so it is added here rather than recorded per channel.
+            if account_id.starts_with("sneedchat:") {
+                sources.push(crate::model::EmojiSource {
+                    id: "sneedchat".to_string(),
+                    name: "Sneedchat".to_string(),
+                    service: "sneedchat".to_string(),
+                    icon_url: None,
+                    buffers: Vec::new(),
+                    sendable_anywhere: true,
+                    emoji: backend::sneedchat::smilies::SMILIES
+                        .iter()
+                        .map(|s| crate::model::EmojiEntry {
+                            id: s.aliases.first().unwrap_or(&s.label).to_string(),
+                            name: s.label.to_string(),
+                            url: None,
+                            animated: false,
+                            locked: false,
+                        })
+                        .collect(),
+                });
+            }
+
+            // Whether each source reaches this conversation. Worked out here
+            // rather than stored, because it is a fact about the pair.
+            let answer: Vec<serde_json::Value> = sources
+                .into_iter()
+                .map(|s| {
+                    let here = s.buffers.is_empty() || s.buffers.iter().any(|b| b == buffer_id);
+                    let usable = here || s.sendable_anywhere;
+                    let mut v = serde_json::to_value(&s).unwrap_or_default();
+                    v["usableHere"] = serde_json::json!(usable);
+                    v
+                })
+                .collect();
+            (Some(serde_json::json!(answer)), None)
+        }
+
         "listBufferEmoji" => match p_str_opt(params, "bufferId") {
             None => (None, Some("listBufferEmoji requires \"bufferId\"".to_string())),
             Some(buffer_id) if buffer_id.starts_with("kick:") => match state.runtime.kick_channel(buffer_id) {

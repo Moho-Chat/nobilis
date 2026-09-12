@@ -445,6 +445,18 @@ pub struct Runtime {
     /// register_guild_channels, populated straight from GUILD_CREATE with
     /// no extra request needed. Empty/absent for IRC and any Discord DM.
     discord_buffer_emojis: Mutex<HashMap<String, Vec<serde_json::Value>>>,
+    /// Everything an account can send, by where it came from - see
+    /// `emoji_catalogue`. Keyed account id -> source id -> the source.
+    ///
+    /// Separate from `discord_buffer_emojis`, which answers "what does this
+    /// channel own". This answers "what can this account send", and they are
+    /// different questions on every service: Discord Nitro reaches every
+    /// guild's emoji from anywhere, and a Kick subscription reaches that
+    /// channel's emotes across the whole site.
+    emoji_catalogue: Mutex<HashMap<String, std::collections::BTreeMap<String, crate::model::EmojiSource>>>,
+    /// Whether this account's subscription lets it use emoji away from where
+    /// they live - Discord Nitro. Absent means no.
+    emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
     /// Discord-specific: account id -> friends list ({userId, username,
     /// globalName, avatarUrl, status}), seeded from READY's `relationships`
     /// (type 1 = friend) + `presences`, kept current by live PRESENCE_UPDATE
@@ -961,6 +973,8 @@ impl Runtime {
             discord_guild_id: Mutex::new(HashMap::new()),
             discord_history_inflight: Mutex::new(HashSet::new()),
             discord_buffer_emojis: Mutex::new(HashMap::new()),
+            emoji_catalogue: Mutex::new(HashMap::new()),
+            emoji_unrestricted: Mutex::new(std::collections::HashSet::new()),
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
@@ -1541,6 +1555,40 @@ impl Runtime {
 
     pub fn set_discord_buffer_emojis(&self, buffer_id: &str, emojis: Vec<serde_json::Value>) {
         self.discord_buffer_emojis.lock().unwrap().insert(buffer_id.to_string(), emojis);
+    }
+
+    /// Records one place emoji come from, replacing what was known about it.
+    pub fn set_emoji_source(&self, account_id: &str, source: crate::model::EmojiSource) {
+        self.emoji_catalogue
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(source.id.clone(), source);
+    }
+
+    /// Everything this account can reach, newest knowledge of each source.
+    pub fn emoji_catalogue(&self, account_id: &str) -> Vec<crate::model::EmojiSource> {
+        self.emoji_catalogue
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether this account may use its emoji anywhere - Discord Nitro.
+    pub fn set_emoji_unrestricted(&self, account_id: &str, yes: bool) {
+        let mut all = self.emoji_unrestricted.lock().unwrap();
+        if yes {
+            all.insert(account_id.to_string());
+        } else {
+            all.remove(account_id);
+        }
+    }
+
+    pub fn emoji_unrestricted(&self, account_id: &str) -> bool {
+        self.emoji_unrestricted.lock().unwrap().contains(account_id)
     }
 
     pub fn get_discord_buffer_emojis(&self, buffer_id: &str) -> Vec<serde_json::Value> {

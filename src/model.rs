@@ -1,5 +1,50 @@
 use serde::{Deserialize, Serialize};
 
+/// One place an account's emoji come from: a Discord guild, a Kick channel,
+/// Sneedchat's own table, 7TV's global set.
+///
+/// A source rather than a flat list because the picker is organised by where
+/// things came from - that is how somebody finds an emote they half remember,
+/// and it is the only way to say *why* one cannot be sent here.
+#[derive(Serialize, Clone, Debug)]
+pub struct EmojiSource {
+    /// Unique within an account. A Discord guild id, a Kick channel slug.
+    pub id: String,
+    pub name: String,
+    pub service: String,
+    /// The guild's icon or the channel's avatar, for the jump strip.
+    #[serde(rename = "iconUrl", skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+    /// Where these can be sent. Empty means anywhere this account can talk -
+    /// which is what Sneedchat's table and 7TV's global set are - and a
+    /// non-empty list names the buffers, for the ones that are tied to a
+    /// place unless a subscription says otherwise.
+    #[serde(rename = "buffers")]
+    pub buffers: Vec<String>,
+    /// Usable away from `buffers` too, because something was paid for: Nitro,
+    /// or a Kick subscription to this channel.
+    #[serde(rename = "sendableAnywhere")]
+    pub sendable_anywhere: bool,
+    pub emoji: Vec<EmojiEntry>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct EmojiEntry {
+    /// What goes in the message. Kick's `[emote:id:name]`, Discord's id, a
+    /// 7TV word, a Sneedchat shortcode - whatever this service sends.
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub animated: bool,
+    /// Owned by somewhere this account has not paid into, so it can be looked
+    /// at and not sent. Shown rather than hidden: the picker is also how
+    /// somebody learns what subscribing would buy.
+    #[serde(default)]
+    pub locked: bool,
+}
+
 /// Matches the wire contract's Account JSON shape exactly (see
 /// daemon/nobilis/model.c's nobilis_account_json) - the frontend renders these
 /// fields directly, so names/shape here are not negotiable.

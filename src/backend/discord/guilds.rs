@@ -419,6 +419,42 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
     let me = own_member(config, guild).await;
     let own_roles = member_role_ids(me.as_ref());
 
+    // This guild's emoji, as a place they come from rather than as a copy on
+    // every channel. The per-channel copy below stays: it answers "what does
+    // this room own", which is what a message being rendered needs, while
+    // this answers "what can this account send", which is what the picker
+    // needs - and with Nitro those are different sets (see #205).
+    if let Some(emojis) = guild["emojis"].as_array() {
+        let entries: Vec<crate::model::EmojiEntry> = emojis
+            .iter()
+            .filter(|e| e["available"].as_bool().unwrap_or(true))
+            .filter_map(|e| {
+                Some(crate::model::EmojiEntry {
+                    id: e["id"].as_str()?.to_string(),
+                    name: e["name"].as_str()?.to_string(),
+                    url: None,
+                    animated: e["animated"].as_bool().unwrap_or(false),
+                    locked: false,
+                })
+            })
+            .collect();
+        if !entries.is_empty() {
+            state.runtime.set_emoji_source(
+                &config.account_id(),
+                crate::model::EmojiSource {
+                    id: guild_id.to_string(),
+                    name: guild_name.clone(),
+                    service: "discord".to_string(),
+                    icon_url: cached_guild_icon(guild_id, guild["icon"].as_str()).await,
+                    // Named by channel below, once the visible set is known.
+                    buffers: Vec::new(),
+                    sendable_anywhere: state.runtime.emoji_unrestricted(&config.account_id()),
+                    emoji: entries,
+                },
+            );
+        }
+    }
+
     // Kept where every path that registers a guild passes, rather than in the
     // GUILD_CREATE arm alone: for this kind of account Discord sends the
     // guilds inside READY and GUILD_CREATE never fires, so everything that
