@@ -3523,6 +3523,29 @@ pub async fn dispatch(
         // edited rarely, while points tick up the whole time somebody watches.
         // The plaque polls this once a minute and asks for the rest only when
         // it is opened.
+        // Saying a Kick channel is on screen, so watch time is earned for it.
+        //
+        // Told rather than inferred: only the window knows what is displayed,
+        // and this is deliberately scoped to that - a chat buffer somebody has
+        // open, or a channel whose video is playing. See backend/kick/watch.rs
+        // for why claiming more would be both untrue and unwise.
+        "setKickWatching" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setKickWatching requires \"bufferId\"".to_string()));
+            };
+            let watching = params.get("watching").and_then(Value::as_bool).unwrap_or(false);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            // A channel that is not live has no broadcast to be watching, and
+            // no livestream id to name one with.
+            let live_id = watching
+                .then(|| state.runtime.kick_stream(buffer_id).and_then(|s| s["livestreamId"].as_u64()))
+                .flatten();
+            state.runtime.set_kick_watching(&buffer.account_id, buffer_id, live_id);
+            (Some(serde_json::json!({ "watching": live_id.is_some() })), None)
+        }
+
         "kickPoints" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("kickPoints requires \"bufferId\"".to_string()));

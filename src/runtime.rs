@@ -451,6 +451,9 @@ pub struct Runtime {
     /// Whether this account's subscription lets it use emoji away from where
     /// they live - Discord Nitro. Absent means no.
     emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
+    /// Which Kick livestreams each account is claiming to watch, by buffer -
+    /// see backend/kick/watch.rs.
+    kick_watching: Mutex<HashMap<String, crate::backend::kick::watch::Watching>>,
     /// Matrix emoticons by shortcode, for the send path - see
     /// backend/matrix/stickers.rs's `inline_emoticons`.
     matrix_emoticons: Mutex<HashMap<String, std::collections::BTreeMap<String, String>>>,
@@ -972,6 +975,7 @@ impl Runtime {
             discord_buffer_emojis: Mutex::new(HashMap::new()),
             emoji_catalogue: Mutex::new(HashMap::new()),
             emoji_unrestricted: Mutex::new(std::collections::HashSet::new()),
+            kick_watching: Mutex::new(HashMap::new()),
             matrix_emoticons: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
@@ -3130,6 +3134,25 @@ impl Runtime {
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// Says this Kick channel is being looked at, or is no longer.
+    ///
+    /// The set is what the watch connection subscribes to, so it is exactly
+    /// what moho claims to be watching - see backend/kick/watch.rs. A channel
+    /// with no live broadcast has no livestream id and cannot be watched,
+    /// which is why the id rather than a flag is what gets stored.
+    pub fn set_kick_watching(&self, account_id: &str, buffer_id: &str, livestream_id: Option<u64>) {
+        let mut all = self.kick_watching.lock().unwrap();
+        let mine = all.entry(account_id.to_string()).or_default();
+        match livestream_id {
+            Some(id) => mine.insert(buffer_id.to_string(), id),
+            None => mine.remove(buffer_id),
+        };
+    }
+
+    pub fn kick_watching(&self, account_id: &str) -> crate::backend::kick::watch::Watching {
+        self.kick_watching.lock().unwrap().get(account_id).cloned().unwrap_or_default()
     }
 
     pub fn set_kick_history_cursor(&self, buffer_id: &str, cursor: Option<String>) {

@@ -177,6 +177,22 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
     state.runtime.set_kick_sender(account_id, tx);
 
+    // A second connection, for a different purpose: this one says who is
+    // watching, which the chat socket above deliberately does not. Only
+    // started for a signed-in account, because an anonymous reader has no
+    // watch time to earn - see backend/kick/watch.rs.
+    if let Some(token) = config.token.clone().filter(|t| !t.is_empty()) {
+        let state = state.clone();
+        let account_id = account_id.to_string();
+        tokio::spawn(async move {
+            let Ok(http) = api::client() else { return };
+            match api::own_user_id(&http, &token).await {
+                Ok(user_id) => watch::run(state, account_id, user_id.to_string(), token).await,
+                Err(e) => tracing::debug!("kick[{account_id}]: cannot watch, no user id: {e:#}"),
+            }
+        });
+    }
+
     let (mut socket, _) = tokio_tungstenite::connect_async(pusher_url())
         .await
         .context("connecting to Kick's chat")?;
