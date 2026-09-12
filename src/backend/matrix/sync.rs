@@ -540,6 +540,29 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
             }
         }
 
+        // Somebody deliberately left this room unread, here or on another
+        // client. Read every sync because it changes from elsewhere, and a
+        // mark made on a phone that never reached this window would be a
+        // reminder that only exists where it was set.
+        //
+        // Only emitted when the room actually says something: an absent key
+        // means "no opinion", which must not overwrite a mark this session
+        // already knows about.
+        if let Some(events) = room["account_data"]["events"].as_array() {
+            if let Some(unread) = receipts::marked_unread_in(events) {
+                if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
+                    state.events.emit(
+                        "markedUnread",
+                        serde_json::json!({
+                            "accountId": account_id,
+                            "bufferId": crate::model::buffer_id(account_id, &buffer_name),
+                            "unread": unread,
+                        }),
+                    );
+                }
+            }
+        }
+
         // The room has been heard from, so it is no longer waiting to be. Set
         // on join and cleared here, which is the first moment there is
         // anything true to say about what is in it.

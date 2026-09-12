@@ -818,6 +818,24 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "messages": messages })), None)
         }
 
+        // Deliberately leaving a room unread, which reading it is the only
+        // way to undo here. Matrix only: it is the one service in moho with an
+        // account-level place to put the mark, so it follows somebody between
+        // their clients rather than being a note this window keeps to itself.
+        "setMatrixMarkedUnread" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setMatrixMarkedUnread requires \"bufferId\"".to_string()));
+            };
+            let unread = params.get("unread").and_then(Value::as_bool).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            match backend::matrix::receipts::set_marked_unread(state, &buffer.account_id, buffer_id, unread).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "markBufferRead" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("markBufferRead requires \"bufferId\"".to_string()));

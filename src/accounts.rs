@@ -837,6 +837,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         tor_proxy: a.tor_proxy.clone(),
         use_tor: a.use_tor,
         has_key_backup: false,
+        rtc_focus_url: None,
     }
 }
 
@@ -869,6 +870,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         tor_proxy: None,
         use_tor: false,
         has_key_backup: false,
+        rtc_focus_url: None,
     }
 }
 
@@ -900,6 +902,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         tor_proxy: a.proxy.clone(),
         use_tor: false,
         has_key_backup: false,
+        rtc_focus_url: None,
     }
 }
 
@@ -940,6 +943,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         tor_proxy: None,
         use_tor: false,
         has_key_backup: false,
+        rtc_focus_url: None,
     }
 }
 
@@ -975,6 +979,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         tor_proxy: None,
         use_tor: false,
         has_key_backup,
+        rtc_focus_url: a.rtc_focus_url.clone(),
     }
 }
 
