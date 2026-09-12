@@ -86,6 +86,11 @@ pub struct Account {
     /// Always false for every other service.
     #[serde(rename = "hasKeyBackup")]
     pub has_key_backup: bool,
+    /// Matrix only: a media server for room calls, where the homeserver names
+    /// none of its own. Absent on every other service and on a Matrix account
+    /// that has not been given one.
+    #[serde(rename = "rtcFocusUrl", skip_serializing_if = "Option::is_none")]
+    pub rtc_focus_url: Option<String>,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on
