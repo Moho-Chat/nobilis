@@ -2018,6 +2018,40 @@ pub async fn dispatch(
             }
         }
 
+        // A window of a conversation between two moments, oldest first.
+        //
+        // Paged by time rather than by offset, because an export reads a range
+        // that the paging beside it is still reaching back into - an OFFSET
+        // into a table growing underneath the reader skips rows, and "after
+        // the last one I saw" cannot. Pass the previous page's last timestamp
+        // back as `after`.
+        "getMessageRange" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("getMessageRange requires \"bufferId\"".to_string()));
+            };
+            let after = p_i64(params, "after", 0);
+            let until = p_i64(params, "until", i64::MAX);
+            let limit = p_i64(params, "limit", 500);
+            match state.store.messages_between(buffer_id, after, until, limit) {
+                Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // How much is held for a range, so an export can show a proportion
+        // rather than a count climbing towards nothing.
+        "countMessageRange" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("countMessageRange requires \"bufferId\"".to_string()));
+            };
+            let after = p_i64(params, "after", 0);
+            let until = p_i64(params, "until", i64::MAX);
+            match state.store.count_between(buffer_id, after, until) {
+                Ok(n) => (Some(serde_json::json!({ "count": n, "oldestHeld": state.store.oldest_message_ts(buffer_id).ok().flatten() })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // Writing a conversation to disk.
         //
         // Six calls rather than one, because the window drives the loop: the

@@ -614,6 +614,51 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// A window of conversation between two moments, oldest first.
+    ///
+    /// Paged by time rather than by offset: an export walks forward through a
+    /// range that the backfill beside it may still be adding to, and an OFFSET
+    /// into a table that is growing underneath the reader skips rows. Asking
+    /// for "after the last one I saw" cannot.
+    ///
+    /// `after` is exclusive and `until` inclusive, so passing the last
+    /// timestamp of one page as the `after` of the next neither repeats a
+    /// message nor drops one.
+    pub fn messages_between(&self, buffer_id: &str, after: i64, until: i64, limit: i64) -> Result<Vec<Message>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = if limit > 0 { limit } else { 500 };
+        let mut stmt = conn.prepare(
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+             FROM messages
+             WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
+             ORDER BY ts ASC LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, after, until, limit], |row| Self::row_to_message(buffer_id, row))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many messages are held for a range, so an export can say how far
+    /// along it is before it starts rather than counting as it goes.
+    pub fn count_between(&self, buffer_id: &str, after: i64, until: i64) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3",
+            params![buffer_id, after, until],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The oldest message held for a buffer, which is where a backfill has to
+    /// start reaching back from.
+    pub fn oldest_message_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row("SELECT MIN(ts) FROM messages WHERE buffer_id = ?1", params![buffer_id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .unwrap_or(None))
+    }
+
     /// The conversation either side of one moment, oldest first.
     ///
     /// `get_backlog` only ever reads backwards, which is right for scrolling
