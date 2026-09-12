@@ -500,6 +500,40 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
             // pack lives.
             if event["type"].as_str() == Some("im.ponies.user_emotes") {
                 state.runtime.set_matrix_sticker_pack(account_id, "", "your stickers", &event["content"]);
+                // The other half of the same pack. Stickers are events of
+                // their own and have their own picker; emoticons are images
+                // inside a line of text, which is what the emoji picker is
+                // for - so the one pack feeds two places (see #205).
+                let emoticons = stickers::read_emoticons(&event["content"], "your emoji");
+                if !emoticons.is_empty() {
+                    state.runtime.set_emoji_source(
+                        account_id,
+                        crate::model::EmojiSource {
+                            id: "matrix:user".to_string(),
+                            name: emoticons[0].pack.clone(),
+                            service: "matrix".to_string(),
+                            kind: "text".to_string(),
+                            icon_url: None,
+                            // Account data, so it travels with the account and
+                            // is sendable in every room it can talk in.
+                            buffers: Vec::new(),
+                            sendable_anywhere: true,
+                            emoji: emoticons
+                                .iter()
+                                .map(|e| crate::model::EmojiEntry {
+                                    // The shortcode, which is what goes in the
+                                    // message - the send path turns it into
+                                    // the image on the way out.
+                                    id: format!(":{}:", e.name),
+                                    name: e.name.clone(),
+                                    url: Some(e.mxc.clone()),
+                                    animated: false,
+                                    locked: false,
+                                })
+                                .collect(),
+                        },
+                    );
+                }
             }
         }
     }

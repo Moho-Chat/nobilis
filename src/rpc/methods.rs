@@ -118,6 +118,7 @@ pub async fn dispatch(
                     id: "sneedchat".to_string(),
                     name: "Sneedchat".to_string(),
                     service: "sneedchat".to_string(),
+                    kind: "text".to_string(),
                     icon_url: None,
                     buffers: Vec::new(),
                     sendable_anywhere: true,
