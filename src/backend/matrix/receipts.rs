@@ -156,6 +156,80 @@ pub async fn mark_read(state: &AppState, account_id: &str, buffer_id: &str, publ
     Ok(())
 }
 
+/// The two spellings of "I have not finished with this room".
+///
+/// `m.marked_unread` is the stable name, from Matrix 1.12. `com.famedly.marked_unread`
+/// is what clients sent for the years before it, and rooms marked from an
+/// older client still carry only that one - so both are read, and the stable
+/// one is what gets written.
+pub const MARKED_UNREAD: [&str; 2] = ["m.marked_unread", "com.famedly.marked_unread"];
+
+#[cfg(test)]
+mod marked_unread_tests {
+    use super::*;
+
+    fn ev(kind: &str, unread: bool) -> Value {
+        serde_json::json!({ "type": kind, "content": { "unread": unread } })
+    }
+
+    #[test]
+    fn reads_either_spelling() {
+        assert_eq!(marked_unread_in(&[ev("m.marked_unread", true)]), Some(true));
+        assert_eq!(marked_unread_in(&[ev("com.famedly.marked_unread", true)]), Some(true));
+    }
+
+    /// A room that was marked and then unmarked carries an explicit false, and
+    /// that has to win over a stale true this client saw earlier - so it is a
+    /// value, not an absence.
+    #[test]
+    fn an_explicit_false_is_not_the_same_as_silence() {
+        assert_eq!(marked_unread_in(&[ev("m.marked_unread", false)]), Some(false));
+        assert_eq!(marked_unread_in(&[]), None);
+        assert_eq!(marked_unread_in(&[serde_json::json!({ "type": "m.tag", "content": {} })]), None);
+    }
+
+    /// Content that says nothing usable is silence rather than a guess.
+    #[test]
+    fn a_mark_with_no_answer_in_it_says_nothing() {
+        let odd = serde_json::json!({ "type": "m.marked_unread", "content": { "unread": "yes" } });
+        assert_eq!(marked_unread_in(&[odd]), None);
+    }
+}
+
+/// Reads a room's own account data for a deliberate unread mark.
+///
+/// `None` when the room says nothing either way, which is not the same as
+/// `Some(false)`: a room that was marked and then unmarked carries an explicit
+/// false, and that has to win over a stale true this client saw earlier.
+pub fn marked_unread_in(events: &[Value]) -> Option<bool> {
+    events
+        .iter()
+        .find(|e| e["type"].as_str().is_some_and(|t| MARKED_UNREAD.contains(&t)))
+        .and_then(|e| e["content"]["unread"].as_bool())
+}
+
+/// Says this room still wants reading, or stops saying it.
+///
+/// Account data rather than anything local, so the mark travels: a room
+/// flagged here is flagged on the phone, which is the whole point of marking
+/// one. Written under the stable name only - a client old enough to want the
+/// unstable one will not be reading this account's rooms for much longer, and
+/// writing both would leave two facts to disagree.
+pub async fn set_marked_unread(state: &AppState, account_id: &str, buffer_id: &str, unread: bool) -> Result<()> {
+    let Some(config) = state.accounts.get_matrix(account_id) else { anyhow::bail!("no such account") };
+    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+        anyhow::bail!("no known Matrix room for this buffer")
+    };
+    let base = config.homeserver_url.trim_end_matches('/');
+    let user = url::form_urlencoded::byte_serialize(config.user_id.as_bytes()).collect::<String>();
+    let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let url = format!("{base}/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread");
+    http::put_json(&url, &config.access_token, serde_json::json!({ "unread": unread }))
+        .await
+        .context("setting the unread mark")?;
+    Ok(())
+}
+
 pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typing: bool) -> Result<()> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
