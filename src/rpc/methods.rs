@@ -144,8 +144,15 @@ pub async fn dispatch(
         // daemon could not keep: a client drawing this list offered Slack,
         // and the add call came back "unknown method" because no such arm
         // exists. Dropping them instead would lose the fact that they are
-        // planned, which is worth telling a client that wants to grey them
-        // out - the settings pane already does exactly that.
+        // planned at all, which is a different thing from not existing and is
+        // worth being able to say.
+        //
+        // What a client does with `available: false` is its own business.
+        // moho's window hides those rather than greying them out - it also
+        // knows which of these it has a sign-in form for, and offers the
+        // intersection. That second half is the part the daemon cannot
+        // answer: a protocol it speaks is not addable from a window that
+        // cannot draw the form for it.
         // What this daemon actually is. Asked because it is not otherwise
         // answerable from inside a running client: a frontend and the daemon
         // it adopted are built and deployed separately, and either can be
