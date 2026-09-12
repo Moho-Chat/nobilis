@@ -46,11 +46,6 @@ use std::sync::atomic::Ordering;
 /// started and is content to wait for.
 const MEDIA_PACE: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The most one picture may be. Past this it is linked rather than fetched -
-/// an export is a readable copy of a conversation, not a mirror of every video
-/// somebody ever posted in it.
-const MEDIA_MAX_BYTES: u64 = 25 * 1024 * 1024;
-
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -246,31 +241,64 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
     }
 
     tokio::time::sleep(MEDIA_PACE).await;
-    let answer = http_client().get(url).send().await;
-    let bytes = match answer {
-        Ok(r) if r.status().is_success() => {
-            if r.content_length().is_some_and(|n| n > MEDIA_MAX_BYTES) {
-                tracing::debug!("export: {url} is larger than the cap, linking it instead");
-                return Ok(serde_json::json!({ "path": url, "skipped": "too large" }));
-            }
-            r.bytes().await.ok()
-        }
+
+    // Streamed to disk a chunk at a time rather than read into memory and
+    // written out. There is no size limit here on purpose - a conversation's
+    // attachments are the conversation, and an export that silently left the
+    // big ones behind would be a worse lie than one that took a while - so the
+    // whole-file-in-memory shape was not survivable: a 2GB video would have
+    // meant 2GB of resident daemon.
+    //
+    // Written to a `.part` beside the destination and renamed only once the
+    // body has ended. Without that, an export interrupted mid-file leaves a
+    // truncated one at the real name, and the `dest.exists()` check above
+    // would treat it as already fetched forever after - a broken picture that
+    // never repairs itself.
+    let part = dest.with_extension(format!("{ext}.part"));
+    let mut response = match http_client().get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
         Ok(r) => {
             tracing::debug!("export: {url} answered {}", r.status());
-            None
+            return Ok(serde_json::json!({ "path": url, "skipped": "could not be fetched" }));
         }
         Err(e) => {
             tracing::debug!("export: fetching {url}: {e}");
-            None
+            return Ok(serde_json::json!({ "path": url, "skipped": "could not be fetched" }));
         }
     };
-    let Some(bytes) = bytes.filter(|b| (b.len() as u64) <= MEDIA_MAX_BYTES) else {
-        // The page keeps the original address, so it still works online even
-        // though the folder is no longer self-contained.
-        return Ok(serde_json::json!({ "path": url, "skipped": "could not be fetched" }));
-    };
-    std::fs::write(&dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
-    Ok(serde_json::json!({ "path": relative, "bytes": bytes.len() }))
+
+    use tokio::io::AsyncWriteExt;
+    let mut file = tokio::fs::File::create(&part).await.with_context(|| format!("writing {}", part.display()))?;
+    let mut written: u64 = 0;
+    loop {
+        // Checked as it goes rather than only between files: with no cap, one
+        // file can be the whole of a long download, and a cancel that only
+        // took effect at the end of it would not feel like a cancel.
+        if t.cancel.load(Ordering::Relaxed) {
+            drop(file);
+            let _ = tokio::fs::remove_file(&part).await;
+            bail!("export cancelled");
+        }
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                file.write_all(&chunk).await.with_context(|| format!("writing {}", part.display()))?;
+                written += chunk.len() as u64;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                // A body that stopped early leaves nothing behind: half a
+                // video under the name of a whole one is worse than a link.
+                tracing::debug!("export: {url} stopped early after {written} bytes: {e}");
+                drop(file);
+                let _ = tokio::fs::remove_file(&part).await;
+                return Ok(serde_json::json!({ "path": url, "skipped": "the download stopped early" }));
+            }
+        }
+    }
+    file.flush().await.ok();
+    drop(file);
+    tokio::fs::rename(&part, &dest).await.with_context(|| format!("renaming {}", part.display()))?;
+    Ok(serde_json::json!({ "path": relative, "bytes": written }))
 }
 
 /// Seals it: wraps the accumulated body in a page and writes `index.html`.
