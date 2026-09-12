@@ -761,6 +761,30 @@ pub(super) async fn handle_message(
         // the whole point of `setname`. Reported where they can be seen; a
         // realname is not shown in a roster, so this is the only place the
         // change is ever visible.
+        // Somebody's published facts, as they change.
+        //
+        // `METADATA <target> <key> <visibility> [:<value>]`, which arrives
+        // because of the `METADATA * SUB` sent at registration. The same four
+        // fields come back from an explicit GET as numeric 761, handled just
+        // below by the same parser.
+        Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("METADATA") => {
+            if let Some((target, key, value)) = metadata::parse_keyvalue(args) {
+                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+            }
+        }
+
+        // The same thing, as the answer to a GET rather than as news.
+        //
+        // Numerics are addressed to us, so the client's own nick sits in
+        // front of the fields the command form starts with - dropped here,
+        // where it is known to be there, rather than guessed at in the
+        // parser.
+        Command::Raw(ref cmd, ref args) if cmd == "761" => {
+            if let Some((target, key, value)) = metadata::parse_keyvalue(args.get(1..).unwrap_or(&[])) {
+                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+            }
+        }
+
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("SETNAME") => {
             let name = args.last().map(String::as_str).unwrap_or("");
             if !from.is_empty() && !name.is_empty() {

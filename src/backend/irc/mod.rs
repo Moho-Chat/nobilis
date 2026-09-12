@@ -34,6 +34,7 @@ pub mod send;
 pub mod typing;
 pub mod dcc;
 pub mod nickserv;
+pub mod metadata;
 pub mod sts;
 pub mod sasl;
 

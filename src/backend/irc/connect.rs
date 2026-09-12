@@ -432,6 +432,27 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
     state.runtime.ensure_buffer(state, &account_id, &config.host, "server");
 
+    // Ask to be told what people publish about themselves.
+    //
+    // Only where the network granted it - the capability was requested during
+    // negotiation, and the ACK recording it has arrived by now. Sending this
+    // to a network that has no metadata is an unknown command and an error
+    // reply in the server buffer, which is noise for a feature nobody asked
+    // for. Subscribing rather than asking per person because the point is the
+    // roster: a GET each for everybody in a busy channel is a lot of round
+    // trips to draw one column.
+    if state.runtime.irc_has_cap(&account_id, "draft/metadata") || state.runtime.irc_has_cap(&account_id, "metadata-2") {
+        if let Err(e) = sender.send(Command::Raw(
+            "METADATA".to_string(),
+            std::iter::once("*".to_string())
+                .chain(std::iter::once("SUB".to_string()))
+                .chain(metadata::WANTED_KEYS.iter().map(|k| (*k).to_string()))
+                .collect(),
+        )) {
+            tracing::warn!("irc[{account_id}]: subscribing to metadata failed: {e}");
+        }
+    }
+
     // Keyed on whether SASL actually authenticated rather than on whether it
     // was asked for. A server that turned out not to offer it leaves the
     // account unidentified, and skipping NickServ there would silently drop
@@ -577,6 +598,13 @@ pub(super) const WANTED_CAPS: &[&str] = &[
     // A channel changing its name without becoming a second channel with the
     // first one's history stranded in it.
     "draft/channel-rename",
+    // The avatar, display name and status a network lets somebody publish.
+    // IRC carries a nick and a realname and nothing else, so this is the only
+    // way a face on an IRC roster is ever anything but a placeholder. Both
+    // spellings, because networks that shipped it first still advertise the
+    // draft one - see metadata.rs.
+    "draft/metadata",
+    "metadata-2",
 ];
 
 /// The capabilities named by a CAP ACK, from whichever field they arrived in.

@@ -250,6 +250,23 @@ pub(super) fn irc_profile(
     crate::profile::set(&mut profile, "away", whois.get("away").cloned());
     crate::profile::set(&mut profile, "channels", whois.get("channels").cloned());
 
+    // What they have published about themselves, where the network carries
+    // it at all. This is the only source of a face on IRC: the protocol
+    // itself has a nick and a realname and nothing else - see metadata.rs.
+    let published = state.runtime.irc_metadata(account_id, nick);
+    if let Some(avatar) = published.get("avatar") {
+        crate::profile::set(&mut profile, "avatarUrl", Some(json!(avatar)));
+    }
+    if let Some(shown) = published.get("display-name") {
+        crate::profile::set(&mut profile, "displayName", Some(json!(shown)));
+    }
+    if let Some(status) = published.get("status") {
+        crate::profile::note(&mut profile, "Status", status);
+    }
+    if let Some(home) = published.get("homepage") {
+        crate::profile::note(&mut profile, "Homepage", home);
+    }
+
     if let Some(real) = whois.get("realName").and_then(serde_json::Value::as_str) {
         crate::profile::note(&mut profile, "Name", real);
     }
