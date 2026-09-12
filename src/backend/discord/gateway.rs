@@ -309,6 +309,14 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             .unwrap_or("me")
                             .to_string();
                         state.runtime.set_own_identity(&account_id, &username);
+                        // Nitro, which is what lets this account's emoji be
+                        // used away from the guild they belong to. Read here
+                        // because READY is the only place the payload carries
+                        // it - `premium_type` 1 is Classic, 2 is Nitro, 3 is
+                        // Basic, and all three buy the cross-guild use this
+                        // cares about; 0 or absent is none.
+                        let nitro = d["user"]["premium_type"].as_u64().unwrap_or(0) > 0;
+                        state.runtime.set_emoji_unrestricted(&account_id, nitro);
                         // What a later reconnect needs to pick this session
                         // back up rather than starting over.
                         if let Some(session_id) = d["session_id"].as_str() {

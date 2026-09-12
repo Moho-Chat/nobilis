@@ -474,6 +474,8 @@ async fn prepare(
         let token = config.token.clone().filter(|t| !t.is_empty());
         let slug = channel.slug.clone();
         let buffer_id = buffer.id.clone();
+        let account_id = account_id.to_string();
+        let avatar_url = channel.avatar_url.clone();
         async move {
             // Whether this account may *use* the streamer's subscriber emotes.
             // Treated as "no" if Kick will not say, which costs a greyed-out
@@ -483,6 +485,38 @@ async fn prepare(
                 Some(token) => api::standing(&http, token, &slug).await.map(|s| s.subscribed).unwrap_or(false),
             };
             let emotes = api::emotes(&http, &slug).await.unwrap_or_default();
+
+            // The same emotes, as a place they come from rather than as this
+            // room's list. A Kick subscription buys the right to use that
+            // channel's emotes across the whole site, so whether these reach
+            // beyond this buffer is the subscription itself - which is why the
+            // flag is set from it rather than being false everywhere but the
+            // room on screen (see #205).
+            if !emotes.is_empty() {
+                let entries: Vec<crate::model::EmojiEntry> = emotes
+                    .iter()
+                    .map(|e| crate::model::EmojiEntry {
+                        id: emotes::token(&e.id, &e.name),
+                        name: e.name.clone(),
+                        url: Some(e.url.clone()),
+                        animated: false,
+                        locked: e.subscribers_only && !subscribed,
+                    })
+                    .collect();
+                state.runtime.set_emoji_source(
+                    &account_id,
+                    crate::model::EmojiSource {
+                        id: format!("kick:{slug}"),
+                        name: slug.clone(),
+                        service: "kick".to_string(),
+                        icon_url: avatar_url.clone(),
+                        buffers: vec![buffer_id.clone()],
+                        sendable_anywhere: subscribed,
+                        emoji: entries,
+                    },
+                );
+            }
+
             state.runtime.set_kick_emotes(&buffer_id, emotes, subscribed);
         }
     });
