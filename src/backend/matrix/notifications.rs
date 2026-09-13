@@ -160,6 +160,23 @@ pub(super) fn push_rule_verdict(rules: &Value, room_id: &str, body: &str) -> (bo
     (muted, keyword)
 }
 
+/// Whether the account still has the spec's own rule suppressing notices.
+///
+/// `.m.rule.suppress_notices` is an override rule every homeserver ships
+/// enabled, and an override beats the content rules that would otherwise
+/// notify - so on a stock account a bot's notice never raises anything, even
+/// one carrying somebody's name. Asked of the account's real rules rather
+/// than assumed, because it is a rule like any other and somebody who has
+/// turned it off meant to.
+pub(super) fn notices_are_suppressed(rules: &Value) -> bool {
+    rules["global"]["override"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|rule| rule["rule_id"].as_str() == Some(".m.rule.suppress_notices"))
+        .any(|rule| rule["enabled"].as_bool().unwrap_or(true) && silences(&rule["actions"]))
+}
+
 /// Whether a rule's actions amount to "say nothing".
 ///
 /// Both spellings: the old `dont_notify` action, and the newer form where an
@@ -190,6 +207,7 @@ pub(super) fn matches_keyword(body: &str, pattern: &str) -> bool {
 
 #[cfg(test)]
 mod push_rule_tests {
+    use super::notices_are_suppressed;
     use super::{matches_keyword, push_rule_verdict};
     use serde_json::json;
 
@@ -231,5 +249,27 @@ mod push_rule_tests {
         assert!(matches_keyword("deploying the release now", "deploy*"));
         assert!(matches_keyword("a build failed", "*failed"));
         assert!(!matches_keyword("a build passed", "*failed"));
+    }
+
+    /// Every homeserver ships `.m.rule.suppress_notices` enabled, and an
+    /// override beats the content rules - so on a stock account a bot's
+    /// notice raises nothing, even one carrying somebody's name.
+    #[test]
+    fn a_stock_account_does_not_announce_notices() {
+        let stock = json!({ "global": { "override": [
+            { "rule_id": ".m.rule.master", "enabled": false, "actions": [] },
+            { "rule_id": ".m.rule.suppress_notices", "enabled": true, "actions": ["dont_notify"] }
+        ]}});
+        assert!(notices_are_suppressed(&stock));
+
+        // Somebody who turned it off meant to.
+        let off = json!({ "global": { "override": [
+            { "rule_id": ".m.rule.suppress_notices", "enabled": false, "actions": ["dont_notify"] }
+        ]}});
+        assert!(!notices_are_suppressed(&off));
+
+        // And an account whose rules have not been read yet says nothing
+        // either way rather than inventing a rule.
+        assert!(!notices_are_suppressed(&json!({})));
     }
 }
