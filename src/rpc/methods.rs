@@ -4255,6 +4255,27 @@ pub async fn dispatch(
             (Some(serde_json::json!(filled)), None)
         }
 
+        // The emoji this account reached for last, kept on the account so it
+        // follows the person between clients - the one part of a picker
+        // worth carrying, because it is the part earned by use.
+        "matrixRecentEmoji" | "matrixEmojiUsed" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some(format!("{method} requires \"accountId\"")));
+            };
+            let result = if method == "matrixRecentEmoji" {
+                backend::matrix::recentemoji::list(state, account_id).await
+            } else {
+                let Some(emoji) = p_str_opt(params, "emoji") else {
+                    return (None, Some("matrixEmojiUsed requires \"emoji\"".to_string()));
+                };
+                backend::matrix::recentemoji::record(state, account_id, emoji).await
+            };
+            match result {
+                Ok(list) => (Some(serde_json::json!(list)), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // A message's address, and what it actually says - the two things
         // somebody reaches for when reporting a problem in a room.
         "matrixMessageLink" | "matrixEventSource" => {

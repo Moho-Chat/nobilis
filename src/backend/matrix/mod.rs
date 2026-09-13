@@ -51,6 +51,7 @@ pub mod notifications;
 pub mod probes;
 pub mod profile;
 pub mod receipts;
+pub mod recentemoji;
 pub mod relock;
 pub mod send;
 pub mod server;
