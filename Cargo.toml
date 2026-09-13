@@ -43,7 +43,7 @@ rand = "0.8"
 # `image` for reading Discord's login code, `svg` (a default) for drawing
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "gif"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Sneedchat backend (SneedChat over embedded Tor)

@@ -44,6 +44,7 @@ pub use cards::*;
 pub use chat::*;
 pub use live::*;
 pub use socket::*;
+pub mod emotecache;
 pub mod emotes;
 
 use crate::accounts::KickAccountConfig;

@@ -170,6 +170,24 @@ pub async fn dispatch(
         // fetched from kiwifarms.st at runtime, so the client resolves the
         // actual path itself (it already knows its own install directory)
         // and this needs no I/O of any kind to answer.
+        // Small local copies of Kick emotes, by id.
+        //
+        // Kick serves one size and it is 500x500 animated, which a 26-pixel
+        // cell decodes in full - see backend/kick/emotecache. The client asks
+        // for what it is about to draw and rewrites the URL, so the big
+        // original is never requested at all once this has answered.
+        //
+        // No ids means "what have you got", which is how a client fills its
+        // map at startup without asking for anything to be fetched.
+        "kickEmotes" => {
+            let ids: Vec<String> = params
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            (Some(serde_json::json!(backend::kick::emotecache::resolve(&ids).await)), None)
+        }
+
         "listSneedchatSmilies" => (
             Some(serde_json::json!(backend::sneedchat::smilies::SMILIES.iter().map(|s| serde_json::json!({ "label": s.label, "aliases": s.aliases, "file": s.file })).collect::<Vec<_>>())),
             None,
