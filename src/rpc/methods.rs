@@ -4255,6 +4255,26 @@ pub async fn dispatch(
             (Some(serde_json::json!(filled)), None)
         }
 
+        // Where a particular day is in a room. The server knows; a client
+        // that had to find out by paging backwards would read a month of a
+        // busy room to reach the start of it.
+        "matrixEventAtDate" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixEventAtDate requires \"bufferId\"".to_string()));
+            };
+            let Some(ts) = params.get("ts").and_then(|v| v.as_i64()) else {
+                return (None, Some("matrixEventAtDate requires \"ts\" in seconds".to_string()));
+            };
+            let forwards = params.get("forwards").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::event_at(state, &buffer.account_id, buffer_id, ts * 1000, forwards).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // The emoji this account reached for last, kept on the account so it
         // follows the person between clients - the one part of a picker
         // worth carrying, because it is the part earned by use.

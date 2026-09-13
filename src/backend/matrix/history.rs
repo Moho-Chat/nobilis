@@ -2,6 +2,41 @@
 
 use super::*;
 
+/// The first event in a room at or after a moment.
+///
+/// `/timestamp_to_event` is the whole of "jump to date": the server knows
+/// where in a room a given day is, and a client that had to find out by
+/// paging backwards would read a month of a busy room to reach the start of
+/// it. Everything either side of this already exists here - the event it
+/// names is handed to the same jump a search result takes.
+///
+/// Forwards by default, because a date means "that day" rather than
+/// "whatever came before it": asking backwards from midnight on the 3rd lands
+/// on the last message of the 2nd, which is the wrong day. Backwards is kept
+/// for the case the spec exists to answer - a date after everything in the
+/// room, where forwards finds nothing at all.
+///
+/// v1 rather than v3: it was added after the v3 client API was frozen, and
+/// lives under /client/v1 on every server that has it.
+pub async fn event_at(state: &AppState, account_id: &str, buffer_id: &str, ts_ms: i64, forwards: bool) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let url = format!(
+        "{}/_matrix/client/v1/rooms/{}/timestamp_to_event?ts={ts_ms}&dir={}",
+        account.homeserver_url.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        if forwards { "f" } else { "b" }
+    );
+    let resp = http::get_json(&url, &account.access_token).await.context("asking where that day is")?;
+    let event_id = resp["event_id"].as_str().context("the server named no event there")?;
+    Ok(serde_json::json!({
+        "eventId": event_id,
+        // Seconds, like every other timestamp this daemon hands out; the
+        // endpoint answers in milliseconds.
+        "ts": resp["origin_server_ts"].as_i64().map(|ms| ms / 1000),
+    }))
+}
+
 /// Reads a thread from the server, then hands back everything known about it.
 ///
 /// `/relations` is the only way to see a thread whole: its replies are
