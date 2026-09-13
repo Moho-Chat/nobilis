@@ -4393,6 +4393,50 @@ pub async fn dispatch(
             }
         }
 
+        // What version a room is on, and moving it to a newer one. An
+        // upgrade makes a new room and tombstones the old one, so it is
+        // offered as an action with its consequences written out rather than
+        // as a setting.
+        "matrixRoomVersion" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixRoomVersion requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::roomsettings::room_version(state, &buffer.account_id, buffer_id).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "upgradeMatrixRoom" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("upgradeMatrixRoom requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            // The server's own default where none was named, which is what
+            // "upgrade this room" means to somebody who has not chosen a
+            // version - and the only answer that is right a year from now.
+            let version = match p_str_opt(params, "version") {
+                Some(v) => v.to_string(),
+                None => state
+                    .runtime
+                    .matrix_server_facts(&buffer.account_id)
+                    .and_then(|f| f.default_room_version)
+                    .unwrap_or_default(),
+            };
+            if version.is_empty() {
+                return (None, Some("this homeserver does not say which room version it makes".to_string()));
+            }
+            match backend::matrix::roomsettings::upgrade_room(state, &buffer.account_id, buffer_id, &version).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // A message's address, and what it actually says - the two things
         // somebody reaches for when reporting a problem in a room.
         "matrixMessageLink" | "matrixEventSource" => {

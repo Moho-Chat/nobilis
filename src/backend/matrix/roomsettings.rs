@@ -99,6 +99,62 @@ pub async fn set_history_visibility(state: &AppState, account_id: &str, buffer_i
     .await
 }
 
+/// What room version this room is on, and whether it is worth moving.
+///
+/// An upgrade is not a setting: it makes a *new room* and leaves a tombstone
+/// pointing at it, which is why it is offered as an action with its
+/// consequences written out rather than as a control that silently rewrites
+/// something. moho has followed a tombstone since spaces were supported and
+/// could never make one, so the whole operation had to happen in another
+/// client.
+pub async fn room_version(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let current = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let facts = state.runtime.matrix_server_facts(account_id).unwrap_or_default();
+    let default = facts.default_room_version.clone().unwrap_or_default();
+    Ok(serde_json::json!({
+        "current": current,
+        "default": default,
+        "available": facts.room_versions,
+        // Worth offering only where there is somewhere to go. A room already
+        // on the server's default is not "upgradable to itself", and an
+        // Upgrade button on one is a button whose only outcome is a new room
+        // identical to the old one with everybody's scrollback left behind.
+        "behind": !current.is_empty() && !default.is_empty() && current != default,
+        // Making the new room is the server's job; making the tombstone in
+        // the old one is this account's, and it is the part that can be
+        // refused.
+        "canUpgrade": moderation::can_send_state_in_buffer(state, account_id, buffer_id, "m.room.tombstone"),
+    }))
+}
+
+/// Moves a room to a newer version.
+///
+/// The server makes the replacement room, copies the state it can, and
+/// tombstones this one. What it cannot copy is the conversation: the old room
+/// keeps its own history and members follow the tombstone as they notice it,
+/// which is why this is worth saying out loud before it is done.
+pub async fn upgrade_room(state: &AppState, account_id: &str, buffer_id: &str, version: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let url = format!(
+        "{}/_matrix/client/v3/rooms/{}/upgrade",
+        account.homeserver_url.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
+    );
+    let answer = http::post_json(&url, Some(&account.access_token), serde_json::json!({ "new_version": version }))
+        .await
+        .context("upgrading the room")?;
+    let replacement = answer["replacement_room"].as_str().context("the server named no replacement room")?;
+
+    // Joined here rather than left to be noticed. The server puts the
+    // upgrading account in the new room in most deployments, but the sync
+    // that says so can be seconds away - and an Upgrade that appears to do
+    // nothing is worse than one that takes a moment.
+    send::join_room(state, account_id, replacement, &[]).await?;
+    Ok(serde_json::json!({ "roomId": replacement }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
