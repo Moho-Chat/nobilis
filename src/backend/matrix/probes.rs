@@ -814,6 +814,23 @@ mod live {
             Err(e) => println!("preview_url: unavailable on this server ({e})"),
         }
 
+        // Whether this homeserver could do the QR sign-in at all (#222).
+        // MSC4108 is built on OIDC-native auth: the new device is signed in
+        // through an OAuth device grant over a rendezvous channel, so a
+        // homeserver without MSC2965's auth metadata cannot do it however
+        // willing the client is. Printed rather than asserted, because the
+        // answer is a property of the server and "no" is the ordinary one
+        // today.
+        println!("msc4108 advertised: {}", facts.has_unstable("org.matrix.msc4108"));
+        for probe in [
+            "_matrix/client/v1/auth_metadata",
+            "_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
+            "_matrix/client/unstable/org.matrix.msc4108/rendezvous",
+        ] {
+            let reachable = http::get_json(&format!("{base}/{probe}"), &token).await.is_ok();
+            println!("  {probe}: {}", if reachable { "present" } else { "absent" });
+        }
+
         // Looking into a room without joining it. Two halves, permitted
         // separately: the summary is answered for anything the server can
         // reach, while reading the conversation needs the homeserver to allow
