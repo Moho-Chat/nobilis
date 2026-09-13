@@ -559,6 +559,11 @@ pub async fn dispatch(
                 if id.starts_with("matrix:") {
                     backend::matrix::crypto::forget(&crate::default_data_dir(), id);
                 }
+                // And any half-built Go Live handshake, which lives outside
+                // the runtime for the same reason the voice one does.
+                if id.starts_with("discord:") {
+                    backend::discord::golive::forget(id);
+                }
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),

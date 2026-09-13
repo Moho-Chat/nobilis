@@ -1132,6 +1132,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         .await;
                     }
 
+                    // A stream coming into being, changing, or ending -
+                    // ours or anybody else's. Two of these carry the two
+                    // halves of the handshake a stream connection needs, in
+                    // either order, exactly as the voice ones above do.
+                    "STREAM_CREATE" | "STREAM_SERVER_UPDATE" | "STREAM_UPDATE" => {
+                        golive::note_stream(state, &account_id, t, d).await;
+                    }
+
+                    "STREAM_DELETE" => {
+                        golive::note_stream_gone(state, &account_id, d);
+                    }
+
                     "PRESENCE_UPDATE" => {
                         // Fires for guild members too, not just friends -
                         // update_discord_presence itself is the friends-only
