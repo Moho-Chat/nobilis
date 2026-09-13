@@ -1,4 +1,5 @@
-//! Voice and video calls, as far as a daemon can carry them.
+//! Voice and video calls, as far as a daemon can carry them - which is the
+//! signalling, and not the pictures.
 //!
 //! The media is not here and cannot be. A call is WebRTC: two peers agreeing
 //! on codecs and network paths and then sending each other encrypted RTP,
