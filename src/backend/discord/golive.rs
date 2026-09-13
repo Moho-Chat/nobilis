@@ -213,6 +213,12 @@ fn slot(account_id: &str, stream_key: &str) -> String {
 /// passed to frontends rather than acted on. Only this account's own stream
 /// has a handshake to complete.
 pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: &Value) {
+    // Logged whole, at a level somebody will actually be running with. None
+    // of this is documented, so the first time a real stream goes past is the
+    // only chance to see what Discord actually sends - and a dispatch read
+    // once from a log beats a field guessed at twice.
+    tracing::info!("discord[{account_id}]: {dispatch} {}", redacted(d));
+
     let Some(stream_key) = d["stream_key"].as_str() else { return };
     let owner = StreamKey::owner(stream_key);
     let own = state.accounts.get_discord(account_id).map(|a| a.user_id);
@@ -332,8 +338,27 @@ pub fn close(account_id: &str) {
     }
 }
 
+/// A dispatch with its credentials taken out.
+///
+/// `STREAM_SERVER_UPDATE` carries the token that opens the stream's
+/// connection. It is exactly as much of a secret as a password, and a log is
+/// the one place it must never be - so the field is replaced rather than
+/// trimmed, which also leaves the log saying that there *was* one.
+fn redacted(d: &Value) -> String {
+    let mut copy = d.clone();
+    if let Some(object) = copy.as_object_mut() {
+        for secret in ["token", "access_token"] {
+            if object.contains_key(secret) {
+                object.insert(secret.to_string(), Value::from("<redacted>"));
+            }
+        }
+    }
+    copy.to_string()
+}
+
 /// A stream that has ended, ours or anybody's.
 pub fn note_stream_gone(state: &AppState, account_id: &str, d: &Value) {
+    tracing::info!("discord[{account_id}]: STREAM_DELETE {}", redacted(d));
     let Some(stream_key) = d["stream_key"].as_str() else { return };
     pending().lock().unwrap().remove(&slot(account_id, stream_key));
     state.events.emit(
@@ -437,4 +462,30 @@ mod tests {
         dropped.absorb(&json!({ "endpoint": "" }));
         assert_eq!(dropped.endpoint, first.endpoint);
     }
+    /// The stream server's token opens the stream's connection and is as
+    /// much of a secret as a password. A log is the one place it must never
+    /// reach - and the field is replaced rather than removed, so the log
+    /// still says there was one.
+    #[test]
+    fn a_logged_dispatch_has_no_token_in_it() {
+        let d = json!({
+            "stream_key": "call:222:333",
+            "endpoint": "eu.discord.media",
+            "token": "a-real-secret",
+            "paused": false
+        });
+        let line = redacted(&d);
+        assert!(!line.contains("a-real-secret"), "{line}");
+        assert!(line.contains("<redacted>"), "{line}");
+        // And everything that is not a secret survives, or the log says
+        // nothing worth reading.
+        assert!(line.contains("call:222:333"), "{line}");
+        assert!(line.contains("eu.discord.media"), "{line}");
+        assert!(line.contains("paused"), "{line}");
+
+        // A dispatch with nothing to hide is unchanged apart from key order.
+        let plain = json!({ "stream_key": "call:1:2" });
+        assert!(!redacted(&plain).contains("redacted"));
+    }
+
 }
