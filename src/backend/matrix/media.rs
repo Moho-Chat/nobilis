@@ -32,6 +32,14 @@ pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_
         mimetype,
         path,
         thumbnail_path,
+        // Matrix has voice messages too - MSC3245, with the length and the
+        // waveform under an MSC1767 audio block - but they are shaped nothing
+        // like Discord's (milliseconds and an array of 0-1024 samples, against
+        // seconds and base64 bytes). Reading them is its own piece of work;
+        // this is the Discord ticket.
+        duration_secs: None,
+        waveform: None,
+        voice: false,
         url: None,
     }
 }

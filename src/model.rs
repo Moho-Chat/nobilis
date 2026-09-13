@@ -495,6 +495,27 @@ pub struct Attachment {
     /// blurhash, where the sender provided one).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blurhash: Option<String>,
+    /// How long the recording runs, where the service says.
+    ///
+    /// Carried for voice messages, which are ordinary traffic in Discord DMs
+    /// and arrived here as an audio file with nothing to say what it was.
+    /// Knowing the length before a byte is fetched is most of what makes one
+    /// readable: a voice message is a thing people decide whether to listen to.
+    #[serde(rename = "durationSecs", skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<f64>,
+    /// The picture of the sound, as the sender's client drew it.
+    ///
+    /// Discord sends up to 256 bytes, base64'd, each one an amplitude sample.
+    /// Kept encoded rather than expanded into numbers: it is drawn once and
+    /// this is four times smaller on the wire and in the scrollback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<String>,
+    /// Somebody spoke this rather than attaching a file of it.
+    ///
+    /// The service's own flag, not a guess from the mimetype: an .ogg someone
+    /// uploaded deliberately is an audio file and should be offered as one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub voice: bool,
     /// Locally cached full-size media.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -736,10 +757,18 @@ mod tests {
             path: Some("file:///x".into()),
             thumbnail_path: Some("file:///t".into()),
             url: Some("https://x".into()),
+            duration_secs: Some(12.4),
+            waveform: Some("AAAI".into()),
+            voice: true,
         };
         let v = serde_json::to_value(&a).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         assert!(keys.contains(&"thumbnailPath"), "got {keys:?}");
+        // The voice-message pair, which is two words in Rust and one on the
+        // wire - exactly the shape this test exists to catch.
+        assert!(keys.contains(&"durationSecs"), "got {keys:?}");
+        assert!(keys.contains(&"waveform"), "got {keys:?}");
+        assert!(keys.contains(&"voice"), "got {keys:?}");
         assert!(!keys.iter().any(|k| k.contains('_')), "snake_case leaked: {keys:?}");
     }
 
@@ -749,6 +778,9 @@ mod tests {
     fn empty_attachment_fields_are_omitted() {
         let a = Attachment { kind: "file".into(), ..Default::default() };
         let v = serde_json::to_value(&a).unwrap();
+        // `voice` included: false is the ordinary case for every attachment
+        // there has ever been, and sending it on all of them would be a flag
+        // on the wire that means nothing.
         assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["kind"]);
     }
 

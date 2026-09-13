@@ -204,6 +204,13 @@ pub(super) fn extract_body(d: &Value) -> Option<String> {
     }
 }
 
+/// Discord message flag 1 << 13: this message is somebody speaking.
+///
+/// Named rather than written as 8192 at the point of use, because the number
+/// says nothing and this is the only thing that distinguishes a voice message
+/// from an ordinary audio attachment.
+const IS_VOICE_MESSAGE: u64 = 1 << 13;
+
 /// Discord's own `attachments` array, kept structured instead of being
 /// flattened into body text. Discord already reports filename, size,
 /// dimensions and content type per file, so there is nothing to infer - and
@@ -219,6 +226,74 @@ pub(super) fn extract_body(d: &Value) -> Option<String> {
 /// ordinary kind of image post there is.
 pub(super) fn is_empty_message(body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
     body.is_empty() && embeds.is_empty() && attachments.is_empty()
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::extract_attachments;
+    use serde_json::json;
+
+    /// A voice message as Discord actually sends one, taken from the shape in
+    /// this account's own scrollback: an ogg named voice-message.ogg, with the
+    /// length and the waveform on the attachment and the flag on the message.
+    fn spoken() -> serde_json::Value {
+        json!({
+            "flags": 8192,
+            "attachments": [{
+                "url": "https://cdn.discordapp.com/attachments/1/2/voice-message.ogg",
+                "filename": "voice-message.ogg",
+                "content_type": "audio/ogg",
+                "size": 453003,
+                "duration_secs": 12.4,
+                "waveform": "AAAICBAQGBggIA=="
+            }]
+        })
+    }
+
+    #[test]
+    fn a_voice_message_says_that_it_is_one() {
+        let att = &extract_attachments(&spoken())[0];
+        assert!(att.voice, "the flag was not read");
+        assert_eq!(att.duration_secs, Some(12.4));
+        assert_eq!(att.waveform.as_deref(), Some("AAAICBAQGBggIA=="));
+        // Still an audio attachment underneath, so everything that already
+        // knew how to play one still can.
+        assert_eq!(att.kind, "audio");
+    }
+
+    /// The distinction that has to survive: an .ogg somebody attached on
+    /// purpose is a file they sent, and drawing it as a voice message would
+    /// claim they spoke it.
+    #[test]
+    fn an_ordinary_sound_file_is_not_a_voice_message() {
+        let mut ordinary = spoken();
+        ordinary["flags"] = json!(0);
+        let att = &extract_attachments(&ordinary)[0];
+        assert!(!att.voice);
+        assert_eq!(att.kind, "audio");
+    }
+
+    /// Discord sets the flag on the message, so every attachment on it is part
+    /// of the same recording - but a message with no flag and no waveform must
+    /// come through exactly as it always did.
+    #[test]
+    fn a_picture_is_untouched_by_any_of_this() {
+        let picture = json!({
+            "attachments": [{
+                "url": "https://cdn.discordapp.com/attachments/1/2/cat.png",
+                "filename": "cat.png",
+                "content_type": "image/png",
+                "size": 100,
+                "width": 800,
+                "height": 600
+            }]
+        });
+        let att = &extract_attachments(&picture)[0];
+        assert_eq!(att.kind, "image");
+        assert!(!att.voice);
+        assert_eq!(att.duration_secs, None);
+        assert_eq!(att.waveform, None);
+    }
 }
 
 #[cfg(test)]
@@ -574,6 +649,10 @@ pub(super) fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
 
 pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
     let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
+    // Whether somebody spoke this message rather than attaching a sound file.
+    // The flag is on the message, the recording is on the attachment, so it is
+    // read once here and carried down to each.
+    let spoken = d["flags"].as_u64().unwrap_or(0) & IS_VOICE_MESSAGE != 0;
     atts.iter()
         .filter_map(|att| {
             let url = att["url"].as_str()?;
@@ -592,6 +671,15 @@ pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
                 height: att["height"].as_u64().map(|v| v as u32),
                 url: Some(url.to_string()),
                 mimetype,
+                // Both only ever appear on a voice message, and both were being
+                // dropped: what arrived was an audio file with no indication of
+                // what it was, no length, and no picture of the sound.
+                duration_secs: att["duration_secs"].as_f64(),
+                waveform: att["waveform"].as_str().map(str::to_string),
+                // The flag decides, not the shape of the attachment. An .ogg
+                // somebody uploaded on purpose is a file they sent, and calling
+                // it a voice message would draw it as something it is not.
+                voice: spoken,
                 ..Default::default()
             })
         })
