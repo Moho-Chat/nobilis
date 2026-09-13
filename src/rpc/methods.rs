@@ -4341,7 +4341,17 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("discordScreenShareReady requires \"accountId\"".to_string()));
             };
-            (Some(serde_json::json!({ "ready": backend::discord::golive::sending(account_id) })), None)
+            let ready = backend::discord::golive::sending(account_id);
+            (
+                Some(serde_json::json!({
+                    "ready": ready,
+                    // Only once, and only when it is the answer: a stale
+                    // reason shown beside a working stream would be worse
+                    // than none.
+                    "error": if ready { None } else { backend::discord::golive::take_last_error(account_id) },
+                })),
+                None,
+            )
         }
 
         // The addresses that can reach this account - an email for password

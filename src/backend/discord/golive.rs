@@ -293,6 +293,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         }
         Err(e) => {
             tracing::warn!("discord[{account_id}]: the stream connection failed: {e:#}");
+            last_error().lock().unwrap().insert(account_id.to_string(), format!("{e:#}"));
             state.events.emit(
                 "discordStream",
                 json!({ "accountId": account_id, "streamKey": stream_key, "own": true, "error": e.to_string() }),
@@ -324,6 +325,22 @@ pub async fn send_frame(account_id: &str, frame: &[u8], timestamp_micros: i64) -
     let sender = senders().lock().unwrap().get(account_id).cloned();
     let sender = sender.context("no stream is running for this account")?;
     sender.send_frame(frame, timestamp_micros).await
+}
+
+/// Why the last attempt to open a stream connection failed, if it did.
+///
+/// Kept so the window can say it. "Discord never opened the stream" is true
+/// and useless; the server's own refusal - a token it would not take, a
+/// server it could not find - is the sentence somebody can act on.
+fn last_error() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static ERRORS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    ERRORS.get_or_init(Default::default)
+}
+
+/// What went wrong last time, and clears it.
+pub fn take_last_error(account_id: &str) -> Option<String> {
+    last_error().lock().unwrap().remove(account_id)
 }
 
 /// Whether this account has a stream connection ready for frames.
