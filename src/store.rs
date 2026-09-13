@@ -39,6 +39,44 @@ impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening scrollback db at {}", db_path.display()))?;
+
+        // Write-ahead logging, and don't fsync on every one.
+        //
+        // Every message written here is its own implicit transaction - there
+        // is no BEGIN anywhere in this file - so in the default rollback
+        // journal at synchronous=FULL each arriving line costs a journal write
+        // and an fsync. Measured on an ext4 SSD, replaying this file's own
+        // one-insert-per-statement pattern: 26.19ms per insert as it was,
+        // 13.31ms in WAL alone, 0.01ms in WAL at NORMAL.
+        //
+        // It compounds because the connection below is behind a single mutex:
+        // those 26ms block every read as well, including backlog fetches and
+        // the LIKE scan that serves search. A 500-message backfill was thirteen
+        // seconds of held lock, and a channel at 20 lines a second needed 520ms
+        // of fsync for every second of traffic, which is not a thing it can
+        // keep up with. WAL also stops writers blocking readers, which is the
+        // other half of that.
+        //
+        // What NORMAL gives up is the last transaction if the machine loses
+        // power - never a corrupt database. For scrollback that is a line or
+        // two of chat, against a daemon that could not keep up with a busy
+        // channel.
+        //
+        // journal_mode returns the mode it settled on rather than nothing, so
+        // it is asked rather than told: WAL needs shared memory and a
+        // filesystem that supports it, and a database on NFS or similar will
+        // quietly stay in rollback mode. Worth a line in the log rather than a
+        // silent assumption, since it is the difference above.
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
+            Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
+            Ok(mode) => tracing::warn!(
+                "scrollback db stayed in {mode} journal mode - every message will fsync"
+            ),
+            Err(e) => tracing::warn!("could not put the scrollback db into WAL mode: {e}"),
+        }
+        // Persistent in the database file for journal_mode, per-connection for
+        // synchronous, which is why this one is set every time.
+        let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
         // Only takes effect for a brand-new file (or after a full VACUUM,
         // which isn't done automatically here since that could be slow on
         // an existing multi-month scrollback.db) - lets incremental_vacuum
@@ -1101,6 +1139,93 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    /// The mode is a property of the file, so an existing scrollback.db -
+    /// written months ago in rollback mode - has to be converted the first
+    /// time this opens it, not only new ones created in WAL. Both halves are
+    /// checked here: a fresh database, and one deliberately put back the old
+    /// way and reopened.
+    #[test]
+    fn the_scrollback_db_is_in_wal_mode() {
+        let (s, dir) = store();
+        let journal_mode = |s: &Store| -> String {
+            s.conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .expect("asking the journal mode")
+                .to_ascii_lowercase()
+        };
+
+        // One written the way it was before this change, then reopened.
+        let old_path = dir.join("existing.db");
+        let _ = std::fs::remove_file(&old_path);
+        {
+            let old = Store::open(&old_path).expect("opening store");
+            old.conn
+                .lock()
+                .unwrap()
+                .execute_batch("PRAGMA journal_mode = DELETE;")
+                .expect("back to the old journal");
+            assert_eq!(journal_mode(&old), "delete", "the fixture is not in the old mode");
+        }
+        let reopened = Store::open(&old_path).expect("reopening store");
+        assert_eq!(journal_mode(&reopened), "wal", "an existing db was left in rollback mode");
+
+        assert_eq!(journal_mode(&s), "wal", "a fresh db was not created in WAL mode");
+
+        // And the fsync-per-message setting that is the other half of it.
+        let sync: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .expect("asking synchronous");
+        assert_eq!(sync, 1, "1 is NORMAL; 2 is the FULL this was costing 26ms a message");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What the journal mode is actually worth, measured through this file's
+    /// own write path rather than a synthetic one.
+    ///
+    /// Ignored by default: it writes a few hundred rows twice and times them,
+    /// so it is slow by design and its numbers depend on the disk underneath.
+    /// Run it when changing anything about how this opens or writes:
+    ///   cargo test --release -- --ignored wal_is_worth
+    #[test]
+    #[ignore]
+    fn wal_is_worth_having() {
+        // Not the temp dir: /tmp is tmpfs on most machines, where fsync costs
+        // nothing and both settings measure the same. The database this is
+        // about lives in the config directory, on a real filesystem, which is
+        // where the difference is.
+        let dir = dirs::home_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(".cache")
+            .join(format!("nobilis-wal-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = Store::open(&dir.join("wal.db")).expect("opening store");
+        // The same store, opened the way it used to be.
+        let old_path = dir.join("rollback.db");
+        let _ = std::fs::remove_file(&old_path);
+        let old = Store::open(&old_path).expect("opening store");
+        old.conn.lock().unwrap().execute_batch(
+            "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;"
+        ).expect("back to the old settings");
+
+        let time = |s: &Store, tag: &str| {
+            let start = std::time::Instant::now();
+            for i in 0..300 {
+                append(s, "#chan", &format!("{tag}-{i}"));
+            }
+            start.elapsed().as_secs_f64() * 1000.0 / 300.0
+        };
+        let before = time(&old, "old");
+        let after = time(&wal, "new");
+        println!("rollback+FULL {before:.2}ms per message, WAL+NORMAL {after:.2}ms per message");
+        assert!(after < before, "WAL was not faster: {after:.2}ms against {before:.2}ms");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Like `append`, but with text worth searching for.
