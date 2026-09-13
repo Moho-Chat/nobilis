@@ -78,6 +78,7 @@ pub mod crypto;
 pub mod http;
 pub mod markup;
 pub mod moderation;
+pub mod permalinks;
 pub mod polls;
 pub mod calls;
 pub mod protocol;

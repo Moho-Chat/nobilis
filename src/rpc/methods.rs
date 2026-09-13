@@ -4255,6 +4255,27 @@ pub async fn dispatch(
             (Some(serde_json::json!(filled)), None)
         }
 
+        // A message's address, and what it actually says - the two things
+        // somebody reaches for when reporting a problem in a room.
+        "matrixMessageLink" | "matrixEventSource" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some(format!("{method} requires \"bufferId\" and \"messageId\""))),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let result = if method == "matrixMessageLink" {
+                backend::matrix::permalinks::message_link(state, &buffer.account_id, buffer_id, message_id).await
+            } else {
+                backend::matrix::permalinks::event_source(state, &buffer.account_id, buffer_id, message_id).await
+            };
+            match result {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // How much of a room somebody who joins later can read. One of the
         // few room settings with a privacy consequence rather than a
         // cosmetic one, and read when it is looked at rather than cached -

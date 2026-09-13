@@ -50,6 +50,18 @@ fn is_not_found(e: &anyhow::Error) -> bool {
     e.to_string().contains("M_NOT_FOUND")
 }
 
+/// The room's published name, where it has one.
+///
+/// Best-effort by design: a room without an alias is ordinary, and so is one
+/// whose alias this account cannot read. Both mean "use the id instead".
+pub async fn canonical_alias(state: &AppState, account_id: &str, room_id: &str) -> Option<String> {
+    read_state(state, account_id, room_id, "m.room.canonical_alias")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|c| c["alias"].as_str().filter(|a| !a.is_empty()).map(str::to_string))
+}
+
 /// What a room says about who can read its past, and whether this account can
 /// change it.
 pub async fn history_visibility(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
