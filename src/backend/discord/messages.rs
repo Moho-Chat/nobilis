@@ -709,6 +709,10 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 color: embed["color"].as_i64(),
                 timestamp: embed["timestamp"].as_str().map(|s| s.to_string()),
                 url: embed["url"].as_str().map(|s| s.to_string()),
+                // Discord's own thumbnails are already reached through the
+                // message's media sniffing, which pairs them with the embed
+                // in the frontend. Nothing to fetch here.
+                image_url: None,
             })
         })
         .collect()

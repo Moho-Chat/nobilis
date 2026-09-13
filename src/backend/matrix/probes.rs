@@ -796,6 +796,24 @@ mod live {
         assert_eq!(source["room_id"].as_str(), Some(room_id.as_str()), "{source}");
         println!("event source: type {}", source["type"]);
 
+        // And what the homeserver makes of a link. Its own endpoint under
+        // /media, and a server is free to have it switched off entirely -
+        // which is a result rather than a failure, so it is printed either
+        // way.
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let preview = http::get_json(
+            &format!(
+                "{base}/_matrix/client/v1/media/preview_url?url={}&ts={ts}",
+                url::form_urlencoded::byte_serialize(b"https://matrix.org/").collect::<String>()
+            ),
+            &token,
+        )
+        .await;
+        match preview {
+            Ok(answer) => println!("preview_url: title {:?}, image {:?}", answer["og:title"], answer["og:image"]),
+            Err(e) => println!("preview_url: unavailable on this server ({e})"),
+        }
+
         let _ = http::post_json(
             &format!("{base}/_matrix/client/v3/rooms/{escaped_room}/leave"),
             Some(&token),

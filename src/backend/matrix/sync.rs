@@ -153,6 +153,7 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
     // this late would leave a conversation filed as an ordinary room for the
     // rest of the session.
     directs::fetch(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
+    previews::fetch_account_setting(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
 
     if next_batch.is_some() {
         if let Err(e) = bootstrap_joined_rooms(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
@@ -511,6 +512,13 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
             // as this rather than as anything about the room itself.
             if event["type"].as_str() == Some("m.direct") {
                 directs::apply(state, account_id, &event["content"]);
+            }
+            // Whether this account wants links unfurled at all. A switch
+            // rather than a preference here, because the unfurling is done by
+            // the homeserver and somebody who turned it off in Element meant
+            // to stop telling it which links they read.
+            if event["type"].as_str() == Some(previews::ACCOUNT_SETTING) {
+                state.runtime.set_matrix_previews_off(account_id, "", previews::disabled_by(&event["content"]));
             }
             // The account's own sticker pack, which travels with it between
             // clients - see backend/matrix/stickers.rs for the two places a

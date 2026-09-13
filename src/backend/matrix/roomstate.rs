@@ -22,7 +22,7 @@
 //! cached: the joined-member roster, power levels (sort key), and presence
 //! (online/offline split) - called any time one of those three changes.
 
-use super::{cached_media_path, moderation, protocol, widgets};
+use super::{cached_media_path, moderation, previews, protocol, widgets};
 use crate::model;
 use crate::state::AppState;
 use serde_json::Value;
@@ -120,6 +120,12 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                         }),
                     );
                 }
+            }
+            // Whether this room lets a link in it be unfurled. A room's own
+            // decision, made for everybody in it, so it outranks an account
+            // that has said nothing - see Runtime::matrix_previews_allowed.
+            previews::ROOM_SETTING => {
+                state.runtime.set_matrix_previews_off(account_id, room_id, previews::disabled_by(&event["content"]));
             }
             "m.room.avatar" => {
                 if let Some(mxc) = event["content"]["url"].as_str() {

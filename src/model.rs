@@ -428,6 +428,16 @@ pub struct Embed {
     pub timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The picture on the card, as a local path.
+    ///
+    /// A link preview is mostly its picture, and the one a homeserver hands
+    /// back is an mxc URI needing a token no frontend holds - so it is
+    /// fetched and cached like every other piece of Matrix media, and what
+    /// travels is the file. Discord embeds carry none of these today; the
+    /// field is on the shared shape because a card with a picture is what an
+    /// unfurled link is, whoever unfurled it.
+    #[serde(rename = "imageUrl", skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
 }
 
 /// Something on a message that can be pressed.

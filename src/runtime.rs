@@ -706,6 +706,13 @@ pub struct Runtime {
     /// "is this room a DM"; the account data is keyed by person, since one
     /// person can have several rooms with you.
     matrix_directs: Mutex<HashMap<(String, String), String>>,
+    /// (account, room) for every place that has turned link previews off; an
+    /// empty room id is the account's own switch.
+    ///
+    /// A set of the refusals rather than a map of every room's answer,
+    /// because the ordinary state is "nobody has said anything" and a map
+    /// would have to hold that answer for every room in order to mean it.
+    matrix_previews_off: Mutex<HashSet<(String, String)>>,
     /// Matrix-specific: (account id, room id) -> {user id -> display name}
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
@@ -1035,6 +1042,7 @@ impl Runtime {
             matrix_pinned: Mutex::new(HashMap::new()),
             matrix_widgets: Mutex::new(HashMap::new()),
             matrix_directs: Mutex::new(HashMap::new()),
+            matrix_previews_off: Mutex::new(HashSet::new()),
             matrix_verification_peers: Mutex::new(HashMap::new()),
             matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
@@ -1397,6 +1405,30 @@ impl Runtime {
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// Whether a room lets a link in it be unfurled.
+    ///
+    /// Two switches, both of which say "disable" rather than "enable" - so an
+    /// account or a room that has never said anything allows them, which is
+    /// what every other client does with the same events. A room that has
+    /// turned them off wins over an account that has not, because that
+    /// decision was made for everybody in the room.
+    pub fn matrix_previews_allowed(&self, account_id: &str, room_id: &str) -> bool {
+        let held = self.matrix_previews_off.lock().unwrap();
+        !held.contains(&(account_id.to_string(), String::new()))
+            && !held.contains(&(account_id.to_string(), room_id.to_string()))
+    }
+
+    /// Records one of those two switches. An empty room id is the account's.
+    pub fn set_matrix_previews_off(&self, account_id: &str, room_id: &str, off: bool) {
+        let key = (account_id.to_string(), room_id.to_string());
+        let mut held = self.matrix_previews_off.lock().unwrap();
+        if off {
+            held.insert(key);
+        } else {
+            held.remove(&key);
+        }
     }
 
     /// Marks a conversation as the service talking rather than a person.
@@ -4661,6 +4693,20 @@ impl Runtime {
                 $( self.$field.lock().unwrap().retain(|key, _| !belongs_to(account_id, &key.0)); )*
             };
         }
+        // A set has no value half, so `retain` hands it one argument rather
+        // than two - which is the whole reason these are separate macros, and
+        // the reason three sets quietly escaped the sweep until the test
+        // below learned to look for them.
+        macro_rules! sweep_set {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key| !belongs_to(account_id, key)); )*
+            };
+        }
+        macro_rules! sweep_set_pairs {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key| !belongs_to(account_id, &key.0)); )*
+            };
+        }
 
         sweep!(
             conn_states, irc_handles, buffers,
@@ -4695,6 +4741,11 @@ impl Runtime {
             matrix_own_reactions, irc_splits, matrix_widgets,
             matrix_directs,
         );
+        sweep_set!(
+            discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,
+            emoji_unrestricted,
+        );
+        sweep_set_pairs!(matrix_previews_off);
     }
 }
 
@@ -4717,14 +4768,22 @@ mod forget_tests {
             .lines()
             .filter_map(|line| {
                 let line = line.trim_start();
-                let name = line.split(": Mutex<HashMap<").next()?;
-                (line.contains(": Mutex<HashMap<") && !name.contains(' ')).then_some(name)
+                // Sets as well as maps. Three of them escaped this test for
+                // as long as it only looked for HashMap - which is the
+                // failure it exists to catch, happening to itself.
+                let name = line.split(": Mutex<HashMap<").next()?.split(": Mutex<HashSet<").next()?;
+                ((line.contains(": Mutex<HashMap<") || line.contains(": Mutex<HashSet<")) && !name.contains(' '))
+                    .then_some(name)
             })
             .collect();
         assert!(fields.len() > 70, "found only {} maps - the parse is wrong", fields.len());
 
+        // To the end of the function rather than a fixed number of bytes: a
+        // cap is a thing to outgrow silently, and outgrowing this one would
+        // make the test start reporting maps that are in fact swept.
         let sweep = src.find("pub fn forget_account").expect("the sweep");
-        let sweep_body = &src[sweep..sweep + 4000];
+        let end = src[sweep..].find("\n    }\n}").expect("its end") + sweep;
+        let sweep_body = &src[sweep..end];
         let missing: Vec<&&str> = fields.iter().filter(|f| !sweep_body.contains(**f)).collect();
         assert!(missing.is_empty(), "these maps would survive removing an account: {missing:?}");
     }

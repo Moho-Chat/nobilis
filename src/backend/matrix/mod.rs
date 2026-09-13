@@ -50,6 +50,7 @@ pub mod history;
 pub mod media;
 pub mod notifications;
 pub mod probes;
+pub mod previews;
 pub mod profile;
 pub mod receipts;
 pub mod recentemoji;

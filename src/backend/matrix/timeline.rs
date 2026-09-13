@@ -353,6 +353,20 @@ pub(super) async fn handle_timeline_event(
             _ => None,
         },
     );
+
+    // What a link in it turns out to be, asked of the homeserver rather than
+    // of the page. After the message is stored, and in the background: the
+    // line is what somebody is waiting for, and a server fetching somebody
+    // else's slow page is not worth holding a conversation up for.
+    previews::unfurl_later(
+        state,
+        account_id,
+        buffer_id,
+        room_id,
+        event_id,
+        &body,
+        event["origin_server_ts"].as_i64().unwrap_or(0),
+    );
 }
 
 /// Applies an incoming `m.room.redaction`: either a real message delete
