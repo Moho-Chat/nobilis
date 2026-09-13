@@ -4255,6 +4255,34 @@ pub async fn dispatch(
             (Some(serde_json::json!(filled)), None)
         }
 
+        // How much of a room somebody who joins later can read. One of the
+        // few room settings with a privacy consequence rather than a
+        // cosmetic one, and read when it is looked at rather than cached -
+        // it changes rarely and is asked about rarely, and a value fetched
+        // as it is shown cannot be stale.
+        "matrixHistoryVisibility" | "setMatrixHistoryVisibility" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let result = if method == "matrixHistoryVisibility" {
+                backend::matrix::roomsettings::history_visibility(state, &buffer.account_id, buffer_id).await
+            } else {
+                let Some(value) = p_str_opt(params, "value") else {
+                    return (None, Some("setMatrixHistoryVisibility requires \"value\"".to_string()));
+                };
+                backend::matrix::roomsettings::set_history_visibility(state, &buffer.account_id, buffer_id, value)
+                    .await
+                    .map(|()| ok_node())
+            };
+            match result {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // How the account files a room: starred to the top, pushed to the
         // bottom, or neither. Per-room account data, so it travels - which is
         // the point, and why this is not the window's own pin.

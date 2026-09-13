@@ -81,6 +81,7 @@ pub mod moderation;
 pub mod polls;
 pub mod calls;
 pub mod protocol;
+pub mod roomsettings;
 pub mod roomstate;
 pub mod widgets;
 pub mod sliding;
