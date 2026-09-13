@@ -27,7 +27,7 @@ pub const HISTORY_CHOICES: [&str; 4] = ["joined", "invited", "shared", "world_re
 /// A 404 here is the ordinary answer rather than a failure: a room that has
 /// never had its history visibility set does not carry the event, and the
 /// spec's default applies. Every other error is a real one and is reported.
-async fn read_state(state: &AppState, account_id: &str, room_id: &str, event_type: &str) -> Result<Option<Value>> {
+pub(super) async fn read_state_event(state: &AppState, account_id: &str, room_id: &str, event_type: &str) -> Result<Option<Value>> {
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/state/{event_type}",
@@ -55,7 +55,7 @@ fn is_not_found(e: &anyhow::Error) -> bool {
 /// Best-effort by design: a room without an alias is ordinary, and so is one
 /// whose alias this account cannot read. Both mean "use the id instead".
 pub async fn canonical_alias(state: &AppState, account_id: &str, room_id: &str) -> Option<String> {
-    read_state(state, account_id, room_id, "m.room.canonical_alias")
+    read_state_event(state, account_id, room_id, "m.room.canonical_alias")
         .await
         .ok()
         .flatten()
@@ -66,7 +66,7 @@ pub async fn canonical_alias(state: &AppState, account_id: &str, room_id: &str) 
 /// change it.
 pub async fn history_visibility(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
-    let content = read_state(state, account_id, &room_id, HISTORY_VISIBILITY).await?;
+    let content = read_state_event(state, account_id, &room_id, HISTORY_VISIBILITY).await?;
     // `shared` is the spec's default, and a room with no event really is
     // shared rather than unknown - saying "unset" would leave somebody
     // guessing about exactly the setting they came here to check.

@@ -4393,6 +4393,41 @@ pub async fn dispatch(
             }
         }
 
+        // What a room refuses and whose judgement it follows: its server
+        // ACL, the policy rules it publishes, and the policy server it
+        // defers to. Read on demand - all three are rare, and an ACL's whole
+        // job is to explain an absence, which is a question somebody asks
+        // rather than something they watch.
+        "matrixRoomPolicy" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixRoomPolicy requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::policy::room_policy(state, &buffer.account_id, buffer_id).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // The deny list, one server at a time. The allow list is the
+        // dangerous half and is not offered - see the module's own comment.
+        "setMatrixServerDenied" => {
+            let (buffer_id, server) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "server")) {
+                (Some(b), Some(s)) => (b, s),
+                _ => return (None, Some("setMatrixServerDenied requires \"bufferId\" and \"server\"".to_string())),
+            };
+            let denied = p_bool(params, "denied", true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::policy::set_denied(state, &buffer.account_id, buffer_id, server, denied).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // What version a room is on, and moving it to a newer one. An
         // upgrade makes a new room and tombstones the old one, so it is
         // offered as an action with its consequences written out rather than
