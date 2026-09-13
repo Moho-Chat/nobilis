@@ -1036,13 +1036,27 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // separate dispatch for going live or turning a
                         // camera on, so dropping them here would mean nobody
                         // could ever be told a screen was being shared.
+                        let flags = crate::runtime::VoiceFlags::from_voice_state(d);
+                        // Somebody's camera or screen going on or off. Said
+                        // out loud because Discord has no dispatch of its
+                        // own for either - they ride on the voice state, and
+                        // this is the only place a client can see them.
+                        if flags.streaming || flags.video {
+                            tracing::info!(
+                                "discord[{account_id}]: {user_id} is {}{}{} in {}",
+                                if flags.streaming { "sharing a screen" } else { "" },
+                                if flags.streaming && flags.video { " and " } else { "" },
+                                if flags.video { "on camera" } else { "" },
+                                channel_id.unwrap_or("nowhere")
+                            );
+                        }
                         state.runtime.set_discord_voice_presence(
                             &account_id,
                             user_id,
                             channel_id,
                             voice_member_name(d),
                             voice_member_avatar(d).as_deref(),
-                            crate::runtime::VoiceFlags::from_voice_state(d),
+                            flags,
                         );
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
@@ -1094,6 +1108,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // before being answered produces exactly that and no
                     // CALL_DELETE at all.
                     "CALL_CREATE" | "CALL_UPDATE" => {
+                        tracing::info!("discord[{account_id}]: {t} {}", brief(d));
                         let Some(channel_id) = d["channel_id"].as_str() else { continue };
                         let ringing = d["ringing"]
                             .as_array()
