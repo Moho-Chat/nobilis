@@ -42,6 +42,7 @@
 //! say `backend::matrix::send_message` without knowing which file that is,
 //! and each opens with `use super::*` to share the imports below.
 
+pub mod account;
 pub mod auth;
 pub mod directory;
 pub mod directs;
