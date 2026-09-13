@@ -1163,7 +1163,23 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // away without waiting for a fresh subscription.
                         update_presence_in_rosters(state, user_id, status);
                     }
-                    _ => {}
+                    // Everything this client does not act on.
+                    //
+                    // Named rather than dropped in silence. A dispatch nobody
+                    // handles is how a feature that has not been written
+                    // announces itself - and when a thing that should work
+                    // does not, the first question is always whether Discord
+                    // said anything at all. At debug for the ordinary flood;
+                    // the families that carry calls and streams are worth
+                    // saying at info, because those are the ones somebody is
+                    // usually watching for.
+                    other => {
+                        if other.starts_with("STREAM_") || other.starts_with("CALL_") || other.starts_with("VOICE_") {
+                            tracing::info!("discord[{account_id}]: {other} (not handled here) {}", brief(d));
+                        } else {
+                            tracing::debug!("discord[{account_id}]: {other} (not handled here)");
+                        }
+                    }
                 }
             }
             7 => bail!("gateway requested a reconnect"),
@@ -1186,3 +1202,63 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
         }
     }
 }
+
+/// A dispatch's payload, short enough to log and with its secrets out.
+///
+/// Whole would be unreadable and occasionally dangerous - a voice or stream
+/// server update carries a token that opens a connection, which is as much of
+/// a secret as a password and must never reach a log. Truncated as well,
+/// because a GUILD_CREATE is a megabyte and nobody reading a log wants it.
+fn brief(d: &Value) -> String {
+    let mut copy = d.clone();
+    if let Some(object) = copy.as_object_mut() {
+        for secret in ["token", "access_token", "secret_key"] {
+            if object.contains_key(secret) {
+                object.insert(secret.to_string(), Value::from("<redacted>"));
+            }
+        }
+    }
+    let text = copy.to_string();
+    match text.char_indices().nth(600) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod brief_tests {
+    use super::brief;
+    use serde_json::json;
+
+    /// A voice or stream server update carries the token that opens the
+    /// connection. A log is the one place it must never be.
+    #[test]
+    fn a_logged_payload_has_no_credentials_in_it() {
+        let line = brief(&json!({ "endpoint": "eu.discord.media", "token": "a-real-secret", "secret_key": [1, 2, 3] }));
+        assert!(!line.contains("a-real-secret"), "{line}");
+        assert!(!line.contains("[1,2,3]"), "{line}");
+        assert!(line.contains("eu.discord.media"), "{line}");
+    }
+
+    /// A GUILD_CREATE is a megabyte and nobody reading a log wants it - but
+    /// the cut has to land on a character boundary, or a payload with an
+    /// emoji in it panics the thread that was only trying to log.
+    #[test]
+    fn a_long_payload_is_cut_without_splitting_a_character() {
+        let long = brief(&json!({ "name": "x".repeat(2000) }));
+        assert!(long.len() < 700, "{}", long.len());
+        assert!(long.ends_with('…'));
+
+        // Counted in characters rather than bytes, so this needs more than
+        // six hundred of them - 400 emoji is 1600 bytes and well under the
+        // limit, which is the point of counting characters for a log.
+        let emoji = brief(&json!({ "name": "\u{1F600}".repeat(900) }));
+        assert!(emoji.ends_with('…'), "{}", &emoji[emoji.len().saturating_sub(20)..]);
+        assert!(emoji.is_char_boundary(emoji.len() - '…'.len_utf8()));
+
+        // Short enough to say whole is said whole.
+        let short = brief(&json!({ "a": 1 }));
+        assert_eq!(short, "{\"a\":1}");
+    }
+}
+
