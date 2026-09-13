@@ -44,6 +44,7 @@
 
 pub mod auth;
 pub mod directory;
+pub mod directs;
 pub mod history;
 pub mod media;
 pub mod notifications;

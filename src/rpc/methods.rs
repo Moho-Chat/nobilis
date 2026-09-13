@@ -4048,7 +4048,7 @@ pub async fn dispatch(
                 _ => return (None, Some(format!("{method} requires \"accountId\" and \"roomId\""))),
             };
             let result = if method == "acceptMatrixInvite" {
-                backend::matrix::join_room(state, account_id, room_id, &[]).await
+                backend::matrix::accept_invite(state, account_id, room_id).await
             } else {
                 backend::matrix::leave_room(state, account_id, room_id).await
             };

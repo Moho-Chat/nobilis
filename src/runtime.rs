@@ -697,6 +697,15 @@ pub struct Runtime {
     /// what arrives is one of them changing, and it is removed by its content
     /// being emptied rather than by anything saying it went away.
     matrix_widgets: Mutex<HashMap<(String, String), std::collections::BTreeMap<String, serde_json::Value>>>,
+    /// (account, room) -> the person a room is a direct message with, per the
+    /// account's own `m.direct` list.
+    ///
+    /// The list is the only answer that travels between clients, and it is
+    /// what decides whether a room is a DM - not anything visible in the room
+    /// itself. Held inverted (by room) because every question asked of it is
+    /// "is this room a DM"; the account data is keyed by person, since one
+    /// person can have several rooms with you.
+    matrix_directs: Mutex<HashMap<(String, String), String>>,
     /// Matrix-specific: (account id, room id) -> {user id -> display name}
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
@@ -1025,6 +1034,7 @@ impl Runtime {
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
             matrix_widgets: Mutex::new(HashMap::new()),
+            matrix_directs: Mutex::new(HashMap::new()),
             matrix_verification_peers: Mutex::new(HashMap::new()),
             matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
@@ -1354,6 +1364,26 @@ impl Runtime {
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
         buffer
+    }
+
+    /// Changes what a buffer already on screen is.
+    ///
+    /// Rare on purpose: a buffer's kind is decided when it is created and is
+    /// not something that drifts. The one case that needs it is a room the
+    /// account newly calls a direct message - `m.direct` can be written from
+    /// another client at any time, and a conversation that was an ordinary
+    /// room a moment ago belongs with the conversations from now on.
+    pub fn set_buffer_kind(&self, state: &AppState, buffer_id: &str, kind: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.kind == kind {
+                return;
+            }
+            buffer.kind = kind.to_string();
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn set_conn_state(&self, state: &AppState, account_id: &str, conn: ConnState, error: Option<&str>) {
@@ -2678,6 +2708,35 @@ impl Runtime {
     /// What a room is carrying, in a stable order - a list that reshuffles
     /// itself every time a room's state is re-read is a list nobody can point
     /// at.
+    /// Replaces this account's whole `m.direct` list.
+    ///
+    /// Whole rather than merged, because that is how the event itself
+    /// arrives: a room removed from the list in another client is removed by
+    /// its absence, and merging would make un-DMing a room impossible here.
+    pub fn set_matrix_directs(&self, account_id: &str, pairs: Vec<(String, String)>) {
+        let mut held = self.matrix_directs.lock().unwrap();
+        held.retain(|(account, _), _| account != account_id);
+        for (room_id, user_id) in pairs {
+            held.insert((account_id.to_string(), room_id), user_id);
+        }
+    }
+
+    /// Who a room is a direct message with, if the account says it is one.
+    pub fn matrix_direct_peer(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_directs.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+    }
+
+    /// Every room this account calls a direct message.
+    pub fn matrix_direct_rooms(&self, account_id: &str) -> Vec<String> {
+        self.matrix_directs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(account, _)| account == account_id)
+            .map(|(_, room)| room.clone())
+            .collect()
+    }
+
     pub fn matrix_widgets(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
         self.matrix_widgets
             .lock()
@@ -4585,6 +4644,7 @@ impl Runtime {
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
             matrix_own_reactions, irc_splits, matrix_widgets,
+            matrix_directs,
         );
     }
 }

@@ -16,17 +16,25 @@ pub struct RoomInfo {
     pub kind: String,
 }
 
-/// Priority: `m.room.name` -> `m.room.canonical_alias` -> (exactly 2
-/// joined members: the other member's display name, kind "dm") -> the raw
-/// room id, kind "channel". `events` should be the union of this sync
-/// response's `state.events` and any state-key-bearing `timeline.events`
-/// for the room (Matrix inlines recent state changes into the timeline
-/// rather than always the separate state array) - see mod.rs's call site.
-pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value]) -> RoomInfo {
+/// Priority: `m.room.name` -> `m.room.canonical_alias` -> (the person the
+/// account's `m.direct` list says this room is with, or failing that exactly
+/// 2 joined members: their display name, kind "dm") -> the raw room id, kind
+/// "channel". `events` should be the union of this sync response's
+/// `state.events` and any state-key-bearing `timeline.events` for the room
+/// (Matrix inlines recent state changes into the timeline rather than always
+/// the separate state array) - see mod.rs's call site.
+///
+/// `direct_peer` is the account's own answer, from `m.direct` (see the
+/// `directs` module), and it outranks the member count entirely: a DM can
+/// have three people in it and a two-person room need not be one. The count
+/// stays as the fallback for an account whose list has not been read yet, or
+/// one that has never had a DM written to it by any client.
+pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], direct_peer: Option<&str>) -> RoomInfo {
     let mut room_name: Option<String> = None;
     let mut canonical_alias: Option<String> = None;
     let mut joined_count = 0usize;
     let mut other_member_name: Option<String> = None;
+    let mut peer_name: Option<String> = None;
 
     for event in events {
         match event["type"].as_str().unwrap_or("") {
@@ -43,6 +51,16 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value]) -> 
                 }
             }
             "m.room.member" => {
+                // What to call the person this room is *with*, at any
+                // membership: a DM opened from here is named after somebody
+                // who has only been invited, and waiting for them to join
+                // would leave the conversation labelled with a room id until
+                // they did.
+                if direct_peer.is_some() && event["state_key"].as_str() == direct_peer {
+                    if let Some(display) = event["content"]["displayname"].as_str().filter(|s| !s.is_empty()) {
+                        peer_name = Some(display.to_string());
+                    }
+                }
                 if event["content"]["membership"].as_str() == Some("join") {
                     joined_count += 1;
                     let sender = event["sender"].as_str().unwrap_or("");
@@ -56,15 +74,34 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value]) -> 
         }
     }
 
-    if let Some(name) = room_name.or(canonical_alias) {
-        return RoomInfo { name, kind: "channel".to_string() };
-    }
-    if joined_count == 2 {
-        if let Some(name) = other_member_name {
-            return RoomInfo { name, kind: "dm".to_string() };
-        }
-    }
-    RoomInfo { name: room_id.to_string(), kind: "channel".to_string() }
+    // A DM is a DM whatever it is called. Element shows a named DM under its
+    // name and still files it with the conversations, and the kind is what
+    // decides where it goes in the rail - so the name and the kind are
+    // decided separately rather than one falling out of the other.
+    let kind = if direct_peer.is_some() || (room_name.is_none() && canonical_alias.is_none() && joined_count == 2 && other_member_name.is_some()) {
+        "dm"
+    } else {
+        "channel"
+    };
+
+    let name = room_name
+        .or(canonical_alias)
+        .or_else(|| {
+            // Only a DM is named after a person. An unnamed room with several
+            // people in it is not named after whichever of them the state
+            // happened to mention last.
+            if kind != "dm" {
+                return None;
+            }
+            peer_name
+                // The mxid itself is a worse name than a display name and a
+                // far better one than a room id.
+                .or_else(|| direct_peer.map(str::to_string))
+                .or(other_member_name)
+        })
+        .unwrap_or_else(|| room_id.to_string());
+
+    RoomInfo { name, kind: kind.to_string() }
 }
 
 pub fn is_encrypted(events: &[&Value]) -> bool {
@@ -180,7 +217,7 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
 
 #[cfg(test)]
 mod space_tests {
-    use super::{invite_summary, is_space, room_avatar_mxc, space_children};
+    use super::{derive_room_info, invite_summary, is_space, room_avatar_mxc, space_children};
     use serde_json::{json, Value};
 
     fn refs(events: &[Value]) -> Vec<&Value> {
@@ -227,6 +264,94 @@ mod space_tests {
         let got = invite_summary("!dm:poa.st", "@me:poa.st", &refs(&events));
         assert_eq!(got["isDirect"], true);
         assert_eq!(got["inviter"], "@friend:poa.st");
+    }
+
+    fn member(mxid: &str, name: &str, membership: &str) -> Value {
+        json!({ "type": "m.room.member", "state_key": mxid, "sender": mxid,
+                "content": { "membership": membership, "displayname": name } })
+    }
+
+    /// The account's own m.direct list decides, and it outranks the member
+    /// count in both directions: a DM can have three people in it, and an
+    /// ordinary two-person room is not a conversation just because it is
+    /// small.
+    #[test]
+    fn the_account_says_which_rooms_are_direct_messages() {
+        let two = vec![member("@me:poa.st", "me", "join"), member("@anna:poa.st", "Anna", "join")];
+
+        // Listed: a DM, named after the person, whatever else is in it.
+        let listed = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&two), Some("@anna:poa.st"));
+        assert_eq!(listed.kind, "dm");
+        assert_eq!(listed.name, "Anna");
+
+        // A third person in a room the account still calls a DM - which is
+        // ordinary, and which the old two-member count got wrong.
+        let three = vec![
+            member("@me:poa.st", "me", "join"),
+            member("@anna:poa.st", "Anna", "join"),
+            member("@bob:poa.st", "Bob", "join"),
+        ];
+        let crowded = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&three), Some("@anna:poa.st"));
+        assert_eq!(crowded.kind, "dm");
+        assert_eq!(crowded.name, "Anna");
+
+        // Not listed, and no name: the old heuristic still answers, because
+        // an account whose list has never been written has no other answer.
+        let guessed = derive_room_info("!x:poa.st", "@me:poa.st", &refs(&two), None);
+        assert_eq!(guessed.kind, "dm");
+        assert_eq!(guessed.name, "Anna");
+    }
+
+    /// A DM with a name is shown under its name and still filed with the
+    /// conversations - the two decisions are separate, which is what Element
+    /// does.
+    #[test]
+    fn a_named_direct_message_keeps_its_name_and_its_kind() {
+        let events = vec![
+            json!({ "type": "m.room.name", "content": { "name": "Holiday plans" } }),
+            member("@me:poa.st", "me", "join"),
+            member("@anna:poa.st", "Anna", "join"),
+        ];
+        let got = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&events), Some("@anna:poa.st"));
+        assert_eq!(got.name, "Holiday plans");
+        assert_eq!(got.kind, "dm");
+
+        // And the same room with nobody claiming it as a DM is an ordinary
+        // room, as it always was.
+        let plain = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&events), None);
+        assert_eq!(plain.kind, "channel");
+    }
+
+    /// A conversation opened from here is named after somebody who has only
+    /// been invited. Waiting for them to join would leave it labelled with a
+    /// room id until they did - which on an unanswered invitation is for ever.
+    #[test]
+    fn a_direct_message_is_named_before_the_other_person_arrives() {
+        let events = vec![member("@me:poa.st", "me", "join"), member("@anna:poa.st", "Anna", "invite")];
+        let got = derive_room_info("!new:poa.st", "@me:poa.st", &refs(&events), Some("@anna:poa.st"));
+        assert_eq!(got.kind, "dm");
+        assert_eq!(got.name, "Anna");
+
+        // With no display name anywhere, the mxid - a worse name than a
+        // display name and a far better one than a room id.
+        let nameless = vec![json!({ "type": "m.room.member", "state_key": "@anna:poa.st", "content": { "membership": "invite" } })];
+        let got = derive_room_info("!new:poa.st", "@me:poa.st", &refs(&nameless), Some("@anna:poa.st"));
+        assert_eq!(got.name, "@anna:poa.st");
+    }
+
+    /// An unnamed room with several people in it keeps its id rather than
+    /// taking the name of whichever member the state happened to mention
+    /// last - which would be arbitrary and would change between syncs.
+    #[test]
+    fn an_unnamed_group_room_is_not_named_after_somebody() {
+        let three = vec![
+            member("@me:poa.st", "me", "join"),
+            member("@anna:poa.st", "Anna", "join"),
+            member("@bob:poa.st", "Bob", "join"),
+        ];
+        let got = derive_room_info("!x:poa.st", "@me:poa.st", &refs(&three), None);
+        assert_eq!(got.kind, "channel");
+        assert_eq!(got.name, "!x:poa.st");
     }
 
     #[test]
