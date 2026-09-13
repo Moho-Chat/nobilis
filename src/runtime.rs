@@ -3925,6 +3925,39 @@ impl Runtime {
         }
     }
 
+    /// One Matrix reaction, counted by its own event id so that seeing it
+    /// again does nothing.
+    ///
+    /// Separate from `update_reaction` below rather than folded into it,
+    /// because the two services identify a reaction differently and only
+    /// Matrix can be counted this way: a Matrix reaction *is* an event with an
+    /// id, while Discord sends per-user add/remove notifications carrying no
+    /// id of their own and re-syncs the true counts from message snapshots.
+    pub fn matrix_reaction(&self, state: &AppState, event_id: &str, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool) {
+        match state.store.matrix_reaction_add(event_id, buffer_id, msg_id, emoji, is_me) {
+            Ok(Some(reactions)) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions })),
+            // Already counted - a replayed timeline, which is not news.
+            Ok(None) => {}
+            Err(e) => tracing::warn!("failed to record matrix reaction: {e}"),
+        }
+    }
+
+    /// A redacted Matrix reaction. `true` if it really was one, so the caller
+    /// can fall back to treating the redaction as a message deletion.
+    pub fn matrix_reaction_redacted(&self, state: &AppState, event_id: &str) -> bool {
+        match state.store.matrix_reaction_remove(event_id) {
+            Ok(Some((buffer_id, msg_id, reactions))) => {
+                state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions }));
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!("failed to remove matrix reaction: {e}");
+                false
+            }
+        }
+    }
+
     /// One reaction add/remove (Discord's REACTION_ADD/REMOVE are
     /// per-user-per-emoji events, not full snapshots) - broadcasts the
     /// message's updated full reaction list once applied.
