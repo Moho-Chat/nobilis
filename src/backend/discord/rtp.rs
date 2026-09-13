@@ -72,6 +72,19 @@ pub fn timestamp_from_micros(micros: i64) -> u32 {
     ((micros.max(0) as u128 * VIDEO_CLOCK_HZ as u128) / 1_000_000) as u32
 }
 
+/// How many packets a frame will take.
+///
+/// Answered without building them, because a sender has to reserve its
+/// sequence numbers before it takes the first one - two frames handed in at
+/// once would otherwise interleave, which the far end reads as loss and
+/// answers by asking for a keyframe over and over.
+pub fn packet_count_vp8(frame: &[u8]) -> usize {
+    if frame.is_empty() {
+        return 0;
+    }
+    frame.len().div_ceil(MAX_PAYLOAD - 1)
+}
+
 /// Splits one encoded VP8 frame across as many packets as it needs.
 ///
 /// The VP8 payload descriptor is one byte here, which is the smallest form the
@@ -206,6 +219,22 @@ mod tests {
 
         let one_more = vec![0u8; MAX_PAYLOAD];
         assert_eq!(packetise_vp8(&one_more, 1, 0, 0).len(), 2);
+    }
+
+    /// The count has to agree with what packetising actually produces, or a
+    /// sender reserves the wrong range and every frame after the first is
+    /// numbered over the top of the one before.
+    #[test]
+    fn the_count_agrees_with_the_packets() {
+        for len in [1, 100, MAX_PAYLOAD - 2, MAX_PAYLOAD - 1, MAX_PAYLOAD, MAX_PAYLOAD * 3 + 7, 10_000] {
+            let frame = vec![7u8; len];
+            assert_eq!(
+                packet_count_vp8(&frame),
+                packetise_vp8(&frame, 1, 0, 0).len(),
+                "disagreed for a {len}-byte frame"
+            );
+        }
+        assert_eq!(packet_count_vp8(&[]), 0);
     }
 
     #[test]

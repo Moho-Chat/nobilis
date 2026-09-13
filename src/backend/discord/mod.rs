@@ -61,6 +61,7 @@ pub mod people;
 pub mod polls;
 pub mod presence;
 pub mod rtp;
+pub mod streamconn;
 pub mod voicecrypto;
 pub mod search;
 pub mod send;
