@@ -559,6 +559,12 @@ pub async fn send_message(
     let is_encrypted = state.runtime.is_matrix_room_encrypted(buffer_id);
 
     let mut plain_content = if let Some(path) = attachment_path {
+        // Before the upload rather than after it. A server states its limit
+        // in /config, and finding out a video is too big by watching it
+        // upload for two minutes and then fail is what this replaces - the
+        // failure was the same either way, but it arrived after the wait and
+        // in the server's words rather than in a sentence.
+        media::check_upload_size(state, account_id, path).await?;
         if is_encrypted {
             upload_encrypted_media_message(base, access_token, path, body).await?
         } else {

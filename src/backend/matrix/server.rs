@@ -1,9 +1,10 @@
 //! What a homeserver says it can do, before being asked to do it.
 //!
-//! Two endpoints nothing here was calling. `/versions` says which spec
+//! Three endpoints nothing here was calling. `/versions` says which spec
 //! versions and unstable features a server speaks; `/capabilities` says what
 //! it will let this account change - the password, the display name, the
-//! avatar - and which room versions it will create.
+//! avatar - and which room versions it will create; the media `/config` says
+//! how large a file it will accept.
 //!
 //! Without them everything was discovered by failing, and failing in the
 //! confusing direction. A homeserver that will not let you change your
@@ -36,6 +37,15 @@ pub struct ServerFacts {
     pub can_change_displayname: bool,
     /// Whether this account may change its own avatar.
     pub can_change_avatar: bool,
+    /// The largest file this server will accept, in bytes.
+    ///
+    /// `None` means it declined to say, which the spec explicitly allows and
+    /// which means "no limit this client knows of" rather than "no limit" -
+    /// so nothing is refused on the strength of it. A server that does say
+    /// turns a failed upload into a sentence before the upload starts, which
+    /// is the whole point: finding out that a video is too big by watching it
+    /// upload for two minutes and then fail is the behaviour this replaces.
+    pub max_upload_size: Option<u64>,
 }
 
 impl ServerFacts {
@@ -51,6 +61,15 @@ impl ServerFacts {
         };
         let Some(wanted) = parse(wanted) else { return false };
         self.versions.iter().filter_map(|v| parse(v)).any(|have| have >= wanted)
+    }
+
+    /// Whether a file of this size can be uploaded at all.
+    ///
+    /// True when the server declined to say, deliberately: a client that
+    /// refused everything because it could not read a limit would be worse
+    /// than one that never asked.
+    pub fn accepts_upload(&self, bytes: u64) -> bool {
+        self.max_upload_size.is_none_or(|limit| bytes <= limit)
     }
 
     /// Whether it has this unstable feature switched on.
@@ -102,6 +121,14 @@ pub async fn read_facts(homeserver_url: &str, access_token: &str) -> ServerFacts
         }
     }
 
+    // The media repository's own limits, which live under /media rather than
+    // with the rest. v1 is the authenticated-media spelling; every server new
+    // enough to require a token for downloads has it, and one that answers
+    // nothing here is simply a server that does not say.
+    if let Ok(answer) = http::get_json(&format!("{base}/_matrix/client/v1/media/config"), access_token).await {
+        facts.max_upload_size = answer["m.upload.size"].as_u64();
+    }
+
     facts
 }
 
@@ -141,5 +168,19 @@ mod tests {
         // Anything unparseable is not a version rather than a panic.
         assert!(!facts(&["nonsense", "v1.1"]).speaks("v1.2"));
         assert!(!facts(&["v1.1"]).speaks("nonsense"));
+    }
+
+    /// A limit the server declined to state is not a limit of zero. The
+    /// spec allows silence here, and a client that refused every upload
+    /// because it could not read a number would be worse than one that never
+    /// asked.
+    #[test]
+    fn an_unstated_upload_limit_refuses_nothing() {
+        let silent = ServerFacts::default();
+        assert!(silent.accepts_upload(4 * 1024 * 1024 * 1024));
+
+        let capped = ServerFacts { max_upload_size: Some(50 * 1024 * 1024), ..ServerFacts::default() };
+        assert!(capped.accepts_upload(50 * 1024 * 1024));
+        assert!(!capped.accepts_upload(50 * 1024 * 1024 + 1));
     }
 }

@@ -54,8 +54,84 @@ pub(super) async fn thumbnail_for(content: &Value, homeserver_url: &str, access_
     if let Some(file) = info.get("thumbnail_file").filter(|v| v.is_object()) {
         return cached_encrypted_media_path(homeserver_url, access_token, file, "").await;
     }
-    let mxc = info["thumbnail_url"].as_str()?;
-    cached_media_path(homeserver_url, access_token, mxc, "").await
+    if let Some(mxc) = info["thumbnail_url"].as_str() {
+        return cached_media_path(homeserver_url, access_token, mxc, "").await;
+    }
+
+    // Nothing the sender made, so ask the server to make one. Only for a
+    // picture big enough that it is worth a second request: a small image
+    // fetched whole is one round trip, and the same image fetched as a
+    // thumbnail and then whole is two.
+    //
+    // Not for an encrypted room - and the `file` branch above has already
+    // taken those. The server holds ciphertext there and cannot resize what
+    // it cannot read, which is why a client-made thumbnail is the only kind
+    // an encrypted room ever has.
+    if content["msgtype"].as_str() != Some("m.image") || !worth_thumbnailing(info) {
+        return None;
+    }
+    let mxc = content["url"].as_str()?;
+    cached_thumbnail_path(homeserver_url, access_token, mxc).await
+}
+
+/// Whether asking the server to shrink this is worth the request.
+///
+/// A picture already small enough to draw is fetched once either way, and
+/// asking for a thumbnail of it costs a round trip to save nothing. The size
+/// is the honest measure where the sender gave one; the dimensions are the
+/// fallback, since a large photograph compresses well and a small one badly.
+fn worth_thumbnailing(info: &Value) -> bool {
+    const WORTH_IT: u64 = 512 * 1024;
+    if let Some(size) = info["size"].as_u64() {
+        return size > WORTH_IT;
+    }
+    let (w, h) = (info["w"].as_u64().unwrap_or(0), info["h"].as_u64().unwrap_or(0));
+    w > THUMBNAIL_W || h > THUMBNAIL_H
+}
+
+/// How big a thumbnail to ask for.
+///
+/// Generous for a timeline picture and far short of a modern camera's output
+/// - a phone photograph is several thousand pixels across and a few
+/// megabytes, and this is tens of kilobytes. `scale` rather than `crop`
+/// because the picture in a timeline is the whole picture: cropping would
+/// quietly cut the sides off somebody's screenshot.
+const THUMBNAIL_W: u64 = 800;
+const THUMBNAIL_H: u64 = 600;
+
+/// Fetches a server-made thumbnail, cached beside the originals.
+///
+/// Its own name in the cache rather than the original's, because they are
+/// different files: a thumbnail written under the original's name would be
+/// handed out later to anything that asked for the full-size picture.
+async fn cached_thumbnail_path(homeserver_url: &str, access_token: &str, mxc_uri: &str) -> Option<String> {
+    let rest = mxc_uri.strip_prefix("mxc://")?;
+    let (server_name, media_id) = rest.split_once('/')?;
+    let dir = media_cache_dir();
+    let path = dir.join(format!("{server_name}_{media_id}_thumb{THUMBNAIL_W}x{THUMBNAIL_H}"));
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return Some(format!("file://{}", path.display()));
+    }
+
+    let url = format!(
+        "{}/_matrix/client/v1/media/thumbnail/{}/{}?width={THUMBNAIL_W}&height={THUMBNAIL_H}&method=scale",
+        homeserver_url.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(server_name.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(media_id.as_bytes()).collect::<String>(),
+    );
+    let fetch = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&url, access_token)).await;
+    // Quiet on every failure. A server that will not thumbnail - an old one,
+    // one that cannot read the format, one that has the original on cold
+    // storage - is not a problem to report: the full-size picture is fetched
+    // anyway and the reader sees the same image.
+    let Ok(Ok((status, bytes))) = fetch else { return None };
+    if !(200..300).contains(&status) || bytes.is_empty() {
+        return None;
+    }
+    if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &bytes).await.is_err() {
+        return None;
+    }
+    Some(format!("file://{}", path.display()))
 }
 
 /// Matrix's own mxc:// media ids carry no file extension - unlike
@@ -370,6 +446,49 @@ pub(super) fn file_extension(path: &str) -> (String, String) {
 }
 
 /// upload_encrypted_media_message for the E2EE counterpart.
+/// Refuses a file the server has already said it will not take.
+///
+/// Asked of what the server published at connect rather than of the server
+/// now: the limit is a property of the deployment, and one round trip per
+/// attachment to re-read a number that does not change would be a round trip
+/// spent to say nothing.
+///
+/// A server that declined to state a limit refuses nothing here - the spec
+/// allows silence, and a client that blocked every upload because it could
+/// not read a number would be worse than one that never asked.
+pub(super) async fn check_upload_size(state: &AppState, account_id: &str, path: &str) -> Result<()> {
+    let Some(facts) = state.runtime.matrix_server_facts(account_id) else { return Ok(()) };
+    let Ok(meta) = tokio::fs::metadata(path).await else { return Ok(()) };
+    if facts.accepts_upload(meta.len()) {
+        return Ok(());
+    }
+    let limit = facts.max_upload_size.unwrap_or(0);
+    anyhow::bail!(
+        "That file is {} and this server accepts at most {}",
+        human_size(meta.len()),
+        human_size(limit)
+    )
+}
+
+/// A byte count as somebody would say it.
+///
+/// Powers of 1024 with the shorter names, which is what a file manager shows
+/// and therefore what the number somebody is comparing against looks like.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["bytes", "KB", "MB", "GB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} bytes")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
 pub(super) async fn upload_media_message(base: &str, access_token: &str, path: &str, body: &str) -> Result<Value> {
     let bytes = tokio::fs::read(path).await.context("reading attachment")?;
     let (filename, ext) = file_extension(path);
@@ -456,6 +575,39 @@ pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, conten
 #[cfg(test)]
 mod attachment_tests {
     use super::*;
+
+    /// A picture already small enough to draw is fetched once either way, so
+    /// asking the server to shrink it costs a round trip to save nothing.
+    #[test]
+    fn only_a_big_picture_is_worth_a_second_request() {
+        let big = serde_json::json!({ "size": 4 * 1024 * 1024, "w": 4000, "h": 3000 });
+        assert!(worth_thumbnailing(&big));
+
+        let small = serde_json::json!({ "size": 20 * 1024, "w": 200, "h": 120 });
+        assert!(!worth_thumbnailing(&small));
+
+        // The size is believed where the sender gave one, even when the
+        // dimensions are large: a big photograph that compressed well is
+        // still one fetch.
+        let compressed = serde_json::json!({ "size": 60 * 1024, "w": 4000, "h": 3000 });
+        assert!(!worth_thumbnailing(&compressed));
+
+        // With no size at all, the dimensions are the only measure there is.
+        assert!(worth_thumbnailing(&serde_json::json!({ "w": 4000, "h": 3000 })));
+        assert!(!worth_thumbnailing(&serde_json::json!({ "w": 100, "h": 100 })));
+        // And a sender who said nothing gets the old behaviour: one fetch.
+        assert!(!worth_thumbnailing(&serde_json::json!({})));
+    }
+
+    /// The number somebody is comparing against is the one their file
+    /// manager shows, so it is written the way a file manager writes it.
+    #[test]
+    fn a_size_is_written_the_way_a_person_reads_one() {
+        assert_eq!(human_size(512), "512 bytes");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(50 * 1024 * 1024), "50.0 MB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
 
     #[test]
     fn carries_the_matrix_info_block_onto_the_attachment() {
