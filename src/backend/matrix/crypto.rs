@@ -80,6 +80,29 @@ fn sanitize_account_id(account_id: &str) -> String {
     account_id.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
 }
 
+/// Deletes an account's crypto store.
+///
+/// Device keys, Olm sessions, the account's own identity - everything that
+/// makes this installation *that device*. Removing the account and leaving
+/// this behind means adding the same account again silently adopts a device
+/// that the homeserver may have forgotten, with sessions to people whose keys
+/// have moved on; what that looks like from the outside is a room that will
+/// not decrypt and a device list with a stranger in it.
+///
+/// Best-effort by design. A store that cannot be removed is worth a line in
+/// the log, not a refusal to remove the account - the account is going either
+/// way, and refusing would leave the caller with half a removal.
+pub fn forget(data_dir: &Path, account_id: &str) {
+    let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
+    if !dir.exists() {
+        return;
+    }
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => tracing::info!("matrix crypto: removed the store at {}", dir.display()),
+        Err(e) => tracing::warn!("matrix crypto: could not remove {}: {e}", dir.display()),
+    }
+}
+
 impl CryptoSession {
     /// Opens (or creates) this account's own crypto store directory under
     /// `<data_dir>/matrix-crypto/<sanitized account id>/` - mirrors the
@@ -865,4 +888,60 @@ pub async fn decrypt_room_event(session: &CryptoSession, event: &Value, room_id:
     let decrypted = session.machine.decrypt_room_event(&raw, room_id, &decryption_settings()).await.context("decrypt_room_event")?;
     let value: Value = serde_json::from_str(decrypted.event.json().get()).context("parsing decrypted event JSON")?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::{forget, sanitize_account_id};
+
+    /// The name on disk, checked against the names actually there.
+    ///
+    /// `forget` deletes a directory computed from the account id, so the
+    /// computation has to agree with the one that created it - and the two
+    /// live in the same function, which is exactly the kind of agreement that
+    /// looks proven and is not. These are the two directories in this
+    /// installation's own store, read off the filesystem.
+    #[test]
+    fn the_directory_is_the_one_that_is_really_there() {
+        assert_eq!(
+            sanitize_account_id("matrix:@salastil:matrix.salastil.com"),
+            "matrix__salastil_matrix.salastil.com"
+        );
+        assert_eq!(sanitize_account_id("matrix:@salastil:poa.st"), "matrix__salastil_poa.st");
+    }
+
+    /// The store is what makes this installation *that device*. The report
+    /// that prompted this: an account removed and added again picked up its
+    /// old device keys and Olm sessions, and rooms would not decrypt.
+    #[test]
+    fn removing_an_account_takes_its_crypto_store() {
+        let data_dir = std::env::temp_dir().join(format!("nobilis-forget-{}", std::process::id()));
+        let account = "matrix:@salastil:matrix.salastil.com";
+        let neighbour = "matrix:@salastil:poa.st";
+
+        for id in [account, neighbour] {
+            let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(id));
+            std::fs::create_dir_all(&dir).unwrap();
+            // What an actual store looks like from outside: a database and
+            // the files SQLite keeps beside it.
+            for file in ["matrix-sdk-crypto.sqlite3", "matrix-sdk-crypto.sqlite3-wal"] {
+                std::fs::write(dir.join(file), b"not really a database").unwrap();
+            }
+        }
+
+        forget(&data_dir, account);
+
+        assert!(
+            !data_dir.join("matrix-crypto").join(sanitize_account_id(account)).exists(),
+            "the store outlived the account"
+        );
+        assert!(
+            data_dir.join("matrix-crypto").join(sanitize_account_id(neighbour)).exists(),
+            "the other account on the same machine lost its keys"
+        );
+        // Twice is not an error: removal has to be something that can be
+        // repeated after a half-finished one.
+        forget(&data_dir, account);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
 }

@@ -534,6 +534,31 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                // And everything else this process is holding about it: the
+                // seventy-odd maps keyed by the account or by one of its
+                // buffers. In memory only, so it mattered exactly when
+                // somebody removed an account and added it again without
+                // restarting - which is what removing it was usually an
+                // attempt to fix.
+                state.runtime.forget_account(id);
+                // The scrollback, which is the largest thing left behind: ten
+                // thousand messages for one account here. Left in place they
+                // reappear under an account added with the same id, as the
+                // old conversation rather than the new one.
+                match state.store.forget_account(id) {
+                    Ok(0) => {}
+                    Ok(rows) => tracing::info!("removed {rows} stored row(s) for {id}"),
+                    Err(e) => tracing::warn!("could not clear the scrollback for {id}: {e}"),
+                }
+                // The Matrix crypto store: device keys and Olm sessions, which
+                // are what make this installation *that device*. Adding the
+                // account again with these still here adopts a device the
+                // homeserver may have forgotten, holding sessions with people
+                // whose keys have moved on - which looks like a room that will
+                // not decrypt.
+                if id.starts_with("matrix:") {
+                    backend::matrix::crypto::forget(&crate::default_data_dir(), id);
+                }
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),

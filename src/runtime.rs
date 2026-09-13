@@ -4480,3 +4480,110 @@ mod rename_tests {
         assert_eq!(rename_own_mentions("hi Sal", "sal", "Sal"), "hi Sal");
     }
 }
+
+/// Whether a key belongs to an account being forgotten.
+///
+/// One rule for every map in this struct, which is what makes forgetting an
+/// account tractable at all: a key is either the account id itself, or a
+/// buffer id, and a buffer id is `<account id>|<whatever the service calls
+/// it>`. Anything else - a guild id, an event id, a room id - cannot match
+/// either shape, so a map keyed by one of those is left alone by the same
+/// test rather than needing to be identified and skipped.
+fn belongs_to(account_id: &str, key: &str) -> bool {
+    key == account_id || (key.len() > account_id.len() && key.starts_with(account_id) && key.as_bytes()[account_id.len()] == b'|')
+}
+
+impl Runtime {
+    /// Forgets everything this process is holding about an account.
+    ///
+    /// Removing an account used to clear its buffers, its groups, its
+    /// highlights and its ignores, and leave the rest of this struct alone -
+    /// seventy-odd maps, some keyed by account and most by buffer. Nothing
+    /// there is written to disk, so it survived only until the daemon
+    /// restarted; what it did do was follow an account that was removed and
+    /// added again in the same session, which is exactly when somebody is
+    /// most likely to be trying to fix something.
+    ///
+    /// Swept rather than enumerated, on the rule in `belongs_to` above, so a
+    /// map added later is covered by this the day it is added rather than the
+    /// day somebody remembers to add it here.
+    pub fn forget_account(&self, account_id: &str) {
+        macro_rules! sweep {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key, _| !belongs_to(account_id, key)); )*
+            };
+        }
+        macro_rules! sweep_pairs {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key, _| !belongs_to(account_id, &key.0)); )*
+            };
+        }
+
+        sweep!(
+            conn_states, irc_handles, buffers,
+            buffer_groups, task_handles, last_connect_attempt,
+            connect_generation, matrix_invites, discord_resync,
+            discord_own_roles, discord_guild_roles, discord_guild_owners,
+            discord_member_windows, presence, own_identity,
+            discord_channels, discord_gateway_sessions, ringing_calls,
+            discord_guild_id, discord_buffer_emojis, emoji_catalogue,
+            kick_watching, matrix_emoticons, discord_friends,
+            sneedchat_senders, kick_senders, kick_channels,
+            kick_streams, kick_stream_fetched, live_cards,
+            irc_channel_lists, irc_caps, irc_metadata,
+            discord_last_interaction, matrix_room_creators, matrix_room_versions,
+            matrix_call_members, matrix_stickers, matrix_rooms,
+            account_status, discord_voice_self, irc_transports,
+            discord_gateway_senders, matrix_machines, matrix_reaction_targets,
+            matrix_verifications, matrix_ignored, matrix_verification_peers,
+            matrix_push_rules, irc_away, kick_pins,
+            matrix_server_facts, irc_isupport, sneedchat_rooms,
+        );
+        // Keyed by (account, something) or (buffer, something): the first
+        // element carries the account either way.
+        sweep_pairs!(
+            discord_members, matrix_back_tokens, matrix_polls,
+            matrix_poll_votes, matrix_room_names, matrix_space_parents,
+            discord_member_list_targets, discord_voice_channels, discord_voice_states,
+            discord_voice_names, discord_voice_avatars, matrix_member_avatars,
+            matrix_room_avatars, matrix_power_levels, matrix_pinned,
+            matrix_room_members, matrix_read_receipts, sneedchat_motds,
+            irc_whois, discord_mutes, matrix_presence,
+            matrix_own_reactions, irc_splits,
+        );
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::belongs_to;
+
+    /// The whole of forgetting an account rests on this one test, so it is
+    /// worth being explicit about what it must and must not match.
+    #[test]
+    fn a_key_belongs_to_an_account_or_it_does_not() {
+        let account = "matrix:@salastil:matrix.salastil.com";
+
+        // The account itself, and its buffers.
+        assert!(belongs_to(account, account));
+        assert!(belongs_to(account, "matrix:@salastil:matrix.salastil.com|!room:server"));
+        assert!(belongs_to(account, "matrix:@salastil:matrix.salastil.com|"));
+
+        // A different account on the same homeserver, whose id is a prefix of
+        // nothing and shares a great deal of text with this one.
+        assert!(!belongs_to(account, "matrix:@someone:matrix.salastil.com"));
+        assert!(!belongs_to(account, "matrix:@someone:matrix.salastil.com|!room:server"));
+
+        // The dangerous one: an account id that starts with this account's id.
+        // Without the separator check, removing one would empty the other.
+        assert!(!belongs_to(account, "matrix:@salastil:matrix.salastil.com.evil"));
+        assert!(!belongs_to(account, "matrix:@salastil:matrix.salastil.com.evil|!room:server"));
+
+        // And the keys that are neither: guild ids, event ids, room ids. A map
+        // holding these is left alone by the same rule rather than needing to
+        // be recognised and skipped.
+        assert!(!belongs_to(account, "$event:server"));
+        assert!(!belongs_to(account, "1295580917137670182"));
+        assert!(!belongs_to(account, ""));
+    }
+}

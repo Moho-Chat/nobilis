@@ -1117,6 +1117,33 @@ impl Store {
         Ok(deleted)
     }
 
+    /// Forgets everything stored for one account.
+    ///
+    /// Messages, cards, reactions and transfers. A removed account that leaves
+    /// ten thousand of its messages in the database is not removed: they come
+    /// back the moment an account is added under the same id, in buffers the
+    /// new account may not even be in, and they are the old conversation
+    /// rather than the new one.
+    ///
+    /// Matched on the buffer id, which begins with the account id and a pipe -
+    /// the same shape every buffer on every protocol is named with - plus the
+    /// account's own id for anything filed against it directly.
+    pub fn forget_account(&self, account_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let like = format!("{account_id}|%");
+        let mut gone = 0;
+        for table in ["messages", "live_cards", "matrix_reactions"] {
+            gone += conn.execute(
+                &format!("DELETE FROM {table} WHERE buffer_id = ?1 OR buffer_id LIKE ?2"),
+                params![account_id, like],
+            )?;
+        }
+        // Transfers are filed against the account rather than a buffer: a DCC
+        // send belongs to a connection, not to a channel.
+        gone += conn.execute("DELETE FROM transfers WHERE account_id = ?1", params![account_id])?;
+        Ok(gone)
+    }
+
     /// Hands freed pages back to the OS until there are few enough left to
     /// stop caring - a no-op on a database that predates
     /// `auto_vacuum = INCREMENTAL` (see `open`'s doc comment).
@@ -1326,6 +1353,30 @@ mod tests {
             "handed back {reclaimed} of {before} free pages"
         );
         assert!(after <= 256, "{after} pages still free after a vacuum");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An account that is removed has to take its messages with it: left
+    /// behind, they reappear under an account added with the same id, as
+    /// somebody else's conversation.
+    #[test]
+    fn forgetting_an_account_takes_its_messages_and_nobody_elses() {
+        let (s, dir) = store();
+        append(&s, "matrix:@a:server|!room", "m1");
+        append(&s, "matrix:@a:server|!other", "m2");
+        // A second account whose id begins with the first one's, which is the
+        // case a naive prefix match gets wrong.
+        append(&s, "matrix:@a:server.uk|!room", "m3");
+        append(&s, "irc:libera|#chat", "m4");
+
+        let gone = s.forget_account("matrix:@a:server").expect("forgetting");
+        assert_eq!(gone, 2, "should have taken exactly its own two");
+
+        let left = |buffer: &str| s.get_backlog(buffer, 50, 0).expect("backlog").len();
+        assert_eq!(left("matrix:@a:server|!room"), 0);
+        assert_eq!(left("matrix:@a:server|!other"), 0);
+        assert_eq!(left("matrix:@a:server.uk|!room"), 1, "a different account was emptied");
+        assert_eq!(left("irc:libera|#chat"), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
