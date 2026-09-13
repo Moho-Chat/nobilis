@@ -282,6 +282,19 @@ pub struct Buffer {
     /// somebody speaks, it simply stops competing for the top of the rail.
     #[serde(rename = "lowPriority", default, skip_serializing_if = "std::ops::Not::not")]
     pub low_priority: bool,
+    /// This conversation is the service itself talking to the account.
+    ///
+    /// Matrix's server notices room, which a homeserver uses to say something
+    /// it needs a person to see - a terms-of-service change, a quota, an
+    /// account restriction. Worth marking because it looks exactly like an
+    /// ordinary room from a stranger otherwise, and because it cannot be
+    /// left: the server refuses, so a client offering to leave it is offering
+    /// something that fails.
+    ///
+    /// Not Matrix-only as an idea - Discord's system messages are the same
+    /// thing - so it is named for what it is rather than after the tag.
+    #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_room: bool,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -816,6 +829,7 @@ mod tests {
             server_muted: false,
             favourite: false,
             low_priority: false,
+            service_room: false,
         }
     }
 

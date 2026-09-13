@@ -1364,6 +1364,7 @@ impl Runtime {
             // tags, which is after the buffer exists.
             favourite: false,
             low_priority: false,
+            service_room: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -1393,6 +1394,24 @@ impl Runtime {
             }
             buffer.favourite = favourite;
             buffer.low_priority = low_priority;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// Marks a conversation as the service talking rather than a person.
+    ///
+    /// One way only. A homeserver does not un-designate its notices room, and
+    /// a client that cleared the mark because one sync happened not to carry
+    /// the tag would offer a Leave that the server refuses.
+    pub fn set_buffer_service_room(&self, state: &AppState, buffer_id: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.service_room {
+                return;
+            }
+            buffer.service_room = true;
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());

@@ -20,10 +20,25 @@ use super::*;
 pub const FAVOURITE: &str = "m.favourite";
 pub const LOW_PRIORITY: &str = "m.lowpriority";
 
+/// The tag that marks the server notices room.
+///
+/// Not a sorting tag and not something anybody sets: the homeserver puts it
+/// there. It is how a client knows that a room is the server talking to this
+/// account - a terms-of-service change, a quota, an account restriction - and
+/// without it that room is an ordinary one from a sender with no particular
+/// standing. Element marks it and refuses to let it be left, because the
+/// server refuses too.
+pub const SERVER_NOTICE: &str = "m.server_notice";
+
 /// Whether a room is starred, and whether it is pushed down.
 pub fn read(content: &Value) -> (bool, bool) {
     let tags = &content["tags"];
     (tags.get(FAVOURITE).is_some(), tags.get(LOW_PRIORITY).is_some())
+}
+
+/// Whether this is the room the homeserver itself talks in.
+pub fn is_server_notices(content: &Value) -> bool {
+    content["tags"].get(SERVER_NOTICE).is_some()
 }
 
 /// Applies a room's `m.tag` to the buffer it belongs to.
@@ -31,6 +46,9 @@ pub(super) fn apply(state: &AppState, account_id: &str, room_id: &str, content: 
     let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else { return };
     let (favourite, low_priority) = read(content);
     state.runtime.set_buffer_tags(state, &buffer_id, favourite, low_priority);
+    if is_server_notices(content) {
+        state.runtime.set_buffer_service_room(state, &buffer_id);
+    }
 }
 
 /// Reads every room's tags at connect.
@@ -142,5 +160,18 @@ mod tests {
         assert_eq!(FAVOURITE, "m.favourite");
         assert_eq!(LOW_PRIORITY, "m.lowpriority");
         assert_eq!(read(&json!({ "tags": { "m.low_priority": {} } })), (false, false));
+    }
+
+    /// The homeserver's own room, which it marks itself. Not a sorting tag
+    /// and not one anybody sets.
+    #[test]
+    fn the_servers_own_room_is_marked_by_the_server() {
+        let notices = json!({ "tags": { "m.server_notice": {} } });
+        assert!(is_server_notices(&notices));
+        // And it is not a favourite or a low priority by being one.
+        assert_eq!(read(&notices), (false, false));
+
+        assert!(!is_server_notices(&json!({ "tags": { "m.favourite": {} } })));
+        assert!(!is_server_notices(&json!({})));
     }
 }
