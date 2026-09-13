@@ -149,6 +149,42 @@ fn moho_dir_migrations(
     vec![("cache", cache_root.join("moho"), cache_root.join("nobilis"))]
 }
 
+/// Cuts every buffer back to the cap, and gives the space back.
+///
+/// Split from the cache sweeps above so it can run on its own cadence. The
+/// vacuum runs on every pass rather than only after a delete: pages are freed
+/// by a message being deleted from a room as well, and the backlog they leave
+/// is what kept the file growing when nothing but a prune could reclaim it.
+async fn prune_scrollback(state: AppState) {
+    // The same settling time the sweeps take: a daemon that has just started
+    // is reconnecting and backfilling, and pruning into that is work done
+    // twice.
+    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    loop {
+        match state.store.prune_old_messages(SCROLLBACK_KEEP_PER_BUFFER) {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                "scrollback: pruned {n} row(s) beyond {SCROLLBACK_KEEP_PER_BUFFER} kept per buffer"
+            ),
+            Err(e) => tracing::warn!("scrollback: pruning failed: {e}"),
+        }
+        match state.store.incremental_vacuum() {
+            Ok(0) => {}
+            Ok(pages) => tracing::info!("scrollback: handed back {pages} page(s) to the filesystem"),
+            Err(e) => tracing::debug!("scrollback: incremental_vacuum failed: {e}"),
+        }
+
+        // Kept to the same number the runtime holds, so the list does not
+        // grow without bound across restarts while showing only the newest.
+        match state.store.prune_transfers(crate::runtime::DCC_KEEP as i64) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => tracing::info!("transfers: forgot {n} old record(s)"),
+        }
+
+        tokio::time::sleep(SCROLLBACK_SWEEP_INTERVAL).await;
+    }
+}
+
 /// flock()-based singleton lock, same purpose as
 /// daemon/nobilis/nobilis.c's acquire_singleton_lock(): prevent two nobilis
 /// processes racing the same socket/account-store. The lock file's fd is
@@ -373,15 +409,34 @@ async fn run() -> Result<()> {
     }
 }
 
-/// Keeps two genuinely unbounded-over-time growth vectors in check for as
-/// long as this daemon process stays up: scrollback (a busy buffer left
-/// open for months of uptime never stops growing on its own) and the
-/// Sneedchat avatar cache (every distinct poster ever seen gets a
-/// permanently-cached file - see backend/sneedchat/mod.rs's
-/// cached_avatar_path). Neither is a one-time startup cost, so this
-/// re-runs periodically rather than once.
+/// How often the scrollback is cut back to its cap.
+///
+/// Its own interval, because it used to share the six-hourly one the media
+/// caches use and they are not the same kind of growth. A cache grows with how
+/// many distinct people you have seen; scrollback grows with how fast they are
+/// talking. Measured on a live daemon, the busiest buffer takes three messages
+/// a second - so six hours after a prune that correctly cut it to 5000 it held
+/// 24,000 rows, and a full interval reaches something like 65,000. Thirteen
+/// times the cap the setting names.
+///
+/// Fifteen minutes keeps the worst case near 2,700 rows over. It also keeps
+/// each pass small, which matters because the prune holds the database while
+/// it runs: the once-per-six-hours pass had 44,131 rows to delete and took
+/// 2.1 seconds, where a quarter-hourly one has a few thousand.
+const SCROLLBACK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// The number of messages kept per buffer. What the pruning is for.
+const SCROLLBACK_KEEP_PER_BUFFER: i64 = 5000;
+
+/// Keeps the stores that grow with use from growing forever: the scrollback
+/// database, and the media caches (every distinct poster ever seen leaves a
+/// cached avatar - see backend/sneedchat/mod.rs's cached_avatar_path).
+///
+/// Two loops rather than one, on two intervals, because the two answer to
+/// different things - see SCROLLBACK_SWEEP_INTERVAL. Neither is a one-time
+/// startup cost, so both re-run for as long as the daemon is up.
 async fn run_housekeeping(state: AppState) {
-    const SCROLLBACK_KEEP_PER_BUFFER: i64 = 5000;
+    tokio::spawn(prune_scrollback(state.clone()));
 
     // Ahead of the wait: this is a one-time local correction, and holding it
     // back a minute would only mean a minute of pictures that should move
@@ -391,24 +446,6 @@ async fn run_housekeeping(state: AppState) {
     // Let the initial reconnect burst above settle before the first pass.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     loop {
-        match state.store.prune_old_messages(SCROLLBACK_KEEP_PER_BUFFER) {
-            Ok(0) => {}
-            Ok(n) => {
-                tracing::info!("scrollback: pruned {n} row(s) beyond {SCROLLBACK_KEEP_PER_BUFFER} kept per buffer");
-                if let Err(e) = state.store.incremental_vacuum() {
-                    tracing::debug!("scrollback: incremental_vacuum failed: {e}");
-                }
-            }
-            Err(e) => tracing::warn!("scrollback: pruning failed: {e}"),
-        }
-
-        // Kept to the same number the runtime holds, so the list does not
-        // grow without bound across restarts while showing only the newest.
-        match state.store.prune_transfers(crate::runtime::DCC_KEEP as i64) {
-            Ok(0) | Err(_) => {}
-            Ok(n) => tracing::info!("transfers: forgot {n} old record(s)"),
-        }
-
         backend::sneedchat::sweep_avatar_cache().await;
         backend::sneedchat::sweep_attachment_cache().await;
         backend::matrix::sweep_media_cache().await;
