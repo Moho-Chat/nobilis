@@ -1090,19 +1090,36 @@ pub async fn dispatch(
                 let _ = std::fs::remove_file(&finished.path);
                 return (None, Some("the conversation this was recorded for is gone".to_string()));
             };
-            let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
+            // Whichever service the conversation belongs to. The recording
+            // itself knows nothing about either - it is a microphone and some
+            // samples - and the two services want the same thing said
+            // differently: a flag and base64 bytes on Discord, an MSC3245
+            // marker and integers on Matrix.
+            let result = if let Some(cfg) = state.accounts.get_discord(&buffer.account_id) {
+                backend::discord::send_voice_message(
+                    state,
+                    &finished.buffer_id,
+                    &cfg.token,
+                    &finished.path,
+                    finished.duration_secs,
+                    &finished.waveform,
+                )
+                .await
+            } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
+                backend::matrix::send_voice_message(
+                    state,
+                    &buffer.account_id,
+                    &finished.buffer_id,
+                    &cfg.access_token,
+                    &finished.path,
+                    finished.duration_secs,
+                    &finished.waveform_bytes,
+                )
+                .await
+            } else {
                 let _ = std::fs::remove_file(&finished.path);
-                return (None, Some("voice messages are a Discord thing for now".to_string()));
+                return (None, Some("this service has no voice messages".to_string()));
             };
-            let result = backend::discord::send_voice_message(
-                state,
-                &finished.buffer_id,
-                &cfg.token,
-                &finished.path,
-                finished.duration_secs,
-                &finished.waveform,
-            )
-            .await;
             // Sent or not, the recording has served its purpose on disk.
             let _ = std::fs::remove_file(&finished.path);
             match result {

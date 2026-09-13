@@ -100,6 +100,9 @@ pub struct Finished {
     pub duration_secs: f64,
     /// Discord's own encoding: one amplitude byte per bucket, base64'd.
     pub waveform: String,
+    /// The same picture before that encoding, for services that want their
+    /// own - Matrix counts to 1024 and sends integers.
+    pub waveform_bytes: Vec<u8>,
     pub samples: usize,
 }
 
@@ -115,10 +118,11 @@ pub fn finish() -> Result<Finished> {
         bail!("the microphone produced no audio");
     }
     let duration_secs = oggopus::duration_secs(&samples);
-    let waveform = base64_of(&oggopus::waveform(&samples, 256));
+    let waveform_bytes = oggopus::waveform(&samples, 256);
+    let waveform = base64_of(&waveform_bytes);
     let bytes = oggopus::encode(&samples)?;
     let path = oggopus::write_temp(&bytes)?;
-    Ok(Finished { buffer_id: recording.buffer_id, path, duration_secs, waveform, samples: samples.len() })
+    Ok(Finished { buffer_id: recording.buffer_id, path, duration_secs, waveform, waveform_bytes, samples: samples.len() })
 }
 
 /// Throws the recording away and closes the microphone.

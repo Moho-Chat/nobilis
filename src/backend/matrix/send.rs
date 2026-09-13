@@ -632,6 +632,66 @@ pub async fn send_message(
     Ok(())
 }
 
+/// Sends a recording as a voice message rather than as a sound file.
+///
+/// Three additions to what an ordinary audio attachment carries, and all of
+/// them are what make a client draw a waveform instead of a file row:
+/// `org.matrix.msc3245.voice` as the marker, `org.matrix.msc1767.audio` with
+/// the length and the picture of the sound, and the length again in `info`
+/// where clients that predate all of this look for it.
+///
+/// The waveform is converted back on the way out. This program carries one
+/// shape internally - Discord's bytes - so the samples are scaled up into the
+/// 0-1024 integers Matrix uses, rather than every caller learning two formats.
+///
+/// Encrypted where the room is, through exactly the same two paths an
+/// attachment already uses: a voice message is a file, and there is no reason
+/// for it to be the one attachment that leaks.
+pub async fn send_voice_message(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    access_token: &str,
+    path: &std::path::Path,
+    duration_secs: f64,
+    waveform: &[u8],
+) -> Result<()> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let is_encrypted = state.runtime.is_matrix_room_encrypted(buffer_id);
+    let file = path.to_str().context("the recording has an unreadable path")?;
+
+    // What Element calls one, so a room's history reads consistently.
+    let body = "Voice message";
+    let mut content = if is_encrypted {
+        upload_encrypted_media_message(base, access_token, file, body).await?
+    } else {
+        upload_media_message(base, access_token, file, body).await?
+    };
+
+    media::mark_as_voice(&mut content, duration_secs, waveform);
+
+    let txn_id = model::next_message_id();
+    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let encoded_txn_id = url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>();
+    let (event_type, body_json) = if is_encrypted {
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, access_token, &room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, protocol::EVENT_ROOM_MESSAGE, content)
+            .await
+            .context("encrypting the voice message")?;
+        (protocol::EVENT_ROOM_ENCRYPTED, encrypted)
+    } else {
+        (protocol::EVENT_ROOM_MESSAGE, content)
+    };
+    let url = format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/send/{event_type}/{encoded_txn_id}");
+    http::put_json(&url, access_token, body_json).await.context("sending the voice message")?;
+    Ok(())
+}
+
 /// The `m.replace` an edit is sent as.
 ///
 /// The replacement carries the sender's formatting the same way a new

@@ -32,14 +32,13 @@ pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_
         mimetype,
         path,
         thumbnail_path,
-        // Matrix has voice messages too - MSC3245, with the length and the
-        // waveform under an MSC1767 audio block - but they are shaped nothing
-        // like Discord's (milliseconds and an array of 0-1024 samples, against
-        // seconds and base64 bytes). Reading them is its own piece of work;
-        // this is the Discord ticket.
-        duration_secs: None,
-        waveform: None,
-        voice: false,
+        duration_secs: voice_duration_secs(content),
+        waveform: voice_waveform(content),
+        // MSC3245: an empty object whose presence is the whole statement.
+        // Element sends it on anything recorded with its microphone button,
+        // and on nothing else - so this says "somebody spoke" exactly where
+        // Discord's flag does, and an .ogg deliberately attached stays a file.
+        voice: !content["org.matrix.msc3245.voice"].is_null(),
         url: None,
     }
 }
@@ -82,6 +81,8 @@ pub(super) fn extension_for_mimetype(mimetype: &str) -> &'static str {
         "image/gif" => "gif",
         "image/webp" => "webp",
         "image/avif" => "avif",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/mpeg" => "mp3",
         "image/bmp" => "bmp",
         "video/mp4" => "mp4",
         "video/webm" => "webm",
@@ -295,9 +296,71 @@ pub(super) fn media_msgtype_and_mime(ext: &str) -> (&'static str, &'static str) 
         "webp" => ("m.image", "image/webp"),
         "avif" => ("m.image", "image/avif"),
         "mp4" | "webm" => ("m.video", "video/mp4"),
-        "mp3" | "ogg" | "wav" | "flac" => ("m.audio", "audio/mpeg"),
+        // Each by its own name. These used to answer "audio/mpeg" together,
+        // which is wrong for three of the four and is the type a voice
+        // message would have been uploaded under - an .ogg labelled as mp3
+        // plays in some clients and not others.
+        "mp3" => ("m.audio", "audio/mpeg"),
+        "ogg" | "opus" => ("m.audio", "audio/ogg"),
+        "wav" => ("m.audio", "audio/wav"),
+        "flac" => ("m.audio", "audio/flac"),
         _ => ("m.file", "application/octet-stream"),
     }
+}
+
+/// How long a Matrix voice message runs.
+///
+/// Milliseconds here, where Discord counts seconds - MSC1767's audio block
+/// first, since that is where a voice message carries it, falling back to the
+/// `info` block that ordinary audio has used since long before any of this.
+fn voice_duration_secs(content: &Value) -> Option<f64> {
+    let ms = content["org.matrix.msc1767.audio"]["duration"]
+        .as_f64()
+        .or_else(|| content["info"]["duration"].as_f64())?;
+    (ms > 0.0).then_some(ms / 1000.0)
+}
+
+/// The waveform, in the one shape the rest of this program reads.
+///
+/// Matrix sends an array of integers from 0 to 1024; Discord sends bytes,
+/// base64'd. Converted here rather than carried as a second format, because
+/// the alternative is every client learning both - and a waveform is a
+/// picture of a sound, not a protocol detail worth preserving. The scale is
+/// 1024 to 255, which loses two bits nobody can see in a 3px-wide bar.
+fn voice_waveform(content: &Value) -> Option<String> {
+    use base64::Engine;
+    let samples = content["org.matrix.msc1767.audio"]["waveform"].as_array()?;
+    if samples.is_empty() {
+        return None;
+    }
+    let bytes: Vec<u8> = samples
+        .iter()
+        .filter_map(|v| v.as_f64())
+        .map(|v| (v.clamp(0.0, 1024.0) / 1024.0 * 255.0).round() as u8)
+        .collect();
+    (!bytes.is_empty()).then(|| base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// Marks an uploaded audio file as somebody speaking.
+///
+/// The three things that make a client draw a waveform instead of a file row,
+/// applied to the content an upload already produced: the MSC3245 marker, the
+/// MSC1767 audio block with the length and the picture of the sound, and the
+/// length again in `info` where clients older than any of this look.
+///
+/// The waveform is scaled back up on the way out. This program carries one
+/// shape internally - Discord's bytes - so converting here keeps every caller
+/// from having to know that Matrix counts to 1024.
+///
+/// Its own function so the shape can be tested without a homeserver, and
+/// tested against the parser above: what this writes, `build_attachment` has
+/// to read back as a voice message.
+pub(super) fn mark_as_voice(content: &mut Value, duration_secs: f64, waveform: &[u8]) {
+    let ms = (duration_secs * 1000.0).round() as u64;
+    let samples: Vec<u64> = waveform.iter().map(|b| (*b as f64 / 255.0 * 1024.0).round() as u64).collect();
+    content["info"]["duration"] = serde_json::json!(ms);
+    content["org.matrix.msc1767.audio"] = serde_json::json!({ "duration": ms, "waveform": samples });
+    content["org.matrix.msc3245.voice"] = serde_json::json!({});
 }
 
 pub(super) fn file_extension(path: &str) -> (String, String) {
@@ -491,5 +554,100 @@ mod attachment_tests {
         decryptor.read_to_end(&mut decrypted).expect("decrypting");
 
         assert_eq!(decrypted, plaintext, "decrypted bytes don't match the original plaintext");
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::{build_attachment, media_msgtype_and_mime};
+    use serde_json::json;
+
+    /// A voice message as Element sends one: the marker, the length in
+    /// milliseconds, and a waveform of integers up to 1024.
+    fn spoken() -> serde_json::Value {
+        json!({
+            "msgtype": "m.audio",
+            "body": "Voice message.ogg",
+            "url": "mxc://example.org/abc",
+            "info": { "mimetype": "audio/ogg", "size": 23294, "duration": 6615 },
+            "org.matrix.msc1767.audio": { "duration": 6615, "waveform": [0, 256, 512, 1024] },
+            "org.matrix.msc3245.voice": {}
+        })
+    }
+
+    #[test]
+    fn element_voice_message_is_read_as_one() {
+        let att = build_attachment(&spoken(), None, None);
+        assert!(att.voice, "the MSC3245 marker was not read");
+        assert_eq!(att.kind, "audio");
+        // Milliseconds there, seconds here.
+        assert_eq!(att.duration_secs, Some(6.615));
+        // 0, 256, 512, 1024 scaled from 0-1024 into bytes: 0, 64, 128, 255.
+        assert_eq!(att.waveform.as_deref(), Some("AECA/w=="));
+    }
+
+    /// The same distinction Discord's flag draws: a sound file somebody
+    /// attached is a file they sent, not something they said.
+    #[test]
+    fn an_ordinary_audio_attachment_is_not_a_voice_message() {
+        let mut ordinary = spoken();
+        ordinary.as_object_mut().unwrap().remove("org.matrix.msc3245.voice");
+        ordinary.as_object_mut().unwrap().remove("org.matrix.msc1767.audio");
+        let att = build_attachment(&ordinary, None, None);
+        assert!(!att.voice);
+        assert_eq!(att.kind, "audio");
+        // The length still comes through, because `info.duration` is older
+        // than any of this and an audio player can use it.
+        assert_eq!(att.duration_secs, Some(6.615));
+        assert_eq!(att.waveform, None);
+    }
+
+    /// The round trip, without a homeserver: what the send path writes has to
+    /// come back through the parser as the thing it was meant to be. The
+    /// parser is already known to read Element's real shape, so agreeing with
+    /// it is the strongest offline statement available about what will land
+    /// in a room.
+    #[test]
+    fn what_is_sent_is_what_is_read_back() {
+        use super::mark_as_voice;
+
+        // What an upload leaves behind, before it is marked.
+        let mut content = json!({
+            "msgtype": "m.audio",
+            "body": "Voice message",
+            "url": "mxc://example.org/xyz",
+            "info": { "mimetype": "audio/ogg" }
+        });
+        // A recording as this daemon produces one: seconds, and bytes.
+        let waveform: Vec<u8> = vec![0, 64, 128, 255];
+        mark_as_voice(&mut content, 2.5, &waveform);
+
+        assert!(content["org.matrix.msc3245.voice"].is_object(), "no marker: {content}");
+        assert_eq!(content["org.matrix.msc1767.audio"]["duration"], 2500);
+        assert_eq!(content["info"]["duration"], 2500);
+        // Bytes on the way out, integers up to 1024 on the wire.
+        assert_eq!(content["org.matrix.msc1767.audio"]["waveform"], json!([0, 257, 514, 1024]));
+
+        let att = build_attachment(&content, None, None);
+        assert!(att.voice);
+        assert_eq!(att.duration_secs, Some(2.5));
+        // And back to bytes, within the rounding two conversions cost.
+        use base64::Engine;
+        let back = base64::engine::general_purpose::STANDARD
+            .decode(att.waveform.expect("a waveform")) 
+            .expect("valid base64");
+        assert_eq!(back.len(), waveform.len());
+        for (sent, read) in waveform.iter().zip(back.iter()) {
+            assert!((*sent as i16 - *read as i16).abs() <= 1, "{sent} came back as {read}");
+        }
+    }
+
+    /// A voice message recorded here is an Ogg, and saying it is an mp3 is
+    /// how it ends up unplayable in somebody else's client.
+    #[test]
+    fn an_ogg_is_uploaded_as_an_ogg() {
+        assert_eq!(media_msgtype_and_mime("ogg"), ("m.audio", "audio/ogg"));
+        assert_eq!(media_msgtype_and_mime("mp3"), ("m.audio", "audio/mpeg"));
+        assert_eq!(media_msgtype_and_mime("wav"), ("m.audio", "audio/wav"));
     }
 }
