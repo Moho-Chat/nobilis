@@ -1099,7 +1099,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             .as_array()
                             .map(|r| r.iter().any(|u| u.as_str() == Some(config.user_id.as_str())))
                             .unwrap_or(false);
-                        announce_call(state, &account_id, channel_id, ringing);
+                        // Opening the conversation first where there is
+                        // none: a first call from a new person arrives on a
+                        // channel this client has never seen, and a call
+                        // with nowhere to ring cannot be answered.
+                        announce_call_opening_dm(state, &account_id, channel_id, ringing).await;
                     }
 
                     "CALL_DELETE" => {

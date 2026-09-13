@@ -255,6 +255,46 @@ pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String
     Ok(buffer.id)
 }
 
+/// Gives a DM channel a buffer from its id alone.
+///
+/// For a conversation this client has never seen: an incoming call from
+/// somebody with no DM history arrives naming a channel and nothing else, and
+/// a call with nowhere to ring is a call that cannot be answered.
+///
+/// The channel is asked for rather than guessed at, because its name is its
+/// recipients and the id says nothing about who they are.
+pub async fn adopt_dm_channel(state: &AppState, account_id: &str, channel_id: &str) -> Result<String> {
+    if let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) {
+        return Ok(buffer_id);
+    }
+    let config = state.accounts.get_discord(account_id).context("account is not connected")?;
+    let resp = http_client()
+        .get(format!("{API_BASE}/channels/{channel_id}"))
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .context("asking about that conversation")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "opening that conversation"));
+    }
+    let ch: Value = resp.json().await.context("invalid JSON response")?;
+
+    let name = dm_channel_name(&ch);
+    let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
+    state.runtime.set_discord_channel(state, &buffer.id, channel_id);
+    if let Some(avatar) = dm_avatar_url(&ch) {
+        state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
+    }
+    // No presence snapshot here either - the channel was fetched rather than
+    // arriving with READY, so their first status update fills it in.
+    set_dm_presence(state, &buffer.id, &ch, &HashMap::new());
+    ensure_dm_group(state, account_id);
+    state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
+    Ok(buffer.id)
+}
+
 /// How many other people a Discord group message holds - ten including you.
 pub(super) const GROUP_DM_MAX_OTHERS: usize = 9;
 

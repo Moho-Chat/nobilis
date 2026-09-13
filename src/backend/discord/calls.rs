@@ -152,6 +152,29 @@ pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringi
     );
 }
 
+/// The same, for a call that may be from somebody this account has never
+/// spoken to.
+///
+/// `announce_call` needs a buffer to ring against and drops the call when
+/// there is none - which is right for an ordinary event about a channel
+/// nobody has opened, and quite wrong for a call. A first call from a new
+/// person arrives on a DM channel this client has never seen, so the answer
+/// was silence: the phone did not ring, and there was nothing on screen to
+/// answer.
+///
+/// So the channel is fetched and given a buffer first. Only for a call that
+/// is actually ringing - a CALL_UPDATE saying the ringing has stopped in a
+/// conversation nobody ever opened has nothing to say and should not create
+/// one.
+pub async fn announce_call_opening_dm(state: &AppState, account_id: &str, channel_id: &str, ringing: bool) {
+    if ringing && state.runtime.discord_buffer_for_channel(account_id, channel_id).is_none() {
+        if let Err(e) = people::adopt_dm_channel(state, account_id, channel_id).await {
+            tracing::warn!("discord[{account_id}]: a call arrived on {channel_id} and it could not be opened: {e:#}");
+        }
+    }
+    announce_call(state, account_id, channel_id, ringing);
+}
+
 /// Joins a call that is already ringing, which is what answering one is.
 ///
 /// The same join as placing a call, minus the ring: the other end is already
