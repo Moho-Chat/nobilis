@@ -389,6 +389,7 @@ async fn run_housekeeping(state: AppState) {
         backend::matrix::sweep_media_cache().await;
         backend::discord::sweep_thumbnail_cache().await;
         backend::discord::sweep_guild_icon_cache().await;
+        backend::kick::emotecache::sweep_emote_cache().await;
 
         tokio::time::sleep(backend::sneedchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
     }
