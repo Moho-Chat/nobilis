@@ -648,6 +648,21 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
                     }
 
+                    // Somebody joined or left a group message. Not
+                    // necessarily by anything this client did: the whole
+                    // point is the change made from a phone, or by another
+                    // person in the group, which this had no way to hear.
+                    "CHANNEL_RECIPIENT_ADD" | "CHANNEL_RECIPIENT_REMOVE" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        people::recipient_changed(
+                            state,
+                            &account_id,
+                            channel_id,
+                            &d["user"],
+                            t == "CHANNEL_RECIPIENT_ADD",
+                        );
+                    }
+
                     "CHANNEL_DELETE" => {
                         let Some(channel_id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(channel_id) {

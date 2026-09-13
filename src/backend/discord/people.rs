@@ -486,6 +486,81 @@ pub(super) fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value
     state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
+/// Somebody joined or left a group message, told by the gateway.
+///
+/// The other half of `addToDiscordGroupDm`/`removeFromDiscordGroupDm`: this
+/// client could change who is in a group and never heard about a change made
+/// anywhere else, so the member list was right only for the changes made from
+/// this window. Somebody added from a phone was absent here, and their
+/// messages arrived from a person not in the list.
+///
+/// The roster already on screen is edited rather than rebuilt, because the
+/// event carries one user and not the channel - there is no `recipients`
+/// array here to re-derive from, and asking Discord for one would be a
+/// request per membership change to learn what the event already said.
+pub(super) fn recipient_changed(state: &AppState, account_id: &str, channel_id: &str, user: &Value, joined: bool) {
+    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) else { return };
+    let Some(user_id) = user["id"].as_str() else { return };
+
+    let before: Vec<Value> = state
+        .runtime
+        .get_presence(&buffer_id)
+        .and_then(|p| p.as_array().cloned())
+        .unwrap_or_default();
+    if joined {
+        // Learned as well as shown, the same as the initial roster does: a
+        // group message is the only place some people are ever seen, and an
+        // event naming them by id alone would otherwise have nothing to look
+        // them up in.
+        state.runtime.remember_discord_name(account_id, user_id, &display_name(user));
+    }
+    let member_list = json!(roster_after(before, user, joined));
+    state.runtime.set_presence(&buffer_id, member_list.clone());
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
+}
+
+/// The roster a membership change leaves behind.
+///
+/// Pure, and separate from the event handling, because this is the part that
+/// can be wrong quietly: a list that grows a duplicate, or loses somebody, or
+/// stops being sorted, all look like a working member list until somebody
+/// counts. The caller has the state; this has the arithmetic.
+///
+/// Removal happens on both paths on purpose. Discord can deliver a second ADD
+/// for somebody already there - a reconnect, a duplicated dispatch - and
+/// appending blindly would show them twice.
+pub(super) fn roster_after(mut members: Vec<Value>, user: &Value, joined: bool) -> Vec<Value> {
+    let Some(user_id) = user["id"].as_str() else { return members };
+    members.retain(|m| m["userId"].as_str() != Some(user_id));
+    if joined {
+        members.push(json!({
+            "nick": display_name(user),
+            "userId": user_id,
+            "prefix": "",
+            // Their status is not in this event. Offline is the honest
+            // placeholder and PRESENCE_UPDATE corrects it, which is exactly
+            // how everybody else in this list arrived.
+            "away": true,
+            "status": "offline",
+            "avatarUrl": super::messages::author_avatar_url(user),
+        }));
+        members.sort_by(|a, b| {
+            a["nick"].as_str().unwrap_or("").to_lowercase().cmp(&b["nick"].as_str().unwrap_or("").to_lowercase())
+        });
+    }
+    members
+}
+
+/// What to call somebody: the display name they set, or their username.
+fn display_name(user: &Value) -> String {
+    user["global_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| user["username"].as_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 /// Closes a direct message, the way pressing the x beside one does.
 ///
 /// Only for a direct message. A guild's channel cannot be left on its own -
@@ -528,6 +603,59 @@ mod tests {
         let legacy = json!({ "id": "80351110224678912", "discriminator": "0007" });
         let url = default_avatar_url(&legacy).unwrap();
         assert!(url.ends_with("/2.png"), "0007 % 5 is 2, got {url}");
+    }
+
+    fn person(id: &str, nick: &str) -> Value {
+        json!({ "nick": nick, "userId": id, "prefix": "", "away": false, "status": "online" })
+    }
+
+    /// The member list was right only for changes made from this window.
+    /// Somebody added from a phone was absent here, with their messages
+    /// arriving from a person not in the list.
+    #[test]
+    fn somebody_added_elsewhere_joins_the_list() {
+        let before = vec![person("1", "Beth"), person("2", "Dave")];
+        let after = roster_after(before, &json!({ "id": "3", "global_name": "Carol" }), true);
+        let names: Vec<&str> = after.iter().map(|m| m["nick"].as_str().unwrap()).collect();
+        // In place, rather than appended: a list people read is a sorted one.
+        assert_eq!(names, vec!["Beth", "Carol", "Dave"]);
+        // Unknown until PRESENCE_UPDATE says otherwise, which is how everybody
+        // else in this list arrived too.
+        let carol = after.iter().find(|m| m["userId"] == "3").unwrap();
+        assert_eq!(carol["status"], "offline");
+    }
+
+    #[test]
+    fn somebody_removed_elsewhere_leaves_it() {
+        let before = vec![person("1", "Beth"), person("2", "Dave")];
+        let after = roster_after(before, &json!({ "id": "2", "username": "dave" }), false);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0]["userId"], "1");
+    }
+
+    /// Discord can deliver the same ADD twice - a reconnect, a duplicated
+    /// dispatch - and a list that grows a second copy of somebody looks like
+    /// a working member list until somebody counts.
+    #[test]
+    fn adding_somebody_twice_does_not_double_them() {
+        let before = vec![person("1", "Beth")];
+        let user = json!({ "id": "1", "global_name": "Beth" });
+        let once = roster_after(before, &user, true);
+        let twice = roster_after(once.clone(), &user, true);
+        assert_eq!(once.len(), 1);
+        assert_eq!(twice.len(), 1);
+    }
+
+    /// A name they never set falls back to the username, and an event with
+    /// no user at all changes nothing rather than emptying the room.
+    #[test]
+    fn a_person_is_named_however_they_can_be() {
+        let after = roster_after(vec![], &json!({ "id": "9", "username": "quiet" }), true);
+        assert_eq!(after[0]["nick"], "quiet");
+
+        let unchanged = roster_after(vec![person("1", "Beth")], &json!({}), true);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0]["userId"], "1");
     }
 
     #[test]
