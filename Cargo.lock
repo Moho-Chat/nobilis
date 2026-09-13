@@ -3789,6 +3789,7 @@ dependencies = [
  "matrix-sdk-common",
  "matrix-sdk-crypto",
  "matrix-sdk-sqlite",
+ "opus2",
  "qrcode",
  "rand 0.8.7",
  "reqwest",

@@ -94,6 +94,10 @@ js_int = "=0.2.2"
 songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite", "receive", "gateway"] }
 cpal = "0.18.2"
 symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
+# The Opus encoder, for recording a voice message. Already in the tree as
+# songbird's own dependency and already built against the same libopus - this
+# only asks for it by name so it can be used directly.
+opus2 = "0.4"
 async-trait = "0.1.92"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat

@@ -301,6 +301,206 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
     Ok(())
 }
 
+/// Sending a recording as a voice message rather than as a sound file.
+///
+/// Three things make Discord treat it as one, and all three are required: the
+/// IS_VOICE_MESSAGE flag on the message, and `duration_secs` and `waveform` on
+/// the attachment. Without them the same bytes arrive as an .ogg somebody
+/// attached - which is what every other client would then show, because that
+/// is what it would be.
+///
+/// The attachment metadata travels in `payload_json` alongside the file, keyed
+/// by the index of the file part. That is the same single multipart POST the
+/// ordinary attachment path uses; the separate upload-then-attach flow exists
+/// for files too large for one request, which a voice message is not.
+///
+/// A voice message carries no text: Discord rejects one with content, and
+/// there is nowhere in its own client to type any.
+pub async fn send_voice_message(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    file_path: &std::path::Path,
+    duration_secs: f64,
+    waveform: &str,
+) -> Result<()> {
+    const IS_VOICE_MESSAGE: u64 = 1 << 13;
+
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    let bytes = tokio::fs::read(file_path)
+        .await
+        .with_context(|| format!("reading {}", file_path.display()))?;
+    // The name Discord's own client uses. Its clients key on the flag rather
+    // than on this, but a file that arrives anywhere else should say what it
+    // is - and an unnamed part is rejected outright.
+    let file_name = "voice-message.ogg";
+    let payload = json!({
+        "content": "",
+        "flags": IS_VOICE_MESSAGE,
+        "attachments": [{
+            "id": "0",
+            "filename": file_name,
+            "duration_secs": duration_secs,
+            "waveform": waveform,
+        }],
+    });
+    let form = reqwest::multipart::Form::new()
+        .text("payload_json", payload.to_string())
+        .part(
+            "files[0]",
+            reqwest::multipart::Part::bytes(bytes)
+                .file_name(file_name)
+                .mime_str("audio/ogg")
+                .context("audio/ogg is a valid mime type")?,
+        );
+    let resp = send_write(
+        http_client()
+            .post(format!("{API_BASE}/channels/{channel_id}/messages"))
+            .header("Authorization", token)
+            .multipart(form),
+    )
+    .await
+    .context("uploading the voice message")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod live_probe {
+    //! Sending a real voice message to a real conversation, run by hand.
+    //!
+    //! The encoder can be checked offline and is - ffprobe agrees the file is
+    //! Ogg/Opus of the right length. What cannot be checked offline is whether
+    //! Discord accepts it *as a voice message* rather than as a sound file
+    //! somebody attached, because that answer only exists on their side.
+    //!
+    //! `#[ignore]`d, and it takes the token and the channel from the
+    //! environment rather than from anywhere in this repository:
+    //!   MOHO_DISCORD_TOKEN=… MOHO_DISCORD_CHANNEL=… \
+    //!     cargo test --release -- --ignored --nocapture voice_message_probe
+
+    #[tokio::test]
+    #[ignore]
+    async fn voice_message_probe() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = std::env::var("MOHO_DISCORD_TOKEN").expect("MOHO_DISCORD_TOKEN");
+        let channel = std::env::var("MOHO_DISCORD_CHANNEL").expect("MOHO_DISCORD_CHANNEL");
+
+        // Two seconds of a tone that rises and falls, so the waveform that
+        // arrives is one a person can recognise as this recording rather than
+        // as a flat bar.
+        let samples: Vec<f32> = (0..crate::oggopus::RATE * 2)
+            .map(|i| {
+                let t = i as f32 / crate::oggopus::RATE as f32;
+                (t * 440.0 * std::f32::consts::TAU).sin() * (t * std::f32::consts::PI / 2.0).sin() * 0.4
+            })
+            .collect();
+        let duration = crate::oggopus::duration_secs(&samples);
+        let waveform = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(crate::oggopus::waveform(&samples, 256))
+        };
+        let bytes = crate::oggopus::encode(&samples).expect("encoding");
+        println!("{} bytes of ogg, {duration:.2}s", bytes.len());
+
+        const IS_VOICE_MESSAGE: u64 = 1 << 13;
+        let payload = serde_json::json!({
+            "content": "",
+            "flags": IS_VOICE_MESSAGE,
+            "attachments": [{ "id": "0", "filename": "voice-message.ogg", "duration_secs": duration, "waveform": waveform }],
+        });
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", payload.to_string())
+            .part(
+                "files[0]",
+                reqwest::multipart::Part::bytes(bytes)
+                    .file_name("voice-message.ogg")
+                    .mime_str("audio/ogg")
+                    .unwrap(),
+            );
+        let resp = super::http_client()
+            .post(format!("{}/channels/{channel}/messages", super::API_BASE))
+            .header("Authorization", &token)
+            .multipart(form)
+            .send()
+            .await
+            .expect("posting");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("a JSON answer");
+        println!("HTTP {status}");
+        assert!(status.is_success(), "Discord refused it: {body}");
+
+        // The answer is the message Discord stored, so this is its own
+        // verification: the flag it kept, and what it did with the metadata.
+        println!("flags={} attachments={}", body["flags"], serde_json::to_string_pretty(&body["attachments"]).unwrap());
+        assert_eq!(
+            body["flags"].as_u64().unwrap_or(0) & IS_VOICE_MESSAGE,
+            IS_VOICE_MESSAGE,
+            "stored without the voice-message flag, so it is a sound file: {body}"
+        );
+        let att = &body["attachments"][0];
+        assert!(att["duration_secs"].as_f64().is_some(), "no duration came back: {att}");
+        assert!(att["waveform"].as_str().is_some(), "no waveform came back: {att}");
+    }
+}
+
+#[cfg(test)]
+mod receive_probe {
+    //! The other half of the round trip: reading back what Discord stored and
+    //! running it through the parser the window draws from.
+    //!
+    //! Read-only, and separate from the send probe so it can be pointed at any
+    //! conversation that already has a voice message in it:
+    //!   MOHO_DISCORD_TOKEN=… MOHO_DISCORD_CHANNEL=… \
+    //!     cargo test --release -- --ignored --nocapture voice_message_read_probe
+
+    #[tokio::test]
+    #[ignore]
+    async fn voice_message_read_probe() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let token = std::env::var("MOHO_DISCORD_TOKEN").expect("MOHO_DISCORD_TOKEN");
+        let channel = std::env::var("MOHO_DISCORD_CHANNEL").expect("MOHO_DISCORD_CHANNEL");
+
+        let messages: serde_json::Value = super::http_client()
+            .get(format!("{}/channels/{channel}/messages?limit=10", super::API_BASE))
+            .header("Authorization", &token)
+            .send()
+            .await
+            .expect("fetching")
+            .json()
+            .await
+            .expect("a JSON answer");
+
+        let spoken = messages
+            .as_array()
+            .expect("a list of messages")
+            .iter()
+            .find(|m| m["flags"].as_u64().unwrap_or(0) & (1 << 13) != 0)
+            .expect("no voice message in the last ten - send one first");
+
+        let attachments = crate::backend::discord::messages::extract_attachments(spoken);
+        let att = attachments.first().expect("a voice message has an attachment");
+        println!(
+            "kind={} voice={} duration={:?} waveform={} bytes",
+            att.kind,
+            att.voice,
+            att.duration_secs,
+            att.waveform.as_deref().map(str::len).unwrap_or(0)
+        );
+        assert!(att.voice, "the parser did not read the flag off a real message");
+        assert!(att.duration_secs.unwrap_or(0.0) > 0.0, "no length came through");
+        assert!(att.waveform.is_some(), "no waveform came through");
+        assert_eq!(att.kind, "audio");
+    }
+}
+
 /// PATCH .../messages/{id} - editing your own message. Discord scopes
 /// this to the message author (enforced server-side; there's no separate
 /// permission check needed here).

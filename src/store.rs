@@ -40,6 +40,21 @@ impl Store {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening scrollback db at {}", db_path.display()))?;
 
+
+        // Only takes effect for a brand-new file (or after a full VACUUM,
+        // which isn't done automatically here since that could be slow on
+        // an existing multi-month scrollback.db) - lets incremental_vacuum
+        // actually hand freed pages back to the OS after prune_old_messages/
+        // delete_message, instead of SQLite just quietly reusing them
+        // in-place forever without the file ever shrinking on disk.
+        let _ = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;");
+        // Strictly after auto_vacuum, and that is not a style choice: SQLite
+        // will not change auto_vacuum on a database that is already in WAL
+        // mode, and says nothing when it refuses. Setting WAL first left every
+        // newly created scrollback.db at auto_vacuum=NONE, which makes the
+        // incremental_vacuum below a permanent no-op - the file would free
+        // pages internally and never hand one back. Found by a vacuum that
+        // reclaimed nothing while reporting that it had.
         // Write-ahead logging, and don't fsync on every one.
         //
         // Every message written here is its own implicit transaction - there
@@ -77,13 +92,6 @@ impl Store {
         // Persistent in the database file for journal_mode, per-connection for
         // synchronous, which is why this one is set every time.
         let _ = conn.execute_batch("PRAGMA synchronous = NORMAL;");
-        // Only takes effect for a brand-new file (or after a full VACUUM,
-        // which isn't done automatically here since that could be slow on
-        // an existing multi-month scrollback.db) - lets incremental_vacuum
-        // actually hand freed pages back to the OS after prune_old_messages/
-        // delete_message, instead of SQLite just quietly reusing them
-        // in-place forever without the file ever shrinking on disk.
-        let _ = conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL;");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1109,13 +1117,89 @@ impl Store {
         Ok(deleted)
     }
 
-    /// Hands freed pages back to the OS a couple hundred at a time, rather
-    /// than a single large blocking VACUUM - a no-op on a database that
-    /// predates `auto_vacuum = INCREMENTAL` (see `open`'s doc comment).
-    pub fn incremental_vacuum(&self) -> Result<()> {
+    /// Forgets everything stored for one account.
+    ///
+    /// Messages, cards, reactions and transfers. A removed account that leaves
+    /// ten thousand of its messages in the database is not removed: they come
+    /// back the moment an account is added under the same id, in buffers the
+    /// new account may not even be in, and they are the old conversation
+    /// rather than the new one.
+    ///
+    /// Matched on the buffer id, which begins with the account id and a pipe -
+    /// the same shape every buffer on every protocol is named with - plus the
+    /// account's own id for anything filed against it directly.
+    pub fn forget_account(&self, account_id: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA incremental_vacuum(200);")?;
-        Ok(())
+        let like = format!("{account_id}|%");
+        let mut gone = 0;
+        for table in ["messages", "live_cards", "matrix_reactions"] {
+            gone += conn.execute(
+                &format!("DELETE FROM {table} WHERE buffer_id = ?1 OR buffer_id LIKE ?2"),
+                params![account_id, like],
+            )?;
+        }
+        // Transfers are filed against the account rather than a buffer: a DCC
+        // send belongs to a connection, not to a channel.
+        gone += conn.execute("DELETE FROM transfers WHERE account_id = ?1", params![account_id])?;
+        Ok(gone)
+    }
+
+    /// Hands freed pages back to the OS until there are few enough left to
+    /// stop caring - a no-op on a database that predates
+    /// `auto_vacuum = INCREMENTAL` (see `open`'s doc comment).
+    ///
+    /// This used to reclaim a flat 200 pages, once, on a pass that had deleted
+    /// something. At 4KB a page that is 800KB per housekeeping pass, against a
+    /// live scrollback that was holding 10,196 free pages - 40MB - and gaining
+    /// on every prune. Twelve days to give back what is already free, while
+    /// more arrives, is a file that only grows.
+    ///
+    /// So it asks how much is free and keeps going until the answer is small,
+    /// in chunks, taking the lock per chunk rather than for the whole run: the
+    /// connection is behind one mutex, so a single long vacuum is a stall for
+    /// every reader as well. Bounded per call, because giving back eighty
+    /// megabytes at once is not worth blocking a housekeeping pass for when
+    /// the next one is minutes away.
+    ///
+    /// Returns how many pages it handed back.
+    pub fn incremental_vacuum(&self) -> Result<usize> {
+        // ~2MB of work between chances for anybody else to use the database.
+        const CHUNK_PAGES: i64 = 512;
+        // A little slack left free on purpose: a database in steady use is
+        // always freeing and reusing a few pages, and chasing the last of them
+        // would mean vacuuming on every pass forever to no purpose.
+        const KEEP_FREE: i64 = 256;
+        // ~80MB, so one pass cannot run away on a database that has been
+        // growing untended for months.
+        const MAX_PAGES_PER_CALL: i64 = 20_000;
+
+        let mut reclaimed: i64 = 0;
+        while reclaimed < MAX_PAGES_PER_CALL {
+            let conn = self.conn.lock().unwrap();
+            let free: i64 = conn.query_row("PRAGMA freelist_count", [], |row| row.get(0))?;
+            if free <= KEEP_FREE {
+                break;
+            }
+            let take = CHUNK_PAGES.min(free - KEEP_FREE).min(MAX_PAGES_PER_CALL - reclaimed);
+            // Stepped to completion rather than run with `execute_batch`,
+            // which is how this quietly did almost nothing before. SQLite
+            // implements this pragma as a statement that frees *one page per
+            // step*; execute_batch steps once, so the old
+            // `incremental_vacuum(200)` handed back a single 4KB page per
+            // housekeeping pass, not the 200 it reads as. Measured: a freelist
+            // of 534 fell by exactly one per call.
+            let mut stmt = conn.prepare(&format!("PRAGMA incremental_vacuum({take})"))?;
+            let mut rows = stmt.query([])?;
+            while rows.next()?.is_some() {}
+            drop(rows);
+            drop(stmt);
+            // Dropped explicitly to say what the chunking is for: the next
+            // iteration takes the lock again, and between the two anything
+            // waiting on it gets a turn.
+            drop(conn);
+            reclaimed += take;
+        }
+        Ok(reclaimed as usize)
     }
 }
 
@@ -1175,6 +1259,18 @@ mod tests {
 
         assert_eq!(journal_mode(&s), "wal", "a fresh db was not created in WAL mode");
 
+        // Both, and in that order. SQLite refuses to set auto_vacuum on a
+        // database already in WAL mode and does not say so, so getting these
+        // two the wrong way round silently costs the ability to hand pages
+        // back at all - which is what incremental_vacuum exists to do.
+        let auto_vacuum: i64 = s
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .expect("asking auto_vacuum");
+        assert_eq!(auto_vacuum, 2, "2 is INCREMENTAL; 0 means the vacuum can never reclaim anything");
+
         // And the fsync-per-message setting that is the other half of it.
         let sync: i64 = s
             .conn
@@ -1225,6 +1321,62 @@ mod tests {
         let after = time(&wal, "new");
         println!("rollback+FULL {before:.2}ms per message, WAL+NORMAL {after:.2}ms per message");
         assert!(after < before, "WAL was not faster: {after:.2}ms against {before:.2}ms");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The vacuum used to hand back a flat 200 pages a pass, which against a
+    /// real scrollback's ten thousand free ones was twelve days of catching up
+    /// while more arrived. It has to clear what is actually free.
+    #[test]
+    fn the_vacuum_clears_the_freelist_rather_than_a_fixed_slice() {
+        let (s, dir) = store();
+        // Enough rows that deleting them frees well over the old 200 pages.
+        for i in 0..4000 {
+            append_saying(&s, "#chan", &format!("m{i}"), &"x".repeat(400));
+        }
+        s.prune_old_messages(10).expect("pruning");
+
+        let free = |s: &Store| -> i64 {
+            s.conn
+                .lock()
+                .unwrap()
+                .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+                .expect("asking the freelist")
+        };
+        let before = free(&s);
+        assert!(before > 200, "the fixture freed only {before} pages - it cannot show the difference");
+
+        let reclaimed = s.incremental_vacuum().expect("vacuuming");
+        let after = free(&s);
+        assert!(
+            reclaimed as i64 >= before - 256,
+            "handed back {reclaimed} of {before} free pages"
+        );
+        assert!(after <= 256, "{after} pages still free after a vacuum");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An account that is removed has to take its messages with it: left
+    /// behind, they reappear under an account added with the same id, as
+    /// somebody else's conversation.
+    #[test]
+    fn forgetting_an_account_takes_its_messages_and_nobody_elses() {
+        let (s, dir) = store();
+        append(&s, "matrix:@a:server|!room", "m1");
+        append(&s, "matrix:@a:server|!other", "m2");
+        // A second account whose id begins with the first one's, which is the
+        // case a naive prefix match gets wrong.
+        append(&s, "matrix:@a:server.uk|!room", "m3");
+        append(&s, "irc:libera|#chat", "m4");
+
+        let gone = s.forget_account("matrix:@a:server").expect("forgetting");
+        assert_eq!(gone, 2, "should have taken exactly its own two");
+
+        let left = |buffer: &str| s.get_backlog(buffer, 50, 0).expect("backlog").len();
+        assert_eq!(left("matrix:@a:server|!room"), 0);
+        assert_eq!(left("matrix:@a:server|!other"), 0);
+        assert_eq!(left("matrix:@a:server.uk|!room"), 1, "a different account was emptied");
+        assert_eq!(left("irc:libera|#chat"), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

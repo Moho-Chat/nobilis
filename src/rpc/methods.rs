@@ -534,6 +534,31 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                // And everything else this process is holding about it: the
+                // seventy-odd maps keyed by the account or by one of its
+                // buffers. In memory only, so it mattered exactly when
+                // somebody removed an account and added it again without
+                // restarting - which is what removing it was usually an
+                // attempt to fix.
+                state.runtime.forget_account(id);
+                // The scrollback, which is the largest thing left behind: ten
+                // thousand messages for one account here. Left in place they
+                // reappear under an account added with the same id, as the
+                // old conversation rather than the new one.
+                match state.store.forget_account(id) {
+                    Ok(0) => {}
+                    Ok(rows) => tracing::info!("removed {rows} stored row(s) for {id}"),
+                    Err(e) => tracing::warn!("could not clear the scrollback for {id}: {e}"),
+                }
+                // The Matrix crypto store: device keys and Olm sessions, which
+                // are what make this installation *that device*. Adding the
+                // account again with these still here adopts a device the
+                // homeserver may have forgotten, holding sessions with people
+                // whose keys have moved on - which looks like a room that will
+                // not decrypt.
+                if id.starts_with("matrix:") {
+                    backend::matrix::crypto::forget(&crate::default_data_dir(), id);
+                }
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
@@ -1037,6 +1062,97 @@ pub async fn dispatch(
             match backend::discord::open_dm_with(state, account_id, &user_ids).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
                 Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Recording somebody speaking, and sending it as the thing Discord
+        // calls a voice message rather than as a sound file.
+        //
+        // Three calls rather than one because it is three moments: a person
+        // starts talking, then decides whether what they said is worth
+        // sending. The microphone is process-wide - there is one - so none of
+        // these take an account.
+        "startVoiceMessage" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("startVoiceMessage requires \"bufferId\"".to_string()));
+            };
+            if state.runtime.get_buffer(buffer_id).is_none() {
+                return (None, Some("no such buffer".to_string()));
+            }
+            // The device the calls settings already chose, so there is not a
+            // second answer to "which microphone" to get wrong.
+            let device = state.voice_prefs.get().input;
+            match crate::voicenote::start(buffer_id, device.as_deref().filter(|d| !d.is_empty())) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        /// How long it has been running and whether the microphone is hearing
+        /// anything - polled by the window rather than pushed, because it is
+        /// only wanted while somebody is watching a timer.
+        "voiceMessageProgress" => match crate::voicenote::progress() {
+            None => (Some(serde_json::json!({ "recording": false })), None),
+            Some(p) => (
+                Some(serde_json::json!({
+                    "recording": true,
+                    "bufferId": p.buffer_id,
+                    "seconds": p.seconds,
+                    "level": p.level,
+                })),
+                None,
+            ),
+        },
+
+        "cancelVoiceMessage" => (Some(serde_json::json!({ "wasRecording": crate::voicenote::cancel() })), None),
+
+        "sendVoiceMessage" => {
+            let finished = match crate::voicenote::finish() {
+                Ok(f) => f,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            let Some(buffer) = state.runtime.get_buffer(&finished.buffer_id) else {
+                let _ = std::fs::remove_file(&finished.path);
+                return (None, Some("the conversation this was recorded for is gone".to_string()));
+            };
+            // Whichever service the conversation belongs to. The recording
+            // itself knows nothing about either - it is a microphone and some
+            // samples - and the two services want the same thing said
+            // differently: a flag and base64 bytes on Discord, an MSC3245
+            // marker and integers on Matrix.
+            let result = if let Some(cfg) = state.accounts.get_discord(&buffer.account_id) {
+                backend::discord::send_voice_message(
+                    state,
+                    &finished.buffer_id,
+                    &cfg.token,
+                    &finished.path,
+                    finished.duration_secs,
+                    &finished.waveform,
+                )
+                .await
+            } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
+                backend::matrix::send_voice_message(
+                    state,
+                    &buffer.account_id,
+                    &finished.buffer_id,
+                    &cfg.access_token,
+                    &finished.path,
+                    finished.duration_secs,
+                    &finished.waveform_bytes,
+                )
+                .await
+            } else {
+                let _ = std::fs::remove_file(&finished.path);
+                return (None, Some("this service has no voice messages".to_string()));
+            };
+            // Sent or not, the recording has served its purpose on disk.
+            let _ = std::fs::remove_file(&finished.path);
+            match result {
+                Ok(()) => (
+                    Some(serde_json::json!({ "durationSecs": finished.duration_secs })),
+                    None,
+                ),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
