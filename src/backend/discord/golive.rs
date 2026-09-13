@@ -247,10 +247,89 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         return;
     };
     tracing::info!("discord[{account_id}]: stream {stream_key} is ready to connect");
-    // The connection itself is not opened from here yet - see the module's
-    // own comment. What is held is enough to open it the moment there is
-    // something to open it with.
-    let _ = ready;
+
+    // The account's own session, not a new one: a stream is one account in
+    // one place sending a second thing, and it identifies with the session
+    // the voice connection already made.
+    let Some(session_id) = state.voice.session_id(account_id) else {
+        tracing::warn!("discord[{account_id}]: a stream arrived with no voice session to attach it to");
+        return;
+    };
+    let Some(user) = own else { return };
+    // The server the stream is on, which is its own rather than the guild's.
+    let server_id = ready
+        .rtc_server_id
+        .clone()
+        .or_else(|| StreamKey::parse(stream_key).map(|k| k.guild_id.unwrap_or(k.channel_id)))
+        .unwrap_or_default();
+
+    match super::streamconn::connect(
+        state,
+        account_id,
+        ready.endpoint.as_deref().unwrap_or_default(),
+        ready.token.as_deref().unwrap_or_default(),
+        &server_id,
+        &session_id,
+        &user,
+    )
+    .await
+    {
+        Ok(sender) => {
+            senders().lock().unwrap().insert(account_id.to_string(), sender);
+            state.events.emit(
+                "discordStream",
+                json!({ "accountId": account_id, "streamKey": stream_key, "own": true, "ready": true }),
+            );
+            // A stream created while nobody is watching starts paused, and
+            // sending into a paused stream is sending into nothing - so this
+            // says outright that there is a picture to have.
+            let _ = set_paused(state, account_id, stream_key, false);
+        }
+        Err(e) => {
+            tracing::warn!("discord[{account_id}]: the stream connection failed: {e:#}");
+            state.events.emit(
+                "discordStream",
+                json!({ "accountId": account_id, "streamKey": stream_key, "own": true, "error": e.to_string() }),
+            );
+        }
+    }
+}
+
+/// The live stream connections, by account.
+///
+/// One at a time: Discord's own client shares one screen, and a second stream
+/// from one account would need a second connection and a second key for no
+/// gain anybody has asked for.
+fn senders() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>>
+{
+    static SENDERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>>,
+    > = std::sync::OnceLock::new();
+    SENDERS.get_or_init(Default::default)
+}
+
+/// Puts one encoded frame on the wire.
+///
+/// The encoding happens in the window - Chromium has the encoders and this
+/// process has none - so what arrives here is already a VP8 frame and all
+/// that is left is to packetise, seal and send it. The same division the
+/// Matrix calls draw from the other side.
+pub async fn send_frame(account_id: &str, frame: &[u8], timestamp_micros: i64) -> Result<()> {
+    let sender = senders().lock().unwrap().get(account_id).cloned();
+    let sender = sender.context("no stream is running for this account")?;
+    sender.send_frame(frame, timestamp_micros).await
+}
+
+/// Whether this account has a stream connection ready for frames.
+pub fn sending(account_id: &str) -> bool {
+    senders().lock().unwrap().contains_key(account_id)
+}
+
+/// Closes the connection, without telling the gateway - `stop` does that.
+pub fn close(account_id: &str) {
+    if let Some(sender) = senders().lock().unwrap().remove(account_id) {
+        sender.stop();
+    }
 }
 
 /// A stream that has ended, ours or anybody's.
@@ -277,6 +356,7 @@ pub fn held(account_id: &str, stream_key: &str) -> Option<PendingStream> {
 pub fn forget(account_id: &str) {
     let prefix = format!("{account_id}|");
     pending().lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
+    close(account_id);
 }
 
 #[cfg(test)]

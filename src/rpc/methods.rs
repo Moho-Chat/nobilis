@@ -4280,6 +4280,70 @@ pub async fn dispatch(
             }
         }
 
+        // Sharing a screen into a Discord call. The gateway is asked for a
+        // stream; the connection it answers with is opened in the
+        // background, and frames follow once it is up.
+        "startDiscordScreenShare" | "stopDiscordScreenShare" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let account_id = buffer.account_id.clone();
+            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                return (None, Some("that conversation has no channel".to_string()));
+            };
+            let guild_id = state.runtime.get_discord_guild(buffer_id);
+            let user_id = state.accounts.get_discord(&account_id).map(|a| a.user_id).unwrap_or_default();
+            let key = backend::discord::golive::StreamKey {
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.clone(),
+                user_id,
+            };
+            let result = if method == "startDiscordScreenShare" {
+                backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
+            } else {
+                backend::discord::golive::close(&account_id);
+                backend::discord::golive::stop(state, &account_id, &key.to_wire())
+            };
+            match result {
+                Ok(()) => (Some(serde_json::json!({ "streamKey": key.to_wire() })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // One encoded frame, from the window that captured and encoded it.
+        // Chromium has the encoders and this process has none, which is the
+        // same division the Matrix calls draw from the other side.
+        "sendDiscordVideoFrame" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("sendDiscordVideoFrame requires \"accountId\"".to_string()));
+            };
+            let Some(frame) = params.get("frame").and_then(|v| v.as_str()) else {
+                return (None, Some("sendDiscordVideoFrame requires \"frame\"".to_string()));
+            };
+            let timestamp = params.get("timestampMicros").and_then(|v| v.as_i64()).unwrap_or(0);
+            use base64::Engine;
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(frame) else {
+                return (None, Some("that frame is not base64".to_string()));
+            };
+            match backend::discord::golive::send_frame(account_id, &bytes, timestamp).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Whether the stream connection is up and wants frames. The window
+        // asks before it starts encoding, so a capture is not opened against
+        // a connection that never arrived.
+        "discordScreenShareReady" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordScreenShareReady requires \"accountId\"".to_string()));
+            };
+            (Some(serde_json::json!({ "ready": backend::discord::golive::sending(account_id) })), None)
+        }
+
         // The addresses that can reach this account - an email for password
         // recovery, a phone somebody gave the server years ago. Neither
         // could be seen, added or removed from here.
