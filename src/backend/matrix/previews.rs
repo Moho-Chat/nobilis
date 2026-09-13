@@ -61,10 +61,15 @@ pub(super) async fn fetch_account_setting(state: &AppState, account_id: &str, ho
 /// somebody posted rather than an index of it - Element shows one too.
 pub fn first_link(body: &str) -> Option<&str> {
     body.split_whitespace()
+        // The punctuation around a link belongs to the sentence rather than
+        // to the address, at both ends: "(see https://example.org)" is a link
+        // to example.org, and a word starting with a bracket is still a word
+        // with a link in it.
+        .map(|word| {
+            word.trim_start_matches(|c| matches!(c, '(' | '[' | '<' | '"' | '\''))
+                .trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | '>' | '!' | '?' | ';' | ':' | '"' | '\''))
+        })
         .find(|word| word.starts_with("https://") || word.starts_with("http://"))
-        // Trailing punctuation belongs to the sentence, not to the URL:
-        // "look at https://example.org." is a link to example.org.
-        .map(|word| word.trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | '!' | '?' | ';' | ':' | '"' | '\'')))
         .filter(|url| url.len() > "https://".len())
 }
 
@@ -158,7 +163,9 @@ mod tests {
         assert_eq!(first_link("look at https://example.org/page"), Some("https://example.org/page"));
         // The full stop ends the sentence, not the address.
         assert_eq!(first_link("see https://example.org."), Some("https://example.org"));
-        assert_eq!(first_link("(https://example.org/a)"), Some("(https://example.org/a"));
+        // And the bracket around it belongs to the sentence at both ends.
+        assert_eq!(first_link("(https://example.org/a)"), Some("https://example.org/a"));
+        assert_eq!(first_link("<https://example.org>"), Some("https://example.org"));
         // First of several: a card is a glance at what somebody posted, not
         // an index of it.
         assert_eq!(first_link("https://one.example https://two.example"), Some("https://one.example"));
