@@ -77,78 +77,6 @@ fn parse_args() -> Options {
     Options { data_dir, socket_path }
 }
 
-/// One-time move of this daemon's cache from the directory it used while it
-/// was still called `chatd` and lived inside the moho repository.
-///
-/// Runs before the singleton lock is taken, so nothing is holding files open
-/// in either directory yet. Deliberately conservative: it only ever moves a
-/// directory into a destination that does not exist, so a second run, a
-/// partially-completed move, or a fresh install with no old data all reduce to
-/// no-ops rather than clobbering anything.
-///
-/// The config half of this used to be here and is gone, because the path it
-/// read is not this daemon's any more: `~/.config/moho` is Electron's own
-/// userData directory for the client - Cookies, Crashpad, blob storage, and
-/// the client's preferences - live on any normal install. Moving it into the
-/// data directory takes the client's entire stored state away silently, and
-/// the client then starts with defaults and no explanation.
-///
-/// Checking the source for a marker like `accounts.toml` first was the
-/// obvious repair and does not work, because on the one machine that would
-/// still have old daemon state there, the daemon's files and Electron's are
-/// *in the same directory* - the old daemon wrote to the path Electron now
-/// uses. A rename cannot take one and leave the other.
-///
-/// So it is dropped rather than gated. Anyone who still has daemon state at
-/// `~/.config/moho` some years on still has it: nothing here deletes it, and
-/// `accounts.toml` and `matrix-crypto/` can be moved across by hand. That is a
-/// worse outcome for nobody in practice and a far better one than eating a
-/// live directory, which is silent, and whose payload - saved credentials and
-/// a Matrix crypto store - is exactly what this function was written to
-/// protect.
-fn migrate_from_moho_dirs(data_dir: &std::path::Path) {
-    let _ = data_dir;
-    let Some(home) = dirs::home_dir() else { return };
-    let cache_root = dirs::cache_dir().unwrap_or_else(|| home.join(".cache"));
-
-    for (label, old, new) in moho_dir_migrations(&cache_root) {
-        if !old.is_dir() || new.exists() {
-            continue;
-        }
-        if let Some(parent) = new.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                tracing::warn!("could not create {} while migrating {label}: {e}", parent.display());
-                continue;
-            }
-        }
-        // A plain rename: both paths are under the same root in every normal
-        // install, and unlike a copy it cannot leave two diverging copies
-        // behind if it fails halfway.
-        match std::fs::rename(&old, &new) {
-            Ok(()) => tracing::info!("migrated {label} from {} to {}", old.display(), new.display()),
-            Err(e) => tracing::warn!(
-                "could not migrate {label} from {} to {}: {e} - starting with an empty {}",
-                old.display(),
-                new.display(),
-                new.display()
-            ),
-        }
-    }
-}
-
-/// Which directories this will move, and to where.
-///
-/// Split out from the move itself so the list can be asserted about without a
-/// test that renames anything in somebody's home directory - and the thing
-/// worth asserting is what is *not* in it.
-fn moho_dir_migrations(
-    cache_root: &std::path::Path,
-) -> Vec<(&'static str, std::path::PathBuf, std::path::PathBuf)> {
-    // Caches only. This one is safe to move where the config one was not:
-    // Electron keeps its cache inside its userData directory, not here.
-    vec![("cache", cache_root.join("moho"), cache_root.join("nobilis"))]
-}
-
 /// Cuts every buffer back to the cap, and gives the space back.
 ///
 /// Split from the cache sweeps above so it can run on its own cadence. The
@@ -324,7 +252,14 @@ async fn run() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let opts = parse_args();
-    migrate_from_moho_dirs(&opts.data_dir);
+    // There is deliberately no migration from the directories this daemon used
+    // when it was called `chatd` and lived in the moho repository. Both halves
+    // of it named a path the *client* now owns - `~/.config/moho` is Electron's
+    // userData, and `~/.cache/moho` is where the client writes its log - so
+    // each was a rename of somebody else's live directory waiting for the day
+    // the destination happened not to exist. Old state at either path is left
+    // where it is; caches are re-derivable, and accounts.toml and
+    // matrix-crypto/ can be carried across by hand.
     std::fs::create_dir_all(&opts.data_dir)
         .with_context(|| format!("creating {}", opts.data_dir.display()))?;
 
@@ -473,46 +408,5 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::moho_dir_migrations;
-
-    /// The config half of this migration once renamed `~/.config/moho` into
-    /// the data directory. That is Electron's own userData directory for the
-    /// client - its cookies, its crash reports, its preferences - so any run
-    /// with a data directory that did not exist yet, a `--data-dir` pointing
-    /// somewhere new among them, took the client's whole stored state away
-    /// without saying anything.
-    ///
-    /// Asserted as an absence, because that is what the fix is: no migration
-    /// may ever name a directory under `.config` as a source.
-    #[test]
-    fn nothing_under_config_is_ever_moved() {
-        let cache_root = std::path::Path::new("/home/somebody/.cache");
-        let sources: Vec<_> = moho_dir_migrations(cache_root).into_iter().map(|(_, old, _)| old).collect();
-
-        assert!(!sources.is_empty(), "the cache migration is still wanted");
-        for source in sources {
-            assert!(
-                !source.components().any(|c| c.as_os_str() == ".config"),
-                "{} is somebody else's directory to move",
-                source.display()
-            );
-        }
-    }
-
-    /// And the half that remains still does its job: Electron keeps its cache
-    /// inside userData rather than here, so this path really is the old
-    /// daemon's and nobody else's.
-    #[test]
-    fn the_old_cache_still_moves_to_the_new_one() {
-        let cache_root = std::path::Path::new("/home/somebody/.cache");
-        let moves = moho_dir_migrations(cache_root);
-        assert_eq!(moves.len(), 1);
-        assert_eq!(moves[0].1, cache_root.join("moho"));
-        assert_eq!(moves[0].2, cache_root.join("nobilis"));
     }
 }
