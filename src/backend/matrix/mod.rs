@@ -82,6 +82,7 @@ pub mod http;
 pub mod markup;
 pub mod moderation;
 pub mod permalinks;
+pub mod peek;
 pub mod policy;
 pub mod polls;
 pub mod calls;

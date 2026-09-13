@@ -814,6 +814,19 @@ mod live {
             Err(e) => println!("preview_url: unavailable on this server ({e})"),
         }
 
+        // Looking into a room without joining it. Two halves, permitted
+        // separately: the summary is answered for anything the server can
+        // reach, while reading the conversation needs the homeserver to allow
+        // peeking - and many, Synapse's own default among them, do not.
+        let hq = url::form_urlencoded::byte_serialize(b"#matrix:matrix.org").collect::<String>();
+        match http::get_json(&format!("{base}/_matrix/client/v1/room_summary/{hq}"), &token).await {
+            Ok(summary) => println!(
+                "room summary: {:?}, {} members, world_readable {}",
+                summary["name"], summary["num_joined_members"], summary["world_readable"]
+            ),
+            Err(e) => println!("room summary: unavailable ({e})"),
+        }
+
         let _ = http::post_json(
             &format!("{base}/_matrix/client/v3/rooms/{escaped_room}/leave"),
             Some(&token),

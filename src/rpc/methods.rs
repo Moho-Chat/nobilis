@@ -4393,6 +4393,37 @@ pub async fn dispatch(
             }
         }
 
+        // Looking into a room before deciding to be in it. Joining is a
+        // membership event everybody in the room can see, so without this
+        // the decision to look and the decision to join were the same act.
+        "matrixRoomSummary" => {
+            let (account_id, room) = match (p_str_opt(params, "accountId"), p_str_opt(params, "room")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some("matrixRoomSummary requires \"accountId\" and \"room\"".to_string())),
+            };
+            let via: Vec<String> = params
+                .get("via")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::matrix::peek::summary(state, account_id, room, &via).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "matrixPeekRoom" => {
+            let (account_id, room_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomId")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some("matrixPeekRoom requires \"accountId\" and \"roomId\"".to_string())),
+            };
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as u32;
+            match backend::matrix::peek::recent(state, account_id, room_id, limit).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // What a room refuses and whose judgement it follows: its server
         // ACL, the policy rules it publishes, and the policy server it
         // defers to. Read on demand - all three are rare, and an ACL's whole
