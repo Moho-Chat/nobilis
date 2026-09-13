@@ -87,6 +87,7 @@ pub mod sliding;
 pub mod dehydration;
 pub mod ssss;
 pub mod stickers;
+pub mod tags;
 pub mod rooms;
 pub mod verification;
 

@@ -4255,6 +4255,24 @@ pub async fn dispatch(
             (Some(serde_json::json!(filled)), None)
         }
 
+        // How the account files a room: starred to the top, pushed to the
+        // bottom, or neither. Per-room account data, so it travels - which is
+        // the point, and why this is not the window's own pin.
+        "setMatrixRoomTag" => {
+            let (buffer_id, tag) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "tag")) {
+                (Some(b), Some(t)) => (b, t),
+                _ => return (None, Some("setMatrixRoomTag requires \"bufferId\" and \"tag\"".to_string())),
+            };
+            let on = params.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::tags::set(state, &buffer.account_id, buffer_id, tag, on).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // The account's own stickers, from the packs it carries and the ones
         // its rooms share.
         "listMatrixStickers" => {

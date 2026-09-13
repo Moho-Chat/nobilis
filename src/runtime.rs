@@ -1360,6 +1360,10 @@ impl Runtime {
             // Whichever backend knows says so; a buffer is not muted until
             // the service tells us it is.
             server_muted: false,
+            // Likewise: the account's own filing arrives with the room's
+            // tags, which is after the buffer exists.
+            favourite: false,
+            low_priority: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -1373,6 +1377,32 @@ impl Runtime {
     /// account newly calls a direct message - `m.direct` can be written from
     /// another client at any time, and a conversation that was an ordinary
     /// room a moment ago belongs with the conversations from now on.
+    /// How the account itself has filed this conversation: starred, pushed
+    /// down, or neither.
+    ///
+    /// Both at once because they arrive together - `m.tag` is one event
+    /// listing every tag a room has - and because they are mutually
+    /// exclusive in practice: setting one in Element clears the other, and
+    /// applying them one at a time would draw a room as both for an instant.
+    pub fn set_buffer_tags(&self, state: &AppState, buffer_id: &str, favourite: bool, low_priority: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.favourite == favourite && buffer.low_priority == low_priority {
+                return;
+            }
+            buffer.favourite = favourite;
+            buffer.low_priority = low_priority;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// What this conversation is currently filed as.
+    pub fn buffer_tags(&self, buffer_id: &str) -> (bool, bool) {
+        self.buffers.lock().unwrap().get(buffer_id).map(|b| (b.favourite, b.low_priority)).unwrap_or((false, false))
+    }
+
     pub fn set_buffer_kind(&self, state: &AppState, buffer_id: &str, kind: &str) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();

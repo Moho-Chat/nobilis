@@ -170,6 +170,11 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
         tracing::debug!("matrix[{account_id}]: pending invites: {e:#}");
     }
 
+    // And how the account has filed its rooms - see tags::fetch.
+    if let Err(e) = tags::fetch(state, account_id, &config.homeserver_url, &access_token).await {
+        tracing::debug!("matrix[{account_id}]: room tags: {e:#}");
+    }
+
     // And what this account has asked to be told about - see fetch_push_rules.
     fetch_push_rules(state, account_id, &config.homeserver_url, &access_token).await;
     // And who it has asked never to hear from.
@@ -731,6 +736,15 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
 
         let buffer = state.runtime.ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
         state.runtime.set_matrix_room(state, &buffer.id, room_id);
+
+        // How the account has filed this room. Read every sync because it is
+        // set from any client, and after the buffer exists because it is the
+        // buffer this moves in the rail.
+        for event in room["account_data"]["events"].as_array().into_iter().flatten() {
+            if event["type"].as_str() == Some("m.tag") {
+                tags::apply(state, account_id, room_id, &event["content"]);
+            }
+        }
 
         // A room can be added to a space at any time, and a space seen after
         // this room was first synced only records the mapping - so this is
