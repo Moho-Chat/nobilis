@@ -81,6 +81,7 @@ pub mod polls;
 pub mod calls;
 pub mod protocol;
 pub mod roomstate;
+pub mod widgets;
 pub mod sliding;
 pub mod dehydration;
 pub mod ssss;

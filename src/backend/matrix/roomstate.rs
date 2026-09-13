@@ -22,7 +22,7 @@
 //! cached: the joined-member roster, power levels (sort key), and presence
 //! (online/offline split) - called any time one of those three changes.
 
-use super::{cached_media_path, moderation, protocol};
+use super::{cached_media_path, moderation, protocol, widgets};
 use crate::model;
 use crate::state::AppState;
 use serde_json::Value;
@@ -42,6 +42,30 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // messages themselves are looked up when somebody asks to see
             // them, because a pin can point at something said years before
             // this client ever joined.
+            // Whatever the room has hung on its wall: a jitsi, an etherpad,
+            // a whiteboard, a dashboard. Two spellings because the state
+            // event has an old name and a new one and rooms carry both -
+            // Element writes the `im.vector.modular.widgets` form to this
+            // day, and reads either.
+            //
+            // The state key is the widget's id, and content going empty is
+            // how one is taken down: a widget is removed by replacing it
+            // with `{}`, because state events cannot be deleted.
+            "im.vector.modular.widgets" | "m.widget" => {
+                let Some(id) = event["state_key"].as_str().filter(|s| !s.is_empty()) else { continue };
+                let widget = widgets::read(id, &event["content"]);
+                state.runtime.set_matrix_widget(account_id, room_id, id, widget);
+                if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
+                    state.events.emit(
+                        "matrixWidgets",
+                        serde_json::json!({
+                            "bufferId": buffer_id,
+                            "widgets": state.runtime.matrix_widgets(account_id, room_id),
+                        }),
+                    );
+                }
+            }
+
             "m.room.pinned_events" => {
                 let pinned: Vec<String> = event["content"]["pinned"]
                     .as_array()

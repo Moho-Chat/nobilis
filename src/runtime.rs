@@ -691,6 +691,12 @@ pub struct Runtime {
     /// server, and a pin outliving the message it points at is a normal state
     /// rather than a broken one.
     matrix_pinned: Mutex<HashMap<(String, String), Vec<String>>>,
+    /// (account, room) -> what the room has hung on its wall, by widget id.
+    ///
+    /// Kept by id rather than as a list because a widget is a state event:
+    /// what arrives is one of them changing, and it is removed by its content
+    /// being emptied rather than by anything saying it went away.
+    matrix_widgets: Mutex<HashMap<(String, String), std::collections::BTreeMap<String, serde_json::Value>>>,
     /// Matrix-specific: (account id, room id) -> {user id -> display name}
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
@@ -1018,6 +1024,7 @@ impl Runtime {
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
+            matrix_widgets: Mutex::new(HashMap::new()),
             matrix_verification_peers: Mutex::new(HashMap::new()),
             matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
@@ -2652,6 +2659,32 @@ impl Runtime {
 
     pub fn matrix_verification_peers(&self, account_id: &str) -> HashSet<String> {
         self.matrix_verification_peers.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Records a widget, or takes it down when its content was emptied.
+    pub fn set_matrix_widget(&self, account_id: &str, room_id: &str, widget_id: &str, widget: Option<serde_json::Value>) {
+        let mut held = self.matrix_widgets.lock().unwrap();
+        let room = held.entry((account_id.to_string(), room_id.to_string())).or_default();
+        match widget {
+            Some(widget) => {
+                room.insert(widget_id.to_string(), widget);
+            }
+            None => {
+                room.remove(widget_id);
+            }
+        }
+    }
+
+    /// What a room is carrying, in a stable order - a list that reshuffles
+    /// itself every time a room's state is re-read is a list nobody can point
+    /// at.
+    pub fn matrix_widgets(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
+        self.matrix_widgets
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .map(|room| room.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {
@@ -4504,9 +4537,11 @@ impl Runtime {
     /// added again in the same session, which is exactly when somebody is
     /// most likely to be trying to fix something.
     ///
-    /// Swept rather than enumerated, on the rule in `belongs_to` above, so a
-    /// map added later is covered by this the day it is added rather than the
-    /// day somebody remembers to add it here.
+    /// Swept on the rule in `belongs_to` above rather than by knowing what
+    /// each map means, which is what makes seventy-odd of them tractable: the
+    /// rule never needs revisiting, only the list of fields does. That list is
+    /// not automatic - a map added to this struct has to be added here too, or
+    /// it is the one thing an account leaves behind.
     pub fn forget_account(&self, account_id: &str) {
         macro_rules! sweep {
             ($($field:ident),* $(,)?) => {
@@ -4549,7 +4584,7 @@ impl Runtime {
             matrix_room_avatars, matrix_power_levels, matrix_pinned,
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
-            matrix_own_reactions, irc_splits,
+            matrix_own_reactions, irc_splits, matrix_widgets,
         );
     }
 }
@@ -4557,6 +4592,33 @@ impl Runtime {
 #[cfg(test)]
 mod forget_tests {
     use super::belongs_to;
+
+    /// Every map in the struct has to be in the sweep, and the list is
+    /// hand-written - so this reads both and says which was forgotten.
+    ///
+    /// Source-reading in a test is unusual and earns its place here: the cost
+    /// of a missing field is an account that leaves something behind, and the
+    /// failure is silent in exactly the way the whole change exists to stop.
+    #[test]
+    fn every_map_is_swept_when_an_account_is_forgotten() {
+        let src = include_str!("runtime.rs");
+        let start = src.find("pub struct Runtime {").expect("the struct");
+        let end = src[start..].find("\n}").expect("its end") + start;
+        let fields: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                let name = line.split(": Mutex<HashMap<").next()?;
+                (line.contains(": Mutex<HashMap<") && !name.contains(' ')).then_some(name)
+            })
+            .collect();
+        assert!(fields.len() > 70, "found only {} maps - the parse is wrong", fields.len());
+
+        let sweep = src.find("pub fn forget_account").expect("the sweep");
+        let sweep_body = &src[sweep..sweep + 4000];
+        let missing: Vec<&&str> = fields.iter().filter(|f| !sweep_body.contains(**f)).collect();
+        assert!(missing.is_empty(), "these maps would survive removing an account: {missing:?}");
+    }
 
     /// The whole of forgetting an account rests on this one test, so it is
     /// worth being explicit about what it must and must not match.

@@ -4218,6 +4218,43 @@ pub async fn dispatch(
 
         // A room's own name and topic. Two state events with one shape, which
         // is why they share a method rather than having one each.
+        // What a room has hung on its wall: a jitsi, an etherpad, a
+        // whiteboard, a dashboard somebody wrote.
+        //
+        // Answered with the url already filled in, because the caller has no
+        // business knowing that a widget url carries $matrix_ variables - and
+        // because filling them needs the account's own id, which is here and
+        // not there.
+        "listMatrixWidgets" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixWidgets requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+                return (Some(serde_json::json!([])), None);
+            };
+            let user_id = state
+                .accounts
+                .get_matrix(&buffer.account_id)
+                .map(|a| a.user_id)
+                .unwrap_or_default();
+            let filled: Vec<serde_json::Value> = state
+                .runtime
+                .matrix_widgets(&buffer.account_id, &room_id)
+                .into_iter()
+                .map(|mut widget| {
+                    if let (Some(url), Some(id)) = (widget["url"].as_str(), widget["id"].as_str()) {
+                        let opened = backend::matrix::widgets::fill(url, &user_id, &room_id, id);
+                        widget["url"] = serde_json::json!(opened);
+                    }
+                    widget
+                })
+                .collect();
+            (Some(serde_json::json!(filled)), None)
+        }
+
         // The account's own stickers, from the packs it carries and the ones
         // its rooms share.
         "listMatrixStickers" => {
