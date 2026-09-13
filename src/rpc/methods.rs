@@ -1040,6 +1040,80 @@ pub async fn dispatch(
             }
         }
 
+        // Recording somebody speaking, and sending it as the thing Discord
+        // calls a voice message rather than as a sound file.
+        //
+        // Three calls rather than one because it is three moments: a person
+        // starts talking, then decides whether what they said is worth
+        // sending. The microphone is process-wide - there is one - so none of
+        // these take an account.
+        "startVoiceMessage" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("startVoiceMessage requires \"bufferId\"".to_string()));
+            };
+            if state.runtime.get_buffer(buffer_id).is_none() {
+                return (None, Some("no such buffer".to_string()));
+            }
+            // The device the calls settings already chose, so there is not a
+            // second answer to "which microphone" to get wrong.
+            let device = state.voice_prefs.get().input;
+            match crate::voicenote::start(buffer_id, device.as_deref().filter(|d| !d.is_empty())) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        /// How long it has been running and whether the microphone is hearing
+        /// anything - polled by the window rather than pushed, because it is
+        /// only wanted while somebody is watching a timer.
+        "voiceMessageProgress" => match crate::voicenote::progress() {
+            None => (Some(serde_json::json!({ "recording": false })), None),
+            Some(p) => (
+                Some(serde_json::json!({
+                    "recording": true,
+                    "bufferId": p.buffer_id,
+                    "seconds": p.seconds,
+                    "level": p.level,
+                })),
+                None,
+            ),
+        },
+
+        "cancelVoiceMessage" => (Some(serde_json::json!({ "wasRecording": crate::voicenote::cancel() })), None),
+
+        "sendVoiceMessage" => {
+            let finished = match crate::voicenote::finish() {
+                Ok(f) => f,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            let Some(buffer) = state.runtime.get_buffer(&finished.buffer_id) else {
+                let _ = std::fs::remove_file(&finished.path);
+                return (None, Some("the conversation this was recorded for is gone".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
+                let _ = std::fs::remove_file(&finished.path);
+                return (None, Some("voice messages are a Discord thing for now".to_string()));
+            };
+            let result = backend::discord::send_voice_message(
+                state,
+                &finished.buffer_id,
+                &cfg.token,
+                &finished.path,
+                finished.duration_secs,
+                &finished.waveform,
+            )
+            .await;
+            // Sent or not, the recording has served its purpose on disk.
+            let _ = std::fs::remove_file(&finished.path);
+            match result {
+                Ok(()) => (
+                    Some(serde_json::json!({ "durationSecs": finished.duration_secs })),
+                    None,
+                ),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "addToDiscordGroupDm" | "removeFromDiscordGroupDm" => {
             let (account_id, buffer_id, user_id) = match (
                 p_str_opt(params, "accountId"),

@@ -9,6 +9,7 @@ mod ignores;
 mod ipc;
 mod model;
 mod net;
+mod oggopus;
 mod profile;
 mod rpc;
 mod runtime;
@@ -16,6 +17,7 @@ mod secure;
 mod state;
 mod store;
 mod upload;
+mod voicenote;
 
 use accounts::AccountStore;
 use anyhow::{bail, Context, Result};
