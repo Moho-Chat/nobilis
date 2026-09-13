@@ -196,7 +196,112 @@ impl Store {
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique ON messages(buffer_id, msg_id)",
             [],
         );
+        // Which Matrix reaction events have been counted, so counting one
+        // twice is impossible rather than merely unlikely.
+        //
+        // A reaction used to be a number that incoming events nudged up and
+        // down. That is only correct if every event arrives exactly once, and
+        // Matrix makes no such promise: an initial sync replays the recent
+        // timeline, so every reconnect re-delivered the same reactions and
+        // added them again. Against a homeserver that was flapping, one
+        // message in a busy room reached a count of 33,224.
+        //
+        // Keyed by the reaction's own event id, the arithmetic disappears: the
+        // count is how many distinct reaction events are on record, and seeing
+        // one twice changes nothing. It is on disk rather than in memory for
+        // the same reason - the duplicates arrive *across* restarts, which is
+        // exactly when an in-memory guard is empty.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS matrix_reactions (
+                 event_id TEXT PRIMARY KEY,
+                 buffer_id TEXT NOT NULL,
+                 msg_id TEXT NOT NULL,
+                 emoji TEXT NOT NULL,
+                 is_me INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idx_matrix_reactions_msg ON matrix_reactions(buffer_id, msg_id);",
+        );
+
+        // One-time repair of the counts the old arithmetic left behind.
+        //
+        // They cannot be corrected, only cleared: what is stored is a running
+        // total with no record of what it was counting, so there is nothing to
+        // recompute it from. Clearing them puts every Matrix message at zero,
+        // and the table above refills honestly as reactions are seen again.
+        // Losing a real reaction count is a smaller wrong than showing 33,224
+        // of them, and only Matrix is touched - Discord's counts come from its
+        // own message snapshots and were never inflated.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+        if version < 1 {
+            match conn.execute("UPDATE messages SET reactions = '[]' WHERE buffer_id LIKE 'matrix:%' AND reactions <> '[]'", []) {
+                Ok(n) if n > 0 => tracing::info!("scrollback: cleared inflated reaction counts on {n} Matrix message(s)"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("scrollback: could not clear old reaction counts: {e}"),
+            }
+            let _ = conn.execute_batch("PRAGMA user_version = 1;");
+        }
+
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// The reactions on one message, counted from the events on record.
+    ///
+    /// The single place that turns reaction events into the numbers a client
+    /// draws, so add and remove cannot disagree about what a count means.
+    fn recount_matrix_reactions(conn: &Connection, buffer_id: &str, msg_id: &str) -> Result<Vec<Reaction>> {
+        let mut stmt = conn.prepare(
+            "SELECT emoji, COUNT(*), MAX(is_me) FROM matrix_reactions
+             WHERE buffer_id = ?1 AND msg_id = ?2
+             GROUP BY emoji ORDER BY MIN(rowid)",
+        )?;
+        let rows = stmt.query_map(params![buffer_id, msg_id], |row| {
+            Ok(Reaction {
+                emoji: row.get(0)?,
+                count: row.get(1)?,
+                me: row.get::<_, i64>(2)? != 0,
+                // Matrix reactions are Unicode text, which the client draws as
+                // text and never consults this for.
+                animated: false,
+            })
+        })?;
+        let reactions: Vec<Reaction> = rows.collect::<rusqlite::Result<_>>()?;
+        let json = serde_json::to_string(&reactions)?;
+        conn.execute("UPDATE messages SET reactions = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![json, buffer_id, msg_id])?;
+        Ok(reactions)
+    }
+
+    /// Record one Matrix reaction event and return the message's reactions.
+    ///
+    /// `None` means this exact event was already counted, which is the whole
+    /// point: a replayed timeline changes nothing and the client is told
+    /// nothing, rather than being told a larger number.
+    pub fn matrix_reaction_add(&self, event_id: &str, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool) -> Result<Option<Vec<Reaction>>> {
+        let conn = self.conn.lock().unwrap();
+        let inserted = conn.execute(
+            "INSERT OR IGNORE INTO matrix_reactions (event_id, buffer_id, msg_id, emoji, is_me) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![event_id, buffer_id, msg_id, emoji, is_me as i64],
+        )?;
+        if inserted == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self::recount_matrix_reactions(&conn, buffer_id, msg_id)?))
+    }
+
+    /// Forget a redacted reaction, returning where it was and what is left.
+    ///
+    /// `None` for an event that was never a reaction we counted, which is how
+    /// the caller tells a reaction redaction from a message deletion.
+    pub fn matrix_reaction_remove(&self, event_id: &str) -> Result<Option<(String, String, Vec<Reaction>)>> {
+        let conn = self.conn.lock().unwrap();
+        let found: Option<(String, String)> = conn
+            .query_row("SELECT buffer_id, msg_id FROM matrix_reactions WHERE event_id = ?1", params![event_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        let Some((buffer_id, msg_id)) = found else { return Ok(None) };
+        conn.execute("DELETE FROM matrix_reactions WHERE event_id = ?1", params![event_id])?;
+        let reactions = Self::recount_matrix_reactions(&conn, &buffer_id, &msg_id)?;
+        Ok(Some((buffer_id, msg_id, reactions)))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1002,6 +1107,81 @@ mod tests {
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
         s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    /// The bug this table exists for: an initial sync replays the recent
+    /// timeline, so the same reaction event arrives again on every reconnect.
+    /// Counted by arithmetic that was one message reaching 33,224.
+    #[test]
+    fn the_same_reaction_event_is_only_counted_once() {
+        let (s, _dir) = store();
+        append(&s, "matrix:me|Room", "$msg1");
+
+        let first = s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
+        assert_eq!(first.expect("a new reaction is news")[0].count, 1);
+
+        // The same event, ten more times, as a flapping homeserver would.
+        for _ in 0..10 {
+            assert!(
+                s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false).unwrap().is_none(),
+                "a reaction already counted is not news, and must not be re-counted"
+            );
+        }
+
+        let again = s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
+        assert_eq!(again.expect("a different event is a different reaction")[0].count, 2);
+    }
+
+    #[test]
+    fn a_redacted_reaction_stops_being_counted() {
+        let (s, _dir) = store();
+        append(&s, "matrix:me|Room", "$msg1");
+        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🔥", false).unwrap();
+        s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🔥", false).unwrap();
+
+        let (buffer, msg, left) = s.matrix_reaction_remove("$rx1").unwrap().expect("that was a reaction");
+        assert_eq!((buffer.as_str(), msg.as_str()), ("matrix:me|Room", "$msg1"));
+        assert_eq!(left[0].count, 1);
+
+        // The last one leaves no entry at all rather than a zero.
+        let (_, _, none_left) = s.matrix_reaction_remove("$rx2").unwrap().expect("that was a reaction");
+        assert!(none_left.is_empty());
+
+        // Something that was never a reaction is not one now - which is how
+        // the caller tells a reaction redaction from a message deletion.
+        assert!(s.matrix_reaction_remove("$neverseen").unwrap().is_none());
+    }
+
+    #[test]
+    fn my_own_reaction_is_marked_as_mine_among_others() {
+        let (s, _dir) = store();
+        append(&s, "matrix:me|Room", "$msg1");
+        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "👍", false).unwrap();
+        let with_mine = s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "👍", true).unwrap().unwrap();
+        assert_eq!(with_mine[0].count, 2);
+        assert!(with_mine[0].me, "one of these is mine");
+
+        // And stops being mine when mine is the one redacted.
+        let (_, _, left) = s.matrix_reaction_remove("$rx2").unwrap().unwrap();
+        assert_eq!(left[0].count, 1);
+        assert!(!left[0].me);
+    }
+
+    #[test]
+    fn reactions_are_counted_per_message_and_per_emoji() {
+        let (s, _dir) = store();
+        append(&s, "matrix:me|Room", "$msg1");
+        append(&s, "matrix:me|Room", "$msg2");
+        s.matrix_reaction_add("$a", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
+        s.matrix_reaction_add("$b", "matrix:me|Room", "$msg1", "😂", false).unwrap();
+        let other = s.matrix_reaction_add("$c", "matrix:me|Room", "$msg2", "🙏", false).unwrap().unwrap();
+
+        assert_eq!(other.len(), 1, "another message's reactions are its own");
+        assert_eq!(other[0].count, 1);
+
+        let first = s.get_message("matrix:me|Room", "$msg1").unwrap().expect("message is there");
+        assert_eq!(first.reactions.len(), 2);
+        assert!(first.reactions.iter().all(|r| r.count == 1));
     }
 
     fn mention(s: &Store, buffer: &str, id: &str, kind: &str) {

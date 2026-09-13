@@ -131,7 +131,10 @@ pub(super) async fn handle_timeline_event(
         let Some((target_event, emoji)) = protocol::reaction_target(&content) else { return };
         let is_me = sender == own_user_id;
         state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me);
-        state.runtime.update_reaction(state, buffer_id, target_event, emoji, is_me, true);
+        // By event id, so a replayed timeline counts for nothing. An initial
+        // sync hands back the recent timeline again on every reconnect, and
+        // this used to add each of those reactions a second time.
+        state.runtime.matrix_reaction(state, event_id, buffer_id, target_event, emoji, is_me);
         return;
     }
 
@@ -351,8 +354,12 @@ pub(super) async fn handle_timeline_event(
 /// same "try, then fall back" precedent backend/sneedchat/mod.rs uses for
 /// its own ambiguous edit-vs-insert wire signal.
 pub(super) fn handle_redaction(state: &AppState, buffer_id: &str, target_event: &str) {
-    if let Some((target_buffer, msg_id, emoji, is_me)) = state.runtime.take_matrix_reaction_target(target_event) {
-        state.runtime.update_reaction(state, &target_buffer, &msg_id, &emoji, is_me, false);
+    // Asked of the store rather than of a map in memory. The map is built as
+    // reactions arrive and is empty after a restart, so a reaction redacted
+    // across one used to fall through to the message-delete path and the
+    // count never came back down.
+    state.runtime.take_matrix_reaction_target(target_event);
+    if state.runtime.matrix_reaction_redacted(state, target_event) {
         return;
     }
     state.runtime.delete_message(state, buffer_id, target_event);
