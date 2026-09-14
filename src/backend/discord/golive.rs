@@ -249,6 +249,17 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     if !mine {
         return;
     }
+    // A connection is opened once per stream, not once per dispatch. Both
+    // halves of the handshake stay in `pending`, so every later
+    // STREAM_UPDATE - one arrives each time somebody starts or stops
+    // watching - found a complete entry and opened a second connection with
+    // the same voice session. Discord answers that by invalidating one of
+    // them, which is where the 4006 in the log came from.
+    if sending(account_id).await || connecting(account_id, stream_key) {
+        let mut all = pending().lock().unwrap();
+        all.entry(slot(account_id, stream_key)).or_default().absorb(d);
+        return;
+    }
     let ready = {
         let mut all = pending().lock().unwrap();
         let entry = all.entry(slot(account_id, stream_key)).or_default();
@@ -259,6 +270,9 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         tracing::debug!("discord[{account_id}]: {dispatch} for {stream_key}, still waiting for the other half");
         return;
     };
+    if !opening().lock().unwrap().insert(slot(account_id, stream_key)) {
+        return;
+    }
     tracing::info!("discord[{account_id}]: stream {stream_key} is ready to connect");
 
     // The account's own session, not a new one: a stream is one account in
@@ -308,6 +322,23 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
             );
         }
     }
+    opening().lock().unwrap().remove(&slot(account_id, stream_key));
+}
+
+/// Streams whose connection is being opened right now.
+///
+/// A connection takes seconds to build - a UDP round trip and an encrypted
+/// group forming - and dispatches keep arriving while it does. Without this,
+/// the second one starts a second connection before the first has finished
+/// becoming one.
+fn opening() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static OPENING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    OPENING.get_or_init(Default::default)
+}
+
+fn connecting(account_id: &str, stream_key: &str) -> bool {
+    opening().lock().unwrap().contains(&slot(account_id, stream_key))
 }
 
 /// The live stream connections, by account.
@@ -369,6 +400,8 @@ pub fn close(account_id: &str) {
     if let Some(sender) = senders().lock().unwrap().remove(account_id) {
         sender.stop();
     }
+    let prefix = format!("{account_id}|");
+    opening().lock().unwrap().retain(|k| !k.starts_with(&prefix));
 }
 
 /// A dispatch with its credentials taken out.

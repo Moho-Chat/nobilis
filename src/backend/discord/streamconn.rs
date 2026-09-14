@@ -389,26 +389,26 @@ pub async fn connect(
 
     // What is about to arrive, so the far end expects a picture rather than
     // discarding packets on an SSRC it was never told about.
-    write
-        .send(WsMessage::Text(
-            json!({
-                "op": 12,
-                "d": {
-                    "audio_ssrc": 0,
-                    "video_ssrc": video_ssrc,
-                    "rtx_ssrc": video_ssrc.wrapping_add(1),
-                    "streams": [{
-                        "type": "video", "rid": "100", "ssrc": video_ssrc, "active": true,
-                        "quality": 100, "rtx_ssrc": video_ssrc.wrapping_add(1),
-                        "max_bitrate": 2_500_000, "max_framerate": 30,
-                        "max_resolution": { "type": "fixed", "width": 1280, "height": 720 }
-                    }],
-                }
-            })
-            .to_string(),
-        ))
-        .await
-        .context("announcing the video stream")?;
+    //
+    // Held until the encrypted group exists. Announcing video on a
+    // connection that cannot yet encrypt any is announcing something that
+    // will not come, and the ordering is the one thing left that could be
+    // provoking the server into dropping us.
+    let announce_video = json!({
+        "op": 12,
+        "d": {
+            "audio_ssrc": 0,
+            "video_ssrc": video_ssrc,
+            "rtx_ssrc": video_ssrc.wrapping_add(1),
+            "streams": [{
+                "type": "video", "rid": "100", "ssrc": video_ssrc, "active": true,
+                "quality": 100, "rtx_ssrc": video_ssrc.wrapping_add(1),
+                "max_bitrate": 2_500_000, "max_framerate": 30,
+                "max_resolution": { "type": "fixed", "width": 1280, "height": 720 }
+            }],
+        }
+    })
+    .to_string();
 
     let live = Arc::new(AtomicBool::new(true));
     let sender = Arc::new(StreamSender {
@@ -425,6 +425,8 @@ pub async fn connect(
     let account = account_id.to_string();
     tokio::spawn(async move {
         let mut beat = tokio::time::interval(beat_every);
+        // Sent once, the first moment there is a group to encrypt for.
+        let mut announced = false;
         loop {
             tokio::select! {
                 _ = beat.tick() => {
@@ -460,6 +462,15 @@ pub async fn connect(
                                     break;
                                 }
                             }
+                            // The moment the group exists, say what is about
+                            // to be sent on it.
+                            if !announced && group_ready(&dave).await {
+                                announced = true;
+                                tracing::info!("discord[{account}]: the group is ready; announcing the video stream");
+                                if write.send(WsMessage::Text(announce_video.clone())).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                         _ => break,
                     }
@@ -472,6 +483,15 @@ pub async fn connect(
 
     let _ = state;
     Ok(sender)
+}
+
+/// Whether the end-to-end encrypted group has formed.
+async fn group_ready(dave: &Arc<Mutex<Option<super::dave::Dave>>>) -> bool {
+    match dave.lock().await.as_ref() {
+        Some(dave) => dave.ready(),
+        // No group asked for, so there is nothing to wait on.
+        None => true,
+    }
 }
 
 /// Takes in one frame on a running stream connection and says what, if
