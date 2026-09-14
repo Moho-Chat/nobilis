@@ -466,7 +466,13 @@ pub async fn connect(
                             // to be sent on it.
                             if !announced && group_ready(&dave).await {
                                 announced = true;
-                                tracing::info!("discord[{account}]: the group is ready; announcing the video stream");
+                                let epoch = match dave.lock().await.as_ref() {
+                                    Some(d) => d.epoch(),
+                                    None => None,
+                                };
+                                tracing::info!(
+                                    "discord[{account}]: the group is ready at epoch {epoch:?}; announcing the video stream"
+                                );
                                 if write.send(WsMessage::Text(announce_video.clone())).await.is_err() {
                                     break;
                                 }
@@ -514,6 +520,17 @@ async fn answer_dave(
         match incoming {
             WsMessage::Binary(bytes) => {
                 let frame = super::dave::read_binary(bytes)?;
+                // Every DAVE frame, by name, at a level somebody runs with.
+                // Whether Discord answers a key package at all is the
+                // difference between a group that is forming and one that
+                // was refused, and nothing else in the log distinguishes
+                // them.
+                tracing::info!(
+                    "discord[{account_id}]: DAVE in: op {} ({} bytes), ready={}",
+                    frame.opcode,
+                    frame.payload.len(),
+                    session.ready()
+                );
                 // Nobody is named: this client does not track who is
                 // watching a stream, and an empty set would mean "nobody
                 // belongs in this group" rather than "no opinion".

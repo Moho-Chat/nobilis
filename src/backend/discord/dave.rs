@@ -127,6 +127,17 @@ impl Dave {
         self.session.is_ready()
     }
 
+    /// What epoch the group is in, if it is in one at all.
+    ///
+    /// A session that has made a key package and heard nothing back is in no
+    /// epoch: it has a group of one that it invented, which is not the same
+    /// as having joined the one Discord is running. Worth being able to tell
+    /// apart, because encrypting for the first produces a picture nobody can
+    /// read and looks identical from here.
+    pub fn epoch(&self) -> Option<u64> {
+        self.session.epoch().map(|e| e.as_u64())
+    }
+
     /// Encrypts one video frame for the group.
     ///
     /// Before the transport sealing rather than instead of it: DAVE hides the
