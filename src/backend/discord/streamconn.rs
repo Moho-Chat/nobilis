@@ -377,7 +377,10 @@ pub async fn connect(
             None => None,
         }
     } {
-        tracing::info!("discord[{account_id}]: DAVE v{dave_version}, asking to join the group");
+        tracing::info!(
+            "discord[{account_id}]: DAVE v{dave_version}, asking to join the group for channel {rtc_channel_id} with a {}-byte key package",
+            package.len()
+        );
         write
             .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into()))
             .await
@@ -432,6 +435,20 @@ pub async fn connect(
                 }
                 frame = read.next() => {
                     match frame {
+                        // Why the connection ended, which the handshake
+                        // loops above say and this one used to swallow - it
+                        // passed a Close to the DAVE handler, got nothing
+                        // back, and read again until the stream ended. So a
+                        // refusal after the group had started forming looked
+                        // exactly like a socket quietly going away.
+                        Some(Ok(WsMessage::Close(reason))) => {
+                            let said = reason
+                                .as_ref()
+                                .map(|r| format!("{} {}", u16::from(r.code), r.reason))
+                                .unwrap_or_else(|| "with no reason given".to_string());
+                            tracing::warn!("discord[{account}]: the stream server closed the connection: {said}");
+                            break;
+                        }
                         // DAVE is server-driven: the group is rebuilt as
                         // people come and go, and a client's whole job is to
                         // answer correctly and promptly. A connection that
