@@ -155,6 +155,18 @@ pub async fn connect(
                     // that identifies without it is given audio SSRCs and no
                     // video one, and there is then nowhere to put a picture.
                     "video": true,
+                    // Whether this end speaks DAVE, Discord's end-to-end
+                    // encryption. Said outright rather than left out: an
+                    // identify with no opinion is read as a client claiming
+                    // the current version, which is then held to a handshake
+                    // it never does - and the server closes with 4017, E2EE
+                    // protocol required, which is exactly what happened.
+                    //
+                    // Zero is the spec's way of saying "not this one". A
+                    // channel that insists will refuse it anyway, and then
+                    // the refusal means what it says rather than describing
+                    // a field we failed to send.
+                    "max_dave_protocol_version": 0,
                     "streams": [{ "type": "video", "rid": "100", "quality": 100 }],
                 }
             })
@@ -187,6 +199,15 @@ pub async fn connect(
                 .as_ref()
                 .map(|r| format!("{} {}", u16::from(r.code), r.reason))
                 .unwrap_or_else(|| "with no reason given".to_string());
+            // 4017 is worth translating. "E2EE protocol required" names a
+            // protocol nobody has heard of; what it means is that this
+            // conversation will not carry a picture that the server itself
+            // could watch.
+            if reason.as_ref().map(|r| u16::from(r.code)) == Some(4017) {
+                anyhow::bail!(
+                    "this call requires Discord's end-to-end encryption (DAVE), which moho's stream connection does not speak yet"
+                );
+            }
             anyhow::bail!("the stream server closed the connection: {said}");
         }
         let WsMessage::Text(text) = frame else { continue };
