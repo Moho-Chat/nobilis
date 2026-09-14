@@ -3776,6 +3776,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "cpal",
+ "davey",
  "dirs 5.0.1",
  "fs2",
  "futures",

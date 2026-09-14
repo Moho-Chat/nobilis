@@ -49,6 +49,7 @@ pub mod voice;
 pub mod calls;
 pub mod commands;
 pub mod gateway;
+pub mod dave;
 pub mod golive;
 pub mod guilds;
 pub mod history;

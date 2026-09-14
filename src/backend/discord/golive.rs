@@ -153,6 +153,10 @@ pub fn ping(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> 
 pub struct PendingStream {
     pub stream_key: Option<String>,
     pub rtc_server_id: Option<String>,
+    /// The channel the stream itself is on, which STREAM_CREATE names apart
+    /// from the conversation's. The end-to-end encrypted group is built from
+    /// it.
+    pub rtc_channel_id: Option<String>,
     pub endpoint: Option<String>,
     pub token: Option<String>,
     /// Whether Discord says the stream is paused - a stream created while
@@ -177,6 +181,9 @@ impl PendingStream {
         }
         if let Some(id) = d["rtc_server_id"].as_str() {
             self.rtc_server_id = Some(id.to_string());
+        }
+        if let Some(id) = d["rtc_channel_id"].as_str() {
+            self.rtc_channel_id = Some(id.to_string());
         }
         if let Some(endpoint) = d["endpoint"].as_str().filter(|e| !e.is_empty()) {
             self.endpoint = Some(endpoint.to_string());
@@ -275,6 +282,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         ready.endpoint.as_deref().unwrap_or_default(),
         ready.token.as_deref().unwrap_or_default(),
         &server_id,
+        ready.rtc_channel_id.as_deref().unwrap_or_default(),
         &session_id,
         &user,
     )
@@ -344,8 +352,16 @@ pub fn take_last_error(account_id: &str) -> Option<String> {
 }
 
 /// Whether this account has a stream connection ready for frames.
-pub fn sending(account_id: &str) -> bool {
-    senders().lock().unwrap().contains_key(account_id)
+///
+/// Ready means the end-to-end encrypted group has formed, not merely that a
+/// socket is open: a picture encrypted for a group that does not exist yet is
+/// one nobody can read.
+pub async fn sending(account_id: &str) -> bool {
+    let sender = senders().lock().unwrap().get(account_id).cloned();
+    match sender {
+        Some(sender) => sender.ready().await,
+        None => false,
+    }
 }
 
 /// Closes the connection, without telling the gateway - `stop` does that.

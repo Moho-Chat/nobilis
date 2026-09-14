@@ -84,6 +84,10 @@ pub struct StreamSender {
     /// Cleared when the connection goes, so a frame arriving from the window
     /// after a hangup is dropped rather than sent into a closed socket.
     live: Arc<AtomicBool>,
+    /// The end-to-end encryption, shared with the websocket loop that keeps
+    /// its group up to date. Absent only if the server declined to require
+    /// it, which it currently never does.
+    dave: Arc<Mutex<Option<super::dave::Dave>>>,
 }
 
 impl StreamSender {
@@ -93,6 +97,28 @@ impl StreamSender {
             return Ok(());
         }
         let timestamp = rtp::timestamp_from_micros(timestamp_micros);
+
+        // Encrypted for the group before it is cut into packets, and sealed
+        // for the wire after. Two different promises to two different
+        // parties: DAVE hides the picture from Discord, and the packet
+        // sealing hides it from everybody between here and Discord.
+        //
+        // A frame sent before the group is ready would be one nobody can
+        // read, so it is dropped instead - the next keyframe is two seconds
+        // away at most and a viewer arriving into a group that is still
+        // forming is expected to wait.
+        let encrypted;
+        let frame = {
+            let mut held = self.dave.lock().await;
+            match held.as_mut() {
+                Some(dave) if dave.ready() => {
+                    encrypted = dave.encrypt_video(frame)?;
+                    &encrypted[..]
+                }
+                Some(_) => return Ok(()),
+                None => frame,
+            }
+        };
         // The range is reserved before anything is built, so two frames
         // handed in at once cannot interleave their sequence numbers - which
         // the far end would read as loss and answer by asking for a keyframe
@@ -115,6 +141,22 @@ impl StreamSender {
         Ok(())
     }
 
+    /// Whether a frame handed in now would actually reach anybody.
+    ///
+    /// A connection exists some seconds before its group does, and a picture
+    /// encrypted for a group that has not formed is one nobody can read - so
+    /// the window waits for this rather than for the socket.
+    pub async fn ready(&self) -> bool {
+        if !self.live.load(Ordering::Relaxed) {
+            return false;
+        }
+        match self.dave.lock().await.as_ref() {
+            Some(dave) => dave.ready(),
+            // No group asked for, so nothing to wait on.
+            None => true,
+        }
+    }
+
     pub fn stop(&self) {
         self.live.store(false, Ordering::Relaxed);
     }
@@ -131,6 +173,10 @@ pub async fn connect(
     endpoint: &str,
     token: &str,
     server_id: &str,
+    // The channel the *stream* is on, which STREAM_CREATE names separately
+    // from the conversation's. The DAVE group is built from it, and a group
+    // named after the wrong channel is one nobody else is in.
+    rtc_channel_id: &str,
     session_id: &str,
     user_id: &str,
 ) -> Result<Arc<StreamSender>> {
@@ -155,18 +201,11 @@ pub async fn connect(
                     // that identifies without it is given audio SSRCs and no
                     // video one, and there is then nowhere to put a picture.
                     "video": true,
-                    // Whether this end speaks DAVE, Discord's end-to-end
-                    // encryption. Said outright rather than left out: an
-                    // identify with no opinion is read as a client claiming
-                    // the current version, which is then held to a handshake
-                    // it never does - and the server closes with 4017, E2EE
-                    // protocol required, which is exactly what happened.
-                    //
-                    // Zero is the spec's way of saying "not this one". A
-                    // channel that insists will refuse it anyway, and then
-                    // the refusal means what it says rather than describing
-                    // a field we failed to send.
-                    "max_dave_protocol_version": 0,
+                    // Which version of DAVE this end speaks. Declaring zero
+                    // - "not this one" - was refused with 4017 just as
+                    // firmly as declaring nothing, so a Go Live stream
+                    // genuinely has to be end-to-end encrypted.
+                    "max_dave_protocol_version": davey::DAVE_PROTOCOL_VERSION,
                     "streams": [{ "type": "video", "rid": "100", "quality": 100 }],
                 }
             })
@@ -297,6 +336,7 @@ pub async fn connect(
         .context("choosing a protocol")?;
 
     let mut key: Vec<u8> = Vec::new();
+    let mut dave_version = 0u16;
     while let Some(frame) = read.next().await {
         let frame = frame.context("the stream socket failed")?;
         if let WsMessage::Close(reason) = &frame {
@@ -316,11 +356,32 @@ pub async fn connect(
                 .flatten()
                 .filter_map(|b| b.as_u64().map(|b| b as u8))
                 .collect();
+            // The version actually in force, which is the server's decision
+            // rather than what the identify asked for.
+            dave_version = message["d"]["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
             break;
         }
     }
     if key.len() != 32 {
         return Err(anyhow!("the stream server sent no usable key"));
+    }
+
+    // The group this stream's media belongs to. Built from the stream's own
+    // channel rather than the conversation's: a Go Live session is its own
+    // group, and naming the wrong channel builds one nobody else is in.
+    let dave = Arc::new(Mutex::new(super::dave::Dave::new(dave_version, user_id, rtc_channel_id)?));
+    if let Some(package) = {
+        let mut held = dave.lock().await;
+        match held.as_mut() {
+            Some(session) => Some(session.key_package()?),
+            None => None,
+        }
+    } {
+        tracing::info!("discord[{account_id}]: DAVE v{dave_version}, asking to join the group");
+        write
+            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into()))
+            .await
+            .context("sending the key package")?;
     }
 
     // What is about to arrive, so the far end expects a picture rather than
@@ -353,6 +414,7 @@ pub async fn connect(
         video_ssrc,
         sequence: AtomicU32::new(rand::random::<u16>() as u32),
         live: live.clone(),
+        dave: dave.clone(),
     });
 
     // The socket has to keep being read and heart-beaten for the connection
@@ -370,7 +432,18 @@ pub async fn connect(
                 }
                 frame = read.next() => {
                     match frame {
-                        Some(Ok(_)) => {}
+                        // DAVE is server-driven: the group is rebuilt as
+                        // people come and go, and a client's whole job is to
+                        // answer correctly and promptly. A connection that
+                        // stops answering keeps its socket and stops being
+                        // able to encrypt anything.
+                        Some(Ok(incoming)) => {
+                            if let Some(reply) = answer_dave(&dave, &incoming, &account).await {
+                                if write.send(reply).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
                         _ => break,
                     }
                 }
@@ -382,6 +455,53 @@ pub async fn connect(
 
     let _ = state;
     Ok(sender)
+}
+
+/// Takes in one frame on a running stream connection and says what, if
+/// anything, has to go back.
+///
+/// Separate from the loop so that the lock on the group is held for exactly
+/// as long as it takes to process a frame, and never across a socket write -
+/// the sender takes the same lock for every frame of video, and a write that
+/// blocked while holding it would stall the picture.
+async fn answer_dave(
+    dave: &Arc<Mutex<Option<super::dave::Dave>>>,
+    incoming: &WsMessage,
+    account_id: &str,
+) -> Option<WsMessage> {
+    use super::dave::Reply;
+
+    let reply = {
+        let mut held = dave.lock().await;
+        let session = held.as_mut()?;
+        match incoming {
+            WsMessage::Binary(bytes) => {
+                let frame = super::dave::read_binary(bytes)?;
+                // Nobody is named: this client does not track who is
+                // watching a stream, and an empty set would mean "nobody
+                // belongs in this group" rather than "no opinion".
+                session.take_binary(&frame, None)
+            }
+            WsMessage::Text(text) => {
+                let message: Value = serde_json::from_str(text).ok()?;
+                let op = message["op"].as_u64()?;
+                session.take_json(op, &message["d"])
+            }
+            _ => Reply::Nothing,
+        }
+    };
+
+    match reply {
+        Reply::Nothing => None,
+        Reply::Binary(opcode, payload) => {
+            tracing::debug!("discord[{account_id}]: DAVE answering with binary op {opcode}");
+            Some(WsMessage::Binary(super::dave::write_binary(opcode, &payload).into()))
+        }
+        Reply::Json(value) => {
+            tracing::debug!("discord[{account_id}]: DAVE answering with {}", value["op"]);
+            Some(WsMessage::Text(value.to_string()))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -46,6 +46,11 @@ rand = "0.8"
 # Live stream is a connection songbird has no part in.
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
+# DAVE, Discord's end-to-end encryption for voice. Already in the tree as
+# songbird's own dependency - named here because the Go Live stream
+# connection is one songbird has no part in, and Discord refuses a voice
+# connection that cannot speak it (close code 4017).
+davey = "0.1"
 # `image` for reading Discord's login code, `svg` (a default) for drawing
 # Matrix's verification one - the same crate answers both directions.
 qrcode = { version = "0.14", features = ["image"] }

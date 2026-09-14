@@ -4341,7 +4341,7 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("discordScreenShareReady requires \"accountId\"".to_string()));
             };
-            let ready = backend::discord::golive::sending(account_id);
+            let ready = backend::discord::golive::sending(account_id).await;
             (
                 Some(serde_json::json!({
                     "ready": ready,
