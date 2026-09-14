@@ -425,13 +425,33 @@ pub async fn connect(
     let account = account_id.to_string();
     tokio::spawn(async move {
         let mut beat = tokio::time::interval(beat_every);
+        // The last sequence number the server sent, which every v8 heartbeat
+        // has to acknowledge. Binary frames carry it in their first two
+        // bytes; JSON ones carry it as `seq`.
+        let seq_ack = Arc::new(AtomicU32::new(0));
         // Sent once, the first moment there is a group to encrypt for.
         let mut announced = false;
         loop {
             tokio::select! {
                 _ = beat.tick() => {
-                    let nonce = rand::random::<u32>();
-                    if write.send(WsMessage::Text(json!({ "op": 3, "d": nonce }).to_string())).await.is_err() {
+                    // Voice gateway v8's heartbeat, which is not v4's.
+                    //
+                    // v4 takes a bare nonce: {"op":3,"d":<number>}. v8 takes
+                    // an object carrying the nonce and the last sequence
+                    // number seen, because v8 added buffered resume and the
+                    // server needs to know how far this client got. Sending
+                    // v4's shape on a v8 socket is a protocol violation the
+                    // server answers by invalidating the session - which is
+                    // the 4006 that arrived a few seconds into every
+                    // connection, whatever else had just been sent.
+                    //
+                    // songbird speaks v4, so its heartbeat was the wrong
+                    // thing to copy onto this connection.
+                    let beat_frame = json!({
+                        "op": 3,
+                        "d": { "t": rand::random::<u32>(), "seq_ack": seq_ack.load(Ordering::Relaxed) }
+                    });
+                    if write.send(WsMessage::Text(beat_frame.to_string())).await.is_err() {
                         break;
                     }
                 }
@@ -457,6 +477,7 @@ pub async fn connect(
                         // stops answering keeps its socket and stops being
                         // able to encrypt anything.
                         Some(Ok(incoming)) => {
+                            note_sequence(&incoming, &seq_ack);
                             if let Some(reply) = answer_dave(&dave, &incoming, &account).await {
                                 if write.send(reply).await.is_err() {
                                     break;
@@ -489,6 +510,27 @@ pub async fn connect(
 
     let _ = state;
     Ok(sender)
+}
+
+/// Remembers how far the server has got, for the next heartbeat to
+/// acknowledge.
+///
+/// Only ever forward. Frames are read on one task and the heartbeat fires on
+/// the same one, but an out-of-order acknowledgement would tell the server
+/// this client had lost ground it has not lost.
+fn note_sequence(incoming: &WsMessage, seq_ack: &Arc<AtomicU32>) {
+    let seq = match incoming {
+        WsMessage::Binary(bytes) if bytes.len() >= 2 => u32::from(u16::from_be_bytes([bytes[0], bytes[1]])),
+        WsMessage::Text(text) => match serde_json::from_str::<Value>(text) {
+            Ok(message) => match message["seq"].as_u64() {
+                Some(seq) => seq as u32,
+                None => return,
+            },
+            Err(_) => return,
+        },
+        _ => return,
+    };
+    seq_ack.fetch_max(seq, Ordering::Relaxed);
 }
 
 /// Whether the end-to-end encrypted group has formed.
