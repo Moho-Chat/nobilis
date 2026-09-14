@@ -138,6 +138,10 @@ pub async fn connect(
     let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening the stream socket")?;
     let (mut write, mut read) = socket.split();
 
+    tracing::info!(
+        "discord[{account_id}]: identifying to {endpoint} as server {server_id}, session {}…, user {user_id}",
+        session_id.chars().take(6).collect::<String>()
+    );
     write
         .send(WsMessage::Text(
             json!({
@@ -164,19 +168,43 @@ pub async fn connect(
     let mut address = String::new();
     let mut port = 0u16;
     let mut modes: Vec<String> = Vec::new();
+    let mut beat_every = std::time::Duration::from_millis(13_750);
+    // Which opcodes came, so a failure can say how far it got rather than
+    // only that it did not finish.
+    let mut saw: Vec<u64> = Vec::new();
 
     // Up to the point there is a key, the handshake is a short sequence with
     // a definite end; after it, the socket is a loop. Read it as the former
     // first.
     while let Some(frame) = read.next().await {
         let frame = frame.context("the stream socket failed")?;
+        // The whole of why a handshake failed is in here. A voice gateway
+        // refuses in numbers - 4004 is a token it would not take, 4011 a
+        // server it could not find, 4016 an encryption mode it does not
+        // know - and each points at a different mistake.
+        if let WsMessage::Close(reason) = &frame {
+            let said = reason
+                .as_ref()
+                .map(|r| format!("{} {}", u16::from(r.code), r.reason))
+                .unwrap_or_else(|| "with no reason given".to_string());
+            anyhow::bail!("the stream server closed the connection: {said}");
+        }
         let WsMessage::Text(text) = frame else { continue };
         let message: Value = serde_json::from_str(&text).context("the stream server sent something odd")?;
+        // Every frame of the handshake, at a level somebody is running with.
+        // Four of them, once per stream: saying them costs nothing, and not
+        // saying them cost two live attempts that could report only that
+        // nothing had arrived.
+        saw.push(message["op"].as_u64().unwrap_or(u64::MAX));
+        tracing::info!("discord[{account_id}]: stream op {} {}", message["op"], super::gateway::brief(&message["d"]));
         match message["op"].as_u64() {
-            // Hello: start the heartbeat and keep reading.
+            // Hello. The heartbeat starts from here rather than after the
+            // handshake: a voice gateway expects one from this moment, and a
+            // handshake that pauses on a UDP round trip is one the server is
+            // entitled to give up on.
             Some(8) => {
                 let interval = message["d"]["heartbeat_interval"].as_f64().unwrap_or(41_250.0);
-                tracing::debug!("discord[{account_id}]: stream heartbeat every {interval}ms");
+                beat_every = std::time::Duration::from_millis(interval.max(500.0) as u64);
             }
             // Ready: our SSRCs, and where to send.
             Some(2) => {
@@ -207,7 +235,15 @@ pub async fn connect(
     }
 
     if ssrc == 0 || address.is_empty() || port == 0 {
-        return Err(anyhow!("the stream server never said where to send"));
+        // How far it got, which is the difference between a rejected
+        // identify and a handshake that went wrong later. An empty list is a
+        // socket that opened and said nothing at all; a list with 8 in it and
+        // no 2 is Discord accepting the connection and then refusing what we
+        // identified as.
+        return Err(anyhow!(
+            "the stream server never said where to send - it sent {}",
+            if saw.is_empty() { "nothing at all".to_string() } else { format!("op(s) {saw:?}") }
+        ));
     }
     let mode = Mode::negotiate(&modes).ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
 
@@ -242,8 +278,16 @@ pub async fn connect(
     let mut key: Vec<u8> = Vec::new();
     while let Some(frame) = read.next().await {
         let frame = frame.context("the stream socket failed")?;
+        if let WsMessage::Close(reason) = &frame {
+            let said = reason
+                .as_ref()
+                .map(|r| format!("{} {}", u16::from(r.code), r.reason))
+                .unwrap_or_else(|| "with no reason given".to_string());
+            anyhow::bail!("the stream server closed after being told how to reach us: {said}");
+        }
         let WsMessage::Text(text) = frame else { continue };
         let message: Value = serde_json::from_str(&text).unwrap_or_default();
+        tracing::info!("discord[{account_id}]: stream op {} {}", message["op"], super::gateway::brief(&message["d"]));
         if message["op"].as_u64() == Some(4) {
             key = message["d"]["secret_key"]
                 .as_array()
@@ -294,7 +338,7 @@ pub async fn connect(
     // to stay up; nothing else is waiting on it, so it runs on its own.
     let account = account_id.to_string();
     tokio::spawn(async move {
-        let mut beat = tokio::time::interval(std::time::Duration::from_millis(13_750));
+        let mut beat = tokio::time::interval(beat_every);
         loop {
             tokio::select! {
                 _ = beat.tick() => {

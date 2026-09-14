@@ -1224,7 +1224,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
 /// server update carries a token that opens a connection, which is as much of
 /// a secret as a password and must never reach a log. Truncated as well,
 /// because a GUILD_CREATE is a megabyte and nobody reading a log wants it.
-fn brief(d: &Value) -> String {
+pub(super) fn brief(d: &Value) -> String {
     let mut copy = d.clone();
     if let Some(object) = copy.as_object_mut() {
         for secret in ["token", "access_token", "secret_key"] {
