@@ -203,12 +203,12 @@ pub(super) fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_
 /// without it, which is the "new chat buffer" that opened when one was sent:
 /// not a window being opened, but a conversation being written somewhere
 /// nobody was looking. One definition so the two cannot disagree again.
-pub(super) fn room_buffer_name(room_name: &str) -> String {
+pub fn room_buffer_name(room_name: &str) -> String {
     format!("#{room_name}")
 }
 
 /// And the room behind a buffer's name - the same pairing read backwards.
-pub(super) fn room_name_of(buffer_name: &str) -> &str {
+pub fn room_name_of(buffer_name: &str) -> &str {
     buffer_name.strip_prefix('#').unwrap_or(buffer_name)
 }
 

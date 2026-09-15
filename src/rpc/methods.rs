@@ -2571,8 +2571,10 @@ pub async fn dispatch(
                         // room. A Discord direct message is closed, but one of
                         // a guild's channels cannot be left on its own - you
                         // are in it because you are in the guild - so that
-                        // stays a local matter, as does Sneedchat, whose rooms
-                        // are a fixed list rather than something joined.
+                        // stays a local matter. Sneedchat is similar: the site
+                        // does not have a leave command, but the configured 
+                        // room list is updated and the account reconnected so 
+                        // the room is no longer followed.
                         if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
                             let _ = sender.send_part(&buffer.name);
                         } else if buffer.account_id.starts_with("kick:") {
@@ -2597,6 +2599,19 @@ pub async fn dispatch(
                             if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {
                                 if let Err(e) = backend::discord::close_dm(state, &buffer.account_id, &channel_id).await {
                                     return (None, Some(e.to_string()));
+                                }
+                            }
+                        } else if buffer.account_id.starts_with("sneedchat:") {
+                            let room_name = backend::sneedchat::rooms::room_name_of(&buffer.name);
+                            if let Some(cfg) = state.accounts.get_sneedchat(&buffer.account_id) {
+                                let left: Vec<crate::accounts::SneedChatRoom> = cfg
+                                    .rooms
+                                    .into_iter()
+                                    .filter(|r| r.name != room_name)
+                                    .collect();
+                                let _ = state.accounts.set_sneedchat_rooms(&buffer.account_id, left);
+                                if let Some(new_cfg) = state.accounts.get_sneedchat(&buffer.account_id) {
+                                    backend::sneedchat::spawn(state.clone(), new_cfg);
                                 }
                             }
                         }
@@ -3194,9 +3209,18 @@ pub async fn dispatch(
                 let Some(rooms) = parse_sneedchat_rooms(params) else {
                     return (None, Some("setSneedChatRooms requires \"rooms\": [{\"id\":.., \"name\":..}, ...]".to_string()));
                 };
-                match state.accounts.set_sneedchat_rooms(id, rooms) {
+                match state.accounts.set_sneedchat_rooms(id, rooms.clone()) {
                     Ok(true) => match state.accounts.get_sneedchat(id) {
                         Some(cfg) => {
+                            let kept_names: std::collections::HashSet<String> = rooms
+                                .iter()
+                                .map(|r| backend::sneedchat::rooms::room_buffer_name(&r.name))
+                                .collect();
+                            for buffer in state.runtime.list_buffers() {
+                                if buffer.account_id == id && buffer.kind == "channel" && !kept_names.contains(&buffer.name) {
+                                    state.runtime.remove_buffer(state, &buffer.id);
+                                }
+                            }
                             backend::sneedchat::spawn(state.clone(), cfg);
                             (Some(ok_node()), None)
                         }
