@@ -659,6 +659,10 @@ async fn watch_socket(
     // Which of the header readings below turned out to be this sender's,
     // once one packet has proved it.
     let mut reading: Option<usize> = None;
+    let mut seen = 0u32;
+    let mut unparsed = 0u64;
+    let mut types: HashMap<u8, u64> = HashMap::new();
+    let mut sources: HashMap<u32, u64> = HashMap::new();
 
     tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
     while live.load(Ordering::Relaxed) {
@@ -678,9 +682,35 @@ async fn watch_socket(
             }
         };
         let datagram = &buffer[..length];
+        // The first few, whole, before anything decides what they are.
+        //
+        // Three readings of the header have now failed on every packet of a
+        // live stream, which rules out the question they were asking. What is
+        // left is to stop reasoning about the shape and look at it: the
+        // version and extension bits, the payload type, the SSRC, and enough
+        // leading bytes to see the extension if there is one.
+        //
+        // Bounded hard at three. This is the one diagnostic that cannot be
+        // rate-limited by counting, because what it is for is the packets
+        // before anything has been counted.
+        if seen < 3 {
+            seen += 1;
+            let head: String = datagram.iter().take(24).map(|b| format!("{b:02x}")).collect();
+            tracing::info!(
+                "discord[{account_id}]: datagram {seen} on {stream_key}: {length} bytes, first 24: {head}"
+            );
+        }
         // Not everything arriving here is a packet. The discovery answer and
         // whatever else the server sends would otherwise be fed to a decoder.
-        let Some(parsed) = rtp::parse_header(datagram) else { continue };
+        let Some(parsed) = rtp::parse_header(datagram) else {
+            unparsed += 1;
+            continue;
+        };
+        // Counted by type, so a stream arriving under a payload type this
+        // does not expect is visible rather than silently discarded - which
+        // is indistinguishable, from the outside, from no stream at all.
+        *types.entry(parsed.payload_type).or_insert(0u64) += 1;
+        *sources.entry(parsed.ssrc).or_insert(0u64) += 1;
         if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 {
             continue;
         }
@@ -784,8 +814,12 @@ async fn watch_socket(
             );
         }
     }
+    let mut by_type: Vec<_> = types.into_iter().collect();
+    by_type.sort();
+    let mut by_source: Vec<_> = sources.into_iter().collect();
+    by_source.sort();
     tracing::info!(
-        "discord[{account_id}]: stopped watching {stream_key} after {frames} frames ({unopened} unopened, {undecrypted} undecrypted)"
+        "discord[{account_id}]: stopped watching {stream_key} after {frames} frames ({unopened} unopened, {undecrypted} undecrypted, {unparsed} not RTP); payload types {by_type:?}; ssrcs {by_source:?}"
     );
     live.store(false, Ordering::Relaxed);
     state.events.emit(
