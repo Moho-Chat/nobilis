@@ -61,6 +61,7 @@ pub mod mutes;
 pub mod people;
 pub mod polls;
 pub mod presence;
+pub mod reassemble;
 pub mod rtp;
 pub mod streamconn;
 pub mod voicecrypto;

@@ -56,6 +56,65 @@ pub fn header(packet: &Packet) -> [u8; 12] {
     out
 }
 
+/// An incoming packet's header, and where its payload begins.
+///
+/// The sending side writes a fixed twelve bytes, because everything it sends
+/// is the simplest shape there is. Nothing incoming is promised to be: a
+/// sender may carry contributing sources, and Discord's own client sends a
+/// header extension on every packet. So the length has to be read out of the
+/// header rather than assumed, and it matters twice over - it is where the
+/// payload starts, and under the `_rtpsize` modes it is also exactly the span
+/// the AEAD authenticates. Get it wrong and every packet fails to open, with
+/// nothing to say why beyond "the packet did not open".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Parsed {
+    pub payload_type: u8,
+    pub sequence: u16,
+    pub timestamp: u32,
+    pub ssrc: u32,
+    pub marker: bool,
+    /// Bytes before the payload: the fixed header, the contributing sources,
+    /// and the extension if there is one.
+    pub header_len: usize,
+}
+
+/// Reads an RTP header, or refuses.
+///
+/// Refusing rather than guessing: a datagram that is not RTP at all arrives on
+/// this socket routinely - the discovery answer, and whatever else the server
+/// decides to send - and treating one of those as a packet would put noise
+/// into the decoder.
+pub fn parse_header(bytes: &[u8]) -> Option<Parsed> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    // Version 2 in the top two bits. Anything else is not a packet this
+    // understands, whatever else it may be.
+    if bytes[0] >> 6 != 2 {
+        return None;
+    }
+    let csrc_count = (bytes[0] & 0x0f) as usize;
+    let extended = bytes[0] & 0x10 != 0;
+    let mut header_len = 12 + csrc_count * 4;
+    if extended {
+        // The extension is a four-byte header - two bytes of profile, two of
+        // length - followed by that many 32-bit words.
+        let words = u16::from_be_bytes([*bytes.get(header_len + 2)?, *bytes.get(header_len + 3)?]) as usize;
+        header_len += 4 + words * 4;
+    }
+    if bytes.len() < header_len {
+        return None;
+    }
+    Some(Parsed {
+        payload_type: bytes[1] & 0x7f,
+        sequence: u16::from_be_bytes([bytes[2], bytes[3]]),
+        timestamp: u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        ssrc: u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+        marker: bytes[1] & 0x80 != 0,
+        header_len,
+    })
+}
+
 /// The 90kHz clock RTP timestamps video on.
 ///
 /// Not the frame number and not milliseconds: a decoder times playback from
@@ -132,6 +191,67 @@ pub fn packetise_vp8(frame: &[u8], ssrc: u32, first_sequence: u16, timestamp: u3
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_header_written_here_reads_back_the_same() {
+        let packet = Packet {
+            payload_type: PAYLOAD_TYPE_VP8,
+            sequence: 4_242,
+            timestamp: 90_900,
+            ssrc: 0xdead_beef,
+            marker: true,
+            payload: vec![1, 2, 3],
+        };
+        let bytes = header(&packet);
+        let parsed = parse_header(&bytes).expect("our own header must parse");
+        assert_eq!(parsed.payload_type, PAYLOAD_TYPE_VP8);
+        assert_eq!(parsed.sequence, 4_242);
+        assert_eq!(parsed.timestamp, 90_900);
+        assert_eq!(parsed.ssrc, 0xdead_beef);
+        assert!(parsed.marker);
+        assert_eq!(parsed.header_len, 12);
+    }
+
+    #[test]
+    fn the_marker_bit_is_not_read_as_part_of_the_payload_type() {
+        let mut bytes = [0u8; 12];
+        bytes[0] = 0x80;
+        bytes[1] = 0x80 | PAYLOAD_TYPE_VP8;
+        let parsed = parse_header(&bytes).unwrap();
+        assert_eq!(parsed.payload_type, PAYLOAD_TYPE_VP8);
+        assert!(parsed.marker);
+    }
+
+    #[test]
+    fn contributing_sources_move_the_payload_along() {
+        let mut bytes = vec![0u8; 12 + 8];
+        bytes[0] = 0x82; // version 2, two CSRCs
+        assert_eq!(parse_header(&bytes).unwrap().header_len, 20);
+    }
+
+    #[test]
+    fn an_extension_is_counted_in_words_and_skipped_whole() {
+        // Version 2, X set, no CSRCs, then a four-byte extension header
+        // announcing three words of extension.
+        let mut bytes = vec![0u8; 12 + 4 + 12];
+        bytes[0] = 0x90;
+        bytes[14] = 0x00;
+        bytes[15] = 0x03;
+        let parsed = parse_header(&bytes).expect("Discord sends an extension on every packet");
+        assert_eq!(parsed.header_len, 28, "12 fixed + 4 extension header + 3 words");
+    }
+
+    #[test]
+    fn something_that_is_not_a_packet_is_refused_rather_than_guessed_at() {
+        assert!(parse_header(&[]).is_none());
+        assert!(parse_header(&[0u8; 8]).is_none(), "too short to be a header");
+        assert!(parse_header(&[0u8; 12]).is_none(), "version 0 is not RTP");
+        // An extension claiming more words than the datagram holds.
+        let mut bytes = vec![0u8; 16];
+        bytes[0] = 0x90;
+        bytes[15] = 0xff;
+        assert!(parse_header(&bytes).is_none());
+    }
 
     #[test]
     fn a_header_says_version_two_and_carries_the_marker() {
