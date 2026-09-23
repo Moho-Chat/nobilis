@@ -4321,15 +4321,37 @@ pub async fn dispatch(
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some(format!("{method} requires \"accountId\"")));
             };
-            let Some(stream_key) = p_str_opt(params, "streamKey") else {
-                return (None, Some(format!("{method} requires \"streamKey\"")));
+            // The key, or the three things it is made of.
+            //
+            // Discord does not announce somebody else's stream to the people
+            // who might watch it: STREAM_CREATE goes to the owner, and the
+            // rest of the call learns only that a voice state has
+            // `self_stream` set. So a viewer has to name the stream itself,
+            // and the name is a function of where the stream is and whose it
+            // is - both of which the roster already knows.
+            let built = match (p_str_opt(params, "userId"), p_str_opt(params, "channelId")) {
+                (Some(user_id), Some(channel_id)) => Some(
+                    backend::discord::golive::StreamKey {
+                        guild_id: p_str_opt(params, "guildId").map(str::to_string),
+                        channel_id: channel_id.to_string(),
+                        user_id: user_id.to_string(),
+                    }
+                    .to_wire(),
+                ),
+                _ => None,
             };
+            let Some(stream_key) = p_str_opt(params, "streamKey").map(str::to_string).or(built) else {
+                return (None, Some(format!("{method} requires \"streamKey\", or \"userId\" and \"channelId\"")));
+            };
+            let stream_key = stream_key.as_str();
             if method == "stopWatchingDiscordStream" {
                 backend::discord::golive::stop_watching(account_id, stream_key);
                 return (Some(ok_node()), None);
             }
             match backend::discord::golive::start_watching(state, account_id, stream_key) {
-                Ok(()) => (Some(ok_node()), None),
+                // Answered with the key, because the caller may not have
+                // known it: it is what every later event names the stream by.
+                Ok(()) => (Some(serde_json::json!({ "streamKey": stream_key })), None),
                 Err(e) => (None, Some(e.to_string())),
             }
         }
