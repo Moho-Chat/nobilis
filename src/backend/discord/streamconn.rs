@@ -656,6 +656,9 @@ async fn watch_socket(
     let mut undecrypted = 0u64;
     let mut frames = 0u64;
     let mut waiting_for_keyframe = true;
+    // Which of the header readings below turned out to be this sender's,
+    // once one packet has proved it.
+    let mut reading: Option<usize> = None;
 
     tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
     while live.load(Ordering::Relaxed) {
@@ -681,13 +684,46 @@ async fn watch_socket(
         if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 {
             continue;
         }
-        let payload = match voicecrypto::open(mode, &key, datagram, parsed.header_len) {
-            Ok(payload) => payload,
-            Err(_) => {
-                unopened += 1;
-                continue;
-            }
+        // Where the authenticated span ends and where the ciphertext begins
+        // are the same place in everything this stack sends, and need not be
+        // in what arrives: the `_rtpsize` modes exist so a relay can read an
+        // RTP header extension it may not decrypt, and Discord's own client
+        // sends an extension on every packet where this one sends none.
+        //
+        // Which reading is right is not written down anywhere this project
+        // can consult, and getting it wrong fails every packet with nothing
+        // to say why - 1137 of them, in the run that prompted this. So the
+        // readings are tried and the AEAD tag decides, which is exactly the
+        // question a tag answers. The winner is remembered, so this costs one
+        // packet's worth of guessing per connection and nothing after.
+        let candidates = [
+            // The extension authenticated, and outside the ciphertext.
+            (parsed.header_len, parsed.header_len),
+            // The extension treated as part of the encrypted body.
+            (parsed.fixed_len, parsed.fixed_len),
+            // Readable by a relay, and not covered by the tag.
+            (parsed.fixed_len, parsed.header_len),
+        ];
+        let opened = match reading {
+            Some(index) => voicecrypto::open_at(mode, &key, datagram, candidates[index].0, candidates[index].1)
+                .ok()
+                .map(|payload| (index, payload)),
+            None => candidates.iter().enumerate().find_map(|(index, (aad, body))| {
+                voicecrypto::open_at(mode, &key, datagram, *aad, *body).ok().map(|payload| (index, payload))
+            }),
         };
+        let Some((index, payload)) = opened else {
+            unopened += 1;
+            continue;
+        };
+        if reading.is_none() {
+            tracing::info!(
+                "discord[{account_id}]: packets on {stream_key} open with reading {index} (authenticated {} bytes, body from {})",
+                candidates[index].0,
+                candidates[index].1
+            );
+            reading = Some(index);
+        }
         let window = windows
             .entry(parsed.ssrc)
             .or_insert_with(|| super::reassemble::Reassembler::new(super::reassemble::DEFAULT_WINDOW));

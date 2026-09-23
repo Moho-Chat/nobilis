@@ -76,6 +76,10 @@ pub struct Parsed {
     /// Bytes before the payload: the fixed header, the contributing sources,
     /// and the extension if there is one.
     pub header_len: usize,
+    /// The same without the extension - twelve bytes plus any contributing
+    /// sources. Kept separately because where the extension falls relative to
+    /// the encryption is a question the cipher has to answer, not this.
+    pub fixed_len: usize,
 }
 
 /// Reads an RTP header, or refuses.
@@ -95,7 +99,8 @@ pub fn parse_header(bytes: &[u8]) -> Option<Parsed> {
     }
     let csrc_count = (bytes[0] & 0x0f) as usize;
     let extended = bytes[0] & 0x10 != 0;
-    let mut header_len = 12 + csrc_count * 4;
+    let fixed_len = 12 + csrc_count * 4;
+    let mut header_len = fixed_len;
     if extended {
         // The extension is a four-byte header - two bytes of profile, two of
         // length - followed by that many 32-bit words.
@@ -112,6 +117,7 @@ pub fn parse_header(bytes: &[u8]) -> Option<Parsed> {
         ssrc: u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
         marker: bytes[1] & 0x80 != 0,
         header_len,
+        fixed_len,
     })
 }
 
