@@ -559,6 +559,11 @@ pub async fn dispatch(
                 if id.starts_with("matrix:") {
                     backend::matrix::crypto::forget(&crate::default_data_dir(), id);
                 }
+                // And any half-built Go Live handshake, which lives outside
+                // the runtime for the same reason the voice one does.
+                if id.starts_with("discord:") {
+                    backend::discord::golive::forget(id);
+                }
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
@@ -4048,7 +4053,7 @@ pub async fn dispatch(
                 _ => return (None, Some(format!("{method} requires \"accountId\" and \"roomId\""))),
             };
             let result = if method == "acceptMatrixInvite" {
-                backend::matrix::join_room(state, account_id, room_id, &[]).await
+                backend::matrix::accept_invite(state, account_id, room_id).await
             } else {
                 backend::matrix::leave_room(state, account_id, room_id).await
             };
@@ -4218,6 +4223,432 @@ pub async fn dispatch(
 
         // A room's own name and topic. Two state events with one shape, which
         // is why they share a method rather than having one each.
+        // What a room has hung on its wall: a jitsi, an etherpad, a
+        // whiteboard, a dashboard somebody wrote.
+        //
+        // Answered with the url already filled in, because the caller has no
+        // business knowing that a widget url carries $matrix_ variables - and
+        // because filling them needs the account's own id, which is here and
+        // not there.
+        "listMatrixWidgets" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listMatrixWidgets requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
+                return (Some(serde_json::json!([])), None);
+            };
+            let user_id = state
+                .accounts
+                .get_matrix(&buffer.account_id)
+                .map(|a| a.user_id)
+                .unwrap_or_default();
+            let filled: Vec<serde_json::Value> = state
+                .runtime
+                .matrix_widgets(&buffer.account_id, &room_id)
+                .into_iter()
+                .map(|mut widget| {
+                    if let (Some(url), Some(id)) = (widget["url"].as_str(), widget["id"].as_str()) {
+                        let opened = backend::matrix::widgets::fill(url, &user_id, &room_id, id);
+                        widget["url"] = serde_json::json!(opened);
+                    }
+                    widget
+                })
+                .collect();
+            (Some(serde_json::json!(filled)), None)
+        }
+
+        // Where a particular day is in a room. The server knows; a client
+        // that had to find out by paging backwards would read a month of a
+        // busy room to reach the start of it.
+        "matrixEventAtDate" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixEventAtDate requires \"bufferId\"".to_string()));
+            };
+            let Some(ts) = params.get("ts").and_then(|v| v.as_i64()) else {
+                return (None, Some("matrixEventAtDate requires \"ts\" in seconds".to_string()));
+            };
+            let forwards = params.get("forwards").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::event_at(state, &buffer.account_id, buffer_id, ts * 1000, forwards).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Sharing a screen into a Discord call. The gateway is asked for a
+        // stream; the connection it answers with is opened in the
+        // background, and frames follow once it is up.
+        "startDiscordScreenShare" | "stopDiscordScreenShare" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let account_id = buffer.account_id.clone();
+            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                return (None, Some("that conversation has no channel".to_string()));
+            };
+            let guild_id = state.runtime.get_discord_guild(buffer_id);
+            let user_id = state.accounts.get_discord(&account_id).map(|a| a.user_id).unwrap_or_default();
+            let key = backend::discord::golive::StreamKey {
+                guild_id: guild_id.clone(),
+                channel_id: channel_id.clone(),
+                user_id,
+            };
+            let result = if method == "startDiscordScreenShare" {
+                backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
+            } else {
+                backend::discord::golive::close(&account_id);
+                backend::discord::golive::stop(state, &account_id, &key.to_wire())
+            };
+            match result {
+                Ok(()) => (Some(serde_json::json!({ "streamKey": key.to_wire() })), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // One encoded frame, from the window that captured and encoded it.
+        // Chromium has the encoders and this process has none, which is the
+        // same division the Matrix calls draw from the other side.
+        "sendDiscordVideoFrame" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("sendDiscordVideoFrame requires \"accountId\"".to_string()));
+            };
+            let Some(frame) = params.get("frame").and_then(|v| v.as_str()) else {
+                return (None, Some("sendDiscordVideoFrame requires \"frame\"".to_string()));
+            };
+            let timestamp = params.get("timestampMicros").and_then(|v| v.as_i64()).unwrap_or(0);
+            use base64::Engine;
+            let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(frame) else {
+                return (None, Some("that frame is not base64".to_string()));
+            };
+            match backend::discord::golive::send_frame(account_id, &bytes, timestamp).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Whether the stream connection is up and wants frames. The window
+        // asks before it starts encoding, so a capture is not opened against
+        // a connection that never arrived.
+        "discordScreenShareReady" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordScreenShareReady requires \"accountId\"".to_string()));
+            };
+            let ready = backend::discord::golive::sending(account_id).await;
+            (
+                Some(serde_json::json!({
+                    "ready": ready,
+                    // Only once, and only when it is the answer: a stale
+                    // reason shown beside a working stream would be worse
+                    // than none.
+                    "error": if ready { None } else { backend::discord::golive::take_last_error(account_id) },
+                })),
+                None,
+            )
+        }
+
+        // The addresses that can reach this account - an email for password
+        // recovery, a phone somebody gave the server years ago. Neither
+        // could be seen, added or removed from here.
+        "matrixThirdPartyIds" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("matrixThirdPartyIds requires \"accountId\"".to_string()));
+            };
+            match backend::matrix::account::third_party_ids(state, account_id).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Adding one is the two steps it really is: the homeserver mails a
+        // link, and the account is only changed once somebody says they have
+        // followed it. A single button would have to either lie about what
+        // happened or block on an inbox.
+        "matrixRequestEmailToken" => {
+            let (account_id, address) = match (p_str_opt(params, "accountId"), p_str_opt(params, "address")) {
+                (Some(a), Some(e)) => (a, e),
+                _ => return (None, Some("matrixRequestEmailToken requires \"accountId\" and \"address\"".to_string())),
+            };
+            match backend::matrix::account::request_email_token(state, account_id, address).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "matrixAddThirdPartyId" => {
+            let (account_id, sid, secret, password) = match (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "sid"),
+                p_str_opt(params, "clientSecret"),
+                p_str_opt(params, "password"),
+            ) {
+                (Some(a), Some(s), Some(c), Some(p)) => (a, s, c, p),
+                _ => {
+                    return (
+                        None,
+                        Some("matrixAddThirdPartyId requires \"accountId\", \"sid\", \"clientSecret\" and \"password\"".to_string()),
+                    )
+                }
+            };
+            match backend::matrix::account::add_third_party_id(state, account_id, sid, secret, password).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "matrixRemoveThirdPartyId" => {
+            let (account_id, medium, address) = match (
+                p_str_opt(params, "accountId"),
+                p_str_opt(params, "medium"),
+                p_str_opt(params, "address"),
+            ) {
+                (Some(a), Some(m), Some(addr)) => (a, m, addr),
+                _ => return (None, Some("matrixRemoveThirdPartyId requires \"accountId\", \"medium\" and \"address\"".to_string())),
+            };
+            match backend::matrix::account::remove_third_party_id(state, account_id, medium, address).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Closing the account for good. The homeserver is told first and this
+        // machine is cleaned up afterwards, in that order: an account removed
+        // here while the server still holds it would leave somebody with an
+        // account they can no longer reach from the client that made it.
+        "deactivateMatrixAccount" => {
+            let (account_id, password) = match (p_str_opt(params, "accountId"), p_str_opt(params, "password")) {
+                (Some(a), Some(p)) => (a, p),
+                _ => return (None, Some("deactivateMatrixAccount requires \"accountId\" and \"password\"".to_string())),
+            };
+            let erase = p_bool(params, "erase", false);
+            if let Err(e) = backend::matrix::account::deactivate(state, account_id, password, erase).await {
+                return (None, Some(e.to_string()));
+            }
+            // The same cleanup removing an account does, because the account
+            // is now gone in the strongest sense there is. Left behind, its
+            // crypto store would be adopted by the next account added under
+            // the same id - a device the homeserver has forgotten.
+            state.runtime.disconnect(state, account_id);
+            state.runtime.remove_buffers_for_account(state, account_id);
+            state.runtime.clear_buffer_groups_for_account(account_id);
+            state.highlights.forget(account_id);
+            state.ignores.forget(account_id);
+            state.runtime.forget_account(account_id);
+            if let Err(e) = state.store.forget_account(account_id) {
+                tracing::warn!("could not clear the scrollback for {account_id}: {e}");
+            }
+            backend::matrix::crypto::forget(&crate::default_data_dir(), account_id);
+            match state.accounts.remove(account_id) {
+                Ok(_) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // The emoji this account reached for last, kept on the account so it
+        // follows the person between clients - the one part of a picker
+        // worth carrying, because it is the part earned by use.
+        "matrixRecentEmoji" | "matrixEmojiUsed" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some(format!("{method} requires \"accountId\"")));
+            };
+            let result = if method == "matrixRecentEmoji" {
+                backend::matrix::recentemoji::list(state, account_id).await
+            } else {
+                let Some(emoji) = p_str_opt(params, "emoji") else {
+                    return (None, Some("matrixEmojiUsed requires \"emoji\"".to_string()));
+                };
+                backend::matrix::recentemoji::record(state, account_id, emoji).await
+            };
+            match result {
+                Ok(list) => (Some(serde_json::json!(list)), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Looking into a room before deciding to be in it. Joining is a
+        // membership event everybody in the room can see, so without this
+        // the decision to look and the decision to join were the same act.
+        "matrixRoomSummary" => {
+            let (account_id, room) = match (p_str_opt(params, "accountId"), p_str_opt(params, "room")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some("matrixRoomSummary requires \"accountId\" and \"room\"".to_string())),
+            };
+            let via: Vec<String> = params
+                .get("via")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match backend::matrix::peek::summary(state, account_id, room, &via).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "matrixPeekRoom" => {
+            let (account_id, room_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomId")) {
+                (Some(a), Some(r)) => (a, r),
+                _ => return (None, Some("matrixPeekRoom requires \"accountId\" and \"roomId\"".to_string())),
+            };
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as u32;
+            match backend::matrix::peek::recent(state, account_id, room_id, limit).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // What a room refuses and whose judgement it follows: its server
+        // ACL, the policy rules it publishes, and the policy server it
+        // defers to. Read on demand - all three are rare, and an ACL's whole
+        // job is to explain an absence, which is a question somebody asks
+        // rather than something they watch.
+        "matrixRoomPolicy" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixRoomPolicy requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::policy::room_policy(state, &buffer.account_id, buffer_id).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // The deny list, one server at a time. The allow list is the
+        // dangerous half and is not offered - see the module's own comment.
+        "setMatrixServerDenied" => {
+            let (buffer_id, server) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "server")) {
+                (Some(b), Some(s)) => (b, s),
+                _ => return (None, Some("setMatrixServerDenied requires \"bufferId\" and \"server\"".to_string())),
+            };
+            let denied = p_bool(params, "denied", true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::policy::set_denied(state, &buffer.account_id, buffer_id, server, denied).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // What version a room is on, and moving it to a newer one. An
+        // upgrade makes a new room and tombstones the old one, so it is
+        // offered as an action with its consequences written out rather than
+        // as a setting.
+        "matrixRoomVersion" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("matrixRoomVersion requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::roomsettings::room_version(state, &buffer.account_id, buffer_id).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        "upgradeMatrixRoom" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("upgradeMatrixRoom requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            // The server's own default where none was named, which is what
+            // "upgrade this room" means to somebody who has not chosen a
+            // version - and the only answer that is right a year from now.
+            let version = match p_str_opt(params, "version") {
+                Some(v) => v.to_string(),
+                None => state
+                    .runtime
+                    .matrix_server_facts(&buffer.account_id)
+                    .and_then(|f| f.default_room_version)
+                    .unwrap_or_default(),
+            };
+            if version.is_empty() {
+                return (None, Some("this homeserver does not say which room version it makes".to_string()));
+            }
+            match backend::matrix::roomsettings::upgrade_room(state, &buffer.account_id, buffer_id, &version).await {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // A message's address, and what it actually says - the two things
+        // somebody reaches for when reporting a problem in a room.
+        "matrixMessageLink" | "matrixEventSource" => {
+            let (buffer_id, message_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")) {
+                (Some(b), Some(m)) => (b, m),
+                _ => return (None, Some(format!("{method} requires \"bufferId\" and \"messageId\""))),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let result = if method == "matrixMessageLink" {
+                backend::matrix::permalinks::message_link(state, &buffer.account_id, buffer_id, message_id).await
+            } else {
+                backend::matrix::permalinks::event_source(state, &buffer.account_id, buffer_id, message_id).await
+            };
+            match result {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // How much of a room somebody who joins later can read. One of the
+        // few room settings with a privacy consequence rather than a
+        // cosmetic one, and read when it is looked at rather than cached -
+        // it changes rarely and is asked about rarely, and a value fetched
+        // as it is shown cannot be stale.
+        "matrixHistoryVisibility" | "setMatrixHistoryVisibility" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let result = if method == "matrixHistoryVisibility" {
+                backend::matrix::roomsettings::history_visibility(state, &buffer.account_id, buffer_id).await
+            } else {
+                let Some(value) = p_str_opt(params, "value") else {
+                    return (None, Some("setMatrixHistoryVisibility requires \"value\"".to_string()));
+                };
+                backend::matrix::roomsettings::set_history_visibility(state, &buffer.account_id, buffer_id, value)
+                    .await
+                    .map(|()| ok_node())
+            };
+            match result {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // How the account files a room: starred to the top, pushed to the
+        // bottom, or neither. Per-room account data, so it travels - which is
+        // the point, and why this is not the window's own pin.
+        "setMatrixRoomTag" => {
+            let (buffer_id, tag) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "tag")) {
+                (Some(b), Some(t)) => (b, t),
+                _ => return (None, Some("setMatrixRoomTag requires \"bufferId\" and \"tag\"".to_string())),
+            };
+            let on = params.get("on").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::tags::set(state, &buffer.account_id, buffer_id, tag, on).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
         // The account's own stickers, from the packs it carries and the ones
         // its rooms share.
         "listMatrixStickers" => {

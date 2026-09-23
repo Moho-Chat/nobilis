@@ -46,6 +46,33 @@ pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &st
     Ok(())
 }
 
+/// Accepting an invitation, which is a join and one thing more.
+///
+/// `is_direct` on the invitation is how the inviter said "this is a
+/// conversation, not a room". It is a hint carried on one event and nothing
+/// keeps it: the account's own `m.direct` list is where the fact lives, and
+/// the invitee is the one who has to write it - the inviter cannot write to
+/// somebody else's account data. Without this, accepting a DM from Element
+/// gave an ordinary room here and stayed one.
+pub async fn accept_invite(state: &AppState, account_id: &str, room_id: &str) -> Result<()> {
+    // Read before the join, because the invitation stops being listed once
+    // it has been accepted.
+    let direct_with = state
+        .runtime
+        .matrix_invites(account_id)
+        .into_iter()
+        .find(|invite| invite["roomId"].as_str() == Some(room_id))
+        .filter(|invite| invite["isDirect"].as_bool() == Some(true))
+        .and_then(|invite| invite["inviter"].as_str().map(str::to_string));
+
+    join_room(state, account_id, room_id, &[]).await?;
+
+    if let Some(peer) = direct_with {
+        directs::record(state, account_id, &peer, room_id).await;
+    }
+    Ok(())
+}
+
 /// Sends one of the account's stickers.
 ///
 /// Its own event type rather than a message with an image in it, which is what
@@ -499,6 +526,12 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_matrix_room(state, &buffer.id, &room_id);
 
+    // And told to the account, so the conversation is a conversation in
+    // Element too. `is_direct` on the invitation is a hint to the person
+    // being invited; `m.direct` is where the fact is actually kept, and
+    // without this a DM opened here was an ordinary room everywhere else.
+    directs::record(state, account_id, target_user_id, &room_id).await;
+
     Ok(buffer.id)
 }
 
@@ -526,6 +559,12 @@ pub async fn send_message(
     let is_encrypted = state.runtime.is_matrix_room_encrypted(buffer_id);
 
     let mut plain_content = if let Some(path) = attachment_path {
+        // Before the upload rather than after it. A server states its limit
+        // in /config, and finding out a video is too big by watching it
+        // upload for two minutes and then fail is what this replaces - the
+        // failure was the same either way, but it arrived after the wait and
+        // in the server's words rather than in a sentence.
+        media::check_upload_size(state, account_id, path).await?;
         if is_encrypted {
             upload_encrypted_media_message(base, access_token, path, body).await?
         } else {

@@ -269,12 +269,19 @@ pub(super) async fn handle_timeline_event(
     // including for the nick match this client makes on its own - which is
     // why the mute is put on the buffer rather than folded into this one
     // message's answer.
-    let (muted, keyword) = match state.runtime.matrix_push_rules(account_id) {
-        Some(rules) => push_rule_verdict(&rules, room_id, &body),
-        None => (false, false),
+    let (muted, keyword, notices_quiet) = match state.runtime.matrix_push_rules(account_id) {
+        Some(rules) => {
+            let (muted, keyword) = push_rule_verdict(&rules, room_id, &body);
+            (muted, keyword, notices_are_suppressed(&rules))
+        }
+        None => (false, false, false),
     };
     state.runtime.set_silenced(state, buffer_id, muted);
-    let mentioned = mentioned || keyword;
+    // A notice does not announce itself while the account's own override
+    // rule says so - which is the state every homeserver ships. Without
+    // this, a bridge relaying a room full of somebody's name would light up
+    // the mentions inbox with traffic no person wrote.
+    let mentioned = (mentioned || keyword) && !(notices_quiet && protocol::message_kind(&content) == "notice");
 
     if reply_to.is_some() {
         // The raw body Matrix sends for a reply includes a quoted `> `
@@ -313,7 +320,9 @@ pub(super) async fn handle_timeline_event(
         &from,
         &body,
         is_action,
-        "message",
+        // A bot's announcement is drawn more quietly than a person's
+        // sentence, which is the whole reason m.notice exists.
+        protocol::message_kind(&content),
         reply_to,
         Some(event_id.to_string()),
         mentioned,
@@ -343,6 +352,20 @@ pub(super) async fn handle_timeline_event(
             }),
             _ => None,
         },
+    );
+
+    // What a link in it turns out to be, asked of the homeserver rather than
+    // of the page. After the message is stored, and in the background: the
+    // line is what somebody is waiting for, and a server fetching somebody
+    // else's slow page is not worth holding a conversation up for.
+    previews::unfurl_later(
+        state,
+        account_id,
+        buffer_id,
+        room_id,
+        event_id,
+        &body,
+        event["origin_server_ts"].as_i64().unwrap_or(0),
     );
 }
 
@@ -423,7 +446,7 @@ pub(super) async fn store_thread_event(
         ts,
         is_action,
         false,
-        "message",
+        protocol::message_kind(content),
         reply_to.as_ref(),
         &[],
         sender_mxid == own_user_id,
@@ -501,7 +524,7 @@ pub(super) async fn store_history_event(
     // thread read back from the server arrived as loose messages.
     let reply_to = relation_preview(state, buffer_id, content);
     if let Err(e) = state.store.append_message(
-        buffer_id, event_id, &from, &body, ts, is_action, false, "message", reply_to.as_ref(), &[], is_own,
+        buffer_id, event_id, &from, &body, ts, is_action, false, protocol::message_kind(content), reply_to.as_ref(), &[], is_own,
         avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
         &state.runtime.buffer_kind_of(buffer_id),
         // Matrix has no per-sender colour or badges of its own.

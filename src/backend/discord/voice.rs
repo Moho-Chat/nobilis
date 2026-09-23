@@ -448,6 +448,15 @@ impl VoiceState {
         Some((entry.guild_id.clone(), entry.channel_id.clone()?))
     }
 
+    /// The gateway session this account's voice connection was made with.
+    ///
+    /// A Go Live stream identifies with the same session id the voice
+    /// connection did - it is one account in one place, sending two things -
+    /// so the stream connection has to ask for it rather than start its own.
+    pub fn session_id(&self, account_id: &str) -> Option<String> {
+        self.pending.lock().unwrap().get(account_id)?.session_id.clone()
+    }
+
     /// Every account with a live voice connection.
     pub fn connected_accounts(&self) -> Vec<String> {
         self.drivers.lock().unwrap().keys().cloned().collect()

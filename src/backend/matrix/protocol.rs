@@ -58,6 +58,22 @@ pub fn message_body(content: &Value) -> (String, bool) {
     (body, is_action)
 }
 
+/// What kind of line a message content is: something said, or something
+/// announced.
+///
+/// `m.notice` exists precisely so a client can draw it more quietly. It is
+/// what bots and bridges send, and what a homeserver's own notices arrive as -
+/// the spec's default push rules even suppress notifications for it. Drawn
+/// like anybody else's message, an active bridge makes automated traffic
+/// indistinguishable from people talking.
+///
+/// Still a chat line rather than a system one: it has a sender, it can be
+/// replied to and redacted, and it belongs beside the conversation. Only its
+/// weight changes.
+pub fn message_kind(content: &Value) -> &'static str {
+    if content["msgtype"].as_str() == Some("m.notice") { "notice" } else { "message" }
+}
+
 /// Whether this is a voice message rather than an attached audio file.
 ///
 /// The marker is still under its MSC prefix everywhere that sends it, and the
@@ -164,6 +180,22 @@ pub fn reaction_target(content: &Value) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod thread_tests {
     use super::*;
+
+    /// A bot's notice is still a chat line - it has a sender and can be
+    /// replied to - but it is not somebody talking, and drawing it the same
+    /// way makes a bridged room unreadable.
+    #[test]
+    fn a_notice_is_its_own_kind_of_line() {
+        use serde_json::json;
+        assert_eq!(message_kind(&json!({ "msgtype": "m.notice", "body": "build failed" })), "notice");
+        assert_eq!(message_kind(&json!({ "msgtype": "m.text", "body": "hello" })), "message");
+        // An emote is a person talking about themselves, not an
+        // announcement; it keeps its own handling through `is_action`.
+        assert_eq!(message_kind(&json!({ "msgtype": "m.emote", "body": "waves" })), "message");
+        // Media, and content with no msgtype at all, stay ordinary.
+        assert_eq!(message_kind(&json!({ "msgtype": "m.image", "body": "cat.png" })), "message");
+        assert_eq!(message_kind(&json!({ "body": "hello" })), "message");
+    }
 
     #[test]
     fn finds_the_thread_a_message_belongs_to() {

@@ -49,6 +49,8 @@ pub mod voice;
 pub mod calls;
 pub mod commands;
 pub mod gateway;
+pub mod dave;
+pub mod golive;
 pub mod guilds;
 pub mod history;
 pub mod http;
@@ -59,6 +61,9 @@ pub mod mutes;
 pub mod people;
 pub mod polls;
 pub mod presence;
+pub mod rtp;
+pub mod streamconn;
+pub mod voicecrypto;
 pub mod search;
 pub mod send;
 

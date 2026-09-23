@@ -121,12 +121,6 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// whole range of entries, while INSERT/UPDATE/DELETE adjust it as people come
 /// and go. Entries are either a group header - a role name, or the online and
 /// offline buckets - or a member.
-///
-/// Only SYNC is acted on. The incremental ops move members between roles and
-/// buckets by position within a list this client does not otherwise model, and
-/// applying them half-understood would corrupt the roster; re-opening the
-/// channel asks for a fresh SYNC, which is what Discord's own client does when
-/// its view changes.
 /// One entry of Discord's member window, or nothing if the item is a role
 /// header rather than a person.
 pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
@@ -176,16 +170,48 @@ pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, 
     }))
 }
 
+/// One slot of the window, member or not.
+///
+/// The headers matter even though nothing is drawn for them. Discord's
+/// incremental ops address the list *it* holds, and that list interleaves
+/// group headers - "Online", "Offline", every role with its own section -
+/// among the people. Dropping them on SYNC and then applying an INSERT at
+/// Discord's index puts the person in somebody else's place, and the DELETE
+/// that was meant to remove their old row removes a different one instead:
+/// the person is now listed twice, and the drift grows with every status
+/// change. So a header takes up its slot here and is left out at the end.
+fn window_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
+    if let Some(group) = item.get("group") {
+        return Some(json!({ "group": group["id"].as_str().unwrap_or("") }));
+    }
+    member_entry(runtime, account_id, guild_id, item)
+}
+
+/// Whether an entry is a header rather than somebody.
+fn is_group(entry: &Value) -> bool {
+    entry.get("group").is_some()
+}
+
+/// What one op did to the window.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(super) enum Applied {
+    /// The window now says something different.
+    Changed,
+    /// Nothing to do, and nothing wrong.
+    Nothing,
+    /// The op could not be applied where Discord said it went, so the window
+    /// no longer lines up with Discord's. Anything applied to it after this
+    /// lands in the wrong place, which is how a roster grows duplicates -
+    /// the only safe answer is to throw it away and ask for it again.
+    Stale,
+}
+
 /// Applies one of Discord's lazy member-list operations.
 ///
-/// Only SYNC was applied before, so a roster was correct at the moment a
-/// channel was opened and then stood still: somebody joining, leaving, or
-/// going offline changed nothing until the channel was reopened.
-///
 /// INSERT, UPDATE and DELETE address the window by index, which is why the
-/// list they are applied to is held in Discord's order rather than the
-/// sorted one that gets displayed.
-pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, window: &mut Vec<Value>, op: &Value) -> bool {
+/// list they are applied to is held in Discord's order - headers and all -
+/// rather than the sorted one that gets displayed.
+pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, window: &mut Vec<Value>, op: &Value) -> Applied {
     let index = |op: &Value| op["index"].as_u64().map(|i| i as usize);
     match op["op"].as_str().unwrap_or("") {
         "SYNC" => {
@@ -193,7 +219,7 @@ pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &st
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|item| member_entry(runtime, account_id, guild_id, item))
+                .filter_map(|item| window_entry(runtime, account_id, guild_id, item))
                 .collect();
             // The range is the slice of the window this SYNC describes.
             // Only ever [0, 99] is asked for, so this replaces the lot -
@@ -201,39 +227,69 @@ pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &st
             let start = op["range"][0].as_u64().unwrap_or(0) as usize;
             if start == 0 {
                 *window = items;
-            } else {
+            } else if start <= window.len() {
                 window.truncate(start);
                 window.extend(items);
+            } else {
+                // A range beginning past the end of what is held would leave
+                // a hole, and a hole is an index everything below is wrong by.
+                return Applied::Stale;
             }
-            true
+            Applied::Changed
         }
-        "INSERT" => match (index(op), member_entry(runtime, account_id, guild_id, &op["item"])) {
+        "INSERT" => match (index(op), window_entry(runtime, account_id, guild_id, &op["item"])) {
             (Some(i), Some(entry)) if i <= window.len() => {
+                let drawn = !is_group(&entry);
                 window.insert(i, entry);
-                true
+                // A header takes its slot but changes nothing anybody sees.
+                if drawn { Applied::Changed } else { Applied::Nothing }
             }
-            // A role header being inserted shifts everyone below it, and
-            // there is nothing to show for it - so the window is refreshed
-            // by the next SYNC rather than being left subtly misaligned.
-            _ => false,
+            _ => Applied::Stale,
         },
-        "UPDATE" => match (index(op), member_entry(runtime, account_id, guild_id, &op["item"])) {
+        "UPDATE" => match (index(op), window_entry(runtime, account_id, guild_id, &op["item"])) {
             (Some(i), Some(entry)) if i < window.len() => {
+                let drawn = !is_group(&entry) || !is_group(&window[i]);
                 window[i] = entry;
-                true
+                if drawn { Applied::Changed } else { Applied::Nothing }
             }
-            _ => false,
+            _ => Applied::Stale,
         },
         "DELETE" => match index(op) {
             Some(i) if i < window.len() => {
+                let drawn = !is_group(&window[i]);
                 window.remove(i);
-                true
+                if drawn { Applied::Changed } else { Applied::Nothing }
             }
-            _ => false,
+            _ => Applied::Stale,
         },
-        // INVALIDATE says a range is stale; the next SYNC replaces it.
-        _ => false,
+        // INVALIDATE says a range is no longer being kept up to date, so what
+        // is held for it is already behind.
+        "INVALIDATE" => Applied::Stale,
+        _ => Applied::Nothing,
     }
+}
+
+/// The window as a roster: headers dropped, nobody listed twice, sorted by
+/// name.
+///
+/// The de-duplication is a belt as well as braces. Keeping Discord's headers
+/// is what stops the indices drifting in the first place, but this is the
+/// thing the bug was actually reported as - one person appearing over and
+/// over in a channel left open all day - and a roster that cannot show
+/// anybody twice cannot regress to it however the window is reached.
+pub(super) fn roster(window: &[Value]) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut members: Vec<Value> = window
+        .iter()
+        .filter(|e| !is_group(e))
+        .filter(|e| seen.insert(e["userId"].as_str().unwrap_or("").to_string()))
+        .cloned()
+        .collect();
+    members.sort_by(|a, b| {
+        let (an, bn) = (a["nick"].as_str().unwrap_or(""), b["nick"].as_str().unwrap_or(""));
+        an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))
+    });
+    members
 }
 
 pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
@@ -246,7 +302,20 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
     // goes past. It is on the dispatch rather than on the entries.
     let guild_id = d["guild_id"].as_str().unwrap_or("");
     for op in d["ops"].as_array().into_iter().flatten() {
-        changed |= apply_member_op(&state.runtime, &account_id, guild_id, &mut window, op);
+        match apply_member_op(&state.runtime, &account_id, guild_id, &mut window, op) {
+            Applied::Changed => changed = true,
+            Applied::Nothing => {}
+            // Everything after this op would be applied at the wrong index,
+            // so the rest of the batch is abandoned along with the window
+            // and a fresh SYNC is asked for. What is on screen is left alone
+            // meanwhile: a stale roster reads better than an emptied one.
+            Applied::Stale => {
+                tracing::debug!("discord: member window for {buffer_id} is out of step; resyncing");
+                state.runtime.set_discord_member_window(buffer_id, Vec::new());
+                request_member_list(state, buffer_id);
+                return;
+            }
+        }
     }
 
     if !changed {
@@ -254,12 +323,7 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
     }
     state.runtime.set_discord_member_window(buffer_id, window.clone());
 
-    let mut members = window;
-    members.sort_by(|a, b| {
-        let (an, bn) = (a["nick"].as_str().unwrap_or(""), b["nick"].as_str().unwrap_or(""));
-        an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))
-    });
-    let member_list = json!(members);
+    let member_list = json!(roster(&window));
     state.runtime.set_presence(buffer_id, member_list.clone());
     state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
 }
@@ -301,51 +365,145 @@ mod window_tests {
     use super::*;
     use serde_json::json;
 
+    fn member(id: &str, nick: &str, status: &str) -> Value {
+        json!({ "member": { "nick": nick, "user": { "id": id, "username": nick }, "presence": { "status": status } } })
+    }
+
+    fn group(id: &str) -> Value {
+        json!({ "group": { "id": id, "count": 1 } })
+    }
+
+    fn names(window: &[Value]) -> Vec<String> {
+        roster(window).iter().map(|m| m["nick"].as_str().unwrap_or("").to_string()).collect()
+    }
+
     /// Only SYNC was ever applied, so a roster froze the moment a channel
     /// was opened. The index-addressed ops are why the window is held in
     /// Discord's order rather than the sorted one that gets shown.
     #[test]
     fn a_member_window_follows_inserts_updates_and_deletes() {
         let runtime = crate::runtime::Runtime::new();
-        let member = |id: &str, nick: &str, status: &str| {
-            json!({ "member": { "nick": nick, "user": { "id": id, "username": nick }, "presence": { "status": status } } })
-        };
-        let mut window: Vec<serde_json::Value> = Vec::new();
+        let mut window: Vec<Value> = Vec::new();
 
         let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [member("1", "anna", "online"), member("2", "bob", "idle")] });
-        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync), Applied::Changed);
         assert_eq!(window.len(), 2);
         assert_eq!(window[0]["nick"], "anna");
 
         let insert = json!({ "op": "INSERT", "index": 1, "item": member("3", "carol", "online") });
-        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &insert));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &insert), Applied::Changed);
         assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "carol", "bob"]);
 
         let update = json!({ "op": "UPDATE", "index": 0, "item": member("1", "anna", "offline") });
-        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &update));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &update), Applied::Changed);
         assert_eq!(window[0]["away"], true);
 
         let delete = json!({ "op": "DELETE", "index": 1 });
-        assert!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &delete));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &delete), Applied::Changed);
         assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "bob"]);
     }
 
-    /// An op that cannot be applied cleanly - a role header with no member,
-    /// an index past the end - reports no change rather than corrupting the
-    /// window, leaving the next SYNC to put it right.
+    /// The reported bug, in the shape it actually arrives in.
+    ///
+    /// Discord's list interleaves group headers among the people and its ops
+    /// count them. Somebody's status changing is a DELETE from one section
+    /// and an INSERT into another - so with the headers thrown away, every
+    /// index is short by the number of headers above it: the DELETE takes
+    /// out whoever happens to sit there instead, and the INSERT puts a
+    /// second copy of the person who moved into a list that still holds
+    /// their old row. Left open for a day, a channel accumulates one
+    /// duplicate per status change, which is what the screenshot shows.
     #[test]
-    fn an_op_that_does_not_fit_changes_nothing() {
+    fn moving_between_groups_does_not_duplicate_anybody() {
         let runtime = crate::runtime::Runtime::new();
-        let mut window: Vec<serde_json::Value> = Vec::new();
+        let mut window: Vec<Value> = Vec::new();
 
-        let header = json!({ "op": "INSERT", "index": 0, "item": { "group": { "id": "online", "count": 4 } } });
-        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &header));
-        assert!(window.is_empty());
+        // Discord's own indices: 0 header, 1 anna, 2 bob, 3 header, then
+        // carol, dave, erin, finn, gail at 4..8.
+        let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [
+            group("online"),
+            member("1", "anna", "online"),
+            member("2", "bob", "online"),
+            group("offline"),
+            member("3", "carol", "offline"),
+            member("4", "dave", "offline"),
+            member("5", "erin", "offline"),
+            member("6", "finn", "offline"),
+            member("7", "gail", "offline"),
+        ]});
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync), Applied::Changed);
+        assert_eq!(names(&window), ["anna", "bob", "carol", "dave", "erin", "finn", "gail"]);
+
+        // finn comes online: out of the offline section at 7, into the
+        // online one at 3. Both indices are well inside the list, so with
+        // the headers missing these would apply - to the wrong people.
+        for op in [
+            json!({ "op": "DELETE", "index": 7 }),
+            json!({ "op": "INSERT", "index": 3, "item": member("6", "finn", "online") }),
+        ] {
+            assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &op), Applied::Changed);
+        }
+
+        assert_eq!(
+            names(&window),
+            ["anna", "bob", "carol", "dave", "erin", "finn", "gail"],
+            "finn moved; nobody was lost and nobody was listed twice"
+        );
+        let finn = roster(&window).into_iter().find(|m| m["userId"] == "6").expect("finn");
+        assert_eq!(finn["status"], "online");
+        assert_eq!(finn["away"], false);
+    }
+
+    /// A header is a real slot but nothing anybody sees, so it holds the
+    /// indices straight without emitting a roster change of its own.
+    #[test]
+    fn a_header_takes_a_slot_and_shows_nothing() {
+        let runtime = crate::runtime::Runtime::new();
+        let mut window: Vec<Value> = Vec::new();
+
+        let header = json!({ "op": "INSERT", "index": 0, "item": group("online") });
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &header), Applied::Nothing);
+        assert_eq!(window.len(), 1);
+        assert!(roster(&window).is_empty());
+
+        let person = json!({ "op": "INSERT", "index": 1, "item": member("1", "anna", "online") });
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &person), Applied::Changed);
+        assert_eq!(names(&window), ["anna"]);
+    }
+
+    /// An op that cannot be applied where Discord said it goes means the
+    /// window has drifted. Carrying on would put people in each other's
+    /// places; the answer is to say so, and let the caller ask again.
+    #[test]
+    fn an_op_that_does_not_fit_asks_for_a_resync() {
+        let runtime = crate::runtime::Runtime::new();
+        let mut window: Vec<Value> = Vec::new();
 
         let past_end = json!({ "op": "DELETE", "index": 7 });
-        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &past_end));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &past_end), Applied::Stale);
 
         let invalidate = json!({ "op": "INVALIDATE", "range": [0, 99] });
-        assert!(!apply_member_op(&runtime, "discord:me", "guild", &mut window, &invalidate));
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &invalidate), Applied::Stale);
+
+        // An item that is neither a person nor a header: nothing can be put
+        // in its slot, so the slot cannot be kept straight either.
+        let nonsense = json!({ "op": "INSERT", "index": 0, "item": { "thing": 1 } });
+        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &nonsense), Applied::Stale);
+    }
+
+    /// Whatever the window holds, nobody is listed twice. This is the
+    /// symptom the ticket describes, and it is worth being unable to produce
+    /// rather than merely fixed upstream.
+    #[test]
+    fn a_roster_never_shows_the_same_person_twice() {
+        let runtime = crate::runtime::Runtime::new();
+        let mut window: Vec<Value> = Vec::new();
+        let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [
+            member("1", "anna", "online"),
+            member("2", "bob", "online"),
+            member("1", "anna", "offline"),
+        ]});
+        apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync);
+        assert_eq!(names(&window), ["anna", "bob"]);
     }
 }

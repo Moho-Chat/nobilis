@@ -648,6 +648,21 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
                     }
 
+                    // Somebody joined or left a group message. Not
+                    // necessarily by anything this client did: the whole
+                    // point is the change made from a phone, or by another
+                    // person in the group, which this had no way to hear.
+                    "CHANNEL_RECIPIENT_ADD" | "CHANNEL_RECIPIENT_REMOVE" => {
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        people::recipient_changed(
+                            state,
+                            &account_id,
+                            channel_id,
+                            &d["user"],
+                            t == "CHANNEL_RECIPIENT_ADD",
+                        );
+                    }
+
                     "CHANNEL_DELETE" => {
                         let Some(channel_id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(channel_id) {
@@ -1021,13 +1036,27 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // separate dispatch for going live or turning a
                         // camera on, so dropping them here would mean nobody
                         // could ever be told a screen was being shared.
+                        let flags = crate::runtime::VoiceFlags::from_voice_state(d);
+                        // Somebody's camera or screen going on or off. Said
+                        // out loud because Discord has no dispatch of its
+                        // own for either - they ride on the voice state, and
+                        // this is the only place a client can see them.
+                        if flags.streaming || flags.video {
+                            tracing::info!(
+                                "discord[{account_id}]: {user_id} is {}{}{} in {}",
+                                if flags.streaming { "sharing a screen" } else { "" },
+                                if flags.streaming && flags.video { " and " } else { "" },
+                                if flags.video { "on camera" } else { "" },
+                                channel_id.unwrap_or("nowhere")
+                            );
+                        }
                         state.runtime.set_discord_voice_presence(
                             &account_id,
                             user_id,
                             channel_id,
                             voice_member_name(d),
                             voice_member_avatar(d).as_deref(),
-                            crate::runtime::VoiceFlags::from_voice_state(d),
+                            flags,
                         );
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
@@ -1079,12 +1108,17 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // before being answered produces exactly that and no
                     // CALL_DELETE at all.
                     "CALL_CREATE" | "CALL_UPDATE" => {
+                        tracing::info!("discord[{account_id}]: {t} {}", brief(d));
                         let Some(channel_id) = d["channel_id"].as_str() else { continue };
                         let ringing = d["ringing"]
                             .as_array()
                             .map(|r| r.iter().any(|u| u.as_str() == Some(config.user_id.as_str())))
                             .unwrap_or(false);
-                        announce_call(state, &account_id, channel_id, ringing);
+                        // Opening the conversation first where there is
+                        // none: a first call from a new person arrives on a
+                        // channel this client has never seen, and a call
+                        // with nowhere to ring cannot be answered.
+                        announce_call_opening_dm(state, &account_id, channel_id, ringing).await;
                     }
 
                     "CALL_DELETE" => {
@@ -1117,6 +1151,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         .await;
                     }
 
+                    // A stream coming into being, changing, or ending -
+                    // ours or anybody else's. Two of these carry the two
+                    // halves of the handshake a stream connection needs, in
+                    // either order, exactly as the voice ones above do.
+                    "STREAM_CREATE" | "STREAM_SERVER_UPDATE" | "STREAM_UPDATE" => {
+                        golive::note_stream(state, &account_id, t, d).await;
+                    }
+
+                    "STREAM_DELETE" => {
+                        golive::note_stream_gone(state, &account_id, d);
+                    }
+
                     "PRESENCE_UPDATE" => {
                         // Fires for guild members too, not just friends -
                         // update_discord_presence itself is the friends-only
@@ -1132,7 +1178,23 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // away without waiting for a fresh subscription.
                         update_presence_in_rosters(state, user_id, status);
                     }
-                    _ => {}
+                    // Everything this client does not act on.
+                    //
+                    // Named rather than dropped in silence. A dispatch nobody
+                    // handles is how a feature that has not been written
+                    // announces itself - and when a thing that should work
+                    // does not, the first question is always whether Discord
+                    // said anything at all. At debug for the ordinary flood;
+                    // the families that carry calls and streams are worth
+                    // saying at info, because those are the ones somebody is
+                    // usually watching for.
+                    other => {
+                        if other.starts_with("STREAM_") || other.starts_with("CALL_") || other.starts_with("VOICE_") {
+                            tracing::info!("discord[{account_id}]: {other} (not handled here) {}", brief(d));
+                        } else {
+                            tracing::debug!("discord[{account_id}]: {other} (not handled here)");
+                        }
+                    }
                 }
             }
             7 => bail!("gateway requested a reconnect"),
@@ -1155,3 +1217,63 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
         }
     }
 }
+
+/// A dispatch's payload, short enough to log and with its secrets out.
+///
+/// Whole would be unreadable and occasionally dangerous - a voice or stream
+/// server update carries a token that opens a connection, which is as much of
+/// a secret as a password and must never reach a log. Truncated as well,
+/// because a GUILD_CREATE is a megabyte and nobody reading a log wants it.
+pub(super) fn brief(d: &Value) -> String {
+    let mut copy = d.clone();
+    if let Some(object) = copy.as_object_mut() {
+        for secret in ["token", "access_token", "secret_key"] {
+            if object.contains_key(secret) {
+                object.insert(secret.to_string(), Value::from("<redacted>"));
+            }
+        }
+    }
+    let text = copy.to_string();
+    match text.char_indices().nth(600) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text,
+    }
+}
+
+#[cfg(test)]
+mod brief_tests {
+    use super::brief;
+    use serde_json::json;
+
+    /// A voice or stream server update carries the token that opens the
+    /// connection. A log is the one place it must never be.
+    #[test]
+    fn a_logged_payload_has_no_credentials_in_it() {
+        let line = brief(&json!({ "endpoint": "eu.discord.media", "token": "a-real-secret", "secret_key": [1, 2, 3] }));
+        assert!(!line.contains("a-real-secret"), "{line}");
+        assert!(!line.contains("[1,2,3]"), "{line}");
+        assert!(line.contains("eu.discord.media"), "{line}");
+    }
+
+    /// A GUILD_CREATE is a megabyte and nobody reading a log wants it - but
+    /// the cut has to land on a character boundary, or a payload with an
+    /// emoji in it panics the thread that was only trying to log.
+    #[test]
+    fn a_long_payload_is_cut_without_splitting_a_character() {
+        let long = brief(&json!({ "name": "x".repeat(2000) }));
+        assert!(long.len() < 700, "{}", long.len());
+        assert!(long.ends_with('…'));
+
+        // Counted in characters rather than bytes, so this needs more than
+        // six hundred of them - 400 emoji is 1600 bytes and well under the
+        // limit, which is the point of counting characters for a log.
+        let emoji = brief(&json!({ "name": "\u{1F600}".repeat(900) }));
+        assert!(emoji.ends_with('…'), "{}", &emoji[emoji.len().saturating_sub(20)..]);
+        assert!(emoji.is_char_boundary(emoji.len() - '…'.len_utf8()));
+
+        // Short enough to say whole is said whole.
+        let short = brief(&json!({ "a": 1 }));
+        assert_eq!(short, "{\"a\":1}");
+    }
+}
+

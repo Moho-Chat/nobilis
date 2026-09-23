@@ -103,6 +103,33 @@ fn message_send_threshold(pl: &Value) -> i64 {
     pl["events"]["m.room.message"].as_i64().unwrap_or_else(|| threshold(pl, "events_default", 0))
 }
 
+/// Whether this account may set one particular piece of room state.
+///
+/// The rule is the same for every state event and the numbers are not: a room
+/// can name a level for each type, and everything unnamed falls to
+/// `state_default`, which is 50 rather than the 0 an ordinary message gets.
+/// Asked before offering a setting, so a room somebody cannot change says so
+/// instead of offering a control that fails on use.
+///
+/// Room-level, like `permissions_json` beside it - the server enforces the
+/// real rule either way, and this only decides what to put in front of
+/// somebody.
+pub fn can_send_state(pl: &Value, own_user_id: &str, creators: &[String], room_version: &str, event_type: &str) -> bool {
+    let own_level = effective_power(pl, own_user_id, creators, room_version);
+    let needed = pl["events"][event_type].as_i64().unwrap_or_else(|| threshold(pl, "state_default", 50));
+    own_level >= needed
+}
+
+/// The same question asked about a buffer, with the room's cached levels.
+pub fn can_send_state_in_buffer(state: &AppState, account_id: &str, buffer_id: &str, event_type: &str) -> bool {
+    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else { return false };
+    let Some(account) = state.accounts.get_matrix(account_id) else { return false };
+    let pl = state.runtime.get_matrix_power_levels(account_id, &room_id).unwrap_or_else(|| serde_json::json!({}));
+    let creators = state.runtime.matrix_room_creators(account_id, &room_id);
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    can_send_state(&pl, &account.user_id, &creators, &version, event_type)
+}
+
 fn power_levels_change_threshold(pl: &Value) -> i64 {
     pl["events"]["m.room.power_levels"].as_i64().unwrap_or_else(|| threshold(pl, "state_default", 50))
 }

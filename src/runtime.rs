@@ -691,6 +691,28 @@ pub struct Runtime {
     /// server, and a pin outliving the message it points at is a normal state
     /// rather than a broken one.
     matrix_pinned: Mutex<HashMap<(String, String), Vec<String>>>,
+    /// (account, room) -> what the room has hung on its wall, by widget id.
+    ///
+    /// Kept by id rather than as a list because a widget is a state event:
+    /// what arrives is one of them changing, and it is removed by its content
+    /// being emptied rather than by anything saying it went away.
+    matrix_widgets: Mutex<HashMap<(String, String), std::collections::BTreeMap<String, serde_json::Value>>>,
+    /// (account, room) -> the person a room is a direct message with, per the
+    /// account's own `m.direct` list.
+    ///
+    /// The list is the only answer that travels between clients, and it is
+    /// what decides whether a room is a DM - not anything visible in the room
+    /// itself. Held inverted (by room) because every question asked of it is
+    /// "is this room a DM"; the account data is keyed by person, since one
+    /// person can have several rooms with you.
+    matrix_directs: Mutex<HashMap<(String, String), String>>,
+    /// (account, room) for every place that has turned link previews off; an
+    /// empty room id is the account's own switch.
+    ///
+    /// A set of the refusals rather than a map of every room's answer,
+    /// because the ordinary state is "nobody has said anything" and a map
+    /// would have to hold that answer for every room in order to mean it.
+    matrix_previews_off: Mutex<HashSet<(String, String)>>,
     /// Matrix-specific: (account id, room id) -> {user id -> display name}
     /// for every member currently *joined* to that room (see roomstate.rs's
     /// m.room.member handling - a leave/ban removes the entry entirely,
@@ -1018,6 +1040,9 @@ impl Runtime {
             matrix_room_avatars: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
+            matrix_widgets: Mutex::new(HashMap::new()),
+            matrix_directs: Mutex::new(HashMap::new()),
+            matrix_previews_off: Mutex::new(HashSet::new()),
             matrix_verification_peers: Mutex::new(HashMap::new()),
             matrix_ignored: Mutex::new(HashMap::new()),
             matrix_room_members: Mutex::new(HashMap::new()),
@@ -1343,10 +1368,103 @@ impl Runtime {
             // Whichever backend knows says so; a buffer is not muted until
             // the service tells us it is.
             server_muted: false,
+            // Likewise: the account's own filing arrives with the room's
+            // tags, which is after the buffer exists.
+            favourite: false,
+            low_priority: false,
+            service_room: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
         buffer
+    }
+
+    /// Changes what a buffer already on screen is.
+    ///
+    /// Rare on purpose: a buffer's kind is decided when it is created and is
+    /// not something that drifts. The one case that needs it is a room the
+    /// account newly calls a direct message - `m.direct` can be written from
+    /// another client at any time, and a conversation that was an ordinary
+    /// room a moment ago belongs with the conversations from now on.
+    /// How the account itself has filed this conversation: starred, pushed
+    /// down, or neither.
+    ///
+    /// Both at once because they arrive together - `m.tag` is one event
+    /// listing every tag a room has - and because they are mutually
+    /// exclusive in practice: setting one in Element clears the other, and
+    /// applying them one at a time would draw a room as both for an instant.
+    pub fn set_buffer_tags(&self, state: &AppState, buffer_id: &str, favourite: bool, low_priority: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.favourite == favourite && buffer.low_priority == low_priority {
+                return;
+            }
+            buffer.favourite = favourite;
+            buffer.low_priority = low_priority;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// Whether a room lets a link in it be unfurled.
+    ///
+    /// Two switches, both of which say "disable" rather than "enable" - so an
+    /// account or a room that has never said anything allows them, which is
+    /// what every other client does with the same events. A room that has
+    /// turned them off wins over an account that has not, because that
+    /// decision was made for everybody in the room.
+    pub fn matrix_previews_allowed(&self, account_id: &str, room_id: &str) -> bool {
+        let held = self.matrix_previews_off.lock().unwrap();
+        !held.contains(&(account_id.to_string(), String::new()))
+            && !held.contains(&(account_id.to_string(), room_id.to_string()))
+    }
+
+    /// Records one of those two switches. An empty room id is the account's.
+    pub fn set_matrix_previews_off(&self, account_id: &str, room_id: &str, off: bool) {
+        let key = (account_id.to_string(), room_id.to_string());
+        let mut held = self.matrix_previews_off.lock().unwrap();
+        if off {
+            held.insert(key);
+        } else {
+            held.remove(&key);
+        }
+    }
+
+    /// Marks a conversation as the service talking rather than a person.
+    ///
+    /// One way only. A homeserver does not un-designate its notices room, and
+    /// a client that cleared the mark because one sync happened not to carry
+    /// the tag would offer a Leave that the server refuses.
+    pub fn set_buffer_service_room(&self, state: &AppState, buffer_id: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.service_room {
+                return;
+            }
+            buffer.service_room = true;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// What this conversation is currently filed as.
+    pub fn buffer_tags(&self, buffer_id: &str) -> (bool, bool) {
+        self.buffers.lock().unwrap().get(buffer_id).map(|b| (b.favourite, b.low_priority)).unwrap_or((false, false))
+    }
+
+    pub fn set_buffer_kind(&self, state: &AppState, buffer_id: &str, kind: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.kind == kind {
+                return;
+            }
+            buffer.kind = kind.to_string();
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn set_conn_state(&self, state: &AppState, account_id: &str, conn: ConnState, error: Option<&str>) {
@@ -2652,6 +2770,61 @@ impl Runtime {
 
     pub fn matrix_verification_peers(&self, account_id: &str) -> HashSet<String> {
         self.matrix_verification_peers.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Records a widget, or takes it down when its content was emptied.
+    pub fn set_matrix_widget(&self, account_id: &str, room_id: &str, widget_id: &str, widget: Option<serde_json::Value>) {
+        let mut held = self.matrix_widgets.lock().unwrap();
+        let room = held.entry((account_id.to_string(), room_id.to_string())).or_default();
+        match widget {
+            Some(widget) => {
+                room.insert(widget_id.to_string(), widget);
+            }
+            None => {
+                room.remove(widget_id);
+            }
+        }
+    }
+
+    /// What a room is carrying, in a stable order - a list that reshuffles
+    /// itself every time a room's state is re-read is a list nobody can point
+    /// at.
+    /// Replaces this account's whole `m.direct` list.
+    ///
+    /// Whole rather than merged, because that is how the event itself
+    /// arrives: a room removed from the list in another client is removed by
+    /// its absence, and merging would make un-DMing a room impossible here.
+    pub fn set_matrix_directs(&self, account_id: &str, pairs: Vec<(String, String)>) {
+        let mut held = self.matrix_directs.lock().unwrap();
+        held.retain(|(account, _), _| account != account_id);
+        for (room_id, user_id) in pairs {
+            held.insert((account_id.to_string(), room_id), user_id);
+        }
+    }
+
+    /// Who a room is a direct message with, if the account says it is one.
+    pub fn matrix_direct_peer(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_directs.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+    }
+
+    /// Every room this account calls a direct message.
+    pub fn matrix_direct_rooms(&self, account_id: &str) -> Vec<String> {
+        self.matrix_directs
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(account, _)| account == account_id)
+            .map(|(_, room)| room.clone())
+            .collect()
+    }
+
+    pub fn matrix_widgets(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
+        self.matrix_widgets
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .map(|room| room.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {
@@ -4504,9 +4677,11 @@ impl Runtime {
     /// added again in the same session, which is exactly when somebody is
     /// most likely to be trying to fix something.
     ///
-    /// Swept rather than enumerated, on the rule in `belongs_to` above, so a
-    /// map added later is covered by this the day it is added rather than the
-    /// day somebody remembers to add it here.
+    /// Swept on the rule in `belongs_to` above rather than by knowing what
+    /// each map means, which is what makes seventy-odd of them tractable: the
+    /// rule never needs revisiting, only the list of fields does. That list is
+    /// not automatic - a map added to this struct has to be added here too, or
+    /// it is the one thing an account leaves behind.
     pub fn forget_account(&self, account_id: &str) {
         macro_rules! sweep {
             ($($field:ident),* $(,)?) => {
@@ -4516,6 +4691,20 @@ impl Runtime {
         macro_rules! sweep_pairs {
             ($($field:ident),* $(,)?) => {
                 $( self.$field.lock().unwrap().retain(|key, _| !belongs_to(account_id, &key.0)); )*
+            };
+        }
+        // A set has no value half, so `retain` hands it one argument rather
+        // than two - which is the whole reason these are separate macros, and
+        // the reason three sets quietly escaped the sweep until the test
+        // below learned to look for them.
+        macro_rules! sweep_set {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key| !belongs_to(account_id, key)); )*
+            };
+        }
+        macro_rules! sweep_set_pairs {
+            ($($field:ident),* $(,)?) => {
+                $( self.$field.lock().unwrap().retain(|key| !belongs_to(account_id, &key.0)); )*
             };
         }
 
@@ -4549,14 +4738,55 @@ impl Runtime {
             matrix_room_avatars, matrix_power_levels, matrix_pinned,
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
-            matrix_own_reactions, irc_splits,
+            matrix_own_reactions, irc_splits, matrix_widgets,
+            matrix_directs,
         );
+        sweep_set!(
+            discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,
+            emoji_unrestricted,
+        );
+        sweep_set_pairs!(matrix_previews_off);
     }
 }
 
 #[cfg(test)]
 mod forget_tests {
     use super::belongs_to;
+
+    /// Every map in the struct has to be in the sweep, and the list is
+    /// hand-written - so this reads both and says which was forgotten.
+    ///
+    /// Source-reading in a test is unusual and earns its place here: the cost
+    /// of a missing field is an account that leaves something behind, and the
+    /// failure is silent in exactly the way the whole change exists to stop.
+    #[test]
+    fn every_map_is_swept_when_an_account_is_forgotten() {
+        let src = include_str!("runtime.rs");
+        let start = src.find("pub struct Runtime {").expect("the struct");
+        let end = src[start..].find("\n}").expect("its end") + start;
+        let fields: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                // Sets as well as maps. Three of them escaped this test for
+                // as long as it only looked for HashMap - which is the
+                // failure it exists to catch, happening to itself.
+                let name = line.split(": Mutex<HashMap<").next()?.split(": Mutex<HashSet<").next()?;
+                ((line.contains(": Mutex<HashMap<") || line.contains(": Mutex<HashSet<")) && !name.contains(' '))
+                    .then_some(name)
+            })
+            .collect();
+        assert!(fields.len() > 70, "found only {} maps - the parse is wrong", fields.len());
+
+        // To the end of the function rather than a fixed number of bytes: a
+        // cap is a thing to outgrow silently, and outgrowing this one would
+        // make the test start reporting maps that are in fact swept.
+        let sweep = src.find("pub fn forget_account").expect("the sweep");
+        let end = src[sweep..].find("\n    }\n}").expect("its end") + sweep;
+        let sweep_body = &src[sweep..end];
+        let missing: Vec<&&str> = fields.iter().filter(|f| !sweep_body.contains(**f)).collect();
+        assert!(missing.is_empty(), "these maps would survive removing an account: {missing:?}");
+    }
 
     /// The whole of forgetting an account rests on this one test, so it is
     /// worth being explicit about what it must and must not match.

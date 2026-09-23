@@ -268,6 +268,33 @@ pub struct Buffer {
     /// would put an un-mute in front of somebody that does nothing.
     #[serde(rename = "serverMuted", default, skip_serializing_if = "std::ops::Not::not")]
     pub server_muted: bool,
+    /// Starred on the account itself: Matrix's `m.favourite` tag today.
+    ///
+    /// The account's own filing rather than this window's, and the reason it
+    /// is carried separately from the local pin: a pin is a thing somebody
+    /// did here, while this was very likely done in another client and is
+    /// what they expect to find when they open this one. Both raise a
+    /// conversation to the top of the list.
+    #[serde(rename = "favourite", default, skip_serializing_if = "std::ops::Not::not")]
+    pub favourite: bool,
+    /// The other end of the same idea: `m.lowpriority`, a room the account
+    /// has pushed to the bottom of its list. Not muted - it still says when
+    /// somebody speaks, it simply stops competing for the top of the rail.
+    #[serde(rename = "lowPriority", default, skip_serializing_if = "std::ops::Not::not")]
+    pub low_priority: bool,
+    /// This conversation is the service itself talking to the account.
+    ///
+    /// Matrix's server notices room, which a homeserver uses to say something
+    /// it needs a person to see - a terms-of-service change, a quota, an
+    /// account restriction. Worth marking because it looks exactly like an
+    /// ordinary room from a stranger otherwise, and because it cannot be
+    /// left: the server refuses, so a client offering to leave it is offering
+    /// something that fails.
+    ///
+    /// Not Matrix-only as an idea - Discord's system messages are the same
+    /// thing - so it is named for what it is rather than after the tag.
+    #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_room: bool,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -401,6 +428,16 @@ pub struct Embed {
     pub timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// The picture on the card, as a local path.
+    ///
+    /// A link preview is mostly its picture, and the one a homeserver hands
+    /// back is an mxc URI needing a token no frontend holds - so it is
+    /// fetched and cached like every other piece of Matrix media, and what
+    /// travels is the file. Discord embeds carry none of these today; the
+    /// field is on the shared shape because a card with a picture is what an
+    /// unfurled link is, whoever unfurled it.
+    #[serde(rename = "imageUrl", skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
 }
 
 /// Something on a message that can be pressed.
@@ -800,6 +837,9 @@ mod tests {
             group_id: None,
             remote_id: None,
             server_muted: false,
+            favourite: false,
+            low_priority: false,
+            service_room: false,
         }
     }
 

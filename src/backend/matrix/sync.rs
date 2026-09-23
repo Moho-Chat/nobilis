@@ -148,6 +148,13 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
     // "connected" and genuinely being in many rooms. A fresh account
     // (next_batch still None) doesn't need this - its first /sync already
     // sends full state for every joined room on its own.
+    // Which rooms this account calls direct messages, before any of them are
+    // named. A room named without it is named once and cached, so reading
+    // this late would leave a conversation filed as an ordinary room for the
+    // rest of the session.
+    directs::fetch(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
+    previews::fetch_account_setting(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
+
     if next_batch.is_some() {
         if let Err(e) = bootstrap_joined_rooms(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
             tracing::warn!("matrix[{account_id}]: bootstrapping joined rooms failed: {e:#}");
@@ -162,6 +169,11 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
     // And the invitations already waiting - see fetch_pending_invites.
     if let Err(e) = fetch_pending_invites(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
         tracing::debug!("matrix[{account_id}]: pending invites: {e:#}");
+    }
+
+    // And how the account has filed its rooms - see tags::fetch.
+    if let Err(e) = tags::fetch(state, account_id, &config.homeserver_url, &access_token).await {
+        tracing::debug!("matrix[{account_id}]: room tags: {e:#}");
     }
 
     // And what this account has asked to be told about - see fetch_push_rules.
@@ -417,7 +429,7 @@ pub(super) async fn register_room(
         return;
     }
 
-    let info = rooms::derive_room_info(room_id, own_user_id, &event_refs);
+    let info = rooms::derive_room_info(room_id, own_user_id, &event_refs, state.runtime.matrix_direct_peer(account_id, room_id).as_deref());
     state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
 
     let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
@@ -494,6 +506,19 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
         for event in events {
             if event["type"].as_str() == Some("m.ignored_user_list") {
                 apply_ignored_users(state, account_id, &event["content"]);
+            }
+            // Which rooms this account calls direct messages. Written from
+            // any client, so a conversation started in Element arrives here
+            // as this rather than as anything about the room itself.
+            if event["type"].as_str() == Some("m.direct") {
+                directs::apply(state, account_id, &event["content"]);
+            }
+            // Whether this account wants links unfurled at all. A switch
+            // rather than a preference here, because the unfurling is done by
+            // the homeserver and somebody who turned it off in Element meant
+            // to stop telling it which links they read.
+            if event["type"].as_str() == Some(previews::ACCOUNT_SETTING) {
+                state.runtime.set_matrix_previews_off(account_id, "", previews::disabled_by(&event["content"]));
             }
             // The account's own sticker pack, which travels with it between
             // clients - see backend/matrix/stickers.rs for the two places a
@@ -700,7 +725,12 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
                     continue;
                 }
 
-                let info = rooms::derive_room_info(room_id, own_user_id, &naming_events);
+                let info = rooms::derive_room_info(
+                    room_id,
+                    own_user_id,
+                    &naming_events,
+                    state.runtime.matrix_direct_peer(account_id, room_id).as_deref(),
+                );
                 state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
                 // Same full-state snapshot naming just derived from - also
                 // seeds member avatars/room avatar/power levels the first
@@ -714,6 +744,15 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
 
         let buffer = state.runtime.ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
         state.runtime.set_matrix_room(state, &buffer.id, room_id);
+
+        // How the account has filed this room. Read every sync because it is
+        // set from any client, and after the buffer exists because it is the
+        // buffer this moves in the rail.
+        for event in room["account_data"]["events"].as_array().into_iter().flatten() {
+            if event["type"].as_str() == Some("m.tag") {
+                tags::apply(state, account_id, room_id, &event["content"]);
+            }
+        }
 
         // A room can be added to a space at any time, and a space seen after
         // this room was first synced only records the mapping - so this is
@@ -866,7 +905,8 @@ pub(super) async fn register_space(
     access_token: &str,
     events: &[&Value],
 ) {
-    let name = rooms::derive_room_info(room_id, "", events).name;
+    // A space is never a direct message, so it is asked with none.
+    let name = rooms::derive_room_info(room_id, "", events, None).name;
     let group_id = space_group_id(account_id, room_id);
 
     // Resolved to a local file for the same reason room avatars are: the mxc

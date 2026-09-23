@@ -681,4 +681,176 @@ mod live {
         .await;
         println!("media probe passed: upload -> receive -> local cache all confirmed, bytes match exactly.");
     }
+
+    /// The endpoints this round of spec work added, against a real
+    /// homeserver.
+    ///
+    /// Read-only apart from one throwaway room, which is created, tagged,
+    /// asked about and left. Everything here is a URL and a response shape
+    /// that no unit test can check: a path off by a version prefix compiles,
+    /// passes every test in the tree, and fails the first time somebody uses
+    /// it.
+    ///
+    /// Takes an existing token rather than a password - these are all things
+    /// an already-connected account does, and there is no reason for a probe
+    /// to handle a password to prove it:
+    ///
+    ///   MATRIX_HOMESERVER=https://matrix.poast.org MATRIX_USER_ID=@you:poa.st \
+    ///     MATRIX_TOKEN=... cargo test --release -- --ignored --nocapture matrix_spec_probe
+    #[tokio::test]
+    #[ignore]
+    async fn matrix_spec_probe() {
+        let (Ok(homeserver), Ok(user_id), Ok(token)) = (
+            std::env::var("MATRIX_HOMESERVER"),
+            std::env::var("MATRIX_USER_ID"),
+            std::env::var("MATRIX_TOKEN"),
+        ) else {
+            println!("MATRIX_HOMESERVER / MATRIX_USER_ID / MATRIX_TOKEN not set, skipping");
+            return;
+        };
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let base = homeserver.trim_end_matches('/').to_string();
+        let escaped_user = url::form_urlencoded::byte_serialize(user_id.as_bytes()).collect::<String>();
+
+        // What the server says about itself, including the media limit that
+        // lives under /media rather than with the rest of it.
+        let facts = server::read_facts(&base, &token).await;
+        println!("versions: {:?}", facts.versions.last());
+        println!("default room version: {:?}", facts.default_room_version);
+        println!("upload limit: {:?}", facts.max_upload_size);
+        assert!(!facts.versions.is_empty(), "a homeserver that claims no spec version is not one");
+
+        // The account's own lists.
+        let directs = ssss::read_account_data(&base, &token, &user_id, "m.direct").await;
+        println!("m.direct: {} conversation(s)", directs.as_ref().map(|c| directs::read(c).len()).unwrap_or(0));
+
+        let recents = ssss::read_account_data(&base, &token, &user_id, recentemoji::EVENT).await;
+        println!("recent emoji: {:?}", recents.as_ref().map(|c| recentemoji::read(c)).unwrap_or_default());
+
+        let threepids = http::get_json(&format!("{base}/_matrix/client/v3/account/3pid"), &token)
+            .await
+            .expect("/account/3pid");
+        println!("addresses: {}", threepids["threepids"].as_array().map(|a| a.len()).unwrap_or(0));
+
+        // A room of its own to write to, so nothing here touches a real one.
+        let created = http::post_json(
+            &format!("{base}/_matrix/client/v3/createRoom"),
+            Some(&token),
+            serde_json::json!({ "preset": "private_chat", "name": "nobilis-spec-probe" }),
+        )
+        .await
+        .expect("createRoom");
+        let room_id = created["room_id"].as_str().expect("room_id").to_string();
+        let escaped_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+        println!("probe room {room_id}");
+
+        // Tags: written, read back, removed.
+        let tag_url = format!("{base}/_matrix/client/v3/user/{escaped_user}/rooms/{escaped_room}/tags/{}", tags::FAVOURITE);
+        http::put_json(&tag_url, &token, serde_json::json!({ "order": 0.5 })).await.expect("adding m.favourite");
+        let read_back = http::get_json(
+            &format!("{base}/_matrix/client/v3/user/{escaped_user}/rooms/{escaped_room}/tags"),
+            &token,
+        )
+        .await
+        .expect("reading tags");
+        assert_eq!(tags::read(&read_back), (true, false), "the tag we just set did not come back: {read_back}");
+        http::delete_json(&tag_url, &token).await.expect("removing m.favourite");
+        println!("tags: set, read back and removed");
+
+        // History visibility: the state event, set and read.
+        let hv_url = format!("{base}/_matrix/client/v3/rooms/{escaped_room}/state/m.room.history_visibility");
+        http::put_json(&hv_url, &token, serde_json::json!({ "history_visibility": "invited" }))
+            .await
+            .expect("setting history visibility");
+        let hv = http::get_json(&hv_url, &token).await.expect("reading history visibility");
+        assert_eq!(hv["history_visibility"], "invited", "{hv}");
+        println!("history visibility: set and read back");
+
+        // Where a day is. Asked of a moment before the room existed, so the
+        // answer forwards is the room's own first event.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 60_000;
+        let when = http::get_json(
+            &format!("{base}/_matrix/client/v1/rooms/{escaped_room}/timestamp_to_event?ts={ts}&dir=f"),
+            &token,
+        )
+        .await
+        .expect("timestamp_to_event");
+        assert!(when["event_id"].as_str().is_some(), "no event named: {when}");
+        println!("timestamp_to_event: {}", when["event_id"]);
+
+        // And one event read back whole, which is what View source does.
+        let event_id = when["event_id"].as_str().unwrap();
+        let source = http::get_json(
+            &format!(
+                "{base}/_matrix/client/v3/rooms/{escaped_room}/event/{}",
+                url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
+            ),
+            &token,
+        )
+        .await
+        .expect("reading the event");
+        assert_eq!(source["room_id"].as_str(), Some(room_id.as_str()), "{source}");
+        println!("event source: type {}", source["type"]);
+
+        // And what the homeserver makes of a link. Its own endpoint under
+        // /media, and a server is free to have it switched off entirely -
+        // which is a result rather than a failure, so it is printed either
+        // way.
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let preview = http::get_json(
+            &format!(
+                "{base}/_matrix/client/v1/media/preview_url?url={}&ts={ts}",
+                url::form_urlencoded::byte_serialize(b"https://matrix.org/").collect::<String>()
+            ),
+            &token,
+        )
+        .await;
+        match preview {
+            Ok(answer) => println!("preview_url: title {:?}, image {:?}", answer["og:title"], answer["og:image"]),
+            Err(e) => println!("preview_url: unavailable on this server ({e})"),
+        }
+
+        // Whether this homeserver could do the QR sign-in at all (#222).
+        // MSC4108 is built on OIDC-native auth: the new device is signed in
+        // through an OAuth device grant over a rendezvous channel, so a
+        // homeserver without MSC2965's auth metadata cannot do it however
+        // willing the client is. Printed rather than asserted, because the
+        // answer is a property of the server and "no" is the ordinary one
+        // today.
+        println!("msc4108 advertised: {}", facts.has_unstable("org.matrix.msc4108"));
+        for probe in [
+            "_matrix/client/v1/auth_metadata",
+            "_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
+            "_matrix/client/unstable/org.matrix.msc4108/rendezvous",
+        ] {
+            let reachable = http::get_json(&format!("{base}/{probe}"), &token).await.is_ok();
+            println!("  {probe}: {}", if reachable { "present" } else { "absent" });
+        }
+
+        // Looking into a room without joining it. Two halves, permitted
+        // separately: the summary is answered for anything the server can
+        // reach, while reading the conversation needs the homeserver to allow
+        // peeking - and many, Synapse's own default among them, do not.
+        let hq = url::form_urlencoded::byte_serialize(b"#matrix:matrix.org").collect::<String>();
+        match http::get_json(&format!("{base}/_matrix/client/v1/room_summary/{hq}"), &token).await {
+            Ok(summary) => println!(
+                "room summary: {:?}, {} members, world_readable {}",
+                summary["name"], summary["num_joined_members"], summary["world_readable"]
+            ),
+            Err(e) => println!("room summary: unavailable ({e})"),
+        }
+
+        let _ = http::post_json(
+            &format!("{base}/_matrix/client/v3/rooms/{escaped_room}/leave"),
+            Some(&token),
+            serde_json::json!({}),
+        )
+        .await;
+        println!("spec probe passed.");
+    }
 }
+

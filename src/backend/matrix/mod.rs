@@ -42,14 +42,18 @@
 //! say `backend::matrix::send_message` without knowing which file that is,
 //! and each opens with `use super::*` to share the imports below.
 
+pub mod account;
 pub mod auth;
 pub mod directory;
+pub mod directs;
 pub mod history;
 pub mod media;
 pub mod notifications;
 pub mod probes;
+pub mod previews;
 pub mod profile;
 pub mod receipts;
+pub mod recentemoji;
 pub mod relock;
 pub mod send;
 pub mod server;
@@ -77,14 +81,20 @@ pub mod crypto;
 pub mod http;
 pub mod markup;
 pub mod moderation;
+pub mod permalinks;
+pub mod peek;
+pub mod policy;
 pub mod polls;
 pub mod calls;
 pub mod protocol;
+pub mod roomsettings;
 pub mod roomstate;
+pub mod widgets;
 pub mod sliding;
 pub mod dehydration;
 pub mod ssss;
 pub mod stickers;
+pub mod tags;
 pub mod rooms;
 pub mod verification;
 
