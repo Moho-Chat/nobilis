@@ -4313,6 +4313,42 @@ pub async fn dispatch(
             }
         }
 
+        // Watching somebody else's stream, which is a different act from
+        // hosting one: no capture, no encoder, and a connection that reads
+        // rather than writes. The frames arrive as `discordStreamFrame`
+        // events rather than as an answer here, because they keep coming.
+        "watchDiscordStream" | "stopWatchingDiscordStream" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some(format!("{method} requires \"accountId\"")));
+            };
+            let Some(stream_key) = p_str_opt(params, "streamKey") else {
+                return (None, Some(format!("{method} requires \"streamKey\"")));
+            };
+            if method == "stopWatchingDiscordStream" {
+                backend::discord::golive::stop_watching(account_id, stream_key);
+                return (Some(ok_node()), None);
+            }
+            match backend::discord::golive::start_watching(state, account_id, stream_key) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e.to_string())),
+            }
+        }
+
+        // Whether a picture is actually being received, for a window that
+        // wants to show "connecting" rather than a black rectangle.
+        "discordStreamWatched" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordStreamWatched requires \"accountId\"".to_string()));
+            };
+            let Some(stream_key) = p_str_opt(params, "streamKey") else {
+                return (None, Some("discordStreamWatched requires \"streamKey\"".to_string()));
+            };
+            (
+                Some(serde_json::json!({ "watching": backend::discord::golive::watching(account_id, stream_key) })),
+                None,
+            )
+        }
+
         // One encoded frame, from the window that captured and encoded it.
         // Chromium has the encoders and this process has none, which is the
         // same division the Matrix calls draw from the other side.

@@ -28,13 +28,14 @@ use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::rtp;
-use super::voicecrypto::{Mode, Sealer};
+use super::voicecrypto::{self, Mode, Sealer};
 
 /// Discord's voice gateway version. 8 is what carries the video fields.
 const VOICE_VERSION: u8 = 8;
@@ -73,6 +74,43 @@ pub fn discovery_answer(packet: &[u8]) -> Result<(String, u16)> {
     }
     let port = u16::from_be_bytes([packet[72], packet[73]]);
     Ok((address, port))
+}
+
+/// What a stream connection is for.
+///
+/// The handshake is the same either way - the same identify, the same
+/// protocol selection, the same DAVE group - and only the two ends differ:
+/// a host announces a video SSRC and then writes to the socket, a viewer
+/// announces nothing and reads from it. Keeping them on one path means the
+/// half that is known to work is the half the other one uses.
+#[derive(Debug, Clone, Copy)]
+pub enum Role {
+    Host,
+    /// Whose stream is being watched. Needed rather than merely useful: MLS
+    /// keys every sender separately, so a frame can only be decrypted by
+    /// naming who sent it.
+    Viewer { owner: u64 },
+}
+
+/// A connection that is up, in whichever direction it runs.
+pub enum Connected {
+    Sending(Arc<StreamSender>),
+    Watching(Arc<Watching>),
+}
+
+/// A stream being received.
+///
+/// Nothing to call on it but `stop`: frames arrive on their own task and go
+/// straight to the window as events, because a viewer has nothing to ask for
+/// and nothing to wait on.
+pub struct Watching {
+    live: Arc<AtomicBool>,
+}
+
+impl Watching {
+    pub fn stop(&self) {
+        self.live.store(false, Ordering::Relaxed);
+    }
 }
 
 /// One stream connection, once it is sending.
@@ -179,7 +217,11 @@ pub async fn connect(
     rtc_channel_id: &str,
     session_id: &str,
     user_id: &str,
-) -> Result<Arc<StreamSender>> {
+    role: Role,
+    // Named for the events a viewer's frames arrive under, so the window can
+    // tell two streams apart. Unused by a host, which has nothing to report.
+    stream_key: &str,
+) -> Result<Connected> {
     let url = format!("wss://{}/?v={VOICE_VERSION}", endpoint.trim_end_matches(":443"));
     let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening the stream socket")?;
     let (mut write, mut read) = socket.split();
@@ -394,6 +436,9 @@ pub async fn connect(
     // connection that cannot yet encrypt any is announcing something that
     // will not come, and the ordering is the one thing left that could be
     // provoking the server into dropping us.
+    // A viewer sends no media, so it claims no SSRCs. Announcing a video
+    // SSRC it will never put a packet on would tell the server to expect a
+    // second picture in a conversation that has one.
     let announce_video = json!({
         "op": 12,
         "d": {
@@ -411,14 +456,39 @@ pub async fn connect(
     .to_string();
 
     let live = Arc::new(AtomicBool::new(true));
+    // Held back from the tasks below, which each take their own handle: the
+    // value returned has to be able to stop them after they have started.
+    let watching = live.clone();
+    let udp = Arc::new(udp);
     let sender = Arc::new(StreamSender {
-        udp: Arc::new(udp),
+        udp: udp.clone(),
         sealer: Mutex::new(Sealer::new(mode, &key)?),
         video_ssrc,
         sequence: AtomicU32::new(rand::random::<u16>() as u32),
         live: live.clone(),
         dave: dave.clone(),
     });
+
+    // Who is sending on which SSRC, learned from the server rather than
+    // assumed. The server describes other people's streams in its own op 12
+    // frames, and a viewer needs the mapping both to know which packets are
+    // the picture and to name the sender when decrypting.
+    let senders: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    if let Role::Viewer { owner } = role {
+        tokio::spawn(watch_socket(
+            state.clone(),
+            account_id.to_string(),
+            stream_key.to_string(),
+            udp.clone(),
+            mode,
+            key.clone(),
+            dave.clone(),
+            senders.clone(),
+            owner,
+            live.clone(),
+        ));
+    }
 
     // The socket has to keep being read and heart-beaten for the connection
     // to stay up; nothing else is waiting on it, so it runs on its own.
@@ -478,14 +548,16 @@ pub async fn connect(
                         // able to encrypt anything.
                         Some(Ok(incoming)) => {
                             note_sequence(&incoming, &seq_ack);
+                            note_senders(&incoming, &senders).await;
                             if let Some(reply) = answer_dave(&dave, &incoming, &account).await {
                                 if write.send(reply).await.is_err() {
                                     break;
                                 }
                             }
                             // The moment the group exists, say what is about
-                            // to be sent on it.
-                            if !announced && group_ready(&dave).await {
+                            // to be sent on it. A viewer has nothing to say:
+                            // it is here to receive.
+                            if matches!(role, Role::Host) && !announced && group_ready(&dave).await {
                                 announced = true;
                                 let epoch = match dave.lock().await.as_ref() {
                                     Some(d) => d.epoch(),
@@ -508,8 +580,182 @@ pub async fn connect(
         live.store(false, Ordering::Relaxed);
     });
 
-    let _ = state;
-    Ok(sender)
+    Ok(match role {
+        Role::Host => Connected::Sending(sender),
+        Role::Viewer { .. } => Connected::Watching(Arc::new(Watching { live: watching })),
+    })
+}
+
+/// Reads the server's own op 12 frames for who is sending on which SSRC.
+///
+/// The server describes every other participant's streams this way, and it is
+/// the only place the mapping exists: a packet carries an SSRC and nothing
+/// else identifying, so without this a viewer knows a picture is arriving and
+/// not whose it is - which under MLS means it cannot be decrypted at all.
+async fn note_senders(incoming: &WsMessage, senders: &Arc<Mutex<HashMap<u32, u64>>>) {
+    let WsMessage::Text(text) = incoming else { return };
+    let Ok(message) = serde_json::from_str::<Value>(text) else { return };
+    if message["op"].as_u64() != Some(12) {
+        return;
+    }
+    let d = &message["d"];
+    // Discord writes ids as strings everywhere else and as numbers here, so
+    // both are read rather than the one that happened to arrive first.
+    let Some(user) = d["user_id"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| d["user_id"].as_u64()) else {
+        return;
+    };
+    let mut held = senders.lock().await;
+    if let Some(ssrc) = d["video_ssrc"].as_u64().filter(|s| *s != 0) {
+        held.insert(ssrc as u32, user);
+    }
+    // A stream can be re-announced on a new SSRC when quality changes, and
+    // the entries in `streams` are where that arrives first.
+    for stream in d["streams"].as_array().into_iter().flatten() {
+        if let Some(ssrc) = stream["ssrc"].as_u64().filter(|s| *s != 0) {
+            held.insert(ssrc as u32, user);
+        }
+    }
+}
+
+/// Reads the socket for as long as the stream lasts, and hands the window
+/// whole frames.
+///
+/// The exact mirror of `StreamSender::send_frame`, run backwards: open each
+/// packet, reassemble the frame it belongs to, decrypt the frame for the
+/// group. Doing the two decryptions in the wrong order produces nothing that
+/// looks like an error - the packet opens, the bytes are the right length,
+/// and the decoder is handed noise - so the order here is the same one the
+/// sender used, read bottom to top.
+#[allow(clippy::too_many_arguments)]
+async fn watch_socket(
+    state: AppState,
+    account_id: String,
+    stream_key: String,
+    udp: Arc<UdpSocket>,
+    mode: Mode,
+    key: Vec<u8>,
+    dave: Arc<Mutex<Option<super::dave::Dave>>>,
+    senders: Arc<Mutex<HashMap<u32, u64>>>,
+    owner: u64,
+    live: Arc<AtomicBool>,
+) {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    // One per SSRC. Two people sending into the same connection do not share
+    // a sequence space, and treating them as if they did would read every
+    // other packet as a gap.
+    let mut windows: HashMap<u32, super::reassemble::Reassembler> = HashMap::new();
+    // A datagram is at most an MTU, and the sender caps its payload well
+    // under one; this is roomy rather than tight.
+    let mut buffer = vec![0u8; 4096];
+    // Counted, not logged one by one. A stream that cannot be decrypted
+    // produces one of these per packet - thousands a second - and a log line
+    // each is how a client stops responding entirely.
+    let mut unopened = 0u64;
+    let mut undecrypted = 0u64;
+    let mut frames = 0u64;
+    let mut waiting_for_keyframe = true;
+
+    tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
+    while live.load(Ordering::Relaxed) {
+        let read = tokio::time::timeout(std::time::Duration::from_secs(30), udp.recv(&mut buffer)).await;
+        let length = match read {
+            Ok(Ok(length)) => length,
+            // Not an error worth ending on by itself: a paused stream sends
+            // nothing, and the websocket is what says whether it is still
+            // there.
+            Err(_) => {
+                tracing::debug!("discord[{account_id}]: nothing on {stream_key} for thirty seconds");
+                continue;
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("discord[{account_id}]: the stream socket failed: {e}");
+                break;
+            }
+        };
+        let datagram = &buffer[..length];
+        // Not everything arriving here is a packet. The discovery answer and
+        // whatever else the server sends would otherwise be fed to a decoder.
+        let Some(parsed) = rtp::parse_header(datagram) else { continue };
+        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 {
+            continue;
+        }
+        let payload = match voicecrypto::open(mode, &key, datagram, parsed.header_len) {
+            Ok(payload) => payload,
+            Err(_) => {
+                unopened += 1;
+                continue;
+            }
+        };
+        let window = windows
+            .entry(parsed.ssrc)
+            .or_insert_with(|| super::reassemble::Reassembler::new(super::reassemble::DEFAULT_WINDOW));
+        let whole = window.push(rtp::Packet {
+            payload_type: parsed.payload_type,
+            sequence: parsed.sequence,
+            timestamp: parsed.timestamp,
+            ssrc: parsed.ssrc,
+            marker: parsed.marker,
+            payload,
+        });
+        for frame in whole {
+            // Whoever the server said owns this SSRC, and the stream's owner
+            // if it has not said yet - which is right for a viewer
+            // connection, since it carries one person's stream.
+            let from = senders.lock().await.get(&parsed.ssrc).copied().unwrap_or(owner);
+            let picture = {
+                let mut held = dave.lock().await;
+                match held.as_mut() {
+                    Some(session) => match session.decrypt_video(from, &frame.data) {
+                        Ok(picture) => picture,
+                        Err(_) => {
+                            undecrypted += 1;
+                            continue;
+                        }
+                    },
+                    None => frame.data,
+                }
+            };
+            // A decoder started on an inter frame produces either an error or
+            // a wrong picture that persists until the next keyframe, so
+            // everything before the first keyframe is thrown away here rather
+            // than sent to the window to be refused there.
+            if waiting_for_keyframe {
+                if !frame.keyframe {
+                    continue;
+                }
+                waiting_for_keyframe = false;
+                tracing::info!("discord[{account_id}]: the first keyframe of {stream_key} arrived");
+            }
+            frames += 1;
+            if frames % 300 == 1 {
+                tracing::info!(
+                    "discord[{account_id}]: {stream_key}: {frames} frames, {unopened} packets that would not open, {undecrypted} frames that would not decrypt"
+                );
+            }
+            state.events.emit(
+                "discordStreamFrame",
+                json!({
+                    "accountId": account_id,
+                    "streamKey": stream_key,
+                    "keyframe": frame.keyframe,
+                    // Microseconds, which is what a WebCodecs decoder takes.
+                    // RTP counts video in 90kHz ticks.
+                    "timestampMicros": (frame.timestamp as u64 * 1_000_000) / rtp::VIDEO_CLOCK_HZ,
+                    "frame": STANDARD.encode(&picture),
+                }),
+            );
+        }
+    }
+    tracing::info!(
+        "discord[{account_id}]: stopped watching {stream_key} after {frames} frames ({unopened} unopened, {undecrypted} undecrypted)"
+    );
+    live.store(false, Ordering::Relaxed);
+    state.events.emit(
+        "discordStreamFrame",
+        json!({ "accountId": account_id, "streamKey": stream_key, "ended": true }),
+    );
 }
 
 /// Remembers how far the server has got, for the next heartbeat to
