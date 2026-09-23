@@ -483,6 +483,14 @@ pub fn start_watching(state: &AppState, account_id: &str, stream_key: &str) -> R
     }
     wanted().lock().unwrap().insert(slot(account_id, stream_key));
     watch(state, account_id, stream_key)?;
+    // What is already known about it, which after a STREAM_CREATE is the RTC
+    // channel and after a second watch of the same stream may be everything.
+    if let Some(held) = held(account_id, stream_key) {
+        tracing::info!(
+            "discord[{account_id}]: {stream_key} is already {}",
+            if held.complete() { "fully described" } else { "partly described" }
+        );
+    }
     // Discord stops sending a stream nobody has said they are still there
     // for, so the ping goes out with the request rather than only on a timer.
     let _ = ping(state, account_id, stream_key);
@@ -514,23 +522,37 @@ pub fn watching(account_id: &str, stream_key: &str) -> bool {
 /// have arrived.
 async fn join_stream(state: &AppState, account_id: &str, stream_key: &str, d: &Value) {
     let key = slot(account_id, stream_key);
-    if !wanted().lock().unwrap().contains(&key) {
-        return;
-    }
-    if watchers().lock().unwrap().contains_key(&key) {
-        // Already receiving. Later dispatches for the same stream - one
-        // arrives every time somebody else starts or stops watching - must
-        // not open a second connection on the same session, which is what
-        // the server answers by invalidating one of them.
-        pending().lock().unwrap().entry(key).or_default().absorb(d);
-        return;
-    }
+    // Kept before anything is decided, and whether or not this client has
+    // asked to watch.
+    //
+    // The halves of somebody else's handshake do not arrive together or in
+    // one order. STREAM_CREATE announces the stream to everybody in the call
+    // the moment it starts - carrying the RTC channel, which is what the
+    // end-to-end encrypted group is named after - and STREAM_SERVER_UPDATE
+    // brings the endpoint and token, which only arrive after this client has
+    // asked to watch. So the first of them lands seconds or minutes before
+    // anybody presses anything.
+    //
+    // Discarding it until asked meant the RTC channel was gone by the time it
+    // was wanted, and a group built on an empty channel name is one nobody
+    // else is in: the connection would open, the picture would arrive, and
+    // not one frame of it would decrypt.
     let ready = {
         let mut all = pending().lock().unwrap();
         let entry = all.entry(key.clone()).or_default();
         entry.absorb(d);
         entry.complete().then(|| entry.clone())
     };
+    if !wanted().lock().unwrap().contains(&key) {
+        return;
+    }
+    // Already receiving. Later dispatches for the same stream - one arrives
+    // every time anybody starts or stops watching - must not open a second
+    // connection on the same session, which the server answers by
+    // invalidating one of them.
+    if watchers().lock().unwrap().contains_key(&key) {
+        return;
+    }
     let Some(ready) = ready else { return };
     if !opening().lock().unwrap().insert(key.clone()) {
         return;
@@ -563,6 +585,21 @@ async fn open_viewer(state: &AppState, account_id: &str, stream_key: &str, ready
         .clone()
         .or_else(|| StreamKey::parse(stream_key).map(|k| k.guild_id.unwrap_or(k.channel_id)))
         .unwrap_or_default();
+
+    // Said out loud because it is the one thing that can be missing while
+    // everything else looks right. The RTC channel names the encrypted group;
+    // without it the connection opens, packets arrive, and nothing decrypts -
+    // a failure that otherwise shows up only as a count of frames that would
+    // not decrypt, minutes later.
+    match ready.rtc_channel_id.as_deref() {
+        Some(channel) => tracing::info!(
+            "discord[{account_id}]: watching {stream_key} on {} via rtc channel {channel}",
+            ready.endpoint.as_deref().unwrap_or("nowhere")
+        ),
+        None => tracing::warn!(
+            "discord[{account_id}]: {stream_key} never named an rtc channel - its group cannot be joined, so nothing will decrypt"
+        ),
+    }
 
     let connected = super::streamconn::connect(
         state,
