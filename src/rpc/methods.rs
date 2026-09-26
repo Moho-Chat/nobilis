@@ -4070,6 +4070,31 @@ pub async fn dispatch(
             }
         }
 
+        // What a space holds, including the rooms this account has not
+        // joined - which sync cannot answer, because a room nobody here is
+        // in appears in nobody's sync.
+        "matrixSpaceHierarchy" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("matrixSpaceHierarchy requires \"accountId\"".to_string()));
+            };
+            // Named by room id, or by the buffer group a space owns - the
+            // window has the latter and would otherwise have to keep a
+            // second mapping of its own.
+            let space_id = match p_str_opt(params, "spaceId") {
+                Some(id) => id.to_string(),
+                None => match p_str_opt(params, "groupId").and_then(backend::matrix::space_room_id) {
+                    Some(id) => id,
+                    None => return (None, Some("matrixSpaceHierarchy requires \"spaceId\" or \"groupId\"".to_string())),
+                },
+            };
+            let from = p_str(params, "from", "");
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 100) as u32;
+            match backend::matrix::space_hierarchy(state, account_id, &space_id, from, limit).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "joinMatrixRoom" => {
             let (account_id, room) = match (p_str_opt(params, "accountId"), p_str_opt(params, "roomIdOrAlias")) {
                 (Some(a), Some(r)) => (a, r),
