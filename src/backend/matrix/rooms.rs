@@ -99,7 +99,25 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
                 .or_else(|| direct_peer.map(str::to_string))
                 .or(other_member_name)
         })
-        .unwrap_or_else(|| room_id.to_string());
+        .unwrap_or_else(|| {
+            // Nothing to name it after at all: no name, no alias, nobody but
+            // this account in it. A room id is not a name - it is an
+            // identifier somebody has to recognise a room by, and next to
+            // real names in a list it reads as a fault rather than as an
+            // empty room. Element calls this "Empty room" and so does this.
+            //
+            // The id stays on the end, because two empty rooms are otherwise
+            // the same buffer: the name is what a buffer is keyed by, and
+            // three failed direct messages collapsing into one conversation
+            // would be worse than an ugly name. Short, because it is there to
+            // disambiguate rather than to be read.
+            if joined_count <= 1 {
+                let short: String = room_id.trim_start_matches('!').chars().take(6).collect();
+                format!("Empty room ({short})")
+            } else {
+                room_id.to_string()
+            }
+        });
 
     RoomInfo { name, kind: kind.to_string() }
 }
@@ -362,6 +380,35 @@ mod space_tests {
         let room = vec![json!({ "type": "m.room.create", "content": { "room_version": "10" } })];
         assert!(!is_space(&refs(&room)));
         assert!(!is_space(&[]));
+    }
+
+    /// A room with nothing to be named after.
+    ///
+    /// Three of these turned up during an audit - each one a direct message
+    /// whose invitation the server refused after making the room - and every
+    /// one of them sat in the room list as a raw `!abc...` id, which reads as
+    /// a fault rather than as an empty room.
+    #[test]
+    fn a_room_with_nothing_to_name_it_after_is_called_empty() {
+        let events: Vec<Value> = vec![];
+        let refs: Vec<&Value> = events.iter().collect();
+        let info = derive_room_info("!BaHfUc5E49KE2GLZWkdt:matrix.org", "@me:matrix.org", &refs, None);
+        assert!(info.name.starts_with("Empty room ("), "got {}", info.name);
+        // The id is kept, shortened, because the name is the buffer's key and
+        // two empty rooms must not collapse into one conversation.
+        assert!(info.name.contains("BaHfUc"), "got {}", info.name);
+
+        let other = derive_room_info("!different0000:matrix.org", "@me:matrix.org", &refs, None);
+        assert_ne!(info.name, other.name, "two empty rooms are two rooms");
+    }
+
+    /// And a room that has a name keeps it - the fallback must not reach
+    /// anything that was namable.
+    #[test]
+    fn a_named_room_is_untouched_by_the_empty_fallback() {
+        let events = vec![json!({ "type": "m.room.name", "state_key": "", "content": { "name": "real name" } })];
+        let refs: Vec<&Value> = events.iter().collect();
+        assert_eq!(derive_room_info("!x:matrix.org", "@me:matrix.org", &refs, None).name, "real name");
     }
 
     #[test]

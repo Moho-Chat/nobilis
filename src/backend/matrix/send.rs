@@ -488,6 +488,15 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
+    // Refused before anything is sent, and not only because it is a strange
+    // thing to want. `createRoom` carries the invitation, and a homeserver
+    // asked to invite somebody already in the room makes the room and *then*
+    // refuses - so the failure leaves an empty room behind on the server
+    // every time, with no id handed back to clean it up with.
+    if target_user_id == account.user_id {
+        anyhow::bail!("that is this account - there is nobody to open a conversation with");
+    }
+
     if let Some(room_id) = state.runtime.find_matrix_dm_room(account_id, target_user_id) {
         if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, &room_id) {
             let buffer = state.runtime.ensure_buffer(state, account_id, &name, &kind);
