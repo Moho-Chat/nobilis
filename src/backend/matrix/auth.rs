@@ -27,13 +27,26 @@ pub struct LoginResult {
 /// homeserver to reuse (or create-with-this-id) that specific device
 /// rather than minting a fresh one - see the module doc above for why this
 /// matters for E2EE continuity.
+/// What this client calls itself in somebody's session list.
+///
+/// One name, used by every way in. It was three: the password and token
+/// paths said "nobilis", registration said "moho", and the device grant said
+/// nothing at all - so the provider invented "moho on Unknown device" from
+/// the registered client name and whatever it could guess from the request.
+///
+/// "moho" rather than "nobilis" because this list is read by a person
+/// deciding whether a session is theirs. The daemon is an implementation
+/// detail they have never heard of, and a line they do not recognise in a
+/// list of logins is the one that gets revoked - possibly the wrong one.
+pub const DEVICE_DISPLAY_NAME: &str = "moho";
+
 pub async fn login(homeserver_url: &str, username: &str, password: &str, device_id: Option<&str>) -> Result<LoginResult> {
     let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
     let mut body = json!({
         "type": "m.login.password",
         "identifier": { "type": "m.id.user", "user": username },
         "password": password,
-        "initial_device_display_name": "nobilis",
+        "initial_device_display_name": DEVICE_DISPLAY_NAME,
     });
     if let Some(device_id) = device_id {
         body["device_id"] = json!(device_id);
@@ -74,7 +87,7 @@ pub async fn login_with_token(homeserver_url: &str, token: &str, device_id: Opti
     let mut body = json!({
         "type": "m.login.token",
         "token": token,
-        "initial_device_display_name": "nobilis",
+        "initial_device_display_name": DEVICE_DISPLAY_NAME,
     });
     if let Some(device_id) = device_id {
         body["device_id"] = json!(device_id);
@@ -169,7 +182,7 @@ pub async fn register(homeserver_url: &str, username: &str, password: &str) -> R
         "password": password,
         // A device this client will use, named the way the login path names
         // one, so the new account's device list reads the same as any other.
-        "initial_device_display_name": "moho",
+        "initial_device_display_name": DEVICE_DISPLAY_NAME,
         // Deliberately not `inhibit_login`: the point of registering here is
         // to end up signed in, and asking the server to register *without*
         // logging in would mean immediately logging in again.
@@ -363,6 +376,33 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
     // The server's own answer wins where it has one: it is what the device
     // list will show, and a mismatch here would be a device nobody can find.
     let device_id = whoami["device_id"].as_str().unwrap_or(&device_id).to_string();
+
+    // Said outright, because this flow has nowhere to say it in passing. The
+    // password and token paths carry `initial_device_display_name` on the
+    // request that creates the device; a device made by an OAuth grant has
+    // no such field, so the provider names it from whatever it can guess -
+    // "moho on Unknown device", in matrix.org's case.
+    //
+    // Which matters more than it looks: a session list is read by somebody
+    // deciding whether a login is theirs, and "Unknown device" is exactly
+    // the line that gets revoked in a hurry.
+    //
+    // Not fatal if it fails. The account is signed in and working by this
+    // point, and an unhelpfully named device is a far smaller problem than
+    // refusing a sign-in that succeeded.
+    let naming = http::put_json(
+        &format!(
+            "{}/_matrix/client/v3/devices/{}",
+            homeserver_url.trim_end_matches('/'),
+            url::form_urlencoded::byte_serialize(device_id.as_bytes()).collect::<String>()
+        ),
+        &access_token,
+        serde_json::json!({ "display_name": DEVICE_DISPLAY_NAME }),
+    )
+    .await;
+    if let Err(e) = naming {
+        tracing::warn!("matrix device login[{login_id}]: could not name the new device: {e:#}");
+    }
 
     let config = MatrixAccountConfig {
         homeserver_url: homeserver_url.to_string(),

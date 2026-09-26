@@ -15,7 +15,19 @@ pub fn http_client() -> &'static reqwest::Client {
         // let every client here negotiate h2 as a side effect, changing the
         // transport under a backend that works and is tested as it stands.
         // Nothing here wants h2; if it ever does, that is its own change.
-        reqwest::Client::builder().http1_only().build().unwrap_or_else(|_| reqwest::Client::new())
+        //
+        // A user agent, because otherwise there is none. Homeservers log it,
+        // rate limiters key on it, and an account provider naming a new
+        // device guesses from it - which is where "moho on Unknown device"
+        // came from in a matrix.org session list. The device's name is now
+        // set outright (see auth::DEVICE_DISPLAY_NAME), so this is no longer
+        // load-bearing for that; it is simply what a well-behaved client
+        // says about itself.
+        reqwest::Client::builder()
+            .http1_only()
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
