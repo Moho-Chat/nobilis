@@ -13,6 +13,89 @@ use serde::Serialize;
 /// Anonymous hosts only. Nothing here holds an account or a key: a client that
 /// silently signed uploads into an account somebody forgot they had would be a
 /// worse thing than a broken link.
+/// How far an upload has got, said out loud.
+///
+/// An upload to somebody else's host is the one part of sending a message
+/// that can take a minute and has nothing to show for itself. The window
+/// showed the message as sent-and-pending the whole time, which meant an
+/// ordinary slow upload was indistinguishable from a message that had
+/// vanished - and after ten seconds the window's own send timeout called it
+/// failed and offered a retry, while the upload was still running.
+///
+/// So the upload says where it is. `Phase` rather than a percentage on
+/// purpose: the file is handed to the HTTP client whole, and restructuring
+/// that into a counted stream would mean rebuilding a request body whose
+/// current shape was arrived at the hard way (see `http_client` on catbox and
+/// HTTP/1.1). What can be said honestly is which of the three waits this is,
+/// and how long it has been - which is what somebody looking at a spinner
+/// actually wants to know.
+pub struct Progress {
+    events: crate::events::EventBus,
+    id: String,
+}
+
+/// The stages of an upload, in the order they happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Reading the file and checking it against the host's limits.
+    Preparing,
+    /// The request is out and the bytes are going.
+    Sending,
+    /// Everything is written and the host has not answered yet. Distinct from
+    /// `Sending` because this is the wait that goes long on a slow host, and
+    /// a spinner that has silently meant two different things for a minute is
+    /// no better than no spinner.
+    Waiting,
+}
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Preparing => "preparing",
+            Phase::Sending => "sending",
+            Phase::Waiting => "waiting",
+        }
+    }
+}
+
+impl Progress {
+    pub fn new(events: crate::events::EventBus, id: &str) -> Progress {
+        Progress { events, id: id.to_string() }
+    }
+
+    /// Says which stage this is, and how big the file turned out to be.
+    ///
+    /// `bytes` is zero until the file has been read, which is why it is sent
+    /// with every phase rather than once at the start.
+    pub fn at(&self, phase: Phase, bytes: usize, host: &str) {
+        self.events.emit(
+            "uploadProgress",
+            serde_json::json!({
+                "uploadId": self.id,
+                "phase": phase.name(),
+                "bytes": bytes,
+                "host": host,
+            }),
+        );
+    }
+
+    /// The end, either way.
+    ///
+    /// Always sent, including when the upload failed, because the window has
+    /// a row on screen waiting to be told - and a spinner with nothing coming
+    /// is the failure this whole thing exists to remove.
+    pub fn done(&self, error: Option<&str>) {
+        self.events.emit(
+            "uploadProgress",
+            serde_json::json!({
+                "uploadId": self.id,
+                "phase": "done",
+                "error": error,
+            }),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Host {
     /// Permanent, 200MB, takes any file type.
@@ -115,6 +198,36 @@ pub fn hosts() -> Vec<serde_json::Value> {
 /// rather than interpreted, so a value that host does not know is its own
 /// error to report rather than something to be silently corrected here.
 pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<String> {
+    upload_reporting(host, path, retention, None).await
+}
+
+/// The same, with somewhere to say how it is going.
+///
+/// Separate entry point rather than an extra argument everywhere, because
+/// most callers have no window waiting on them - a voice note's upload, or a
+/// probe - and threading `None` through those would be noise.
+pub async fn upload_reporting(
+    host: Host,
+    path: &str,
+    retention: Option<&str>,
+    progress: Option<&Progress>,
+) -> Result<String> {
+    let result = upload_inner(host, path, retention, progress).await;
+    if let Some(progress) = progress {
+        progress.done(result.as_ref().err().map(|e| e.to_string()).as_deref());
+    }
+    result
+}
+
+async fn upload_inner(
+    host: Host,
+    path: &str,
+    retention: Option<&str>,
+    progress: Option<&Progress>,
+) -> Result<String> {
+    if let Some(progress) = progress {
+        progress.at(Phase::Preparing, 0, host.id());
+    }
     let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {path}"))?;
     if bytes.is_empty() {
         bail!("that file is empty");
@@ -135,13 +248,16 @@ pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<S
         bail!("{} does not take \"{file_name}\" - it accepts {taken}", host.id());
     }
 
+    if let Some(progress) = progress {
+        progress.at(Phase::Sending, bytes.len(), host.id());
+    }
     match host {
-        Host::Catbox | Host::Litterbox => catbox_family(host, file_name, bytes, retention).await,
+        Host::Catbox | Host::Litterbox => catbox_family(host, file_name, bytes, retention, progress).await,
         // The direct image link, not the page about it. Sneedchat wraps both
         // in BBCode because it renders markup; a caller reaching this has
         // none, so what it wants is the URL that ends in a file extension -
         // it is what makes a link unfurl into a picture at the far end.
-        Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg(path).await?.direct),
+        Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg_reporting(path, progress).await?.direct),
     }
 }
 
@@ -166,17 +282,29 @@ fn http_client() -> &'static reqwest::Client {
 
 /// catbox.moe and its temporary sibling share one API: a multipart form with a
 /// `reqtype`, and the finished URL as the whole of the response body.
-async fn catbox_family(host: Host, file_name: String, bytes: Vec<u8>, retention: Option<&str>) -> Result<String> {
+async fn catbox_family(
+    host: Host,
+    file_name: String,
+    bytes: Vec<u8>,
+    retention: Option<&str>,
+    progress: Option<&Progress>,
+) -> Result<String> {
     let url = match host {
         Host::Litterbox => "https://litterbox.catbox.moe/resources/internals/api.php",
         _ => "https://catbox.moe/user/api.php",
     };
+    let size = bytes.len();
     let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
     let mut form = reqwest::multipart::Form::new().text("reqtype", "fileupload").part("fileToUpload", part);
     if host == Host::Litterbox {
         form = form.text("time", retention.unwrap_or("72h").to_string());
     }
 
+    // Everything past here is one await with nothing observable inside it, so
+    // this is the last honest thing that can be said until the host answers.
+    if let Some(progress) = progress {
+        progress.at(Phase::Waiting, size, host.id());
+    }
     let resp = http_client()
         .post(url)
         .multipart(form)
@@ -305,6 +433,39 @@ mod tests {
         std::fs::write(&file, b"not really a video").unwrap();
         let err = upload(Host::Postimg, file.to_str().unwrap(), None).await.unwrap_err().to_string();
         assert!(err.contains("does not take"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upload that never starts still says it is over.
+    ///
+    /// The whole point of the progress events is a spinner that ends. A
+    /// refusal before any network work - the wrong file type, a file over the
+    /// host's limit - is exactly the case where it would be easiest to return
+    /// early and leave the window turning forever, so it is the one pinned
+    /// down here.
+    #[tokio::test]
+    async fn a_refused_file_still_reports_that_it_finished() {
+        let dir = std::env::temp_dir().join(format!("nobilis-progress-{}", crate::model::next_message_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"not really a video").unwrap();
+
+        let bus = crate::events::EventBus::new();
+        let mut rx = bus.subscribe();
+        let progress = Progress::new(bus, "upload-1");
+        let err = upload_reporting(Host::Postimg, file.to_str().unwrap(), None, Some(&progress))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not take"), "got {err}");
+
+        let mut phases = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            assert_eq!(event.data["uploadId"], "upload-1");
+            phases.push(event.data["phase"].as_str().unwrap_or_default().to_string());
+        }
+        assert_eq!(phases.first().map(String::as_str), Some("preparing"));
+        assert_eq!(phases.last().map(String::as_str), Some("done"), "phases were {phases:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

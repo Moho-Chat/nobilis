@@ -2701,6 +2701,12 @@ pub async fn dispatch(
             // as everywhere else that's protocol-specific (e.g. autojoin/
             // NickServ being IRC-only fields on the account).
             let attachment_path = p_str_opt(params, "attachmentPath");
+            // Named by the window so it can match the progress back to the
+            // row it is drawing. Absent for a send with no file, and for any
+            // caller that is not watching.
+            let progress = p_str_opt(params, "uploadId")
+                .map(|id| crate::upload::Progress::new(state.events.clone(), id));
+            let progress = progress.as_ref();
             let reply_to_id = p_str_opt(params, "replyToId");
             // The commands that are only a way of writing something, applied
             // before anybody decides how to send it: they mean the same on
@@ -2821,7 +2827,8 @@ pub async fn dispatch(
                     let result = match attachment_path {
                         Some(path) => {
                             let host = p_str_opt(params, "uploadHost").and_then(crate::upload::Host::parse);
-                            backend::sneedchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host).await
+                            backend::sneedchat::send_attachment(state, &buffer.account_id, &buffer.name, body, path, host, progress)
+                                .await
                         }
                         None => backend::sneedchat::send_message(state, &buffer.account_id, &buffer.name, body, reply_to_nick.as_deref()),
                     };
@@ -2853,7 +2860,7 @@ pub async fn dispatch(
                                 let host = p_str_opt(params, "uploadHost")
                                     .and_then(crate::upload::Host::parse)
                                     .unwrap_or(crate::upload::Host::Catbox);
-                                match crate::upload::upload(host, path, p_str_opt(params, "uploadRetention")).await {
+                                match crate::upload::upload_reporting(host, path, p_str_opt(params, "uploadRetention"), progress).await {
                                     Ok(link) if body.is_empty() => link,
                                     Ok(link) => format!("{body} {link}"),
                                     Err(e) => return (None, Some(e.to_string())),
