@@ -265,7 +265,7 @@ pub async fn dispatch(
                     let limit = p_i64(params, "limit", 200);
                     return match state.store.messages_after(buffer_id, after, limit) {
                         Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
                 let before = p_i64(params, "before", 0);
@@ -369,7 +369,7 @@ pub async fn dispatch(
                         backend::discord::resign_stale_attachments(state.clone(), buffer_id.to_string(), &messages);
                         (Some(serde_json::to_value(messages).unwrap()), None)
                     }
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             }
         },
@@ -510,7 +510,7 @@ pub async fn dispatch(
                     let account = crate::accounts::irc_account_to_json(&saved, "connecting");
                     (Some(serde_json::to_value(account).unwrap()), None)
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -567,7 +567,7 @@ pub async fn dispatch(
                 match state.accounts.remove(id) {
                     Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             }
         },
@@ -733,7 +733,7 @@ pub async fn dispatch(
                 None => (None, Some("join failed (account not connected?)".to_string())),
                 Some(sender) => match sender.send_join(name) {
                     Ok(()) => (Some(ok_node()), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 },
             }
         }
@@ -956,7 +956,7 @@ pub async fn dispatch(
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::discord::ack_read(state, buffer_id, &cfg.token).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 // Matrix has read markers and they were never sent, so a room
@@ -1010,12 +1010,12 @@ pub async fn dispatch(
             if method == "getDiscordMemberVerification" {
                 match backend::discord::member_verification(state, account_id, guild_id).await {
                     Ok(form) => (Some(form), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             } else {
                 match backend::discord::accept_member_verification(state, account_id, guild_id).await {
                     Ok(()) => (Some(ok_node()), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             }
         }
@@ -1044,7 +1044,7 @@ pub async fn dispatch(
             };
             match backend::discord::open_dm(state, account_id, user_id).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1066,7 +1066,7 @@ pub async fn dispatch(
                 .unwrap_or_default();
             match backend::discord::open_dm_with(state, account_id, &user_ids).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1186,7 +1186,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1258,7 +1258,7 @@ pub async fn dispatch(
             };
             match backend::discord::create_guild(state, account_id, name).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1291,7 +1291,7 @@ pub async fn dispatch(
             };
             match backend::discord::refresh_attachments(state, buffer_id, message_id).await {
                 Ok(attachments) => (Some(serde_json::json!({ "attachments": attachments })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -1368,7 +1368,7 @@ pub async fn dispatch(
             } else if let Some(config) = state.accounts.get_matrix(account_id) {
                 match backend::matrix::apply_status(state, &config, status).await {
                     Ok(()) => true,
-                    Err(e) => return (None, Some(e.to_string())),
+                    Err(e) => return (None, Some(format!("{e:#}"))),
                 }
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
@@ -1426,7 +1426,7 @@ pub async fn dispatch(
         // too.
         "listAudioDevices" => match crate::audio::list_devices() {
             Ok(devices) => (Some(serde_json::to_value(devices).unwrap()), None),
-            Err(e) => (None, Some(e.to_string())),
+            Err(e) => (None, Some(format!("{e:#}"))),
         },
 
         // Searching one conversation's scrollback. Scoped to a buffer rather
@@ -1442,7 +1442,7 @@ pub async fn dispatch(
             }
             match state.store.search_messages(buffer_id, query.trim(), p_i64(params, "limit", 50)) {
                 Ok(messages) => (Some(serde_json::to_value(messages).unwrap()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2048,7 +2048,7 @@ pub async fn dispatch(
             };
             match backend::discord::call_user(state, account_id, user_id).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2066,7 +2066,7 @@ pub async fn dispatch(
             };
             match backend::discord::start_call(state, &buffer.account_id, &channel_id).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2090,7 +2090,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2254,7 +2254,7 @@ pub async fn dispatch(
             let limit = p_i64(params, "limit", 500);
             match state.store.messages_between(buffer_id, after, until, limit) {
                 Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2268,7 +2268,7 @@ pub async fn dispatch(
             let until = p_i64(params, "until", i64::MAX);
             match state.store.count_between(buffer_id, after, until) {
                 Ok(n) => (Some(serde_json::json!({ "count": n, "oldestHeld": state.store.oldest_message_ts(buffer_id).ok().flatten() })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2432,7 +2432,7 @@ pub async fn dispatch(
             }
             if kind == "input" && !device_id.is_empty() {
                 if let Err(e) = crate::audio::route_input(&device_id) {
-                    return (None, Some(e.to_string()));
+                    return (None, Some(format!("{e:#}")));
                 }
             }
             let prefs = state.voice_prefs.update(|p| {
@@ -2547,7 +2547,7 @@ pub async fn dispatch(
             };
             match backend::discord::join_voice(state, account_id, guild_id, channel_id, options) {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2595,13 +2595,13 @@ pub async fn dispatch(
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
-                                    return (None, Some(e.to_string()));
+                                    return (None, Some(format!("{e:#}")));
                                 }
                             }
                         } else if buffer.kind == "dm" && buffer.account_id.starts_with("discord:") {
                             if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {
                                 if let Err(e) = backend::discord::close_dm(state, &buffer.account_id, &channel_id).await {
-                                    return (None, Some(e.to_string()));
+                                    return (None, Some(format!("{e:#}")));
                                 }
                             }
                         }
@@ -2636,7 +2636,7 @@ pub async fn dispatch(
             let limit = p_i64(params, "limit", 100);
             match state.store.mentions(&buffers, limit) {
                 Ok(messages) => (Some(serde_json::to_value(messages).unwrap()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2657,7 +2657,7 @@ pub async fn dispatch(
                 .unwrap_or(crate::upload::Host::Catbox);
             match crate::upload::upload(host, path, p_str_opt(params, "retention")).await {
                 Ok(url) => (Some(serde_json::json!({ "url": url })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2686,7 +2686,7 @@ pub async fn dispatch(
                     state.runtime.remove_buffer_group(state, group_id);
                     (Some(ok_node()), None)
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -2764,7 +2764,7 @@ pub async fn dispatch(
                         };
                         match result {
                             Ok(()) => (Some(ok_node()), None),
-                            Err(e) => (None, Some(e.to_string())),
+                            Err(e) => (None, Some(format!("{e:#}"))),
                         }
                     }
                 },
@@ -2801,7 +2801,7 @@ pub async fn dispatch(
                     // field is where it does not apply.
                     let http = match backend::kick::api::client() {
                         Ok(c) => c,
-                        Err(e) => return (None, Some(e.to_string())),
+                        Err(e) => return (None, Some(format!("{e:#}"))),
                     };
                     match backend::kick::api::send_message(&http, token, channel.chatroom_id, body, reply_to.as_ref()).await {
                         Ok(()) => (Some(ok_node()), None),
@@ -2834,14 +2834,14 @@ pub async fn dispatch(
                     };
                     match result {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::matrix::send_message(state, &buffer.account_id, buffer_id, &cfg.access_token, body, reply_to_id, params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false), attachment_path).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(_) if reply_to_id.is_some() => (None, Some("replies aren't supported for this service".to_string())),
@@ -2863,13 +2863,13 @@ pub async fn dispatch(
                                 match crate::upload::upload_reporting(host, path, p_str_opt(params, "uploadRetention"), progress).await {
                                     Ok(link) if body.is_empty() => link,
                                     Ok(link) => format!("{body} {link}"),
-                                    Err(e) => return (None, Some(e.to_string())),
+                                    Err(e) => return (None, Some(format!("{e:#}"))),
                                 }
                             }
                         };
                         match backend::irc::send_message(state, &buffer.account_id, &sender, &buffer.name, &body) {
                             Ok(()) => (Some(ok_node()), None),
-                            Err(e) => (None, Some(e.to_string())),
+                            Err(e) => (None, Some(format!("{e:#}"))),
                         }
                     }
                 },
@@ -2887,18 +2887,18 @@ pub async fn dispatch(
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::discord::edit_message(state, buffer_id, &cfg.token, msg_id, body).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
                     Ok(()) => (Some(ok_node()), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 },
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::matrix::edit_message(state, &buffer.account_id, buffer_id, &cfg.access_token, msg_id, body).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(_) => (None, Some("editing isn't supported for this service".to_string())),
@@ -2920,14 +2920,14 @@ pub async fn dispatch(
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::discord::toggle_reaction(state, buffer_id, &cfg.token, msg_id, emoji, add).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::matrix::toggle_reaction(state, &buffer.account_id, buffer_id, &cfg.access_token, msg_id, emoji, add).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(_) => (None, Some("reactions aren't supported for this service".to_string())),
@@ -2945,7 +2945,7 @@ pub async fn dispatch(
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::discord::delete_message(state, buffer_id, &cfg.token, msg_id).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 Some(buffer) if buffer.account_id.starts_with("kick:") => {
@@ -2962,13 +2962,13 @@ pub async fn dispatch(
                 }
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
                     Ok(()) => (Some(ok_node()), None),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 },
                 Some(buffer) if buffer.account_id.starts_with("matrix:") => match state.accounts.get_matrix(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => match backend::matrix::delete_message(state, &buffer.account_id, buffer_id, &cfg.access_token, msg_id).await {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 // IRC, where the network offers `draft/message-redaction`.
@@ -3041,7 +3041,7 @@ pub async fn dispatch(
             let reauth = p_str_opt(params, "accountId").map(String::from);
             match backend::discord::finish_token_login(state, &login_id, token.to_string(), reauth).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3166,7 +3166,7 @@ pub async fn dispatch(
             config.cookies = cookies;
             let account_id = config.account_id();
             if let Err(e) = state.accounts.add_sneedchat(config.clone()) {
-                return (None, Some(e.to_string()));
+                return (None, Some(format!("{e:#}")));
             }
             // Straight into a connection: the session is live now, and the
             // point of having just signed in is not to wait for a retry.
@@ -3215,7 +3215,7 @@ pub async fn dispatch(
                         None => (None, Some("no such account".to_string())),
                     },
                     Ok(false) => (None, Some("no such account".to_string())),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             }
         },
@@ -3231,7 +3231,7 @@ pub async fn dispatch(
             for cfg in state.accounts.all_sneedchat() {
                 let id = cfg.account_id();
                 if let Err(e) = state.accounts.set_sneedchat_tor_config(&id, tor_mode.clone(), proxy.clone()) {
-                    return (None, Some(e.to_string()));
+                    return (None, Some(format!("{e:#}")));
                 }
                 if let Some(cfg) = state.accounts.get_sneedchat(&id) {
                     backend::sneedchat::spawn(state.clone(), cfg);
@@ -3291,7 +3291,7 @@ pub async fn dispatch(
                         None => (None, Some("no such account".to_string())),
                     },
                     Ok(false) => (None, Some("no such account".to_string())),
-                    Err(e) => (None, Some(e.to_string())),
+                    Err(e) => (None, Some(format!("{e:#}"))),
                 }
             }
         },
@@ -3415,7 +3415,7 @@ pub async fn dispatch(
                 .filter(|t| !t.is_empty());
             let http = match backend::kick::api::client() {
                 Ok(c) => c,
-                Err(e) => return (None, Some(e.to_string())),
+                Err(e) => return (None, Some(format!("{e:#}"))),
             };
             let username = match &token {
                 Some(token) => match backend::kick::api::identity(&http, token).await {
@@ -3447,7 +3447,7 @@ pub async fn dispatch(
                     backend::kick::spawn(state.clone(), saved);
                     (Some(serde_json::json!({ "accountId": id })), None)
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3582,6 +3582,49 @@ pub async fn dispatch(
         // A vote in the poll on screen. The answer Kick sends back is the
         // poll with the vote in it, so the card updates from the reply rather
         // than waiting for the broadcast that follows it.
+        // Starting one, which nothing could do: polls have been readable and
+        // votable since they were supported, and the first event had no way
+        // to be sent.
+        "startMatrixPoll" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("startMatrixPoll requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(question) = p_str_opt(params, "question") else {
+                return (None, Some("startMatrixPoll requires \"question\"".to_string()));
+            };
+            let answers: Vec<String> = params
+                .get("answers")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            // Disclosed by default, which is what Element offers first: a
+            // running tally is what most people mean by a poll, and a hidden
+            // one is the deliberate choice.
+            let disclosed = params.get("disclosed").and_then(Value::as_bool).unwrap_or(true);
+            match backend::matrix::start_poll(state, &buffer.account_id, buffer_id, question, &answers, disclosed).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // And closing one, so a finished poll stops saying it is open.
+        "endMatrixPoll" => {
+            let (buffer_id, poll_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "pollId")) {
+                (Some(b), Some(p)) => (b, p),
+                _ => return (None, Some("endMatrixPoll requires \"bufferId\" and \"pollId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "votePoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("votePoll requires \"bufferId\"".to_string()));
@@ -3819,7 +3862,7 @@ pub async fn dispatch(
                         .collect();
                     (Some(serde_json::json!(cards)), None)
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3840,7 +3883,7 @@ pub async fn dispatch(
             };
             let http = match backend::kick::api::client() {
                 Ok(c) => c,
-                Err(e) => return (None, Some(e.to_string())),
+                Err(e) => return (None, Some(format!("{e:#}"))),
             };
             match backend::kick::api::set_following(&http, &token, &channel.slug, follow).await {
                 Ok(()) => {
@@ -3864,7 +3907,7 @@ pub async fn dispatch(
             };
             let http = match backend::kick::api::client() {
                 Ok(c) => c,
-                Err(e) => return (None, Some(e.to_string())),
+                Err(e) => return (None, Some(format!("{e:#}"))),
             };
             let followed = match backend::kick::api::followed(&http, token).await {
                 Ok(f) => f,
@@ -3885,7 +3928,7 @@ pub async fn dispatch(
 
             if !added.is_empty() {
                 if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
-                    return (None, Some(e.to_string()));
+                    return (None, Some(format!("{e:#}")));
                 }
             }
             // Told to the live connection so they open now rather than at the
@@ -3912,7 +3955,7 @@ pub async fn dispatch(
             None => (None, Some("listMatrixDevices requires \"accountId\"".to_string())),
             Some(account_id) => match backend::matrix::verification::list_own_devices(state, account_id).await {
                 Ok(devices) => (Some(serde_json::json!(devices)), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             },
         },
 
@@ -3928,7 +3971,7 @@ pub async fn dispatch(
                 };
             match backend::matrix::verification::delete_device(state, account_id, device_id, password).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3937,7 +3980,7 @@ pub async fn dispatch(
             None => (None, Some("matrixCrossSigningStatus requires \"accountId\"".to_string())),
             Some(account_id) => match backend::matrix::verification::cross_signing_status(state, account_id).await {
                 Ok(status) => (Some(status), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             },
         },
 
@@ -3975,7 +4018,7 @@ pub async fn dispatch(
             };
             match backend::matrix::verification::start_verification(state, account_id, p_str_opt(params, "userId"), device_id).await {
                 Ok(verification_id) => (Some(serde_json::json!({ "verificationId": verification_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4002,7 +4045,7 @@ pub async fn dispatch(
             let accept = p_bool(params, "accept", false);
             match backend::matrix::verification::respond_to_request(state, account_id, verification_id, accept).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4014,7 +4057,7 @@ pub async fn dispatch(
             let matches = p_bool(params, "matches", false);
             match backend::matrix::verification::confirm_sas(state, account_id, verification_id, matches).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4025,7 +4068,7 @@ pub async fn dispatch(
             };
             match backend::matrix::verification::cancel(state, account_id, verification_id).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4039,7 +4082,7 @@ pub async fn dispatch(
             None => (None, Some("setupMatrixRecoveryKey requires \"accountId\"".to_string())),
             Some(account_id) => match backend::matrix::backup::setup_recovery_key(state, account_id).await {
                 Ok(recovery_key) => (Some(serde_json::json!({ "recoveryKey": recovery_key })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             },
         },
 
@@ -4059,7 +4102,7 @@ pub async fn dispatch(
                     }
                     (Some(serde_json::json!({ "restoredKeys": summary.imported_keys, "totalKeys": summary.total_keys })), None)
                 }
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4074,7 +4117,7 @@ pub async fn dispatch(
             };
             match backend::matrix::moderation::permissions_for_buffer(state, account_id, buffer_id) {
                 Ok(permissions) => (Some(permissions), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4103,7 +4146,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4144,7 +4187,7 @@ pub async fn dispatch(
                 .unwrap_or_default();
             match backend::matrix::join_room(state, account_id, room, &via).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4200,7 +4243,7 @@ pub async fn dispatch(
             };
             match opened {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4224,7 +4267,7 @@ pub async fn dispatch(
                 .map(|b| b.name);
             match backend::sneedchat::send_whisper(state, account_id, target, body, from_buffer.as_deref()) {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4235,7 +4278,7 @@ pub async fn dispatch(
             };
             match backend::irc::open_query(state, account_id, nick) {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4247,7 +4290,7 @@ pub async fn dispatch(
             let display_name = p_str_opt(params, "displayName").unwrap_or("");
             match backend::matrix::open_dm(state, account_id, user_id, display_name).await {
                 Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4260,7 +4303,7 @@ pub async fn dispatch(
             let reason = p_str_opt(params, "reason");
             match backend::matrix::moderation::kick_member(state, account_id, buffer_id, user_id, reason).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4345,7 +4388,7 @@ pub async fn dispatch(
             };
             match backend::matrix::event_at(state, &buffer.account_id, buffer_id, ts * 1000, forwards).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4378,7 +4421,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(()) => (Some(serde_json::json!({ "streamKey": key.to_wire() })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4421,7 +4464,7 @@ pub async fn dispatch(
                 // Answered with the key, because the caller may not have
                 // known it: it is what every later event names the stream by.
                 Ok(()) => (Some(serde_json::json!({ "streamKey": stream_key })), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4457,7 +4500,7 @@ pub async fn dispatch(
             };
             match backend::discord::golive::send_frame(account_id, &bytes, timestamp).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4490,7 +4533,7 @@ pub async fn dispatch(
             };
             match backend::matrix::account::third_party_ids(state, account_id).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4505,7 +4548,7 @@ pub async fn dispatch(
             };
             match backend::matrix::account::request_email_token(state, account_id, address).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4526,7 +4569,7 @@ pub async fn dispatch(
             };
             match backend::matrix::account::add_third_party_id(state, account_id, sid, secret, password).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4541,7 +4584,7 @@ pub async fn dispatch(
             };
             match backend::matrix::account::remove_third_party_id(state, account_id, medium, address).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4556,7 +4599,7 @@ pub async fn dispatch(
             };
             let erase = p_bool(params, "erase", false);
             if let Err(e) = backend::matrix::account::deactivate(state, account_id, password, erase).await {
-                return (None, Some(e.to_string()));
+                return (None, Some(format!("{e:#}")));
             }
             // The same cleanup removing an account does, because the account
             // is now gone in the strongest sense there is. Left behind, its
@@ -4574,7 +4617,7 @@ pub async fn dispatch(
             backend::matrix::crypto::forget(&crate::default_data_dir(), account_id);
             match state.accounts.remove(account_id) {
                 Ok(_) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4595,7 +4638,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(list) => (Some(serde_json::json!(list)), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4614,7 +4657,7 @@ pub async fn dispatch(
                 .unwrap_or_default();
             match backend::matrix::peek::summary(state, account_id, room, &via).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4626,7 +4669,7 @@ pub async fn dispatch(
             let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as u32;
             match backend::matrix::peek::recent(state, account_id, room_id, limit).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4644,7 +4687,7 @@ pub async fn dispatch(
             };
             match backend::matrix::policy::room_policy(state, &buffer.account_id, buffer_id).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4661,7 +4704,7 @@ pub async fn dispatch(
             };
             match backend::matrix::policy::set_denied(state, &buffer.account_id, buffer_id, server, denied).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4678,7 +4721,7 @@ pub async fn dispatch(
             };
             match backend::matrix::roomsettings::room_version(state, &buffer.account_id, buffer_id).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4705,7 +4748,7 @@ pub async fn dispatch(
             }
             match backend::matrix::roomsettings::upgrade_room(state, &buffer.account_id, buffer_id, &version).await {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4726,7 +4769,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4754,7 +4797,7 @@ pub async fn dispatch(
             };
             match result {
                 Ok(node) => (Some(node), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -4772,7 +4815,7 @@ pub async fn dispatch(
             };
             match backend::matrix::tags::set(state, &buffer.account_id, buffer_id, tag, on).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5054,7 +5097,7 @@ pub async fn dispatch(
                     None => (None, Some("account not connected".to_string())),
                     Some(sender) => match backend::irc::send_message(state, &target.account_id, &sender, &target.name, &body) {
                         Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(e.to_string())),
+                        Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
                 // Kick and Sneedchat both send a line of text and nothing
@@ -5280,7 +5323,7 @@ pub async fn dispatch(
             let reason = p_str_opt(params, "reason");
             match backend::matrix::moderation::ban_member(state, account_id, buffer_id, user_id, reason).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5292,7 +5335,7 @@ pub async fn dispatch(
                 };
             match backend::matrix::moderation::unban_member(state, account_id, buffer_id, user_id).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5304,7 +5347,7 @@ pub async fn dispatch(
                 };
             match backend::matrix::moderation::mute_member(state, account_id, buffer_id, user_id).await {
                 Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(e.to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5352,7 +5395,7 @@ fn account_mutation_result(result: anyhow::Result<bool>) -> (Option<Value>, Opti
     match result {
         Ok(true) => (Some(ok_node()), None),
         Ok(false) => (None, Some("no such account".to_string())),
-        Err(e) => (None, Some(e.to_string())),
+        Err(e) => (None, Some(format!("{e:#}"))),
     }
 }
 

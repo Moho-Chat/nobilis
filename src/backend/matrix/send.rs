@@ -927,6 +927,134 @@ pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, p
     Ok(())
 }
 
+/// Starts a poll.
+///
+/// moho has read and voted in polls since they were supported and never made
+/// one - `polls.rs` parses every shape of them, and there was no way to send
+/// the first event. So a poll in a room worked completely, and a poll could
+/// only ever have been started somewhere else.
+///
+/// Written in the stable shape with the text repeated the old way beside it.
+/// The stable spelling landed in Matrix 1.7 and the unstable one is what
+/// every older client still reads, so a poll sent only in the new shape is
+/// invisible to some of the room; `m.text` costs a line and is what a client
+/// that understands no polls at all falls back to showing.
+pub async fn start_poll(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    question: &str,
+    answers: &[String],
+    disclosed: bool,
+) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let question = question.trim();
+    if question.is_empty() {
+        anyhow::bail!("a poll needs a question");
+    }
+    let answers: Vec<&str> = answers.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    if answers.len() < 2 {
+        anyhow::bail!("a poll needs at least two answers");
+    }
+    // The spec's own ceiling. A server would reject more, and finding that
+    // out after writing twenty of them is worse than being told now.
+    if answers.len() > 20 {
+        anyhow::bail!("a poll can have at most twenty answers");
+    }
+
+    let answer_events: Vec<Value> = answers
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({
+                // The id is what a vote refers to, and it has to survive the
+                // answers being renamed - so it is positional rather than the
+                // text itself.
+                "id": format!("answer-{i}"),
+                "m.text": [{ "body": text }],
+                "org.matrix.msc1767.text": text,
+            })
+        })
+        .collect();
+
+    let content = serde_json::json!({
+        "m.poll": {
+            "kind": if disclosed { "m.poll.disclosed" } else { "m.poll.undisclosed" },
+            "max_selections": 1,
+            "question": { "m.text": [{ "body": question }] },
+            "answers": answer_events,
+        },
+        // What a client with no idea what a poll is will show instead of
+        // nothing at all.
+        "m.text": [{ "body": format!("{question}\n{}", answers.join("\n")) }],
+        "body": question,
+    });
+
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_START[0], content).await
+}
+
+/// Closes a poll, so its result is final and late votes are ignored.
+///
+/// The other half nothing could do: a poll started here could be voted in and
+/// never finished, which leaves a card on screen that says "open" for ever.
+pub async fn end_poll(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let content = serde_json::json!({
+        "m.relates_to": { "rel_type": "m.reference", "event_id": poll_id },
+        "m.poll.end": {},
+        "m.text": [{ "body": "The poll has closed." }],
+        "body": "The poll has closed.",
+    });
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_END[0], content).await
+}
+
+/// The part both halves share, including the encrypted-room path.
+///
+/// A poll in an encrypted room is encrypted like anything else - the card is
+/// built from the decrypted event - so this is the same two-branch shape
+/// `vote_in_poll` already uses rather than a second way of doing it.
+#[allow(clippy::too_many_arguments)]
+async fn send_poll_event(
+    state: &AppState,
+    account: &MatrixAccountConfig,
+    base: &str,
+    access_token: &str,
+    buffer_id: &str,
+    room_id: &str,
+    event_type: &str,
+    content: Value,
+) -> Result<()> {
+    let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
+        let session = state.runtime.get_matrix_machine(&account.account_id()).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, access_token, room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, event_type, content)
+            .await
+            .context("encrypting the poll")?;
+        (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
+    } else {
+        (event_type.to_string(), content)
+    };
+
+    let txn_id = model::next_message_id();
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
+    );
+    http::put_json(&url, access_token, body_json).await.context("sending the poll")?;
+    Ok(())
+}
+
 /// Redacts (deletes) a message. Redactions are always sent in cleartext,
 /// even in an encrypted room (per the C-S API spec) - no crypto involved.
 pub async fn delete_message(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str) -> Result<()> {
