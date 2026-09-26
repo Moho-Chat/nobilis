@@ -563,15 +563,29 @@ impl CryptoSession {
         let members: Vec<&UserId> = member_ids.iter().map(|u| u.as_ref()).collect();
 
         // Queues a key query for this room's members if any are newly
-        // tracked - picked up by the main sync loop's own regular
-        // process_outgoing_requests() calls (every /sync cycle), not
-        // flushed synchronously here: doing so would need to re-enter the
-        // same lock process_outgoing_requests() takes below, and Rust's
-        // Mutex isn't reentrant. Slightly stale device-list data in the
-        // rare case of sending to a brand-new member within the same
-        // sync cycle they were first seen in is an acceptable edge case,
-        // not a correctness problem - get_missing_sessions/share_room_key
-        // still work correctly against whatever device list is current.
+        // tracked. It used to be left for the sync loop to flush on its next
+        // cycle, on the grounds that a stale device list for a brand-new
+        // member was a rare edge case.
+        //
+        // It is neither rare nor an edge case. It is the first thing that
+        // happens in every encrypted room: somebody is invited, they join,
+        // and the next message is sent before the sync loop has asked who
+        // their devices are - so the room key is shared to nobody on their
+        // side and the message cannot be read. Measured between two real
+        // accounts on two homeservers: the first message each way was
+        // permanently unreadable, every message after it fine.
+        //
+        // Permanently, because the usual repair does not reach this. A client
+        // that cannot decrypt asks for the key (see relock.rs), but a room
+        // key is forwarded only to the sender's *own* other devices, never to
+        // another user - so there is nobody to answer. Prevention is the only
+        // cure there is.
+        //
+        // The reentrancy that made this awkward is not in the way: the query
+        // is queued here, before the lock below is taken, so flushing it is a
+        // sequential call and not a nested one. It is close to free when
+        // there is nothing to flush - `outgoing_requests()` answers with an
+        // empty list, which is every message after the first.
         //
         // Passed as a concrete `Vec<&UserId>` (cloned - cheap, just
         // pointer copies), not an `.iter().map(...)` adaptor - unlike
@@ -585,6 +599,10 @@ impl CryptoSession {
         // enough" build failure reported all the way up at rpc/mod.rs's
         // connection-handler spawn).
         self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+
+        // Takes and releases the lock itself, which is why it is called
+        // here and not after the guard below.
+        self.process_outgoing_requests(homeserver_url, access_token).await;
 
         let _guard = self.outgoing_lock.lock().await;
         if let Some((request_id, claim_request)) = self.machine.get_missing_sessions(members.iter().copied()).await.context("get_missing_sessions")? {
@@ -631,6 +649,10 @@ impl CryptoSession {
         // rustc's Send inference once this whole chain is inside a spawn.
         let members: Vec<&UserId> = users.iter().map(|u| u.as_ref()).collect();
         self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+
+        // Takes and releases the lock itself, which is why it is called
+        // here and not after the guard below.
+        self.process_outgoing_requests(homeserver_url, access_token).await;
 
         let _guard = self.outgoing_lock.lock().await;
         if let Some((request_id, claim_request)) =
