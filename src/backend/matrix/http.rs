@@ -140,6 +140,34 @@ pub async fn get_json_anonymous(url: &str) -> Result<Value> {
     handle_response(resp).await
 }
 
+/// A POST with no credential, for the same reason as the GET above: an
+/// account provider is asked to register this client before there is any
+/// account to act as.
+pub async fn post_json_anonymous(url: &str, body: Value) -> Result<Value> {
+    let resp = http_client().post(url).json(&body).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
+/// A form POST, which is what OAuth 2.0 endpoints take rather than JSON.
+pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<Value> {
+    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
+/// The same, keeping the status and the body whatever the status is.
+///
+/// The device grant answers "not yet" with a 403 and a JSON body saying so -
+/// a perfectly ordinary step in a sign-in that has not finished - and
+/// `handle_response` correctly turns a 403 into an error. Polling needs to
+/// read the body either way, so it asks for both and decides for itself.
+pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Result<(u16, Value)> {
+    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.context("reading the reply")?;
+    let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Null);
+    Ok((status, body))
+}
+
 pub async fn get_json(url: &str, token: &str) -> Result<Value> {
     let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await

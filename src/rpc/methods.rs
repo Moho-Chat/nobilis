@@ -3318,6 +3318,43 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Signing in with a short code, for a homeserver whose accounts live
+        // with an OAuth provider rather than with itself. Nothing here takes
+        // a password, which is the point: the approval happens in a browser
+        // the person is already signed in to.
+        "addMatrixAccountDeviceCode" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("addMatrixAccountDeviceCode requires \"homeserverUrl\"".to_string()));
+            };
+            let login_id = format!("matrix-device-{}", crate::model::next_message_id());
+            backend::matrix::start_device_login(state.clone(), login_id.clone(), homeserver_url.to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Whether that door is open here at all, so a client can offer it
+        // only where it will work rather than after it has failed.
+        "matrixAuthMetadata" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("matrixAuthMetadata requires \"homeserverUrl\"".to_string()));
+            };
+            let resolved = match backend::matrix::http::resolve_homeserver(homeserver_url).await {
+                Ok(v) => v,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            match backend::matrix::oidc::auth_metadata(&resolved).await {
+                Ok(Some(m)) => (
+                    Some(serde_json::json!({
+                        "delegated": true,
+                        "issuer": m.issuer,
+                        "accountManagementUri": m.account_management_uri,
+                    })),
+                    None,
+                ),
+                Ok(None) => (Some(serde_json::json!({ "delegated": false })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Making one, rather than signing in to one that exists. Reports
         // through the same events a login does, so a client that can follow a
         // sign-in follows this with nothing new.

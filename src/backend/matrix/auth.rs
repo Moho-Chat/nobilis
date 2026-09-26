@@ -268,6 +268,125 @@ pub fn start_sso_login(state: AppState, login_id: String, homeserver_url: String
     });
 }
 
+/// Signing in with a code, for a homeserver that delegates its accounts.
+///
+/// Reports through the same events every other Matrix sign-in uses, with one
+/// addition: `matrixDeviceCode`, carrying the code to show and where to type
+/// it. The RPC that starts this answers immediately - the flow takes as long
+/// as somebody takes to walk to a browser.
+pub fn start_device_login(state: AppState, login_id: String, homeserver_url: String) {
+    tokio::spawn(async move {
+        let result =
+            std::panic::AssertUnwindSafe(try_device_login(&state, &login_id, &homeserver_url)).catch_unwind().await;
+        let error = match result {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => format!("{e:#}"),
+            Err(_) => "internal error (see nobilis logs)".to_string(),
+        };
+        tracing::warn!("matrix device login[{login_id}]: {error}");
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
+    });
+}
+
+/// A device id this client picks for itself.
+///
+/// Chosen here because the grant asks to *be* a particular device - the id is
+/// part of the scope string, and the token that comes back is bound to it.
+/// Upper case and short, the shape Matrix device ids have everywhere else, so
+/// it reads like one in a device list beside the ones a server generated.
+fn fresh_device_id() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    (0..10).map(|_| ALPHABET[rand::random::<usize>() % ALPHABET.len()] as char).collect()
+}
+
+pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserver_url: &str) -> Result<()> {
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
+    let homeserver_url = http::resolve_homeserver(homeserver_url).await?;
+
+    let metadata = oidc::auth_metadata(&homeserver_url)
+        .await?
+        // Said plainly, because it is a property of the homeserver rather
+        // than a failure: most of Matrix still holds its own accounts, and
+        // for those the password form is the right door.
+        .context("this homeserver holds its own accounts, so there is no code to sign in with - use a password")?;
+
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "asking for a code..." }));
+    let client_id = oidc::register_client(&metadata).await?;
+    let device_id = fresh_device_id();
+    let grant = oidc::request_device_code(&metadata, &client_id, &device_id).await?;
+
+    // The code itself, to be shown. Never logged: it is a credential for as
+    // long as it lives, and a log is the one place a screen is not.
+    state.events.emit(
+        "matrixDeviceCode",
+        serde_json::json!({
+            "loginId": login_id,
+            "userCode": grant.user_code,
+            "verificationUri": grant.verification_uri,
+            "verificationUriComplete": grant.verification_uri_complete,
+            "expiresInMs": grant.expires_in.as_millis() as u64,
+        }),
+    );
+    tracing::info!(
+        "matrix device login[{login_id}]: waiting for approval at {} for up to {}s",
+        grant.verification_uri,
+        grant.expires_in.as_secs()
+    );
+
+    let deadline = tokio::time::Instant::now() + grant.expires_in;
+    let mut interval = grant.interval;
+    let access_token = loop {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("the sign-in code expired before it was approved");
+        }
+        tokio::time::sleep(interval).await;
+        match oidc::poll_once(&metadata, &client_id, &grant.device_code).await {
+            oidc::Poll::Pending => {}
+            // Told to back off, and it stays backed off: a provider that
+            // said this once will say it again at the old rate.
+            oidc::Poll::SlowDown => interval += Duration::from_secs(5),
+            oidc::Poll::Stopped(why) => anyhow::bail!("{why}"),
+            oidc::Poll::Approved { access_token } => break access_token,
+        }
+    };
+
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "signing in..." }));
+    // Who this turned out to be. The grant knows nothing about Matrix ids -
+    // it hands back a token, and the homeserver is what says whose it is.
+    let whoami = http::get_json(
+        &format!("{}/_matrix/client/v3/account/whoami", homeserver_url.trim_end_matches('/')),
+        &access_token,
+    )
+    .await
+    .context("asking the homeserver who this token belongs to")?;
+    let user_id = whoami["user_id"].as_str().context("the homeserver did not say who this is")?.to_string();
+    // The server's own answer wins where it has one: it is what the device
+    // list will show, and a mismatch here would be a device nobody can find.
+    let device_id = whoami["device_id"].as_str().unwrap_or(&device_id).to_string();
+
+    let config = MatrixAccountConfig {
+        homeserver_url: homeserver_url.to_string(),
+        user_id,
+        // Nothing to keep, and the same real difference the SSO path notes:
+        // anything needing a password will have to ask the homeserver for
+        // its own interactive auth instead.
+        password: String::new(),
+        access_token,
+        device_id,
+        next_batch: None,
+        used_sliding_sync: false,
+        prefer_sliding_sync: false,
+        dehydration_enabled: false,
+        display_name: None,
+        rtc_focus_url: None,
+    };
+    let saved = state.accounts.add_matrix(config)?;
+    let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
+    spawn(state.clone(), saved);
+    state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
+    Ok(())
+}
+
 /// How long to hold the loopback listener open waiting for the browser.
 pub(super) const SSO_TIMEOUT: Duration = Duration::from_secs(300);
 
