@@ -49,7 +49,12 @@ pub(super) async fn run_with_retry(state: &AppState, config: &MatrixAccountConfi
         let detail = match result {
             Ok(Ok(())) => "sync loop ended".to_string(),
             Ok(Err(e)) => {
-                tracing::warn!("matrix[{account_id}]: {e}");
+                // The whole chain, not just the outermost context. This said
+                // "sync request failed" and nothing else for every failure
+                // the sync loop has ever had - the cause was built, handed to
+                // the line below for the window, and thrown away here, which
+                // is the one place somebody debugging actually looks.
+                tracing::warn!("matrix[{account_id}]: {e:#}");
                 format!("{e:#}")
             }
             Err(_) => {
@@ -67,6 +72,23 @@ pub(super) async fn run_with_retry(state: &AppState, config: &MatrixAccountConfi
 pub(super) fn is_auth_error(e: &anyhow::Error) -> bool {
     let s = e.to_string();
     s.contains("M_UNKNOWN_TOKEN") || s.contains("M_MISSING_TOKEN") || s.contains("HTTP 401")
+}
+
+/// Whether the server has forgotten where this sliding-sync stream was.
+///
+/// Not an error in any useful sense - it is the server saying "start again",
+/// and the only correct answer is to drop the position and ask for a fresh
+/// snapshot. It happens for ordinary reasons: the connection expired while
+/// nothing was happening, the server restarted, or another client opened a
+/// stream with the same connection id and took the position with it.
+///
+/// Treating it as a failure is what made sliding sync unusable against
+/// Synapse. The loop tore itself down, reconnected, sent the same dead
+/// position again and was refused again - so the first sync worked, every
+/// delta after it failed, and a room renamed or a message sent from anywhere
+/// else simply never arrived.
+pub(super) fn is_unknown_position(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("M_UNKNOWN_POS")
 }
 
 /// Logs in (or re-logs-in) and persists the fresh session - `device_id` is
@@ -284,6 +306,15 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
                     }
                 };
                 access_token = token;
+                continue;
+            }
+            // Start again from nothing rather than ending the loop: the
+            // stored position is dead, and everything else about this
+            // connection is still good.
+            Err(e) if use_sliding && is_unknown_position(&e) => {
+                tracing::info!("matrix[{account_id}]: the server no longer knows this sync position; starting a fresh one");
+                next_batch = None;
+                let _ = state.accounts.set_matrix_next_batch(account_id, "");
                 continue;
             }
             Err(e) => {
@@ -698,7 +729,26 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
         let timeline_events: Vec<&Value> = room["timeline"]["events"].as_array().into_iter().flatten().collect();
 
         let (buffer_name, buffer_kind) = match state.runtime.get_matrix_room_name(account_id, room_id) {
-            Some(cached) => cached,
+            // Known already - but a room can be renamed by anybody with the
+            // power to do it, from any client, at any time, and the cached
+            // name would then be wrong for the rest of the session and every
+            // session after it: the name is what the buffer is keyed by, so
+            // nothing re-derives it and a restart finds the old one again.
+            //
+            // Re-derived only when this sync actually carries a naming event,
+            // which is the narrow case the blanket rule below was protecting
+            // against. A later sync is a delta, and deriving a name from a
+            // delta that says nothing about naming would take a direct
+            // message with no member events in it and call it by its room id.
+            // An `m.room.name` in hand is not a guess.
+            Some(cached) => match renamed_to(room, &cached.0) {
+                Some(new_name) => {
+                    state.runtime.set_matrix_room_name(account_id, room_id, &new_name, &cached.1);
+                    state.runtime.rename_buffer(state, account_id, &cached.0, &new_name, &cached.1);
+                    (new_name, cached.1)
+                }
+                None => cached,
+            },
             None => {
                 // First time seeing this room - either the account's true
                 // first /sync (a full state snapshot) or a room newly
@@ -958,5 +1008,126 @@ mod space_id_tests {
         assert_eq!(space_room_id(&group).as_deref(), Some("!space:example.org"));
         // A Discord guild's rail entry is not a space and must not answer.
         assert_eq!(space_room_id("discord:123|guild:456"), None);
+    }
+}
+
+/// The room's new name, when this sync says it has one and it differs.
+///
+/// Looks only at `m.room.name`, and only at a non-empty one. A room whose
+/// name is *removed* falls back to being called after its members or its
+/// alias, which is a full re-derive rather than a rename, and is rare enough
+/// to be left to the next fresh sync rather than guessed at from a delta.
+///
+/// Both buckets are read because a state change arrives in either: `state`
+/// carries what changed outside the timeline window, and a rename made while
+/// this client is connected arrives as a state event in the timeline itself.
+fn renamed_to(room: &Value, current: &str) -> Option<String> {
+    let in_state = room["state"]["events"].as_array().into_iter().flatten();
+    let in_timeline = room["timeline"]["events"].as_array().into_iter().flatten();
+    in_state
+        .chain(in_timeline)
+        .filter(|e| e["type"].as_str() == Some("m.room.name") && e["state_key"].as_str() == Some(""))
+        .filter_map(|e| e["content"]["name"].as_str())
+        .filter(|n| !n.is_empty())
+        // The last one wins: a sync can carry several, and the newest is the
+        // name the room now has.
+        .last()
+        .filter(|n| *n != current)
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::renamed_to;
+    use anyhow::Context;
+    use serde_json::json;
+
+    fn name_event(name: &str) -> serde_json::Value {
+        json!({ "type": "m.room.name", "state_key": "", "content": { "name": name } })
+    }
+
+    /// The refusal that made sliding sync unusable against Synapse. Matched
+    /// on the error code anywhere in the chain, because it arrives as a body
+    /// wrapped in whatever context the request added on the way up.
+    #[test]
+    fn a_dead_sync_position_is_recognised_as_one() {
+        let raw = anyhow::anyhow!("M_UNKNOWN_POS: Unknown position");
+        assert!(super::is_unknown_position(&raw));
+        let wrapped = raw.context("sync request failed");
+        assert!(super::is_unknown_position(&wrapped), "the cause has to be found through the context");
+    }
+
+    /// And nothing else is: ending the loop is right for a real failure, so
+    /// this must not swallow one.
+    #[test]
+    fn an_ordinary_failure_is_not_mistaken_for_one() {
+        assert!(!super::is_unknown_position(&anyhow::anyhow!("HTTP 502: bad gateway")));
+        assert!(!super::is_unknown_position(&anyhow::anyhow!("M_UNKNOWN_TOKEN")));
+    }
+
+    #[test]
+    fn a_rename_in_the_state_section_is_picked_up() {
+        let room = json!({ "state": { "events": [name_event("after")] }, "timeline": { "events": [] } });
+        assert_eq!(renamed_to(&room, "before").as_deref(), Some("after"));
+    }
+
+    /// A rename made while this client is connected arrives in the timeline,
+    /// not the state section - which is the case that actually happens to
+    /// somebody sitting in the room when it is renamed.
+    #[test]
+    fn a_rename_in_the_timeline_is_picked_up_too() {
+        let room = json!({ "state": { "events": [] }, "timeline": { "events": [name_event("after")] } });
+        assert_eq!(renamed_to(&room, "before").as_deref(), Some("after"));
+    }
+
+    #[test]
+    fn a_sync_that_says_nothing_about_naming_changes_nothing() {
+        let room = json!({
+            "state": { "events": [json!({ "type": "m.room.topic", "state_key": "", "content": { "topic": "x" } })] },
+            "timeline": { "events": [json!({ "type": "m.room.message", "content": { "body": "hello" } })] }
+        });
+        assert_eq!(renamed_to(&room, "before"), None, "a delta with no name in it is not a rename");
+    }
+
+    #[test]
+    fn the_name_it_already_has_is_not_a_rename() {
+        let room = json!({ "state": { "events": [name_event("same")] }, "timeline": { "events": [] } });
+        assert_eq!(renamed_to(&room, "same"), None);
+    }
+
+    /// Clearing a room's name falls back to naming it after its members or
+    /// its alias, which a delta cannot answer - so it is deliberately not
+    /// treated as a rename here.
+    #[test]
+    fn removing_the_name_is_left_alone_rather_than_guessed_at() {
+        let room = json!({
+            "state": { "events": [json!({ "type": "m.room.name", "state_key": "", "content": {} })] },
+            "timeline": { "events": [] }
+        });
+        assert_eq!(renamed_to(&room, "before"), None);
+    }
+
+    #[test]
+    fn the_last_name_in_a_sync_wins() {
+        let room = json!({
+            "state": { "events": [name_event("first")] },
+            "timeline": { "events": [name_event("second"), name_event("third")] }
+        });
+        assert_eq!(renamed_to(&room, "before").as_deref(), Some("third"));
+    }
+
+    /// A member's display name is a state event with a name in it too, and
+    /// one arrives on every join - so matching on the type alone would rename
+    /// the room after whoever last walked in.
+    #[test]
+    fn a_member_event_is_not_a_room_name() {
+        let room = json!({
+            "state": { "events": [json!({
+                "type": "m.room.member", "state_key": "@someone:example.org",
+                "content": { "membership": "join", "displayname": "Someone" }
+            })] },
+            "timeline": { "events": [] }
+        });
+        assert_eq!(renamed_to(&room, "before"), None);
     }
 }
