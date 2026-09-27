@@ -269,12 +269,19 @@ pub async fn post_with_password_uia(
     handle_response(resp).await
 }
 
+/// Some homeservers put the errcode at the front of the human-readable error
+/// as well, so printing both verbatim gives "M_USER_IN_USE: M_USER_IN_USE:
+/// User ID is not available." Tuwunel does this to every error it sends.
+fn without_errcode<'a>(errcode: &str, error: &'a str) -> &'a str {
+    error.strip_prefix(errcode).map(|rest| rest.trim_start_matches([':', ' '])).filter(|rest| !rest.is_empty()).unwrap_or(error)
+}
+
 async fn handle_response(resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
     let body: Value = resp.json().await.context("invalid JSON response")?;
     if !status.is_success() {
         if let Ok(err) = serde_json::from_value::<MatrixError>(body.clone()) {
-            bail!("{}: {}", err.errcode, err.error);
+            bail!("{}: {}", err.errcode, without_errcode(&err.errcode, &err.error));
         }
         bail!("HTTP {status}: {body}");
     }
@@ -284,6 +291,15 @@ async fn handle_response(resp: reqwest::Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_errcode_is_printed_once_however_the_server_words_it() {
+        assert_eq!(without_errcode("M_USER_IN_USE", "M_USER_IN_USE: User ID is not available."), "User ID is not available.");
+        assert_eq!(without_errcode("M_FORBIDDEN", "Registration has been disabled."), "Registration has been disabled.");
+        // Nothing left once the prefix goes: keep what there was, because an
+        // errcode alone still says more than an empty string.
+        assert_eq!(without_errcode("M_LIMIT_EXCEEDED", "M_LIMIT_EXCEEDED"), "M_LIMIT_EXCEEDED");
+    }
 
     #[test]
     fn assumes_https_where_no_scheme_was_typed() {
