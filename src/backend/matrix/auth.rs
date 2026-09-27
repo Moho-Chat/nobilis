@@ -162,10 +162,14 @@ pub async fn login_flows(homeserver_url: &str) -> Result<Vec<String>> {
 ///
 /// Registration is user-interactive auth, which means the first attempt is
 /// *expected* to be refused: the server answers 401 with the stages it wants
-/// and a session to carry between them. Most homeservers that allow open
-/// registration at all ask only for `m.login.dummy`, which is a stage that
-/// exists precisely so a flow can have no stages - and that is the one this
-/// completes.
+/// and a session to carry between them. Each pass through the loop below
+/// completes one of them and asks again.
+///
+/// Two stages can be completed from here. `m.login.dummy` exists precisely so
+/// a flow can have no stages, and is what an open homeserver asks for. An
+/// invitation token is the other: a private homeserver that is not open to
+/// the world hands one out, and it is typed here like a password because that
+/// is exactly what it is - a credential its holder already has.
 ///
 /// The rest are named rather than attempted. A captcha cannot be answered
 /// from here (see the Discord backend for what answering one honestly costs),
@@ -173,11 +177,16 @@ pub async fn login_flows(homeserver_url: &str) -> Result<Vec<String>> {
 /// back, and terms need reading rather than agreeing to on somebody's behalf.
 /// Where one of those is required this says which, and says where it can be
 /// done instead - which is a better answer than a 401 shown as an error.
-pub async fn register(homeserver_url: &str, username: &str, password: &str) -> Result<(String, String, String)> {
+pub async fn register(
+    homeserver_url: &str,
+    username: &str,
+    password: &str,
+    token: Option<&str>,
+) -> Result<(String, String, String)> {
     let resolved = http::resolve_homeserver(homeserver_url).await?;
     let base = resolved.trim_end_matches('/');
     let url = format!("{base}/_matrix/client/v3/register");
-    let body = serde_json::json!({
+    let body = json!({
         "username": username,
         "password": password,
         // A device this client will use, named the way the login path names
@@ -188,61 +197,153 @@ pub async fn register(homeserver_url: &str, username: &str, password: &str) -> R
         // logging in would mean immediately logging in again.
     });
 
-    let challenge = match http::post_json_uia(&url, body.clone()).await? {
-        // A homeserver with no stages at all answers the first attempt.
-        http::Attempt::Done(answer) => answer,
-        http::Attempt::NeedsAuth(challenge) => {
-            let session = challenge["session"].as_str().context("registration was refused with no session to continue")?;
-            let stage = dummy_stage(&challenge)?;
-            let mut authed = body;
-            if let Some(object) = authed.as_object_mut() {
-                object.insert("auth".to_string(), serde_json::json!({ "type": stage, "session": session }));
+    let mut attempt = http::post_json_uia(&url, body.clone()).await?;
+    let mut last_stage = "";
+    // Bounded rather than `loop`: a homeserver that keeps asking for a stage
+    // it has already been given would otherwise spin here for ever, sending a
+    // password at every turn. No real flow is longer than this.
+    for _ in 0..MAX_REGISTRATION_STAGES {
+        let challenge = match attempt {
+            // A homeserver with no stages at all answers the first attempt.
+            http::Attempt::Done(answer) => return registered(&answer),
+            http::Attempt::NeedsAuth(challenge) => challenge,
+        };
+        let session = challenge["session"].as_str().context("registration was refused with no session to continue")?;
+        let stage = next_stage(&challenge, token.is_some())?;
+        // The same stage twice means the answer was wrong, not that another
+        // turn is needed: a refused stage comes back as the same 401 with
+        // `completed` unchanged. Retrying it would spend every remaining pass
+        // resending the same rejected token and then report a timeout, which
+        // says nothing about the one thing that is actually wrong.
+        if stage == last_stage {
+            let said = challenge["error"].as_str().unwrap_or_default();
+            if stage == REGISTRATION_TOKEN {
+                bail!("this homeserver refused that invitation token{}", suffix(said));
             }
-            match http::post_json_uia(&url, authed).await? {
-                http::Attempt::Done(answer) => answer,
-                // Asked again after the one stage this can complete, which
-                // means the flow needed more than it advertised.
-                http::Attempt::NeedsAuth(_) => bail!("this homeserver wants more to register than can be done from here"),
-            }
+            bail!("this homeserver refused the registration{}", suffix(said));
         }
-    };
+        last_stage = stage;
+        let mut auth = json!({ "type": stage, "session": session });
+        if stage == REGISTRATION_TOKEN {
+            auth["token"] = json!(token.unwrap_or_default());
+        }
+        let mut authed = body.clone();
+        if let Some(object) = authed.as_object_mut() {
+            object.insert("auth".to_string(), auth);
+        }
+        attempt = http::post_json_uia(&url, authed).await?;
+    }
+    bail!("this homeserver kept asking for more to register than can be done from here")
+}
 
-    let user_id = challenge["user_id"].as_str().context("the homeserver registered no user id")?.to_string();
-    let access_token = challenge["access_token"].as_str().context("the homeserver returned no access token")?.to_string();
-    let device_id = challenge["device_id"].as_str().unwrap_or_default().to_string();
+/// Whatever the homeserver said about it, where it said anything.
+fn suffix(said: &str) -> String {
+    if said.is_empty() { String::new() } else { format!(" ({said})") }
+}
+
+const REGISTRATION_TOKEN: &str = "m.login.registration_token";
+const MAX_REGISTRATION_STAGES: usize = 4;
+
+fn registered(answer: &Value) -> Result<(String, String, String)> {
+    let user_id = answer["user_id"].as_str().context("the homeserver registered no user id")?.to_string();
+    let access_token = answer["access_token"].as_str().context("the homeserver returned no access token")?.to_string();
+    let device_id = answer["device_id"].as_str().unwrap_or_default().to_string();
     Ok((user_id, access_token, device_id))
 }
 
-/// The one registration stage a client can complete on its own.
+/// The next registration stage this client can complete on its own, or why
+/// there is none.
 ///
-/// `m.login.dummy` exists so a flow can have no stages, and it is what an open
-/// homeserver asks for. Anything else needs a person somewhere else - a
-/// captcha, a message to read, terms to agree to - so this names what was
-/// wanted rather than pretending to satisfy it.
-fn dummy_stage(challenge: &Value) -> Result<&'static str> {
+/// A flow is only worth starting if every one of its stages can be finished,
+/// so flows are filtered whole before a stage is picked out of one - starting
+/// a flow that cannot be finished would leave a half-registered session on
+/// the server and an error here either way.
+fn next_stage(challenge: &Value, have_token: bool) -> Result<&'static str> {
+    let completed: Vec<&str> = challenge["completed"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|s| s.as_str()).collect();
     let flows = challenge["flows"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let doable = flows.iter().any(|flow| {
-        flow["stages"].as_array().is_some_and(|stages| stages.len() == 1 && stages[0].as_str() == Some("m.login.dummy"))
-    });
-    if doable {
-        return Ok("m.login.dummy");
-    }
-    let wanted: Vec<String> = flows
+    let doable = |stage: &str| stage == "m.login.dummy" || (stage == REGISTRATION_TOKEN && have_token);
+
+    let next = flows
         .iter()
         .filter_map(|flow| flow["stages"].as_array())
-        .flatten()
-        .filter_map(|s| s.as_str().map(readable_stage))
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
+        .filter(|stages| stages.iter().filter_map(|s| s.as_str()).all(doable))
+        .flat_map(|stages| stages.iter().filter_map(|s| s.as_str()))
+        .find(|stage| !completed.contains(stage));
+    match next {
+        Some("m.login.dummy") => return Ok("m.login.dummy"),
+        Some(stage) if stage == REGISTRATION_TOKEN => return Ok(REGISTRATION_TOKEN),
+        // Every stage of a flow this client can finish is already finished,
+        // and the server asked anyway.
+        Some(_) | None => {}
+    }
+
+    let wanted = wanted_stages(flows);
     if wanted.is_empty() {
         bail!("this homeserver is not accepting new accounts");
+    }
+    // Worth separating from the rest: an invitation token is the one missing
+    // thing that can be supplied from this window, so saying "sign up on its
+    // own page" here would send somebody away from the field they need.
+    if !have_token && flows.iter().filter_map(|flow| flow["stages"].as_array()).any(|stages| stages.iter().filter_map(|s| s.as_str()).all(|s| doable(s) || s == REGISTRATION_TOKEN)) {
+        bail!("this homeserver needs an invitation token to register");
     }
     bail!(
         "this homeserver asks for {} to register, which has to be done on its own page - \
          sign up there and then add the account here",
         wanted.join(" and ")
     )
+}
+
+/// Everything any flow asks for, deduplicated and in words.
+fn wanted_stages(flows: &[Value]) -> Vec<String> {
+    flows
+        .iter()
+        .filter_map(|flow| flow["stages"].as_array())
+        .flatten()
+        .filter_map(|s| s.as_str())
+        // The stage that means there is no stage. Listing it as something the
+        // server "wants" would be listing nothing.
+        .filter(|s| *s != "m.login.dummy")
+        .map(readable_stage)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// What a homeserver wants before it will make an account, asked before
+/// anything is typed.
+///
+/// The same question `matrixLoginFlows` asks about signing in, and asked the
+/// same way: an empty POST is refused with the flows attached. A server that
+/// is closed to new accounts refuses it outright instead, which is a
+/// different answer and is reported as one - a greyed-out button with a
+/// reason beats a form that fails on submit.
+pub async fn registration_flows(homeserver_url: &str) -> Result<(bool, bool, Vec<String>)> {
+    let resolved = http::resolve_homeserver(homeserver_url).await?;
+    let url = format!("{}/_matrix/client/v3/register", resolved.trim_end_matches('/'));
+    let challenge = match http::post_json_uia(&url, json!({})).await {
+        Ok(http::Attempt::NeedsAuth(challenge)) => challenge,
+        // Answering an empty registration outright would be a homeserver
+        // making an account with no name and no password, which none do.
+        Ok(http::Attempt::Done(_)) => return Ok((true, false, Vec::new())),
+        // Only a refusal means closed. A server that could not be reached at
+        // all is one nothing is known about, and saying "not accepting new
+        // accounts" about a typo in a hostname would be a confident wrong
+        // answer where an empty one is honest.
+        Err(e) if is_closed(&e) => return Ok((false, false, Vec::new())),
+        Err(e) => return Err(e),
+    };
+    let flows = challenge["flows"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let needs_token = flows.iter().filter_map(|flow| flow["stages"].as_array()).any(|stages| stages.iter().any(|s| s.as_str() == Some(REGISTRATION_TOKEN)));
+    Ok((!flows.is_empty(), needs_token, wanted_stages(flows)))
+}
+
+/// Whether a refused registration means the door is shut rather than
+/// something having gone wrong on the way to it. Matched on the errcode
+/// rather than the prose, which homeservers word differently.
+fn is_closed(e: &impl std::fmt::Display) -> bool {
+    let said = e.to_string();
+    said.contains("M_FORBIDDEN") || said.contains("M_UNRECOGNIZED")
 }
 
 fn readable_stage(stage: &str) -> String {
@@ -558,10 +659,10 @@ pub(super) async fn wait_for_sso_token(listener: tokio::net::TcpListener) -> Res
 /// The same shape as `start_login` on purpose: a client that can already
 /// follow a sign-in follows this with no new machinery, and what somebody sees
 /// is a form that either works or explains itself.
-pub fn start_registration(state: AppState, login_id: String, homeserver_url: String, username: String, password: String) {
+pub fn start_registration(state: AppState, login_id: String, homeserver_url: String, username: String, password: String, token: Option<String>) {
     tokio::spawn(async move {
         let result =
-            std::panic::AssertUnwindSafe(try_registration(&state, &login_id, &homeserver_url, &username, &password)).catch_unwind().await;
+            std::panic::AssertUnwindSafe(try_registration(&state, &login_id, &homeserver_url, &username, &password, token.as_deref())).catch_unwind().await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
@@ -572,7 +673,7 @@ pub fn start_registration(state: AppState, login_id: String, homeserver_url: Str
     });
 }
 
-async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str) -> Result<()> {
+async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str, token: Option<&str>) -> Result<()> {
     state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
     let homeserver_url = &http::resolve_homeserver(homeserver_url).await?;
     state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "making the account..." }));
@@ -582,7 +683,7 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
     // no equivalent here, because a registration that failed left no account
     // to retry against - the name may now be taken, by us, or not exist at
     // all, and guessing which would be storing a guess.
-    let (user_id, access_token, device_id) = register(homeserver_url, username, password).await?;
+    let (user_id, access_token, device_id) = register(homeserver_url, username, password, token).await?;
 
     let config = MatrixAccountConfig {
         homeserver_url: homeserver_url.to_string(),
@@ -737,5 +838,75 @@ mod sso_tests {
             .expect("task")
             .expect("token");
         assert_eq!(token, "syt_abc123");
+    }
+}
+
+#[cfg(test)]
+mod registration_stage_tests {
+    use super::{is_closed, next_stage, REGISTRATION_TOKEN};
+    use serde_json::json;
+
+    fn challenge(flows: serde_json::Value, completed: serde_json::Value) -> serde_json::Value {
+        json!({ "session": "s", "flows": flows, "completed": completed })
+    }
+
+    #[test]
+    fn an_open_homeserver_asks_for_nothing() {
+        let c = challenge(json!([{ "stages": ["m.login.dummy"] }]), json!([]));
+        assert_eq!(next_stage(&c, false).unwrap(), "m.login.dummy");
+    }
+
+    #[test]
+    fn a_private_homeserver_takes_the_token_then_the_dummy() {
+        // Synapse's shape: the token is one stage of two, so the flow is only
+        // finished after the dummy that follows it. Answering the first and
+        // stopping would leave the account half made.
+        let flows = json!([{ "stages": [REGISTRATION_TOKEN, "m.login.dummy"] }]);
+        let c = challenge(flows.clone(), json!([]));
+        assert_eq!(next_stage(&c, true).unwrap(), REGISTRATION_TOKEN);
+        let c = challenge(flows, json!([REGISTRATION_TOKEN]));
+        assert_eq!(next_stage(&c, true).unwrap(), "m.login.dummy");
+    }
+
+    #[test]
+    fn without_a_token_a_token_server_says_so_rather_than_sending_you_away() {
+        // The distinction that matters: this is the one missing thing that
+        // can be supplied from the same window, so the message must not be
+        // the "sign up on its own page" one.
+        let c = challenge(json!([{ "stages": [REGISTRATION_TOKEN] }]), json!([]));
+        let said = next_stage(&c, false).unwrap_err().to_string();
+        assert!(said.contains("invitation token"), "{said}");
+        assert!(!said.contains("its own page"), "{said}");
+    }
+
+    #[test]
+    fn a_flow_that_cannot_be_finished_is_never_started() {
+        // A captcha sits behind the token here. Answering the token stage
+        // would succeed and then strand the registration at the captcha, so
+        // the whole flow is refused before the first request.
+        let c = challenge(json!([{ "stages": [REGISTRATION_TOKEN, "m.login.recaptcha"] }]), json!([]));
+        let said = next_stage(&c, true).unwrap_err().to_string();
+        assert!(said.contains("a captcha"), "{said}");
+    }
+
+    #[test]
+    fn the_doable_flow_wins_where_a_server_offers_several() {
+        let c = challenge(
+            json!([{ "stages": ["m.login.recaptcha"] }, { "stages": ["m.login.dummy"] }]),
+            json!([]),
+        );
+        assert_eq!(next_stage(&c, false).unwrap(), "m.login.dummy");
+    }
+
+    #[test]
+    fn no_flows_at_all_means_no_new_accounts() {
+        let c = challenge(json!([]), json!([]));
+        assert!(next_stage(&c, true).unwrap_err().to_string().contains("not accepting"));
+    }
+
+    #[test]
+    fn a_refusal_is_closed_and_a_broken_connection_is_not() {
+        assert!(is_closed(&"M_FORBIDDEN: Registration has been disabled."));
+        assert!(!is_closed(&"request failed: dns error"));
     }
 }

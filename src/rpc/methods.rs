@@ -3363,9 +3363,32 @@ pub async fn dispatch(
                 (Some(h), Some(u), Some(p)) => (h.to_string(), u.to_string(), p.to_string()),
                 _ => return (None, Some("registerMatrixAccount requires \"homeserverUrl\", \"username\" and \"password\"".to_string())),
             };
+            // Optional, and optional is the whole point: a homeserver open to
+            // the world asks for nothing, and one that is not hands out an
+            // invitation token instead. Sent only where the server's own
+            // flows ask for it.
+            let token = p_str_opt(params, "registrationToken").map(str::trim).filter(|t| !t.is_empty()).map(|t| t.to_string());
             let login_id = format!("matrix-register-{}", crate::model::next_message_id());
-            backend::matrix::start_registration(state.clone(), login_id.clone(), homeserver_url, username, password);
+            backend::matrix::start_registration(state.clone(), login_id.clone(), homeserver_url, username, password, token);
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // What the homeserver wants before it will make an account, asked
+        // before anything is typed - the registration counterpart of
+        // `matrixLoginFlows`. `open` false means it takes no new accounts at
+        // all, which is worth saying out loud rather than discovering on
+        // submit.
+        "matrixRegistrationFlows" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("matrixRegistrationFlows requires \"homeserverUrl\"".to_string()));
+            };
+            match backend::matrix::registration_flows(homeserver_url).await {
+                Ok((open, needs_token, wants)) => (
+                    Some(serde_json::json!({ "open": open, "needsToken": needs_token, "wants": wants })),
+                    None,
+                ),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // How a homeserver lets people sign in, asked before anything is
