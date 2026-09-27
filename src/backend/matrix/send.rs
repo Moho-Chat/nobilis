@@ -5,6 +5,7 @@
 //! is why they end at the same two functions.
 
 use super::*;
+use anyhow::bail;
 
 /// Joins an existing room (or space - a Space is just a room with an
 /// `m.space` creation type under the hood, joined through this exact same
@@ -154,11 +155,7 @@ pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str,
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/report/{}",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report/{}", encoded(&room_id), encoded(event_id));
     // The score is a severity from -100 to 0 that no server this client has
     // met does anything with, and a number nobody chose is worse than no
     // number: the reason is what a moderator reads.
@@ -167,8 +164,68 @@ pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str,
     } else {
         serde_json::json!({ "reason": reason.trim() })
     };
-    http::post_json(&url, Some(&account.access_token), body).await.context("reporting that message")?;
-    Ok(())
+    send_report(&url, &account.access_token, body, "reporting that message").await
+}
+
+/// Reports a whole room to the people who run the homeserver.
+///
+/// A room rather than a message, for the case the message endpoint cannot
+/// describe: a room that is wholly what it should not be, where picking one
+/// message out of it would understate the thing being reported. Moderators
+/// get the room and the reason; they were never going to act on a single line
+/// of it anyway.
+pub async fn report_room(state: &AppState, account_id: &str, buffer_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report", encoded(&room_id));
+    // Required here, unlike a message report: a room report carries no
+    // content at all, so without a reason it says only that somebody
+    // objected to somewhere, which is not something anybody can act on.
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("a room report needs a reason - there is no message to speak for it");
+    }
+    send_report(&url, &account.access_token, serde_json::json!({ "reason": reason }), "reporting that room").await
+}
+
+/// Reports a person to the people who run the homeserver.
+///
+/// The one report that is not about a place. Somebody whose behaviour spans
+/// rooms - or who has done it in a direct message, where there is nobody else
+/// to see - cannot be described by pointing at one room or one line, and
+/// until this there was nothing in moho that said so.
+pub async fn report_user(state: &AppState, account_id: &str, user_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    if !user_id.starts_with('@') || !user_id.contains(':') {
+        bail!("{user_id} is not a Matrix id");
+    }
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/users/{}/report", encoded(user_id));
+    let reason = reason.trim();
+    let body = if reason.is_empty() { serde_json::json!({}) } else { serde_json::json!({ "reason": reason }) };
+    send_report(&url, &account.access_token, body, "reporting that person").await
+}
+
+/// The part the three reports share, including what to say about a homeserver
+/// too old to have the endpoint.
+///
+/// Room and user reports are recent additions to the spec, so a server that
+/// has not caught up answers 404 with `M_UNRECOGNIZED` - which reads as "that
+/// room does not exist" and sends somebody looking for a mistake they did not
+/// make. Named for what it is instead.
+async fn send_report(url: &str, access_token: &str, body: Value, doing: &'static str) -> Result<()> {
+    match http::post_json(url, Some(access_token), body).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("M_UNRECOGNIZED") => {
+            bail!("this homeserver is too old to take this kind of report - reporting a message in the room still works")
+        }
+        Err(e) => Err(e).context(doing),
+    }
+}
+
+fn encoded(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
 }
 
 /// Who a message is aimed at, in the form the spec calls intentional

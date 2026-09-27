@@ -5239,6 +5239,35 @@ pub async fn dispatch(
             }
         }
 
+        // Telling whoever runs the server about a whole room, for when one
+        // message out of it would understate what is wrong.
+        "reportMatrixRoom" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("reportMatrixRoom requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            match backend::matrix::report_room(state, &buffer.account_id, buffer_id, p_str(params, "reason", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The same about a person rather than a place. Takes an account
+        // rather than a buffer: somebody being reported for what they do
+        // across rooms is not reported from one of them.
+        "reportMatrixUser" => {
+            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
+                (Some(a), Some(u)) => (a, u),
+                _ => return (None, Some("reportMatrixUser requires \"accountId\" and \"userId\"".to_string())),
+            };
+            match backend::matrix::report_user(state, account_id, user_id, p_str(params, "reason", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Putting a room in a space, or taking it out of one.
         "setMatrixSpaceChild" => {
             let (space_group_id, buffer_id) = match (p_str_opt(params, "spaceId"), p_str_opt(params, "bufferId")) {
