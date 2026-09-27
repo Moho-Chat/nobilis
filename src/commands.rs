@@ -71,6 +71,16 @@ pub const BUILTINS: &[Builtin] = &[
     Builtin { name: "unnotify", usage: "<nick>", description: "Stop watching for somebody", services: IRC },
     Builtin { name: "whowas", usage: "<nick>", description: "Look up somebody who has left", services: IRC },
     Builtin { name: "notice", usage: "<target> <message>", description: "Send a notice", services: IRC },
+    // The same name twice, because the two services mean different things by
+    // it. IRC's notice is aimed at somebody; Matrix's is a kind of message,
+    // said to the room you are already in, so there is no target to name.
+    // `matching` filters by service, so each side only ever sees its own.
+    Builtin {
+        name: "notice",
+        usage: "<message>",
+        description: "Announce something, drawn apart from conversation",
+        services: MATRIX,
+    },
     Builtin { name: "ctcp", usage: "<nick> <request>", description: "Send a CTCP request", services: IRC },
     Builtin { name: "invite", usage: "<nick>", description: "Invite somebody to this channel", services: IRC },
     Builtin { name: "list", usage: "[pattern]", description: "List the network's channels", services: IRC },

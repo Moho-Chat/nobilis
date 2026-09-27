@@ -228,6 +228,44 @@ fn encoded(id: &str) -> String {
     url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
 }
 
+/// Which kind of message somebody typed, and what is left once the command
+/// that said so is taken off the front.
+///
+/// Three of the msgtypes are reachable from the box rather than from a menu,
+/// because all three are things somebody says in the middle of saying other
+/// things: an action, an announcement, and ordinary text.
+///
+/// `/me` is the convention IRC has always had and the one Matrix spells
+/// `m.emote`. `/notice` is `m.notice` - what bots and bridges send, drawn
+/// apart from conversation, and until now something moho could read but not
+/// write; typing it sent the literal word. `//` escapes a leading slash, the
+/// same way the IRC backend reads the same box.
+fn typed_msgtype(body: &str) -> Result<(&'static str, &str)> {
+    let Some(rest) = body.strip_prefix('/') else {
+        return Ok(("m.text", body));
+    };
+    if rest.starts_with('/') {
+        return Ok(("m.text", rest));
+    }
+    if let Some(action) = rest.strip_prefix("me ") {
+        return Ok(("m.emote", action));
+    }
+    if let Some(announcement) = rest.strip_prefix("notice ").map(str::trim) {
+        // Refused rather than sent as text. "/notice" with nothing after it
+        // is somebody who meant to announce something and stopped, and a room
+        // reading the word "/notice" is the failure this command exists to
+        // stop.
+        if announcement.is_empty() {
+            bail!("/notice needs something to announce");
+        }
+        return Ok(("m.notice", announcement));
+    }
+    if rest.trim_end() == "notice" {
+        bail!("/notice needs something to announce");
+    }
+    Ok(("m.text", body))
+}
+
 /// Who a message is aimed at, in the form the spec calls intentional
 /// mentions.
 ///
@@ -651,14 +689,7 @@ pub async fn send_message(
                 .unwrap_or_else(|| (rest.to_string(), String::new()));
             return send_location(state, account_id, buffer_id, &place, &label).await;
         }
-        let (msgtype, body) = match body.strip_prefix('/') {
-            Some(literal) if literal.starts_with('/') => ("m.text", literal),
-            Some(rest) => match rest.strip_prefix("me ") {
-                Some(action) => ("m.emote", action),
-                None => ("m.text", body),
-            },
-            None => ("m.text", body),
-        };
+        let (msgtype, body) = typed_msgtype(body)?;
         let mut content = serde_json::json!({ "msgtype": msgtype, "body": body });
         // Who this is aimed at, said outright rather than left to be guessed
         // from the text. Matrix used to work by every client scanning every
@@ -1216,5 +1247,48 @@ mod edit_tests {
         let c = super::edit_content("$abc", "just words");
         assert!(c["m.new_content"].get("format").is_none());
         assert!(c["m.new_content"].get("formatted_body").is_none());
+    }
+}
+
+#[cfg(test)]
+mod typed_msgtype_tests {
+    use super::typed_msgtype;
+
+    #[test]
+    fn plain_text_is_plain_text() {
+        assert_eq!(typed_msgtype("hello").unwrap(), ("m.text", "hello"));
+    }
+
+    #[test]
+    fn an_action_keeps_only_what_follows_it() {
+        assert_eq!(typed_msgtype("/me waves").unwrap(), ("m.emote", "waves"));
+    }
+
+    #[test]
+    fn a_notice_is_a_notice() {
+        assert_eq!(typed_msgtype("/notice build #412 failed").unwrap(), ("m.notice", "build #412 failed"));
+        // The spacing somebody typed is not part of what they announced.
+        assert_eq!(typed_msgtype("/notice   spaced out  ").unwrap(), ("m.notice", "spaced out"));
+    }
+
+    #[test]
+    fn an_empty_notice_is_refused_rather_than_said_out_loud() {
+        // This is the bug the command was added for: "/notice" used to reach
+        // the room as the literal word.
+        assert!(typed_msgtype("/notice").is_err());
+        assert!(typed_msgtype("/notice   ").is_err());
+    }
+
+    #[test]
+    fn a_doubled_slash_escapes_the_command() {
+        assert_eq!(typed_msgtype("//notice not a command").unwrap(), ("m.text", "/notice not a command"));
+    }
+
+    #[test]
+    fn a_command_this_backend_does_not_know_is_said_as_typed() {
+        // Matched by the whole word, so a room called "/noticeboard" is not
+        // swallowed by the command that starts the same way.
+        assert_eq!(typed_msgtype("/noticeboard").unwrap(), ("m.text", "/noticeboard"));
+        assert_eq!(typed_msgtype("/whois someone").unwrap(), ("m.text", "/whois someone"));
     }
 }
