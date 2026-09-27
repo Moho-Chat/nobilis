@@ -188,6 +188,18 @@ pub struct MatrixAccountConfig {
     pub password: String,
     pub access_token: String,
     pub device_id: String,
+    /// What to get a fresh access token with, for an account signed in
+    /// through an OAuth provider rather than with a password.
+    ///
+    /// Those access tokens expire - in minutes, on matrix.org - and there is
+    /// no password here to sign in again with, so without this an account
+    /// signed in by code works until its first expiry and then never again.
+    #[serde(default)]
+    pub oauth_refresh_token: String,
+    /// Which client the refresh token was issued to. A refresh is bound to
+    /// it, so a freshly registered client id will not do.
+    #[serde(default)]
+    pub oauth_client_id: String,
     /// Last successful `/sync` cursor - throttled-persisted (see
     /// Runtime::maybe_persist_matrix_next_batch) rather than on every
     /// sync response, since resuming from a slightly stale cursor after an
@@ -668,6 +680,16 @@ impl AccountStore {
     /// Clears the token with it, for the same reason the kind-changed path
     /// does: the two are different streams and neither will take the other's
     /// place-marker.
+    /// Keeps a rotated refresh token. Providers may hand back a new one on
+    /// every refresh, and using a spent one is refused.
+    pub fn set_matrix_oauth_refresh(&self, account_id: &str, refresh_token: &str) -> Result<bool> {
+        let mut matrix = self.matrix.lock().unwrap();
+        let Some(a) = matrix.get_mut(account_id) else { return Ok(false) };
+        a.oauth_refresh_token = refresh_token.to_string();
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     pub fn set_matrix_prefer_sliding_sync(&self, account_id: &str, prefer: bool) -> Result<bool> {
         let mut matrix = self.matrix.lock().unwrap();
         match matrix.get_mut(account_id) {

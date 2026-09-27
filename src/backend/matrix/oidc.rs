@@ -151,7 +151,10 @@ pub enum Poll {
     SlowDown,
     /// The code ran out, or was refused. Either way this attempt is over.
     Stopped(String),
-    Approved { access_token: String },
+    /// Signed in. The refresh token matters as much as the access one: the
+    /// access token expires in minutes on matrix.org, and an account signed
+    /// in this way has no password to fall back on.
+    Approved { access_token: String, refresh_token: String, expires_in: u64 },
 }
 
 /// Reads one poll of the token endpoint.
@@ -162,7 +165,11 @@ pub enum Poll {
 pub fn classify(status: u16, body: &Value) -> Poll {
     if let Some(token) = body["access_token"].as_str() {
         if !token.is_empty() {
-            return Poll::Approved { access_token: token.to_string() };
+            return Poll::Approved {
+                access_token: token.to_string(),
+                refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+                expires_in: body["expires_in"].as_u64().unwrap_or(0),
+            };
         }
     }
     match body["error"].as_str().unwrap_or_default() {
@@ -201,6 +208,36 @@ pub async fn poll_once(metadata: &AuthMetadata, client_id: &str, device_code: &s
     classify(status, &body)
 }
 
+/// A fresh access token, from the refresh token stored at sign-in.
+///
+/// The other half of the device grant, and the half without which it is a
+/// sign-in that stops working: matrix.org's access tokens last minutes, and
+/// an account signed in by code has no password to try again with. Without
+/// this the account simply went dead - `M_UNKNOWN_TOKEN`, a re-login attempt
+/// against an empty password, and a reconnect loop.
+///
+/// Returns the new pair. Providers may or may not rotate the refresh token;
+/// where the answer carries a new one it replaces the old, and where it does
+/// not the old one stays valid.
+pub async fn refresh(metadata: &AuthMetadata, client_id: &str, refresh_token: &str) -> Result<(String, String)> {
+    let (status, body) = http::post_form_anonymous_raw(
+        &metadata.token_endpoint,
+        &[("client_id", client_id), ("grant_type", "refresh_token"), ("refresh_token", refresh_token)],
+    )
+    .await
+    .context("asking for a fresh access token")?;
+    let access = body["access_token"].as_str().unwrap_or_default();
+    if access.is_empty() {
+        let why = body["error_description"]
+            .as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("the provider gave no reason");
+        anyhow::bail!("refusing to refresh the session (HTTP {status}): {why}");
+    }
+    let rotated = body["refresh_token"].as_str().filter(|t| !t.is_empty()).unwrap_or(refresh_token);
+    Ok((access.to_string(), rotated.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,10 +249,20 @@ mod tests {
         assert_eq!(classify(400, &json!({ "error": "slow_down" })), Poll::SlowDown);
     }
 
+    /// The refresh token is part of the approval, not an extra. Dropping it
+    /// is what made a code sign-in work until the first expiry and then
+    /// never again, with no password to fall back on.
     #[test]
-    fn an_approval_carries_the_token() {
-        let p = classify(200, &json!({ "access_token": "syt_x", "token_type": "Bearer" }));
-        assert_eq!(p, Poll::Approved { access_token: "syt_x".to_string() });
+    fn an_approval_carries_both_tokens() {
+        let p = classify(200, &json!({
+            "access_token": "syt_x", "token_type": "Bearer",
+            "refresh_token": "mar_y", "expires_in": 300
+        }));
+        assert_eq!(p, Poll::Approved {
+            access_token: "syt_x".to_string(),
+            refresh_token: "mar_y".to_string(),
+            expires_in: 300,
+        });
     }
 
     /// The two ends of the flow, which must stop it rather than spin.

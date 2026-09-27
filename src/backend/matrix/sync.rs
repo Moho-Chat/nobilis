@@ -95,12 +95,50 @@ pub(super) fn is_unknown_position(e: &anyhow::Error) -> bool {
 /// threaded through so a re-login reuses the *same* device rather than
 /// minting a fresh one (see auth.rs's module doc for why that matters).
 pub(super) async fn ensure_login(state: &AppState, config: &MatrixAccountConfig, account_id: &str) -> Result<(String, String)> {
+    // An account signed in through an OAuth provider has no password to try
+    // again with, and its access token is short-lived by design - minutes,
+    // on matrix.org. Refreshing is the only way back, and the way every
+    // other client does it.
+    //
+    // Without this the expiry was terminal: the token stopped working, the
+    // re-login below ran against an empty password, that failed, and the
+    // account sat in a reconnect loop saying "connecting" for ever while
+    // every request answered M_UNKNOWN_TOKEN.
+    if !config.oauth_refresh_token.is_empty() && !config.oauth_client_id.is_empty() {
+        match refresh_oauth_session(state, config, account_id).await {
+            Ok(token) => return Ok((token, config.device_id.clone())),
+            // Falls through to the password path rather than giving up: a
+            // refresh token can be revoked or rotated out from under us, and
+            // an account that also has a password can still get in.
+            Err(e) => {
+                tracing::warn!("matrix[{account_id}]: could not refresh the session: {e:#}");
+                if config.password.is_empty() {
+                    return Err(e).context("this account was signed in with a code, and the code's session cannot be renewed - sign in again");
+                }
+            }
+        }
+    }
     let device_id = if config.device_id.is_empty() { None } else { Some(config.device_id.as_str()) };
     let login = auth::login(&config.homeserver_url, &config.user_id, &config.password, device_id)
         .await
         .context("logging in")?;
     let _ = state.accounts.set_matrix_session(account_id, &login.access_token, &login.device_id);
     Ok((login.access_token, login.device_id))
+}
+
+/// Trades the stored refresh token for a fresh access token, and keeps both.
+async fn refresh_oauth_session(state: &AppState, config: &MatrixAccountConfig, account_id: &str) -> Result<String> {
+    let metadata = oidc::auth_metadata(&config.homeserver_url)
+        .await?
+        .context("this homeserver no longer says where its accounts live")?;
+    let (access, rotated) =
+        oidc::refresh(&metadata, &config.oauth_client_id, &config.oauth_refresh_token).await?;
+    // The device id does not change on a refresh - the token is bound to the
+    // same one - so only the session is rewritten.
+    let _ = state.accounts.set_matrix_session(account_id, &access, &config.device_id);
+    let _ = state.accounts.set_matrix_oauth_refresh(account_id, &rotated);
+    tracing::info!("matrix[{account_id}]: renewed the session from its refresh token");
+    Ok(access)
 }
 
 /// One sync-loop "session": logs in if there's no usable access_token yet,

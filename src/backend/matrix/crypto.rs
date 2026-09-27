@@ -103,6 +103,19 @@ pub fn forget(data_dir: &Path, account_id: &str) {
     }
 }
 
+/// Whether opening the store failed because it holds a different device.
+///
+/// Matched on the message because the SDK models it as one variant among
+/// many in an error type this does not otherwise inspect, and the wording is
+/// its own: "the account in the store doesn't match the account in the
+/// constructor". Deliberately narrow - anything else is a real failure and
+/// must not cause a store to be thrown away.
+fn is_wrong_device(e: &impl std::fmt::Display) -> bool {
+    let said = e.to_string();
+    said.contains("doesn't match the account in the constructor")
+        || said.contains("does not match the account in the constructor")
+}
+
 impl CryptoSession {
     /// Opens (or creates) this account's own crypto store directory under
     /// `<data_dir>/matrix-crypto/<sanitized account id>/` - mirrors the
@@ -115,7 +128,33 @@ impl CryptoSession {
         let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
         tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
         let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = OlmMachine::with_store(user_id, device_id, store, None).await.context("initializing OlmMachine")?;
+        let machine = match OlmMachine::with_store(user_id, device_id, store, None).await {
+            Ok(machine) => machine,
+            // A store belonging to a different device, which happens whenever
+            // somebody signs in again: the homeserver mints a new device, and
+            // the store on disk still holds the old one's Olm identity. The
+            // SDK refuses to open it, and refuses again every minute for ever
+            // - so the account never syncs, never shows an invitation, never
+            // does anything, and says "connecting" while it fails.
+            //
+            // There is nothing in that store worth keeping. Its keys belong
+            // to a device the server no longer knows, so they cannot decrypt
+            // anything new and cannot be published. What the old device could
+            // read comes back from key backup, which is what backup is for.
+            Err(e) if is_wrong_device(&e) => {
+                tracing::warn!(
+                    "matrix crypto: the store at {} belongs to a device that has been replaced; starting a fresh one",
+                    dir.display()
+                );
+                forget(data_dir, account_id);
+                tokio::fs::create_dir_all(&dir).await.context("recreating matrix crypto store directory")?;
+                let store = SqliteCryptoStore::open(&dir, None).await.context("reopening matrix crypto store")?;
+                OlmMachine::with_store(user_id, device_id, store, None)
+                    .await
+                    .context("initializing OlmMachine on a fresh store")?
+            }
+            Err(e) => return Err(e).context("initializing OlmMachine"),
+        };
         Ok(Self { machine, outgoing_lock: AsyncMutex::new(()) })
     }
 
@@ -935,6 +974,33 @@ mod forget_tests {
     /// The store is what makes this installation *that device*. The report
     /// that prompted this: an account removed and added again picked up its
     /// old device keys and Olm sessions, and rooms would not decrypt.
+    use super::is_wrong_device;
+
+    /// The message the SDK actually produced when an account was signed in
+    /// again and the homeserver gave it a new device. Left unhandled it
+    /// stopped the account syncing entirely, for ever, once a minute.
+    #[test]
+    fn a_store_from_a_replaced_device_is_recognised() {
+        let real = "initializing OlmMachine: the account in the store doesn't match the account \
+                    in the constructor: expected @mohotest1:matrix.org:IDKATNUEPP, got \
+                    @mohotest1:matrix.org:viS2g66kqb";
+        assert!(is_wrong_device(&real));
+    }
+
+    /// And nothing else is, because the answer to this one is to delete
+    /// somebody's keys - which must not happen for a disk error or a locked
+    /// database.
+    #[test]
+    fn an_ordinary_store_failure_keeps_the_keys() {
+        for other in [
+            "opening matrix crypto store: database is locked",
+            "initializing OlmMachine: no space left on device",
+            "permission denied",
+        ] {
+            assert!(!is_wrong_device(&other), "{other} must not throw the store away");
+        }
+    }
+
     #[test]
     fn removing_an_account_takes_its_crypto_store() {
         let data_dir = std::env::temp_dir().join(format!("nobilis-forget-{}", std::process::id()));

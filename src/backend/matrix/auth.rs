@@ -348,6 +348,7 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
 
     let deadline = tokio::time::Instant::now() + grant.expires_in;
     let mut interval = grant.interval;
+    let mut refresh_token = String::new();
     let access_token = loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("the sign-in code expired before it was approved");
@@ -359,7 +360,18 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
             // said this once will say it again at the old rate.
             oidc::Poll::SlowDown => interval += Duration::from_secs(5),
             oidc::Poll::Stopped(why) => anyhow::bail!("{why}"),
-            oidc::Poll::Approved { access_token } => break access_token,
+            oidc::Poll::Approved { access_token, refresh_token: refresh, expires_in } => {
+                // Kept, because the access token does not last: matrix.org
+                // measures these in minutes, and there is no password here
+                // to sign in again with when one runs out.
+                refresh_token = refresh;
+                tracing::info!(
+                    "matrix device login[{login_id}]: approved; the access token lasts {}s and {} a refresh token",
+                    expires_in,
+                    if refresh_token.is_empty() { "came without" } else { "came with" }
+                );
+                break access_token;
+            }
         }
     };
 
@@ -413,6 +425,8 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
         password: String::new(),
         access_token,
         device_id,
+        oauth_refresh_token: refresh_token,
+        oauth_client_id: client_id,
         next_batch: None,
         used_sliding_sync: false,
         prefer_sliding_sync: false,
@@ -485,6 +499,8 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
         device_id: login.device_id,
         next_batch: None,
         used_sliding_sync: false,
+        oauth_refresh_token: String::new(),
+        oauth_client_id: String::new(),
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
@@ -576,6 +592,8 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
         device_id,
         next_batch: None,
         used_sliding_sync: false,
+        oauth_refresh_token: String::new(),
+        oauth_client_id: String::new(),
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
@@ -632,6 +650,8 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         device_id: String::new(),
         next_batch: None,
         used_sliding_sync: false,
+        oauth_refresh_token: String::new(),
+        oauth_client_id: String::new(),
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
@@ -649,6 +669,8 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
         device_id: login.device_id,
         next_batch: None,
         used_sliding_sync: false,
+        oauth_refresh_token: String::new(),
+        oauth_client_id: String::new(),
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
