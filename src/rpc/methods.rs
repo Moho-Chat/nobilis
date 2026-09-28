@@ -4824,6 +4824,50 @@ pub async fn dispatch(
             }
         }
 
+        // Who may come in. Read and written through one method the way
+        // history visibility is, because the panel asks for both at the same
+        // moment and for the same reason.
+        "matrixJoinRule" | "setMatrixJoinRule" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some(format!("{method} requires \"bufferId\"")));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let result = if method == "matrixJoinRule" {
+                backend::matrix::roomsettings::join_rule(state, &buffer.account_id, buffer_id).await
+            } else {
+                let Some(value) = p_str_opt(params, "value") else {
+                    return (None, Some("setMatrixJoinRule requires \"value\"".to_string()));
+                };
+                // The spaces whose members may join, for the two rules that
+                // take them. Absent everywhere else.
+                //
+                // Named by group id, the way setMatrixSpaceChild takes them -
+                // that is what the rail and the room list hold, and a window
+                // that had to keep room ids as well would be keeping two
+                // names for one thing. A plain room id is taken too, for a
+                // caller that has one.
+                let allow: Vec<String> = params
+                    .get("allow")
+                    .and_then(Value::as_array)
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|id| crate::backend::matrix::space_room_id(id).unwrap_or_else(|| id.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                backend::matrix::roomsettings::set_join_rule(state, &buffer.account_id, buffer_id, value, &allow)
+                    .await
+                    .map(|()| ok_node())
+            };
+            match result {
+                Ok(node) => (Some(node), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // How the account files a room: starred to the top, pushed to the
         // bottom, or neither. Per-room account data, so it travels - which is
         // the point, and why this is not the window's own pin.

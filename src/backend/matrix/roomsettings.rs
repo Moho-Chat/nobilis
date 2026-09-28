@@ -178,3 +178,146 @@ mod tests {
         assert!(!is_not_found(&anyhow::anyhow!("request failed")));
     }
 }
+
+/// Who may come in without being let in.
+///
+/// The one room setting moho could read everywhere and write nowhere. A room
+/// made here took the server's default and stayed on it, which also meant
+/// knocking - which moho has been able to *do* since spaces landed - had
+/// nowhere to be done: you cannot knock on a room that does not accept knocks,
+/// and no room made in moho ever did.
+pub const JOIN_RULES: &str = "m.room.join_rules";
+
+/// What a rule is called, what it needs, and the oldest room version that
+/// understands it.
+///
+/// Version matters here in a way it does not for most state: a homeserver
+/// asked to put `knock` on a version 6 room rejects the event, and the
+/// refusal names an auth rule rather than the setting somebody was changing.
+/// Checked here so the answer is about the room.
+struct Rule {
+    name: &'static str,
+    /// Whether it takes a list of spaces whose members may join.
+    allows: bool,
+    since: u8,
+}
+
+const RULES: [Rule; 5] = [
+    Rule { name: "public", allows: false, since: 1 },
+    Rule { name: "invite", allows: false, since: 1 },
+    Rule { name: "knock", allows: false, since: 7 },
+    Rule { name: "restricted", allows: true, since: 8 },
+    Rule { name: "knock_restricted", allows: true, since: 10 },
+];
+
+/// The numeric part of a room version, where it has one.
+///
+/// Custom versions are strings and may be anything at all; one this cannot
+/// read is treated as new enough, because refusing a setting on a room whose
+/// version is merely unfamiliar would be this client guessing on the server's
+/// behalf - and the server is about to answer anyway.
+fn version_number(version: &str) -> Option<u8> {
+    version.parse::<u8>().ok()
+}
+
+/// What a room says about who may join, and what this account could change it
+/// to.
+pub async fn join_rule(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let content = read_state_event(state, account_id, &room_id, JOIN_RULES).await?;
+    // `invite` is the spec's default, and a room carrying no event really is
+    // invite-only rather than unknown.
+    let value = content.as_ref().and_then(|c| c["join_rule"].as_str()).unwrap_or("invite").to_string();
+    // The spaces already named, so a panel can show which ones without
+    // reading the state event a second time.
+    let allow: Vec<String> = content
+        .as_ref()
+        .and_then(|c| c["allow"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry["room_id"].as_str().map(str::to_string))
+        .collect();
+
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let number = version_number(&version);
+    let choices: Vec<Value> = RULES
+        .iter()
+        .map(|rule| {
+            serde_json::json!({
+                "value": rule.name,
+                "allows": rule.allows,
+                // Offered greyed rather than hidden: "this room is too old for
+                // that" is a fact somebody wants, and a control that silently
+                // has three options on one room and five on another is one
+                // nobody can learn.
+                "supported": number.is_none_or(|n| n >= rule.since),
+                "since": rule.since,
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "value": value,
+        "allow": allow,
+        "choices": choices,
+        "version": version,
+        "canChange": moderation::can_send_state_in_buffer(state, account_id, buffer_id, JOIN_RULES),
+    }))
+}
+
+/// Sets it.
+///
+/// `allow` is the list of spaces whose members may join, and is meaningful
+/// only for the two restricted rules. Sent empty on the others rather than
+/// carried over, because an `allow` beside `invite` is a list the server
+/// ignores and a reader misreads.
+pub async fn set_join_rule(state: &AppState, account_id: &str, buffer_id: &str, value: &str, allow: &[String]) -> Result<()> {
+    let Some(rule) = RULES.iter().find(|r| r.name == value) else {
+        anyhow::bail!("{value} is not a join rule this client sets");
+    };
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    if version_number(&version).is_some_and(|n| n < rule.since) {
+        anyhow::bail!(
+            "this room is version {version} and \"{value}\" needs {} or newer - upgrade the room first",
+            rule.since
+        );
+    }
+    // A restricted room with nothing in its allow list is a room nobody can
+    // join and nobody can be told why: the server takes it, and every join
+    // fails the auth rules afterwards.
+    if rule.allows && allow.is_empty() {
+        anyhow::bail!("\"{value}\" needs at least one space whose members may join");
+    }
+
+    let mut content = serde_json::json!({ "join_rule": value });
+    if rule.allows {
+        content["allow"] = allow
+            .iter()
+            .map(|room| serde_json::json!({ "type": "m.room_membership", "room_id": room }))
+            .collect();
+    }
+    send::put_room_state(state, account_id, &room_id, JOIN_RULES, "", content).await
+}
+
+#[cfg(test)]
+mod join_rule_tests {
+    use super::{version_number, RULES};
+
+    #[test]
+    fn a_rule_knows_the_version_that_introduced_it() {
+        let knock = RULES.iter().find(|r| r.name == "knock").unwrap();
+        assert_eq!(knock.since, 7);
+        assert!(!knock.allows);
+        let restricted = RULES.iter().find(|r| r.name == "restricted").unwrap();
+        assert!(restricted.allows);
+    }
+
+    #[test]
+    fn a_version_this_does_not_understand_is_not_refused() {
+        // Custom room versions are free-form strings. Treating one as too old
+        // would refuse a setting the server might well accept.
+        assert_eq!(version_number("12"), Some(12));
+        assert_eq!(version_number("org.example.room.v3"), None);
+    }
+}
