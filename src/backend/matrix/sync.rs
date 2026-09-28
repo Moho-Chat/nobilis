@@ -179,6 +179,10 @@ pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, acc
         crypto::CryptoSession::open(&config_dir(), account_id, &user_id, device_id_ruma).await.context("opening crypto store")?,
     );
     state.runtime.set_matrix_machine(account_id, session.clone());
+    // Asked for outright, because a resumed sync will never mention it: see
+    // load_user_emotes. Before the first sync, so the picker has the pack
+    // from the moment the account is up rather than one round trip later.
+    load_user_emotes(state, account_id, config.homeserver_url.trim_end_matches('/'), &access_token, &config.user_id).await;
     // What this homeserver says it can do, before anything asks it to. Read
     // once because both answers are properties of the server rather than of
     // the moment - a homeserver that changes either has been restarted, which
@@ -593,47 +597,7 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
             // clients - see backend/matrix/stickers.rs for the two places a
             // pack lives.
             if event["type"].as_str() == Some("im.ponies.user_emotes") {
-                state.runtime.set_matrix_sticker_pack(account_id, "", "your stickers", &event["content"]);
-                // The other half of the same pack. Stickers are events of
-                // their own and have their own picker; emoticons are images
-                // inside a line of text, which is what the emoji picker is
-                // for - so the one pack feeds two places (see #205).
-                let emoticons = stickers::read_emoticons(&event["content"], "your emoji");
-                // Also kept by shortcode, which is what the send path needs to
-                // turn `:name:` into the image on the way out.
-                state.runtime.set_matrix_emoticons(
-                    account_id,
-                    emoticons.iter().map(|e| (e.name.clone(), e.mxc.clone())).collect(),
-                );
-                if !emoticons.is_empty() {
-                    state.runtime.set_emoji_source(
-                        account_id,
-                        crate::model::EmojiSource {
-                            id: "matrix:user".to_string(),
-                            name: emoticons[0].pack.clone(),
-                            service: "matrix".to_string(),
-                            kind: "text".to_string(),
-                            icon_url: None,
-                            // Account data, so it travels with the account and
-                            // is sendable in every room it can talk in.
-                            buffers: Vec::new(),
-                            sendable_anywhere: true,
-                            emoji: emoticons
-                                .iter()
-                                .map(|e| crate::model::EmojiEntry {
-                                    // The shortcode, which is what goes in the
-                                    // message - the send path turns it into
-                                    // the image on the way out.
-                                    id: format!(":{}:", e.name),
-                                    name: e.name.clone(),
-                                    url: Some(e.mxc.clone()),
-                                    animated: false,
-                                    locked: false,
-                                })
-                                .collect(),
-                        },
-                    );
-                }
+                apply_user_emotes(state, account_id, &event["content"]);
             }
         }
     }
@@ -1167,5 +1131,64 @@ mod rename_tests {
             "timeline": { "events": [] }
         });
         assert_eq!(renamed_to(&room, "before"), None);
+    }
+}
+
+/// Takes an account's own `im.ponies.user_emotes` pack into the two places it
+/// is used.
+///
+/// Pulled out of the sync loop so a connect can do the same thing. Account
+/// data only arrives in a sync when it *changes*, and moho resumes from a
+/// stored batch token - so a pack that was set yesterday was never mentioned
+/// again, and the stickers stayed missing until somebody edited the pack.
+fn apply_user_emotes(state: &AppState, account_id: &str, content: &Value) {
+    state.runtime.set_matrix_sticker_pack(account_id, "", "your stickers", content);
+    // The other half of the same pack. Stickers are events of
+    // their own and have their own picker; emoticons are images
+    // inside a line of text, which is what the emoji picker is
+    // for - so the one pack feeds two places (see #205).
+    let emoticons = stickers::read_emoticons(content, "your emoji");
+    // Also kept by shortcode, which is what the send path needs to
+    // turn `:name:` into the image on the way out.
+    state.runtime.set_matrix_emoticons(
+        account_id,
+        emoticons.iter().map(|e| (e.name.clone(), e.mxc.clone())).collect(),
+    );
+    if !emoticons.is_empty() {
+        state.runtime.set_emoji_source(
+            account_id,
+            crate::model::EmojiSource {
+                id: "matrix:user".to_string(),
+                name: emoticons[0].pack.clone(),
+                service: "matrix".to_string(),
+                kind: "text".to_string(),
+                icon_url: None,
+                // Account data, so it travels with the account and
+                // is sendable in every room it can talk in.
+                buffers: Vec::new(),
+                sendable_anywhere: true,
+                emoji: emoticons
+                    .iter()
+                    .map(|e| crate::model::EmojiEntry {
+                        // The shortcode, which is what goes in the
+                        // message - the send path turns it into
+                        // the image on the way out.
+                        id: format!(":{}:", e.name),
+                        name: e.name.clone(),
+                        url: Some(e.mxc.clone()),
+                        animated: false,
+                        locked: false,
+                    })
+                    .collect(),
+            },
+        );
+    }
+}
+
+/// Asks for the account's pack outright, for the connect that would otherwise
+/// never be told about it.
+pub(super) async fn load_user_emotes(state: &AppState, account_id: &str, base: &str, token: &str, user_id: &str) {
+    if let Some(content) = super::ssss::read_account_data(base, token, user_id, "im.ponies.user_emotes").await {
+        apply_user_emotes(state, account_id, &content);
     }
 }

@@ -135,6 +135,19 @@ pub async fn create(homeserver_url: &str, token: &str, user_id: &str, passphrase
     Ok((key, recovery_code))
 }
 
+/// Stops the account pointing at a secret storage key.
+///
+/// There is no delete for account data, so the pointer is emptied rather than
+/// removed - `default_key_id` reads the `key` field and finds none, which is
+/// the same answer as never having had one. The key's own description is left
+/// where it is: unused, and harmless, and the only record that this happened.
+///
+/// Only for a safe this client made moments ago and could not finish setting
+/// up. Never for one that holds anything.
+pub async fn forget_default_key(homeserver_url: &str, token: &str, user_id: &str) -> Result<()> {
+    write_account_data(homeserver_url, token, user_id, DEFAULT_KEY_EVENT, json!({})).await
+}
+
 /// Puts a secret in the safe.
 ///
 /// Written alongside whatever is already there rather than over it: a secret

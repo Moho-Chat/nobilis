@@ -81,11 +81,17 @@ pub async fn accept_invite(state: &AppState, account_id: &str, room_id: &str) ->
 /// download button, and inline at its own size. moho has read them since
 /// stickers were supported and could send none.
 pub async fn send_sticker(state: &AppState, account_id: &str, buffer_id: &str, mxc: &str, body: &str) -> Result<()> {
+    // Looked up rather than rebuilt from the two things the window sent: the
+    // pack this came from knows the image's size and type, and the window
+    // does not. Falls back to what was sent for a sticker sent from anywhere
+    // else - a pack that has since gone, or a mxc somebody typed.
+    let known = state.runtime.matrix_stickers(account_id).into_iter().find(|s| s.mxc == mxc);
     let sticker = stickers::Sticker {
         name: body.to_string(),
         pack: String::new(),
         mxc: mxc.to_string(),
         body: body.to_string(),
+        info: known.map(|s| s.info).unwrap_or(serde_json::Value::Null),
     };
     send_typed_event(state, account_id, buffer_id, protocol::EVENT_STICKER, stickers::sticker_event(&sticker)).await
 }

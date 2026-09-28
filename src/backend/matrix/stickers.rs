@@ -34,6 +34,14 @@ pub struct Sticker {
     /// What it is called in a client that cannot show it, and the fallback
     /// body of the event that sends it.
     pub body: String,
+    /// The pack's own `info` for this image - mimetype, width, height, size.
+    ///
+    /// Carried rather than recomputed, because the pack is the only thing
+    /// that knows: the image is an mxc URI, and measuring it would mean
+    /// downloading it. Passed straight back out when the sticker is sent, so
+    /// a client on the other end can lay the message out before the picture
+    /// arrives instead of reflowing around it afterwards.
+    pub info: Value,
 }
 
 /// Whether this image is a sticker, as its pack describes it.
@@ -87,6 +95,7 @@ pub fn read_emoticons(content: &Value, fallback_name: &str) -> Vec<Sticker> {
                 pack: pack_name.clone(),
                 mxc: mxc.to_string(),
                 body: image["body"].as_str().filter(|b| !b.trim().is_empty()).unwrap_or(shortcode).to_string(),
+                info: image["info"].clone(),
             })
         })
         .collect()
@@ -124,6 +133,7 @@ pub fn read_pack(content: &Value, fallback_name: &str) -> Vec<Sticker> {
                     .filter(|b| !b.trim().is_empty())
                     .unwrap_or(shortcode)
                     .to_string(),
+                info: image["info"].clone(),
             })
         })
         .collect()
@@ -199,7 +209,10 @@ pub fn sticker_event(sticker: &Sticker) -> Value {
     serde_json::json!({
         "body": sticker.body,
         "url": sticker.mxc,
-        "info": {},
+        // The pack's own, where the pack gave one. This was always `{}`, and
+        // an m.sticker with no info is one the receiving client cannot size
+        // until the image has downloaded - so it lays the message out twice.
+        "info": if sticker.info.is_object() { sticker.info.clone() } else { serde_json::json!({}) },
     })
 }
 

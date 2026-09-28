@@ -78,6 +78,17 @@ pub async fn enable(
     let token = &config.access_token;
     let user = &config.user_id;
 
+    // Checked before anything is written, because everything after this point
+    // leaves a mark on the account. A dehydrated device is signed with the
+    // account's self-signing key, so without cross-signing there is nothing
+    // to sign it with - and that failure used to arrive *after* a fresh safe
+    // had been made, taking the recovery code with it into the error. What
+    // was left was an account holding secret storage nobody had been told the
+    // code for, which refuses every later attempt for ever.
+    if !session.machine.cross_signing_status().await.has_self_signing {
+        bail!("set up cross-signing on this account first - a dehydrated device is signed with its self-signing key");
+    }
+
     // An account that already has secret storage must be opened rather than
     // replaced: making a second one would orphan every secret in the first,
     // including a backup key somebody else's client is relying on.
@@ -117,9 +128,26 @@ pub async fn enable(
         .await
         .context("caching the pickle key")?;
 
-    upload(&session, base, token, &pickle_key).await?;
-    let _ = state.accounts.set_matrix_dehydration(account_id, true);
-    Ok(fresh_code)
+    let uploaded = upload(&session, base, token, &pickle_key).await;
+    match (uploaded, &fresh_code) {
+        (Ok(()), _) => {
+            let _ = state.accounts.set_matrix_dehydration(account_id, true);
+            Ok(fresh_code)
+        }
+        // The safe already existed, so it is not ours to undo.
+        (Err(e), None) => Err(e),
+        // The safe was made in this call, holds nothing anybody wants, and
+        // the code that opens it is about to go with the error. Left pointed
+        // at, it would refuse every future attempt - so the pointer goes too.
+        (Err(e), Some(_)) => {
+            let _ = ssss::forget_default_key(base, token, user).await;
+            Err(e)
+        }
+    }
+}
+
+fn escape(raw: &str) -> String {
+    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect()
 }
 
 /// Creates a device and puts it on the server, replacing any already there.
@@ -227,15 +255,19 @@ async fn rehydrate(
         let devices = session.machine.dehydrated_devices();
         let rehydrated = devices.rehydrate(&pickle_key, &device_id, data).await.context("rehydrating")?;
 
+        // Percent-encoded, which for once is not boilerplate: a dehydrated
+        // device's id is base64 and routinely contains a "/". Dropped into
+        // the path raw it ends the path segment, the request lands on a route
+        // that does not exist, and the server answers M_UNRECOGNIZED - which
+        // reads as "this homeserver is too old for dehydration" rather than
+        // as a malformed URL.
+        let in_path = escape(device_id.as_str());
         let mut next: Option<String> = None;
         let mut collected = 0usize;
         loop {
             let url = match &next {
-                Some(t) => format!(
-                    "{base}{BASE}/{device_id}/events?limit={EVENT_PAGE}&next_batch={}",
-                    url::form_urlencoded::byte_serialize(t.as_bytes()).collect::<String>()
-                ),
-                None => format!("{base}{BASE}/{device_id}/events?limit={EVENT_PAGE}"),
+                Some(t) => format!("{base}{BASE}/{in_path}/events?limit={EVENT_PAGE}&next_batch={}", escape(t)),
+                None => format!("{base}{BASE}/{in_path}/events?limit={EVENT_PAGE}"),
             };
             let page: Value = http::post_json(&url, Some(token), json!({})).await.context("reading its events")?;
             let events: Vec<_> = page["events"]

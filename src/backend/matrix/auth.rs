@@ -542,6 +542,13 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
     Ok(())
 }
 
+/// Whether a login flow means there is a page a browser can be sent to.
+///
+/// CAS is the older of the two and still in the spec; both redirect.
+fn offers_sso(flow: &str) -> bool {
+    flow == "m.login.sso" || flow == "m.login.cas"
+}
+
 /// How long to hold the loopback listener open waiting for the browser.
 pub(super) const SSO_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -550,8 +557,14 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
     let homeserver_url = http::resolve_homeserver(homeserver_url).await?;
     let base = homeserver_url.trim_end_matches('/');
 
+    // m.login.sso and nothing else, deliberately. m.login.token used to count
+    // here, and it means something different: it says tokens are *accepted*,
+    // which is also true of a server that mints them for its own signed-in
+    // sessions and has no sign-in page at all. matrix.salastil.com is exactly
+    // that, and the redirect this flow then opened answered 403 - a browser
+    // window onto an error, offered as a way in.
     let flows = auth::login_flows(&homeserver_url).await.unwrap_or_default();
-    if !flows.iter().any(|flow| flow == "m.login.sso" || flow == "m.login.token") {
+    if !flows.iter().any(|flow| offers_sso(flow)) {
         anyhow::bail!("this homeserver does not offer single sign-on");
     }
 
@@ -908,5 +921,26 @@ mod registration_stage_tests {
     fn a_refusal_is_closed_and_a_broken_connection_is_not() {
         assert!(is_closed(&"M_FORBIDDEN: Registration has been disabled."));
         assert!(!is_closed(&"request failed: dns error"));
+    }
+}
+
+#[cfg(test)]
+mod sso_offer_tests {
+    use super::offers_sso;
+
+    #[test]
+    fn a_redirect_flow_is_a_way_in() {
+        assert!(offers_sso("m.login.sso"));
+        assert!(offers_sso("m.login.cas"));
+    }
+
+    #[test]
+    fn accepting_tokens_is_not_the_same_as_having_a_sign_in_page() {
+        // What matrix.salastil.com advertises: it takes a login token minted
+        // by one of its own sessions, and its /login/sso/redirect answers
+        // 403. Offering the browser flow there opens a window onto an error.
+        assert!(!offers_sso("m.login.token"));
+        assert!(!offers_sso("m.login.password"));
+        assert!(!offers_sso("m.login.application_service"));
     }
 }
