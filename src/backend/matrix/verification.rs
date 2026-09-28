@@ -653,6 +653,28 @@ pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, o
                     v.qr_state = Some(named.to_string());
                     if changed {
                         tracing::info!("matrix verification[{id}]: QR flow is {named}");
+                        // Answered here rather than asked about. The spec has
+                        // the side that showed the code confirm that the
+                        // other device reported success, and Element asks -
+                        // but the scan already proves the scanner held this
+                        // screen's code, and a second dialog on top of a
+                        // gesture somebody has just performed reads as the
+                        // client not believing them. So it is confirmed as
+                        // soon as the scan lands.
+                        if named == "scanned" {
+                            match qr.confirm_scanning() {
+                                Some(outgoing) => {
+                                    if let Err(e) = session
+                                        .send_verification_request(homeserver_url, access_token, outgoing)
+                                        .await
+                                    {
+                                        tracing::warn!("matrix verification[{id}]: confirming the scan failed: {e:#}");
+                                    }
+                                    session.process_outgoing_requests(homeserver_url, access_token).await;
+                                }
+                                None => tracing::warn!("matrix verification[{id}]: a scan arrived that could not be confirmed"),
+                            }
+                        }
                         match named {
                             "done" => {
                                 if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
