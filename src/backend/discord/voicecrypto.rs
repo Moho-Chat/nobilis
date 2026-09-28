@@ -146,10 +146,32 @@ impl Sealer {
 /// either way: a sealer with nothing that can open what it makes is a sealer
 /// nothing can check.
 pub fn open(mode: Mode, key: &[u8], packet: &[u8], header_len: usize) -> anyhow::Result<Vec<u8>> {
-    if packet.len() < header_len + OVERHEAD {
+    open_at(mode, key, packet, header_len, header_len)
+}
+
+/// Opens a packet whose authenticated span and whose ciphertext do not begin
+/// at the same place.
+///
+/// They coincide in everything this stack sends, because it sends the
+/// simplest header there is. They need not coincide in what arrives: the
+/// `_rtpsize` modes exist so that a relay can read an RTP header extension it
+/// is not allowed to decrypt, and where exactly that extension falls - inside
+/// the authenticated span, inside the ciphertext, or in neither - is a
+/// property of the sender's implementation rather than of the cipher.
+///
+/// So this takes the two independently and the AEAD tag decides which reading
+/// was right. Getting it wrong is not subtle in its effect and completely
+/// silent in its cause: every packet fails to open and there is nothing to
+/// say why.
+pub fn open_at(mode: Mode, key: &[u8], packet: &[u8], aad_len: usize, body_at: usize) -> anyhow::Result<Vec<u8>> {
+    if aad_len > packet.len() || body_at > packet.len() {
+        anyhow::bail!("that span is longer than the packet");
+    }
+    if packet.len() < body_at + OVERHEAD {
         anyhow::bail!("packet too short to hold a tag and a nonce");
     }
-    let (header, rest) = packet.split_at(header_len);
+    let header = &packet[..aad_len];
+    let rest = &packet[body_at..];
     let nonce_at = rest.len() - NONCE_LEN;
     let counter = &rest[nonce_at..];
     let tag = &rest[nonce_at - TAG_LEN..nonce_at];
@@ -187,6 +209,41 @@ mod tests {
             *b = i as u8;
         }
         k
+    }
+
+    /// A packet whose extension is readable by a relay and not covered by
+    /// the tag - the shape `open_at` exists for.
+    ///
+    /// Built by hand rather than by the sealer, because the sealer never
+    /// makes this shape: it is what a *different* implementation sends, and
+    /// the whole point of taking the two spans separately is to be able to
+    /// read one. The tag is computed over the twelve-byte header alone while
+    /// the ciphertext begins past an extension that was never encrypted.
+    #[test]
+    fn an_extension_outside_both_the_tag_and_the_ciphertext_still_opens() {
+        for mode in [Mode::Aes256Gcm, Mode::XChaCha20Poly1305] {
+            let header = [0x90u8, 103, 0, 7, 0, 0, 1, 0, 0, 0, 0, 9];
+            let extension = [0xbe, 0xde, 0x00, 0x01, 0x51, 0x02, 0x03, 0x00];
+            let body = b"a picture, in pieces".to_vec();
+
+            let mut sealer = Sealer::new(mode, &key()).unwrap();
+            // `seal` returns the whole packet, header included, so the
+            // extension is spliced in behind the header rather than the
+            // header written again.
+            let sealed = sealer.seal(&header, &body).unwrap();
+            let mut packet = sealed[..header.len()].to_vec();
+            packet.extend_from_slice(&extension);
+            packet.extend_from_slice(&sealed[header.len()..]);
+
+            let aad = header.len();
+            let starts_at = header.len() + extension.len();
+            assert_eq!(open_at(mode, &key(), &packet, aad, starts_at).unwrap(), body);
+            // And the readings that do not describe this packet are refused
+            // rather than returning something plausible - which is what makes
+            // trying them in turn a safe way to find the right one.
+            assert!(open_at(mode, &key(), &packet, starts_at, starts_at).is_err());
+            assert!(open_at(mode, &key(), &packet, aad, aad).is_err());
+        }
     }
 
     /// The claim the whole module rests on, for both modes: what is sealed

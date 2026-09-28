@@ -128,6 +128,17 @@ pub struct PostimgLinks {
 /// markup to wrap anything in. The mechanics below are the same either way
 /// and were hard enough won that a second copy of them would be a liability.
 pub async fn upload_to_postimg(file_path: &str) -> Result<PostimgLinks> {
+    upload_to_postimg_reporting(file_path, None).await
+}
+
+/// The same, saying where it has got to. See `crate::upload::Progress`.
+pub async fn upload_to_postimg_reporting(
+    file_path: &str,
+    progress: Option<&crate::upload::Progress>,
+) -> Result<PostimgLinks> {
+    if let Some(progress) = progress {
+        progress.at(crate::upload::Phase::Preparing, 0, "postimg");
+    }
     let bytes = tokio::fs::read(file_path).await.with_context(|| format!("reading {file_path}"))?;
     if bytes.is_empty() {
         bail!("file is empty");
@@ -154,6 +165,11 @@ pub async fn upload_to_postimg(file_path: &str) -> Result<PostimgLinks> {
     ];
     let extra_headers = [("Origin", POSTIMG_ORIGIN), ("Referer", &format!("{POSTIMG_ORIGIN}/"))];
 
+    // Postimg is reached over Tor, so this wait is the long one: the whole
+    // circuit is built and the file crosses it before anything comes back.
+    if let Some(progress) = progress {
+        progress.at(crate::upload::Phase::Waiting, bytes.len(), "postimg");
+    }
     let (status, resp_bytes) = http.post_multipart(POSTIMG_UPLOAD_URL, &fields, &extra_headers).await.context("uploading to postimg.cc")?;
     if !(200..300).contains(&status) {
         let snippet = String::from_utf8_lossy(&resp_bytes[..resp_bytes.len().min(300)]);

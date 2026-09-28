@@ -152,6 +152,21 @@ impl Dave {
             .into_owned())
     }
 
+    /// Decrypts one video frame somebody else sent to the group.
+    ///
+    /// The mirror of `encrypt_video`, and addressed to a person rather than
+    /// to the group: MLS gives every sender their own key schedule, so the
+    /// decryptor is chosen by who sent the frame. A user with no decryptor is
+    /// somebody this client has not been told about yet, which happens
+    /// legitimately for the moment between joining a group and processing the
+    /// commit that names its members - so it is worth reporting plainly
+    /// rather than treating as corruption.
+    pub fn decrypt_video(&mut self, from_user: u64, frame: &[u8]) -> Result<Vec<u8>> {
+        self.session
+            .decrypt(from_user, davey::MediaType::VIDEO, frame)
+            .map_err(|e| anyhow::anyhow!("could not decrypt a frame from {from_user}: {e:?}"))
+    }
+
     /// Takes in one binary frame and says what to send back.
     /// `recognised` is the set of users this client expects in the group, or
     /// `None` when it does not know. None rather than an empty slice: an

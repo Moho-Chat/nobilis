@@ -103,6 +103,19 @@ pub fn forget(data_dir: &Path, account_id: &str) {
     }
 }
 
+/// Whether opening the store failed because it holds a different device.
+///
+/// Matched on the message because the SDK models it as one variant among
+/// many in an error type this does not otherwise inspect, and the wording is
+/// its own: "the account in the store doesn't match the account in the
+/// constructor". Deliberately narrow - anything else is a real failure and
+/// must not cause a store to be thrown away.
+fn is_wrong_device(e: &impl std::fmt::Display) -> bool {
+    let said = e.to_string();
+    said.contains("doesn't match the account in the constructor")
+        || said.contains("does not match the account in the constructor")
+}
+
 impl CryptoSession {
     /// Opens (or creates) this account's own crypto store directory under
     /// `<data_dir>/matrix-crypto/<sanitized account id>/` - mirrors the
@@ -115,7 +128,33 @@ impl CryptoSession {
         let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
         tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
         let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = OlmMachine::with_store(user_id, device_id, store, None).await.context("initializing OlmMachine")?;
+        let machine = match OlmMachine::with_store(user_id, device_id, store, None).await {
+            Ok(machine) => machine,
+            // A store belonging to a different device, which happens whenever
+            // somebody signs in again: the homeserver mints a new device, and
+            // the store on disk still holds the old one's Olm identity. The
+            // SDK refuses to open it, and refuses again every minute for ever
+            // - so the account never syncs, never shows an invitation, never
+            // does anything, and says "connecting" while it fails.
+            //
+            // There is nothing in that store worth keeping. Its keys belong
+            // to a device the server no longer knows, so they cannot decrypt
+            // anything new and cannot be published. What the old device could
+            // read comes back from key backup, which is what backup is for.
+            Err(e) if is_wrong_device(&e) => {
+                tracing::warn!(
+                    "matrix crypto: the store at {} belongs to a device that has been replaced; starting a fresh one",
+                    dir.display()
+                );
+                forget(data_dir, account_id);
+                tokio::fs::create_dir_all(&dir).await.context("recreating matrix crypto store directory")?;
+                let store = SqliteCryptoStore::open(&dir, None).await.context("reopening matrix crypto store")?;
+                OlmMachine::with_store(user_id, device_id, store, None)
+                    .await
+                    .context("initializing OlmMachine on a fresh store")?
+            }
+            Err(e) => return Err(e).context("initializing OlmMachine"),
+        };
         Ok(Self { machine, outgoing_lock: AsyncMutex::new(()) })
     }
 
@@ -563,15 +602,29 @@ impl CryptoSession {
         let members: Vec<&UserId> = member_ids.iter().map(|u| u.as_ref()).collect();
 
         // Queues a key query for this room's members if any are newly
-        // tracked - picked up by the main sync loop's own regular
-        // process_outgoing_requests() calls (every /sync cycle), not
-        // flushed synchronously here: doing so would need to re-enter the
-        // same lock process_outgoing_requests() takes below, and Rust's
-        // Mutex isn't reentrant. Slightly stale device-list data in the
-        // rare case of sending to a brand-new member within the same
-        // sync cycle they were first seen in is an acceptable edge case,
-        // not a correctness problem - get_missing_sessions/share_room_key
-        // still work correctly against whatever device list is current.
+        // tracked. It used to be left for the sync loop to flush on its next
+        // cycle, on the grounds that a stale device list for a brand-new
+        // member was a rare edge case.
+        //
+        // It is neither rare nor an edge case. It is the first thing that
+        // happens in every encrypted room: somebody is invited, they join,
+        // and the next message is sent before the sync loop has asked who
+        // their devices are - so the room key is shared to nobody on their
+        // side and the message cannot be read. Measured between two real
+        // accounts on two homeservers: the first message each way was
+        // permanently unreadable, every message after it fine.
+        //
+        // Permanently, because the usual repair does not reach this. A client
+        // that cannot decrypt asks for the key (see relock.rs), but a room
+        // key is forwarded only to the sender's *own* other devices, never to
+        // another user - so there is nobody to answer. Prevention is the only
+        // cure there is.
+        //
+        // The reentrancy that made this awkward is not in the way: the query
+        // is queued here, before the lock below is taken, so flushing it is a
+        // sequential call and not a nested one. It is close to free when
+        // there is nothing to flush - `outgoing_requests()` answers with an
+        // empty list, which is every message after the first.
         //
         // Passed as a concrete `Vec<&UserId>` (cloned - cheap, just
         // pointer copies), not an `.iter().map(...)` adaptor - unlike
@@ -585,6 +638,10 @@ impl CryptoSession {
         // enough" build failure reported all the way up at rpc/mod.rs's
         // connection-handler spawn).
         self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+
+        // Takes and releases the lock itself, which is why it is called
+        // here and not after the guard below.
+        self.process_outgoing_requests(homeserver_url, access_token).await;
 
         let _guard = self.outgoing_lock.lock().await;
         if let Some((request_id, claim_request)) = self.machine.get_missing_sessions(members.iter().copied()).await.context("get_missing_sessions")? {
@@ -631,6 +688,10 @@ impl CryptoSession {
         // rustc's Send inference once this whole chain is inside a spawn.
         let members: Vec<&UserId> = users.iter().map(|u| u.as_ref()).collect();
         self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+
+        // Takes and releases the lock itself, which is why it is called
+        // here and not after the guard below.
+        self.process_outgoing_requests(homeserver_url, access_token).await;
 
         let _guard = self.outgoing_lock.lock().await;
         if let Some((request_id, claim_request)) =
@@ -913,6 +974,33 @@ mod forget_tests {
     /// The store is what makes this installation *that device*. The report
     /// that prompted this: an account removed and added again picked up its
     /// old device keys and Olm sessions, and rooms would not decrypt.
+    use super::is_wrong_device;
+
+    /// The message the SDK actually produced when an account was signed in
+    /// again and the homeserver gave it a new device. Left unhandled it
+    /// stopped the account syncing entirely, for ever, once a minute.
+    #[test]
+    fn a_store_from_a_replaced_device_is_recognised() {
+        let real = "initializing OlmMachine: the account in the store doesn't match the account \
+                    in the constructor: expected @mohotest1:matrix.org:IDKATNUEPP, got \
+                    @mohotest1:matrix.org:viS2g66kqb";
+        assert!(is_wrong_device(&real));
+    }
+
+    /// And nothing else is, because the answer to this one is to delete
+    /// somebody's keys - which must not happen for a disk error or a locked
+    /// database.
+    #[test]
+    fn an_ordinary_store_failure_keeps_the_keys() {
+        for other in [
+            "opening matrix crypto store: database is locked",
+            "initializing OlmMachine: no space left on device",
+            "permission denied",
+        ] {
+            assert!(!is_wrong_device(&other), "{other} must not throw the store away");
+        }
+    }
+
     #[test]
     fn removing_an_account_takes_its_crypto_store() {
         let data_dir = std::env::temp_dir().join(format!("nobilis-forget-{}", std::process::id()));

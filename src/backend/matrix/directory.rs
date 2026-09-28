@@ -380,3 +380,94 @@ mod directory_tests {
         assert_eq!(server_name(""), "");
     }
 }
+
+/// What a space contains, asked of the server rather than inferred from sync.
+///
+/// Sync says which of a space's rooms this account is *in* - that is what
+/// builds the rail entry. It cannot say what else is in there, because a room
+/// nobody here has joined is not in anybody's sync. So a space looked at in
+/// moho showed the handful already joined and gave no way to find the rest,
+/// which is most of what a space is for.
+///
+/// `/hierarchy` is the server's own answer to that question, and it resolves
+/// through federation: a space on one homeserver listing rooms on three
+/// others comes back whole. Paged, because a large space is hundreds of rooms
+/// and the first screen should not wait for the last of them.
+pub async fn space_hierarchy(
+    state: &AppState,
+    account_id: &str,
+    space_id: &str,
+    from: &str,
+    limit: u32,
+) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let mut url = format!(
+        "{base}/_matrix/client/v1/rooms/{}/hierarchy?limit={limit}",
+        url::form_urlencoded::byte_serialize(space_id.as_bytes()).collect::<String>()
+    );
+    if !from.is_empty() {
+        url.push_str("&from=");
+        url.push_str(&url::form_urlencoded::byte_serialize(from.as_bytes()).collect::<String>());
+    }
+    let resp = http::get_json(&url, &account.access_token).await.context("reading the space")?;
+
+    let joined = state.runtime.matrix_joined_rooms(account_id);
+
+    // Where each child can be joined through, gathered before the rooms are
+    // walked. The routing hints live in the *parent's* `m.space.child`
+    // events, not on the child's own entry - so read off the child they
+    // describe they are always empty, and a room on a homeserver this one has
+    // never met cannot be joined at all. Every entry is read, not just the
+    // space's own, because a nested space carries the hints for its children.
+    let mut via_for: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for room in resp["rooms"].as_array().into_iter().flatten() {
+        for child in room["children_state"].as_array().into_iter().flatten() {
+            if child["type"].as_str() != Some("m.space.child") {
+                continue;
+            }
+            let Some(target) = child["state_key"].as_str() else { continue };
+            if let Some(via) = child["content"]["via"].as_array() {
+                if !via.is_empty() {
+                    via_for.insert(target.to_string(), Value::Array(via.clone()));
+                }
+            }
+        }
+    }
+
+    let mut rooms: Vec<Value> = Vec::new();
+    for room in resp["rooms"].as_array().into_iter().flatten() {
+        let room_id = room["room_id"].as_str().unwrap_or("");
+        // The space itself is the first entry in its own hierarchy. It is
+        // the thing being looked at, not something to offer to join.
+        if room_id.is_empty() || room_id == space_id {
+            continue;
+        }
+        let is_space = room["room_type"].as_str() == Some("m.space");
+        rooms.push(serde_json::json!({
+            "roomId": room_id,
+            "name": room["name"].as_str().unwrap_or(""),
+            "alias": room["canonical_alias"].as_str().unwrap_or(""),
+            "topic": room["topic"].as_str().unwrap_or(""),
+            "members": room["num_joined_members"].as_i64().unwrap_or(0),
+            "joined": joined.contains(room_id),
+            // A space inside a space. Worth saying, because it is opened
+            // rather than joined and a Join button against one is wrong.
+            "isSpace": is_space,
+            // How many rooms a nested space holds, so it can say so without
+            // a second request per row.
+            "children": room["children_state"].as_array().map(|c| c.len()).unwrap_or(0),
+            // Same rule as the directory: `mxc://` is not a URL anything can
+            // load without the token, so a room shows its initial instead.
+            "joinRule": room["join_rule"].as_str().unwrap_or("public"),
+            // Where to join it through. A room this homeserver has never met
+            // cannot be joined by id alone, and the hierarchy is the only
+            // place that routing hint appears.
+            "via": via_for.get(room_id).cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        }));
+    }
+    Ok(serde_json::json!({
+        "rooms": rooms,
+        "next": resp["next_batch"].as_str().unwrap_or(""),
+    }))
+}

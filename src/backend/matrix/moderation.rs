@@ -275,6 +275,19 @@ pub async fn set_power_level(
     if level > own {
         anyhow::bail!("you cannot give somebody a rank above your own ({own})");
     }
+    // A room's creator cannot be ranked at all from version 12 on, and the
+    // server says so in a way nobody can act on: "Creator user @x must not
+    // appear in content.users". Their power is a property of having made the
+    // room rather than an entry in a list, which is exactly why it cannot be
+    // written - and why it cannot be taken away either.
+    //
+    // Refused here rather than sent and bounced, because the bounce arrives
+    // as M_UNKNOWN against a change that looked perfectly ordinary.
+    if creators_outrank_everybody(&version) && creators.iter().any(|c| c == target_user_id) {
+        anyhow::bail!(
+            "{target_user_id} made this room, and from room version 12 a creator's rank is fixed - it cannot be raised or lowered by anybody, including themselves"
+        );
+    }
     pl["users"][target_user_id] = Value::from(level);
     http::put_json(&state_url, &access_token, pl).await.context("setting power level")?;
     Ok(())
@@ -294,6 +307,22 @@ pub async fn mute_member(state: &AppState, account_id: &str, buffer_id: &str, ta
     let state_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
 
     let mut pl = http::get_json(&state_url, &access_token).await.context("fetching current power levels")?;
+    // Same rule as set_power_level: muting is a power-level floor, and a
+    // creator's floor cannot be written from room version 12 on.
+    let create_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.create/");
+    let create = http::get_json(&create_url, &access_token).await.unwrap_or(Value::Null);
+    let version = create["room_version"]
+        .as_str()
+        .or_else(|| create["content"]["room_version"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let mut creators = state.runtime.matrix_room_creators(account_id, &room_id);
+    if creators.is_empty() {
+        creators = creators_of(&create);
+    }
+    if creators_outrank_everybody(&version) && creators.iter().any(|c| c == target_user_id) {
+        anyhow::bail!("{target_user_id} made this room, and from room version 12 a creator cannot be muted");
+    }
     let muted_level = message_send_threshold(&pl) - 1;
     pl["users"][target_user_id] = serde_json::json!(muted_level);
 
@@ -305,6 +334,25 @@ pub async fn mute_member(state: &AppState, account_id: &str, buffer_id: &str, ta
 mod creator_tests {
     use super::*;
     use serde_json::json;
+
+    /// The refusal that matrix.org's own default room version produces.
+    ///
+    /// Room 12 is what matrix.org creates now, so this is not a corner: it is
+    /// what happens the first time anybody opens the moderation menu on the
+    /// person who made the room. The server answers `M_UNKNOWN: Creator user
+    /// ... must not appear in content.users`, which says nothing somebody can
+    /// act on.
+    #[test]
+    fn a_creator_outranks_everybody_from_version_twelve() {
+        assert!(creators_outrank_everybody("12"));
+        assert!(!creators_outrank_everybody("11"));
+        let create = create("12", "@owner:example.org", vec!["@second:example.org"]);
+        let creators = creators_of(&create);
+        assert!(creators.iter().any(|c| c == "@owner:example.org"));
+        assert!(creators.iter().any(|c| c == "@second:example.org"), "additional_creators count too");
+        // And an ordinary member is not one, so ranking them stays possible.
+        assert!(!creators.iter().any(|c| c == "@somebody:example.org"));
+    }
 
     fn create(version: &str, sender: &str, extra: Vec<&str>) -> Value {
         json!({

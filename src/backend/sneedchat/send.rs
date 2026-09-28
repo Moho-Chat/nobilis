@@ -161,6 +161,7 @@ pub async fn send_attachment(
     caption: &str,
     file_path: &str,
     host: Option<crate::upload::Host>,
+    progress: Option<&crate::upload::Progress>,
 ) -> Result<()> {
     // Only used to confirm the account is real before spending any time on
     // the upload - the transport below is deliberately unrelated to it.
@@ -168,10 +169,25 @@ pub async fn send_attachment(
 
     match host {
         None | Some(crate::upload::Host::Postimg) => {}
-        Some(host) => return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host).await,
+        Some(host) => {
+            return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host, progress).await
+        }
     }
 
-    let links = upload_to_postimg(file_path).await?;
+    let links = match upload_to_postimg_reporting(file_path, progress).await {
+        Ok(links) => {
+            if let Some(progress) = progress {
+                progress.done(None);
+            }
+            links
+        }
+        Err(e) => {
+            if let Some(progress) = progress {
+                progress.done(Some(&e.to_string()));
+            }
+            return Err(e);
+        }
+    };
 
     let wrapped = format!("[url={}][img]{}[/img][/url]", links.page, links.direct);
     let text = if caption.trim().is_empty() { wrapped } else { format!("{caption}\n{wrapped}") };
@@ -198,8 +214,9 @@ pub(super) async fn send_via_upload_host(
     caption: &str,
     file_path: &str,
     host: crate::upload::Host,
+    progress: Option<&crate::upload::Progress>,
 ) -> Result<()> {
-    let link = crate::upload::upload(host, file_path, None).await?;
+    let link = crate::upload::upload_reporting(host, file_path, None, progress).await?;
     let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("");
     let posted = posted_markup(file_name, &link);
     let text = if caption.trim().is_empty() { posted } else { format!("{caption}\n{posted}") };

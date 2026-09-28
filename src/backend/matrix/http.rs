@@ -15,7 +15,19 @@ pub fn http_client() -> &'static reqwest::Client {
         // let every client here negotiate h2 as a side effect, changing the
         // transport under a backend that works and is tested as it stands.
         // Nothing here wants h2; if it ever does, that is its own change.
-        reqwest::Client::builder().http1_only().build().unwrap_or_else(|_| reqwest::Client::new())
+        //
+        // A user agent, because otherwise there is none. Homeservers log it,
+        // rate limiters key on it, and an account provider naming a new
+        // device guesses from it - which is where "moho on Unknown device"
+        // came from in a matrix.org session list. The device's name is now
+        // set outright (see auth::DEVICE_DISPLAY_NAME), so this is no longer
+        // load-bearing for that; it is simply what a well-behaved client
+        // says about itself.
+        reqwest::Client::builder()
+            .http1_only()
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
@@ -140,6 +152,34 @@ pub async fn get_json_anonymous(url: &str) -> Result<Value> {
     handle_response(resp).await
 }
 
+/// A POST with no credential, for the same reason as the GET above: an
+/// account provider is asked to register this client before there is any
+/// account to act as.
+pub async fn post_json_anonymous(url: &str, body: Value) -> Result<Value> {
+    let resp = http_client().post(url).json(&body).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
+/// A form POST, which is what OAuth 2.0 endpoints take rather than JSON.
+pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<Value> {
+    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    handle_response(resp).await
+}
+
+/// The same, keeping the status and the body whatever the status is.
+///
+/// The device grant answers "not yet" with a 403 and a JSON body saying so -
+/// a perfectly ordinary step in a sign-in that has not finished - and
+/// `handle_response` correctly turns a 403 into an error. Polling needs to
+/// read the body either way, so it asks for both and decides for itself.
+pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Result<(u16, Value)> {
+    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    let status = resp.status().as_u16();
+    let text = resp.text().await.context("reading the reply")?;
+    let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Null);
+    Ok((status, body))
+}
+
 pub async fn get_json(url: &str, token: &str) -> Result<Value> {
     let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await
@@ -229,12 +269,19 @@ pub async fn post_with_password_uia(
     handle_response(resp).await
 }
 
+/// Some homeservers put the errcode at the front of the human-readable error
+/// as well, so printing both verbatim gives "M_USER_IN_USE: M_USER_IN_USE:
+/// User ID is not available." Tuwunel does this to every error it sends.
+fn without_errcode<'a>(errcode: &str, error: &'a str) -> &'a str {
+    error.strip_prefix(errcode).map(|rest| rest.trim_start_matches([':', ' '])).filter(|rest| !rest.is_empty()).unwrap_or(error)
+}
+
 async fn handle_response(resp: reqwest::Response) -> Result<Value> {
     let status = resp.status();
     let body: Value = resp.json().await.context("invalid JSON response")?;
     if !status.is_success() {
         if let Ok(err) = serde_json::from_value::<MatrixError>(body.clone()) {
-            bail!("{}: {}", err.errcode, err.error);
+            bail!("{}: {}", err.errcode, without_errcode(&err.errcode, &err.error));
         }
         bail!("HTTP {status}: {body}");
     }
@@ -244,6 +291,15 @@ async fn handle_response(resp: reqwest::Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_errcode_is_printed_once_however_the_server_words_it() {
+        assert_eq!(without_errcode("M_USER_IN_USE", "M_USER_IN_USE: User ID is not available."), "User ID is not available.");
+        assert_eq!(without_errcode("M_FORBIDDEN", "Registration has been disabled."), "Registration has been disabled.");
+        // Nothing left once the prefix goes: keep what there was, because an
+        // errcode alone still says more than an empty string.
+        assert_eq!(without_errcode("M_LIMIT_EXCEEDED", "M_LIMIT_EXCEEDED"), "M_LIMIT_EXCEEDED");
+    }
 
     #[test]
     fn assumes_https_where_no_scheme_was_typed() {

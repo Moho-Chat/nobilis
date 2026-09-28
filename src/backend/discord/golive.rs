@@ -247,6 +247,10 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     );
 
     if !mine {
+        // Somebody else's. Interesting only if this client asked to watch it,
+        // in which case these are the two halves of the handshake to receive
+        // it with.
+        join_stream(state, account_id, stream_key, d).await;
         return;
     }
     // A connection is opened once per stream, not once per dispatch. Both
@@ -299,10 +303,12 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         ready.rtc_channel_id.as_deref().unwrap_or_default(),
         &session_id,
         &user,
+        super::streamconn::Role::Host,
+        stream_key,
     )
     .await
     {
-        Ok(sender) => {
+        Ok(super::streamconn::Connected::Sending(sender)) => {
             senders().lock().unwrap().insert(account_id.to_string(), sender);
             state.events.emit(
                 "discordStream",
@@ -312,6 +318,12 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
             // sending into a paused stream is sending into nothing - so this
             // says outright that there is a picture to have.
             let _ = set_paused(state, account_id, stream_key, false);
+        }
+        // Asked for as a host, so the other shape cannot arrive. Named
+        // rather than caught by a wildcard, so adding a third role is a
+        // compile error here instead of a silent no-op.
+        Ok(super::streamconn::Connected::Watching(_)) => {
+            tracing::error!("discord[{account_id}]: asked to host {stream_key} and got a viewer back");
         }
         Err(e) => {
             tracing::warn!("discord[{account_id}]: the stream connection failed: {e:#}");
@@ -436,6 +448,185 @@ pub fn note_stream_gone(state: &AppState, account_id: &str, d: &Value) {
             "gone": true,
         }),
     );
+}
+
+/// Streams this client has asked to watch, by `account|key`.
+///
+/// Asked for and received are different things and arrive seconds apart: the
+/// request goes out on the gateway, and the endpoint and token to connect
+/// with come back as ordinary STREAM_CREATE and STREAM_SERVER_UPDATE
+/// dispatches - the same ones that arrive for streams nobody here asked
+/// about. This is what tells the two apart.
+fn wanted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static WANTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    WANTED.get_or_init(Default::default)
+}
+
+/// The connections currently receiving a picture, by `account|key`.
+fn watchers() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>>
+{
+    static WATCHERS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>>,
+    > = std::sync::OnceLock::new();
+    WATCHERS.get_or_init(Default::default)
+}
+
+/// Starts watching somebody else's stream.
+///
+/// Two steps that look like one from outside: the gateway is told this client
+/// wants the stream, and the key is remembered so that the handshake coming
+/// back for it is acted on rather than merely noted. Nothing is connected
+/// here - the endpoint does not exist yet.
+pub fn start_watching(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> {
+    if watchers().lock().unwrap().contains_key(&slot(account_id, stream_key)) {
+        return Ok(());
+    }
+    wanted().lock().unwrap().insert(slot(account_id, stream_key));
+    watch(state, account_id, stream_key)?;
+    // What is already known about it, which after a STREAM_CREATE is the RTC
+    // channel and after a second watch of the same stream may be everything.
+    if let Some(held) = held(account_id, stream_key) {
+        tracing::info!(
+            "discord[{account_id}]: {stream_key} is already {}",
+            if held.complete() { "fully described" } else { "partly described" }
+        );
+    }
+    // Discord stops sending a stream nobody has said they are still there
+    // for, so the ping goes out with the request rather than only on a timer.
+    let _ = ping(state, account_id, stream_key);
+    tracing::info!("discord[{account_id}]: asked to watch {stream_key}");
+    Ok(())
+}
+
+/// Stops watching, and stops being counted as a viewer.
+///
+/// There is no "unwatch" on the gateway - a viewer leaves by no longer
+/// pinging - so this closes the connection and forgets the request, and the
+/// server drops this client from the stream's audience on its own.
+pub fn stop_watching(account_id: &str, stream_key: &str) {
+    let key = slot(account_id, stream_key);
+    wanted().lock().unwrap().remove(&key);
+    if let Some(watching) = watchers().lock().unwrap().remove(&key) {
+        watching.stop();
+        tracing::info!("discord[{account_id}]: stopped watching {stream_key}");
+    }
+    pending().lock().unwrap().remove(&key);
+}
+
+/// Whether this account is watching that stream right now.
+pub fn watching(account_id: &str, stream_key: &str) -> bool {
+    watchers().lock().unwrap().contains_key(&slot(account_id, stream_key))
+}
+
+/// Opens the receiving end, once both halves of somebody else's handshake
+/// have arrived.
+async fn join_stream(state: &AppState, account_id: &str, stream_key: &str, d: &Value) {
+    let key = slot(account_id, stream_key);
+    // Kept before anything is decided, and whether or not this client has
+    // asked to watch.
+    //
+    // The halves of somebody else's handshake do not arrive together or in
+    // one order. STREAM_CREATE announces the stream to everybody in the call
+    // the moment it starts - carrying the RTC channel, which is what the
+    // end-to-end encrypted group is named after - and STREAM_SERVER_UPDATE
+    // brings the endpoint and token, which only arrive after this client has
+    // asked to watch. So the first of them lands seconds or minutes before
+    // anybody presses anything.
+    //
+    // Discarding it until asked meant the RTC channel was gone by the time it
+    // was wanted, and a group built on an empty channel name is one nobody
+    // else is in: the connection would open, the picture would arrive, and
+    // not one frame of it would decrypt.
+    let ready = {
+        let mut all = pending().lock().unwrap();
+        let entry = all.entry(key.clone()).or_default();
+        entry.absorb(d);
+        entry.complete().then(|| entry.clone())
+    };
+    if !wanted().lock().unwrap().contains(&key) {
+        return;
+    }
+    // Already receiving. Later dispatches for the same stream - one arrives
+    // every time anybody starts or stops watching - must not open a second
+    // connection on the same session, which the server answers by
+    // invalidating one of them.
+    if watchers().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    let Some(ready) = ready else { return };
+    if !opening().lock().unwrap().insert(key.clone()) {
+        return;
+    }
+
+    let outcome = open_viewer(state, account_id, stream_key, &ready).await;
+    opening().lock().unwrap().remove(&key);
+    match outcome {
+        Ok(()) => {}
+        Err(e) => {
+            tracing::warn!("discord[{account_id}]: could not watch {stream_key}: {e:#}");
+            state.events.emit(
+                "discordStream",
+                json!({ "accountId": account_id, "streamKey": stream_key, "own": false, "error": e.to_string() }),
+            );
+        }
+    }
+}
+
+async fn open_viewer(state: &AppState, account_id: &str, stream_key: &str, ready: &PendingStream) -> Result<()> {
+    // The same voice session the channel connection made. A stream is one
+    // account in one place receiving a second thing, not a second login.
+    let session_id = state.voice.session_id(account_id).context("there is no voice session to attach a viewer to")?;
+    let user = state.accounts.get_discord(account_id).map(|a| a.user_id).context("no account")?;
+    let owner = StreamKey::owner(stream_key)
+        .and_then(|o| o.parse::<u64>().ok())
+        .context("that stream key names nobody")?;
+    let server_id = ready
+        .rtc_server_id
+        .clone()
+        .or_else(|| StreamKey::parse(stream_key).map(|k| k.guild_id.unwrap_or(k.channel_id)))
+        .unwrap_or_default();
+
+    // Said out loud because it is the one thing that can be missing while
+    // everything else looks right. The RTC channel names the encrypted group;
+    // without it the connection opens, packets arrive, and nothing decrypts -
+    // a failure that otherwise shows up only as a count of frames that would
+    // not decrypt, minutes later.
+    match ready.rtc_channel_id.as_deref() {
+        Some(channel) => tracing::info!(
+            "discord[{account_id}]: watching {stream_key} on {} via rtc channel {channel}",
+            ready.endpoint.as_deref().unwrap_or("nowhere")
+        ),
+        None => tracing::warn!(
+            "discord[{account_id}]: {stream_key} never named an rtc channel - its group cannot be joined, so nothing will decrypt"
+        ),
+    }
+
+    let connected = super::streamconn::connect(
+        state,
+        account_id,
+        ready.endpoint.as_deref().unwrap_or_default(),
+        ready.token.as_deref().unwrap_or_default(),
+        &server_id,
+        ready.rtc_channel_id.as_deref().unwrap_or_default(),
+        &session_id,
+        &user,
+        super::streamconn::Role::Viewer { owner },
+        stream_key,
+    )
+    .await?;
+    match connected {
+        super::streamconn::Connected::Watching(watching) => {
+            watchers().lock().unwrap().insert(slot(account_id, stream_key), watching);
+            state.events.emit(
+                "discordStream",
+                json!({ "accountId": account_id, "streamKey": stream_key, "own": false, "watching": true }),
+            );
+            Ok(())
+        }
+        // Asked for as a viewer, so this cannot arrive - named rather than
+        // ignored so a third role is a compile error rather than silence.
+        super::streamconn::Connected::Sending(_) => Err(anyhow::anyhow!("asked to watch {stream_key} and got a sender back")),
+    }
 }
 
 /// What is known about one of this account's streams, if anything.

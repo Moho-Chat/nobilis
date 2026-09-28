@@ -49,6 +49,7 @@ pub mod directs;
 pub mod history;
 pub mod media;
 pub mod notifications;
+pub mod oidc;
 pub mod probes;
 pub mod previews;
 pub mod profile;

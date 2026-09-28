@@ -5,6 +5,7 @@
 //! is why they end at the same two functions.
 
 use super::*;
+use anyhow::bail;
 
 /// Joins an existing room (or space - a Space is just a room with an
 /// `m.space` creation type under the hood, joined through this exact same
@@ -80,11 +81,17 @@ pub async fn accept_invite(state: &AppState, account_id: &str, room_id: &str) ->
 /// download button, and inline at its own size. moho has read them since
 /// stickers were supported and could send none.
 pub async fn send_sticker(state: &AppState, account_id: &str, buffer_id: &str, mxc: &str, body: &str) -> Result<()> {
+    // Looked up rather than rebuilt from the two things the window sent: the
+    // pack this came from knows the image's size and type, and the window
+    // does not. Falls back to what was sent for a sticker sent from anywhere
+    // else - a pack that has since gone, or a mxc somebody typed.
+    let known = state.runtime.matrix_stickers(account_id).into_iter().find(|s| s.mxc == mxc);
     let sticker = stickers::Sticker {
         name: body.to_string(),
         pack: String::new(),
         mxc: mxc.to_string(),
         body: body.to_string(),
+        info: known.map(|s| s.info).unwrap_or(serde_json::Value::Null),
     };
     send_typed_event(state, account_id, buffer_id, protocol::EVENT_STICKER, stickers::sticker_event(&sticker)).await
 }
@@ -154,11 +161,7 @@ pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str,
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/report/{}",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report/{}", encoded(&room_id), encoded(event_id));
     // The score is a severity from -100 to 0 that no server this client has
     // met does anything with, and a number nobody chose is worse than no
     // number: the reason is what a moderator reads.
@@ -167,8 +170,106 @@ pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str,
     } else {
         serde_json::json!({ "reason": reason.trim() })
     };
-    http::post_json(&url, Some(&account.access_token), body).await.context("reporting that message")?;
-    Ok(())
+    send_report(&url, &account.access_token, body, "reporting that message").await
+}
+
+/// Reports a whole room to the people who run the homeserver.
+///
+/// A room rather than a message, for the case the message endpoint cannot
+/// describe: a room that is wholly what it should not be, where picking one
+/// message out of it would understate the thing being reported. Moderators
+/// get the room and the reason; they were never going to act on a single line
+/// of it anyway.
+pub async fn report_room(state: &AppState, account_id: &str, buffer_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report", encoded(&room_id));
+    // Required here, unlike a message report: a room report carries no
+    // content at all, so without a reason it says only that somebody
+    // objected to somewhere, which is not something anybody can act on.
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("a room report needs a reason - there is no message to speak for it");
+    }
+    send_report(&url, &account.access_token, serde_json::json!({ "reason": reason }), "reporting that room").await
+}
+
+/// Reports a person to the people who run the homeserver.
+///
+/// The one report that is not about a place. Somebody whose behaviour spans
+/// rooms - or who has done it in a direct message, where there is nobody else
+/// to see - cannot be described by pointing at one room or one line, and
+/// until this there was nothing in moho that said so.
+pub async fn report_user(state: &AppState, account_id: &str, user_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    if !user_id.starts_with('@') || !user_id.contains(':') {
+        bail!("{user_id} is not a Matrix id");
+    }
+    let base = account.homeserver_url.trim_end_matches('/');
+    let url = format!("{base}/_matrix/client/v3/users/{}/report", encoded(user_id));
+    let reason = reason.trim();
+    let body = if reason.is_empty() { serde_json::json!({}) } else { serde_json::json!({ "reason": reason }) };
+    send_report(&url, &account.access_token, body, "reporting that person").await
+}
+
+/// The part the three reports share, including what to say about a homeserver
+/// too old to have the endpoint.
+///
+/// Room and user reports are recent additions to the spec, so a server that
+/// has not caught up answers 404 with `M_UNRECOGNIZED` - which reads as "that
+/// room does not exist" and sends somebody looking for a mistake they did not
+/// make. Named for what it is instead.
+async fn send_report(url: &str, access_token: &str, body: Value, doing: &'static str) -> Result<()> {
+    match http::post_json(url, Some(access_token), body).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.to_string().contains("M_UNRECOGNIZED") => {
+            bail!("this homeserver is too old to take this kind of report - reporting a message in the room still works")
+        }
+        Err(e) => Err(e).context(doing),
+    }
+}
+
+fn encoded(id: &str) -> String {
+    url::form_urlencoded::byte_serialize(id.as_bytes()).collect()
+}
+
+/// Which kind of message somebody typed, and what is left once the command
+/// that said so is taken off the front.
+///
+/// Three of the msgtypes are reachable from the box rather than from a menu,
+/// because all three are things somebody says in the middle of saying other
+/// things: an action, an announcement, and ordinary text.
+///
+/// `/me` is the convention IRC has always had and the one Matrix spells
+/// `m.emote`. `/notice` is `m.notice` - what bots and bridges send, drawn
+/// apart from conversation, and until now something moho could read but not
+/// write; typing it sent the literal word. `//` escapes a leading slash, the
+/// same way the IRC backend reads the same box.
+fn typed_msgtype(body: &str) -> Result<(&'static str, &str)> {
+    let Some(rest) = body.strip_prefix('/') else {
+        return Ok(("m.text", body));
+    };
+    if rest.starts_with('/') {
+        return Ok(("m.text", rest));
+    }
+    if let Some(action) = rest.strip_prefix("me ") {
+        return Ok(("m.emote", action));
+    }
+    if let Some(announcement) = rest.strip_prefix("notice ").map(str::trim) {
+        // Refused rather than sent as text. "/notice" with nothing after it
+        // is somebody who meant to announce something and stopped, and a room
+        // reading the word "/notice" is the failure this command exists to
+        // stop.
+        if announcement.is_empty() {
+            bail!("/notice needs something to announce");
+        }
+        return Ok(("m.notice", announcement));
+    }
+    if rest.trim_end() == "notice" {
+        bail!("/notice needs something to announce");
+    }
+    Ok(("m.text", body))
 }
 
 /// Who a message is aimed at, in the form the spec calls intentional
@@ -488,6 +589,15 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
     let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
+    // Refused before anything is sent, and not only because it is a strange
+    // thing to want. `createRoom` carries the invitation, and a homeserver
+    // asked to invite somebody already in the room makes the room and *then*
+    // refuses - so the failure leaves an empty room behind on the server
+    // every time, with no id handed back to clean it up with.
+    if target_user_id == account.user_id {
+        anyhow::bail!("that is this account - there is nobody to open a conversation with");
+    }
+
     if let Some(room_id) = state.runtime.find_matrix_dm_room(account_id, target_user_id) {
         if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, &room_id) {
             let buffer = state.runtime.ensure_buffer(state, account_id, &name, &kind);
@@ -585,14 +695,7 @@ pub async fn send_message(
                 .unwrap_or_else(|| (rest.to_string(), String::new()));
             return send_location(state, account_id, buffer_id, &place, &label).await;
         }
-        let (msgtype, body) = match body.strip_prefix('/') {
-            Some(literal) if literal.starts_with('/') => ("m.text", literal),
-            Some(rest) => match rest.strip_prefix("me ") {
-                Some(action) => ("m.emote", action),
-                None => ("m.text", body),
-            },
-            None => ("m.text", body),
-        };
+        let (msgtype, body) = typed_msgtype(body)?;
         let mut content = serde_json::json!({ "msgtype": msgtype, "body": body });
         // Who this is aimed at, said outright rather than left to be guessed
         // from the text. Matrix used to work by every client scanning every
@@ -927,6 +1030,134 @@ pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, p
     Ok(())
 }
 
+/// Starts a poll.
+///
+/// moho has read and voted in polls since they were supported and never made
+/// one - `polls.rs` parses every shape of them, and there was no way to send
+/// the first event. So a poll in a room worked completely, and a poll could
+/// only ever have been started somewhere else.
+///
+/// Written in the stable shape with the text repeated the old way beside it.
+/// The stable spelling landed in Matrix 1.7 and the unstable one is what
+/// every older client still reads, so a poll sent only in the new shape is
+/// invisible to some of the room; `m.text` costs a line and is what a client
+/// that understands no polls at all falls back to showing.
+pub async fn start_poll(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    question: &str,
+    answers: &[String],
+    disclosed: bool,
+) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let question = question.trim();
+    if question.is_empty() {
+        anyhow::bail!("a poll needs a question");
+    }
+    let answers: Vec<&str> = answers.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    if answers.len() < 2 {
+        anyhow::bail!("a poll needs at least two answers");
+    }
+    // The spec's own ceiling. A server would reject more, and finding that
+    // out after writing twenty of them is worse than being told now.
+    if answers.len() > 20 {
+        anyhow::bail!("a poll can have at most twenty answers");
+    }
+
+    let answer_events: Vec<Value> = answers
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            serde_json::json!({
+                // The id is what a vote refers to, and it has to survive the
+                // answers being renamed - so it is positional rather than the
+                // text itself.
+                "id": format!("answer-{i}"),
+                "m.text": [{ "body": text }],
+                "org.matrix.msc1767.text": text,
+            })
+        })
+        .collect();
+
+    let content = serde_json::json!({
+        "m.poll": {
+            "kind": if disclosed { "m.poll.disclosed" } else { "m.poll.undisclosed" },
+            "max_selections": 1,
+            "question": { "m.text": [{ "body": question }] },
+            "answers": answer_events,
+        },
+        // What a client with no idea what a poll is will show instead of
+        // nothing at all.
+        "m.text": [{ "body": format!("{question}\n{}", answers.join("\n")) }],
+        "body": question,
+    });
+
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_START[0], content).await
+}
+
+/// Closes a poll, so its result is final and late votes are ignored.
+///
+/// The other half nothing could do: a poll started here could be voted in and
+/// never finished, which leaves a card on screen that says "open" for ever.
+pub async fn end_poll(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+    let base = account.homeserver_url.trim_end_matches('/');
+    let access_token = account.access_token.clone();
+
+    let content = serde_json::json!({
+        "m.relates_to": { "rel_type": "m.reference", "event_id": poll_id },
+        "m.poll.end": {},
+        "m.text": [{ "body": "The poll has closed." }],
+        "body": "The poll has closed.",
+    });
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_END[0], content).await
+}
+
+/// The part both halves share, including the encrypted-room path.
+///
+/// A poll in an encrypted room is encrypted like anything else - the card is
+/// built from the decrypted event - so this is the same two-branch shape
+/// `vote_in_poll` already uses rather than a second way of doing it.
+#[allow(clippy::too_many_arguments)]
+async fn send_poll_event(
+    state: &AppState,
+    account: &MatrixAccountConfig,
+    base: &str,
+    access_token: &str,
+    buffer_id: &str,
+    room_id: &str,
+    event_type: &str,
+    content: Value,
+) -> Result<()> {
+    let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
+        let session = state.runtime.get_matrix_machine(&account.account_id()).context("crypto session not ready yet")?;
+        let member_ids = joined_member_ids(base, access_token, room_id).await?;
+        let room_id_ruma = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
+        let encrypted = session
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, event_type, content)
+            .await
+            .context("encrypting the poll")?;
+        (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
+    } else {
+        (event_type.to_string(), content)
+    };
+
+    let txn_id = model::next_message_id();
+    let url = format!(
+        "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
+    );
+    http::put_json(&url, access_token, body_json).await.context("sending the poll")?;
+    Ok(())
+}
+
 /// Redacts (deletes) a message. Redactions are always sent in cleartext,
 /// even in an encrypted room (per the C-S API spec) - no crypto involved.
 pub async fn delete_message(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str) -> Result<()> {
@@ -1022,5 +1253,48 @@ mod edit_tests {
         let c = super::edit_content("$abc", "just words");
         assert!(c["m.new_content"].get("format").is_none());
         assert!(c["m.new_content"].get("formatted_body").is_none());
+    }
+}
+
+#[cfg(test)]
+mod typed_msgtype_tests {
+    use super::typed_msgtype;
+
+    #[test]
+    fn plain_text_is_plain_text() {
+        assert_eq!(typed_msgtype("hello").unwrap(), ("m.text", "hello"));
+    }
+
+    #[test]
+    fn an_action_keeps_only_what_follows_it() {
+        assert_eq!(typed_msgtype("/me waves").unwrap(), ("m.emote", "waves"));
+    }
+
+    #[test]
+    fn a_notice_is_a_notice() {
+        assert_eq!(typed_msgtype("/notice build #412 failed").unwrap(), ("m.notice", "build #412 failed"));
+        // The spacing somebody typed is not part of what they announced.
+        assert_eq!(typed_msgtype("/notice   spaced out  ").unwrap(), ("m.notice", "spaced out"));
+    }
+
+    #[test]
+    fn an_empty_notice_is_refused_rather_than_said_out_loud() {
+        // This is the bug the command was added for: "/notice" used to reach
+        // the room as the literal word.
+        assert!(typed_msgtype("/notice").is_err());
+        assert!(typed_msgtype("/notice   ").is_err());
+    }
+
+    #[test]
+    fn a_doubled_slash_escapes_the_command() {
+        assert_eq!(typed_msgtype("//notice not a command").unwrap(), ("m.text", "/notice not a command"));
+    }
+
+    #[test]
+    fn a_command_this_backend_does_not_know_is_said_as_typed() {
+        // Matched by the whole word, so a room called "/noticeboard" is not
+        // swallowed by the command that starts the same way.
+        assert_eq!(typed_msgtype("/noticeboard").unwrap(), ("m.text", "/noticeboard"));
+        assert_eq!(typed_msgtype("/whois someone").unwrap(), ("m.text", "/whois someone"));
     }
 }

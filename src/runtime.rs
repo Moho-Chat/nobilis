@@ -1279,14 +1279,43 @@ impl Runtime {
     /// said. Done in that order deliberately - creating first would show the
     /// channel twice for as long as it took to remove the old one.
     pub fn rename_irc_buffer(&self, state: &AppState, account_id: &str, old_name: &str, new_name: &str) {
+        self.rename_buffer(state, account_id, old_name, new_name, "channel");
+    }
+
+    /// The same for any service whose conversations can be renamed.
+    ///
+    /// Not IRC's alone: a Matrix room is renamed by anybody with the power to
+    /// do it, from any client, at any time. The kind travels with it because
+    /// it is part of what the new buffer has to be created as - a direct
+    /// message that acquires a name is still a direct message.
+    pub fn rename_buffer(&self, state: &AppState, account_id: &str, old_name: &str, new_name: &str, kind: &str) {
+        if old_name == new_name {
+            return;
+        }
         let old_id = crate::model::buffer_id(account_id, old_name);
         let new_id = crate::model::buffer_id(account_id, new_name);
+        // What was in the old buffer, carried across before the group,
+        // avatar and the rest are read off it - remove_buffer below drops
+        // every one of those.
+        let carried = self.get_buffer(&old_id);
         match state.store.move_buffer(&old_id, &new_id) {
-            Ok(moved) => tracing::debug!("irc[{account_id}]: {old_name} renamed to {new_name}, {moved} messages moved"),
-            Err(e) => tracing::warn!("irc[{account_id}]: moving {old_name} to {new_name}: {e:#}"),
+            Ok(moved) => tracing::info!("{account_id}: \"{old_name}\" is now \"{new_name}\", {moved} messages moved"),
+            Err(e) => tracing::warn!("{account_id}: moving \"{old_name}\" to \"{new_name}\": {e:#}"),
         }
         self.remove_buffer(state, &old_id);
-        self.ensure_buffer(state, account_id, new_name, "channel");
+        self.ensure_buffer(state, account_id, new_name, kind);
+        // A renamed room keeps where it was filed and what it looked like.
+        // Without this a room in a space jumped to the account's own rail
+        // entry the moment somebody renamed it, which reads as the room
+        // having been moved out of the space by whoever renamed it.
+        if let Some(old) = carried {
+            if let Some(group) = old.group_id {
+                self.set_buffer_group(state, &new_id, &group);
+            }
+            if let Some(avatar) = old.avatar_url {
+                self.set_buffer_avatar(state, &new_id, &avatar);
+            }
+        }
         self.refresh_buffer_activity(state, &new_id);
     }
 
