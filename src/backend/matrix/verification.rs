@@ -283,6 +283,27 @@ pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) 
         bail!("that verification belongs to another account");
     }
     let Some(qr) = v.request.generate_qr_code().await.context("making the QR code")? else {
+        // Why there is none, which is otherwise unanswerable from outside.
+        // A code needs three things and the absence of any one of them looks
+        // identical from the window: this session holding the master key, the
+        // other side saying it can scan, and both sides past "ready". Saying
+        // which is missing turns "no code appeared" into a fact.
+        let theirs = v
+            .request
+            .their_supported_methods()
+            .map(|m| m.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", "))
+            .unwrap_or_else(|| "not yet known".to_string());
+        let held = match state.runtime.get_matrix_machine(account_id) {
+            Some(session) => {
+                let status = session.machine.cross_signing_status().await;
+                format!("master {}, self-signing {}", status.has_master, status.has_self_signing)
+            }
+            None => "no crypto session".to_string(),
+        };
+        tracing::info!(
+            "matrix[{account_id}]: no QR code for this verification - the other side offers [{theirs}], we are in state {:?}, and we hold {held}",
+            v.request.state()
+        );
         return Ok(None);
     };
     let code = qr.to_qr_code().context("encoding the QR code")?;
