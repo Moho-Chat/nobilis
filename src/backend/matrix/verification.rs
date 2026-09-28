@@ -24,7 +24,7 @@ use super::http;
 use crate::accounts::MatrixAccountConfig;
 use crate::state::AppState;
 use anyhow::{Context, Result, bail};
-use matrix_sdk_crypto::{Sas, SasState, VerificationRequest, VerificationRequestState};
+use matrix_sdk_crypto::{QrVerification, Sas, SasState, VerificationRequest, VerificationRequestState};
 use ruma_common::{DeviceId, UserId};
 use std::sync::Arc;
 
@@ -41,6 +41,29 @@ pub struct ActiveVerification {
     pub flow_id: String,
     pub request: VerificationRequest,
     pub sas: Option<Sas>,
+    /// The scan, once the other side has read the code this one showed.
+    ///
+    /// A verification that transitions is either emoji or QR, and only the
+    /// first was ever picked up here - so a scan arrived, the request moved
+    /// on, and nothing in moho noticed. The other device then waited for a
+    /// confirmation that was never coming.
+    pub qr: Option<QrVerification>,
+    /// The code, drawn once.
+    ///
+    /// Asking the crate for a QR code is not a read: `generate_qr_code` mints
+    /// a fresh verification and re-transitions the request to it. Call it a
+    /// second time on a flow the other side has already scanned and the scan
+    /// is thrown away, two verifications exist for one flow, and the crate
+    /// cancels both - which is exactly what a window redrawing its dialog
+    /// does. So it is generated once and kept.
+    qr_svg: Option<String>,
+    /// The last QR state this told the window about.
+    ///
+    /// The object exists from the moment the flow turns into a QR one, which
+    /// is *before* anybody has scanned anything - so its own state is what
+    /// says whether there is a question to ask, and asking it early produces
+    /// a prompt that cannot be answered.
+    qr_state: Option<String>,
     emoji_emitted: bool,
     done: bool,
 }
@@ -190,7 +213,7 @@ pub async fn start_verification(
         .context("sending verification request")?;
 
     let verification_id = flow_id.clone();
-    let v = ActiveVerification { account_id: account_id.to_string(), flow_id, request, sas: None, emoji_emitted: false, done: false };
+    let v = ActiveVerification { account_id: account_id.to_string(), flow_id, request, sas: None, qr: None, qr_svg: None, qr_state: None, emoji_emitted: false, done: false };
     state.events.emit("matrixVerificationStatus", status_event(&v, "requested"));
     state.runtime.insert_matrix_verification(&verification_id, v);
     Ok(verification_id)
@@ -249,6 +272,9 @@ pub async fn start_user_verification(state: &AppState, account_id: &str, user_id
         flow_id: flow_id.clone(),
         request,
         sas: None,
+        qr: None,
+        qr_svg: None,
+        qr_state: None,
         emoji_emitted: false,
         done: false,
     };
@@ -260,6 +286,84 @@ pub async fn start_user_verification(state: &AppState, account_id: &str, user_id
 
 /// Accepts or declines an incoming verification request (one the *other*
 /// session started - see tick's incoming-request scan below).
+/// Answers a scan: the other device read the code and is waiting to be told
+/// that it showed a tick.
+///
+/// Refusing is not the same as doing nothing. A scan that did not happen, or
+/// happened on a screen somebody else was holding, is the case this question
+/// exists for - so "no" cancels the flow rather than quietly leaving it open.
+async fn confirm_scan(
+    state: &AppState,
+    config: &MatrixAccountConfig,
+    session: &Arc<CryptoSession>,
+    account_id: &str,
+    verification_id: &str,
+    qr: &QrVerification,
+    scanned: bool,
+) -> Result<()> {
+    if !scanned {
+        if let Some(outgoing) = qr.cancel() {
+            let _ = session.send_verification_request(&config.homeserver_url, &config.access_token, outgoing).await;
+        }
+        state.events.emit(
+            "matrixVerificationResult",
+            serde_json::json!({ "accountId": account_id, "verificationId": verification_id, "success": false, "error": "the scan was not confirmed" }),
+        );
+        state.runtime.remove_matrix_verification(verification_id);
+        return Ok(());
+    }
+
+    // Which of the five states it is in, because "nothing happened" is the
+    // one answer this must never give. Started means their scan has not
+    // reached us yet; Confirmed means it has already been answered and the
+    // other side is what we are waiting on.
+    let before = qr.state();
+    let Some(outgoing) = qr.confirm_scanning() else {
+        tracing::info!("matrix[{account_id}]: a scan was confirmed while the code was in state {before:?}");
+        match before {
+            // Already finished. Both of these mean the flow got where it was
+            // going without this press, which is a success arriving out of
+            // order rather than a failure - and telling somebody their
+            // verification failed when the device is verified is worse than
+            // saying nothing.
+            matrix_sdk_crypto::QrVerificationState::Confirmed
+            | matrix_sdk_crypto::QrVerificationState::Done { .. } => {
+                state.events.emit(
+                    "matrixVerificationResult",
+                    serde_json::json!({ "accountId": account_id, "verificationId": verification_id, "success": true }),
+                );
+                state.runtime.remove_matrix_verification(verification_id);
+                return Ok(());
+            }
+            matrix_sdk_crypto::QrVerificationState::Started => {
+                bail!("the other device has not sent its scan yet - give it a moment and try again")
+            }
+            other => bail!("this scan cannot be confirmed from {other:?}"),
+        }
+    };
+    session
+        .send_verification_request(&config.homeserver_url, &config.access_token, outgoing)
+        .await
+        .context("sending the scan confirmation")?;
+    // The same half that matters for emoji: both sides agreeing is private
+    // until the signatures are published, and a device verified here would
+    // still read as unverified everywhere else without it. A QR flow queues
+    // those on the machine rather than handing them back, so they go out the
+    // way every other queued request does.
+    session.process_outgoing_requests(&config.homeserver_url, &config.access_token).await;
+    if qr.is_done() {
+        if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
+            tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
+        }
+        state.events.emit(
+            "matrixVerificationResult",
+            serde_json::json!({ "accountId": account_id, "verificationId": verification_id, "success": true }),
+        );
+        state.runtime.remove_matrix_verification(verification_id);
+    }
+    Ok(())
+}
+
 /// The QR code for a verification, as an SVG to draw.
 ///
 /// The method Element offers first and the one most people use: point one
@@ -276,11 +380,15 @@ pub async fn start_user_verification(state: &AppState, account_id: &str, user_id
 /// other side can already check, so it needs cross-signing set up. Without it
 /// there is nothing to encode, and emoji remain the way through.
 pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) -> Result<Option<String>> {
-    let Some(v) = state.runtime.get_matrix_verification(verification_id) else {
+    let Some(mut v) = state.runtime.get_matrix_verification(verification_id) else {
         bail!("no such verification");
     };
     if v.account_id != account_id {
         bail!("that verification belongs to another account");
+    }
+    // Drawn once. See the field's own comment: asking again is destructive.
+    if let Some(svg) = &v.qr_svg {
+        return Ok(Some(svg.clone()));
     }
     let Some(qr) = v.request.generate_qr_code().await.context("making the QR code")? else {
         // Why there is none, which is otherwise unanswerable from outside.
@@ -306,6 +414,21 @@ pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) 
         );
         return Ok(None);
     };
+    // What is actually in the code, said once. MSC1543's payload begins with
+    // the ASCII "MATRIX", a version byte and a mode byte, and the mode is the
+    // part worth knowing: 0 verifies another person, 1 says "I hold the
+    // master key and I am vouching for you", 2 says "I do not hold it, please
+    // vouch for me". Which of the three a client offers is the difference
+    // between a verification that will work and one that will be refused at
+    // the far end, and a picture on a screen says none of it.
+    let payload = qr.to_bytes().context("reading the QR payload")?;
+    tracing::info!(
+        "matrix[{account_id}]: QR code ready - {} bytes, magic {:?}, version {}, mode {}",
+        payload.len(),
+        String::from_utf8_lossy(&payload[..payload.len().min(6)]),
+        payload.get(6).copied().unwrap_or(0),
+        payload.get(7).copied().unwrap_or(0),
+    );
     let code = qr.to_qr_code().context("encoding the QR code")?;
     // SVG rather than a bitmap: the daemon has no idea how large this will be
     // drawn, and a QR code scaled up from a fixed grid of pixels is a QR code
@@ -316,6 +439,9 @@ pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) 
         .dark_color(qrcode::render::svg::Color("#000000"))
         .light_color(qrcode::render::svg::Color("#ffffff"))
         .build();
+    v.qr = Some(qr);
+    v.qr_svg = Some(svg.clone());
+    state.runtime.update_matrix_verification(verification_id, v);
     Ok(Some(svg))
 }
 
@@ -349,6 +475,12 @@ pub async fn confirm_sas(state: &AppState, account_id: &str, verification_id: &s
     let v = state.runtime.get_matrix_verification(verification_id).context("no such verification")?;
     if v.account_id != account_id {
         bail!("verification does not belong to this account");
+    }
+    // A scan gets here too. The two flows ask the same question - "did the
+    // other device agree?" - and the same button answers it, so they share a
+    // method rather than making a window decide which one it is in.
+    if let Some(qr) = v.qr.clone() {
+        return confirm_scan(state, &config, &session, account_id, verification_id, &qr, matches).await;
     }
     let sas = v.sas.clone().context("verification has not reached the emoji stage yet")?;
 
@@ -443,6 +575,9 @@ pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, o
             flow_id: flow_id.clone(),
             request,
             sas: None,
+            qr: None,
+            qr_svg: None,
+            qr_state: None,
             emoji_emitted: false,
             done: false,
         };
@@ -494,6 +629,56 @@ pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, o
             // method" separately from "verify this device", only the
             // eventual emoji match/no-match is a real user choice.
             if let VerificationRequestState::Transitioned { verification, .. } = v.request.state() {
+                // A scan, rather than emoji. The other device read the code
+                // this one showed and is now waiting to be told that it
+                // showed a tick - which is a question for the person holding
+                // both, not something to answer on their behalf.
+                if let Some(qr) = verification.clone().qr_v1() {
+                    let qr = (*qr).clone();
+                    // Named for what the person has to do about it, not for
+                    // the crate's internal state: "showing" is a code on
+                    // screen waiting to be read, "scanned" is the one moment
+                    // there is a question to answer, and "confirmed" is
+                    // waiting on the far end.
+                    let named = match qr.state() {
+                        matrix_sdk_crypto::QrVerificationState::Started => "showing",
+                        matrix_sdk_crypto::QrVerificationState::Scanned => "scanned",
+                        matrix_sdk_crypto::QrVerificationState::Confirmed => "confirmed",
+                        matrix_sdk_crypto::QrVerificationState::Reciprocated => "reciprocated",
+                        matrix_sdk_crypto::QrVerificationState::Done { .. } => "done",
+                        matrix_sdk_crypto::QrVerificationState::Cancelled(_) => "cancelled",
+                    };
+                    let changed = v.qr_state.as_deref() != Some(named);
+                    v.qr = Some(qr.clone());
+                    v.qr_state = Some(named.to_string());
+                    if changed {
+                        tracing::info!("matrix verification[{id}]: QR flow is {named}");
+                        match named {
+                            "done" => {
+                                if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
+                                    tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
+                                }
+                                state.events.emit(
+                                    "matrixVerificationResult",
+                                    serde_json::json!({ "accountId": account_id, "verificationId": id, "success": true }),
+                                );
+                                state.runtime.remove_matrix_verification(&id);
+                                continue;
+                            }
+                            "cancelled" => {
+                                state.events.emit(
+                                    "matrixVerificationResult",
+                                    serde_json::json!({ "accountId": account_id, "verificationId": id, "success": false, "error": "the other device cancelled" }),
+                                );
+                                state.runtime.remove_matrix_verification(&id);
+                                continue;
+                            }
+                            _ => state.events.emit("matrixVerificationStatus", status_event(&v, named)),
+                        }
+                        state.runtime.update_matrix_verification(&id, v.clone());
+                    }
+                    continue;
+                }
                 if let Some(sas) = verification.sas_v1() {
                     let sas = *sas;
                     if let Some(outgoing) = sas.accept() {
