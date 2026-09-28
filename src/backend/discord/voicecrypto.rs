@@ -142,9 +142,10 @@ impl Sealer {
 
 /// Opens a packet sealed the same way.
 ///
-/// Here for the other half of a stream - watching one - and used by the tests
-/// either way: a sealer with nothing that can open what it makes is a sealer
-/// nothing can check.
+/// Only the tests call it: the live path knows its own header length and
+/// goes straight to `open_at`. Kept because a sealer with nothing that can
+/// open what it makes is a sealer nothing can check.
+#[cfg(test)]
 pub fn open(mode: Mode, key: &[u8], packet: &[u8], header_len: usize) -> anyhow::Result<Vec<u8>> {
     open_at(mode, key, packet, header_len, header_len)
 }

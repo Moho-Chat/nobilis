@@ -210,7 +210,6 @@ mod live {
             rtc_focus_url: None,
         };
         let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
-        let account_id = saved.account_id();
         spawn(state.clone(), saved);
 
         let buffer_name = "nobilis-matrix-phase3-probe";

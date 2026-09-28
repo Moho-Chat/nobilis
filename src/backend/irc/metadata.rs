@@ -57,6 +57,9 @@ pub fn parse_keyvalue(args: &[String]) -> Option<(String, String, Option<String>
 }
 
 /// Whether a capability name is one of the two spellings of metadata.
+/// Only the tests reach this - the capability names are matched inline
+/// where they are negotiated.
+#[cfg(test)]
 pub fn is_metadata_cap(cap: &str) -> bool {
     matches!(cap, "draft/metadata" | "metadata-2")
 }

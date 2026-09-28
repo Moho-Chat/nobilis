@@ -308,7 +308,9 @@ pub(super) fn mode_letter(mode: &ChannelMode) -> char {
         ChannelMode::Halfop => 'h',
         ChannelMode::Unknown(c) => *c,
         // The crate may grow variants; a letter nobody here knows is still
-        // better shown than swallowed.
+        // better shown than swallowed. Unreachable against today's version
+        // of the crate, which is not a reason to drop the guard.
+        #[allow(unreachable_patterns)]
         _ => '?',
     }
 }

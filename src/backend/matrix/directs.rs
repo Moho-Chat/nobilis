@@ -57,29 +57,6 @@ pub fn with(content: &Value, user_id: &str, room_id: &str) -> Value {
     Value::Object(by_user)
 }
 
-/// The list without a room, wherever it appears.
-///
-/// A person is dropped entirely when their last room goes: an empty array
-/// left behind is a person the account claims to have a DM list for and no
-/// DMs with, which other clients render as an empty conversation.
-pub fn without(content: &Value, room_id: &str) -> Value {
-    let Some(by_user) = content.as_object() else { return json!({}) };
-    let mut out = Map::new();
-    for (user_id, rooms) in by_user {
-        let kept: Vec<Value> = rooms
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| r.as_str() != Some(room_id))
-            .cloned()
-            .collect();
-        if !kept.is_empty() {
-            out.insert(user_id.clone(), Value::Array(kept));
-        }
-    }
-    Value::Object(out)
-}
-
 /// Reads the account's list once, at connect.
 ///
 /// Asked for directly rather than waited for: a resumed connection gets only
@@ -139,6 +116,35 @@ pub(super) async fn record(state: &AppState, account_id: &str, peer_user_id: &st
         Ok(()) => apply(state, account_id, &updated),
         Err(e) => tracing::warn!("matrix[{account_id}]: recording {room_id} as a direct message: {e:#}"),
     }
+}
+
+/// The list without a room, wherever it appears.
+///
+/// A person is dropped entirely when their last room goes: an empty array
+/// left behind is a person the account claims to have a DM list for and no
+/// DMs with, which other clients render as an empty conversation.
+///
+/// Only the tests call it. The live path rewrites the whole map rather than
+/// subtracting from it, which is a difference worth keeping an eye on: this
+/// is the rule the tests pin down, and nothing enforces that the live path
+/// still agrees with it.
+#[cfg(test)]
+pub fn without(content: &Value, room_id: &str) -> Value {
+    let Some(by_user) = content.as_object() else { return json!({}) };
+    let mut out = Map::new();
+    for (user_id, rooms) in by_user {
+        let kept: Vec<Value> = rooms
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r.as_str() != Some(room_id))
+            .cloned()
+            .collect();
+        if !kept.is_empty() {
+            out.insert(user_id.clone(), Value::Array(kept));
+        }
+    }
+    Value::Object(out)
 }
 
 #[cfg(test)]

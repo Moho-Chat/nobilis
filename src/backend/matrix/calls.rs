@@ -131,9 +131,6 @@ pub const MEMBERSHIP_TTL_MS: i64 = 90_000;
 /// already moved on is still understood.
 pub const EVENT_MEMBER: &str = "org.matrix.msc3401.call.member";
 
-/// Where the membership event is going: MSC4143's own name for it.
-pub const EVENT_MEMBER_NEXT: &str = "org.matrix.msc4143.rtc.member";
-
 /// What moho puts in `foci_preferred` to mean "I am on the mesh".
 ///
 /// Element's clients read the transports in a membership and connect to the
@@ -577,6 +574,10 @@ async fn openid_again(state: &AppState, account_id: &str) -> anyhow::Result<Valu
 /// same on both sides: the smaller id calls the larger. It has to be a
 /// property of the pair rather than of who arrived first, because "first" is
 /// not something two clients can agree on.
+///
+/// Kept for the tests that pin the rule down; nothing in the call path
+/// asks it yet, which is its own gap rather than a reason to lose it.
+#[cfg(test)]
 pub fn should_offer(own_key: &str, their_key: &str) -> bool {
     own_key < their_key
 }

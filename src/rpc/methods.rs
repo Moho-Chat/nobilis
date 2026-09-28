@@ -1093,9 +1093,9 @@ pub async fn dispatch(
             }
         }
 
-        /// How long it has been running and whether the microphone is hearing
-        /// anything - polled by the window rather than pushed, because it is
-        /// only wanted while somebody is watching a timer.
+        // How long it has been running and whether the microphone is hearing
+        // anything - polled by the window rather than pushed, because it is
+        // only wanted while somebody is watching a timer.
         "voiceMessageProgress" => match crate::voicenote::progress() {
             None => (Some(serde_json::json!({ "recording": false })), None),
             Some(p) => (

@@ -458,9 +458,6 @@ impl Capture {
         self.active.store(!muted, Ordering::Relaxed);
     }
 
-    pub fn is_muted(&self) -> bool {
-        !self.active.load(Ordering::Relaxed)
-    }
 }
 
 
@@ -517,11 +514,6 @@ impl Playback {
         if backlog > MAX_SAMPLES {
             buf.drain(..backlog - MAX_SAMPLES);
         }
-    }
-
-    /// How much audio is waiting, in samples. For tests and diagnostics.
-    pub fn queued(&self) -> usize {
-        self.buffer.lock().unwrap().len()
     }
 
     /// The loudest thing heard since this was last called, and the running
@@ -629,11 +621,6 @@ fn route_when_ready(stream: Stream, device_id: &str) -> Result<String> {
         Ok(_) => Err(anyhow!("the stream never appeared to the sound server")),
         Err(e) => Err(e),
     }
-}
-
-/// Points this process's playback stream at `device_id`.
-pub fn route_output(device_id: &str) -> Result<bool> {
-    route_stream(Stream::Output, device_id)
 }
 
 #[cfg(test)]

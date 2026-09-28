@@ -360,6 +360,7 @@ pub(super) struct Who {
 
 impl Who {
     /// Somebody who has just arrived and is so far only a rank.
+    #[cfg(test)]
     pub(super) fn ranked(rank: MemberRank) -> Self {
         Self { rank, ..Self::default() }
     }

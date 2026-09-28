@@ -11,8 +11,6 @@ use super::*;
 /// host is targeted.
 pub const DEFAULT_ONION: &str = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion";
 
-pub const ONION_PORT: u16 = 443;
-
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 /// Spawns the background task that keeps a Sneedchat account's connection

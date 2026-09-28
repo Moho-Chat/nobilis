@@ -367,6 +367,11 @@ impl CryptoSession {
                 );
                 self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(RoomMessage)")?;
             }
+            // Unreachable today and kept anyway: AnyOutgoingRequest is the
+            // crate's enum, not ours, and a version that adds a variant
+            // should leave this sending the ones it knows rather than
+            // failing to compile.
+            #[allow(unreachable_patterns)]
             _ => {}
         }
         Ok(())
@@ -768,6 +773,9 @@ impl CryptoSession {
     /// `m.room.encrypted` content JSON. See `CollectStrategy::AllDevices`
     /// in `encryption_settings()` above for why every device (not just
     /// cross-signed ones) gets the key.
+    /// Used by the live probes and the backup tests; the send path calls
+    /// `share_and_encrypt_content` directly.
+    #[cfg(test)]
     pub async fn share_and_encrypt(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, body: &str) -> Result<Value> {
         self.share_and_encrypt_content(homeserver_url, access_token, room_id, member_ids, "m.room.message", serde_json::json!({ "msgtype": "m.text", "body": body })).await
     }

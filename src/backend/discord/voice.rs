@@ -672,11 +672,6 @@ pub async fn disconnect(state: &AppState, account_id: &str) {
     }
 }
 
-/// Whether a voice connection is currently up for this account.
-pub fn is_connected(state: &AppState, account_id: &str) -> bool {
-    state.voice.drivers.lock().unwrap().contains_key(account_id)
-}
-
 
 #[cfg(test)]
 mod tests {

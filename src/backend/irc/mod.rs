@@ -40,15 +40,10 @@ pub mod sasl;
 
 pub use connect::*;
 pub use history::*;
-// Not `pub use`: these are asked and answered inside this folder.
-use drafts::*;
 // Not `pub use`: the dispatch is nobody else's business, but its helpers
 // are wanted by the files beside it.
 use incoming::*;
 pub use presence::*;
-// Not `pub use`: `who` is asked and answered inside this folder, and its
-// names (`ask`, `read_who`) are too plain to sit in the backend's namespace.
-use who::*;
 pub use send::*;
 pub use typing::*;
 pub use sasl::*;

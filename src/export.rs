@@ -78,7 +78,6 @@ pub fn safe_name(raw: &str) -> String {
 
 /// Where an export's pieces live while it is being written.
 pub struct Paths {
-    pub root: PathBuf,
     pub media: PathBuf,
     pub body: PathBuf,
     pub index: PathBuf,
@@ -86,7 +85,6 @@ pub struct Paths {
 
 pub fn paths(root: &Path) -> Paths {
     Paths {
-        root: root.to_path_buf(),
         media: root.join("media"),
         // Accumulated separately from index.html so that an unfinished export
         // has no index.html at all, rather than half a page that looks whole.

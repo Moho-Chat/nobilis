@@ -449,7 +449,11 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
 
     let deadline = tokio::time::Instant::now() + grant.expires_in;
     let mut interval = grant.interval;
-    let mut refresh_token = String::new();
+    // Declared without a value on purpose: the loop below either assigns it
+    // or bails, so an initialiser here would be a value nothing ever reads -
+    // and this is the one variable in this function whose going missing
+    // silently is a bug with a history (see the refresh path in sync.rs).
+    let refresh_token;
     let access_token = loop {
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("the sign-in code expired before it was approved");

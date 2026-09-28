@@ -10,9 +10,6 @@
 use serde_json::Value;
 
 pub const EVENT_ROOM_MESSAGE: &str = "m.room.message";
-pub const EVENT_ROOM_NAME: &str = "m.room.name";
-pub const EVENT_ROOM_MEMBER: &str = "m.room.member";
-pub const EVENT_ROOM_ENCRYPTION: &str = "m.room.encryption";
 pub const EVENT_ROOM_ENCRYPTED: &str = "m.room.encrypted";
 pub const EVENT_REACTION: &str = "m.reaction";
 pub const EVENT_REDACTION: &str = "m.room.redaction";

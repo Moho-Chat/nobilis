@@ -103,7 +103,6 @@ pub struct Finished {
     /// The same picture before that encoding, for services that want their
     /// own - Matrix counts to 1024 and sends integers.
     pub waveform_bytes: Vec<u8>,
-    pub samples: usize,
 }
 
 /// Stops the microphone and turns what was said into a file.
@@ -122,7 +121,7 @@ pub fn finish() -> Result<Finished> {
     let waveform = base64_of(&waveform_bytes);
     let bytes = oggopus::encode(&samples)?;
     let path = oggopus::write_temp(&bytes)?;
-    Ok(Finished { buffer_id: recording.buffer_id, path, duration_secs, waveform, waveform_bytes, samples: samples.len() })
+    Ok(Finished { buffer_id: recording.buffer_id, path, duration_secs, waveform, waveform_bytes })
 }
 
 /// Throws the recording away and closes the microphone.

@@ -472,7 +472,6 @@ const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(400
 /// What a transfer tells the world as it runs.
 pub struct Progress {
     pub received: u64,
-    pub total: u64,
     /// Bytes a second, over the last interval rather than the whole transfer:
     /// an average since the start keeps showing a healthy rate for a transfer
     /// that stalled a minute ago.
@@ -647,7 +646,7 @@ async fn stream_to(
             let moved = received - mark.1;
             let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
             mark = (std::time::Instant::now(), received);
-            on_progress(Progress { received, total: offer.size, rate });
+            on_progress(Progress { received, rate });
         }
 
         // After the accounting, so a limited transfer still reports what it
@@ -863,7 +862,7 @@ async fn serve_file(
             let moved = sent - mark.1;
             let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
             mark = (std::time::Instant::now(), sent);
-            on_progress(Progress { received: sent, total: size, rate });
+            on_progress(Progress { received: sent, rate });
         }
         limiter.take(n as u64).await;
     }
