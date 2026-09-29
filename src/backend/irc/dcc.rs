@@ -35,6 +35,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dcc {
     Send(DccSend),
+    /// The sender agreeing to start from an offset we asked for.
+    ///
+    /// The second half of RESUME: we say where we got to, they say where they
+    /// will start. Their answer is the one that counts - a sender is free to
+    /// answer with a different position, or not to answer at all.
+    Accept { file_name: String, port: u16, position: u64 },
     /// Recognised but not offered here - DCC CHAT and friends. Kept apart from
     /// "not DCC at all" so it can be answered with a reason rather than shown
     /// as a line of control characters.
@@ -80,10 +86,37 @@ pub fn parse_dcc(body: &str) -> Option<Dcc> {
     let rest = rest.trim();
 
     let (verb, args) = rest.split_once(char::is_whitespace)?;
+    if verb.eq_ignore_ascii_case("ACCEPT") {
+        return parse_accept(args).or(Some(Dcc::Unsupported("ACCEPT".into())));
+    }
     if !verb.eq_ignore_ascii_case("SEND") {
         return Some(Dcc::Unsupported(verb.to_uppercase()));
     }
     parse_send(args).map(Dcc::Send)
+}
+
+/// `DCC ACCEPT <filename> <port> <position>`.
+///
+/// The filename is echoed back and may be quoted, may contain spaces, and is
+/// not to be trusted as a path - it is matched against what we asked about
+/// and otherwise ignored. The port is what identifies the transfer.
+fn parse_accept(args: &str) -> Option<Dcc> {
+    let args = args.trim();
+    let (name, rest) = if let Some(rest) = args.strip_prefix('"') {
+        let (name, rest) = rest.split_once('"')?;
+        (name.to_string(), rest)
+    } else {
+        let mut fields: Vec<&str> = args.rsplitn(3, char::is_whitespace).collect();
+        fields.reverse();
+        if fields.len() < 3 {
+            return None;
+        }
+        (fields[0].to_string(), &args[fields[0].len()..])
+    };
+    let mut numbers = rest.split_whitespace();
+    let port: u16 = numbers.next()?.parse().ok()?;
+    let position: u64 = numbers.next()?.parse().ok()?;
+    Some(Dcc::Accept { file_name: name, port, position })
 }
 
 /// `<name> <address> <port> <size> [token]`, where the name may be quoted.
@@ -241,6 +274,44 @@ fn cap_length(name: &str) -> String {
     }
 }
 
+/// Senders that have been asked to resume, and are yet to answer.
+///
+/// Keyed by port, which is what a `DCC ACCEPT` carries and what makes one
+/// offer different from another: the filename comes back echoed and quoted
+/// differently by every bot, and is not something to match on.
+static AWAITING_ACCEPT: std::sync::Mutex<Option<std::collections::HashMap<u16, tokio::sync::oneshot::Sender<u64>>>> =
+    std::sync::Mutex::new(None);
+
+/// How long to wait for a `DCC ACCEPT` before starting from nothing.
+///
+/// Short on purpose. A sender that does not do RESUME says nothing at all
+/// rather than refusing, so this is the whole of the protocol's answer to
+/// "do you support it", and every second of it is a second the file is not
+/// being transferred.
+const ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+fn park_for_accept(port: u16) -> tokio::sync::oneshot::Receiver<u64> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut held = AWAITING_ACCEPT.lock().unwrap();
+    held.get_or_insert_with(std::collections::HashMap::new).insert(port, tx);
+    rx
+}
+
+fn stop_waiting(port: u16) {
+    if let Some(map) = AWAITING_ACCEPT.lock().unwrap().as_mut() {
+        map.remove(&port);
+    }
+}
+
+/// Hands a sender's answer to whoever asked for it.
+fn deliver_accept(port: u16, position: u64) -> bool {
+    let waiting = AWAITING_ACCEPT.lock().unwrap().as_mut().and_then(|m| m.remove(&port));
+    match waiting {
+        Some(tx) => tx.send(position).is_ok(),
+        None => false,
+    }
+}
+
 /// Where a transfer is written while it is still running.
 ///
 /// Alongside the eventual file rather than in a temp directory, so the rename
@@ -249,6 +320,12 @@ pub fn part_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".part");
     target.with_file_name(name)
+}
+
+/// The file a `.part` is on its way to becoming.
+fn target_of(part: &Path) -> PathBuf {
+    let name = part.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    part.with_file_name(name.strip_suffix(".part").unwrap_or(&name))
 }
 
 /// A path in `dir` that nothing is using yet, suffixing "(2)", "(3)"...
@@ -535,12 +612,20 @@ impl RateLimiter {
 /// Written to a `.part` file and renamed only once it is whole, so an
 /// interrupted transfer never leaves something that looks like a finished
 /// file. The part file is removed on every failure path.
+#[allow(clippy::too_many_arguments)]
 pub async fn receive(
     offer: &DccSend,
     transport: &crate::net::tor::Transport,
     dir: &Path,
     max_bytes: u64,
     max_rate: u64,
+    // Where the file already gets to, agreed with the sender beforehand;
+    // zero for an ordinary transfer, which is every one that cannot resume.
+    // The part file it counts bytes of comes with it, because the same
+    // reasoning picked that file when the resume was negotiated and two
+    // answers to "which file" is one too many.
+    resume_from: u64,
+    part_override: Option<PathBuf>,
     cancel: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<PathBuf> {
@@ -555,12 +640,20 @@ pub async fn receive(
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
 
-    let target = unique_path(dir, &offer.file_name);
+    // A resume already knows which part file it is continuing, and asking
+    // `unique_path` again would answer with a fresh name beside it.
+    let (target, part): (PathBuf, PathBuf) = match part_override {
+        Some(part) => (target_of(&part), part),
+        None => {
+            let target = unique_path(dir, &offer.file_name);
+            let part = part_path(&target);
+            (target, part)
+        }
+    };
     // Checked before anything is opened, and again on the finished file.
     assert_inside(dir, &target)?;
-    let part = part_path(&target);
 
-    let result = stream_to(offer, transport, &part, max_rate, cancel, &mut on_progress).await;
+    let result = stream_to(offer, transport, &part, max_rate, resume_from, cancel, &mut on_progress).await;
     match result {
         Ok(()) => {
             tokio::fs::rename(&part, &target)
@@ -570,18 +663,33 @@ pub async fn receive(
             Ok(target)
         }
         Err(e) => {
-            // Nothing half-written is left behind to be mistaken for the file.
-            let _ = tokio::fs::remove_file(&part).await;
+            // What arrived is kept, where keeping it is worth something: a
+            // part file is the only thing a later RESUME can continue from,
+            // and throwing away most of a gigabyte because the sender hung up
+            // is a worse answer than leaving a `.part` beside the folder.
+            //
+            // Not kept when it holds nothing, and not kept when the transfer
+            // was cancelled here - somebody who said stop did not mean
+            // "stop and keep it for later".
+            let scrap = cancel.load(std::sync::atomic::Ordering::Relaxed)
+                || tokio::fs::metadata(&part).await.map(|m| m.len() == 0).unwrap_or(true);
+            if scrap {
+                let _ = tokio::fs::remove_file(&part).await;
+            } else {
+                tracing::info!("dcc: keeping {} to resume from", part.display());
+            }
             Err(e)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_to(
     offer: &DccSend,
     transport: &crate::net::tor::Transport,
     part: &Path,
     max_rate: u64,
+    resume_from: u64,
     cancel: &std::sync::atomic::AtomicBool,
     on_progress: &mut impl FnMut(Progress),
 ) -> Result<()> {
@@ -591,21 +699,35 @@ async fn stream_to(
     // screen, in a line too long to fit because half of it was a repeat.
     let mut stream = transport.connect(&offer.addr.to_string(), offer.port, false).await?;
 
-    // create_new, so if the check above raced with another transfer this is
-    // an error rather than two writers sharing a file.
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(part)
-        .await
-        .with_context(|| format!("creating {}", part.display()))?;
+    // Appending when resuming, and create_new otherwise: if the check that
+    // picked this name raced with another transfer, a fresh one is an error
+    // rather than two writers sharing a file. A resume has already looked at
+    // the file it means to continue, so for that one the file existing is
+    // the point.
+    let mut file = if resume_from > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(part)
+            .await
+            .with_context(|| format!("re-opening {} to continue it", part.display()))?
+    } else {
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(part)
+            .await
+            .with_context(|| format!("creating {}", part.display()))?
+    };
 
     let mut limiter = RateLimiter::new(max_rate);
     let mut buf = vec![0u8; CHUNK];
-    let mut received: u64 = 0;
+    // Counts the whole file, not this attempt: the acknowledgements a sender
+    // reads are absolute offsets, and a resumed transfer that counted from
+    // zero would tell it the file had gone backwards.
+    let mut received: u64 = resume_from;
     // Where the last progress report was taken from, which is what makes the
     // rate a measurement over an interval rather than a running average.
-    let mut mark = (std::time::Instant::now(), 0u64);
+    let mut mark = (std::time::Instant::now(), resume_from);
     // Acknowledgements are advisory, and a sender that has stopped reading
     // them must not be written to again: on a socket the far end has closed,
     // writing provokes a reset, and a reset throws away whatever this side
@@ -947,6 +1069,15 @@ pub fn transport_for(config: &crate::accounts::IrcAccountConfig) -> crate::net::
 /// have nothing to go on.
 pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &str, kind: &str, dcc: Dcc) {
     let offer = match dcc {
+        // Not an offer: an answer to one already in flight. Nothing is said
+        // in the conversation about it - the transfer itself reports what it
+        // is doing, and a line for every step of a handshake would be noise.
+        Dcc::Accept { port, position, .. } => {
+            if !deliver_accept(port, position) {
+                tracing::debug!("dcc: a DCC ACCEPT arrived for port {port}, which nothing is waiting on");
+            }
+            return;
+        }
         Dcc::Unsupported(verb) => {
             note(state, account_id, buffer, kind, &format!("{from} offered a DCC {verb}, which moho does not do."));
             return;
@@ -1066,10 +1197,27 @@ pub fn accept(state: &AppState, id: &str) {
             dir.display()
         );
 
+        // Where a previous attempt at this exact file got to, and whether
+        // the sender will carry on from there. Both answers can be no, and
+        // the transfer starts from nothing when they are.
+        let (resume_from, part_override) =
+            negotiate_resume(&state, &transfer.account_id, &transfer.from, &offer, &dir).await;
+        if resume_from > 0 {
+            tracing::info!(
+                "dcc: {} agreed to continue \"{}\" from {}",
+                transfer.from,
+                offer.file_name,
+                human_size(resume_from)
+            );
+            if let Some(t) = state.runtime.update_dcc(&id, |t| t.received = resume_from) {
+                announce(&state, &t);
+            }
+        }
+
         let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
         let progress_state = state.clone();
         let progress_id = id.clone();
-        let result = receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, &cancel, |p| {
+        let result = receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, resume_from, part_override, &cancel, |p| {
             if let Some(t) = progress_state.runtime.update_dcc(&progress_id, |t| {
                 t.received = p.received;
                 t.rate = p.rate;
@@ -1100,6 +1248,64 @@ pub fn accept(state: &AppState, id: &str) {
         // should not still be carrying somewhere to connect to.
         state.runtime.update_dcc(&id, |t| t.offer = None);
     });
+}
+
+/// Asks the sender to carry on from where a previous attempt stopped.
+///
+/// Answers with the offset to start at and the part file it belongs to, or
+/// `(0, None)` for every case that cannot resume - which is most of them, and
+/// none of which is an error:
+///
+/// - nothing half-finished is sitting there under that name;
+/// - what is there is a different size from what is on offer, so it is a
+///   different file that happens to share a name;
+/// - the sender never answered, which is how a client that does not do
+///   RESUME declines: the protocol has no "no".
+///
+/// The size check is the load-bearing one. A part file is matched by name,
+/// and a name is the weakest thing on the wire - appending the wrong 400 MB
+/// to the right file produces something of exactly the right length and
+/// entirely corrupt, which nothing downstream would catch.
+async fn negotiate_resume(
+    state: &AppState,
+    account_id: &str,
+    from: &str,
+    offer: &DccSend,
+    dir: &Path,
+) -> (u64, Option<PathBuf>) {
+    let part = part_path(&dir.join(&offer.file_name));
+    let Ok(meta) = tokio::fs::metadata(&part).await else { return (0, None) };
+    let have = meta.len();
+    if have == 0 || have >= offer.size {
+        return (0, None);
+    }
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return (0, None) };
+
+    let waiting = park_for_accept(offer.port);
+    // Quoted, because the name may contain spaces and the sender has to
+    // match it against its own record of what it offered.
+    let ask = format!("\u{1}DCC RESUME \"{}\" {} {}\u{1}", offer.file_name, offer.port, have);
+    if sender.send(irc::proto::Command::PRIVMSG(from.to_string(), ask)).is_err() {
+        stop_waiting(offer.port);
+        return (0, None);
+    }
+    tracing::info!("dcc: asking {from} to continue \"{}\" from {have} of {}", offer.file_name, offer.size);
+
+    match tokio::time::timeout(ACCEPT_WAIT, waiting).await {
+        Ok(Ok(position)) if position <= have => (position, Some(part)),
+        // A sender answering with an offset past what we hold would have us
+        // write a hole into the middle of the file.
+        Ok(Ok(position)) => {
+            tracing::warn!("dcc: {from} wants to start at {position}, past the {have} bytes held; starting over");
+            (0, None)
+        }
+        Ok(Err(_)) => (0, None),
+        Err(_) => {
+            stop_waiting(offer.port);
+            tracing::info!("dcc: {from} did not answer the resume; starting over");
+            (0, None)
+        }
+    }
 }
 
 /// Turns an offer down, or stops one already running.
@@ -1405,7 +1611,7 @@ mod transfer_tests {
 
     async fn run(dir: &Path, offer: &DccSend, max: u64) -> Result<PathBuf> {
         let cancel = AtomicBool::new(false);
-        receive(offer, &crate::net::tor::Transport::Direct, dir, max, 0, &cancel, |_| {}).await
+        receive(offer, &crate::net::tor::Transport::Direct, dir, max, 0, 0, None, &cancel, |_| {}).await
     }
 
     #[tokio::test]
@@ -1435,15 +1641,57 @@ mod transfer_tests {
     }
 
     #[tokio::test]
-    async fn a_transfer_that_stops_early_leaves_nothing_behind() {
+    async fn a_transfer_that_stops_early_keeps_what_it_got() {
         let dir = temp_dir("short");
         let port = serve(vec![2u8; 50]).await;
         let err = run(&dir, &offer_of(port, "short.bin", 5_000), 0).await.unwrap_err();
 
         assert!(format!("{err:#}").contains("ended after"), "{err:#}");
-        // The important half: a partial file must not be left looking whole.
-        assert!(!dir.join("short.bin").exists());
-        assert!(!part_path(&dir.join("short.bin")).exists());
+        // Still not left looking whole - that half has not changed.
+        assert!(!dir.join("short.bin").exists(), "a partial file must not wear the final name");
+        // But kept, because it is the only thing a later RESUME can continue
+        // from, and a sender hanging up two thirds of the way through a large
+        // file is the ordinary case rather than the strange one.
+        let part = part_path(&dir.join("short.bin"));
+        assert!(part.exists(), "the part file should be kept to resume from");
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_transfer_keeps_nothing() {
+        // Somebody who pressed stop did not mean "stop and keep it for
+        // later", so this is the one failure that still cleans up.
+        let dir = temp_dir("cancelled");
+        let port = serve(vec![3u8; 100_000]).await;
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let offer = offer_of(port, "stopped.bin", 100_000);
+        let err = receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 0, 0, None, &cancel, |_| {})
+            .await
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert!(!part_path(&dir.join("stopped.bin")).exists(), "a cancelled transfer leaves nothing");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_transfer_appends_rather_than_starting_over() {
+        let dir = temp_dir("resume");
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = part_path(&dir.join("half.bin"));
+        std::fs::write(&part, vec![7u8; 40]).unwrap();
+
+        // The sender picks up at 40, so it sends only the remaining 60.
+        let port = serve(vec![9u8; 60]).await;
+        let offer = offer_of(port, "half.bin", 100);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let got = receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 0, 40, Some(part), &cancel, |_| {})
+            .await
+            .expect("the transfer should complete");
+
+        let whole = std::fs::read(&got).unwrap();
+        assert_eq!(whole.len(), 100, "the two halves should make one file");
+        assert_eq!(&whole[..40], &[7u8; 40], "what was already there is untouched");
+        assert_eq!(&whole[40..], &[9u8; 60], "the rest is appended after it");
     }
 
     #[tokio::test]
@@ -1531,7 +1779,7 @@ mod transfer_tests {
 
         let began = std::time::Instant::now();
         let offer = offer_of(port, "slow.bin", body.len() as u64);
-        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 20 * 1024, &cancel, |_| {})
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 20 * 1024, 0, None, &cancel, |_| {})
             .await
             .expect("should still arrive");
         let took = began.elapsed();
@@ -1549,7 +1797,7 @@ mod transfer_tests {
         let seen = std::sync::Mutex::new(Vec::new());
 
         let offer = offer_of(port, "measured.bin", body.len() as u64);
-        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 16 * 1024, &cancel, |p| {
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 16 * 1024, 0, None, &cancel, |p| {
             seen.lock().unwrap().push((p.received, p.rate));
         })
         .await
@@ -1665,7 +1913,29 @@ mod parse_tests {
     #[test]
     fn other_dcc_verbs_are_named_rather_than_shown_as_control_codes() {
         assert_eq!(parse_dcc("\u{1}DCC CHAT chat 1 2\u{1}"), Some(Dcc::Unsupported("CHAT".into())));
+        // RESUME is what *we* send; a sender asking us to resume would mean
+        // moho was the one sending, which it does not do.
         assert_eq!(parse_dcc("\u{1}DCC RESUME f 5000 100\u{1}"), Some(Dcc::Unsupported("RESUME".into())));
+
+        // ACCEPT is the answer to ours, and is read.
+        assert_eq!(
+            parse_dcc("\u{1}DCC ACCEPT file.bin 5000 4096\u{1}"),
+            Some(Dcc::Accept { file_name: "file.bin".into(), port: 5000, position: 4096 })
+        );
+        // Quoted, which is how every sender echoes a name with a space in it.
+        assert_eq!(
+            parse_dcc("\u{1}DCC ACCEPT \"two words.bin\" 5000 4096\u{1}"),
+            Some(Dcc::Accept { file_name: "two words.bin".into(), port: 5000, position: 4096 })
+        );
+        // Unquoted with spaces, which some senders do: the two numbers are
+        // taken from the end, where the shape of the line is fixed, and
+        // everything before them is the name.
+        assert_eq!(
+            parse_dcc("\u{1}DCC ACCEPT two words.bin 5000 4096\u{1}"),
+            Some(Dcc::Accept { file_name: "two words.bin".into(), port: 5000, position: 4096 })
+        );
+        // Not a resume at all, and not to be mistaken for one.
+        assert_eq!(parse_dcc("\u{1}DCC ACCEPT nonsense\u{1}"), Some(Dcc::Unsupported("ACCEPT".into())));
     }
 
     #[test]
