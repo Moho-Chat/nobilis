@@ -792,6 +792,10 @@ pub async fn dispatch(
         // The public room directory - Element's room explorer. Optionally
         // somebody else's directory, which is how a room on a server this
         // account has never touched is found at all.
+        // Directories worth adding to a room search, for a client that wants
+        // to offer them. Needs no account: it is a list, not a question.
+        "suggestedMatrixDirectories" => (Some(backend::matrix::suggested_directories()), None),
+
         "searchMatrixRooms" => {
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("searchMatrixRooms requires \"accountId\"".to_string()));

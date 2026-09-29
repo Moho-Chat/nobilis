@@ -323,6 +323,55 @@ pub(super) async fn directory_targets(
     targets
 }
 
+/// Homeservers worth offering as places to look, chosen for how little they
+/// overlap rather than for how large they are.
+///
+/// The directory somebody gets by default is their own server and the servers
+/// their rooms are on, which for most people is matrix.org and the technology
+/// communities around it. That is a fact about who joined first, not about
+/// what Matrix holds, and a search that only ever asks those places will keep
+/// finding only them.
+///
+/// Every entry here answered a real directory query through a federating
+/// account when this list was made - guessing at hostnames finds mostly dead
+/// ones, so the servers came from the room ids other directories listed - and
+/// was kept for holding rooms that are not about software: a language, a city,
+/// a game, a hobby, a country's news. Several large servers were left out on
+/// purpose because they mirror each other's rooms word for word (four of them
+/// list the same GrapheneOS rooms), which adds a chip and no rooms.
+///
+/// Nothing here is searched until somebody adds it. Fifteen extra requests to
+/// other people's servers on every keystroke is not something to do by default.
+pub const SUGGESTED_DIRECTORIES: &[(&str, &str)] = &[
+    ("tchncs.de", "The broadest general-purpose directory: languages, privacy, hobby groups"),
+    ("unredacted.org", "Language learning and exchange, Russian-language communities"),
+    ("sibnsk.net", "Russian-language communities"),
+    ("pub.solar", "Ukrainian-language news and communities"),
+    ("utwente.io", "Dutch, Ukrainian and Arabic-language communities"),
+    ("rollenspiel.chat", "German tabletop and pen-and-paper role-playing"),
+    ("glasgow.social", "A city: Glasgow, and its clubs and gaming"),
+    ("chagai.website", "A city: Bern, meetups and games nights"),
+    ("dod.ngo", "German-speaking regulars' tables and meetups"),
+    ("4d2.org", "A general community: coffee shop, stickers, clients"),
+    ("mailstation.de", "Book talk, calibre and reading"),
+    ("explodie.org", "World news feeds and a small community space"),
+    ("xonotic.org", "A single game's community"),
+    ("dithered.space", "Touhou, retro computing, a small hobby server"),
+    ("fosdem.org", "A conference: talks, hallway chat, events"),
+    ("hackint.org", "Hackers' congress and event channels"),
+    ("poa.st", "Political discussion, and the Japanese and Portuguese-speaking threads"),
+];
+
+/// [`SUGGESTED_DIRECTORIES`] as a client can show it.
+pub fn suggested_directories() -> Value {
+    Value::Array(
+        SUGGESTED_DIRECTORIES
+            .iter()
+            .map(|(server, about)| serde_json::json!({ "server": server, "about": about }))
+            .collect(),
+    )
+}
+
 /// The homeserver named inside a room id, where there is one.
 ///
 /// Room ids used to be `!opaque:server.example` and this could be taken as
@@ -355,12 +404,23 @@ pub(super) fn server_name(typed: &str) -> String {
 
 #[cfg(test)]
 mod directory_tests {
-    use super::{server_name, server_of_room};
+    use super::{server_name, server_of_room, SUGGESTED_DIRECTORIES};
 
     /// Room version 12 ids are a hash and nothing else. Reading a server out
     /// of one gave the whole room id as a hostname, which was then asked to
     /// search its own directory and answered M_BAD_JSON - a real error in the
     /// server list, against a "server" that was a room.
+    #[test]
+    fn every_suggested_directory_is_a_bare_hostname_listed_once() {
+        let mut seen = std::collections::HashSet::new();
+        for &(server, about) in SUGGESTED_DIRECTORIES {
+            assert_eq!(server_name(server), server, "{server} is not written the way it is asked for");
+            assert!(server.contains('.') && !server.contains('/'), "{server}");
+            assert!(!about.is_empty(), "{server} says nothing about itself");
+            assert!(seen.insert(server), "{server} is listed twice");
+        }
+    }
+
     #[test]
     fn a_room_id_only_names_a_server_when_it_has_one() {
         assert_eq!(server_of_room("!abc:matrix.org"), Some("matrix.org"));
