@@ -2411,6 +2411,9 @@ pub async fn dispatch(
                 if let Some(b) = params.get("autoAccept").and_then(|v| v.as_bool()) {
                     p.auto_accept = b;
                 }
+                if let Some(b) = params.get("autoResume").and_then(|v| v.as_bool()) {
+                    p.auto_resume = b;
+                }
                 if let Some(ip) = p_str_opt(params, "advertisedIp") {
                     p.advertised_ip = (!ip.is_empty()).then(|| ip.to_string());
                 }

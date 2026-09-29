@@ -410,6 +410,15 @@ pub struct DccPrefs {
     /// to be. Zero means no limit, which is a choice somebody can make.
     #[serde(default = "default_max_bytes")]
     pub max_bytes: u64,
+    /// Ask again, by itself, when a transfer stops short of the whole file.
+    ///
+    /// Only where the request that started it can be repeated - an XDCC pack
+    /// number somebody typed - and only while each attempt is bringing more
+    /// of the file than the last. On by default: a sender that cuts every
+    /// transfer off at four minutes makes a large file unobtainable by hand,
+    /// and asking again is exactly what a person would do.
+    #[serde(default = "default_auto_resume")]
+    pub auto_resume: bool,
     #[serde(default = "default_max_transfers")]
     pub max_transfers: usize,
     /// Bytes a second, across all transfers at once. Zero means as fast as it
@@ -433,6 +442,89 @@ fn default_max_bytes() -> u64 {
     4 * 1024 * 1024 * 1024
 }
 
+fn default_auto_resume() -> bool {
+    true
+}
+
+/// What somebody typed to make a bot send a file, kept so it can be typed
+/// again.
+///
+/// Keyed by account and by the nick it was said to, lowercased because IRC
+/// nicks are compared that way. Only the most recent request to a given bot
+/// is kept: asking for pack 5 and then pack 9 means the one still arriving is
+/// 9, and a queue of remembered requests would re-ask for things nobody is
+/// waiting on.
+static LAST_REQUEST: std::sync::Mutex<Option<std::collections::HashMap<(String, String), String>>> =
+    std::sync::Mutex::new(None);
+
+/// How many times a file will be asked for again before giving up.
+///
+/// High, because the case this exists for is a sender that stops every
+/// transfer after a fixed time: a large enough file legitimately needs a
+/// dozen goes. The real brake is the progress check below, not this.
+const MAX_AUTO_RESUMES: u32 = 24;
+
+/// How long to leave a bot alone before asking again.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(12);
+
+/// Remembers an XDCC request, if that is what this message is.
+///
+/// Called for everything sent to a person, and quietly ignores the rest. The
+/// shape is the one every XDCC bot in the world has used since the nineties:
+/// `xdcc send #12`, give or take the hash and the case.
+pub(super) fn remember_request(account_id: &str, target: &str, body: &str) {
+    if target.starts_with('#') || target.starts_with('&') {
+        return;
+    }
+    let lower = body.trim().to_lowercase();
+    let is_request = (lower.starts_with("xdcc send") || lower.starts_with("xdcc get"))
+        && lower.split_whitespace().nth(2).is_some_and(|n| n.trim_start_matches('#').parse::<u32>().is_ok());
+    if !is_request {
+        return;
+    }
+    let mut held = LAST_REQUEST.lock().unwrap();
+    held.get_or_insert_with(std::collections::HashMap::new)
+        .insert((account_id.to_string(), target.to_lowercase()), body.trim().to_string());
+    tracing::debug!("dcc: remembering \"{}\" to {target}, in case it has to be asked again", body.trim());
+}
+
+fn remembered_request(account_id: &str, nick: &str) -> Option<String> {
+    LAST_REQUEST.lock().unwrap().as_ref()?.get(&(account_id.to_string(), nick.to_lowercase())).cloned()
+}
+
+/// How far each part file has got, and how many times it has been asked for.
+///
+/// Keyed by the part file, which is the one name that stays the same across
+/// attempts at the same file.
+static RESUME_ATTEMPTS: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, (u32, u64)>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether to ask again, and the bookkeeping that decides it.
+///
+/// Two brakes, and the second is the one that matters. A cap on attempts
+/// stops a loop eventually; requiring that each attempt bring *more* of the
+/// file than the last stops it immediately when asking again is not working -
+/// a bot that hangs up at the same place every time, or one that has stopped
+/// answering, gets asked twice and then left alone.
+fn should_ask_again(part: &Path, have: u64) -> bool {
+    let mut held = RESUME_ATTEMPTS.lock().unwrap();
+    let map = held.get_or_insert_with(std::collections::HashMap::new);
+    let (attempts, best) = map.get(part).copied().unwrap_or((0, 0));
+    if attempts >= MAX_AUTO_RESUMES || have <= best {
+        map.remove(part);
+        return false;
+    }
+    map.insert(part.to_path_buf(), (attempts + 1, have));
+    true
+}
+
+/// Forgets a file's history, once it is no longer being chased.
+fn stop_chasing(part: &Path) {
+    if let Some(map) = RESUME_ATTEMPTS.lock().unwrap().as_mut() {
+        map.remove(part);
+    }
+}
+
 fn default_max_transfers() -> usize {
     3
 }
@@ -445,6 +537,7 @@ impl Default for DccPrefs {
             max_transfers: default_max_transfers(),
             max_rate: 0,
             auto_accept: false,
+            auto_resume: default_auto_resume(),
             advertised_ip: None,
         }
     }
@@ -1327,6 +1420,7 @@ pub fn accept(state: &AppState, id: &str) {
         match result {
             Ok(path) => {
                 tracing::info!("dcc: saved {}", path.display());
+                stop_chasing(&part_path(&path));
                 if let Some(t) = state.runtime.update_dcc(&id, |t| {
                     t.state = crate::runtime::DccState::Done;
                     t.received = t.size;
@@ -1339,12 +1433,75 @@ pub fn accept(state: &AppState, id: &str) {
             Err(e) => {
                 tracing::warn!("dcc: {:#}", e);
                 fail(&state, &id, &format!("{e:#}"));
+                // Asked for again, if asking again is likely to help. See
+                // `ask_again` for the four things that have to be true.
+                ask_again(&state, &transfer.account_id, &transfer.from, &offer, &dir).await;
             }
         }
         // The address and port are of no further use, and a settled transfer
         // should not still be carrying somewhere to connect to.
         state.runtime.update_dcc(&id, |t| t.offer = None);
     });
+}
+
+/// Asks a bot for the same file again, so a transfer that stopped short can
+/// pick up where it left off.
+///
+/// The case this is for: a sender that cuts every transfer off after a fixed
+/// time. Four minutes of a five-minute file is not a failure anybody can do
+/// anything about by hand except ask again, and again, watching. So moho
+/// asks - and the RESUME it already does means each answer continues rather
+/// than starting over.
+///
+/// Four things have to be true, and each is a way this stops rather than
+/// loops:
+///
+/// - the setting is on;
+/// - something was kept, so there is a partial worth continuing and the
+///   transfer was neither cancelled nor empty;
+/// - somebody typed a request to this bot that can be typed again - moho
+///   does not invent pack numbers;
+/// - the last attempt brought more of the file than the one before it.
+///
+/// The last is the real brake. A bot that hangs up in the same place every
+/// time, or has stopped answering, gets asked twice and then left alone.
+async fn ask_again(state: &AppState, account_id: &str, from: &str, offer: &DccSend, dir: &Path) {
+    if !state.dcc_prefs.get().auto_resume {
+        return;
+    }
+    let part = part_path(&dir.join(&offer.file_name));
+    let Ok(meta) = tokio::fs::metadata(&part).await else { return };
+    let have = meta.len();
+    if have == 0 || have >= offer.size {
+        stop_chasing(&part);
+        return;
+    }
+    let Some(request) = remembered_request(account_id, from) else {
+        tracing::debug!("dcc: nothing to re-send to {from}; leaving \"{}\" where it stopped", offer.file_name);
+        return;
+    };
+    if !should_ask_again(&part, have) {
+        tracing::info!(
+            "dcc: not asking {from} for \"{}\" again - the last attempt brought nothing more, or it has been asked enough",
+            offer.file_name
+        );
+        return;
+    }
+
+    // A pause before asking, because the bot has just hung up and a request
+    // arriving in the same breath is the kind of thing that gets a client
+    // ignored.
+    tokio::time::sleep(RETRY_AFTER).await;
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return };
+    if sender.send(irc::proto::Command::PRIVMSG(from.to_string(), request.clone())).is_err() {
+        return;
+    }
+    tracing::info!(
+        "dcc: asking {from} again for \"{}\" ({} of {} so far): {request}",
+        offer.file_name,
+        human_size(have),
+        human_size(offer.size)
+    );
 }
 
 /// How long to hold a passive listener open waiting to be dialled.
@@ -2181,5 +2338,68 @@ mod parse_tests {
                 "{body:?} must not be read as an offer"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod auto_resume_tests {
+    use super::*;
+
+    #[test]
+    fn an_xdcc_request_is_remembered_and_nothing_else_is() {
+        let acct = "irc:test";
+        remember_request(acct, "bot", "xdcc send #42");
+        assert_eq!(remembered_request(acct, "bot").as_deref(), Some("xdcc send #42"));
+        // Nicks are compared without case, the way IRC compares them.
+        assert_eq!(remembered_request(acct, "BOT").as_deref(), Some("xdcc send #42"));
+
+        // The later request wins: whatever is arriving now is the one worth
+        // asking for again.
+        remember_request(acct, "bot", "XDCC SEND 9");
+        assert_eq!(remembered_request(acct, "bot").as_deref(), Some("XDCC SEND 9"));
+
+        // Ordinary conversation is not a request, and a channel is not a bot.
+        remember_request(acct, "friend", "did you get the xdcc send working");
+        assert!(remembered_request(acct, "friend").is_none());
+        remember_request(acct, "#channel", "xdcc send #1");
+        assert!(remembered_request(acct, "#channel").is_none());
+        // A pack number is what makes it a request.
+        remember_request(acct, "bot2", "xdcc send please");
+        assert!(remembered_request(acct, "bot2").is_none());
+    }
+
+    #[test]
+    fn asking_again_stops_when_it_stops_helping() {
+        let part = std::path::PathBuf::from("/tmp/moho-test-asking-again.part");
+        stop_chasing(&part);
+
+        // Each attempt bringing more of the file keeps it going.
+        assert!(should_ask_again(&part, 100));
+        assert!(should_ask_again(&part, 500));
+        assert!(should_ask_again(&part, 900));
+
+        // One that brought nothing more ends it, however many attempts are
+        // left - a sender hanging up in the same place will do it again.
+        assert!(!should_ask_again(&part, 900));
+        // And the count is forgotten with it, so a later transfer of the same
+        // file starts with a clean slate rather than inheriting a giving-up.
+        assert!(should_ask_again(&part, 1_000));
+        stop_chasing(&part);
+    }
+
+    #[test]
+    fn a_file_is_not_chased_for_ever() {
+        let part = std::path::PathBuf::from("/tmp/moho-test-chase-cap.part");
+        stop_chasing(&part);
+        // Always making progress, so only the cap can stop it.
+        let mut asked = 0;
+        for n in 1..100u64 {
+            if !should_ask_again(&part, n * 1000) {
+                break;
+            }
+            asked += 1;
+        }
+        assert_eq!(asked, MAX_AUTO_RESUMES, "the cap is what ended it");
+        stop_chasing(&part);
     }
 }

@@ -332,6 +332,10 @@ pub(super) fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode
 }
 
 pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
+    // Noted on the way past, so a transfer that stops short can be asked for
+    // again without anybody having to remember the pack number. Ignores
+    // everything that is not an XDCC request, which is almost everything.
+    dcc::remember_request(account_id, target, body);
     // Longer than a line. Without `draft/multiline` the server truncates at
     // its own limit and the rest is simply gone, which is the one failure
     // here that loses what somebody wrote - so where the network offers the
