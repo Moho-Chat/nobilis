@@ -235,6 +235,10 @@ pub async fn search_public_rooms(
                 // may not be in. A client that shows one Join button for all
                 // three offers a button that fails for two of them.
                 "joinRule": room["join_rule"].as_str().unwrap_or("public"),
+                // Whether the room itself lets anybody read it without being
+                // in it. The only rooms worth offering a look at: the rest
+                // refuse however willing anyone else is.
+                "worldReadable": room["world_readable"].as_bool().unwrap_or(false),
             }));
         }
         // What this server actually contributed, after the rooms every other
