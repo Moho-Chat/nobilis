@@ -322,6 +322,21 @@ pub fn part_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+/// How far along, in the width the sender is expecting.
+///
+/// Four bytes for a file that fits in four bytes, eight for one that does
+/// not. The field was 32 bits when DCC was written, and a count that wraps at
+/// 4 GiB tells a sender the file has gone backwards in the middle of it - so
+/// the width is decided from the size that was offered, before the first byte
+/// arrives, and never changes under a sender part way through.
+fn acknowledgement(received: u64, size: u64) -> Vec<u8> {
+    if size > u64::from(u32::MAX) {
+        received.to_be_bytes().to_vec()
+    } else {
+        (received as u32).to_be_bytes().to_vec()
+    }
+}
+
 /// The file a `.part` is on its way to becoming.
 fn target_of(part: &Path) -> PathBuf {
     let name = part.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -629,8 +644,10 @@ pub async fn receive(
     cancel: &std::sync::atomic::AtomicBool,
     mut on_progress: impl FnMut(Progress),
 ) -> Result<PathBuf> {
+    // Still refused here: this is the half that dials, and a passive offer
+    // has nowhere to dial to. `receive_passive` is the one that answers it.
     if offer.passive() {
-        bail!("this is a reverse (passive) offer, which moho does not accept");
+        bail!("this is a reverse (passive) offer, which is received by listening rather than by connecting");
     }
     if max_bytes > 0 && offer.size > max_bytes {
         bail!("offered file is {} bytes, over the {max_bytes} byte limit", offer.size);
@@ -654,13 +671,28 @@ pub async fn receive(
     assert_inside(dir, &target)?;
 
     let result = stream_to(offer, transport, &part, max_rate, resume_from, cancel, &mut on_progress).await;
+    finish(result, &part, &target, dir, cancel).await
+}
+
+/// Puts a finished transfer in its place, or decides what to do with what
+/// arrived before it stopped.
+///
+/// Shared by both directions of receiving, because the answer is the same
+/// whichever end opened the socket.
+async fn finish(
+    result: Result<()>,
+    part: &Path,
+    target: &Path,
+    dir: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<PathBuf> {
     match result {
         Ok(()) => {
-            tokio::fs::rename(&part, &target)
+            tokio::fs::rename(part, target)
                 .await
                 .with_context(|| format!("moving {} into place", part.display()))?;
-            assert_inside(dir, &target)?;
-            Ok(target)
+            assert_inside(dir, target)?;
+            Ok(target.to_path_buf())
         }
         Err(e) => {
             // What arrived is kept, where keeping it is worth something: a
@@ -672,9 +704,9 @@ pub async fn receive(
             // was cancelled here - somebody who said stop did not mean
             // "stop and keep it for later".
             let scrap = cancel.load(std::sync::atomic::Ordering::Relaxed)
-                || tokio::fs::metadata(&part).await.map(|m| m.len() == 0).unwrap_or(true);
+                || tokio::fs::metadata(part).await.map(|m| m.len() == 0).unwrap_or(true);
             if scrap {
-                let _ = tokio::fs::remove_file(&part).await;
+                let _ = tokio::fs::remove_file(part).await;
             } else {
                 tracing::info!("dcc: keeping {} to resume from", part.display());
             }
@@ -697,7 +729,28 @@ async fn stream_to(
     // the route it tried, so wrapping it printed the address twice in one
     // sentence - which is what a failed transfer showed on the downloads
     // screen, in a line too long to fit because half of it was a repeat.
-    let mut stream = transport.connect(&offer.addr.to_string(), offer.port, false).await?;
+    let stream = transport.connect(&offer.addr.to_string(), offer.port, false).await?;
+    stream_socket(stream, offer, part, max_rate, resume_from, cancel, on_progress).await
+}
+
+/// The half that moves bytes, once there is a socket to move them over.
+///
+/// Which side opened it is not this function's business: an ordinary transfer
+/// dialled out, a passive one was dialled into, and from here they are the
+/// same file arriving over the same kind of socket.
+#[allow(clippy::too_many_arguments)]
+async fn stream_socket<S>(
+    mut stream: S,
+    offer: &DccSend,
+    part: &Path,
+    max_rate: u64,
+    resume_from: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: &mut impl FnMut(Progress),
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
 
     // Appending when resuming, and create_new otherwise: if the check that
     // picked this name raced with another transfer, a fresh one is an error
@@ -753,10 +806,16 @@ async fn stream_to(
         file.write_all(&buf[..n]).await.context("writing to disk")?;
 
         // The acknowledgement every DCC sender expects: how much has arrived
-        // so far, big-endian. Some stall without it. Truncated to 32 bits the
-        // way every other client does it, which is all the field has room for.
+        // so far, big-endian.
+        //
+        // Four bytes for a file that fits in four bytes, eight for one that
+        // does not. The field was 32 bits when DCC was written and a count
+        // that wraps at 4 GiB tells a sender the file has gone backwards
+        // mid-transfer - so the width is decided from the offered size,
+        // before the first byte, and does not change underneath a sender
+        // part way through.
         if acknowledge {
-            let ack = (received as u32).to_be_bytes();
+            let ack = acknowledgement(received, offer.size);
             if stream.write_all(&ack).await.is_err() {
                 tracing::debug!("dcc: sender is not reading acknowledgements; not sending more");
                 acknowledge = false;
@@ -1087,18 +1146,36 @@ pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &s
 
     let prefs = state.dcc_prefs.get();
 
+    // A passive offer asks moho to listen, which means publishing an address.
+    // On a direct connection that address is already how the server sees this
+    // machine and the offer can be taken. Through a proxy it is the one thing
+    // the proxy exists to hide, so it is refused there and only there - which
+    // is the same rule sending a file follows.
     if offer.passive() {
-        note(
-            state,
-            account_id,
-            buffer,
-            kind,
-            &format!(
-                "{from} offered \"{}\" as a reverse (passive) transfer, which moho does not accept - it would mean listening for a connection rather than making one. Ask them to send it the ordinary way.",
-                offer.raw_name
-            ),
-        );
-        return;
+        let direct = matches!(state.runtime.irc_transport(account_id), Some(crate::net::tor::Transport::Direct));
+        if !direct {
+            note(
+                state,
+                account_id,
+                buffer,
+                kind,
+                &format!(
+                    "{from} offered \"{}\" as a reverse (passive) transfer, which means moho would have to publish this machine's address - and this connection goes through a proxy that exists to hide it. Ask them to send it the ordinary way.",
+                    offer.raw_name
+                ),
+            );
+            return;
+        }
+        if offer.token.is_none() {
+            note(
+                state,
+                account_id,
+                buffer,
+                kind,
+                &format!("{from} offered \"{}\" on port 0 with no token, which is not an offer anything can answer.", offer.raw_name),
+            );
+            return;
+        }
     }
     if prefs.max_bytes > 0 && offer.size > prefs.max_bytes {
         note(
@@ -1217,15 +1294,35 @@ pub fn accept(state: &AppState, id: &str) {
         let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
         let progress_state = state.clone();
         let progress_id = id.clone();
-        let result = receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, resume_from, part_override, &cancel, |p| {
+        let report = |p: Progress| {
             if let Some(t) = progress_state.runtime.update_dcc(&progress_id, |t| {
                 t.received = p.received;
                 t.rate = p.rate;
             }) {
                 announce(&progress_state, &t);
             }
-        })
-        .await;
+        };
+        // Which side opens the socket is the only difference between these,
+        // and it is decided by the offer rather than by anything here.
+        let result = if offer.passive() {
+            receive_passive(
+                &state,
+                &transfer.account_id,
+                &transfer.from,
+                &offer,
+                &dir,
+                prefs.max_bytes,
+                prefs.max_rate,
+                resume_from,
+                part_override,
+                &cancel,
+                report,
+            )
+            .await
+        } else {
+            receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, resume_from, part_override, &cancel, report)
+                .await
+        };
 
         match result {
             Ok(path) => {
@@ -1248,6 +1345,91 @@ pub fn accept(state: &AppState, id: &str) {
         // should not still be carrying somewhere to connect to.
         state.runtime.update_dcc(&id, |t| t.offer = None);
     });
+}
+
+/// How long to hold a passive listener open waiting to be dialled.
+///
+/// Generous: the sender has to read our reply off the server and come back,
+/// and a bot working through a queue may take its time. Not unbounded,
+/// because an offer nobody ever connects to would otherwise hold a port and
+/// a transfer slot for ever.
+const PASSIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Receives a passive (reverse) offer: we listen, they dial.
+///
+/// The shape is the ordinary one turned around. A sender that cannot accept a
+/// connection - behind NAT, or a firewall, which is most bots that offer this
+/// - sends port 0 and a token, and asks us to publish somewhere to connect
+/// to. We open a port, answer with the same token so they can match it to the
+/// offer they made, and then wait.
+///
+/// The token is echoed back untouched and never parsed. It is the sender's
+/// own bookkeeping, and the one rule is that it comes back exactly as it went
+/// out.
+#[allow(clippy::too_many_arguments)]
+async fn receive_passive(
+    state: &AppState,
+    account_id: &str,
+    from: &str,
+    offer: &DccSend,
+    dir: &Path,
+    max_bytes: u64,
+    max_rate: u64,
+    resume_from: u64,
+    part_override: Option<PathBuf>,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut on_progress: impl FnMut(Progress),
+) -> Result<PathBuf> {
+    if max_bytes > 0 && offer.size > max_bytes {
+        bail!("offered file is {} bytes, over the {max_bytes} byte limit", offer.size);
+    }
+    let token = offer.token.clone().context("a passive offer with no token is one nothing could answer")?;
+    let sender = state.runtime.irc_sender(account_id).context("that connection is no longer up")?;
+
+    tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+    let (target, part): (PathBuf, PathBuf) = match part_override {
+        Some(part) => (target_of(&part), part),
+        None => {
+            let target = unique_path(dir, &offer.file_name);
+            let part = part_path(&target);
+            (target, part)
+        }
+    };
+    assert_inside(dir, &target)?;
+
+    // Bound before anything is published, because the reply has to carry the
+    // port and there is no port until something is listening on it.
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.context("opening a port to receive on")?;
+    let port = listener.local_addr().context("reading the port")?.port();
+    let advertise = advertised_address(state, account_id).await?;
+
+    let advertised_name =
+        if offer.file_name.contains(' ') { format!("\"{}\"", offer.file_name) } else { offer.file_name.clone() };
+    let reply = format!(
+        "\u{1}DCC SEND {advertised_name} {} {port} {} {token}\u{1}",
+        u32::from(advertise),
+        offer.size
+    );
+    sender
+        .send(irc::proto::Command::PRIVMSG(from.to_string(), reply))
+        .map_err(|e| anyhow!("answering {from}'s passive offer: {e}"))?;
+    tracing::info!("dcc: listening on {advertise}:{port} for {from} to send \"{}\"", offer.file_name);
+
+    let accepted = tokio::time::timeout(PASSIVE_WAIT, listener.accept()).await;
+    let (stream, peer) = match accepted {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => bail!("waiting for {from} to connect: {e}"),
+        Err(_) => bail!("{from} never connected to the port moho opened for them"),
+    };
+    // Only that the sender is who the offer said, which is all the protocol
+    // gives us to check: the address was in the offer, and a connection from
+    // anywhere else is somebody who read the reply off the channel.
+    if peer.ip() != offer.addr {
+        bail!("something at {} connected instead of {}", peer.ip(), offer.addr);
+    }
+
+    let result = stream_socket(stream, offer, &part, max_rate, resume_from, cancel, &mut on_progress).await;
+    finish(result, &part, &target, dir, cancel).await
 }
 
 /// Asks the sender to carry on from where a previous attempt stopped.
@@ -1701,6 +1883,48 @@ mod transfer_tests {
         // the only way this can pass.
         let err = run(&dir, &offer_of(1, "huge.bin", 10_000), 1_000).await.unwrap_err();
         assert!(format!("{err:#}").contains("over the"), "{err:#}");
+    }
+
+    #[test]
+    fn an_acknowledgement_is_as_wide_as_the_file_needs() {
+        // The ordinary case, and the one every sender since 1994 expects.
+        assert_eq!(acknowledgement(1024, 5_000), 1024u32.to_be_bytes().to_vec());
+        // Right on the boundary: still four bytes, because the count can
+        // still be said in four.
+        assert_eq!(acknowledgement(7, u64::from(u32::MAX)), 7u32.to_be_bytes().to_vec());
+
+        // One byte past it, and the width changes for the whole transfer -
+        // including while the count is still small, which is the point. A
+        // sender reading eight bytes must get eight from the first ack, not
+        // from whenever the file happens to pass 4 GiB.
+        let big = u64::from(u32::MAX) + 1;
+        assert_eq!(acknowledgement(7, big), 7u64.to_be_bytes().to_vec());
+        assert_eq!(acknowledgement(big, big).len(), 8);
+
+        // What the old code did to a count past 4 GiB: wrapped to zero, and
+        // told the sender the file had gone backwards.
+        assert_eq!(big as u32, 0);
+        assert_ne!(acknowledgement(big, big), 0u32.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn a_passive_offer_is_recognised_by_either_half() {
+        // Port 0 with a token is the ordinary shape.
+        let passive = DccSend {
+            raw_name: "f.bin".into(),
+            file_name: "f.bin".into(),
+            addr: "198.51.100.7".parse().unwrap(),
+            port: 0,
+            size: 10,
+            token: Some("12345".into()),
+        };
+        assert!(passive.passive());
+        // A token with a real port is still passive - some senders do this,
+        // and answering it as an ordinary offer would dial a port that is
+        // not listening.
+        assert!(DccSend { port: 5000, ..passive.clone() }.passive());
+        // Neither is an ordinary offer.
+        assert!(!DccSend { port: 5000, token: None, ..passive }.passive());
     }
 
     #[tokio::test]
