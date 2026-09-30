@@ -252,7 +252,8 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
             state.runtime.delete_message(state, &buffer_id, &m.message_uuid);
             continue;
         }
-        let body = protocol::unescape_html(&m.message_raw);
+        // The short `/attachments/...` form, written out in full so it embeds.
+        let body = expand_attachment_paths(&protocol::unescape_html(&m.message_raw), host).into_owned();
         if body.is_empty() {
             continue;
         }
@@ -281,7 +282,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
         // recent history, and looking every attachment in it up again is a
         // request per message, over Tor, for answers already on disk.
         if is_new && !m.message_uuid.is_empty() {
-            spawn_attachment_resolve(state.clone(), http.clone(), buffer_id.clone(), m.message_uuid.clone(), body);
+            spawn_attachment_resolve(state.clone(), http.clone(), host, buffer_id.clone(), m.message_uuid.clone(), body);
         }
     }
     // Cleared unconditionally rather than only when it was set: nothing above
@@ -310,7 +311,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
 
     if is_primary {
         if let Some(w) = &resp.whisper {
-            let body = protocol::unescape_html(&w.message_raw);
+            let body = expand_attachment_paths(&protocol::unescape_html(&w.message_raw), host).into_owned();
             // The site echoes our own whisper back to us, which is worth
             // knowing rather than working around: it means a whisper we sent
             // arrives twice, once from `send_whisper` recording it locally and
@@ -331,7 +332,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
                 for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true, None) {
                     if !w.message_uuid.is_empty() {
-                        spawn_attachment_resolve(state.clone(), http.clone(), buffer, w.message_uuid.clone(), body.clone());
+                        spawn_attachment_resolve(state.clone(), http.clone(), host, buffer, w.message_uuid.clone(), body.clone());
                     }
                 }
             }

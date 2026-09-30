@@ -142,6 +142,16 @@ pub struct SneedChatAccountConfig {
     pub host: String,
     #[serde(default = "default_tor_mode")]
     pub tor_mode: String,
+    /// Whether this account reaches the forum through Tor, at the onion
+    /// address. Off by default: the forum is on the open internet at
+    /// kiwifarms.st, and Tor is started only for an account that asks for
+    /// it - an account that never does never costs a Tor bootstrap.
+    ///
+    /// Absent in accounts saved before this was a choice, which were all
+    /// Tor; they read as off, and move to the open internet, like any new
+    /// account does.
+    #[serde(default)]
+    pub use_tor: bool,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default = "default_sneedchat_rooms")]
@@ -175,6 +185,21 @@ fn default_sneedchat_rooms() -> Vec<SneedChatRoom> {
 }
 
 impl SneedChatAccountConfig {
+    /// The forum's address as this account reaches it: the onion address
+    /// through Tor, and kiwifarms.st without it.
+    ///
+    /// `host` is what was stored, which for every account made so far is the
+    /// onion address - so without Tor an onion host means its counterpart on
+    /// the open internet, and anything else is used as it is.
+    pub fn site_host(&self) -> String {
+        let onion = self.host.ends_with(".onion");
+        match (self.use_tor, onion) {
+            (false, true) => crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST.to_string(),
+            (true, false) if self.host == crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST => crate::backend::sneedchat::DEFAULT_ONION.to_string(),
+            _ => self.host.clone(),
+        }
+    }
+
     pub fn account_id(&self) -> String {
         format!("sneedchat:{}", self.username)
     }
@@ -558,6 +583,19 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.rooms = rooms;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Whether this account connects through Tor.
+    pub fn set_sneedchat_use_tor(&self, account_id: &str, use_tor: bool) -> Result<bool> {
+        let mut sneedchat = self.sneedchat.lock().unwrap();
+        match sneedchat.get_mut(account_id) {
+            None => Ok(false),
+            Some(a) => {
+                a.use_tor = use_tor;
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
@@ -1019,7 +1057,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1112,6 +1150,23 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
 
 #[cfg(test)]
 mod display_name_tests {
+    /// Saved Sneedchat accounts carry the onion address as their host, and
+    /// all of them now start on the open internet: the address has to follow
+    /// the choice rather than the stored host.
+    #[test]
+    fn a_sneedchat_account_reaches_the_address_its_tor_choice_implies() {
+        let mut config: super::SneedChatAccountConfig =
+            serde_json::from_value(serde_json::json!({ "username": "u", "password": "" })).unwrap();
+        assert!(!config.use_tor, "the open internet unless asked");
+        assert_eq!(config.site_host(), "kiwifarms.st");
+        config.use_tor = true;
+        assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION);
+        config.host = "kiwifarms.st".to_string();
+        assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION, "Tor means the onion");
+        config.host = "example.test".to_string();
+        assert_eq!(config.site_host(), "example.test", "a host of somebody's own is left alone");
+    }
+
     use super::*;
 
     fn store(name: &str) -> AccountStore {

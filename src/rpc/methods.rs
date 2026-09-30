@@ -3086,6 +3086,8 @@ pub async fn dispatch(
                 totp_secret: p_str_opt(params, "totpSecret").map(String::from),
                 host: p_str_opt(params, "host").map(String::from).unwrap_or_else(|| backend::sneedchat::DEFAULT_ONION.to_string()),
                 tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| "embedded".to_string()),
+                // The open internet unless asked otherwise.
+                use_tor: p_bool(params, "useTor", false),
                 proxy: p_str_opt(params, "proxy").map(String::from),
                 rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
                 display_name: None,
@@ -3159,6 +3161,9 @@ pub async fn dispatch(
                     totp_secret: None,
                     host: backend::sneedchat::DEFAULT_ONION.to_string(),
                     tor_mode: "embedded".to_string(),
+                    // Chosen on the add form before the window opened; an
+                    // account that already exists keeps its own setting.
+                    use_tor: p_bool(params, "useTor", false),
                     proxy: None,
                     rooms: Vec::new(),
                     display_name: None,
@@ -3238,6 +3243,25 @@ pub async fn dispatch(
         // external proxy" is applied uniformly to every configured
         // Sneedchat account rather than asked per-account. Reconnects each
         // affected account immediately, same as setSneedChatRooms above.
+        // One account's choice of Tor or the open internet, changed on an
+        // account that already exists. Reconnected at once, so the change is
+        // the connection rather than a setting waiting for one.
+        "setSneedChatUseTor" => {
+            let Some(id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setSneedChatUseTor requires \"accountId\"".to_string()));
+            };
+            match state.accounts.set_sneedchat_use_tor(id, p_bool(params, "enabled", false)) {
+                Ok(true) => {
+                    if let Some(cfg) = state.accounts.get_sneedchat(id) {
+                        backend::sneedchat::spawn(state.clone(), cfg);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "setTorConfig" => {
             let tor_mode = p_str(params, "torMode", "embedded").to_string();
             let proxy = p_str_opt(params, "proxy").filter(|s| !s.is_empty()).map(String::from);

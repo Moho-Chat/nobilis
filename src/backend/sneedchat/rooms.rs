@@ -27,7 +27,7 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
             if let Some(id) = member["userId"].as_str() {
                 profile["id"] = serde_json::json!(id);
                 if let Some(config) = state.accounts.get_sneedchat(account_id) {
-                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.host));
+                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.site_host()));
                 }
             }
             if let Some(avatar) = member["avatarUrl"].as_str() {
@@ -80,7 +80,7 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
 pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
     let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let transport = build_transport(state, &config, account_id).await?;
-    let session = Session::new(transport, format!("https://{}", config.host), DEFAULT_USER_AGENT.to_string());
+    let session = Session::new(transport, format!("https://{}", config.site_host()), DEFAULT_USER_AGENT.to_string());
     restore_session(&session, &config);
 
     let url = format!("https://{}/test-chat", config.host);

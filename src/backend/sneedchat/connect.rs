@@ -6,9 +6,9 @@
 
 use super::*;
 
-/// Default hidden service (Kiwi Farms). Clearnet fallback is
-/// `kiwifarms.st`, but embedded Tor is used by default regardless of which
-/// host is targeted.
+/// Kiwi Farms' hidden service, used by an account set to connect through
+/// Tor. Without Tor an account connects to `kiwifarms.st` directly - see
+/// `SneedChatAccountConfig::site_host`.
 pub const DEFAULT_ONION: &str = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion";
 
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
@@ -50,7 +50,7 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
             Ok(Ok(())) => ("connection ended".to_string(), false),
             Ok(Err(e)) => {
                 tracing::warn!("sneedchat[{account_id}]: {e:#}");
-                (format!("{e:#}"), crate::net::tor::is_tor_failure(&e))
+                (format!("{e:#}"), config.use_tor && crate::net::tor::is_tor_failure(&e))
             }
             Err(_) => {
                 tracing::error!("sneedchat[{account_id}]: connection task panicked");
@@ -87,19 +87,28 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
 }
 
 pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<Transport> {
+    let account_id = account_id.to_string();
+    let state2 = state.clone();
+    transport_for(state, config, move |msg| state2.runtime.report_progress(&state2, &account_id, msg)).await
+}
+
+/// How this account reaches the forum.
+///
+/// Directly, unless the account is set to use Tor - and only then is Tor
+/// touched at all: an account on the open internet never bootstraps it. With
+/// Tor, the daemon-wide choice between the embedded client and an external
+/// proxy applies.
+pub(super) async fn transport_for(state: &AppState, config: &SneedChatAccountConfig, on_progress: impl FnOnce(&str)) -> Result<Transport> {
+    if !config.use_tor {
+        return Ok(Transport::Direct);
+    }
     match config.tor_mode.as_str() {
         "proxy" => {
             let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
             Transport::socks_from_url(proxy)
         }
         _ => {
-            let account_id = account_id.to_string();
-            let state2 = state.clone();
-            let client = state
-                .tor
-                .get_or_bootstrap(|msg| state2.runtime.report_progress(&state2, &account_id, msg))
-                .await
-                .context("bootstrapping Tor")?;
+            let client = state.tor.get_or_bootstrap(on_progress).await.context("bootstrapping Tor")?;
             Ok(Transport::Tor(client))
         }
     }
@@ -167,7 +176,7 @@ pub(super) fn no_way_in(e: anyhow::Error) -> anyhow::Error {
 pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
     let transport = build_transport(state, config, account_id).await?;
 
-    let base = format!("https://{}", config.host);
+    let base = format!("https://{}", config.site_host());
     let session = Session::new(transport.clone(), base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?),
@@ -181,7 +190,9 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     // Reaching the site at all is what this records: whatever Tor was doing
     // before, it is working now, and the count of failures behind it is no
     // longer evidence of anything.
-    state.tor.note_success().await;
+    if config.use_tor {
+        state.tor.note_success().await;
+    }
     remember_session(state, account_id, &session);
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
@@ -204,7 +215,7 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
             let state = state.clone();
             let transport = transport.clone();
             let session = session.clone();
-            let host = config.host.clone();
+            let host = config.site_host();
             let username = config.username.clone();
             let password = config.password.clone();
             let totp_secret = config.totp_secret.clone();
@@ -287,18 +298,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedCh
     // which is exactly the state Connect knows how to retry.
     state.accounts.add_sneedchat(config.clone())?;
 
-    let transport = match config.tor_mode.as_str() {
-        "proxy" => {
-            let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
-            Transport::socks_from_url(proxy)?
-        }
-        _ => {
-            let client = state.tor.get_or_bootstrap(emit_progress).await.context("bootstrapping Tor")?;
-            Transport::Tor(client)
-        }
-    };
+    let transport = transport_for(state, config, emit_progress).await?;
 
-    let base = format!("https://{}", config.host);
+    let base = format!("https://{}", config.site_host());
     let session = Session::new(transport, base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?),
