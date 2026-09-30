@@ -272,9 +272,9 @@ impl ConnState {
 
 /// Per-connected-account handle the RPC layer uses to act on a live IRC
 /// connection (join/part/send) - see backend/irc/connect.rs for what populates
-/// this. `nick` is the *current* nick (may differ from the account's
-/// configured nick after a collision-driven rename, though that's not
-/// handled yet - out of scope for this milestone).
+/// this. `nick` is the *current* nick: it follows every `NICK` of our own,
+/// whether typed, or forced by the server (Ergo renames a connection to its
+/// account name on login).
 pub struct IrcHandle {
     pub sender: irc::client::Sender,
     pub nick: String,
@@ -3756,6 +3756,13 @@ impl Runtime {
 
     pub fn irc_sender(&self, account_id: &str) -> Option<irc::client::Sender> {
         self.irc_handles.lock().unwrap().get(account_id).map(|h| h.sender.clone())
+    }
+
+    /// Our own nick changed on this connection.
+    pub fn set_irc_current_nick(&self, account_id: &str, nick: &str) {
+        if let Some(handle) = self.irc_handles.lock().unwrap().get_mut(account_id) {
+            handle.nick = nick.to_string();
+        }
     }
 
     pub fn irc_current_nick(&self, account_id: &str) -> Option<String> {

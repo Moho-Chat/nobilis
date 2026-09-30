@@ -192,7 +192,7 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     });
     let establish_abort = establish_task.abort_handle();
 
-    let (sender, mut stream, nickserv_wait) = match tokio::time::timeout(OVERALL_ESTABLISH_TIMEOUT, establish_task).await {
+    let (sender, mut stream, nickserv_wait, authenticated) = match tokio::time::timeout(OVERALL_ESTABLISH_TIMEOUT, establish_task).await {
         Err(_) => {
             // Best-effort: if establish() actually is cooperating (just
             // slow, not truly wedged), this frees it immediately instead
@@ -242,9 +242,27 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     // rather than the setting.
     state.runtime.set_irc_transport(&account_id, Some(dcc::transport_for(config)));
 
+    // A login that could not happen at connect - services were down, so the
+    // server offered no SASL - happens here instead, when the server says
+    // SASL is back. See latesasl.rs.
+    let mut late_sasl = super::latesasl::LateSasl::new(authenticated);
+    let mut clock = tokio::time::interval(std::time::Duration::from_secs(5));
+    clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     let result = async {
-        while let Some(msg) = stream.next().await.transpose()? {
-            handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
+        loop {
+            tokio::select! {
+                next = stream.next() => {
+                    let Some(msg) = next.transpose()? else { break };
+                    let outs = late_sasl.observe(&msg, config, std::time::Instant::now());
+                    act_on_late_sasl(state, &account_id, &sender, config, outs);
+                    handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
+                }
+                _ = clock.tick() => {
+                    let outs = late_sasl.tick(std::time::Instant::now());
+                    act_on_late_sasl(state, &account_id, &sender, config, outs);
+                }
+            }
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -260,6 +278,61 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     result?;
 
     Ok(())
+}
+
+/// Carries out what the live login decided.
+///
+/// On a refusal the fallbacks run in order of how little they disturb: a
+/// NickServ IDENTIFY first, which works now that services are back where the
+/// one sent at connect could not; and only where there is no NickServ password
+/// and this network has been set to allow it, a reconnect, whose registration
+/// logs in the ordinary way. Never after a refused password - reconnecting
+/// would only send it again.
+fn act_on_late_sasl(state: &AppState, account_id: &str, sender: &Sender, config: &IrcAccountConfig, outs: Vec<super::latesasl::Out>) {
+    use super::latesasl::Out;
+    let host = super::incoming::server_buffer(account_id);
+    let note = |kind: &str, body: &str| {
+        state.runtime.record_message(state, account_id, host, "server", "*", body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
+    };
+    for out in outs {
+        match out {
+            Out::Send(command) => {
+                if let Err(e) = sender.send(command) {
+                    tracing::warn!("irc[{account_id}]: sending during the late SASL login failed: {e}");
+                }
+            }
+            Out::LoggedIn { account } => {
+                tracing::info!("irc[{account_id}]: logged in with SASL after connecting");
+                let who = account.map(|a| format!(" as {a}")).unwrap_or_default();
+                note("system", &format!("SASL is available again, and moho has logged in{who} without reconnecting."));
+                // Channels that only take registered users refused us at
+                // connect; asking again is harmless for the ones we are in.
+                send_autojoin(sender, &config.autojoin);
+            }
+            Out::Refused { why, credentials } => {
+                tracing::warn!("irc[{account_id}]: the late SASL login did not happen: {why}");
+                if let Some(pw) = config.nickserv_password.as_deref().filter(|p| !p.is_empty()) {
+                    note("error", &format!("Couldn't log in with SASL: {why}. Identifying to NickServ instead."));
+                    if let Err(e) = sender.send_privmsg("NickServ", format!("IDENTIFY {pw}")) {
+                        tracing::warn!("irc[{account_id}]: NickServ IDENTIFY failed to send: {e}");
+                    }
+                } else if !credentials && config.reconnect_for_sasl {
+                    note("error", &format!("Couldn't log in with SASL on this connection: {why}. Reconnecting to log in."));
+                    let _ = sender.send_quit("Reconnecting to log in");
+                } else if !credentials {
+                    note(
+                        "error",
+                        &format!(
+                            "Couldn't log in with SASL: {why}. You stay connected without being logged in. \
+                             To have moho reconnect and log in, turn on \"Reconnect to log in when services come back\" in this network's settings."
+                        ),
+                    );
+                } else {
+                    note("error", &format!("Couldn't log in with SASL: {why}. You stay connected without being logged in."));
+                }
+            }
+        }
+    }
 }
 
 /// Standard system Tor daemon port - the sensible zero-config default when
@@ -284,7 +357,7 @@ pub(super) fn proxy_port(config: &IrcAccountConfig) -> u16 {
 /// Split out from run() specifically so it can be wrapped in one single
 /// outer timeout independent of its own inner per-step ones - see
 /// OVERALL_ESTABLISH_TIMEOUT's doc comment above.
-pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sender, ClientStream, Option<NickservWait>)> {
+pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sender, ClientStream, Option<NickservWait>, bool)> {
     let account_id = config.account_id();
 
     // A network that told us, over TLS, not to come back in plaintext.
@@ -402,7 +475,7 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     }
 
     state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
-    wait_for_welcome(state, &account_id, &mut stream).await?;
+    let welcomed = wait_for_welcome(state, &account_id, &mut stream).await?;
 
     // Landed on the alt_nicks fallback above means our real nick's old
     // session is still alive server-side. With NickServ credentials we can
@@ -425,7 +498,9 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         &account_id,
         IrcHandle {
             sender: sender.clone(),
-            nick: config.nick.clone(),
+            // What the server says we are, which a fallback nick or a server
+            // that renames on login makes different from what was asked for.
+            nick: welcomed.unwrap_or_else(|| client.current_nickname().to_string()),
             quit_message: quit_message(config),
         },
     );
@@ -478,7 +553,7 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         None
     };
 
-    Ok((sender, stream, nickserv_wait))
+    Ok((sender, stream, nickserv_wait, authenticated))
 }
 
 /// Capabilities asked for on every connection, whatever else is going on.
@@ -632,9 +707,9 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
 /// stream directly. Asking for it again here would record the capability as
 /// held without authenticating anything, which is worse than not asking:
 /// `irc_has_cap(.., "sasl")` would then be true for a connection that is not
-/// signed in. Re-authenticating an already-registered connection needs a state
-/// machine in the router rather than a blocking read, and is its own piece of
-/// work.
+/// signed in. Logging in on an already-registered connection is done by
+/// `latesasl.rs`, which follows the request through to `903` before it
+/// believes anything.
 pub(super) fn caps_worth_requesting(offered: &str) -> Vec<&str> {
     offered
         .split_whitespace()
@@ -785,7 +860,9 @@ pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream)
     }
 }
 
-pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<()> {
+/// Returns the nick the server registered us under, which is not always the
+/// one asked for: Ergo, for one, renames a connection to its account on login.
+pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<Option<String>> {
     let result = tokio::time::timeout(REGISTRATION_TIMEOUT, async {
         loop {
             match stream.next().await {
@@ -803,7 +880,7 @@ pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream:
                             state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                         }
                         if matches!(code, Response::RPL_WELCOME) {
-                            return Ok(());
+                            return Ok(args.first().filter(|n| !n.is_empty() && *n != "*").cloned());
                         }
                     }
                     // Capabilities are ACKed during registration, which is

@@ -37,6 +37,7 @@ pub mod nickserv;
 pub mod metadata;
 pub mod sts;
 pub mod sasl;
+pub mod latesasl;
 
 pub use connect::*;
 pub use history::*;

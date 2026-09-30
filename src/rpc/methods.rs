@@ -492,6 +492,7 @@ pub async fn dispatch(
                 username: p_str_opt(params, "username").map(String::from),
                 quit_message: p_str_opt(params, "quitMessage").map(String::from),
                 allow_plaintext_sasl: p_bool(params, "allowPlaintextSasl", false),
+                reconnect_for_sasl: p_bool(params, "reconnectForSasl", false),
                 sasl_mechanism: p_str_opt(params, "saslMechanism").map(String::from),
                 sasl_cert_path: p_str_opt(params, "saslCertPath").map(String::from),
                 sasl_cert_pass: p_str_opt(params, "saslCertPass").map(String::from),
@@ -699,6 +700,11 @@ pub async fn dispatch(
                 p_str_opt(params, "saslCertPath"),
                 p_str_opt(params, "saslCertPass"),
             )),
+        },
+
+        "setIrcReconnectForSasl" => match p_str_opt(params, "accountId") {
+            None => (None, Some("no such account".to_string())),
+            Some(id) => account_mutation_result(state.accounts.set_irc_reconnect_for_sasl(id, p_bool(params, "enabled", false))),
         },
 
         "joinBuffer" => {

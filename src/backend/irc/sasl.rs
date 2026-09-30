@@ -420,7 +420,7 @@ pub(super) enum SaslMechanism {
 }
 
 impl SaslMechanism {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::External => "EXTERNAL",
             Self::ScramSha256 => "SCRAM-SHA-256",
@@ -557,17 +557,25 @@ pub(super) async fn read_challenge(stream: &mut ClientStream) -> std::result::Re
     .map_err(|_| SaslRefusal::Fatal(anyhow!("server stopped answering during SASL")))?;
 
     match &message.command {
-        Command::AUTHENTICATE(payload) if payload == "+" => Ok("+".to_string()),
-        Command::AUTHENTICATE(payload) => base64::engine::general_purpose::STANDARD
-            .decode(payload)
-            .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not base64: {e}")))
-            .and_then(|bytes| {
-                String::from_utf8(bytes)
-                    .map_err(|e| SaslRefusal::Fatal(anyhow!("server's SASL challenge is not text: {e}")))
-            }),
+        Command::AUTHENTICATE(payload) => decode_challenge(payload).map_err(SaslRefusal::Fatal),
         Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
             args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
         )),
         _ => Err(SaslRefusal::Fatal(anyhow!("SASL was refused before it finished"))),
     }
+}
+
+/// One `AUTHENTICATE` payload from the server, decoded.
+///
+/// A bare `+` means "nothing", and is passed through as itself rather than
+/// decoded - it is not base64 for an empty string, it is the protocol's way of
+/// writing one.
+pub(super) fn decode_challenge(payload: &str) -> Result<String> {
+    if payload == "+" {
+        return Ok("+".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|e| anyhow!("server's SASL challenge is not base64: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| anyhow!("server's SASL challenge is not text: {e}"))
 }

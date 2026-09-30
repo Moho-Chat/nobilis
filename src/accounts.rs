@@ -47,6 +47,11 @@ pub struct IrcAccountConfig {
     pub sasl_cert_pass: Option<String>,
     #[serde(default)]
     pub allow_plaintext_sasl: bool,
+    /// Whether to reconnect when SASL returns mid-connection and the server
+    /// will not take a login on the live connection. Off by default: it drops
+    /// every channel for a moment, and most servers take the live login.
+    #[serde(default)]
+    pub reconnect_for_sasl: bool,
     #[serde(default)]
     pub autojoin: String,
     /// Nicks to watch for, comma-separated, in the order they were added.
@@ -884,6 +889,11 @@ impl AccountStore {
         })
     }
 
+    /// Whether this network may be reconnected to log in with SASL.
+    pub fn set_irc_reconnect_for_sasl(&self, account_id: &str, enabled: bool) -> Result<bool> {
+        self.mutate(account_id, |a| a.reconnect_for_sasl = enabled)
+    }
+
     /// The realname this IRC account registers with, changed while connected.
     ///
     /// Written down as well as sent, because `SETNAME` changes it on this
@@ -923,6 +933,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         sasl_enabled: a.sasl,
         sasl_username: a.sasl_user.clone().unwrap_or_default(),
         allow_plaintext_sasl: a.allow_plaintext_sasl,
+        reconnect_for_sasl: a.reconnect_for_sasl,
         sasl_mechanism: a.sasl_mechanism.clone().unwrap_or_default(),
         has_sasl_certificate: a.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()),
         // Filled in by Runtime::list_accounts, which is the only place that
@@ -960,6 +971,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -994,6 +1006,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -1037,6 +1050,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -1075,6 +1089,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
