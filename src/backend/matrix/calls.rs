@@ -89,28 +89,56 @@ pub async fn send(
     super::send_typed_event(state, account_id, buffer_id, event_type, content).await
 }
 
-/// Where to reach this homeserver's TURN servers, and with what.
+/// A public STUN server that any Matrix client may fall back on.
+///
+/// This is matrix.org's, and it is what Element itself falls back on when a
+/// homeserver offers nothing. STUN is only a mirror: a client sends it one
+/// packet and is told what its address looks like from outside, which is what
+/// a call between two networks needs in order to find a way through. It relays
+/// nothing - no audio, no video - and it holds no credentials, so it costs
+/// matrix.org nothing worth guarding and costs the caller one address.
+///
+/// It does not replace a relay. Behind the stricter kind of NAT a mirror is
+/// not enough and only a working TURN server connects the call.
+pub const FALLBACK_STUN: &[&str] = &["stun:turn.matrix.org:3478"];
+
+/// Where to reach this homeserver's TURN servers, and with what - and, beside
+/// it, the public STUN server to fall back on.
 ///
 /// Asked of the server rather than configured, because that is where the
 /// answer is: a homeserver runs its own relay and hands out short-lived
 /// credentials for it. Without one, a call only connects between two people
 /// whose networks happen to allow it - which is most of the time on a LAN and
 /// almost never between two homes.
+///
+/// The fallback is returned always and used only if the client chooses: a
+/// homeserver that advertises a relay nobody can reach - poa.st's answers
+/// `turn.poast.org` and then says nothing to anyone - looks identical to a
+/// working one from here, so this cannot decide for itself when it is needed.
 pub async fn turn_servers(state: &AppState, account_id: &str) -> anyhow::Result<Value> {
     let account = state
         .accounts
         .get_matrix(account_id)
         .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let base = account.homeserver_url.trim_end_matches('/');
-    match super::http::get_json(&format!("{base}/_matrix/client/v3/voip/turnServer"), &account.access_token).await {
-        Ok(answer) => Ok(answer),
+    let mut answer = match super::http::get_json(&format!("{base}/_matrix/client/v3/voip/turnServer"), &account.access_token).await {
+        Ok(answer) => answer,
         // A server with no relay configured answers 404, and that is not an
         // error: it means "there is no relay", which a client can still make
         // a call without.
         Err(e) => {
             tracing::debug!("matrix[{account_id}]: no TURN server offered: {e:#}");
-            Ok(json!({ "uris": [] }))
+            json!({ "uris": [] })
         }
+    };
+    with_fallback(&mut answer);
+    Ok(answer)
+}
+
+/// Adds the fallback STUN servers to a TURN answer, whatever it held.
+fn with_fallback(answer: &mut Value) {
+    if let Some(object) = answer.as_object_mut() {
+        object.insert("fallback".to_string(), json!(FALLBACK_STUN));
     }
 }
 
@@ -130,9 +158,6 @@ pub const MEMBERSHIP_TTL_MS: i64 = 90_000;
 /// events, MSC4143 - and is read below as well, so a room where Element has
 /// already moved on is still understood.
 pub const EVENT_MEMBER: &str = "org.matrix.msc3401.call.member";
-
-/// Where the membership event is going: MSC4143's own name for it.
-pub const EVENT_MEMBER_NEXT: &str = "org.matrix.msc4143.rtc.member";
 
 /// What moho puts in `foci_preferred` to mean "I am on the mesh".
 ///
@@ -577,6 +602,10 @@ async fn openid_again(state: &AppState, account_id: &str) -> anyhow::Result<Valu
 /// same on both sides: the smaller id calls the larger. It has to be a
 /// property of the pair rather than of who arrived first, because "first" is
 /// not something two clients can agree on.
+///
+/// Kept for the tests that pin the rule down; nothing in the call path
+/// asks it yet, which is its own gap rather than a reason to lose it.
+#[cfg(test)]
 pub fn should_offer(own_key: &str, their_key: &str) -> bool {
     own_key < their_key
 }
@@ -679,5 +708,31 @@ mod member_tests {
         // makes a user-id comparison alone wrong.
         assert!(should_offer("@a:example.org|AAA", "@a:example.org|ZZZ"));
         assert!(!should_offer("@a:example.org|ZZZ", "@a:example.org|AAA"));
+    }
+
+    /// The fallback rides along whether or not the homeserver offered a relay:
+    /// it is needed exactly when the relay is missing or unreachable, and the
+    /// two look the same from here.
+    #[test]
+    fn the_fallback_stun_is_offered_beside_a_relay_and_in_place_of_one() {
+        let mut with_relay = json!({ "uris": ["turn:turn.example.org"], "username": "u", "password": "p", "ttl": 86400 });
+        with_fallback(&mut with_relay);
+        assert_eq!(with_relay["uris"][0], "turn:turn.example.org");
+        assert_eq!(with_relay["fallback"][0], "stun:turn.matrix.org:3478");
+
+        let mut without = json!({ "uris": [] });
+        with_fallback(&mut without);
+        assert_eq!(without["uris"].as_array().map(Vec::len), Some(0));
+        assert_eq!(without["fallback"][0], "stun:turn.matrix.org:3478");
+    }
+
+    /// STUN takes no credentials and relays nothing, so the fallback must never
+    /// be a `turn:` address - that would be a relay somebody else paid for.
+    #[test]
+    fn the_fallback_is_only_ever_stun() {
+        assert!(!FALLBACK_STUN.is_empty());
+        for uri in FALLBACK_STUN {
+            assert!(uri.starts_with("stun:"), "{uri} is not a STUN address");
+        }
     }
 }

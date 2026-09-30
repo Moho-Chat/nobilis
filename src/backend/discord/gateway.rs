@@ -176,7 +176,6 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // Disjoint borrows, so the resume state can be updated while the maps
     // are being passed around mutably.
     let GatewaySession { resume, channel_map, guild_context } = session;
-    let account_id = config.account_id();
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
     let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());

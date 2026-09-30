@@ -40,15 +40,11 @@ sha2 = "0.10"
 # The login captcha's proof of work; see backend/sneedchat/captcha.rs.
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 rand = "0.8"
-# Discord's own voice encryption, for the connection this crate hand-rolls
-# rather than hands to songbird - see backend/discord/voicecrypto.rs. Both are
-# already in the tree as songbird's own dependencies; named here because a Go
-# Live stream is a connection songbird has no part in.
+# Discord's own voice encryption, for the voice and Go Live connections this
+# crate runs itself - see backend/discord/voicecrypto.rs.
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
-# DAVE, Discord's end-to-end encryption for voice. Already in the tree as
-# songbird's own dependency - named here because the Go Live stream
-# connection is one songbird has no part in, and Discord refuses a voice
+# DAVE, Discord's end-to-end encryption for voice. Discord refuses a voice
 # connection that cannot speak it (close code 4017).
 davey = "0.1"
 # `image` for reading Discord's login code, `svg` (a default) for drawing
@@ -98,23 +94,18 @@ ruma-common = "=0.19.0"
 ruma-client-api = "=0.24.0"
 ruma-events = "=0.34.0"
 js_int = "=0.2.2"
-# Discord voice. Standalone: no serenity or twilight gateway, since nobilis
-# has its own - only the driver, which needs a websocket backend named
-# explicitly, and tungstenite is what the rest of this crate already speaks.
-# `receive` is what makes hearing anyone possible; it is off by default.
-songbird = { version = "0.6", default-features = false, features = ["driver", "rustls", "tungstenite", "receive", "gateway"] }
+# Discord voice is this crate's own connection (backend/discord/voiceconn.rs):
+# cpal for the sound devices, opus2 for the codec. Songbird carried calls until
+# they needed video, which it never asks Discord for.
 cpal = "0.18.2"
-symphonia = { version = "0.5", default-features = false, features = ["pcm"] }
-# The Opus encoder, for recording a voice message. Already in the tree as
-# songbird's own dependency and already built against the same libopus - this
-# only asks for it by name so it can be used directly.
+# The Opus codec, for calls and for recording a voice message.
 opus2 = "0.4"
-async-trait = "0.1.92"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+socket2 = "0.6"
 
 # Tor's certificate validation hangs on Windows without this.
 #

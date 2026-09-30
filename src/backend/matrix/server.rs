@@ -54,6 +54,7 @@ impl ServerFacts {
     /// String comparison would say `v1.10` is older than `v1.9`, which is the
     /// kind of wrong that only shows up once a year and then looks like
     /// something else entirely - so the numbers are compared as numbers.
+    #[cfg(test)]
     pub fn speaks(&self, wanted: &str) -> bool {
         let parse = |v: &str| -> Option<(u32, u32)> {
             let (major, minor) = v.trim_start_matches('v').split_once('.')?;
@@ -73,6 +74,7 @@ impl ServerFacts {
     }
 
     /// Whether it has this unstable feature switched on.
+    #[cfg(test)]
     pub fn has_unstable(&self, feature: &str) -> bool {
         self.unstable.iter().any(|f| f == feature)
     }

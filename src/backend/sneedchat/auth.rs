@@ -92,9 +92,6 @@ impl Session {
         Self { http: HttpClient::new(transport, CookieJar::new(), user_agent), base }
     }
 
-    pub fn base(&self) -> &str {
-        &self.base
-    }
 
     /// Whether the current session is authenticated, costing one request.
     pub async fn is_authenticated(&self) -> Result<bool> {

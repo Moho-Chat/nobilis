@@ -161,6 +161,15 @@ impl Dave {
     /// legitimately for the moment between joining a group and processing the
     /// commit that names its members - so it is worth reporting plainly
     /// rather than treating as corruption.
+    /// Encrypts one Opus frame for the group.
+    pub fn encrypt_opus(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
+        Ok(self
+            .session
+            .encrypt_opus(frame)
+            .map_err(|e| anyhow::anyhow!("could not encrypt audio: {e:?}"))?
+            .into_owned())
+    }
+
     pub fn decrypt_video(&mut self, from_user: u64, frame: &[u8]) -> Result<Vec<u8>> {
         self.session
             .decrypt(from_user, davey::MediaType::VIDEO, frame)

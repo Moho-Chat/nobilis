@@ -1805,12 +1805,6 @@ impl Runtime {
         self.discord_voice_channels.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default()
     }
 
-    /// Records where someone is, or that they left. Returns the channel they
-    /// were in before, so a caller can tell a move from an arrival.
-    pub fn set_discord_voice_state(&self, account_id: &str, user_id: &str, channel_id: Option<&str>, name: Option<&str>) -> Option<String> {
-        self.set_discord_voice_presence(account_id, user_id, channel_id, name, None, VoiceFlags::default())
-    }
-
     /// The same, carrying what they are doing in there.
     ///
     /// Discord puts these on every voice state it sends, and they are the only
@@ -1881,14 +1875,6 @@ impl Runtime {
             .insert((account_id.to_string(), user_id.to_string()), url.to_string());
     }
 
-    pub fn discord_known_avatar(&self, account_id: &str, user_id: &str) -> Option<String> {
-        self.discord_voice_avatars
-            .lock()
-            .unwrap()
-            .get(&(account_id.to_string(), user_id.to_string()))
-            .cloned()
-    }
-
     /// What this account has previously learned to call somebody.
     ///
     /// A typing notice from a DM carries no member object to read a name
@@ -1915,17 +1901,6 @@ impl Runtime {
             .unwrap()
             .get(&(account_id.to_string(), user_id.to_string()))
             .cloned()
-    }
-
-    /// Everyone in a voice channel, as (user id, what to call them).
-    ///
-    /// Nobody is excluded here: a channel list has to show you your own
-    /// presence, which is how you can tell you are in a call at all.
-    pub fn discord_voice_members(&self, account_id: &str, channel_id: &str) -> Vec<(String, String)> {
-        self.discord_voice_roster(account_id, channel_id)
-            .into_iter()
-            .map(|m| (m.user_id, m.name))
-            .collect()
     }
 
     /// The same, with what each of them is doing.
@@ -2159,18 +2134,6 @@ impl Runtime {
         let mutes = self.discord_mutes.lock().unwrap();
         let Some(entry) = mutes.get(&(account_id.to_string(), guild_key.to_string())) else { return false };
         entry.muted || entry.channels.get(channel_id).copied().unwrap_or(false)
-    }
-
-    /// Every guild this account has settings for, so they can all be applied
-    /// at once when the channels they name finally exist.
-    pub fn discord_mute_keys(&self, account_id: &str) -> Vec<String> {
-        self.discord_mutes
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|(account, _)| account == account_id)
-            .map(|(_, guild)| guild.clone())
-            .collect()
     }
 
     pub fn discord_buffers_in_guild(&self, account_id: &str, guild_id: &str) -> Vec<String> {
@@ -2762,15 +2725,6 @@ impl Runtime {
         self.matrix_room_avatars.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
     }
 
-    /// This room's power levels, as the state last said.
-    pub fn matrix_power_levels(&self, account_id: &str, room_id: &str) -> Option<Value> {
-        self.matrix_power_levels
-            .lock()
-            .unwrap()
-            .get(&(account_id.to_string(), room_id.to_string()))
-            .cloned()
-    }
-
     pub fn set_matrix_power_levels(&self, account_id: &str, room_id: &str, content: Value) {
         self.matrix_power_levels.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), content);
     }
@@ -2834,17 +2788,6 @@ impl Runtime {
     /// Who a room is a direct message with, if the account says it is one.
     pub fn matrix_direct_peer(&self, account_id: &str, room_id: &str) -> Option<String> {
         self.matrix_directs.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
-    }
-
-    /// Every room this account calls a direct message.
-    pub fn matrix_direct_rooms(&self, account_id: &str) -> Vec<String> {
-        self.matrix_directs
-            .lock()
-            .unwrap()
-            .keys()
-            .filter(|(account, _)| account == account_id)
-            .map(|(_, room)| room.clone())
-            .collect()
     }
 
     pub fn matrix_widgets(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {

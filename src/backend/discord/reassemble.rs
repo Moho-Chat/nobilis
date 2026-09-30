@@ -12,6 +12,7 @@
 //! whole, and drop what is too old to wait for any longer.
 
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use super::rtp::Packet;
 
@@ -25,7 +26,21 @@ pub struct Frame {
     /// inter frame first will either refuse it or produce garbage.
     pub keyframe: bool,
     pub data: Vec<u8>,
+    /// Something before this frame was lost for good. A decoder handed an
+    /// inter frame after a loss draws it on top of a picture it never had -
+    /// the smearing that spreads across a moving camera until the next
+    /// keyframe - so whoever decodes must stop at this and wait for one.
+    pub after_gap: bool,
 }
+
+/// How long a complete frame waits behind a missing packet for it to be sent
+/// again, before the missing packet is given up on.
+///
+/// A retransmission asked for straight away comes back in one round trip to
+/// the relay - tens of milliseconds - and a frame at thirty a second is
+/// thirty-three; this is a few frames' worth, which covers a resend without
+/// making every loss a visible stall.
+pub const RETRANSMIT_WAIT: Duration = Duration::from_millis(120);
 
 /// How many packets to hold before giving up on a gap.
 ///
@@ -49,11 +64,17 @@ pub struct Reassembler {
     /// without it.
     floor: u64,
     window: usize,
+    /// Since when a complete frame has been held behind a hole, if one is.
+    waiting_since: Option<Instant>,
+    /// Whether any frame has been handed out. Until one has, nothing can have
+    /// been lost - the stream simply had not begun - and a receiver is
+    /// waiting for a keyframe anyway.
+    emitted: bool,
 }
 
 impl Reassembler {
     pub fn new(window: usize) -> Self {
-        Self { packets: BTreeMap::new(), highest: None, floor: 0, window: window.max(2) }
+        Self { packets: BTreeMap::new(), highest: None, floor: 0, window: window.max(2), waiting_since: None, emitted: false }
     }
 
     /// Where a 16-bit sequence number sits on a line that does not wrap.
@@ -76,7 +97,14 @@ impl Reassembler {
     /// complete nothing and the one carrying the marker completes everything
     /// at once. More than one comes back when a late packet fills the hole in
     /// an older frame and the frames after it were already whole.
+    #[cfg(test)]
     pub fn push(&mut self, packet: Packet) -> Vec<Frame> {
+        self.push_at(packet, Instant::now())
+    }
+
+    /// `push`, told the time - which is what decides whether a hole has been
+    /// waited on long enough.
+    pub fn push_at(&mut self, packet: Packet, now: Instant) -> Vec<Frame> {
         let extended = self.extend(packet.sequence);
         if extended < self.floor {
             return Vec::new();
@@ -86,7 +114,22 @@ impl Reassembler {
         // replacing it would be harmless but pointless.
         self.packets.entry(extended).or_insert(packet);
         self.evict();
-        self.drain()
+        self.drain(now)
+    }
+
+    /// Sequence numbers that are missing between what has been handed out and
+    /// the newest packet - the ones worth asking the sender for again. At most
+    /// `limit` of them, oldest first.
+    pub fn missing(&self, limit: usize) -> Vec<u16> {
+        let Some(highest) = self.highest else { return Vec::new() };
+        if !self.emitted {
+            return Vec::new();
+        }
+        (self.floor..highest)
+            .filter(|sequence| !self.packets.contains_key(sequence))
+            .take(limit)
+            .map(|sequence| (sequence & 0xffff) as u16)
+            .collect()
     }
 
     /// Forgets packets too old to be waiting for.
@@ -105,11 +148,21 @@ impl Reassembler {
     }
 
     /// Every complete frame currently in the window, oldest first.
-    fn drain(&mut self) -> Vec<Frame> {
+    fn drain(&mut self, now: Instant) -> Vec<Frame> {
         let mut out = Vec::new();
         loop {
             let Some(range) = self.first_complete() else { break };
             let (start, end) = range;
+            // A hole before this frame: hold it a moment for the hole to be
+            // filled by a resend, then give up on the hole and say so.
+            let after_gap = self.emitted && start > self.floor;
+            if after_gap {
+                let since = *self.waiting_since.get_or_insert(now);
+                if now.duration_since(since) < RETRANSMIT_WAIT {
+                    break;
+                }
+            }
+            self.waiting_since = None;
             let mut data = Vec::new();
             let mut keyframe = false;
             let mut timestamp = 0;
@@ -127,7 +180,8 @@ impl Reassembler {
             // belong to anything a decoder will still accept.
             self.packets.retain(|&sequence, _| sequence > end);
             if !data.is_empty() {
-                out.push(Frame { timestamp, keyframe, data });
+                self.emitted = true;
+                out.push(Frame { timestamp, keyframe, data, after_gap });
             }
         }
         out
@@ -281,13 +335,45 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_behind_a_hole_waits_for_the_resend_and_takes_it() {
+        let mut r = Reassembler::new(DEFAULT_WINDOW);
+        let t = Instant::now();
+        r.push_at(packet(10, true, first_packet(&[1])), t);
+        // 11 is lost; 12 is a whole frame, held rather than handed out.
+        assert!(r.push_at(packet(12, true, first_packet(&[3])), t).is_empty());
+        assert_eq!(r.missing(8), vec![11]);
+        // The resend arrives in time: both come out, in order, whole.
+        let frames = r.push_at(packet(11, true, first_packet(&[2])), t + Duration::from_millis(40));
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|f| !f.after_gap));
+    }
+
+    #[test]
+    fn a_hole_that_is_not_filled_in_time_is_given_up_and_marked() {
+        let mut r = Reassembler::new(DEFAULT_WINDOW);
+        let t = Instant::now();
+        r.push_at(packet(10, true, first_packet(&[1])), t);
+        assert!(r.push_at(packet(12, true, first_packet(&[3])), t).is_empty());
+        let frames = r.push_at(packet(13, true, first_packet(&[4])), t + RETRANSMIT_WAIT);
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].after_gap, "the first frame past the hole says so");
+        assert!(!frames[1].after_gap);
+        assert!(r.missing(8).is_empty(), "nothing is still asked for once given up");
+    }
+
+    #[test]
     fn the_frame_after_a_lost_one_still_arrives() {
         let mut r = Reassembler::new(DEFAULT_WINDOW);
-        r.push(packet(10, false, first_packet(&[1])));
-        r.push(packet(12, true, later_packet(&[3])));
-        let frames = r.push(packet(13, true, first_packet(&[9])));
-        assert_eq!(frames.len(), 1, "losing one frame must not stop the stream");
+        let t = Instant::now();
+        r.push_at(packet(9, true, first_packet(&[0])), t);
+        r.push_at(packet(10, false, first_packet(&[1])), t);
+        r.push_at(packet(12, true, later_packet(&[3])), t);
+        assert!(r.push_at(packet(13, true, first_packet(&[9])), t).is_empty(), "held for a resend first");
+        let frames = r.push_at(packet(14, true, first_packet(&[10])), t + RETRANSMIT_WAIT);
+        assert_eq!(frames.len(), 2, "losing one frame must not stop the stream");
         assert_eq!(&frames[0].data[3..], &[9]);
+        assert!(frames[0].after_gap, "and it says a frame was lost before it");
+        assert!(!frames[1].after_gap);
     }
 
     #[test]

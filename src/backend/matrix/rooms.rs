@@ -30,6 +30,24 @@ pub struct RoomInfo {
 /// stays as the fallback for an account whose list has not been read yet, or
 /// one that has never had a DM written to it by any client.
 pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], direct_peer: Option<&str>) -> RoomInfo {
+    // A direct message this account started, whose other person has been
+    // invited and not yet joined. The account's own `m.direct` list often does
+    // not have it - a client other than this one may have created the room,
+    // and nobody writes the list until somebody accepts - which left the
+    // conversation called "Empty room" although the invitation names exactly
+    // who it is for. The invited member's own event says so: `is_direct` is
+    // set on it by whoever made the room.
+    //
+    // Only that flag, and never merely "one person invited": a private room
+    // with a single guest waiting is not a conversation with that guest.
+    let invited_peer: Option<&str> = events
+        .iter()
+        .filter(|e| e["type"].as_str() == Some("m.room.member"))
+        .filter(|e| e["content"]["membership"].as_str() == Some("invite") && e["content"]["is_direct"].as_bool() == Some(true))
+        .filter_map(|e| e["state_key"].as_str())
+        .find(|who| *who != own_user_id);
+    let direct_peer = direct_peer.or(invited_peer);
+
     let mut room_name: Option<String> = None;
     let mut canonical_alias: Option<String> = None;
     let mut joined_count = 0usize;
@@ -437,5 +455,32 @@ mod space_tests {
         let events = vec![json!({ "type": "m.room.avatar", "content": { "url": "mxc://example.org/abc" } })];
         assert_eq!(room_avatar_mxc(&refs(&events)).as_deref(), Some("mxc://example.org/abc"));
         assert_eq!(room_avatar_mxc(&[]), None);
+    }
+
+    /// The conversation somebody started, before the other person has said
+    /// yes: named for them, not "Empty room". The flag is what makes it one.
+    #[test]
+    fn a_direct_message_awaiting_its_other_person_is_named_after_them() {
+        let events = vec![
+            json!({ "type": "m.room.member", "state_key": "@me:matrix.org", "sender": "@me:matrix.org", "content": { "membership": "join" } }),
+            json!({ "type": "m.room.member", "state_key": "@them:poa.st", "sender": "@me:matrix.org",
+                    "content": { "membership": "invite", "is_direct": true, "displayname": "Them" } }),
+        ];
+        let info = derive_room_info("!abcdef:matrix.org", "@me:matrix.org", &refs(&events), None);
+        assert_eq!(info.kind, "dm");
+        assert_eq!(info.name, "Them");
+    }
+
+    /// Without the flag it is only a private room with a guest waiting, and
+    /// naming it after the guest would be a claim nobody made.
+    #[test]
+    fn a_lone_invitation_that_is_not_direct_is_still_an_empty_room() {
+        let events = vec![
+            json!({ "type": "m.room.member", "state_key": "@me:matrix.org", "sender": "@me:matrix.org", "content": { "membership": "join" } }),
+            json!({ "type": "m.room.member", "state_key": "@them:poa.st", "sender": "@me:matrix.org", "content": { "membership": "invite" } }),
+        ];
+        let info = derive_room_info("!abcdef:matrix.org", "@me:matrix.org", &refs(&events), None);
+        assert_eq!(info.kind, "channel");
+        assert!(info.name.starts_with("Empty room ("), "got {}", info.name);
     }
 }

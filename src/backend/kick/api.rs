@@ -52,6 +52,10 @@ pub struct Channel {
     /// in general, even though it often is for older channels.
     pub chatroom_id: u64,
     pub slug: String,
+    /// On the payload and unused here: the channel's owner, which moho
+    /// shows by slug instead. Kept because a wire struct that drops fields
+    /// stops being a description of what the site sends.
+    #[allow(dead_code)]
     pub username: String,
     pub avatar_url: Option<String>,
     /// Chat is restricted to subscribers right now.
@@ -418,7 +422,11 @@ pub fn bare_token(raw: &str) -> String {
 pub struct Identity {
     #[serde(default)]
     pub username: Option<String>,
+    /// On the payload and unread here: moho identifies a Kick account by
+    /// its name. Kept so the struct stays a description of what the API
+    /// sends rather than of what this file happens to want.
     #[serde(default)]
+    #[allow(dead_code)]
     pub id: Option<u64>,
 }
 
@@ -703,7 +711,11 @@ pub struct HistoryMessage {
     pub id: String,
     #[serde(default)]
     pub content: String,
+    /// On the payload and unread here - every message this endpoint
+    /// returns is an ordinary one. Kept for the same reason as the rest of
+    /// this struct's unused fields: it says what the wire carries.
     #[serde(rename = "type", default)]
+    #[allow(dead_code)]
     pub kind: String,
     #[serde(default)]
     pub created_at: Option<String>,
@@ -1582,31 +1594,6 @@ pub async fn prediction_latest(
 ) -> Result<Option<(Prediction, Option<PredictionVote>)>> {
     let body = prediction_call(http, token, &format!("/api/v2/channels/{slug}/predictions/latest"), None).await?;
     Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
-}
-
-/// The predictions this channel has run before, newest first.
-pub async fn predictions_recent(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Result<Vec<Prediction>> {
-    #[derive(Deserialize)]
-    struct RecentEnvelope {
-        #[serde(default)]
-        data: Option<RecentData>,
-    }
-    #[derive(Deserialize)]
-    struct RecentData {
-        #[serde(default)]
-        predictions: Vec<Prediction>,
-    }
-    let url = format!("{API_ROOT}/api/v2/channels/{slug}/predictions/recent");
-    let mut req = http.get(&url).header("Accept", "application/json");
-    if let Some(token) = token.filter(|t| !t.is_empty()) {
-        req = req.bearer_auth(token);
-    }
-    let res = req.send().await.context("asking Kick about past predictions")?;
-    if !res.status().is_success() {
-        bail!("Kick answered {} about past predictions", res.status());
-    }
-    let body: RecentEnvelope = res.json().await.context("reading Kick's answer about past predictions")?;
-    Ok(body.data.map(|d| d.predictions).unwrap_or_default())
 }
 
 /// Puts points on an outcome.

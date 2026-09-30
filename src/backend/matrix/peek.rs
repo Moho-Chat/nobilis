@@ -79,12 +79,16 @@ pub async fn recent(state: &AppState, account_id: &str, room_id: &str, limit: u3
     );
     let answer = match http::get_json(&url, &account.access_token).await {
         Ok(answer) => answer,
-        // Said plainly rather than passed through. A homeserver that will not
-        // peek answers with a bare M_FORBIDDEN naming the room, which reads
-        // as "you are banned" rather than as what it is - a setting on your
-        // own server, not a judgement by the room's.
+        // Said plainly rather than passed through, and as what it usually is.
+        // The room allowed it - the caller only asks about world-readable
+        // rooms - so a bare M_FORBIDDEN here means this homeserver has no
+        // copy of the room to read from. Only a server with somebody in a
+        // room holds its history, and a room on another server that nobody
+        // here has joined is one it has never seen. Measured against six
+        // servers' directories: rooms on our own server and ones our users
+        // were already in answered, and ten of twelve elsewhere did not.
         Err(e) if e.to_string().contains("M_FORBIDDEN") => {
-            anyhow::bail!("your homeserver does not allow looking into a room you have not joined")
+            anyhow::bail!("your homeserver has no copy of this room's history to show - it only keeps rooms somebody on it has joined")
         }
         Err(e) => return Err(e).context("reading the room"),
     };

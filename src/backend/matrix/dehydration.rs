@@ -197,7 +197,7 @@ pub async fn rehydrate_with_code(state: &crate::state::AppState, account_id: &st
         .context("caching the pickle key")?;
     let _ = state.accounts.set_matrix_dehydration(account_id, true);
 
-    rehydrate(state, account_id, &session, &config).await
+    rehydrate(account_id, &session, &config).await
 }
 
 /// Takes down whatever was left last time, collects what it was sent, and puts
@@ -210,7 +210,7 @@ pub async fn rehydrate_on_connect(state: &crate::state::AppState, account_id: &s
     if !config.dehydration_enabled {
         return;
     }
-    if let Err(e) = rehydrate(state, account_id, session, &config).await {
+    if let Err(e) = rehydrate(account_id, session, &config).await {
         // Never fatal. A dehydrated device that cannot be collected costs the
         // keys it was holding; failing the connection over it would cost the
         // whole account.
@@ -219,7 +219,6 @@ pub async fn rehydrate_on_connect(state: &crate::state::AppState, account_id: &s
 }
 
 async fn rehydrate(
-    state: &crate::state::AppState,
     account_id: &str,
     session: &CryptoSession,
     config: &crate::accounts::MatrixAccountConfig,

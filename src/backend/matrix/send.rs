@@ -1229,7 +1229,6 @@ pub(super) async fn redact_event(homeserver_url: &str, access_token: &str, room_
 
 #[cfg(test)]
 mod edit_tests {
-    use super::*;
 
     /// An edit carries the sender's formatting the same way a new message
     /// does. Building this in two places is how a formatted body reached

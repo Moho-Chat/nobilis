@@ -758,30 +758,9 @@ pub(super) async fn end_cap_and_register(
     Ok(())
 }
 
-/// What the server says it can do, or nothing if it will not say.
-///
-/// `CAP LS 302` may answer over several lines, each but the last marked with
-/// a `*` in the parameter before the list. They are gathered until the one
-/// without it, because a capability named on a continuation line is as real
-/// as one named on the first.
-///
-/// A server too old to answer at all is not an error: it times out, this
-/// returns None, and the caller falls back to asking for everything the way
-/// it always did.
-pub(super) async fn offered_caps(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
-    offered_caps_raw(sender, stream).await.map(|raw| {
-        raw.iter()
-            // `cap=value` advertises a capability with parameters - SASL names
-            // its mechanisms this way, STS its duration and port. The name is
-            // what is requested.
-            .map(|cap| cap.split('=').next().unwrap_or(cap).to_string())
-            .collect()
-    })
-}
-
 /// The offer as the server wrote it, values and all.
 ///
-/// Separate from `offered_caps` because two callers want two different things
+/// Two callers want two different things from a CAP LS
 /// out of one answer: negotiation wants names to compare against
 /// `WANTED_CAPS`, and STS wants the value it would otherwise have thrown away.
 pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {

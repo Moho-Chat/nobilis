@@ -27,6 +27,10 @@ pub struct WireMessage {
     #[serde(default)]
     pub message_uuid: String,
     #[serde(default)]
+    /// On the wire and unread: the site's own timestamp. Kept because a
+    /// wire struct that drops the fields it does not use stops describing
+    /// what arrives.
+    #[allow(dead_code)]
     pub message_date: i64,
     /// Nonzero once this message has been edited at least once - the wire
     /// has no separate "edit" event, the server just re-sends the same
@@ -52,6 +56,8 @@ pub struct WireMessage {
     /// a room. Acting on that guess would have painted ordinary messages as
     /// private ones.
     #[serde(default)]
+    /// Likewise: the caller already knows the room, having asked it.
+    #[allow(dead_code)]
     pub room_id: Option<u32>,
 }
 
@@ -269,16 +275,6 @@ impl ServerResponse {
             motd: raw.motd.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
         }
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-            && self.whisper.is_none()
-            && self.perms.is_none()
-            && self.deleted_uuids.is_empty()
-            && self.users_joined.is_empty()
-            && self.users_left.is_empty()
-            && self.plaintext.is_none()
-    }
 }
 
 /// Decode the HTML entities the server escapes in `message_raw`.
@@ -400,6 +396,10 @@ pub fn prepare_whisper(target: &str, body: &str) -> String {
 /// is the one somebody will type after reading about this feature anywhere
 /// else, and taking it means a message meant for one person cannot go to the
 /// room because of the word chosen for it.
+///
+/// The no-roster form, which only the tests want: everything live goes
+/// through `parse_whisper_command_among` with the names it knows.
+#[cfg(test)]
 pub fn parse_whisper_command(text: &str) -> Option<(String, String)> {
     parse_whisper_command_among(text, &[])
 }
@@ -468,6 +468,24 @@ pub fn parse_whisper_command_among(text: &str, known: &[String]) -> Option<(Stri
 /// `/delete <uuid>` - unlike `/edit`, just the bare uuid, no JSON.
 pub fn prepare_delete(uuid: &str) -> String {
     format!("/delete {uuid}")
+}
+
+impl ServerResponse {
+    /// Whether the frame carried nothing at all.
+    ///
+    /// Only the tests ask: the live path looks at the piece it wants and
+    /// ignores the rest, so a frame being wholly empty is not a case it has
+    /// to name.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+            && self.whisper.is_none()
+            && self.perms.is_none()
+            && self.deleted_uuids.is_empty()
+            && self.users_joined.is_empty()
+            && self.users_left.is_empty()
+            && self.plaintext.is_none()
+    }
 }
 
 #[cfg(test)]

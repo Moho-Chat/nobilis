@@ -309,6 +309,9 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     .await
     {
         Ok(super::streamconn::Connected::Sending(sender)) => {
+            if sound_wanted(account_id) {
+                sender.clone().start_audio(account_id.to_string());
+            }
             senders().lock().unwrap().insert(account_id.to_string(), sender);
             state.events.emit(
                 "discordStream",
@@ -364,6 +367,22 @@ fn senders() -> &'static std::sync::Mutex<std::collections::HashMap<String, std:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>>,
     > = std::sync::OnceLock::new();
     SENDERS.get_or_init(Default::default)
+}
+
+/// Whether the next stream from each account carries the computer's sound.
+fn sound() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
+    static SOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
+    SOUND.get_or_init(Default::default)
+}
+
+/// Says whether the stream about to start should carry sound. On unless said
+/// otherwise, which is what Discord's own client does.
+pub fn set_sound(account_id: &str, wanted: bool) {
+    sound().lock().unwrap().insert(account_id.to_string(), wanted);
+}
+
+fn sound_wanted(account_id: &str) -> bool {
+    sound().lock().unwrap().get(account_id).copied().unwrap_or(true)
 }
 
 /// Puts one encoded frame on the wire.

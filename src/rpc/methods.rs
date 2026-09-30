@@ -792,6 +792,10 @@ pub async fn dispatch(
         // The public room directory - Element's room explorer. Optionally
         // somebody else's directory, which is how a room on a server this
         // account has never touched is found at all.
+        // Directories worth adding to a room search, for a client that wants
+        // to offer them. Needs no account: it is a list, not a question.
+        "suggestedMatrixDirectories" => (Some(backend::matrix::suggested_directories()), None),
+
         "searchMatrixRooms" => {
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("searchMatrixRooms requires \"accountId\"".to_string()));
@@ -1093,9 +1097,9 @@ pub async fn dispatch(
             }
         }
 
-        /// How long it has been running and whether the microphone is hearing
-        /// anything - polled by the window rather than pushed, because it is
-        /// only wanted while somebody is watching a timer.
+        // How long it has been running and whether the microphone is hearing
+        // anything - polled by the window rather than pushed, because it is
+        // only wanted while somebody is watching a timer.
         "voiceMessageProgress" => match crate::voicenote::progress() {
             None => (Some(serde_json::json!({ "recording": false })), None),
             Some(p) => (
@@ -2410,6 +2414,9 @@ pub async fn dispatch(
                 }
                 if let Some(b) = params.get("autoAccept").and_then(|v| v.as_bool()) {
                     p.auto_accept = b;
+                }
+                if let Some(b) = params.get("autoResume").and_then(|v| v.as_bool()) {
+                    p.auto_resume = b;
                 }
                 if let Some(ip) = p_str_opt(params, "advertisedIp") {
                     p.advertised_ip = (!ip.is_empty()).then(|| ip.to_string());
@@ -4437,6 +4444,10 @@ pub async fn dispatch(
                 user_id,
             };
             let result = if method == "startDiscordScreenShare" {
+                // The computer's sound goes with the picture unless the
+                // window says otherwise.
+                let sound = params.get("audio").and_then(|v| v.as_bool()).unwrap_or(true);
+                backend::discord::golive::set_sound(&account_id, sound);
                 backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
             } else {
                 backend::discord::golive::close(&account_id);

@@ -1041,7 +1041,6 @@ fn renamed_to(room: &Value, current: &str) -> Option<String> {
 #[cfg(test)]
 mod rename_tests {
     use super::renamed_to;
-    use anyhow::Context;
     use serde_json::json;
 
     fn name_event(name: &str) -> serde_json::Value {

@@ -6,17 +6,14 @@
 //! neither is usable alone, so this waits for both and then opens the actual
 //! voice connection.
 //!
-//! The connection itself is Songbird's. Doing it by hand is no longer
-//! reasonable: on top of the voice websocket, UDP hole punching and Opus, a
-//! voice connection now has to negotiate DAVE, Discord's end-to-end
-//! encryption, which became mandatory in 2026.
+//! The connection itself is `voiceconn`'s. It was songbird's until cameras
+//! mattered: songbird never tells Discord it can receive video, so nobody's
+//! camera ever arrived. See voiceconn.rs for what replaced it.
 
 use crate::state::AppState;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde_json::json;
-use songbird::id::{ChannelId, GuildId, UserId};
-use songbird::driver::{DecodeMode, DecodeConfig};
-use songbird::{Config, ConnectionInfo, Driver, Event, EventContext, EventHandler};
+use super::voiceconn::{self, Ended, Handshake, Media, VoiceConn};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -85,7 +82,9 @@ impl Default for VoiceOptions {
 #[derive(Default)]
 pub struct VoiceState {
     pending: Mutex<HashMap<String, PendingHandshake>>,
-    drivers: Mutex<HashMap<String, Driver>>,
+    conns: Mutex<HashMap<String, Arc<VoiceConn>>>,
+    /// Reconnection attempts since the last connection that held, per account.
+    retries: Mutex<HashMap<String, u32>>,
     options: Mutex<HashMap<String, VoiceOptions>>,
     /// The running microphone stream, held here because dropping it stops the
     /// capture; the driver reads from the buffer it feeds.
@@ -132,7 +131,7 @@ pub struct SpeakingTracker {
 const SPEAKING_HOLD: std::time::Duration = std::time::Duration::from_millis(400);
 
 impl SpeakingTracker {
-    fn learn(&self, ssrc: u32, user_id: String) {
+    pub(super) fn learn(&self, ssrc: u32, user_id: String) {
         // Once per speaker per call, and at info because it is the only
         // evidence that Discord is announcing these at all - which is
         // otherwise invisible from outside, since a missing announcement and
@@ -143,12 +142,12 @@ impl SpeakingTracker {
         }
     }
 
-    fn forget(&self, ssrc: u32) {
+    pub(super) fn forget(&self, ssrc: u32) {
         self.owners.lock().unwrap().remove(&ssrc);
         self.heard.lock().unwrap().remove(&ssrc);
     }
 
-    fn heard_from(&self, ssrc: u32, peak: f32) {
+    pub(super) fn heard_from(&self, ssrc: u32, peak: f32) {
         self.heard.lock().unwrap().insert(ssrc, (std::time::Instant::now(), peak));
     }
 
@@ -199,7 +198,7 @@ impl SpeakingTracker {
 /// A peak rather than a mean: what this drives is a "somebody is talking"
 /// indicator, and the mean over 20ms of speech - which is mostly the quiet
 /// parts of a waveform - reads as near-silence even when it is not.
-fn peak_of(samples: &[i16]) -> f32 {
+pub(super) fn peak_of(samples: &[i16]) -> f32 {
     samples.iter().map(|s| (s.unsigned_abs() as f32) / 32768.0).fold(0.0, f32::max)
 }
 
@@ -322,71 +321,13 @@ mod speaking_tests {
     }
 }
 
-/// Plays what everyone else says.
-///
-/// Songbird hands over each 20ms tick already decoded and per-speaker, so the
-/// mixing is ours to do: several people talking at once is the normal case,
-/// not an error, and their audio has to be summed rather than interleaved or
-/// dropped. Saturating addition means a loud room clips rather than wrapping
-/// around into noise.
-struct Speakers {
-    /// None on a machine whose audio output would not open. The call still
-    /// runs - you can talk, and you can see who else is - it is just silent.
-    playback: Option<Arc<crate::audio::Playback>>,
-    tracker: Arc<SpeakingTracker>,
-}
-
-/// Learns which stream belongs to whom, and forgets it when they leave.
-///
-/// A separate handler because these are separate events from the audio and
-/// arrive on their own schedule - the mapping is announced once, when someone
-/// first speaks, long before or after any particular tick.
-struct Identities {
-    tracker: Arc<SpeakingTracker>,
-}
-
-#[async_trait::async_trait]
-impl EventHandler for Identities {
-    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        match ctx {
-            EventContext::SpeakingStateUpdate(speaking) => {
-                if let Some(user) = speaking.user_id {
-                    self.tracker.learn(speaking.ssrc, user.0.to_string());
-                }
-            }
-            EventContext::ClientDisconnect(who) => {
-                // Keyed by user rather than SSRC here, so the whole entry goes
-                // rather than leaving them stuck mid-word in the view.
-                let user = who.user_id.0.to_string();
-                let ssrcs: Vec<u32> = self
-                    .tracker
-                    .owners
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|(_, u)| **u == user)
-                    .map(|(s, _)| *s)
-                    .collect();
-                // Nothing to forget by SSRC if they never spoke - which is
-                // exactly when the deduction above was covering for them, and
-                // it stops on its own once they are out of the roster.
-                for ssrc in ssrcs {
-                    self.tracker.forget(ssrc);
-                }
-            }
-            _ => {}
-        }
-        None
-    }
-}
-
 /// Sums what several people are saying into one stream.
 ///
 /// Saturating rather than wrapping: a loud moment should clip, which sounds
 /// like a loud moment, instead of wrapping around to the opposite extreme,
 /// which sounds like a gunshot. Speakers whose packets were lost contribute
 /// nothing rather than shortening the tick.
-fn mix(voices: &[&[i16]]) -> Vec<i16> {
+pub(super) fn mix(voices: &[&[i16]]) -> Vec<i16> {
     let longest = voices.iter().map(|v| v.len()).max().unwrap_or(0);
     let mut mixed = vec![0i16; longest];
     for voice in voices {
@@ -395,30 +336,6 @@ fn mix(voices: &[&[i16]]) -> Vec<i16> {
         }
     }
     mixed
-}
-
-#[async_trait::async_trait]
-impl EventHandler for Speakers {
-    async fn act(&self, ctx: &EventContext<'_>) -> Option<Event> {
-        let EventContext::VoiceTick(tick) = ctx else { return None };
-
-        // Noted per speaker before the mix throws the identities away - which
-        // is the only place they exist, since what comes out of mix() is one
-        // stream that nobody in particular said.
-        for (ssrc, data) in &tick.speaking {
-            if let Some(voice) = data.decoded_voice.as_deref() {
-                self.tracker.heard_from(*ssrc, peak_of(voice));
-            }
-        }
-
-        let Some(playback) = self.playback.as_ref() else { return None };
-        let voices: Vec<&[i16]> = tick.speaking.values().filter_map(|d| d.decoded_voice.as_deref()).collect();
-        let mixed = mix(&voices);
-        if !mixed.is_empty() {
-            playback.push(&mixed);
-        }
-        None
-    }
 }
 
 impl VoiceState {
@@ -459,7 +376,7 @@ impl VoiceState {
 
     /// Every account with a live voice connection.
     pub fn connected_accounts(&self) -> Vec<String> {
-        self.drivers.lock().unwrap().keys().cloned().collect()
+        self.conns.lock().unwrap().keys().cloned().collect()
     }
 
     /// Closes or opens the microphone of a live session.
@@ -545,6 +462,7 @@ async fn try_connect(state: &AppState, account_id: &str) {
 
     match connect(state, account_id, &info).await {
         Ok(()) => {
+            state.voice.retries.lock().unwrap().remove(account_id);
             tracing::info!("discord[{account_id}]: voice connected");
             state.events.emit(
                 "discordVoiceConnected",
@@ -563,39 +481,23 @@ async fn try_connect(state: &AppState, account_id: &str) {
 
 async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) -> Result<()> {
     let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
-
-    let parse = |s: &str, what: &str| -> Result<std::num::NonZeroU64> {
-        s.parse::<std::num::NonZeroU64>().map_err(|e| anyhow!("bad {what} {s:?}: {e}"))
+    let handshake = Handshake {
+        server_id: info.server_id().context("no channel to connect to")?.to_string(),
+        channel_id: info.channel_id.clone().context("no channel to connect to")?,
+        user_id: config.user_id.clone(),
+        session_id: info.session_id.clone().context("no voice session")?,
+        token: info.token.clone().context("no voice token")?,
+        endpoint: info.endpoint.clone().context("no voice server")?,
     };
 
-    let connection = ConnectionInfo {
-        channel_id: ChannelId(parse(info.channel_id.as_ref().unwrap(), "channel id")?),
-        guild_id: GuildId(parse(info.server_id().context("no channel to connect to")?, "server id")?),
-        user_id: UserId(parse(&config.user_id, "user id")?),
-        session_id: info.session_id.clone().unwrap(),
-        token: info.token.clone().unwrap(),
-        endpoint: info.endpoint.clone().unwrap(),
-    };
+    // A connection already running for this account is replaced, not kept
+    // beside: moving channels arrives as a fresh handshake.
+    if let Some(old) = state.voice.conns.lock().unwrap().remove(account_id) {
+        old.stop();
+    }
 
-    // Decoding has to be asked for: the default merely decrypts, which is
-    // enough to know somebody is talking and not enough to hear them.
-    let config = Config::default().decode_mode(DecodeMode::Decode(DecodeConfig::default()));
-    let mut driver = Driver::new(config);
-    driver.connect(connection).await.context("opening the voice connection")?;
-
-    // One tracker per session, registered whether or not there are speakers to
-    // play through: who is talking is worth knowing even on a machine with no
-    // audio output, and the call view is the only thing that shows it.
     let tracker = Arc::new(SpeakingTracker::default());
     state.voice.speaking.lock().unwrap().insert(account_id.to_string(), tracker.clone());
-    driver.add_global_event(
-        songbird::CoreEvent::SpeakingStateUpdate.into(),
-        Identities { tracker: tracker.clone() },
-    );
-    driver.add_global_event(
-        songbird::CoreEvent::ClientDisconnect.into(),
-        Identities { tracker: tracker.clone() },
-    );
 
     let prefs = state.voice_prefs.get();
     crate::audio::set_playback_muted(prefs.deafened);
@@ -605,76 +507,105 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
             state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback.clone());
             Some(playback)
         }
-        // No speakers is a worse call, not a failed one - and someone who
-        // only wants to talk should still be able to.
         Err(e) => {
             tracing::warn!("discord[{account_id}]: no audio output, joining deaf: {e:#}");
             None
         }
     };
-    // Registered whether or not there is anywhere to play the audio, which is
-    // what the tracker above promises. It used to sit inside the branch that
-    // opened the speakers, so on a machine with no working output nobody ever
-    // lit up as talking - and every tick is also where a stream is noticed at
-    // all, not only where it is heard.
-    driver.add_global_event(songbird::CoreEvent::VoiceTick.into(), Speakers { playback, tracker: tracker.clone() });
 
+    let mut mic = None;
     if state.voice.options(account_id).transmit {
-        match start_transmitting(&mut driver, prefs.input.as_deref(), prefs.mic_muted || prefs.deafened) {
-            Ok(capture) => {
+        match start_transmitting(prefs.input.as_deref(), prefs.mic_muted || prefs.deafened) {
+            Ok((capture, source)) => {
                 state.voice.captures.lock().unwrap().insert(account_id.to_string(), capture);
+                mic = Some(source);
                 tracing::info!("discord[{account_id}]: transmitting microphone audio");
             }
-            // A missing or busy microphone should not tear down a connection
-            // that is otherwise fine; the session simply carries no audio.
             Err(e) => tracing::warn!("discord[{account_id}]: no microphone, joining silent: {e:#}"),
         }
     }
 
-    state.voice.drivers.lock().unwrap().insert(account_id.to_string(), driver);
+    let for_end = state.clone();
+    let account = account_id.to_string();
+    let conn = voiceconn::connect(state, account_id, &handshake, Media { playback, tracker, mic }, move |ended| {
+        tokio::spawn(after_end(for_end, account, ended));
+    })
+    .await
+    .context("opening the voice connection")?;
+
+    state.voice.conns.lock().unwrap().insert(account_id.to_string(), conn);
     Ok(())
 }
 
-/// Opens the microphone and hands it to the driver as a live track.
+/// `connection_ended`, boxed with its thread-safety stated.
 ///
-/// Songbird plays an input by reading from it, so the microphone is presented
-/// as a byte stream of interleaved f32 samples at the rate Discord expects
-/// (see `audio::MicSource`), which the raw adapter labels and the driver then
-/// encodes to Opus.
-fn start_transmitting(
-    driver: &mut Driver,
-    device_id: Option<&str>,
-    muted: bool,
-) -> Result<crate::audio::Capture> {
-    use crate::audio::{self, MicSource, TARGET_CHANNELS, TARGET_RATE};
-
-    let (source, sink) = MicSource::new();
-    let capture = audio::start_capture(device_id, sink)?;
-    // Joining already muted has to happen before any audio can be sent, not
-    // after the connection settles.
-    capture.set_muted(muted);
-    let input = songbird::input::RawAdapter::new(source, TARGET_RATE, TARGET_CHANNELS as u32);
-    let handle = driver.play_input(input.into());
-    // Looping is meaningless for a live source, but an explicit play makes the
-    // intent clear and surfaces a rejected track immediately.
-    let _ = handle.play();
-    Ok(capture)
+/// Reconnecting opens a connection that carries this same handler, so the
+/// future contains itself; spelling out `Send` here is what lets the compiler
+/// stop following the loop.
+fn after_end(state: AppState, account: String, ended: Ended) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move { connection_ended(&state, &account, ended).await })
 }
 
-/// Tears down a voice connection, if one is up.
-pub async fn disconnect(state: &AppState, account_id: &str) {
-    state.voice.captures.lock().unwrap().remove(account_id);
-    state.voice.playbacks.lock().unwrap().remove(account_id);
-    let driver = state.voice.drivers.lock().unwrap().remove(account_id);
-    if let Some(mut driver) = driver {
-        driver.leave();
-        tracing::info!("discord[{account_id}]: voice disconnected");
+/// How many times a dropped connection is reopened before giving up.
+const MAX_RETRIES: u32 = 3;
+
+/// A connection has stopped. Opens it again if the server's reason allows and
+/// the account still means to be in that channel.
+async fn connection_ended(state: &AppState, account_id: &str, ended: Ended) {
+    match ended {
+        Ended::Stopped => {}
+        Ended::Final(reason) => {
+            tracing::warn!("discord[{account_id}]: voice ended: {reason}");
+            state.events.emit("discordVoiceError", json!({ "accountId": account_id, "error": reason }));
+            teardown(state, account_id);
+        }
+        Ended::Retry(reason) => {
+            teardown(state, account_id);
+            let attempt = {
+                let mut retries = state.voice.retries.lock().unwrap();
+                let attempt = retries.entry(account_id.to_string()).or_insert(0);
+                *attempt += 1;
+                *attempt
+            };
+            let still_wanted = state.voice.pending.lock().unwrap().get(account_id).is_some_and(|p| p.complete());
+            if !still_wanted {
+                return;
+            }
+            if attempt > MAX_RETRIES {
+                tracing::warn!("discord[{account_id}]: voice dropped ({reason}); gave up after {MAX_RETRIES} attempts");
+                state.events.emit("discordVoiceError", json!({ "accountId": account_id, "error": reason }));
+                return;
+            }
+            tracing::info!("discord[{account_id}]: voice dropped ({reason}); reconnecting, attempt {attempt}");
+            tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
+            try_connect(state, account_id).await;
+        }
     }
 }
 
-/// Whether a voice connection is currently up for this account.
-pub fn is_connected(state: &AppState, account_id: &str) -> bool {
-    state.voice.drivers.lock().unwrap().contains_key(account_id)
+/// Releases what a connection held: its capture, speakers and entry.
+fn teardown(state: &AppState, account_id: &str) {
+    state.voice.captures.lock().unwrap().remove(account_id);
+    state.voice.playbacks.lock().unwrap().remove(account_id);
+    state.voice.conns.lock().unwrap().remove(account_id);
+}
+
+fn start_transmitting(device_id: Option<&str>, muted: bool) -> Result<(crate::audio::Capture, crate::audio::MicSource)> {
+    let (source, sink) = crate::audio::MicSource::new();
+    let capture = crate::audio::start_capture(device_id, sink)?;
+    capture.set_muted(muted);
+    Ok((capture, source))
+}
+
+pub async fn disconnect(state: &AppState, account_id: &str) {
+    let conn = state.voice.conns.lock().unwrap().remove(account_id);
+    state.voice.captures.lock().unwrap().remove(account_id);
+    state.voice.playbacks.lock().unwrap().remove(account_id);
+    state.voice.retries.lock().unwrap().remove(account_id);
+    if let Some(conn) = conn {
+        conn.stop();
+        tracing::info!("discord[{account_id}]: voice disconnected");
+    }
 }
 
 

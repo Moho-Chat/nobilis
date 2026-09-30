@@ -120,17 +120,6 @@ pub struct PostimgLinks {
     pub direct: String,
 }
 
-/// Puts an image on postimg.cc and returns where it landed.
-///
-/// Shared rather than private to Sneedchat, because the two callers want
-/// different halves of the same answer: Sneedchat wraps both in the BBCode
-/// the site renders, and IRC sends the direct link on its own, having no
-/// markup to wrap anything in. The mechanics below are the same either way
-/// and were hard enough won that a second copy of them would be a liability.
-pub async fn upload_to_postimg(file_path: &str) -> Result<PostimgLinks> {
-    upload_to_postimg_reporting(file_path, None).await
-}
-
 /// The same, saying where it has got to. See `crate::upload::Progress`.
 pub async fn upload_to_postimg_reporting(
     file_path: &str,
@@ -201,7 +190,6 @@ pub async fn upload_to_postimg_reporting(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn extracts_the_postimg_thumb_name_from_a_real_result_page() {
