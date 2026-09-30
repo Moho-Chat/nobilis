@@ -105,6 +105,12 @@ pub enum Host {
     Litterbox,
     /// Images only, permanent.
     Postimg,
+    /// Images only, permanent, 32MB - and a much wider list than postimg's,
+    /// avif and heic among it.
+    Ibb,
+    /// Images only, 20MB. Not offered to Sneedchat, where an imgur link does
+    /// not embed.
+    Imgur,
 }
 
 impl Host {
@@ -113,6 +119,8 @@ impl Host {
             "catbox" => Some(Host::Catbox),
             "litterbox" => Some(Host::Litterbox),
             "postimg" => Some(Host::Postimg),
+            "ibb" | "imgbb" => Some(Host::Ibb),
+            "imgur" => Some(Host::Imgur),
             _ => None,
         }
     }
@@ -122,6 +130,8 @@ impl Host {
             Host::Catbox => "catbox",
             Host::Litterbox => "litterbox",
             Host::Postimg => "postimg",
+            Host::Ibb => "ibb",
+            Host::Imgur => "imgur",
         }
     }
 
@@ -130,12 +140,14 @@ impl Host {
             Host::Catbox => "catbox.moe (permanent, any file, 200MB)",
             Host::Litterbox => "litterbox.catbox.moe (expires, any file, 1GB)",
             Host::Postimg => "postimg.cc (permanent, images only)",
+            Host::Ibb => "ibb.co (permanent, images only, avif and heic too, 32MB)",
+            Host::Imgur => "imgur.com (images only, 20MB - removes unused anonymous uploads)",
         }
     }
 
     /// Whether this host will take something that is not an image.
     pub fn takes_any_file(self) -> bool {
-        !matches!(self, Host::Postimg)
+        !matches!(self, Host::Postimg | Host::Ibb | Host::Imgur)
     }
 
     /// The file extensions this host accepts, or `None` for anything.
@@ -148,6 +160,8 @@ impl Host {
     pub fn accepted_extensions(self) -> Option<&'static [(&'static str, &'static str)]> {
         match self {
             Host::Postimg => Some(crate::backend::sneedchat::POSTIMG_TYPES),
+            Host::Ibb => Some(IBB_TYPES),
+            Host::Imgur => Some(IMGUR_TYPES),
             _ => None,
         }
     }
@@ -168,14 +182,37 @@ impl Host {
             Host::Catbox => 200 * 1024 * 1024,
             Host::Litterbox => 1024 * 1024 * 1024,
             Host::Postimg => 32 * 1024 * 1024,
+            // Decimal, as the site states it: `max_filesize":32000000`.
+            Host::Ibb => 32_000_000,
+            // imgur's own anonymous image cap, from its upload page's script
+            // (`R=20971520`).
+            Host::Imgur => 20 * 1024 * 1024,
         }
+    }
+
+    /// The services this host is not offered to, by the protocol name an
+    /// account carries.
+    ///
+    /// Sneedchat's forum embeds a picture from the hosts it trusts and shows
+    /// anything else as a bare link, and imgur is not among them - so a
+    /// picture sent there would arrive as a URL nobody sees the image of.
+    pub fn not_for(self) -> &'static [&'static str] {
+        match self {
+            Host::Imgur => &["sneedchat"],
+            _ => &[],
+        }
+    }
+
+    /// Whether this host may be used for an upload posted to `service`.
+    pub fn offered_to(self, service: &str) -> bool {
+        !self.not_for().contains(&service)
     }
 }
 
 /// Every host a frontend can offer, so the list of choices lives in one place
 /// rather than being spelled out again in each client that draws a menu.
 pub fn hosts() -> Vec<serde_json::Value> {
-    [Host::Catbox, Host::Litterbox, Host::Postimg]
+    [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur]
         .iter()
         .map(|h| {
             serde_json::json!({
@@ -187,6 +224,8 @@ pub fn hosts() -> Vec<serde_json::Value> {
                 // will refuse it.
                 "accepts": h.accepted_extensions().map(|t| t.iter().map(|(e, _)| *e).collect::<Vec<_>>()),
                 "maxBytes": h.max_bytes(),
+                // Services a menu should leave this host out of.
+                "notFor": h.not_for(),
             })
         })
         .collect()
@@ -258,6 +297,238 @@ async fn upload_inner(
         // none, so what it wants is the URL that ends in a file extension -
         // it is what makes a link unfurl into a picture at the far end.
         Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg_reporting(path, progress).await?.direct),
+        Host::Ibb => ibb(file_name, bytes, progress).await,
+        Host::Imgur => imgur(file_name, bytes, progress).await,
+    }
+}
+
+/// Whether a browser shows this file as a picture - what decides whether a
+/// link to it is worth wrapping in a forum's `[img]`.
+///
+/// Wider than any one host's list and narrower than ibb's: heic and tiff are
+/// images, and a browser draws neither.
+pub fn is_web_picture(file_name: &str) -> bool {
+    const SHOWN: &[&str] = &["png", "jpg", "jpeg", "jpe", "gif", "apng", "webp", "avif", "bmp", "svg", "ico"];
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    file_name.contains('.') && SHOWN.contains(&ext.as_str())
+}
+
+/// What imgur will take as an anonymous image upload.
+///
+/// From its upload page's own table (`H={jpeg:"image/jpeg",...}` beside the
+/// accept list `.jpg,.jpeg,.png,.gif,.apng,.tiff,.tif,.bmp,.xcf,.webp`), less
+/// xcf, which is GIMP's working format rather than a picture. No avif: imgur
+/// does not take it. Video is left out too - imgur takes it, through a
+/// different upload with processing afterwards, and that is not built here.
+pub const IMGUR_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("apng", "image/apng"),
+    ("webp", "image/webp"),
+    ("bmp", "image/bmp"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+];
+
+/// imgur's upload endpoint, the one its own site and every anonymous
+/// uploader use.
+const IMGUR_UPLOAD: &str = "https://api.imgur.com/3/image";
+/// The client id imgur's own web app identifies itself with
+/// (`apiClientId` in its page config). It names the application, not a
+/// person: an upload made with it belongs to nobody, which is what anonymous
+/// means here, and it is what the site sends for a visitor who is not signed
+/// in.
+const IMGUR_CLIENT_ID: &str = "d70305e7c3ac5c6";
+
+/// Puts a picture on imgur, anonymously, and returns its direct link.
+///
+/// One request: the file as `image`, with `type=file`, identified by the
+/// site's own client id. The answer's `data.link` is the file on i.imgur.com.
+///
+/// Anonymous imgur uploads are not permanent in the way catbox's are: since
+/// 2023 imgur deletes content not tied to an account once it judges it
+/// unused. The label says so, so the choice is made knowing it.
+async fn imgur(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> Result<String> {
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let content_type = IMGUR_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t).unwrap_or("application/octet-stream");
+    let size = bytes.len();
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(content_type)?;
+    let form = reqwest::multipart::Form::new().text("type", "file").part("image", part);
+
+    if let Some(progress) = progress {
+        progress.at(Phase::Waiting, size, Host::Imgur.id());
+    }
+    let resp = http_client()
+        .post(IMGUR_UPLOAD)
+        .header(reqwest::header::AUTHORIZATION, format!("Client-ID {IMGUR_CLIENT_ID}"))
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| anyhow!("couldn't reach imgur: {}", with_causes(&e)))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    imgur_link(status, &body)
+}
+
+/// The direct link out of imgur's answer, or why there is none.
+///
+/// imgur's error is a string on most failures and an object with a
+/// `message` on some, so it is read loosely.
+fn imgur_link(status: reqwest::StatusCode, body: &str) -> Result<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+    let data = &parsed["data"];
+    if let Some(link) = data["link"].as_str().filter(|l| l.starts_with("https://")) {
+        return Ok(link.to_string());
+    }
+    let reason = data["error"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| data["error"]["message"].as_str().map(str::to_string));
+    match reason {
+        Some(reason) if !reason.is_empty() => bail!("imgur refused the upload: {reason}"),
+        _ if !status.is_success() => bail!("imgur refused the upload: HTTP {status}"),
+        _ => bail!("imgur did not return a link: {}", snippet(body)),
+    }
+}
+
+/// What ibb.co will take, and what to send each as.
+///
+/// A subset of the site's own list (`"upload":{"image_types":[...]}` in its
+/// upload page's config), which runs to seventy-odd formats including camera
+/// raws and Photoshop files: these are the ones somebody would share in a
+/// chat, and each has a content type that means something. avif is the one
+/// that matters - postimg refuses it - with heic, the iPhone's own format,
+/// close behind. The single source for both the multipart content type and
+/// what `hosts()` publishes, as `POSTIMG_TYPES` is for postimg.
+pub const IBB_TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("jpe", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("avif", "image/avif"),
+    ("heic", "image/heic"),
+    ("heif", "image/heif"),
+    ("jxl", "image/jxl"),
+    ("bmp", "image/bmp"),
+    ("tif", "image/tiff"),
+    ("tiff", "image/tiff"),
+    ("ico", "image/x-icon"),
+    ("svg", "image/svg+xml"),
+];
+
+/// ibb.co's upload page, which hands out the token an upload needs.
+const IBB_PAGE: &str = "https://imgbb.com/";
+/// Where the page's own uploader posts (`PF.obj.config.json_api`).
+const IBB_JSON: &str = "https://imgbb.com/json";
+
+/// Puts a picture on ibb.co, anonymously, and returns its direct link.
+///
+/// Not the documented API, which wants a key and so an account: this is what
+/// the site's own upload page does, read out of its script (`ibb.js`,
+/// `CHV.fn.uploader`). Two requests, because the upload has to carry an
+/// `auth_token` the page embeds (`PF.obj.config.auth_token="..."`), and the
+/// token belongs to the PHP session the page opened - so the page's session
+/// cookie goes back with the upload, or the token means nothing.
+///
+/// The form is the page's own, with its empty fields left out as the page
+/// leaves them out: `type=file`, `action=upload`, a millisecond `timestamp`,
+/// the token, and the file as `source`. No `expiration`, which is the page's
+/// "Don't autodelete".
+async fn ibb(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> Result<String> {
+    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let content_type = IBB_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t).unwrap_or("application/octet-stream");
+
+    let page = http_client()
+        .get(IBB_PAGE)
+        .send()
+        .await
+        .map_err(|e| anyhow!("couldn't reach ibb.co: {}", with_causes(&e)))?;
+    let cookies = session_cookies(page.headers());
+    let html = page.text().await.unwrap_or_default();
+    let token = ibb_auth_token(&html).ok_or_else(|| anyhow!("ibb.co's upload page has no upload token in it - the site may have changed"))?;
+
+    let size = bytes.len();
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(content_type)?;
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let form = reqwest::multipart::Form::new()
+        .text("type", "file")
+        .text("action", "upload")
+        .text("timestamp", timestamp.to_string())
+        .text("auth_token", token)
+        .part("source", part);
+
+    if let Some(progress) = progress {
+        progress.at(Phase::Waiting, size, Host::Ibb.id());
+    }
+    let resp = http_client()
+        .post(IBB_JSON)
+        .header(reqwest::header::COOKIE, cookies)
+        .header(reqwest::header::ORIGIN, "https://imgbb.com")
+        .header(reqwest::header::REFERER, IBB_PAGE)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| anyhow!("couldn't reach ibb.co: {}", with_causes(&e)))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    ibb_link(status, &body)
+}
+
+/// The upload token ibb.co's page embeds in its config.
+fn ibb_auth_token(html: &str) -> Option<String> {
+    let start = html.find("auth_token=\"")? + "auth_token=\"".len();
+    let token = &html[start..start + html[start..].find('"')?];
+    (!token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric())).then(|| token.to_string())
+}
+
+/// Every cookie a response set, as a `Cookie` header sends them back.
+fn session_cookies(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| v.split(';').next())
+        .map(str::trim)
+        .filter(|pair| pair.contains('='))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[derive(serde::Deserialize)]
+struct IbbReply {
+    #[serde(default)]
+    image: Option<IbbImage>,
+    #[serde(default)]
+    error: Option<IbbError>,
+}
+
+#[derive(serde::Deserialize)]
+struct IbbImage {
+    /// The file itself, on i.ibb.co - the link that unfurls into a picture.
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct IbbError {
+    #[serde(default)]
+    message: String,
+}
+
+/// The direct link out of ibb.co's answer, or why there is none.
+///
+/// Of the several links the answer carries - the page (`url_viewer`), a
+/// medium and a thumbnail rendition, the delete link - `image.url` is the
+/// original file, which is what a chat that unfurls a bare URL wants.
+fn ibb_link(status: reqwest::StatusCode, body: &str) -> Result<String> {
+    match serde_json::from_str::<IbbReply>(body) {
+        Ok(IbbReply { image: Some(image), .. }) if image.url.starts_with("https://") => Ok(image.url),
+        Ok(IbbReply { error: Some(error), .. }) if !error.message.is_empty() => bail!("ibb.co refused the upload: {}", error.message),
+        _ if !status.is_success() => bail!("ibb.co refused the upload: HTTP {status}"),
+        _ => bail!("ibb.co did not return a link: {}", snippet(body)),
     }
 }
 
@@ -386,13 +657,19 @@ mod tests {
         assert_eq!(postimg["imagesOnly"], true);
         let catbox = listed.iter().find(|h| h["id"] == "catbox").expect("catbox listed");
         assert_eq!(catbox["imagesOnly"], false);
-        // Every host is offered to every service; none is one service's own.
-        assert_eq!(listed.len(), 3);
+        let ibb = listed.iter().find(|h| h["id"] == "ibb").expect("ibb listed");
+        assert_eq!(ibb["imagesOnly"], true);
+        assert_eq!(listed.len(), 5);
+        // imgur is the one host a service is kept from: Sneedchat does not
+        // embed it.
+        let imgur = listed.iter().find(|h| h["id"] == "imgur").expect("imgur listed");
+        assert_eq!(imgur["notFor"], serde_json::json!(["sneedchat"]));
+        assert_eq!(catbox["notFor"], serde_json::json!([]));
     }
 
     #[test]
     fn host_names_round_trip() {
-        for h in [Host::Catbox, Host::Litterbox, Host::Postimg] {
+        for h in [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur] {
             assert_eq!(Host::parse(h.id()), Some(h));
         }
         assert_eq!(Host::parse("nowhere"), None);
@@ -506,6 +783,81 @@ mod tests {
         assert!(snippet(&page).chars().count() <= 203);
         // Short replies are shown whole, with nothing appended.
         assert_eq!(snippet("nope"), "nope");
+    }
+
+    /// ibb.co is the answer to avif: the format postimg refuses, it takes.
+    #[test]
+    fn ibb_takes_what_postimg_refuses_and_still_only_images() {
+        assert!(Host::Ibb.accepts("cat.avif"));
+        assert!(Host::Ibb.accepts("IMG_0001.HEIC"));
+        assert!(Host::Ibb.accepts("cat.png"));
+        assert!(!Host::Ibb.accepts("clip.mp4"));
+        assert!(!Host::Ibb.accepts("notes.txt"));
+        assert_eq!(Host::Ibb.max_bytes(), 32_000_000);
+        let listed = hosts();
+        let accepts = listed.iter().find(|h| h["id"] == "ibb").unwrap()["accepts"].as_array().unwrap().clone();
+        assert!(accepts.iter().any(|v| v == "avif"));
+    }
+
+    /// The token as the page writes it into its config.
+    #[test]
+    fn the_upload_token_is_read_off_the_page() {
+        let html = r#"PF.obj.config.json_api="https://imgbb.com/json";
+PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
+        assert_eq!(ibb_auth_token(html).as_deref(), Some("32dc939d0777df0367b9d127ee79b39aa27525fb"));
+        assert_eq!(ibb_auth_token("<html>no config</html>"), None);
+        assert_eq!(ibb_auth_token(r#"auth_token="";"#), None);
+    }
+
+    #[test]
+    fn the_session_cookie_goes_back_without_its_attributes() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.append(reqwest::header::SET_COOKIE, "PHPSESSID=abc123; path=/; secure; HttpOnly".parse().unwrap());
+        headers.append(reqwest::header::SET_COOKIE, "lang=en; expires=Thu, 01 Jan 2099 00:00:00 GMT".parse().unwrap());
+        assert_eq!(session_cookies(&headers), "PHPSESSID=abc123; lang=en");
+    }
+
+    /// The direct file, not the page, the medium rendition or the delete link.
+    #[test]
+    fn the_direct_link_is_taken_from_the_answer() {
+        let body = r#"{"status_code":200,"success":{"message":"image uploaded","code":200},"image":{"name":"cat","url":"https://i.ibb.co/abc123/cat.png","url_viewer":"https://ibb.co/abc123","display_url":"https://i.ibb.co/xyz/cat.png","delete_url":"https://ibb.co/abc123/deadbeef"},"status_txt":"OK"}"#;
+        assert_eq!(ibb_link(reqwest::StatusCode::OK, body).unwrap(), "https://i.ibb.co/abc123/cat.png");
+        let refused = r#"{"status_code":400,"error":{"message":"Invalid content type","code":311},"status_txt":"Bad Request"}"#;
+        let err = ibb_link(reqwest::StatusCode::BAD_REQUEST, refused).unwrap_err().to_string();
+        assert!(err.contains("Invalid content type"), "got {err}");
+        let err = ibb_link(reqwest::StatusCode::OK, "<html>maintenance</html>").unwrap_err().to_string();
+        assert!(err.contains("did not return a link"), "got {err}");
+    }
+
+    #[test]
+    fn imgur_is_kept_from_sneedchat_and_takes_no_avif() {
+        assert!(!Host::Imgur.offered_to("sneedchat"));
+        assert!(Host::Imgur.offered_to("irc"));
+        assert!(Host::Postimg.offered_to("sneedchat"));
+        assert!(Host::Imgur.accepts("cat.png"));
+        assert!(!Host::Imgur.accepts("cat.avif"));
+        assert!(!Host::Imgur.accepts("clip.mp4"));
+    }
+
+    #[test]
+    fn imgur_answers_are_read_for_the_file_or_the_reason() {
+        let ok = r#"{"data":{"id":"AbC123x","deletehash":"zz","link":"https://i.imgur.com/AbC123x.png","type":"image/png"},"success":true,"status":200}"#;
+        assert_eq!(imgur_link(reqwest::StatusCode::OK, ok).unwrap(), "https://i.imgur.com/AbC123x.png");
+        let refused = r#"{"data":{"error":"File type invalid (1)","request":"/3/image","method":"POST"},"success":false,"status":400}"#;
+        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, refused).unwrap_err().to_string().contains("File type invalid"));
+        let nested = r#"{"data":{"error":{"code":1003,"message":"File type invalid (1)","type":"ImgurException"}},"success":false,"status":400}"#;
+        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, nested).unwrap_err().to_string().contains("File type invalid"));
+        let err = imgur_link(reqwest::StatusCode::TOO_MANY_REQUESTS, "").unwrap_err().to_string();
+        assert!(err.contains("429"), "got {err}");
+    }
+
+    #[test]
+    fn a_web_picture_is_one_a_browser_draws() {
+        assert!(is_web_picture("cat.avif"));
+        assert!(is_web_picture("cat.PNG"));
+        assert!(!is_web_picture("IMG_0001.heic"));
+        assert!(!is_web_picture("clip.mp4"));
+        assert!(!is_web_picture("png"));
     }
 
     /// An empty file is a mistake worth catching here rather than sending a
