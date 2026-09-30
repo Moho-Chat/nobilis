@@ -119,6 +119,12 @@ pub struct StreamSender {
     sealer: Mutex<Sealer>,
     video_ssrc: u32,
     sequence: AtomicU32,
+    /// The stream's sound goes on the SSRC the server handed this
+    /// connection in `op 2`; the picture has one of its own beside it.
+    audio_ssrc: u32,
+    /// Frames for the websocket from outside its loop - saying that sound is
+    /// coming, which the far end needs before it will play any.
+    outgoing: tokio::sync::mpsc::UnboundedSender<WsMessage>,
     /// Cleared when the connection goes, so a frame arriving from the window
     /// after a hangup is dropped rather than sent into a closed socket.
     live: Arc<AtomicBool>,
@@ -197,6 +203,85 @@ impl StreamSender {
 
     pub fn stop(&self) {
         self.live.store(false, Ordering::Relaxed);
+    }
+
+    /// Sends what the computer is playing along with the picture, until the
+    /// stream ends.
+    ///
+    /// Recorded by this process rather than the window: Chromium cannot record
+    /// a Linux desktop's sound at all, and doing it here is one path for every
+    /// desktop the recording works on (see `audio::start_system_capture`).
+    /// Encoded for music rather than speech, and sent continuously rather than
+    /// gated - a quiet passage in a film is still part of the film.
+    pub fn start_audio(self: Arc<Self>, account_id: String) {
+        tokio::spawn(async move {
+            let (source, sink) = crate::audio::MicSource::new();
+            let capture = match crate::audio::start_system_capture(sink) {
+                Ok(capture) => capture,
+                Err(e) => {
+                    tracing::warn!("discord[{account_id}]: the stream goes without sound: {e:#}");
+                    return;
+                }
+            };
+            let mut encoder = match opus2::Encoder::new(48_000, opus2::Channels::Stereo, opus2::Application::Audio) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    tracing::warn!("discord[{account_id}]: no Opus encoder for the stream's sound: {e:?}");
+                    return;
+                }
+            };
+            let _ = encoder.set_bitrate(opus2::Bitrate::Bits(128_000));
+            let _ = self.outgoing.send(WsMessage::Text(
+                json!({ "op": 5, "d": { "speaking": 1, "delay": 0, "ssrc": self.audio_ssrc } }).to_string(),
+            ));
+            tracing::info!("discord[{account_id}]: the stream is sending sound");
+
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(20));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut sequence: u16 = rand::random();
+            let mut timestamp: u32 = rand::random();
+            let mut sent = 0u64;
+            while self.live.load(Ordering::Relaxed) {
+                tick.tick().await;
+                timestamp = timestamp.wrapping_add(rtp::OPUS_FRAME_SAMPLES as u32);
+                let Some(pcm) = source.take(rtp::OPUS_FRAME_SAMPLES * 2) else { continue };
+                let mut opus = vec![0u8; 1275];
+                let Ok(length) = encoder.encode_float(&pcm, &mut opus) else { continue };
+                opus.truncate(length);
+                // As for the picture: nothing until the group can read it.
+                let body = {
+                    let mut held = self.dave.lock().await;
+                    match held.as_mut() {
+                        Some(dave) if dave.ready() => match dave.encrypt_opus(&opus) {
+                            Ok(body) => body,
+                            Err(_) => continue,
+                        },
+                        Some(_) => continue,
+                        None => opus,
+                    }
+                };
+                let header = rtp::header(&rtp::Packet {
+                    payload_type: rtp::PAYLOAD_TYPE_OPUS,
+                    sequence,
+                    timestamp,
+                    ssrc: self.audio_ssrc,
+                    marker: false,
+                    payload: Vec::new(),
+                });
+                sequence = sequence.wrapping_add(1);
+                let sealed = {
+                    let mut sealer = self.sealer.lock().await;
+                    sealer.seal(&header, &body)
+                };
+                if let Ok(packet) = sealed {
+                    if self.udp.send(&packet).await.is_ok() {
+                        sent += 1;
+                    }
+                }
+            }
+            drop(capture);
+            tracing::info!("discord[{account_id}]: the stream's sound stopped after {sent} frames");
+        });
     }
 }
 
@@ -442,7 +527,10 @@ pub async fn connect(
     let announce_video = json!({
         "op": 12,
         "d": {
-            "audio_ssrc": 0,
+            // The sound, if any is sent, arrives on this connection's own
+            // SSRC. Announced whether or not it comes: a stream announced
+            // with no audio SSRC has nowhere for its sound to go.
+            "audio_ssrc": ssrc,
             "video_ssrc": video_ssrc,
             "rtx_ssrc": video_ssrc.wrapping_add(1),
             "streams": [{
@@ -460,11 +548,14 @@ pub async fn connect(
     // value returned has to be able to stop them after they have started.
     let watching = live.clone();
     let udp = Arc::new(udp);
+    let (outgoing, mut to_socket) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
     let sender = Arc::new(StreamSender {
         udp: udp.clone(),
         sealer: Mutex::new(Sealer::new(mode, &key)?),
         video_ssrc,
         sequence: AtomicU32::new(rand::random::<u16>() as u32),
+        audio_ssrc: ssrc,
+        outgoing,
         live: live.clone(),
         dave: dave.clone(),
     });
@@ -522,6 +613,11 @@ pub async fn connect(
                         "d": { "t": rand::random::<u32>(), "seq_ack": seq_ack.load(Ordering::Relaxed) }
                     });
                     if write.send(WsMessage::Text(beat_frame.to_string())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(message) = to_socket.recv() => {
+                    if write.send(message).await.is_err() {
                         break;
                     }
                 }

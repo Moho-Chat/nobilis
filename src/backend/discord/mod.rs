@@ -65,6 +65,7 @@ pub mod reassemble;
 pub mod rtp;
 pub mod streamconn;
 pub mod voicecrypto;
+pub mod voiceconn;
 pub mod search;
 pub mod send;
 

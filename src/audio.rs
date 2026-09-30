@@ -316,18 +316,48 @@ fn default_device(stream: Stream) -> Result<String> {
 /// the last device an application was moved to and puts it back there, so
 /// "system default" would silently mean "whatever was chosen last time",
 /// leaving audio playing into a device nobody is listening to.
-fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
-    let device_id = &if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
+/// The sound server's indices for every stream of this kind this process has
+/// open.
+///
+/// Every stream the ALSA plugin opens for us carries the same node name, so
+/// the name alone cannot tell a microphone from a recording of what the
+/// computer is playing. Which of them a capture owns is worked out by taking
+/// this before the capture opens and again after: the new one is its own.
+fn our_streams(stream: Stream) -> Result<std::collections::HashSet<String>> {
     let json = pactl(&["-f", "json", "list", stream.list()])?;
     let streams: serde_json::Value = serde_json::from_str(&json).context("parsing pactl output")?;
     let want = stream_node_name(stream);
-    let mine: Vec<String> = streams
+    Ok(streams
         .as_array()
         .map(|s| s.as_slice())
         .unwrap_or_default()
         .iter()
         .filter(|s| s["properties"]["node.name"].as_str() == Some(want.as_str()))
         .filter_map(|s| s["index"].as_u64().map(|i| i.to_string()))
+        .collect())
+}
+
+/// Recordings of what the computer plays, which a microphone change must never
+/// move: rerouting "everything this process records" to a new microphone would
+/// turn a shared screen's sound into that microphone.
+fn system_capture_streams() -> &'static Mutex<std::collections::HashSet<String>> {
+    static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    HELD.get_or_init(Default::default)
+}
+
+fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
+    route_stream_except(stream, device_id, &Default::default())
+}
+
+/// Moves this process's streams to `device_id`, leaving alone the ones in
+/// `existing` - there before the capture being routed opened, so somebody
+/// else's - and any recording of the computer's own sound.
+fn route_stream_except(stream: Stream, device_id: &str, existing: &std::collections::HashSet<String>) -> Result<bool> {
+    let device_id = &if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
+    let protected = system_capture_streams().lock().unwrap().clone();
+    let mine: Vec<String> = our_streams(stream)?
+        .into_iter()
+        .filter(|index| !existing.contains(index) && !protected.contains(index))
         .collect();
 
     let mut moved = false;
@@ -354,17 +384,35 @@ fn input_device(device_id: Option<&str>) -> Result<cpal::Device> {
     cpal::default_host().default_input_device().context("no default input device")
 }
 
-/// A running microphone capture.
+/// A running capture: a microphone, or what the computer is playing.
 ///
-/// Dropping it stops the stream. The captured audio is pushed into `sink`,
-/// already converted to what Songbird wants.
+/// Dropping it stops the stream. The captured audio is pushed into `sink` as
+/// 48kHz stereo f32.
 pub struct Capture {
     _stream: cpal::Stream,
     pub level: Arc<Mutex<f32>>,
     pub active: Arc<AtomicBool>,
+    /// The sound server's indices for a system-audio recording, released when
+    /// it closes so a later microphone reusing the index is routable again.
+    system_streams: Vec<String>,
+    /// The private sink a Linux system recording gathers applications into;
+    /// taken down with it.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    _mix: Option<ShareMix>,
 }
 
-/// Starts capturing, handing each converted chunk to `sink`.
+impl Drop for Capture {
+    fn drop(&mut self) {
+        if !self.system_streams.is_empty() {
+            let mut held = system_capture_streams().lock().unwrap();
+            for index in &self.system_streams {
+                held.remove(index);
+            }
+        }
+    }
+}
+
+/// Starts capturing a microphone, handing each converted chunk to `sink`.
 ///
 /// `device_id` names a device from `list_devices`, or is empty for the sound
 /// server's default.
@@ -373,12 +421,98 @@ pub struct Capture {
 /// channel duplication. It is enough to carry speech correctly and keeps this
 /// dependency-free; anything better belongs behind a resampler crate if the
 /// difference ever proves audible.
-pub fn start_capture<F>(device_id: Option<&str>, mut sink: F) -> Result<Capture>
+pub fn start_capture<F>(device_id: Option<&str>, sink: F) -> Result<Capture>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
     let device = input_device(device_id)?;
     let config = device.default_input_config().context("querying the input device")?;
+    open_input(device, config, sink, Route::Device(device_id.unwrap_or("").to_string()))
+}
+
+/// Where a freshly opened recording is pointed once it exists.
+enum Route {
+    /// A microphone: the one chosen, or the default for an empty id.
+    Device(String),
+    /// The monitor of the default output - everything the computer plays.
+    /// Linux, where a recording is moved rather than opened on a device.
+    #[cfg_attr(any(target_os = "windows", target_os = "macos"), allow(dead_code))]
+    Monitor,
+    /// Nowhere: the device opened is already the right one.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    AsOpened,
+}
+
+/// Records what the computer is playing, to share along with a screen.
+///
+/// The same on every desktop in what it delivers - 48kHz stereo, whatever the
+/// device runs at - and different in how it gets it, because each hands its
+/// own sound out differently:
+///
+/// - **Linux** (PipeWire or PulseAudio, X11 or Wayland alike): an ordinary
+///   recording, moved onto the monitor of the default output. The monitor is
+///   the sound server's copy of everything being played.
+/// - **Windows**: a recording opened on the output device itself, which is
+///   how WASAPI offers loopback.
+/// - **macOS** has no loopback a program can open without ScreenCaptureKit,
+///   so it says so rather than sharing silence.
+///
+/// What is recorded is everything - this program's own playback of a call
+/// included, which is what a monitor is. On Linux `NOBILIS_SHARE_AUDIO_SOURCE`
+/// names a different source to record instead.
+pub fn start_system_capture<F>(sink: F) -> Result<Capture>
+where
+    F: FnMut(&[f32]) + Send + 'static,
+{
+    #[cfg(target_os = "macos")]
+    {
+        let _ = sink;
+        Err(anyhow!("sharing the computer's sound is not supported on macOS yet"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let device = cpal::default_host().default_output_device().context("no default output device to record")?;
+        let config = device.default_output_config().context("querying the output device")?;
+        open_input(device, config, sink, Route::AsOpened)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let device = cpal::default_host().default_input_device().context("no recording device to point at the output")?;
+        let config = device.default_input_config().context("querying the input device")?;
+        open_input(device, config, sink, Route::Monitor)
+    }
+}
+
+/// Opens a recording, converts what it delivers to 48kHz stereo, and points it
+/// where `route` says.
+fn open_input<F>(device: cpal::Device, config: cpal::SupportedStreamConfig, mut sink: F, route: Route) -> Result<Capture>
+where
+    F: FnMut(&[f32]) + Send + 'static,
+{
+    // On Linux a system recording is of a private mix rather than of the
+    // speakers - see ShareMix for why the speakers' monitor is not enough.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mix = match route {
+        Route::Monitor => match ShareMix::open() {
+            Ok(mix) => Some(mix),
+            Err(e) => {
+                tracing::warn!("audio: no private mix ({e:#}); sharing the speakers' monitor, which follows their volume");
+                None
+            }
+        },
+        _ => None,
+    };
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let mix: Option<()> = None;
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let _ = &mix;
+
+    // Which of our recordings already exist, so the one about to open is the
+    // only one moved.
+    let existing = match route {
+        Route::AsOpened => Default::default(),
+        _ => our_streams(Stream::Input).unwrap_or_default(),
+    };
     let rate = config.sample_rate();
     let channels = config.channels();
     tracing::info!("audio: capturing from {:?} at {rate}Hz {channels}ch", device.to_string());
@@ -433,18 +567,48 @@ where
 
     stream.play().context("starting the input stream")?;
 
-    let want = device_id.unwrap_or("");
-    match route_when_ready(Stream::Input, want) {
-        Ok(on) => tracing::info!("audio: input routed to {on:?}"),
-        // Being recorded on a different microphone than the one chosen is
-        // worse than being told the choice did not take - but only a choice
-        // can be betrayed. Failing to reach the default leaves the stream
-        // wherever the sound server put it, which is a working call.
-        Err(e) if !want.is_empty() => return Err(e.context(format!("routing input to {want:?}"))),
-        Err(e) => tracing::warn!("audio: could not route input to the default device: {e:#}"),
+    let mut system_streams = Vec::new();
+    match route {
+        Route::Device(want) => match route_when_ready(Stream::Input, &want, &existing) {
+            Ok(on) => tracing::info!("audio: input routed to {on:?}"),
+            // Being recorded on a different microphone than the one chosen is
+            // worse than being told the choice did not take - but only a
+            // choice can be betrayed. Failing to reach the default leaves the
+            // stream wherever the sound server put it, which is a working call.
+            Err(e) if !want.is_empty() => return Err(e.context(format!("routing input to {want:?}"))),
+            Err(e) => tracing::warn!("audio: could not route input to the default device: {e:#}"),
+        },
+        Route::Monitor => {
+            // Three places the sound can come from, best first: a source
+            // named outright; the private mix of every application but this
+            // one; the default output's monitor, where there is no PipeWire
+            // to build a mix with.
+            let monitor = match std::env::var("NOBILIS_SHARE_AUDIO_SOURCE") {
+                Ok(named) if !named.is_empty() => named,
+                _ => match mix.as_ref() {
+                    Some(mix) => mix.monitor(),
+                    None => format!("{}.monitor", default_device(Stream::Output)?),
+                },
+            };
+            route_when_ready(Stream::Input, &monitor, &existing)
+                .with_context(|| format!("pointing the recording at {monitor}"))?;
+            // Remembered, so that changing microphones mid-call leaves it
+            // where it is.
+            system_streams = our_streams(Stream::Input)?.into_iter().filter(|i| !existing.contains(i)).collect();
+            system_capture_streams().lock().unwrap().extend(system_streams.iter().cloned());
+            tracing::info!("audio: recording what is played, from {monitor}");
+        }
+        Route::AsOpened => {}
     }
 
-    Ok(Capture { _stream: stream, level, active })
+    Ok(Capture {
+        _stream: stream,
+        level,
+        active,
+        system_streams,
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        _mix: mix,
+    })
 }
 
 impl Capture {
@@ -540,6 +704,7 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
     let rate = config.sample_rate();
     let channels = config.channels();
     tracing::info!("audio: playing to {:?} at {rate}Hz {channels}ch", device.to_string());
+    let existing = our_streams(Stream::Output).unwrap_or_default();
 
     let buffer = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
     let reader = buffer.clone();
@@ -594,7 +759,7 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
     // Unlike a misrouted microphone this is merely wrong rather than a privacy
     // problem, so a failure here is a warning: hearing the call from the wrong
     // speakers beats not hearing it at all.
-    match route_when_ready(Stream::Output, device_id.unwrap_or("")) {
+    match route_when_ready(Stream::Output, device_id.unwrap_or(""), &existing) {
         Ok(on) => tracing::info!("audio: output routed to {on:?}"),
         Err(e) => tracing::warn!("audio: could not route output: {e:#}"),
     }
@@ -602,16 +767,188 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
     Ok(Playback { _stream: stream, buffer, peak: Mutex::new(0.0), received: std::sync::atomic::AtomicU64::new(0) })
 }
 
+/// Every application's sound except this program's, gathered into a sink of
+/// its own for sharing with a screen.
+///
+/// Why not simply record the speakers' monitor: on PipeWire the monitor can
+/// carry the output's volume - here it carried it twice, so at 28% volume a
+/// shared video arrived at 0.05% of its level, which is silence - and it
+/// carries this program's own playback, so everybody in the call would hear
+/// themselves come back through the stream. This is how Vesktop's `venmic`
+/// does Linux stream audio: a private sink, each application's output linked
+/// into it *as well as* to wherever it already plays, and the private sink's
+/// monitor recorded at full level whatever the speakers are set to.
+///
+/// Applications that start playing after the share begins are linked as they
+/// appear, by a thread that looks every second. Nothing anybody hears changes:
+/// links are added, never moved.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub struct ShareMix {
+    module: String,
+    sink: String,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+impl ShareMix {
+    pub fn open() -> Result<Self> {
+        for tool in ["pw-dump", "pw-link"] {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .with_context(|| format!("{tool} is not installed, so there is no PipeWire to build a mix with"))?;
+        }
+        let sink = format!("nobilis_share_{}", std::process::id());
+        let before = default_device(Stream::Output).ok();
+        let module = pactl(&[
+            "load-module",
+            "module-null-sink",
+            &format!("sink_name={sink}"),
+            "sink_properties=device.description=moho-screen-share",
+        ])?
+        .trim()
+        .to_string();
+        // A new sink can be chosen as the default by a session manager that
+        // likes new devices. The share must never take somebody's speakers.
+        if let Some(before) = before {
+            if default_device(Stream::Output).ok().as_deref() != Some(before.as_str()) {
+                let _ = pactl(&["set-default-sink", &before]);
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let (looking, target) = (stop.clone(), sink.clone());
+        let own_node = stream_node_name(Stream::Output);
+        std::thread::spawn(move || {
+            let mut linked = 0usize;
+            while !looking.load(Ordering::Relaxed) {
+                match link_into(&target, &own_node) {
+                    Ok(made) if made > 0 => {
+                        linked += made;
+                        tracing::info!("audio: share mix now takes {linked} application channel(s)");
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::debug!("audio: share mix: {e:#}"),
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        });
+        tracing::info!("audio: gathering applications' sound into {sink}");
+        Ok(Self { module, sink, stop })
+    }
+
+    pub fn monitor(&self) -> String {
+        format!("{}.monitor", self.sink)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+impl Drop for ShareMix {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // The links go with the sink.
+        if let Err(e) = pactl(&["unload-module", &self.module]) {
+            tracing::warn!("audio: could not take down {}: {e:#}", self.sink);
+        }
+    }
+}
+
+/// Links every application playing sound into `sink`, except this process's
+/// own playback. Returns how many links it made.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn link_into(sink: &str, own_node: &str) -> Result<usize> {
+    let dump = std::process::Command::new("pw-dump").output().context("running pw-dump")?;
+    let graph: serde_json::Value = serde_json::from_slice(&dump.stdout).context("reading pw-dump")?;
+    let plan = links_to_make(&graph, sink, own_node, std::process::id());
+    for (from, to) in &plan {
+        let _ = std::process::Command::new("pw-link").args([from.to_string(), to.to_string()]).output();
+    }
+    Ok(plan.len())
+}
+
+/// Which (output port, input port) links are missing, read from a `pw-dump`.
+///
+/// Pure, so the rules can be tested without a sound server: application
+/// output streams only; not our own (by node name or process); monitor ports
+/// never; a mono channel into both sides; and nothing already linked.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn links_to_make(graph: &serde_json::Value, sink: &str, own_node: &str, own_pid: u32) -> Vec<(u64, u64)> {
+    let objects = graph.as_array().map(|a| a.as_slice()).unwrap_or_default();
+    let kind = |o: &serde_json::Value| o["type"].as_str().unwrap_or("").rsplit(':').next().unwrap_or("").to_string();
+    let props = |o: &serde_json::Value| o["info"]["props"].clone();
+
+    let mut sink_node: Option<u64> = None;
+    let mut sources: std::collections::HashSet<u64> = Default::default();
+    for o in objects.iter().filter(|o| kind(o) == "Node") {
+        let p = props(o);
+        let Some(id) = o["id"].as_u64() else { continue };
+        let name = p["node.name"].as_str().unwrap_or("");
+        if name == sink && p["media.class"].as_str() == Some("Audio/Sink") {
+            sink_node = Some(id);
+            continue;
+        }
+        if p["media.class"].as_str() != Some("Stream/Output/Audio") {
+            continue;
+        }
+        let pid = p["application.process.id"]
+            .as_u64()
+            .or_else(|| p["application.process.id"].as_str().and_then(|s| s.parse().ok()));
+        if name.starts_with(own_node) || pid == Some(own_pid as u64) {
+            continue;
+        }
+        sources.insert(id);
+    }
+    let Some(sink_node) = sink_node else { return Vec::new() };
+
+    let mut inputs: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut outputs: Vec<(u64, String)> = Vec::new();
+    for o in objects.iter().filter(|o| kind(o) == "Port") {
+        let p = props(o);
+        let Some(id) = o["id"].as_u64() else { continue };
+        let node = p["node.id"].as_u64();
+        let channel = p["audio.channel"].as_str().unwrap_or("").to_string();
+        let monitor = p["port.monitor"].as_bool().unwrap_or(false);
+        match p["port.direction"].as_str() {
+            Some("in") if node == Some(sink_node) => {
+                inputs.insert(channel, id);
+            }
+            Some("out") if !monitor && node.is_some_and(|n| sources.contains(&n)) => outputs.push((id, channel)),
+            _ => {}
+        }
+    }
+    let existing: std::collections::HashSet<(u64, u64)> = objects
+        .iter()
+        .filter(|o| kind(o) == "Link")
+        .filter_map(|o| Some((o["info"]["output-port-id"].as_u64()?, o["info"]["input-port-id"].as_u64()?)))
+        .collect();
+
+    let mut plan = Vec::new();
+    for (port, channel) in outputs {
+        let targets: Vec<&str> = match channel.as_str() {
+            "FR" => vec!["FR"],
+            "MONO" => vec!["FL", "FR"],
+            _ => vec!["FL"],
+        };
+        for target in targets {
+            if let Some(&to) = inputs.get(target) {
+                if !existing.contains(&(port, to)) {
+                    plan.push((port, to));
+                }
+            }
+        }
+    }
+    plan
+}
+
 /// Routes a freshly opened stream, waiting for it to exist first.
 ///
 /// A stream is only something the sound server can move once it is playing,
 /// and it takes a moment to appear - measured at 0.3 to 0.4 seconds here - so
 /// concluding it is missing straight away would fail every time.
-fn route_when_ready(stream: Stream, device_id: &str) -> Result<String> {
+fn route_when_ready(stream: Stream, device_id: &str, existing: &std::collections::HashSet<String>) -> Result<String> {
     let target = if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
     let mut last = Ok(false);
     for _ in 0..40 {
-        last = route_stream(stream, &target);
+        last = route_stream_except(stream, &target, existing);
         if matches!(last, Ok(true)) {
             return Ok(target);
         }
@@ -762,31 +1099,14 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_microphone_is_not_the_end_of_the_stream() {
-        // The failure this guards against is subtle: returning 0 bytes is how
-        // a file says it is over, so a moment of silence would end the call.
-        use std::io::Read;
-        let (mut source, _sink) = MicSource::new();
-        let mut buf = [1u8; 256];
-        let n = source.read(&mut buf).expect("reading a live source should not fail");
-        assert!(n > 0, "a silent microphone reported end-of-stream");
-        assert!(buf[..n].iter().all(|b| *b == 0), "silence should read as zeroes");
-    }
-
-    #[test]
-    fn captured_audio_reaches_the_source_and_stops_when_the_capture_does() {
-        use std::io::Read;
-        let (mut source, mut sink) = MicSource::new();
-        sink(&[1.0f32, -1.0]);
-
-        let mut buf = [0u8; 8];
-        source.read_exact(&mut buf).expect("captured audio should be readable");
-        assert_eq!(f32::from_le_bytes(buf[..4].try_into().unwrap()), 1.0);
-        assert_eq!(f32::from_le_bytes(buf[4..].try_into().unwrap()), -1.0);
-
-        // Dropping the capture is what ends a call; the source must agree.
-        drop(sink);
-        assert_eq!(source.read(&mut buf).unwrap(), 0, "the source outlived its microphone");
+    fn a_frame_is_handed_out_whole_or_not_at_all() {
+        let (source, mut sink) = MicSource::new();
+        sink(&[0.25f32; 1000]);
+        assert!(source.take(1920).is_none(), "half a frame is a click, not a frame");
+        sink(&[0.25f32; 920]);
+        let frame = source.take(1920).expect("a whole frame once it has arrived");
+        assert_eq!(frame.len(), 1920);
+        assert!(source.take(1).is_none(), "nothing is left over");
     }
 
     #[test]
@@ -797,36 +1117,64 @@ mod tests {
             sink(&chunk);
         }
         let buffered = source.buffer.lock().unwrap().len();
-        // One second of 48kHz stereo f32, and not the ten seconds pushed in.
-        assert!(buffered <= 48_000 * 2 * 4, "backlog grew to {buffered} bytes");
+        // One second of 48kHz stereo, and not the ten seconds pushed in.
+        assert!(buffered <= 48_000 * 2, "backlog grew to {buffered} samples");
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
-    fn songbird_can_decode_what_the_microphone_produces() {
-        // This is a dependency-shape test, not a logic test, and it earns its
-        // place: songbird builds its codec registry from whatever the shared
-        // symphonia crate has compiled in, and depends on it with no default
-        // features. Without a PCM decoder enabled somewhere in the tree, a
-        // voice connection still opens, negotiates crypto and announces a
-        // microphone - and then discards the track 40ms later with "no
-        // compatible track found", which from the outside is indistinguishable
-        // from a working connection that nobody is talking on.
-        use songbird::input::core::codecs::{CodecParameters, CODEC_TYPE_PCM_F32LE};
-        use songbird::input::core::sample::SampleFormat;
-        // The same parameters songbird's own raw reader describes the stream
-        // with, so this asks exactly the question the mixer asks.
-        let params = CodecParameters::new()
-            .for_codec(CODEC_TYPE_PCM_F32LE)
-            .with_sample_rate(TARGET_RATE)
-            .with_bits_per_coded_sample(32)
-            .with_bits_per_sample(32)
-            .with_sample_format(SampleFormat::F32)
-            .with_max_frames_per_packet(TARGET_RATE as u64 / 50)
-            .with_channels(songbird::input::core::audio::Channels::FRONT_LEFT | songbird::input::core::audio::Channels::FRONT_RIGHT)
-            .clone();
-        songbird::input::codecs::get_codec_registry()
-            .make(&params, &Default::default())
-            .expect("no decoder for the raw f32 audio a microphone produces");
+    fn the_share_mix_takes_other_applications_and_never_our_own() {
+        let graph = serde_json::json!([
+            { "id": 10, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "nobilis_share_1", "media.class": "Audio/Sink" } } },
+            { "id": 11, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 10, "port.direction": "in", "audio.channel": "FL" } } },
+            { "id": 12, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 10, "port.direction": "in", "audio.channel": "FR" } } },
+            // A film playing: both channels, one already linked.
+            { "id": 20, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "Firefox", "media.class": "Stream/Output/Audio", "application.process.id": "900" } } },
+            { "id": 21, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 20, "port.direction": "out", "audio.channel": "FL" } } },
+            { "id": 22, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 20, "port.direction": "out", "audio.channel": "FR" } } },
+            { "id": 23, "type": "PipeWire:Interface:Link", "info": { "output-port-id": 21, "input-port-id": 11 } },
+            // A mono game.
+            { "id": 30, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "game", "media.class": "Stream/Output/Audio" } } },
+            { "id": 31, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 30, "port.direction": "out", "audio.channel": "MONO" } } },
+            // Our own call audio, by node name and by process: never.
+            { "id": 40, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "alsa_playback.nobilis", "media.class": "Stream/Output/Audio" } } },
+            { "id": 41, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 40, "port.direction": "out", "audio.channel": "FL" } } },
+            { "id": 50, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "other", "media.class": "Stream/Output/Audio", "application.process.id": 4242 } } },
+            { "id": 51, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 50, "port.direction": "out", "audio.channel": "FL" } } },
+            // A speaker's monitor port: never a source.
+            { "id": 60, "type": "PipeWire:Interface:Node", "info": { "props": { "node.name": "speakers", "media.class": "Audio/Sink" } } },
+            { "id": 61, "type": "PipeWire:Interface:Port", "info": { "props": { "node.id": 60, "port.direction": "out", "audio.channel": "FL", "port.monitor": true } } }
+        ]);
+        let mut plan = links_to_make(&graph, "nobilis_share_1", "alsa_playback.nobilis", 4242);
+        plan.sort();
+        assert_eq!(plan, vec![(22, 12), (31, 11), (31, 12)]);
+    }
+
+    /// Records what the computer is playing. Ignored by default: it needs a
+    /// sound server and something playing, so it is run deliberately with
+    /// `cargo test -- --ignored system_capture` while a sound plays.
+    #[test]
+    #[ignore]
+    fn system_capture_hears_what_is_played() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let loudest = Arc::new(Mutex::new(0.0f32));
+        let peak = loudest.clone();
+        let capture = start_system_capture(move |pcm: &[f32]| {
+            seen.fetch_add(pcm.len(), Ordering::Relaxed);
+            let mut p = peak.lock().unwrap();
+            *p = pcm.iter().fold(*p, |m, s| m.max(s.abs()));
+        })
+        .expect("opening the system recording");
+        std::thread::sleep(std::time::Duration::from_secs(6));
+        let routed = system_capture_streams().lock().unwrap().clone();
+        drop(capture);
+        let samples = count.load(Ordering::Relaxed);
+        let peak = *loudest.lock().unwrap();
+        println!("recorded {samples} samples, peak {peak:.4}, streams {routed:?}");
+        assert!(samples > 0, "the recording produced nothing");
+        assert!(peak > 0.01, "silence - the recording is not on the monitor");
+        assert!(system_capture_streams().lock().unwrap().is_empty(), "closing it should release its stream");
     }
 
     /// Opens the real default microphone. Ignored by default: it needs
@@ -859,101 +1207,42 @@ mod tests {
 }
 
 
-/// A live microphone presented as something Songbird can play.
+/// A live microphone, read in 20ms frames by whatever is sending it.
 ///
-/// Songbird reads an input the way it reads a file, but a microphone has no
-/// end and no length: reaching the end of the buffer means "nothing has been
-/// said yet", not "the track is over". Returning zero bytes would be read as
-/// end-of-stream and stop the track, so a read with nothing buffered waits
-/// briefly and then returns silence, which keeps the stream alive and the
-/// timing honest.
+/// Filled by the capture callback on the audio thread and drained by the voice
+/// connection's clock. The two run at the same nominal rate and never in step,
+/// so the buffer absorbs the difference - and is capped, because a sender that
+/// stalls for a second must not come back to a second of old speech.
 pub struct MicSource {
-    buffer: Arc<Mutex<std::collections::VecDeque<u8>>>,
-    open: Arc<AtomicBool>,
-}
-
-/// Closes a `MicSource` when the thing feeding it goes away.
-///
-/// The sink is owned by the capture stream, so dropping the capture drops this
-/// too, and the source then reports end-of-stream instead of playing silence
-/// into a connection nobody is speaking on.
-struct SinkGuard(Arc<AtomicBool>);
-
-impl Drop for SinkGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
-    }
+    buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
 }
 
 impl MicSource {
-    /// Returns the source and the sink that feeds it.
+    /// The source, and the sink a capture callback feeds it through.
     pub fn new() -> (Self, impl FnMut(&[f32]) + Send + 'static) {
         let buffer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let open = Arc::new(AtomicBool::new(true));
         let writer = buffer.clone();
-        let guard = SinkGuard(open.clone());
         let sink = move |pcm: &[f32]| {
-            // Held solely so its drop closes the source.
-            let _ = &guard;
             let mut buf = writer.lock().unwrap();
-            for sample in pcm {
-                buf.extend(sample.to_le_bytes());
-            }
-            // Cap the backlog: if the encoder ever stalls, the right thing is
-            // to drop old audio rather than grow without limit and then play
-            // out minutes of stale sound. Trimmed after writing, so the cap
-            // holds for what is actually buffered rather than for what was
-            // buffered one chunk ago.
-            const MAX_BYTES: usize = 48_000 * 2 * 4; // one second
+            buf.extend(pcm.iter().copied());
+            const MAX_SAMPLES: usize = TARGET_RATE as usize * TARGET_CHANNELS as usize; // one second
             let backlog = buf.len();
-            if backlog > MAX_BYTES {
-                buf.drain(..backlog - MAX_BYTES);
+            if backlog > MAX_SAMPLES {
+                buf.drain(..backlog - MAX_SAMPLES);
             }
         };
-        (Self { buffer, open }, sink)
+        (Self { buffer }, sink)
     }
-}
 
-impl std::io::Read for MicSource {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        for _ in 0..20 {
-            if !self.open.load(Ordering::Relaxed) {
-                return Ok(0);
-            }
-            {
-                let mut buf = self.buffer.lock().unwrap();
-                if !buf.is_empty() {
-                    let n = out.len().min(buf.len());
-                    for slot in out.iter_mut().take(n) {
-                        *slot = buf.pop_front().unwrap();
-                    }
-                    return Ok(n);
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+    /// The next `samples` interleaved samples, or None if fewer have arrived.
+    ///
+    /// Nothing is handed out partially: a frame that is half speech and half
+    /// padding is a click, and waiting one more tick for the rest is not.
+    pub fn take(&self, samples: usize) -> Option<Vec<f32>> {
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() < samples {
+            return None;
         }
-        // Still nothing, but the microphone is still open: hand back silence
-        // rather than end-of-stream, which would stop the track for good.
-        let n = out.len().min(1920 * 4);
-        out[..n].fill(0);
-        Ok(n)
-    }
-}
-
-impl std::io::Seek for MicSource {
-    fn seek(&mut self, _: std::io::SeekFrom) -> std::io::Result<u64> {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "a microphone cannot seek"))
-    }
-}
-
-// Songbird's own re-export rather than a direct symphonia dependency: the
-// trait has to be the one Songbird was built against, and naming it through
-// Songbird makes that true by construction instead of by matching versions.
-impl songbird::input::core::io::MediaSource for MicSource {
-    fn is_seekable(&self) -> bool {
-        false
-    }
-    fn byte_len(&self) -> Option<u64> {
-        None
+        Some(buf.drain(..samples).collect())
     }
 }

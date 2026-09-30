@@ -199,6 +199,42 @@ pub fn open_at(mode: Mode, key: &[u8], packet: &[u8], aad_len: usize, body_at: u
     Ok(body)
 }
 
+/// Opens a packet from a voice connection, exactly as Discord seals them.
+///
+/// Discord departs from SRTP in one place: when a packet carries a header
+/// extension, the four-byte extension *preamble* (profile and length) is left
+/// in the clear and authenticated, and the extension's *body* is encrypted
+/// along with the media. So the authenticated span ends four bytes after the
+/// fixed header, and the plaintext starts with the extension body, which has
+/// to be skipped before the codec sees anything. This is songbird's reading,
+/// which is what carried every call before this module existed; the guessing
+/// `open_at` does for a Go Live stream is not needed where the rule is known.
+///
+/// Returns the media payload alone, with RTP padding removed.
+pub fn open_rtp(mode: Mode, key: &[u8], packet: &[u8], parsed: &super::rtp::Parsed) -> anyhow::Result<Vec<u8>> {
+    let extended = packet.first().is_some_and(|b| b & 0x10 != 0);
+    let authenticated = parsed.fixed_len + if extended { 4 } else { 0 };
+    let mut body = open_at(mode, key, packet, authenticated, authenticated)?;
+    if extended {
+        let skip = parsed.header_len - authenticated;
+        if body.len() < skip {
+            anyhow::bail!("the extension is longer than the packet");
+        }
+        body.drain(..skip);
+    }
+    // Padding: the last byte counts how many bytes at the end are filler.
+    if packet[0] & 0x20 != 0 {
+        if let Some(&count) = body.last() {
+            let count = count as usize;
+            if count == 0 || count > body.len() {
+                anyhow::bail!("the padding is longer than the packet");
+            }
+            body.truncate(body.len() - count);
+        }
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +373,34 @@ mod tests {
     fn a_runt_packet_is_refused_rather_than_indexed_past_its_end() {
         assert!(open(Mode::Aes256Gcm, &key(), &[0u8; 12], 12).is_err());
         assert!(open(Mode::Aes256Gcm, &key(), &[0u8; 4], 12).is_err());
+    }
+
+    /// A packet the way Discord's own clients send one: an extension whose
+    /// preamble is authenticated in the clear and whose body is encrypted
+    /// with the audio. The extension body must not reach the codec.
+    #[test]
+    fn a_packet_with_an_encrypted_extension_body_opens_to_the_media_alone() {
+        let key = [7u8; 32];
+        let mut sealer = Sealer::new(Mode::Aes256Gcm, &key).unwrap();
+        let mut clear = vec![0x90u8, 120, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
+        clear.extend_from_slice(&[0xBE, 0xDE, 0x00, 0x01]); // one word of extension
+        let extension_body = [0x10u8, 0xAA, 0xBB, 0xCC];
+        let opus = b"an opus frame".to_vec();
+        let mut secret = extension_body.to_vec();
+        secret.extend_from_slice(&opus);
+        let packet = sealer.seal(&clear, &secret).unwrap();
+
+        let parsed = super::super::rtp::parse_header(&packet).unwrap();
+        assert_eq!(open_rtp(Mode::Aes256Gcm, &key, &packet, &parsed).unwrap(), opus);
+    }
+
+    #[test]
+    fn a_packet_without_an_extension_opens_after_the_fixed_header() {
+        let key = [9u8; 32];
+        let mut sealer = Sealer::new(Mode::XChaCha20Poly1305, &key).unwrap();
+        let clear = [0x80u8, 120, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
+        let packet = sealer.seal(&clear, b"frame").unwrap();
+        let parsed = super::super::rtp::parse_header(&packet).unwrap();
+        assert_eq!(open_rtp(Mode::XChaCha20Poly1305, &key, &packet, &parsed).unwrap(), b"frame");
     }
 }

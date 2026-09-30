@@ -28,6 +28,13 @@ pub const MAX_PAYLOAD: usize = 1100;
 /// worse than one that is a little larger on the wire.
 pub const PAYLOAD_TYPE_VP8: u8 = 103;
 
+/// Opus, as every Discord voice connection negotiates it.
+pub const PAYLOAD_TYPE_OPUS: u8 = 120;
+
+/// Opus runs at 48kHz and Discord sends it in 20ms frames: 960 samples per
+/// channel, which is also how far the RTP timestamp moves per packet.
+pub const OPUS_FRAME_SAMPLES: usize = 960;
+
 /// One RTP packet, before encryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {

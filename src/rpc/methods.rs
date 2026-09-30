@@ -4444,6 +4444,10 @@ pub async fn dispatch(
                 user_id,
             };
             let result = if method == "startDiscordScreenShare" {
+                // The computer's sound goes with the picture unless the
+                // window says otherwise.
+                let sound = params.get("audio").and_then(|v| v.as_bool()).unwrap_or(true);
+                backend::discord::golive::set_sound(&account_id, sound);
                 backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
             } else {
                 backend::discord::golive::close(&account_id);
