@@ -105,6 +105,7 @@ opus2 = "0.4"
 # daemon has anything to say to its allocator.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+socket2 = "0.6"
 
 # Tor's certificate validation hangs on Windows without this.
 #

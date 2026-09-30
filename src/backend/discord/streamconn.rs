@@ -35,6 +35,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::rtp;
+use super::videorx::{self, VideoReceiver};
 use super::voicecrypto::{self, Mode, Sealer};
 
 /// Discord's voice gateway version. 8 is what carries the video fields.
@@ -47,6 +48,17 @@ const VOICE_VERSION: u8 = 8;
 /// which we send empty and the server fills in. The length field counts the
 /// seventy bytes after itself, not the whole packet - which is the kind of
 /// off-by-four that produces a packet the server drops in silence.
+/// Asks for a larger receive buffer than the system's default.
+///
+/// A keyframe arrives as a burst of a hundred packets or more in a few
+/// milliseconds, and the default buffer (about 200KB on Linux) overflows
+/// under it whenever the reader is a moment late - which drops packets out of
+/// the one frame that everything after it depends on. Best effort: the
+/// system caps the size at its own limit, and a refusal leaves the default.
+pub fn widen_receive_buffer(udp: &UdpSocket) {
+    let _ = socket2::SockRef::from(udp).set_recv_buffer_size(4 * 1024 * 1024);
+}
+
 pub fn discovery_request(ssrc: u32) -> [u8; 74] {
     let mut out = [0u8; 74];
     out[0..2].copy_from_slice(&1u16.to_be_bytes());
@@ -116,7 +128,7 @@ impl Watching {
 /// One stream connection, once it is sending.
 pub struct StreamSender {
     udp: Arc<UdpSocket>,
-    sealer: Mutex<Sealer>,
+    sealer: Arc<Mutex<Sealer>>,
     video_ssrc: u32,
     sequence: AtomicU32,
     /// The stream's sound goes on the SSRC the server handed this
@@ -232,7 +244,11 @@ impl StreamSender {
             };
             let _ = encoder.set_bitrate(opus2::Bitrate::Bits(128_000));
             let _ = self.outgoing.send(WsMessage::Text(
-                json!({ "op": 5, "d": { "speaking": 1, "delay": 0, "ssrc": self.audio_ssrc } }).to_string(),
+                // Speaking flag 2 is "soundshare": a stream's sound, not somebody's
+                // microphone. Flag 1 is what a voice call sends, and a viewer
+                // does not play a stream's audio marked as that - which is
+                // exactly what the phone's own stream sends, read off the wire.
+                json!({ "op": 5, "d": { "speaking": 2, "delay": 0, "ssrc": self.audio_ssrc } }).to_string(),
             ));
             tracing::info!("discord[{account_id}]: the stream is sending sound");
 
@@ -436,6 +452,7 @@ pub async fn connect(
 
     // The UDP session, and the round trip that says how the far side sees us.
     let udp = UdpSocket::bind("0.0.0.0:0").await.context("opening a socket")?;
+    widen_receive_buffer(&udp);
     udp.connect((address.as_str(), port)).await.context("pointing the socket at the stream server")?;
     udp.send(&discovery_request(ssrc)).await.context("asking how we are seen")?;
     let mut answer = [0u8; 74];
@@ -548,10 +565,14 @@ pub async fn connect(
     // value returned has to be able to stop them after they have started.
     let watching = live.clone();
     let udp = Arc::new(udp);
+    // One sealer for everything this connection sends - the picture, the
+    // sound, and a viewer's requests for resends - because they share a key,
+    // and two counters under one key could one day send the same nonce twice.
+    let sealer = Arc::new(Mutex::new(Sealer::new(mode, &key)?));
     let (outgoing, mut to_socket) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
     let sender = Arc::new(StreamSender {
         udp: udp.clone(),
-        sealer: Mutex::new(Sealer::new(mode, &key)?),
+        sealer: sealer.clone(),
         video_ssrc,
         sequence: AtomicU32::new(rand::random::<u16>() as u32),
         audio_ssrc: ssrc,
@@ -565,6 +586,8 @@ pub async fn connect(
     // frames, and a viewer needs the mapping both to know which packets are
     // the picture and to name the sender when decrypting.
     let senders: Arc<Mutex<HashMap<u32, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+    // Retransmission SSRCs, to the picture they resend for.
+    let resends: Arc<Mutex<HashMap<u32, u32>>> = Arc::new(Mutex::new(HashMap::new()));
 
     if let Role::Viewer { owner } = role {
         tokio::spawn(watch_socket(
@@ -576,6 +599,9 @@ pub async fn connect(
             key.clone(),
             dave.clone(),
             senders.clone(),
+            resends.clone(),
+            sealer.clone(),
+            ssrc,
             owner,
             live.clone(),
         ));
@@ -644,7 +670,7 @@ pub async fn connect(
                         // able to encrypt anything.
                         Some(Ok(incoming)) => {
                             note_sequence(&incoming, &seq_ack);
-                            note_senders(&incoming, &senders).await;
+                            note_senders(&incoming, &senders, &resends).await;
                             if let Some(reply) = answer_dave(&dave, &incoming, &account).await {
                                 if write.send(reply).await.is_err() {
                                     break;
@@ -688,7 +714,11 @@ pub async fn connect(
 /// the only place the mapping exists: a packet carries an SSRC and nothing
 /// else identifying, so without this a viewer knows a picture is arriving and
 /// not whose it is - which under MLS means it cannot be decrypted at all.
-async fn note_senders(incoming: &WsMessage, senders: &Arc<Mutex<HashMap<u32, u64>>>) {
+async fn note_senders(
+    incoming: &WsMessage,
+    senders: &Arc<Mutex<HashMap<u32, u64>>>,
+    resends: &Arc<Mutex<HashMap<u32, u32>>>,
+) {
     let WsMessage::Text(text) = incoming else { return };
     let Ok(message) = serde_json::from_str::<Value>(text) else { return };
     if message["op"].as_u64() != Some(12) {
@@ -700,6 +730,7 @@ async fn note_senders(incoming: &WsMessage, senders: &Arc<Mutex<HashMap<u32, u64
     let Some(user) = d["user_id"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| d["user_id"].as_u64()) else {
         return;
     };
+    resends.lock().await.extend(videorx::rtx_pairs(d));
     let mut held = senders.lock().await;
     if let Some(ssrc) = d["video_ssrc"].as_u64().filter(|s| *s != 0) {
         held.insert(ssrc as u32, user);
@@ -732,6 +763,9 @@ async fn watch_socket(
     key: Vec<u8>,
     dave: Arc<Mutex<Option<super::dave::Dave>>>,
     senders: Arc<Mutex<HashMap<u32, u64>>>,
+    resends: Arc<Mutex<HashMap<u32, u32>>>,
+    sealer: Arc<Mutex<Sealer>>,
+    ssrc: u32,
     owner: u64,
     live: Arc<AtomicBool>,
 ) {
@@ -741,7 +775,7 @@ async fn watch_socket(
     // One per SSRC. Two people sending into the same connection do not share
     // a sequence space, and treating them as if they did would read every
     // other packet as a gap.
-    let mut windows: HashMap<u32, super::reassemble::Reassembler> = HashMap::new();
+    let mut pictures: HashMap<u32, VideoReceiver> = HashMap::new();
     // A datagram is at most an MTU, and the sender caps its payload well
     // under one; this is roomy rather than tight.
     let mut buffer = vec![0u8; 4096];
@@ -751,14 +785,21 @@ async fn watch_socket(
     let mut unopened = 0u64;
     let mut undecrypted = 0u64;
     let mut frames = 0u64;
-    let mut waiting_for_keyframe = true;
-    // Which of the header readings below turned out to be this sender's,
-    // once one packet has proved it.
-    let mut reading: Option<usize> = None;
     let mut seen = 0u32;
     let mut unparsed = 0u64;
     let mut types: HashMap<u8, u64> = HashMap::new();
     let mut sources: HashMap<u32, u64> = HashMap::new();
+
+    let send_rtcp = |packet: Vec<u8>| {
+        let udp = udp.clone();
+        let sealer = sealer.clone();
+        async move {
+            let sealed = videorx::seal_rtcp(&mut *sealer.lock().await, &packet);
+            if let Ok(sealed) = sealed {
+                let _ = udp.send(&sealed).await;
+            }
+        }
+    };
 
     tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
     while live.load(Ordering::Relaxed) {
@@ -778,23 +819,16 @@ async fn watch_socket(
             }
         };
         let datagram = &buffer[..length];
-        // The first few, whole, before anything decides what they are.
-        //
-        // Three readings of the header have now failed on every packet of a
-        // live stream, which rules out the question they were asking. What is
-        // left is to stop reasoning about the shape and look at it: the
-        // version and extension bits, the payload type, the SSRC, and enough
-        // leading bytes to see the extension if there is one.
-        //
-        // Bounded hard at three. This is the one diagnostic that cannot be
-        // rate-limited by counting, because what it is for is the packets
-        // before anything has been counted.
         if seen < 3 {
             seen += 1;
             let head: String = datagram.iter().take(24).map(|b| format!("{b:02x}")).collect();
             tracing::info!(
                 "discord[{account_id}]: datagram {seen} on {stream_key}: {length} bytes, first 24: {head}"
             );
+        }
+        if videorx::is_rtcp(datagram) {
+            *types.entry(datagram[1] & 0x7f).or_insert(0u64) += 1;
+            continue;
         }
         // Not everything arriving here is a packet. The discovery answer and
         // whatever else the server sends would otherwise be fed to a decoder.
@@ -807,65 +841,54 @@ async fn watch_socket(
         // is indistinguishable, from the outside, from no stream at all.
         *types.entry(parsed.payload_type).or_insert(0u64) += 1;
         *sources.entry(parsed.ssrc).or_insert(0u64) += 1;
-        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 {
+        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 && parsed.payload_type != videorx::PAYLOAD_TYPE_RTX {
             continue;
         }
-        // Where the authenticated span ends and where the ciphertext begins
-        // are the same place in everything this stack sends, and need not be
-        // in what arrives: the `_rtpsize` modes exist so a relay can read an
-        // RTP header extension it may not decrypt, and Discord's own client
-        // sends an extension on every packet where this one sends none.
-        //
-        // Which reading is right is not written down anywhere this project
-        // can consult, and getting it wrong fails every packet with nothing
-        // to say why - 1137 of them, in the run that prompted this. So the
-        // readings are tried and the AEAD tag decides, which is exactly the
-        // question a tag answers. The winner is remembered, so this costs one
-        // packet's worth of guessing per connection and nothing after.
-        let candidates = [
-            // The extension authenticated, and outside the ciphertext.
-            (parsed.header_len, parsed.header_len),
-            // The extension treated as part of the encrypted body.
-            (parsed.fixed_len, parsed.fixed_len),
-            // Readable by a relay, and not covered by the tag.
-            (parsed.fixed_len, parsed.header_len),
-        ];
-        let opened = match reading {
-            Some(index) => voicecrypto::open_at(mode, &key, datagram, candidates[index].0, candidates[index].1)
-                .ok()
-                .map(|payload| (index, payload)),
-            None => candidates.iter().enumerate().find_map(|(index, (aad, body))| {
-                voicecrypto::open_at(mode, &key, datagram, *aad, *body).ok().map(|payload| (index, payload))
-            }),
-        };
-        let Some((index, payload)) = opened else {
+        // Discord's own rule for where the clear header ends, the same one a
+        // voice call's camera arrives under. The three guesses this used to
+        // try between all left the extension's preamble out of one span or
+        // the other, and a phone's stream - which carries an extension on
+        // every packet - opened under none of them.
+        let Ok(payload) = voicecrypto::open_rtp(mode, &key, datagram, &parsed) else {
             unopened += 1;
             continue;
         };
-        if reading.is_none() {
-            tracing::info!(
-                "discord[{account_id}]: packets on {stream_key} open with reading {index} (authenticated {} bytes, body from {})",
-                candidates[index].0,
-                candidates[index].1
-            );
-            reading = Some(index);
+        let (video_ssrc, sequence, payload, resent) = if parsed.payload_type == videorx::PAYLOAD_TYPE_RTX {
+            let known = resends.lock().await.get(&parsed.ssrc).copied();
+            let Some(media) = known.or_else(|| {
+                let guess = parsed.ssrc.wrapping_sub(1);
+                pictures.contains_key(&guess).then_some(guess)
+            }) else {
+                continue;
+            };
+            let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else { continue };
+            (media, sequence, original, true)
+        } else {
+            (parsed.ssrc, parsed.sequence, payload, false)
+        };
+        let now = std::time::Instant::now();
+        let picture_rx = pictures.entry(video_ssrc).or_default();
+        let whole = picture_rx.push(
+            rtp::Packet {
+                payload_type: rtp::PAYLOAD_TYPE_VP8,
+                sequence,
+                timestamp: parsed.timestamp,
+                ssrc: video_ssrc,
+                marker: parsed.marker,
+                payload,
+            },
+            resent,
+            now,
+        );
+        let lost = picture_rx.to_ask_for(now);
+        if !lost.is_empty() {
+            send_rtcp(videorx::nack(ssrc, video_ssrc, &lost)).await;
         }
-        let window = windows
-            .entry(parsed.ssrc)
-            .or_insert_with(|| super::reassemble::Reassembler::new(super::reassemble::DEFAULT_WINDOW));
-        let whole = window.push(rtp::Packet {
-            payload_type: parsed.payload_type,
-            sequence: parsed.sequence,
-            timestamp: parsed.timestamp,
-            ssrc: parsed.ssrc,
-            marker: parsed.marker,
-            payload,
-        });
         for frame in whole {
             // Whoever the server said owns this SSRC, and the stream's owner
             // if it has not said yet - which is right for a viewer
             // connection, since it carries one person's stream.
-            let from = senders.lock().await.get(&parsed.ssrc).copied().unwrap_or(owner);
+            let from = senders.lock().await.get(&video_ssrc).copied().unwrap_or(owner);
             let picture = {
                 let mut held = dave.lock().await;
                 match held.as_mut() {
@@ -876,24 +899,27 @@ async fn watch_socket(
                             continue;
                         }
                     },
-                    None => frame.data,
+                    None => frame.data.clone(),
                 }
             };
-            // A decoder started on an inter frame produces either an error or
-            // a wrong picture that persists until the next keyframe, so
-            // everything before the first keyframe is thrown away here rather
-            // than sent to the window to be refused there.
-            if waiting_for_keyframe {
-                if !frame.keyframe {
-                    continue;
-                }
-                waiting_for_keyframe = false;
+            let keyframe = super::reassemble::is_keyframe(&picture);
+            let Some(picture_rx) = pictures.get_mut(&video_ssrc) else { continue };
+            let first = picture_rx.stats.frames == 0;
+            let admitted = picture_rx.admit(&frame, keyframe);
+            if picture_rx.wants_keyframe(now) {
+                send_rtcp(videorx::pli(ssrc, video_ssrc)).await;
+            }
+            if !admitted {
+                continue;
+            }
+            if first {
                 tracing::info!("discord[{account_id}]: the first keyframe of {stream_key} arrived");
             }
             frames += 1;
-            if frames % 300 == 1 {
+            if frames % 900 == 1 {
                 tracing::info!(
-                    "discord[{account_id}]: {stream_key}: {frames} frames, {unopened} packets that would not open, {undecrypted} frames that would not decrypt"
+                    "discord[{account_id}]: {stream_key}: {frames} frames, {unopened} packets that would not open, {undecrypted} frames that would not decrypt; {:?}",
+                    picture_rx.stats
                 );
             }
             state.events.emit(
@@ -901,7 +927,7 @@ async fn watch_socket(
                 json!({
                     "accountId": account_id,
                     "streamKey": stream_key,
-                    "keyframe": frame.keyframe,
+                    "keyframe": keyframe,
                     // Microseconds, which is what a WebCodecs decoder takes.
                     // RTP counts video in 90kHz ticks.
                     "timestampMicros": (frame.timestamp as u64 * 1_000_000) / rtp::VIDEO_CLOCK_HZ,
@@ -909,6 +935,9 @@ async fn watch_socket(
                 }),
             );
         }
+    }
+    for (source, picture_rx) in &pictures {
+        tracing::info!("discord[{account_id}]: {stream_key}: picture on {source}: {:?}", picture_rx.stats);
     }
     let mut by_type: Vec<_> = types.into_iter().collect();
     by_type.sort();

@@ -39,6 +39,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::rtp;
+use super::videorx::{self, VideoReceiver};
 use super::voicecrypto::{self, Mode, Sealer};
 
 /// Discord's voice gateway version. 8 is what carries the video fields.
@@ -193,6 +194,7 @@ pub async fn connect(
     let mode = Mode::negotiate(&modes).ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
 
     let udp = UdpSocket::bind("0.0.0.0:0").await.context("opening a socket")?;
+    super::streamconn::widen_receive_buffer(&udp);
     udp.connect((address.as_str(), port)).await.context("pointing the socket at the voice server")?;
     udp.send(&super::streamconn::discovery_request(ssrc)).await.context("asking how we are seen")?;
     let mut answer = [0u8; 74];
@@ -252,6 +254,7 @@ pub async fn connect(
         channel_id,
         owners: Mutex::new(HashMap::new()),
         cameras: Mutex::new(HashMap::new()),
+        rtx: Mutex::new(HashMap::new()),
         group: Mutex::new(Group::default()),
         dave_version: AtomicU16::new(dave_version),
         speakers: Mutex::new(HashMap::new()),
@@ -281,9 +284,9 @@ pub async fn connect(
     let (stop_tx, stop_rx) = watch::channel(false);
     let (ws_tx, ws_rx) = mpsc::unbounded_channel::<WsMessage>();
     let udp = Arc::new(udp);
-    let sealer = Sealer::new(mode, &key)?;
+    let sealer = Arc::new(Mutex::new(Sealer::new(mode, &key)?));
 
-    tokio::spawn(receive(shared.clone(), udp.clone(), mode, key.clone(), stop_rx.clone()));
+    tokio::spawn(receive(shared.clone(), udp.clone(), sealer.clone(), ssrc, mode, key.clone(), stop_rx.clone()));
     tokio::spawn(clock(shared.clone(), udp.clone(), sealer, ssrc, media.playback, media.mic, ws_tx.clone(), stop_rx.clone()));
     tokio::spawn(async move {
         let ended = socket_loop(shared.clone(), write, read, early, beat_every, ws_rx, stop_rx).await;
@@ -312,6 +315,8 @@ struct Shared {
     owners: Mutex<HashMap<u32, u64>>,
     /// Cameras being received: SSRC to their reassembly and keyframe state.
     cameras: Mutex<HashMap<u32, Camera>>,
+    /// Retransmission SSRC to the camera SSRC it resends for.
+    rtx: Mutex<HashMap<u32, u32>>,
     group: Mutex<Group>,
     /// The DAVE version in force. Zero means no end-to-end encryption.
     dave_version: AtomicU16,
@@ -333,8 +338,7 @@ struct Group {
 
 struct Camera {
     user: u64,
-    window: super::reassemble::Reassembler,
-    waiting_for_keyframe: bool,
+    rx: VideoReceiver,
 }
 
 impl Shared {
@@ -398,6 +402,7 @@ impl Shared {
             12 => {
                 let Some(user) = user_of(d) else { return replies };
                 let (audio, video) = video_ssrcs(d);
+                self.rtx.lock().unwrap().extend(super::videorx::rtx_pairs(d));
                 let mut owners = self.owners.lock().unwrap();
                 if let Some(audio) = audio {
                     owners.insert(audio, user);
@@ -580,7 +585,9 @@ impl Shared {
             let mut cameras = self.cameras.lock().unwrap();
             let ssrcs: Vec<u32> = cameras.iter().filter(|(_, c)| c.user == user).map(|(s, _)| *s).collect();
             for ssrc in &ssrcs {
-                cameras.remove(ssrc);
+                if let Some(camera) = cameras.remove(ssrc) {
+                    tracing::info!("discord[{}]: camera from {user} ended: {:?}", self.account, camera.rx.stats);
+                }
             }
             ssrcs
         };
@@ -732,12 +739,21 @@ async fn socket_loop(
 }
 
 /// Everything arriving on UDP: other people's voices and cameras.
-async fn receive(shared: Arc<Shared>, udp: Arc<UdpSocket>, mode: Mode, key: Vec<u8>, mut stop: watch::Receiver<bool>) {
+async fn receive(
+    shared: Arc<Shared>,
+    udp: Arc<UdpSocket>,
+    sealer: Arc<Mutex<Sealer>>,
+    ssrc: u32,
+    mode: Mode,
+    key: Vec<u8>,
+    mut stop: watch::Receiver<bool>,
+) {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
 
     let mut buffer = vec![0u8; 4096];
     let mut unopened = 0u64;
+    let mut rtcp_checked = false;
     loop {
         let length = tokio::select! {
             _ = stop.changed() => break,
@@ -750,11 +766,18 @@ async fn receive(shared: Arc<Shared>, udp: Arc<UdpSocket>, mode: Mode, key: Vec<
             },
         };
         let datagram = &buffer[..length];
-        let Some(parsed) = rtp::parse_header(datagram) else { continue };
-        // RTCP shares the socket and reads as payload types 72 to 76.
-        if (72..=76).contains(&parsed.payload_type) {
+        // RTCP shares the socket. Not used, but the first one is opened the
+        // way ours are sealed, which says whether the relay can read the
+        // retransmission and keyframe requests this sends.
+        if videorx::is_rtcp(datagram) {
+            if !rtcp_checked {
+                rtcp_checked = true;
+                let opens = voicecrypto::open_at(mode, &key, datagram, videorx::RTCP_CLEAR, videorx::RTCP_CLEAR).is_ok();
+                tracing::info!("discord[{}]: RTCP from the relay {} with its header in the clear", shared.account, if opens { "opens" } else { "does not open" });
+            }
             continue;
         }
+        let Some(parsed) = rtp::parse_header(datagram) else { continue };
         let payload = match voicecrypto::open_rtp(mode, &key, datagram, &parsed) {
             Ok(payload) => payload,
             Err(_) => {
@@ -765,7 +788,8 @@ async fn receive(shared: Arc<Shared>, udp: Arc<UdpSocket>, mode: Mode, key: Vec<
                 continue;
             }
         };
-        match parsed.payload_type {
+        // A retransmission is the packet it replaces, on the camera's SSRC.
+        let (video_ssrc, sequence, payload, resent) = match parsed.payload_type {
             rtp::PAYLOAD_TYPE_OPUS => {
                 let Some(opus) = shared.open_media(parsed.ssrc, davey::MediaType::AUDIO, payload) else { continue };
                 shared
@@ -775,57 +799,87 @@ async fn receive(shared: Arc<Shared>, udp: Arc<UdpSocket>, mode: Mode, key: Vec<
                     .entry(parsed.ssrc)
                     .or_insert_with(Jitter::new)
                     .push(parsed.sequence, opus);
+                continue;
             }
-            rtp::PAYLOAD_TYPE_VP8 => {
-                let Some(user) = shared.owners.lock().unwrap().get(&parsed.ssrc).copied() else { continue };
-                let frames = {
-                    let mut cameras = shared.cameras.lock().unwrap();
-                    let camera = cameras.entry(parsed.ssrc).or_insert_with(|| Camera {
-                        user,
-                        window: super::reassemble::Reassembler::new(super::reassemble::DEFAULT_WINDOW),
-                        waiting_for_keyframe: true,
-                    });
-                    camera.user = user;
-                    camera.window.push(rtp::Packet {
-                        payload_type: parsed.payload_type,
-                        sequence: parsed.sequence,
-                        timestamp: parsed.timestamp,
-                        ssrc: parsed.ssrc,
-                        marker: parsed.marker,
-                        payload,
-                    })
+            rtp::PAYLOAD_TYPE_VP8 => (parsed.ssrc, parsed.sequence, payload, false),
+            videorx::PAYLOAD_TYPE_RTX => {
+                let known = shared.rtx.lock().unwrap().get(&parsed.ssrc).copied();
+                let Some(media) = known.or_else(|| {
+                    let guess = parsed.ssrc.wrapping_sub(1);
+                    shared.cameras.lock().unwrap().contains_key(&guess).then_some(guess)
+                }) else {
+                    continue;
                 };
-                for frame in frames {
-                    let Some(picture) = shared.open_media(parsed.ssrc, davey::MediaType::VIDEO, frame.data) else { continue };
-                    let keyframe = super::reassemble::is_keyframe(&picture);
-                    {
-                        // Nothing before the first keyframe: a decoder started
-                        // on a delta frame shows garbage until the next one.
-                        let mut cameras = shared.cameras.lock().unwrap();
-                        let Some(camera) = cameras.get_mut(&parsed.ssrc) else { continue };
-                        if camera.waiting_for_keyframe {
-                            if !keyframe {
-                                continue;
-                            }
-                            camera.waiting_for_keyframe = false;
-                            tracing::info!("discord[{}]: a camera from {user} is arriving", shared.account);
-                        }
-                    }
-                    shared.state.events.emit(
-                        "discordCameraFrame",
-                        json!({
-                            "accountId": shared.account,
-                            "userId": user.to_string(),
-                            "keyframe": keyframe,
-                            "timestampMicros": (frame.timestamp as u64 * 1_000_000) / rtp::VIDEO_CLOCK_HZ,
-                            "frame": STANDARD.encode(&picture),
-                        }),
-                    );
-                }
+                let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else { continue };
+                (media, sequence, original, true)
             }
-            // Retransmissions and anything else: not asked for, not used.
-            _ => {}
+            _ => continue,
+        };
+        let Some(user) = shared.owners.lock().unwrap().get(&video_ssrc).copied() else { continue };
+        let now = Instant::now();
+        let (frames, lost) = {
+            let mut cameras = shared.cameras.lock().unwrap();
+            let camera = cameras.entry(video_ssrc).or_insert_with(|| Camera { user, rx: VideoReceiver::new() });
+            camera.user = user;
+            let frames = camera.rx.push(
+                rtp::Packet {
+                    payload_type: rtp::PAYLOAD_TYPE_VP8,
+                    sequence,
+                    timestamp: parsed.timestamp,
+                    ssrc: video_ssrc,
+                    marker: parsed.marker,
+                    payload,
+                },
+                resent,
+                now,
+            );
+            (frames, camera.rx.to_ask_for(now))
+        };
+        if !lost.is_empty() {
+            send_rtcp(&udp, &sealer, &videorx::nack(ssrc, video_ssrc, &lost)).await;
         }
+        for frame in frames {
+            let Some(picture) = shared.open_media(video_ssrc, davey::MediaType::VIDEO, frame.data.clone()) else { continue };
+            let keyframe = super::reassemble::is_keyframe(&picture);
+            let (admitted, want_key, first) = {
+                let mut cameras = shared.cameras.lock().unwrap();
+                let Some(camera) = cameras.get_mut(&video_ssrc) else { continue };
+                let first = camera.rx.stats.frames == 0;
+                let admitted = camera.rx.admit(&frame, keyframe);
+                let want_key = camera.rx.wants_keyframe(now);
+                if admitted && camera.rx.stats.frames % 900 == 0 {
+                    tracing::info!("discord[{}]: camera from {user}: {:?}", shared.account, camera.rx.stats);
+                }
+                (admitted, want_key, first && admitted)
+            };
+            if want_key {
+                send_rtcp(&udp, &sealer, &videorx::pli(ssrc, video_ssrc)).await;
+            }
+            if !admitted {
+                continue;
+            }
+            if first {
+                tracing::info!("discord[{}]: a camera from {user} is arriving", shared.account);
+            }
+            shared.state.events.emit(
+                "discordCameraFrame",
+                json!({
+                    "accountId": shared.account,
+                    "userId": user.to_string(),
+                    "keyframe": keyframe,
+                    "timestampMicros": (frame.timestamp as u64 * 1_000_000) / rtp::VIDEO_CLOCK_HZ,
+                    "frame": STANDARD.encode(&picture),
+                }),
+            );
+        }
+    }
+}
+
+/// Seals and sends one RTCP packet; a failure is the next packet's problem.
+async fn send_rtcp(udp: &UdpSocket, sealer: &Mutex<Sealer>, packet: &[u8]) {
+    let sealed = videorx::seal_rtcp(&mut sealer.lock().unwrap(), packet);
+    if let Ok(sealed) = sealed {
+        let _ = udp.send(&sealed).await;
     }
 }
 
@@ -835,7 +889,7 @@ async fn receive(shared: Arc<Shared>, udp: Arc<UdpSocket>, mode: Mode, key: Vec<
 async fn clock(
     shared: Arc<Shared>,
     udp: Arc<UdpSocket>,
-    mut sealer: Sealer,
+    sealer: Arc<Mutex<Sealer>>,
     ssrc: u32,
     playback: Option<Arc<crate::audio::Playback>>,
     mic: Option<crate::audio::MicSource>,
@@ -925,7 +979,8 @@ async fn clock(
                 payload: Vec::new(),
             });
             sequence = sequence.wrapping_add(1);
-            if let Ok(packet) = sealer.seal(&header, &body) {
+            let sealed = sealer.lock().unwrap().seal(&header, &body);
+            if let Ok(packet) = sealed {
                 let _ = udp.send(&packet).await;
             }
         }
