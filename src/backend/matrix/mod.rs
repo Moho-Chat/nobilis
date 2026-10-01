@@ -57,6 +57,7 @@ pub mod receipts;
 pub mod recentemoji;
 pub mod relock;
 pub mod send;
+pub mod forward;
 pub mod server;
 pub mod sync;
 pub mod timeline;

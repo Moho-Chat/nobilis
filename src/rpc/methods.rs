@@ -5312,19 +5312,40 @@ pub async fn dispatch(
             let (Some(source), Some(target)) = (state.runtime.get_buffer(from_buffer), state.runtime.get_buffer(to_buffer)) else {
                 return (None, Some("no such conversation".to_string()));
             };
-            // Only Discord has a forward of its own, and only within one
-            // account. Anywhere else it would be a copy of somebody's words
-            // posted as yours, which is not what forwarding means - so it is
-            // refused rather than imitated.
-            if !(source.account_id.starts_with("discord:") && target.account_id == source.account_id) {
-                return (None, Some("forwarding is only possible between conversations of one Discord account".to_string()));
-            }
-            let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
-                return (None, Some("account not connected".to_string()));
-            };
-            match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
+            // Forwarded the way each service forwards, or not at all. A quoted
+            // copy posted as yours is not a forward, so nothing imitates one.
+            //
+            // Discord's is its own message type and does not leave the
+            // account. Matrix's is the original content sent again - the same
+            // upload, the same formatting - and an mxc resolves from any
+            // homeserver, so it can go from one Matrix account to another.
+            match (crate::model::service_of(&source.account_id), crate::model::service_of(&target.account_id)) {
+                ("discord", "discord") if target.account_id == source.account_id => {
+                    let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
+                        return (None, Some("account not connected".to_string()));
+                    };
+                    match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                ("matrix", "matrix") => match backend::matrix::forward::forward_message(
+                    state,
+                    &source.account_id,
+                    from_buffer,
+                    message_id,
+                    &target.account_id,
+                    to_buffer,
+                )
+                .await
+                {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                },
+                _ => (
+                    None,
+                    Some("forwarding goes within one Discord account, or between Matrix rooms".to_string()),
+                ),
             }
         }
 
