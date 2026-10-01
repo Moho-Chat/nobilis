@@ -98,7 +98,7 @@ fn reconnect_routed(state: &AppState) {
 /// The service an account-creating request belongs to.
 fn adding_service(method: &str) -> Option<&'static str> {
     match method {
-        "addDiscordAccount" | "addDiscordAccountPassword" | "addDiscordAccountToken" | "submitDiscordMfa" => Some("discord"),
+        "addDiscordAccount" | "addDiscordAccountToken" => Some("discord"),
         "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
         | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
@@ -3297,21 +3297,6 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
-        // Username/password as an alternative to scanning a QR code. Same
-        // async-kickoff shape: a two-factor challenge arrives as a
-        // discordLoginMfa event (answer it with submitDiscordMfa), and
-        // everything else ends in discordLoginResult.
-        "addDiscordAccountPassword" => {
-            let (login, password) = match (p_str_opt(params, "login"), p_str_opt(params, "password")) {
-                (Some(l), Some(p)) => (l.to_string(), p.to_string()),
-                _ => return (None, Some("addDiscordAccountPassword requires \"login\" and \"password\"".to_string())),
-            };
-            let login_id = format!("discord-login-{}", crate::model::next_message_id());
-            let reauth = p_str_opt(params, "accountId").map(String::from);
-            backend::discord::start_password_login(state.clone(), login_id.clone(), login, password, reauth);
-            (Some(serde_json::json!({ "loginId": login_id })), None)
-        }
-
         // A token a frontend already obtained, by signing in on Discord's own
         // login page in a real browser window.
         //
@@ -3330,17 +3315,6 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
-        }
-
-        // The authenticator (or backup) code for a login that reported
-        // discordLoginMfa. The ticket it needs is held against the loginId.
-        "submitDiscordMfa" => {
-            let (login_id, code) = match (p_str_opt(params, "loginId"), p_str_opt(params, "code")) {
-                (Some(l), Some(c)) => (l.to_string(), c.to_string()),
-                _ => return (None, Some("submitDiscordMfa requires \"loginId\" and \"code\"".to_string())),
-            };
-            backend::discord::submit_mfa_code(state.clone(), login_id, code);
-            (Some(ok_node()), None)
         }
 
         // Tor bootstrap + login (+ a possible proof-of-work solve) can take
