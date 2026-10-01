@@ -73,11 +73,15 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
     Some(format!("file://{}", path.display()))
 }
 
-/// Buffers with a re-sign already running, so a burst of getBacklog calls
-/// (opening, scrolling, opening again) issues one sweep rather than several
-/// against a rate-limited endpoint.
-pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+/// Buffers with a re-sign running, and the messages queued behind it.
+///
+/// One sweep per buffer at a time, so a burst of getBacklog calls (opening,
+/// scrolling, opening again) does not fan out against a rate-limited
+/// endpoint. What arrives while one runs is queued for it rather than dropped:
+/// dropping was what left a page scrolled to mid-sweep with dead links for
+/// good, because nothing would ask for it again.
+pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
         std::sync::OnceLock::new();
     IN_FLIGHT.get_or_init(Default::default)
 }
@@ -100,21 +104,59 @@ pub(super) const MAX_RESIGN_FETCHES: usize = 3;
 /// Runs in the background: the buffer opens immediately showing cached
 /// previews, and re-signed links arrive as messageUpdated events.
 pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[crate::model::Message]) {
-    let stale = stale_message_ids(messages);
-    if stale.is_empty() {
+    resign_messages(state, buffer_id, stale_message_ids(messages));
+}
+
+/// Re-signs these messages' attachments, batched with whatever else this
+/// buffer has waiting.
+///
+/// The window names messages itself when a picture it is showing would not
+/// load - a link that lapsed between the page being read and being drawn, or
+/// one that failed for a reason its expiry does not show.
+pub fn resign_messages(state: AppState, buffer_id: String, ids: Vec<String>) {
+    if ids.is_empty() {
         return;
     }
-
-    if !resigning().lock().unwrap().insert(buffer_id.clone()) {
-        return;
+    {
+        let mut all = resigning().lock().unwrap();
+        if let Some(queued) = all.get_mut(&buffer_id) {
+            for id in ids {
+                if !queued.contains(&id) {
+                    queued.push(id);
+                }
+            }
+            return;
+        }
+        all.insert(buffer_id.clone(), Vec::new());
     }
 
     tokio::spawn(async move {
-        if let Err(e) = run_resign(&state, &buffer_id, stale).await {
-            tracing::debug!("discord: re-signing {buffer_id}: {e}");
+        let mut batch = ids;
+        loop {
+            sort_newest_first(&mut batch);
+            if let Err(e) = run_resign(&state, &buffer_id, batch).await {
+                tracing::debug!("discord: re-signing {buffer_id}: {e}");
+            }
+            // Whatever queued up meanwhile is the next batch; the entry goes
+            // only once there is nothing left, under the same lock a caller
+            // queues under, so nothing can be added to a sweep that has
+            // already finished.
+            let mut all = resigning().lock().unwrap();
+            match all.get_mut(&buffer_id) {
+                Some(queued) if !queued.is_empty() => batch = std::mem::take(queued),
+                _ => {
+                    all.remove(&buffer_id);
+                    break;
+                }
+            }
         }
-        resigning().lock().unwrap().remove(&buffer_id);
     });
+}
+
+/// Newest first, which is most likely what is on screen. Discord ids are
+/// snowflakes: lexicographically ordered for equal length, and longer is newer.
+fn sort_newest_first(ids: &mut [String]) {
+    ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
 }
 
 /// Which messages in a page carry a lapsed attachment link, newest first.
@@ -135,9 +177,7 @@ pub(super) fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<Strin
         })
         .map(|m| m.id.clone())
         .collect();
-    // Discord ids are snowflakes: lexicographically ordered for equal length,
-    // and longer means newer, so sort by length first.
-    ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
+    sort_newest_first(&mut ids);
     ids
 }
 
@@ -459,14 +499,24 @@ pub(super) fn thumbnail_source(url: &str, width: u32, height: u32) -> Option<Str
 /// The `ex=` query parameter is the link's expiry, as a hex unix timestamp.
 /// Reading it lets a stale link be recognised before it is requested, rather
 /// than after a failed load.
+///
+/// "Expired" includes the last ten minutes before it lapses: a page read now
+/// is looked at for a while, and a link that dies while it is on screen is the
+/// picture that goes blank for no visible reason.
 pub(super) fn attachment_expired(url: &str) -> bool {
+    expires_within(url, EXPIRY_MARGIN_SECS)
+}
+
+const EXPIRY_MARGIN_SECS: u64 = 600;
+
+fn expires_within(url: &str, margin: u64) -> bool {
     let Some(ex) = url.split(['?', '&']).find_map(|p| p.strip_prefix("ex=")) else { return false };
     let Ok(expiry) = u64::from_str_radix(ex, 16) else { return false };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now >= expiry
+    now + margin >= expiry
 }
 
 #[cfg(test)]
@@ -551,6 +601,23 @@ mod tests {
         assert!(!attachment_expired(future));
         // An unsigned link has no expiry to read, so it is never "expired".
         assert!(!attachment_expired("https://example.com/a.png"));
+    }
+
+    /// A link a few minutes from lapsing is re-signed now, not after it has
+    /// gone blank on screen.
+    #[test]
+    fn a_link_about_to_lapse_counts_as_lapsed() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let link = |at: u64| format!("https://cdn.discordapp.com/attachments/1/2/a.png?ex={at:x}&is=1&hm=2");
+        assert!(attachment_expired(&link(now + 120)));
+        assert!(!attachment_expired(&link(now + 3600)));
+    }
+
+    #[test]
+    fn newest_messages_are_re_signed_first() {
+        let mut ids = vec!["99".to_string(), "1000".to_string(), "100".to_string()];
+        sort_newest_first(&mut ids);
+        assert_eq!(ids, ["1000", "100", "99"]);
     }
 
     #[test]

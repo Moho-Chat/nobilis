@@ -1366,6 +1366,22 @@ pub async fn dispatch(
             }
         }
 
+        // Re-signs the attachment links of messages the window could not
+        // show, batched with any re-sign already running for the buffer. The
+        // fresh links arrive as messageUpdated.
+        "resignDiscordAttachments" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("resignDiscordAttachments requires \"bufferId\"".to_string()));
+            };
+            let ids: Vec<String> = params
+                .get("messageIds")
+                .and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            backend::discord::resign_messages(state.clone(), buffer_id.to_string(), ids);
+            (Some(ok_node()), None)
+        }
+
         // Repairs scrollback by re-reading recent history and storing only
         // what is missing. With no "bufferId" it sweeps every Discord buffer,
         // which is the useful shape after a storage bug: the messages that
