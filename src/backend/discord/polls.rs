@@ -154,7 +154,7 @@ pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, m
         .get_discord_channel(buffer_id)
         .context("no known Discord channel for this conversation")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
             .put(format!("{API_BASE}/channels/{channel_id}/polls/{message_id}/answers/@me"))
             .header("Authorization", &cfg.token)
             .json(&json!({ "answer_ids": [answer_id.to_string()] })),

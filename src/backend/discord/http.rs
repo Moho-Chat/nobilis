@@ -97,19 +97,31 @@ pub(super) fn retry_after(resp: &reqwest::Response) -> Duration {
     Duration::from_millis(((seconds.max(0.0) * 1000.0) as u64).clamp(200, 30_000))
 }
 
-pub(super) fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(USER_AGENT)
+/// The client for requests made under `key` - the account's token, or its
+/// id - routed through Tor or the configured proxy when that account is.
+pub(super) fn http_client_for(key: &str) -> reqwest::Client {
+    discord_client(crate::net::route::router().routed(key))
+}
+
+/// The client for requests that belong to no account yet - the sign-in - or
+/// that cannot say whose they are, such as a thumbnail off the CDN. Routed
+/// when the add form's switch says so, or when any Discord account is.
+pub(super) fn anonymous_client() -> reqwest::Client {
+    let router = crate::net::route::router();
+    discord_client(router.routed(&crate::net::route::pending_key("discord")) || router.wanted(SHARED_KEY))
+}
+
+/// Marked while any Discord account is routed.
+pub(super) const SHARED_KEY: &str = "discord:any-routed";
+
+fn discord_client(routed: bool) -> reqwest::Client {
+    crate::net::route::router().client_if("discord", routed, |builder| {
         // Pinned to HTTP/1.1. Enabling reqwest's http2 feature (which the
         // file-upload path needs - see upload::http_client) would otherwise
         // let every client here negotiate h2 as a side effect, changing the
         // transport under a backend that works and is tested as it stands.
         // Nothing here wants h2; if it ever does, that is its own change.
-            .http1_only()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        builder.user_agent(USER_AGENT).http1_only()
     })
 }
 

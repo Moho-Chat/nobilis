@@ -323,6 +323,13 @@ pub async fn connect(
     // tell two streams apart. Unused by a host, which has nothing to report.
     stream_key: &str,
 ) -> Result<Connected> {
+    // Voice and video travel over UDP, which neither Tor nor a SOCKS5 proxy
+    // carries. Refused rather than sent directly: an account routed through
+    // Tor that quietly called out on its real address would be worse than
+    // one that says it cannot call.
+    if crate::net::route::router().routed(account_id) {
+        anyhow::bail!("calls and screen sharing need UDP, which Tor and SOCKS5 proxies can't carry - turn off Tor for this account to use them");
+    }
     let url = format!("wss://{}/?v={VOICE_VERSION}", endpoint.trim_end_matches(":443"));
     let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening the stream socket")?;
     let (mut write, mut read) = socket.split();

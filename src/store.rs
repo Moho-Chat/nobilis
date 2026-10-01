@@ -475,6 +475,24 @@ impl Store {
 
     /// Discord's MESSAGE_DELETE - removes the row outright (Discord's own
     /// clients don't show a tombstone either, they just remove it).
+    /// Deletes everything kept for a buffer: its messages, and the reactions
+    /// and live cards that hang off them. Answers the deleted messages'
+    /// bodies, so the caller can delete files they point at.
+    pub fn forget_buffer(&self, buffer_id: &str) -> Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let bodies: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT body FROM messages WHERE buffer_id = ?1")?;
+            let rows = stmt.query_map(params![buffer_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        tx.execute("DELETE FROM messages WHERE buffer_id = ?1", params![buffer_id])?;
+        tx.execute("DELETE FROM matrix_reactions WHERE buffer_id = ?1", params![buffer_id])?;
+        tx.execute("DELETE FROM live_cards WHERE buffer_id = ?1", params![buffer_id])?;
+        tx.commit()?;
+        Ok(bodies)
+    }
+
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;

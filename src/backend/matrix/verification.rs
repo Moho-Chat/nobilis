@@ -808,6 +808,7 @@ mod tests {
             ignores: Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
         let config = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.to_string(),
             user_id: login.user_id.clone(),
             password: password.to_string(),

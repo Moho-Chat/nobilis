@@ -16,6 +16,11 @@ pub(super) const SYNC_LONG_POLL_MS: u64 = 30_000;
 
 pub fn spawn(state: AppState, config: MatrixAccountConfig) {
     let account_id = config.account_id();
+    let router = crate::net::route::router();
+    router.mark(&account_id, config.use_tor);
+    router.mark(&config.access_token, config.use_tor);
+    let any = state.accounts.all_matrix().iter().any(|a| a.use_tor) || config.use_tor;
+    router.mark(super::http::SHARED_KEY, any);
     // Same guard backend::discord::spawn/backend::irc::spawn need - see
     // Runtime::reset_connection's doc comment. Also what makes
     // disconnect()/removeAccount reliably stop the retry loop below.
@@ -45,7 +50,20 @@ pub(super) async fn run_with_retry(state: &AppState, config: &MatrixAccountConfi
         // next_batch (state.accounts.set_matrix_session/next_batch) after
         // this loop's own `config` snapshot was taken.
         let current = state.accounts.get_matrix(account_id).unwrap_or_else(|| config.clone());
-        let result = std::panic::AssertUnwindSafe(run_sync(state, &current, account_id)).catch_unwind().await;
+        // A re-login changes the token, and the token is what the requests
+        // are routed by. Tor or the proxy is made ready before the first
+        // request - and only for an account that is routed.
+        let router = crate::net::route::router();
+        router.mark(&current.access_token, current.use_tor);
+        let prepared = if router.routed(account_id) {
+            router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.map(|_| ())
+        } else {
+            Ok(())
+        };
+        let result = match prepared {
+            Ok(()) => std::panic::AssertUnwindSafe(run_sync(state, &current, account_id)).catch_unwind().await,
+            Err(e) => Ok(Err(e.context("starting Tor or reaching the proxy"))),
+        };
         let detail = match result {
             Ok(Ok(())) => "sync loop ended".to_string(),
             Ok(Err(e)) => {

@@ -92,11 +92,11 @@ pub(super) async fn run_room(
     account_id: &str,
     host: &str,
     room: &SneedChatRoom,
-    is_primary: bool,
+    whisper_room: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let mut delay = ROOM_RECONNECT_INITIAL_DELAY;
     loop {
-        let result = std::panic::AssertUnwindSafe(run_room_once(state, transport, session, account_id, host, room, is_primary)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(run_room_once(state, transport, session, account_id, host, room, &whisper_room)).catch_unwind().await;
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -121,7 +121,15 @@ pub(super) async fn run_room(
     }
 }
 
-pub(super) async fn run_room_once(state: &AppState, transport: &Transport, session: &Session, account_id: &str, host: &str, room: &SneedChatRoom, is_primary: bool) -> Result<()> {
+pub(super) async fn run_room_once(
+    state: &AppState,
+    transport: &Transport,
+    session: &Session,
+    account_id: &str,
+    host: &str,
+    room: &SneedChatRoom,
+    whisper_room: &std::sync::atomic::AtomicU32,
+) -> Result<()> {
     let cookie_header = session.cookie_header().unwrap_or_default();
     let ws = open_chat_websocket(transport, host, &cookie_header).await?;
     let (sink, mut incoming) = ws.split();
@@ -185,7 +193,10 @@ pub(super) async fn run_room_once(state: &AppState, transport: &Transport, sessi
             Ok(None) => bail!("connection ended unexpectedly"),
             Err(_) => bail!("no activity for {}s, assuming the connection is dead", IDLE_TIMEOUT.as_secs()),
         };
-        handle_frame(state, &session.http, host, account_id, &buffer_name, is_primary, &frame).await?;
+        // Asked per frame rather than fixed at the start: the room that
+        // records whispers changes when another room is opened or closed.
+        let records_whispers = whisper_room.load(std::sync::atomic::Ordering::Relaxed) == room.id;
+        handle_frame(state, &session.http, host, account_id, &buffer_name, records_whispers, &frame).await?;
     }
 }
 
@@ -252,7 +263,8 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
             state.runtime.delete_message(state, &buffer_id, &m.message_uuid);
             continue;
         }
-        let body = protocol::unescape_html(&m.message_raw);
+        // The short `/attachments/...` form, written out in full so it embeds.
+        let body = expand_attachment_paths(&protocol::unescape_html(&m.message_raw), host).into_owned();
         if body.is_empty() {
             continue;
         }
@@ -281,7 +293,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
         // recent history, and looking every attachment in it up again is a
         // request per message, over Tor, for answers already on disk.
         if is_new && !m.message_uuid.is_empty() {
-            spawn_attachment_resolve(state.clone(), http.clone(), buffer_id.clone(), m.message_uuid.clone(), body);
+            spawn_attachment_resolve(state.clone(), http.clone(), host, buffer_id.clone(), m.message_uuid.clone(), body);
         }
     }
     // Cleared unconditionally rather than only when it was set: nothing above
@@ -310,7 +322,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
 
     if is_primary {
         if let Some(w) = &resp.whisper {
-            let body = protocol::unescape_html(&w.message_raw);
+            let body = expand_attachment_paths(&protocol::unescape_html(&w.message_raw), host).into_owned();
             // The site echoes our own whisper back to us, which is worth
             // knowing rather than working around: it means a whisper we sent
             // arrives twice, once from `send_whisper` recording it locally and
@@ -331,7 +343,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
                 for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true, None) {
                     if !w.message_uuid.is_empty() {
-                        spawn_attachment_resolve(state.clone(), http.clone(), buffer, w.message_uuid.clone(), body.clone());
+                        spawn_attachment_resolve(state.clone(), http.clone(), host, buffer, w.message_uuid.clone(), body.clone());
                     }
                 }
             }
@@ -402,9 +414,9 @@ pub(super) fn record_whisper(
     let rooms: Vec<SneedChatRoom> = match only {
         Some(buffer_name) => {
             let wanted = room_name_of(buffer_name);
-            effective_rooms(&cfg).into_iter().filter(|r| r.name == wanted).collect()
+            cfg.rooms.into_iter().filter(|r| r.name == wanted).collect()
         }
-        None => effective_rooms(&cfg),
+        None => cfg.rooms,
     };
     for (index, room) in rooms.into_iter().enumerate() {
         // Highlighted in the first room only, and highlighting is what raises

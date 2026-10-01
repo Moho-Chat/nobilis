@@ -7,9 +7,15 @@
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-pub fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
+/// The client for requests made with `key` - an account's access token -
+/// routed through Tor or the configured proxy when that account is.
+pub fn http_client_for(key: &str) -> reqwest::Client {
+    let router = crate::net::route::router();
+    matrix_client(router.routed(key))
+}
+
+fn matrix_client(routed: bool) -> reqwest::Client {
+    crate::net::route::router().client_if("matrix", routed, |builder| {
         // Pinned to HTTP/1.1. Enabling reqwest's http2 feature (which the
         // file-upload path needs - see upload::http_client) would otherwise
         // let every client here negotiate h2 as a side effect, changing the
@@ -23,13 +29,24 @@ pub fn http_client() -> &'static reqwest::Client {
         // set outright (see auth::DEVICE_DISPLAY_NAME), so this is no longer
         // load-bearing for that; it is simply what a well-behaved client
         // says about itself.
-        reqwest::Client::builder()
-            .http1_only()
-            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+        builder.http1_only().user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
     })
 }
+
+/// The client for requests that carry no account's token: discovery, the
+/// login and registration flows, the sign-in itself, and the public reads -
+/// room directories, peeks - a signed-in account makes too.
+///
+/// Routed when the add form's switch says so, and whenever any Matrix account
+/// is routed: a request with no token cannot say whose it is, and guessing
+/// "nobody's" would send a routed account's room search out directly.
+pub fn anonymous_client() -> reqwest::Client {
+    let router = crate::net::route::router();
+    matrix_client(router.routed(&crate::net::route::pending_key("matrix")) || router.wanted(SHARED_KEY))
+}
+
+/// Marked while any Matrix account is routed.
+pub const SHARED_KEY: &str = "matrix:any-routed";
 
 /// Turns whatever somebody typed into a base URL the client API answers on.
 ///
@@ -85,7 +102,7 @@ fn normalise_homeserver(typed: &str) -> Result<String> {
 
 async fn discover(base: &str) -> Option<String> {
     let url = format!("{}/.well-known/matrix/client", base.trim_end_matches('/'));
-    let resp = http_client().get(&url).send().await.ok()?;
+    let resp = anonymous_client().get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -127,7 +144,7 @@ pub enum Attempt {
 
 /// A POST whose 401 is an answer rather than a failure.
 pub async fn post_json_uia(url: &str, body: Value) -> Result<Attempt> {
-    let resp = http_client().post(url).json(&body).send().await.context("request failed")?;
+    let resp = anonymous_client().post(url).json(&body).send().await.context("request failed")?;
     if resp.status().as_u16() == 401 {
         let challenge: Value = resp.json().await.context("invalid JSON in the authentication challenge")?;
         return Ok(Attempt::NeedsAuth(challenge));
@@ -136,7 +153,11 @@ pub async fn post_json_uia(url: &str, body: Value) -> Result<Attempt> {
 }
 
 pub async fn post_json(url: &str, token: Option<&str>, body: Value) -> Result<Value> {
-    let mut req = http_client().post(url).json(&body);
+    let client = match token {
+        Some(token) => http_client_for(token),
+        None => anonymous_client(),
+    };
+    let mut req = client.post(url).json(&body);
     if let Some(token) = token {
         req = req.bearer_auth(token);
     }
@@ -148,7 +169,7 @@ pub async fn post_json(url: &str, token: Option<&str>, body: Value) -> Result<Va
 /// asking a homeserver how it lets people sign in is the first thing that
 /// happens, before there is anybody to be.
 pub async fn get_json_anonymous(url: &str) -> Result<Value> {
-    let resp = http_client().get(url).send().await.context("request failed")?;
+    let resp = anonymous_client().get(url).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -156,13 +177,13 @@ pub async fn get_json_anonymous(url: &str) -> Result<Value> {
 /// account provider is asked to register this client before there is any
 /// account to act as.
 pub async fn post_json_anonymous(url: &str, body: Value) -> Result<Value> {
-    let resp = http_client().post(url).json(&body).send().await.context("request failed")?;
+    let resp = anonymous_client().post(url).json(&body).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
 /// A form POST, which is what OAuth 2.0 endpoints take rather than JSON.
 pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<Value> {
-    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    let resp = anonymous_client().post(url).form(fields).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -173,7 +194,7 @@ pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<V
 /// `handle_response` correctly turns a 403 into an error. Polling needs to
 /// read the body either way, so it asks for both and decides for itself.
 pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Result<(u16, Value)> {
-    let resp = http_client().post(url).form(fields).send().await.context("request failed")?;
+    let resp = anonymous_client().post(url).form(fields).send().await.context("request failed")?;
     let status = resp.status().as_u16();
     let text = resp.text().await.context("reading the reply")?;
     let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Null);
@@ -181,17 +202,17 @@ pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Resu
 }
 
 pub async fn get_json(url: &str, token: &str) -> Result<Value> {
-    let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;
+    let resp = http_client_for(token).get(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
 pub async fn delete_json(url: &str, token: &str) -> Result<Value> {
-    let resp = http_client().delete(url).bearer_auth(token).send().await.context("request failed")?;
+    let resp = http_client_for(token).delete(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
 pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
-    let resp = http_client().put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
+    let resp = http_client_for(token).put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -200,7 +221,7 @@ pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
 /// backend/sneedchat/http.rs's own get_bytes, so callers can distinguish
 /// "fetch itself failed" from "server returned a non-2xx".
 pub async fn get_bytes(url: &str, token: &str) -> Result<(u16, Vec<u8>)> {
-    let resp = http_client().get(url).bearer_auth(token).send().await.context("request failed")?;
+    let resp = http_client_for(token).get(url).bearer_auth(token).send().await.context("request failed")?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await.context("reading response body")?;
     Ok((status, bytes.to_vec()))
@@ -215,7 +236,7 @@ pub async fn get_bytes(url: &str, token: &str) -> Result<(u16, Vec<u8>)> {
 /// exists to re-gate behind the account password) - see
 /// backend/matrix/verification.rs's delete_device, the only caller today.
 pub async fn delete_with_password_uia(url: &str, token: &str, user_id: &str, password: &str) -> Result<Value> {
-    let resp = http_client().delete(url).bearer_auth(token).json(&serde_json::json!({})).send().await.context("request failed")?;
+    let resp = http_client_for(token).delete(url).bearer_auth(token).json(&serde_json::json!({})).send().await.context("request failed")?;
     if resp.status().as_u16() != 401 {
         return handle_response(resp).await;
     }
@@ -229,7 +250,7 @@ pub async fn delete_with_password_uia(url: &str, token: &str, user_id: &str, pas
             "session": session,
         }
     });
-    let resp = http_client().delete(url).bearer_auth(token).json(&auth_body).send().await.context("request failed")?;
+    let resp = http_client_for(token).delete(url).bearer_auth(token).json(&auth_body).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -247,7 +268,7 @@ pub async fn post_with_password_uia(
     password: &str,
     body: Value,
 ) -> Result<Value> {
-    let resp = http_client().post(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
+    let resp = http_client_for(token).post(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
     if resp.status().as_u16() != 401 {
         return handle_response(resp).await;
     }
@@ -265,7 +286,7 @@ pub async fn post_with_password_uia(
             }),
         );
     }
-    let resp = http_client().post(url).bearer_auth(token).json(&authed).send().await.context("request failed")?;
+    let resp = http_client_for(token).post(url).bearer_auth(token).json(&authed).send().await.context("request failed")?;
     handle_response(resp).await
 }
 

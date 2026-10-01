@@ -61,7 +61,7 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
     }
     tokio::fs::create_dir_all(&dir).await.ok()?;
 
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), http_client().get(src).send())
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), anonymous_client().get(src).send())
         .await
         .ok()?
         .ok()?;
@@ -150,7 +150,7 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
         let Some(anchor) = stale.first().cloned() else { break };
         // `around` centres the page on the message, so one fetch covers what
         // sits either side of it - usually the rest of the same screenful.
-        let resp = http_client()
+        let resp = http_client_for(&config.token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("around", anchor.as_str())])
             .header("Authorization", &config.token)
@@ -247,7 +247,7 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
 
-    let resp = http_client()
+    let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "1"), ("around", message_id)])
         .header("Authorization", &config.token)
@@ -328,7 +328,7 @@ pub(super) fn cache_guild_icon(state: AppState, account_id: String, guild_id: St
             // for .png yields a still frame of the same thing, which is what a
             // rail wants anyway.
             let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128");
-            let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(20), http_client().get(&url).send()).await else {
+            let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(20), http_client_for(&account_id).get(&url).send()).await else {
                 tracing::debug!("discord: guild icon fetch for {guild_id} timed out");
                 return;
             };

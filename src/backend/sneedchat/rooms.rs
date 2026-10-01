@@ -27,7 +27,7 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
             if let Some(id) = member["userId"].as_str() {
                 profile["id"] = serde_json::json!(id);
                 if let Some(config) = state.accounts.get_sneedchat(account_id) {
-                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.host));
+                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.site_host()));
                 }
             }
             if let Some(avatar) = member["avatarUrl"].as_str() {
@@ -60,16 +60,7 @@ pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &s
 pub fn refresh_rooms(state: AppState, account_id: String) {
     tokio::spawn(async move {
         match list_rooms(&state, &account_id).await {
-            Ok(rooms) => {
-                state.runtime.set_sneedchat_room_catalogue(&account_id, rooms.clone());
-                state.events.emit(
-                    "sneedchatRooms",
-                    serde_json::json!({
-                        "accountId": account_id,
-                        "rooms": rooms.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>(),
-                    }),
-                );
-            }
+            Ok(rooms) => publish_catalogue(&state, &account_id, &rooms),
             // Not surfaced: the client already has a list to show, and a
             // failure here means it keeps showing it.
             Err(e) => tracing::debug!("sneedchat[{account_id}]: reading the room list: {e:#}"),
@@ -80,10 +71,19 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
 pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
     let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let transport = build_transport(state, &config, account_id).await?;
-    let session = Session::new(transport, format!("https://{}", config.host), DEFAULT_USER_AGENT.to_string());
+    let host = config.site_host();
+    let session = Session::new(transport, format!("https://{host}"), DEFAULT_USER_AGENT.to_string());
     restore_session(&session, &config);
+    read_catalogue(&session, &host).await
+}
 
-    let url = format!("https://{}/test-chat", config.host);
+/// The rooms the site lists, read off its chat page with `session`.
+///
+/// From the address the account connects to: the stored host is the onion
+/// address for every account made before the open internet was the default,
+/// and without Tor that address cannot be reached.
+pub(super) async fn read_catalogue(session: &Session, host: &str) -> Result<Vec<SneedChatRoom>> {
+    let url = format!("https://{host}/test-chat");
     let resp = session.fetch(&url).await.context("fetching the chat page")?;
     if !(200..400).contains(&resp.status) {
         bail!("the chat page answered HTTP {}", resp.status);
@@ -93,6 +93,26 @@ pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedC
         bail!("the chat page listed no rooms - its markup has probably changed");
     }
     Ok(rooms)
+}
+
+/// Keeps the catalogue and tells the window, which draws the Join page's list
+/// from it.
+pub(super) fn publish_catalogue(state: &AppState, account_id: &str, rooms: &[SneedChatRoom]) {
+    state.runtime.set_sneedchat_room_catalogue(account_id, rooms.to_vec());
+    state.events.emit(
+        "sneedchatRooms",
+        serde_json::json!({
+            "accountId": account_id,
+            "rooms": rooms.iter().map(|r| serde_json::json!({ "id": r.id, "name": r.name })).collect::<Vec<_>>(),
+        }),
+    );
+}
+
+/// The room a new account is opened in, as a courtesy: the one the site
+/// calls general, or else the first it lists. From the site's own list, so
+/// nothing here assumes what the site's rooms are called or numbered.
+pub(super) fn courtesy_room(catalogue: &[SneedChatRoom]) -> Option<SneedChatRoom> {
+    catalogue.iter().find(|r| r.name == "general").or_else(|| catalogue.first()).cloned()
 }
 
 /// The room switcher, out of the chat page's markup.
@@ -156,6 +176,19 @@ pub(super) mod room_list_tests {
         assert_eq!(slug("Lolcows"), "lolcows");
     }
 
+    /// The courtesy room is found by the site's own name for it, wherever
+    /// the site numbers it, and a site with no room of that name still gets
+    /// its first one rather than nothing.
+    #[test]
+    fn a_new_account_opens_the_room_the_site_calls_general() {
+        use crate::accounts::SneedChatRoom;
+        use crate::backend::sneedchat::rooms::courtesy_room;
+        let room = |id: u32, name: &str| SneedChatRoom { id, name: name.to_string() };
+        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(7, "general")]), Some(room(7, "general")));
+        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(19, "sports")]), Some(room(16, "fishtank")));
+        assert_eq!(courtesy_room(&[]), None);
+    }
+
     #[test]
     fn reads_the_room_switcher_out_of_the_page() {
         let html = concat!(
@@ -190,8 +223,7 @@ pub(super) mod room_list_tests {
 pub(super) fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
     let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let room_name = room_name_of(buffer_name);
-    let rooms = effective_rooms(&cfg);
-    let room = rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
+    let room = cfg.rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
     state.runtime.sneedchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
@@ -219,32 +251,12 @@ pub(super) fn room_name_of(buffer_name: &str) -> &str {
 /// room's socket.
 pub(super) fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
     let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
-    effective_rooms(&cfg)
+    cfg.rooms
         .iter()
         .find_map(|r| state.runtime.sneedchat_sender(account_id, r.id))
-        .ok_or_else(|| anyhow!("not connected to Sneedchat"))
+        .ok_or_else(|| anyhow!("whispers travel over a room's connection - open a room on the Join page to send one"))
 }
 
-/// The rooms this account actually talks in.
-///
-/// An account with none configured still connects - to #general, which is
-/// where a Sneedchat session lands by default and what makes a freshly added
-/// account usable before anybody has been to Settings to choose rooms.
-///
-/// Shared with the send path deliberately. The connect side had this fallback
-/// and the send side read the stored list directly, so an account with no
-/// rooms configured connected to #general, received messages there, and then
-/// refused to send with "#general isn't one of this account's configured
-/// rooms" - true of the stored config and plainly untrue of the connection
-/// the user was looking at. One definition of "which rooms" means the two
-/// cannot disagree again.
-pub(super) fn effective_rooms(config: &SneedChatAccountConfig) -> Vec<SneedChatRoom> {
-    if config.rooms.is_empty() {
-        vec![SneedChatRoom { id: 1, name: "general".to_string() }]
-    } else {
-        config.rooms.clone()
-    }
-}
 
 /// Applies a roster delta to a room and republishes it.
 ///

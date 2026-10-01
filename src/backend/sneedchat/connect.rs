@@ -6,9 +6,9 @@
 
 use super::*;
 
-/// Default hidden service (Kiwi Farms). Clearnet fallback is
-/// `kiwifarms.st`, but embedded Tor is used by default regardless of which
-/// host is targeted.
+/// Kiwi Farms' hidden service, used by an account set to connect through
+/// Tor. Without Tor an account connects to `kiwifarms.st` directly - see
+/// `SneedChatAccountConfig::site_host`.
 pub const DEFAULT_ONION: &str = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion";
 
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
@@ -19,6 +19,7 @@ pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Ge
 /// saved account on daemon startup.
 pub fn spawn(state: AppState, config: SneedChatAccountConfig) {
     let account_id = config.account_id();
+    crate::net::route::router().mark(&account_id, config.use_tor);
     // Same guard as backend::discord::spawn - guarantees at most one live
     // connection per account (see Runtime::reset_connection's doc comment).
     state.runtime.reset_connection(&account_id);
@@ -50,7 +51,7 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
             Ok(Ok(())) => ("connection ended".to_string(), false),
             Ok(Err(e)) => {
                 tracing::warn!("sneedchat[{account_id}]: {e:#}");
-                (format!("{e:#}"), crate::net::tor::is_tor_failure(&e))
+                (format!("{e:#}"), config.use_tor && crate::net::tor::is_tor_failure(&e))
             }
             Err(_) => {
                 tracing::error!("sneedchat[{account_id}]: connection task panicked");
@@ -87,22 +88,36 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
 }
 
 pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<Transport> {
-    match config.tor_mode.as_str() {
-        "proxy" => {
-            let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
-            Transport::socks_from_url(proxy)
-        }
-        _ => {
-            let account_id = account_id.to_string();
-            let state2 = state.clone();
-            let client = state
-                .tor
-                .get_or_bootstrap(|msg| state2.runtime.report_progress(&state2, &account_id, msg))
-                .await
-                .context("bootstrapping Tor")?;
-            Ok(Transport::Tor(client))
-        }
+    let account_id = account_id.to_string();
+    let state2 = state.clone();
+    transport_for(state, config, move |msg| state2.runtime.report_progress(&state2, &account_id, msg)).await
+}
+
+/// How this account reaches the forum.
+///
+/// Directly, unless the account is set to use Tor - and only then is Tor
+/// touched at all: an account on the open internet never bootstraps it. With
+/// Tor, the daemon-wide choice between the embedded client and an external
+/// proxy applies.
+pub(super) async fn transport_for(state: &AppState, config: &SneedChatAccountConfig, on_progress: impl FnOnce(&str)) -> Result<Transport> {
+    let router = crate::net::route::router();
+    if !config.use_tor && !router.tunnel_all() {
+        return Ok(Transport::Direct);
     }
+    let settings = router.settings();
+    if settings.tor_mode == "proxy" {
+        let proxy = settings.proxy.as_deref().ok_or_else(|| anyhow!("the network settings name a proxy but give no address"))?;
+        return Transport::socks_from_url(proxy);
+    }
+    if config.use_tor {
+        // Straight to moho's own Tor client: the onion address needs no relay.
+        let client = state.tor.get_or_bootstrap(on_progress).await.context("bootstrapping Tor")?;
+        return Ok(Transport::Tor(client));
+    }
+    // Everything routed, this account on the open internet: through Tor to
+    // kiwifarms.st, by way of the relay everything else uses.
+    let (host, port) = router.ready(on_progress).await?;
+    Ok(Transport::Socks { host, port })
 }
 
 /// Hands a session whatever cookies were captured from a browser sign-in.
@@ -167,7 +182,7 @@ pub(super) fn no_way_in(e: anyhow::Error) -> anyhow::Error {
 pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
     let transport = build_transport(state, config, account_id).await?;
 
-    let base = format!("https://{}", config.host);
+    let base = format!("https://{}", config.site_host());
     let session = Session::new(transport.clone(), base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?),
@@ -181,7 +196,9 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     // Reaching the site at all is what this records: whatever Tor was doing
     // before, it is working now, and the count of failures behind it is no
     // longer evidence of anything.
-    state.tor.note_success().await;
+    if config.use_tor {
+        state.tor.note_success().await;
+    }
     remember_session(state, account_id, &session);
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
@@ -190,60 +207,52 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     state.runtime.set_own_identity(account_id, &config.username);
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
-    let rooms = effective_rooms(config);
-    tracing::info!("sneedchat[{account_id}]: authenticated, connecting {} room(s)", rooms.len());
+    let host = config.site_host();
+    open_first_room(state, account_id, &session, &host).await;
 
-    // Only the first room's connection stores whispers - every room's
-    // websocket appears to receive the same whisper pushes (they aren't
-    // room-scoped), so storing them on all of them would show each one
-    // duplicated once per connected room.
-    let handles: Vec<_> = rooms
-        .into_iter()
-        .enumerate()
-        .map(|(i, room)| {
-            let state = state.clone();
-            let transport = transport.clone();
-            let session = session.clone();
-            let host = config.host.clone();
-            let username = config.username.clone();
-            let password = config.password.clone();
-            let totp_secret = config.totp_secret.clone();
-            let account_id = account_id.to_string();
-            let is_primary = i == 0;
-            tokio::spawn(async move {
-                let creds = Credentials { username, password };
-                let two_factor = match &totp_secret {
-                    Some(secret) => match totp::decode_secret(secret) {
-                        Ok(bytes) => TwoFactor::Totp(bytes),
-                        Err(_) => TwoFactor::None,
-                    },
-                    None => TwoFactor::None,
-                };
-                run_room(&state, &transport, &session, &creds, &two_factor, &account_id, &host, &room, is_primary).await;
-            })
-        })
-        .collect();
+    // Every room the account is in, each on its own connection and all on
+    // this one session - started now, and started or stopped later as rooms
+    // are opened and closed, without signing in again. See live.rs.
+    let _live = super::live::install(account_id, transport, session, host, config);
+    super::live::sync_rooms(state, account_id);
 
-    // Aborting the account-level task (disconnect/removeAccount/a newer
-    // spawn() superseding this one) does not automatically cancel these
-    // child tasks - tokio only cascades a JoinHandle's own cancellation,
-    // not tasks it spawned - so without this guard every room's websocket
-    // would leak and keep running orphaned in the background forever.
-    struct AbortAllOnDrop(Vec<tokio::task::JoinHandle<()>>);
-    impl Drop for AbortAllOnDrop {
-        fn drop(&mut self) {
-            for h in &self.0 {
-                h.abort();
-            }
-        }
-    }
-    let _rooms_guard = AbortAllOnDrop(handles);
-
-    // Each room task retries forever internally, so this never resolves on
-    // its own - only ever by this whole task being aborted from outside,
-    // at which point the guard above cleans up every room task too.
+    // The rooms retry on their own and are changed from outside, so this
+    // never resolves on its own - only by the account's task being aborted,
+    // at which point the guard above stops every room as well.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Opens a room for an account that has never had any, as a courtesy.
+///
+/// Once per account. After that the room list is whatever the person made it,
+/// including empty: a person who closed every room meant to, and the account
+/// stays signed in with none open until one is added on the Join page.
+///
+/// The room comes from the site's own list, read here with the session that
+/// just signed in. If the list cannot be read the account is left with no
+/// room for now and this is tried again on the next connection.
+async fn open_first_room(state: &AppState, account_id: &str, session: &Session, host: &str) {
+    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
+    if config.rooms_chosen {
+        return;
+    }
+    // An account from before rooms could be closed already has its rooms;
+    // they stand, and are simply recorded as chosen.
+    if !config.rooms.is_empty() {
+        let _ = state.accounts.set_sneedchat_rooms(account_id, config.rooms);
+        return;
+    }
+    match read_catalogue(session, host).await {
+        Ok(catalogue) => {
+            publish_catalogue(state, account_id, &catalogue);
+            if let Some(room) = courtesy_room(&catalogue) {
+                tracing::info!("sneedchat[{account_id}]: opening #{} for a new account", room.name);
+                let _ = state.accounts.set_sneedchat_rooms(account_id, vec![room]);
+            }
+        }
+        Err(e) => tracing::warn!("sneedchat[{account_id}]: could not read the room list to open a first room: {e:#}"),
+    }
 }
 
 /// Kicks off a fresh account's first login in the background - unlike
@@ -287,18 +296,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedCh
     // which is exactly the state Connect knows how to retry.
     state.accounts.add_sneedchat(config.clone())?;
 
-    let transport = match config.tor_mode.as_str() {
-        "proxy" => {
-            let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
-            Transport::socks_from_url(proxy)?
-        }
-        _ => {
-            let client = state.tor.get_or_bootstrap(emit_progress).await.context("bootstrapping Tor")?;
-            Transport::Tor(client)
-        }
-    };
+    let transport = transport_for(state, config, emit_progress).await?;
 
-    let base = format!("https://{}", config.host);
+    let base = format!("https://{}", config.site_host());
     let session = Session::new(transport, base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
         Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?),

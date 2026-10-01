@@ -387,6 +387,12 @@ pub(super) async fn handle_message(
         }
 
         Command::NICK(new_nick) => {
+            // Ours: the handle carries the current nick, and everything that
+            // asks "is this me" reads it.
+            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            if from.eq_ignore_ascii_case(&own) {
+                state.runtime.set_irc_current_nick(account_id, &new_nick);
+            }
             for (channel, members) in channels.iter_mut() {
                 // The record follows the name: a nick change is the same
                 // person, so their host, account and bot mark come with them.
@@ -629,7 +635,10 @@ pub(super) async fn handle_message(
         Command::CAP(_, CapSubCommand::ACK, ref param, ref suffix) => {
             let caps = cap_list(param.as_deref(), suffix.as_deref());
             tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
-            state.runtime.grant_irc_caps(account_id, caps);
+            // Not `sasl`: holding it says nothing about being logged in, and
+            // the late login in latesasl.rs is what follows it up.
+            let caps: Vec<&str> = caps.split_whitespace().filter(|c| c.split('=').next() != Some("sasl")).collect();
+            state.runtime.grant_irc_caps(account_id, &caps.join(" "));
         }
 
         // Something became available after registration.

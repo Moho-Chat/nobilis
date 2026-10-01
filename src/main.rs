@@ -275,12 +275,22 @@ async fn run() -> Result<()> {
     let accounts = AccountStore::open(opts.data_dir.join("accounts.toml"))
         .context("opening account store")?;
 
+    let tor = Arc::new(net::tor::TorManager::new(&opts.data_dir));
+    // The network settings used to live on each Sneedchat account, which left
+    // them nowhere to be with no Sneedchat account. The first account's are
+    // carried over the first time `net.toml` does not exist yet.
+    let carried = accounts.all_sneedchat().into_iter().next().map(|a| net::route::NetSettings {
+        tor_mode: a.tor_mode.clone(),
+        proxy: a.proxy.clone(),
+        tunnel_all: false,
+    });
+    net::route::install(Arc::new(net::route::Router::open(opts.data_dir.join("net.toml"), tor.clone(), carried)));
     let state = AppState {
         store: Arc::new(store),
         accounts: Arc::new(accounts),
         events: EventBus::new(),
         runtime: Arc::new(Runtime::new()),
-        tor: Arc::new(net::tor::TorManager::new(&opts.data_dir)),
+        tor,
         shutdown: Arc::new(tokio::sync::Notify::new()),
         voice: Arc::new(backend::discord::voice::VoiceState::new()),
         voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),

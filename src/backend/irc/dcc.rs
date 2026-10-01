@@ -1194,22 +1194,13 @@ async fn advertised_address(state: &AppState, account_id: &str) -> Result<std::n
 /// transfers reached through the same proxy, and there is no second setting
 /// that could disagree with the first.
 pub fn transport_for(config: &crate::accounts::IrcAccountConfig) -> crate::net::tor::Transport {
-    if !config.use_tor {
+    let router = crate::net::route::router();
+    if !router.routed(&config.account_id()) {
         return crate::net::tor::Transport::Direct;
     }
-    let host = config
-        .tor_proxy
-        .as_deref()
-        .and_then(|p| p.split(':').next())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("127.0.0.1")
-        .to_string();
-    let port = config
-        .tor_proxy
-        .as_deref()
-        .and_then(|p| p.rsplit(':').next())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9050);
+    // Whatever the connection itself went through; nowhere, rather than
+    // directly, if that is somehow not up.
+    let (host, port) = router.socks_now().unwrap_or_else(|| ("127.0.0.1".to_string(), 9));
     crate::net::tor::Transport::Socks { host, port }
 }
 

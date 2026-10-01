@@ -98,6 +98,10 @@ pub struct Account {
     pub sasl_username: String,
     #[serde(rename = "allowPlaintextSasl")]
     pub allow_plaintext_sasl: bool,
+    /// Whether to reconnect to log in when SASL returns mid-connection and
+    /// the server will not take a live login. IRC-only; false elsewhere.
+    #[serde(rename = "reconnectForSasl")]
+    pub reconnect_for_sasl: bool,
     /// Which SASL mechanism this account is pinned to, or empty for the
     /// default. IRC-only; empty everywhere else.
     #[serde(rename = "saslMechanism")]

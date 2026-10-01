@@ -20,7 +20,7 @@ use super::*;
 pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/pins"))
         .header("Authorization", &cfg.token)
         .send()
@@ -93,7 +93,7 @@ pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, mes
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let url = format!("{API_BASE}/channels/{channel_id}/pins/{message_id}");
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
     let request = if pinned { http.put(url) } else { http.delete(url) };
     let doing = if pinned { "pinning the message" } else { "unpinning the message" };
     let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
@@ -589,7 +589,7 @@ pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, m
         return;
     };
     let Some(cfg) = state.accounts.get_discord(account_id) else { return };
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{source_channel}/messages?limit=1&around={source_message}"))
         .header("Authorization", &cfg.token)
         .send()

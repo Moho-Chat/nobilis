@@ -261,17 +261,57 @@ pub(super) fn find_attachment_url(text: &str) -> Option<(&str, &str, &str)> {
     None
 }
 
-pub(super) const KIWIFARMS_CLEARNET_HOST: &str = "kiwifarms.st";
+pub const KIWIFARMS_CLEARNET_HOST: &str = "kiwifarms.st";
 
-/// Kiwi Farms' clearnet edge is frequently unstable - the reason this
-/// backend runs over Tor by default in the first place - and, separately
-/// from that, tends to mishandle Tor exit traffic even when it IS up,
-/// where every other fetch this backend makes already goes out over Tor
-/// regardless of hostname. Routing straight to the onion address instead
-/// (a real hidden-service listener, not something reached via a Tor exit
-/// node at all) sidesteps both problems, so any detected attachment link
-/// is rewritten to that host before fetching - not just Tor-routed under
-/// whatever host the message happened to contain.
+/// Writes the forum's short attachment form out in full.
+///
+/// People type only the path - `/attachments/seal-png.9609686/` - and the
+/// site's own chat page fills in its domain and shows the picture. Nothing
+/// else knows the domain, so here it is filled in with `host`: the address
+/// this account reaches the forum at, kiwifarms.st or the onion address as
+/// it connects over the open internet or through Tor. After this the short
+/// form is an ordinary attachment link and embeds like one.
+///
+/// Only a path standing on its own, at the start of the message or after a
+/// space or a tag, and only one shaped like an attachment (`<name>-<ext>.<id>`
+/// with a media extension) - so `https://example.com/attachments/...`, or a
+/// path somebody is merely talking about, is left as it is.
+pub(super) fn expand_attachment_paths<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str> {
+    const MARKER: &str = "/attachments/";
+    if !body.contains(MARKER) {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut out = String::with_capacity(body.len() + 80);
+    let mut rest = body;
+    let mut changed = false;
+    let mut consumed = 0usize;
+    while let Some(at) = rest.find(MARKER) {
+        let absolute = consumed + at;
+        let before = body[..absolute].chars().next_back();
+        let standalone = matches!(before, None | Some(' ' | '\n' | '\t' | ']' | '(' | '>'));
+        let tail = &body[absolute..];
+        let len = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | ')')).unwrap_or(tail.len());
+        let path = &tail[..len];
+        out.push_str(&rest[..at]);
+        let full = format!("https://{host}{path}");
+        if standalone && find_attachment_url(&full).is_some_and(|(matched, ..)| matched == full) {
+            out.push_str(&full);
+            changed = true;
+        } else {
+            out.push_str(path);
+        }
+        consumed = absolute + len;
+        rest = &body[consumed..];
+    }
+    out.push_str(rest);
+    if changed { std::borrow::Cow::Owned(out) } else { std::borrow::Cow::Borrowed(body) }
+}
+
+/// Fetched from the address this account reaches the forum at (`host`),
+/// whichever address the link was written with: through Tor that is the
+/// onion address - the clearnet edge mishandles Tor exit traffic, and a
+/// hidden service involves no exit at all - and on the open internet it is
+/// kiwifarms.st, since an onion address means nothing there.
 ///
 /// Spawned as its own task rather than run inline in handle_frame's
 /// per-room read loop: the message is recorded and shown immediately with
@@ -280,9 +320,13 @@ pub(super) const KIWIFARMS_CLEARNET_HOST: &str = "kiwifarms.st";
 /// the "(edited)" label alone) once the local copy is ready, re-rendering
 /// the same message with a working embed a moment later instead of
 /// stalling the whole room's message processing on one slow Tor fetch.
-pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, buffer_id: String, msg_id: String, body: String) {
+pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, host: &str, buffer_id: String, msg_id: String, body: String) {
     let Some((matched, id, ext)) = find_attachment_url(&body) else { return };
     let (matched, id, ext) = (matched.to_string(), id.to_string(), ext.to_ascii_lowercase());
+    let fetch_url = match matched.find("/attachments/") {
+        Some(at) => format!("https://{host}{}", &matched[at..]),
+        None => return,
+    };
 
     tokio::spawn(async move {
         let dir = attachment_cache_dir();
@@ -291,8 +335,7 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
         let local_url = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             Some(format!("file://{}", path.display()))
         } else {
-            let onion_url = matched.replacen(KIWIFARMS_CLEARNET_HOST, DEFAULT_ONION, 1);
-            match tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&onion_url)).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&fetch_url)).await {
                 Ok(Ok((status, bytes))) if (200..300).contains(&status) && !bytes.is_empty() => {
                     if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
                         Some(format!("file://{}", path.display()))
@@ -355,6 +398,39 @@ mod tests {
         assert_eq!(matched, "https://kiwifarms.st/attachments/foo-bar-png.42");
         assert_eq!(id, "42");
         assert_eq!(ext, "png");
+    }
+
+    #[test]
+    fn a_bare_attachment_path_is_given_the_host_the_account_connects_to() {
+        let clear = "https://kiwifarms.st/attachments/seal-png.9609686/";
+        assert_eq!(expand_attachment_paths("/attachments/seal-png.9609686/", KIWIFARMS_CLEARNET_HOST), clear);
+        assert_eq!(expand_attachment_paths("look /attachments/seal-png.9609686/ lol", KIWIFARMS_CLEARNET_HOST), format!("look {clear} lol"));
+        assert_eq!(expand_attachment_paths("[img]/attachments/seal-png.9609686/[/img]", KIWIFARMS_CLEARNET_HOST), format!("[img]{clear}[/img]"));
+        // Through Tor, the onion address instead.
+        let onion = format!("https://{DEFAULT_ONION}/attachments/seal-png.9609686/");
+        assert_eq!(expand_attachment_paths("/attachments/seal-png.9609686/", DEFAULT_ONION), onion);
+        // Without the trailing slash, as people type it too.
+        assert_eq!(
+            expand_attachment_paths("/attachments/seal-png.9609686", KIWIFARMS_CLEARNET_HOST),
+            "https://kiwifarms.st/attachments/seal-png.9609686"
+        );
+        // And the result is an attachment link like any other.
+        assert!(find_attachment_url(&expand_attachment_paths("/attachments/seal-png.9609686/", DEFAULT_ONION)).is_some());
+    }
+
+    #[test]
+    fn only_a_standalone_attachment_shaped_path_is_expanded() {
+        for left_alone in [
+            "https://kiwifarms.st/attachments/seal-png.9609686/",
+            "https://example.com/attachments/seal-png.9609686/",
+            "see site/attachments/seal-png.9609686/",
+            "/attachments/report-txt.7/",
+            "/attachments/seal-png.notanid/",
+            "the /attachments/ folder",
+            "nothing here",
+        ] {
+            assert_eq!(expand_attachment_paths(left_alone, KIWIFARMS_CLEARNET_HOST), left_alone, "{left_alone}");
+        }
     }
 
     #[test]

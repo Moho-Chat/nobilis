@@ -47,6 +47,11 @@ pub struct IrcAccountConfig {
     pub sasl_cert_pass: Option<String>,
     #[serde(default)]
     pub allow_plaintext_sasl: bool,
+    /// Whether to reconnect when SASL returns mid-connection and the server
+    /// will not take a login on the live connection. Off by default: it drops
+    /// every channel for a moment, and most servers take the live login.
+    #[serde(default)]
+    pub reconnect_for_sasl: bool,
     #[serde(default)]
     pub autojoin: String,
     /// Nicks to watch for, comma-separated, in the order they were added.
@@ -101,6 +106,10 @@ pub struct DiscordAccountConfig {
     /// reconnects, same precedent as `username` above.
     #[serde(default)]
     pub avatar_url: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl DiscordAccountConfig {
@@ -137,10 +146,25 @@ pub struct SneedChatAccountConfig {
     pub host: String,
     #[serde(default = "default_tor_mode")]
     pub tor_mode: String,
+    /// Whether this account reaches the forum through Tor, at the onion
+    /// address. Off by default: the forum is on the open internet at
+    /// kiwifarms.st, and Tor is started only for an account that asks for
+    /// it - an account that never does never costs a Tor bootstrap.
+    ///
+    /// Absent in accounts saved before this was a choice, which were all
+    /// Tor; they read as off, and move to the open internet, like any new
+    /// account does.
+    #[serde(default)]
+    pub use_tor: bool,
     #[serde(default)]
     pub proxy: Option<String>,
-    #[serde(default = "default_sneedchat_rooms")]
+    #[serde(default)]
     pub rooms: Vec<SneedChatRoom>,
+    /// Whether the room list is somebody's choice yet. Until it is, the
+    /// account's first connection opens one room as a courtesy (see
+    /// `open_first_room`); after it, an empty list means no rooms open.
+    #[serde(default)]
+    pub rooms_chosen: bool,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
@@ -165,11 +189,22 @@ fn default_tor_mode() -> String {
     "embedded".to_string()
 }
 
-fn default_sneedchat_rooms() -> Vec<SneedChatRoom> {
-    vec![SneedChatRoom { id: 1, name: "general".to_string() }]
-}
-
 impl SneedChatAccountConfig {
+    /// The forum's address as this account reaches it: the onion address
+    /// through Tor, and kiwifarms.st without it.
+    ///
+    /// `host` is what was stored, which for every account made so far is the
+    /// onion address - so without Tor an onion host means its counterpart on
+    /// the open internet, and anything else is used as it is.
+    pub fn site_host(&self) -> String {
+        let onion = self.host.ends_with(".onion");
+        match (self.use_tor, onion) {
+            (false, true) => crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST.to_string(),
+            (true, false) if self.host == crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST => crate::backend::sneedchat::DEFAULT_ONION.to_string(),
+            _ => self.host.clone(),
+        }
+    }
+
     pub fn account_id(&self) -> String {
         format!("sneedchat:{}", self.username)
     }
@@ -252,6 +287,10 @@ pub struct MatrixAccountConfig {
     /// name a LiveKit JWT service here and calls go through it.
     #[serde(default)]
     pub rtc_focus_url: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl MatrixAccountConfig {
@@ -290,6 +329,10 @@ pub struct KickAccountConfig {
     /// list belongs to whoever is using it.
     #[serde(default)]
     pub followed_synced: bool,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl KickAccountConfig {
@@ -419,9 +462,15 @@ impl AccountStore {
     /// added is a legitimate way to refresh a stale/revoked token, not a
     /// duplicate-creation mistake (there's no equivalent "did you mean to
     /// reconnect instead" ambiguity IRC's nick@host dedup guards against).
-    pub fn add_discord(&self, config: DiscordAccountConfig) -> Result<DiscordAccountConfig> {
+    pub fn add_discord(&self, mut config: DiscordAccountConfig) -> Result<DiscordAccountConfig> {
         let id = config.account_id();
         let mut discord = self.discord.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if discord.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         discord.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
@@ -456,9 +505,15 @@ impl AccountStore {
     /// Upserts like add_discord/add_sneedchat - re-running addMatrixAccount
     /// for an already-added user_id is how a user refreshes a changed
     /// password, not a duplicate-creation mistake.
-    pub fn add_matrix(&self, config: MatrixAccountConfig) -> Result<MatrixAccountConfig> {
+    pub fn add_matrix(&self, mut config: MatrixAccountConfig) -> Result<MatrixAccountConfig> {
         let id = config.account_id();
         let mut matrix = self.matrix.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if matrix.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         matrix.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(config)
@@ -474,9 +529,15 @@ impl AccountStore {
 
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
-    pub fn add_kick(&self, config: KickAccountConfig) -> Result<KickAccountConfig> {
+    pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
         let id = config.account_id();
         let mut kick = self.kick.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if kick.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         kick.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(config)
@@ -553,29 +614,60 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.rooms = rooms;
+                a.rooms_chosen = true;
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
     }
 
-    /// Updates the account's transport mode (embedded Tor vs an external
-    /// SOCKS5 proxy) - takes effect on the next reconnect, same as
-    /// set_sneedchat_rooms (the RPC handler re-spawns the account
-    /// immediately after this succeeds, rather than waiting for the user
-    /// to notice and reconnect manually).
-    pub fn set_sneedchat_tor_config(&self, account_id: &str, tor_mode: String, proxy: Option<String>) -> Result<bool> {
+    /// Whether any account's connections are routed, by account id. False
+    /// when there is no such account.
+    pub fn set_routed(&self, account_id: &str, routed: bool) -> Result<bool> {
+        let (irc, discord, sneedchat, matrix, kick) = (
+            &mut *self.irc.lock().unwrap(),
+            &mut *self.discord.lock().unwrap(),
+            &mut *self.sneedchat.lock().unwrap(),
+            &mut *self.matrix.lock().unwrap(),
+            &mut *self.kick.lock().unwrap(),
+        );
+        let found = if let Some(a) = discord.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = matrix.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = kick.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = sneedchat.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = irc.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else {
+            false
+        };
+        if found {
+            self.persist(irc, discord, sneedchat, matrix, kick)?;
+        }
+        Ok(found)
+    }
+
+    /// Whether this account connects through Tor.
+    pub fn set_sneedchat_use_tor(&self, account_id: &str, use_tor: bool) -> Result<bool> {
         let mut sneedchat = self.sneedchat.lock().unwrap();
         match sneedchat.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
-                a.tor_mode = tor_mode;
-                a.proxy = proxy;
+                a.use_tor = use_tor;
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
     }
+
 
     /// Called after a successful login once the `xf_user` cookie reveals the
     /// account's numeric id - best-effort, not required for the backend to
@@ -884,6 +976,11 @@ impl AccountStore {
         })
     }
 
+    /// Whether this network may be reconnected to log in with SASL.
+    pub fn set_irc_reconnect_for_sasl(&self, account_id: &str, enabled: bool) -> Result<bool> {
+        self.mutate(account_id, |a| a.reconnect_for_sasl = enabled)
+    }
+
     /// The realname this IRC account registers with, changed while connected.
     ///
     /// Written down as well as sent, because `SETNAME` changes it on this
@@ -923,6 +1020,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         sasl_enabled: a.sasl,
         sasl_username: a.sasl_user.clone().unwrap_or_default(),
         allow_plaintext_sasl: a.allow_plaintext_sasl,
+        reconnect_for_sasl: a.reconnect_for_sasl,
         sasl_mechanism: a.sasl_mechanism.clone().unwrap_or_default(),
         has_sasl_certificate: a.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()),
         // Filled in by Runtime::list_accounts, which is the only place that
@@ -960,6 +1058,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -972,7 +1071,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -994,6 +1093,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -1006,7 +1106,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1037,6 +1137,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -1049,7 +1150,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1075,6 +1176,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sasl_enabled: false,
         sasl_username: String::new(),
         allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
         sasl_mechanism: String::new(),
         has_sasl_certificate: false,
         current_nick: String::new(),
@@ -1087,7 +1189,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup,
         rtc_focus_url: a.rtc_focus_url.clone(),
         sliding_sync: a.prefer_sliding_sync,
@@ -1097,6 +1199,23 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
 
 #[cfg(test)]
 mod display_name_tests {
+    /// Saved Sneedchat accounts carry the onion address as their host, and
+    /// all of them now start on the open internet: the address has to follow
+    /// the choice rather than the stored host.
+    #[test]
+    fn a_sneedchat_account_reaches_the_address_its_tor_choice_implies() {
+        let mut config: super::SneedChatAccountConfig =
+            serde_json::from_value(serde_json::json!({ "username": "u", "password": "" })).unwrap();
+        assert!(!config.use_tor, "the open internet unless asked");
+        assert_eq!(config.site_host(), "kiwifarms.st");
+        config.use_tor = true;
+        assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION);
+        config.host = "kiwifarms.st".to_string();
+        assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION, "Tor means the onion");
+        config.host = "example.test".to_string();
+        assert_eq!(config.site_host(), "example.test", "a host of somebody's own is left alone");
+    }
+
     use super::*;
 
     fn store(name: &str) -> AccountStore {

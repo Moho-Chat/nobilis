@@ -46,13 +46,10 @@ use std::sync::atomic::Ordering;
 /// started and is content to wait for.
 const MEDIA_PACE: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)"))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+fn http_client() -> reqwest::Client {
+    let router = crate::net::route::router();
+    router.client_if("export", router.general_routed(), |builder| {
+        builder.user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)"))
     })
 }
 
@@ -253,6 +250,9 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
     // would treat it as already fetched forever after - a broken picture that
     // never repairs itself.
     let part = dest.with_extension(format!("{ext}.part"));
+    if crate::net::route::router().ready_for_general().await.is_err() {
+        return Ok(serde_json::json!({ "path": url, "skipped": "Tor or the proxy was not reachable" }));
+    }
     let mut response = match http_client().get(url).send().await {
         Ok(r) if r.status().is_success() => r,
         Ok(r) => {

@@ -64,6 +64,13 @@ where
 /// saved Discord account on daemon startup.
 pub fn spawn(state: AppState, config: DiscordAccountConfig) {
     let account_id = config.account_id();
+    // What this account's requests are routed by: its id, and the token
+    // every API request carries.
+    let router = crate::net::route::router();
+    router.mark(&account_id, config.use_tor);
+    router.mark(&config.token, config.use_tor);
+    let any = state.accounts.all_discord().iter().any(|a| a.use_tor) || config.use_tor;
+    router.mark(super::http::SHARED_KEY, any);
     // Guarantee at most one live gateway session per account - the same
     // guard backend::irc::spawn() needed (see Runtime::reset_connection's
     // doc comment): without this, a stale/zombie session left over from an
@@ -179,7 +186,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
     let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());
-    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(connect_url.as_str()))
+    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::route::websocket(&config.token, connect_url.as_str()))
         .await
         .map_err(|_| anyhow!("timed out connecting to Discord's gateway"))?
         .context("connecting to Discord's gateway")?;
@@ -427,7 +434,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // traffic for channel ids that never appeared there) -
                         // fetch the full list over REST as a follow-up rather
                         // than trusting the gateway snapshot alone.
-                        match http_client().get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
+                        match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
                             Ok(resp) => {
                                 let body = resp.text().await.unwrap_or_default();
                                 match serde_json::from_str::<Vec<Value>>(&body) {

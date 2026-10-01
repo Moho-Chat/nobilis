@@ -556,7 +556,7 @@ pub(super) async fn upload_encrypted_media_message(base: &str, access_token: &st
 }
 
 pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, content_type: &str, bytes: Vec<u8>) -> Result<Value> {
-    let resp = http::http_client()
+    let resp = http::http_client_for(access_token)
         .post(url)
         .bearer_auth(access_token)
         .header("Content-Type", content_type)

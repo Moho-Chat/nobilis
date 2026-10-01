@@ -49,7 +49,7 @@ pub(super) async fn backfill_channel_history(state: &AppState, token: &str, user
         }
     }
 
-    let resp = match http_client()
+    let resp = match http_client_for(&token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50")])
         .header("Authorization", token)
@@ -101,7 +101,7 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
     let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
 
-    let resp = http_client()
+    let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", limit.clamp(1, 100).to_string().as_str())])
         .header("Authorization", &config.token)
@@ -191,7 +191,7 @@ pub async fn catch_up_channel(
         // Nothing stored means this is a first sight, which the initial
         // backfill already covers.
         let Some(after_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
-        let resp = http_client()
+        let resp = http_client_for(&token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("after", after_id.as_str())])
             .header("Authorization", token)
@@ -220,7 +220,7 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
     }
     let result: Result<()> = async {
         let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else { return Ok(()) };
-        let resp = http_client()
+        let resp = http_client_for(&token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("before", before_id.as_str())])
             .header("Authorization", token)
@@ -254,7 +254,7 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
 pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<usize> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("after", message_id)])
         .header("Authorization", &cfg.token)
@@ -274,7 +274,7 @@ pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, mes
 pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<i64> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("around", message_id)])
         .header("Authorization", &cfg.token)

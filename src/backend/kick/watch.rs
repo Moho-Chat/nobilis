@@ -193,7 +193,7 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
 
     let http = super::api::client()?;
     let url = negotiate(&http, token, user_id).await?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url).await.context("connecting to Kick's realtime service")?;
+    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str()).await.context("connecting to Kick's realtime service")?;
 
     let mut next_id = 1u64;
     let mut id = || {

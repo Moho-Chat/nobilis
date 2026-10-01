@@ -92,7 +92,7 @@ pub(super) async fn run_password_login(
     reauth_account_id: Option<String>,
 ) -> Result<()> {
     state.events.emit("discordLoginStatus", json!({ "loginId": login_id, "detail": "signing in..." }));
-    let resp: Value = http_client()
+    let resp: Value = anonymous_client()
         .post(format!("{API_BASE}/auth/login"))
         // The full shape the endpoint declares, not the three fields that
         // happen to be interesting. Both of the nulls are meaningful absences
@@ -217,7 +217,7 @@ pub(super) async fn run_mfa_submit(state: &AppState, login_id: &str, code: &str)
         .ok_or_else(|| anyhow!("that login is no longer waiting for a code - start again"))?;
 
     state.events.emit("discordLoginStatus", json!({ "loginId": login_id, "detail": "checking code..." }));
-    let resp: Value = http_client()
+    let resp: Value = anonymous_client()
         .post(format!("{API_BASE}/auth/mfa/totp"))
         // Codes are commonly pasted with a space in the middle from an
         // authenticator app's own display.
@@ -239,7 +239,7 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     // The remote-auth gateway rejects the handshake outright without an
     // Origin it recognizes - confirmed in every working reference client.
     request.headers_mut().insert("Origin", HeaderValue::from_static("https://discord.com"));
-    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
+    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::route::websocket(&crate::net::route::pending_key("discord"), request))
         .await
         .map_err(|_| anyhow!("timed out connecting to Discord's remote-auth gateway"))?
         .context("connecting to Discord's remote-auth gateway")?;
@@ -361,7 +361,7 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
 
     let ticket = flow;
     let resp: Value = send_write(
-        http_client()
+        anonymous_client()
         .post("https://discord.com/api/v9/users/@me/remote-auth/login")
         .json(&json!({ "ticket": ticket }))
         )
@@ -419,7 +419,7 @@ pub(super) async fn finish_login(
     token: String,
     reauth_account_id: Option<String>,
 ) -> Result<()> {
-    let me: Value = http_client()
+    let me: Value = http_client_for(&token)
         .get(format!("{API_BASE}/users/@me"))
         .header("Authorization", &token)
         .send()
@@ -441,7 +441,8 @@ pub(super) async fn finish_login(
         .and_then(|v| v.as_str())
         .map(|hash| format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.png"));
 
-    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url };
+    let use_tor = crate::net::route::router().wanted(&crate::net::route::pending_key("discord"));
+    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor };
     if let Some(expected) = reauth_account_id {
         if config.account_id() != expected {
             bail!("that is a different Discord account - re-authenticating {expected} needs the same account");

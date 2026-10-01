@@ -212,17 +212,17 @@ pub async fn local_copy(http: &reqwest::Client, id: &str) -> Option<String> {
 /// Kick filters on user agent (see `api::client`), so this borrows that
 /// builder rather than reaching for a default one - a plain `reqwest/0.12`
 /// gets a 403 and the emote silently stays big.
-fn http() -> Option<&'static reqwest::Client> {
-    static CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
-    CLIENT
-        .get_or_init(|| match super::api::client() {
-            Ok(c) => Some(c),
-            Err(e) => {
-                tracing::warn!("kick: no HTTP client for emotes: {e}");
-                None
-            }
-        })
-        .as_ref()
+///
+/// Asked each time rather than kept, because whether Kick is routed can
+/// change while the daemon runs; the router keeps the client itself.
+fn http() -> Option<reqwest::Client> {
+    match super::api::client() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("kick: no HTTP client for emotes: {e}");
+            None
+        }
+    }
 }
 
 /// How many emotes to fetch at once.

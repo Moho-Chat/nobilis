@@ -216,6 +216,12 @@ pub(super) async fn send_via_upload_host(
     host: crate::upload::Host,
     progress: Option<&crate::upload::Progress>,
 ) -> Result<()> {
+    // Refused here as well as left out of the menu, because the menu is only
+    // one client's: a link from a host the forum does not embed is a picture
+    // nobody on the other end sees.
+    if !host.offered_to("sneedchat") {
+        bail!("{} links don't show as pictures on Sneedchat - choose another image host for it", host.id());
+    }
     let link = crate::upload::upload_reporting(host, file_path, None, progress).await?;
     let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("");
     let posted = posted_markup(file_name, &link);
@@ -225,7 +231,7 @@ pub(super) async fn send_via_upload_host(
 
 /// How a finished upload is written into a message.
 pub(super) fn posted_markup(file_name: &str, link: &str) -> String {
-    if guess_postimg_content_type(file_name).is_some() {
+    if crate::upload::is_web_picture(file_name) {
         format!("[img]{link}[/img]")
     } else {
         link.to_string()

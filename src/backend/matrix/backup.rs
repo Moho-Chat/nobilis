@@ -259,6 +259,7 @@ mod tests {
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
         let config = crate::accounts::MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.to_string(),
             user_id: login.user_id.clone(),
             password: password.to_string(),
