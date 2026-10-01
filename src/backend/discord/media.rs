@@ -174,11 +174,49 @@ pub(super) fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<Strin
             m.attachments
                 .iter()
                 .any(|a| a.url.as_deref().is_some_and(attachment_expired))
+                || stored_in_old_shape(m)
         })
         .map(|m| m.id.clone())
         .collect();
     sort_newest_first(&mut ids);
     ids
+}
+
+/// Whether a message was stored before attachments were kept as a list
+/// (nobilis 9351109, 21 August 2026), when they were appended to the text as
+/// links. Nothing re-signs a link in the text, so these stayed dead.
+///
+/// A candidate only: somebody pasting a file link into what they wrote looks
+/// the same from here. Which links really are the message's own attachments
+/// is settled against Discord's copy of it - see `strip_attachment_links`.
+pub(super) fn stored_in_old_shape(m: &crate::model::Message) -> bool {
+    m.attachments.is_empty() && (m.body.contains("cdn.discordapp.com/attachments/") || m.body.contains("media.discordapp.net/attachments/"))
+}
+
+/// A link without its signature, which is what stays the same when Discord
+/// signs it again - and on either of its two hosts.
+fn unsigned(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).replace("media.discordapp.net", "cdn.discordapp.com")
+}
+
+/// The text with the links that are really these attachments taken out, and
+/// whatever else it said left exactly as stored.
+pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> String {
+    let own: Vec<String> = attachments.iter().filter_map(|a| a.url.as_deref()).map(unsigned).collect();
+    let kept: Vec<String> = body
+        .lines()
+        .filter_map(|line| {
+            let left = line
+                .split(' ')
+                .filter(|word| !(word.starts_with("http") && own.contains(&unsigned(word))))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // A line that was only the link goes with it; a blank line the
+            // sender wrote stays.
+            (line.trim().is_empty() || !left.trim().is_empty()).then_some(left)
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
 }
 
 pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -> Result<()> {
@@ -215,7 +253,19 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
             if attachments.is_empty() {
                 continue;
             }
-            if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
+            // Stored in the old shape: the links come out of the text as the
+            // list goes in, or the picture would show twice - once as itself
+            // and once as a dead link under it.
+            let old = state.store.get_message(buffer_id, id).ok().flatten().filter(stored_in_old_shape);
+            if let Some(old) = old {
+                let body = strip_attachment_links(&old.body, &attachments);
+                if state.store.repair_message_media(buffer_id, id, &body, &attachments).unwrap_or(false) {
+                    state.events.emit(
+                        "messageUpdated",
+                        json!({ "bufferId": buffer_id, "id": id, "edited": false, "body": body, "attachments": attachments.clone() }),
+                    );
+                }
+            } else if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
                 state.events.emit(
                     "messageUpdated",
                     json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments.clone() }),
@@ -611,6 +661,33 @@ mod tests {
         let link = |at: u64| format!("https://cdn.discordapp.com/attachments/1/2/a.png?ex={at:x}&is=1&hm=2");
         assert!(attachment_expired(&link(now + 120)));
         assert!(!attachment_expired(&link(now + 3600)));
+    }
+
+    /// Only the links that are the message's own attachments come out; a
+    /// link somebody wrote stays, and so does everything else they wrote.
+    #[test]
+    fn old_attachment_links_come_out_of_the_text() {
+        let own = Attachment {
+            url: Some("https://cdn.discordapp.com/attachments/1/2/shot.png?ex=aa&is=bb&hm=cc".into()),
+            ..Default::default()
+        };
+        let body = "look at this\nhttps://cdn.discordapp.com/attachments/1/2/shot.png?ex=11&is=22&hm=33\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1";
+        assert_eq!(
+            strip_attachment_links(body, &[own.clone()]),
+            "look at this\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1"
+        );
+        // The media host is the same file.
+        assert_eq!(strip_attachment_links("https://media.discordapp.net/attachments/1/2/shot.png", &[own]), "");
+    }
+
+    #[test]
+    fn a_message_with_a_link_and_no_list_is_a_candidate() {
+        let mut m = msg("5", &[]);
+        m.body = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=1".into();
+        assert_eq!(stale_message_ids(&[m]), ["5"]);
+        let mut plain = msg("6", &[]);
+        plain.body = "no links here".into();
+        assert!(stale_message_ids(&[plain]).is_empty());
     }
 
     #[test]
