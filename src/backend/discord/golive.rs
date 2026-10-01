@@ -259,7 +259,12 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     // watching - found a complete entry and opened a second connection with
     // the same voice session. Discord answers that by invalidating one of
     // them, which is where the 4006 in the log came from.
-    if sending(account_id).await || connecting(account_id, stream_key) {
+    //
+    // "Has a live connection", not "is sending": a connection is up for
+    // some seconds before its encryption group is ready to send, and a
+    // STREAM_UPDATE in that gap - the other end of the call being told the
+    // stream exists is enough - opened a duplicate that invalidated the first.
+    if has_connection(account_id) || connecting(account_id, stream_key) {
         let mut all = pending().lock().unwrap();
         all.entry(slot(account_id, stream_key)).or_default().absorb(d);
         return;
@@ -369,6 +374,12 @@ fn senders() -> &'static std::sync::Mutex<std::collections::HashMap<String, std:
     SENDERS.get_or_init(Default::default)
 }
 
+/// Whether this account has a stream connection up, whether or not its group
+/// is ready yet.
+fn has_connection(account_id: &str) -> bool {
+    senders().lock().unwrap().get(account_id).is_some_and(|s| s.is_live())
+}
+
 /// Whether the next stream from each account carries the computer's sound.
 fn sound() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
     static SOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
@@ -431,15 +442,14 @@ pub fn take_last_error(account_id: &str) -> Option<String> {
 
 /// Whether this account has a stream connection ready for frames.
 ///
-/// Ready means the end-to-end encrypted group has formed, not merely that a
-/// socket is open: a picture encrypted for a group that does not exist yet is
-/// one nobody can read.
+/// Ready means the connection is up, not that its encrypted group has
+/// formed. The group forms when somebody joins to watch - a stream nobody is
+/// watching has nobody to agree keys with - so waiting for it before
+/// encoding meant a stream started into an empty room gave up after twenty
+/// seconds. Frames sent before the group exists are dropped by the sender,
+/// and the next keyframe is two seconds behind the first viewer.
 pub async fn sending(account_id: &str) -> bool {
-    let sender = senders().lock().unwrap().get(account_id).cloned();
-    match sender {
-        Some(sender) => sender.ready().await,
-        None => false,
-    }
+    has_connection(account_id)
 }
 
 /// Closes the connection, without telling the gateway - `stop` does that.

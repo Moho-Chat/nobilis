@@ -197,24 +197,13 @@ impl StreamSender {
         Ok(())
     }
 
-    /// Whether a frame handed in now would actually reach anybody.
-    ///
-    /// A connection exists some seconds before its group does, and a picture
-    /// encrypted for a group that has not formed is one nobody can read - so
-    /// the window waits for this rather than for the socket.
-    pub async fn ready(&self) -> bool {
-        if !self.live.load(Ordering::Relaxed) {
-            return false;
-        }
-        match self.dave.lock().await.as_ref() {
-            Some(dave) => dave.ready(),
-            // No group asked for, so nothing to wait on.
-            None => true,
-        }
-    }
-
     pub fn stop(&self) {
         self.live.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the connection is still up, ready or not.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// Sends what the computer is playing along with the picture, until the
