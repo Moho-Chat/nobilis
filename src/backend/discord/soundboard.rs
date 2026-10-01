@@ -254,6 +254,25 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i16>> {
     let track = format.default_track().context("the file has no audio in it")?;
     let track_id = track.id;
     let rate = track.codec_params.sample_rate.unwrap_or(48_000) as usize;
+    // A guild's own sounds are Ogg Opus, which symphonia can unwrap but not
+    // decode. libopus is here already for the calls themselves.
+    if track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
+        let mut opus = opus2::Decoder::new(48_000, opus2::Channels::Stereo).map_err(|e| anyhow!("no Opus decoder: {e:?}"))?;
+        let mut out: Vec<i16> = Vec::new();
+        let mut frame = vec![0i16; 5760 * 2];
+        while let Ok(packet) = format.next_packet() {
+            if packet.track_id() != track_id {
+                continue;
+            }
+            if let Ok(n) = opus.decode(&packet.data, &mut frame, false) {
+                out.extend_from_slice(&frame[..n * 2]);
+            }
+            if out.len() / 2 > 48_000 * LONGEST_SECS {
+                break;
+            }
+        }
+        return Ok(out);
+    }
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
         .map_err(|e| anyhow!("no decoder for it: {e}"))?;
@@ -301,6 +320,18 @@ fn resample(stereo: &[f32], from: usize, to: usize) -> Vec<i16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Ogg Opus file - what a guild's own sounds are - decodes through
+    /// libopus to 48kHz stereo.
+    #[test]
+    fn an_ogg_opus_sound_decodes() {
+        let tone: Vec<f32> = (0..48_000).map(|n| (n as f32 * 0.05).sin() * 0.3).collect();
+        let bytes = crate::oggopus::encode(&tone).unwrap();
+        let pcm = decode(&bytes).unwrap();
+        let secs = pcm.len() as f32 / 2.0 / 48_000.0;
+        assert!((0.9..1.1).contains(&secs), "decoded {secs}s");
+        assert!(pcm.iter().any(|s| s.saturating_abs() > 1000));
+    }
 
     #[test]
     fn a_sound_is_read_with_its_emoji() {

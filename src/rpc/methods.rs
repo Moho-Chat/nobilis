@@ -4709,17 +4709,26 @@ pub async fn dispatch(
         // stream; the connection it answers with is opened in the
         // background, and frames follow once it is up.
         "startDiscordScreenShare" | "stopDiscordScreenShare" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some(format!("{method} requires \"bufferId\"")));
+            // Where the stream goes: the voice channel the account is in,
+            // named by the account - which is the only way to name a guild's
+            // voice channel, since it is no conversation and has no buffer -
+            // or, as before, a DM's conversation.
+            let (account_id, guild_id, channel_id) = if let Some(buffer_id) = p_str_opt(params, "bufferId") {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                    return (None, Some("no such buffer".to_string()));
+                };
+                let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                    return (None, Some("that conversation has no channel".to_string()));
+                };
+                (buffer.account_id.clone(), state.runtime.get_discord_guild(buffer_id), channel_id)
+            } else if let Some(account_id) = p_str_opt(params, "accountId") {
+                let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else {
+                    return (None, Some("not in a call".to_string()));
+                };
+                (account_id.to_string(), guild_id, channel_id)
+            } else {
+                return (None, Some(format!("{method} requires \"accountId\" or \"bufferId\"")));
             };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such buffer".to_string()));
-            };
-            let account_id = buffer.account_id.clone();
-            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
-                return (None, Some("that conversation has no channel".to_string()));
-            };
-            let guild_id = state.runtime.get_discord_guild(buffer_id);
             let user_id = state.accounts.get_discord(&account_id).map(|a| a.user_id).unwrap_or_default();
             let key = backend::discord::golive::StreamKey {
                 guild_id: guild_id.clone(),
