@@ -2681,7 +2681,7 @@ pub async fn dispatch(
                 (Some(a), Some(g)) => (a, g),
                 _ => return (None, Some("discordEventCount requires \"accountId\" and \"guildId\"".to_string())),
             };
-            (Some(serde_json::json!({ "count": backend::discord::events::count(account_id, guild_id) })), None)
+            (Some(backend::discord::events::summary(state, account_id, guild_id)), None)
         }
 
         "listDiscordEvents" => {

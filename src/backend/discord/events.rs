@@ -88,12 +88,39 @@ pub fn note_user(state: &AppState, account_id: &str, own_user: &str, added: bool
 }
 
 fn announce(state: &AppState, account_id: &str, guild_id: &str) {
-    let count = known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).map(|l| l.len()).unwrap_or(0);
-    state.events.emit("discordEvents", json!({ "accountId": account_id, "guildId": guild_id, "count": count }));
+    let mut summary = summary(state, account_id, guild_id);
+    summary["accountId"] = json!(account_id);
+    summary["guildId"] = json!(guild_id);
+    state.events.emit("discordEvents", summary);
 }
 
-/// How many events a guild has coming or on, for the row at the top of its
-/// channel list - which is only there when this is more than none.
+/// What the top of a guild's channel list shows: how many events are coming
+/// or on - the events row is there only when that is more than none - and
+/// which are on right now, each of which gets a card with a way to join it.
+pub fn summary(state: &AppState, account_id: &str, guild_id: &str) -> Value {
+    let events = known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default();
+    let live: Vec<Value> = events
+        .iter()
+        .filter(|e| e["status"].as_u64() == Some(2))
+        .map(|e| {
+            let channel_id = e["channel_id"].as_str();
+            let channel_name = channel_id.and_then(|c| {
+                state.runtime.discord_voice_channels(account_id, guild_id).into_iter().find(|v| v.id == c).map(|v| v.name)
+            });
+            json!({
+                "id": e["id"],
+                "name": e["name"],
+                "where": match e["entity_type"].as_u64() { Some(1) => "stage", Some(2) => "voice", _ => "external" },
+                "channelId": channel_id,
+                "channelName": channel_name,
+                "location": e["entity_metadata"]["location"],
+            })
+        })
+        .collect();
+    json!({ "count": events.len(), "live": live })
+}
+
+#[cfg(test)]
 pub fn count(account_id: &str, guild_id: &str) -> usize {
     known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).map(|l| l.len()).unwrap_or(0)
 }
