@@ -5,10 +5,12 @@
 //! otherwise empty message - so picking one sends it, the way it does in
 //! Discord's own client.
 //!
-//! The ones offered are each guild's own, learned as the guild is registered.
-//! Where they may be sent is Discord's rule, applied here so the picker can
-//! say so before the server refuses: a guild's stickers in that guild's
-//! channels, and anywhere at all with Nitro.
+//! Two kinds are offered. Each guild's own, learned as the guild is
+//! registered, which go in that guild's channels - and anywhere at all with
+//! Nitro. And Discord's standard packs, which every account may send
+//! anywhere, a DM included: without them an account with no Nitro had nothing
+//! it could send in a DM. Where each may go is applied here, so the picker can
+//! say so before the server refuses.
 
 use super::*;
 use std::sync::{Mutex, OnceLock};
@@ -77,9 +79,85 @@ pub fn note_guild(account_id: &str, guild_id: &str, entry: GuildStickers) {
     }
 }
 
+/// Discord's standard packs: the same for every account, so fetched once.
+fn standard() -> &'static Mutex<Option<Vec<(String, Vec<Sticker>)>>> {
+    static STANDARD: OnceLock<Mutex<Option<Vec<(String, Vec<Sticker>)>>>> = OnceLock::new();
+    STANDARD.get_or_init(Default::default)
+}
+
+/// The standard packs out of `GET /sticker-packs`.
+pub fn read_packs(body: &Value) -> Vec<(String, Vec<Sticker>)> {
+    body["sticker_packs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|pack| {
+            let name = pack["name"].as_str()?.to_string();
+            let stickers = read_stickers(pack);
+            (!stickers.is_empty()).then_some((name, stickers))
+        })
+        .collect()
+}
+
+async fn standard_packs(token: &str) -> Vec<(String, Vec<Sticker>)> {
+    if let Some(packs) = standard().lock().unwrap().clone() {
+        return packs;
+    }
+    let fetched = async {
+        let resp = http_client_for(token)
+            .get(format!("{API_BASE}/sticker-packs"))
+            .header("Authorization", token)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        Some(read_packs(&resp.json::<Value>().await.ok()?))
+    }
+    .await;
+    match fetched {
+        Some(packs) => {
+            *standard().lock().unwrap() = Some(packs.clone());
+            packs
+        }
+        // Not remembered, so the next time the picker opens asks again.
+        None => Vec::new(),
+    }
+}
+
 /// Every sticker the account has, and whether each can go where it is being
 /// sent from.
-pub fn list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value> {
+pub async fn list(state: &AppState, account_id: &str, buffer_id: &str, token: &str) -> Vec<Value> {
+    let standard = standard_packs(token).await;
+    let mut out = guild_list(state, account_id, buffer_id);
+    // After this conversation's own guild and before the others: they can go
+    // anywhere, so they are the next most likely to be usable here.
+    let own = state.runtime.get_discord_guild(buffer_id);
+    let at = out
+        .iter()
+        .position(|s| own.is_none() || s["guildId"].as_str() != own.as_deref())
+        .unwrap_or(out.len());
+    let extra: Vec<Value> = standard
+        .iter()
+        .flat_map(|(pack, stickers)| {
+            stickers.iter().map(move |sticker| {
+                json!({
+                    "id": sticker.id,
+                    "name": sticker.name,
+                    "pack": pack,
+                    "body": sticker.name,
+                    "url": sticker.url(),
+                    "locked": false,
+                })
+            })
+        })
+        .collect();
+    out.splice(at..at, extra);
+    out
+}
+
+fn guild_list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value> {
     let anywhere = state.runtime.emoji_unrestricted(account_id);
     // Absent in a DM, which belongs to no guild - and where, without Nitro,
     // no guild's sticker can go.
@@ -101,6 +179,7 @@ pub fn list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value> {
                 "body": sticker.name,
                 "url": sticker.url(),
                 "locked": !usable,
+                "guildId": guild_id,
             }));
         }
     }
@@ -143,6 +222,18 @@ mod tests {
         assert!(stickers[1].url().unwrap().ends_with("3.gif"));
         // Offered by name: it can be sent, just not drawn here.
         assert_eq!(stickers[2].url(), None);
+    }
+
+    #[test]
+    fn standard_packs_are_read_by_name() {
+        let body = json!({ "sticker_packs": [
+            { "name": "Wumpus Beyond", "stickers": [{ "id": "5", "name": "wave", "format_type": 3 }] },
+            { "name": "Empty", "stickers": [] },
+        ]});
+        let packs = read_packs(&body);
+        assert_eq!(packs.len(), 1);
+        assert_eq!(packs[0].0, "Wumpus Beyond");
+        assert_eq!(packs[0].1[0].id, "5");
     }
 
     #[test]

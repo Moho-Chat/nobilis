@@ -5183,7 +5183,8 @@ pub async fn dispatch(
             let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
                 return (None, Some("no such buffer".to_string()));
             };
-            (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id))), None)
+            let token = state.accounts.get_discord(&buffer.account_id).map(|c| c.token).unwrap_or_default();
+            (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id, &token).await)), None)
         }
 
         "sendDiscordSticker" => {
