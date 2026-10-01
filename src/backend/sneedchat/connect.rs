@@ -207,60 +207,52 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     state.runtime.set_own_identity(account_id, &config.username);
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
-    let rooms = effective_rooms(config);
-    tracing::info!("sneedchat[{account_id}]: authenticated, connecting {} room(s)", rooms.len());
+    let host = config.site_host();
+    open_first_room(state, account_id, &session, &host).await;
 
-    // Only the first room's connection stores whispers - every room's
-    // websocket appears to receive the same whisper pushes (they aren't
-    // room-scoped), so storing them on all of them would show each one
-    // duplicated once per connected room.
-    let handles: Vec<_> = rooms
-        .into_iter()
-        .enumerate()
-        .map(|(i, room)| {
-            let state = state.clone();
-            let transport = transport.clone();
-            let session = session.clone();
-            let host = config.site_host();
-            let username = config.username.clone();
-            let password = config.password.clone();
-            let totp_secret = config.totp_secret.clone();
-            let account_id = account_id.to_string();
-            let is_primary = i == 0;
-            tokio::spawn(async move {
-                let creds = Credentials { username, password };
-                let two_factor = match &totp_secret {
-                    Some(secret) => match totp::decode_secret(secret) {
-                        Ok(bytes) => TwoFactor::Totp(bytes),
-                        Err(_) => TwoFactor::None,
-                    },
-                    None => TwoFactor::None,
-                };
-                run_room(&state, &transport, &session, &creds, &two_factor, &account_id, &host, &room, is_primary).await;
-            })
-        })
-        .collect();
+    // Every room the account is in, each on its own connection and all on
+    // this one session - started now, and started or stopped later as rooms
+    // are opened and closed, without signing in again. See live.rs.
+    let _live = super::live::install(account_id, transport, session, host, config);
+    super::live::sync_rooms(state, account_id);
 
-    // Aborting the account-level task (disconnect/removeAccount/a newer
-    // spawn() superseding this one) does not automatically cancel these
-    // child tasks - tokio only cascades a JoinHandle's own cancellation,
-    // not tasks it spawned - so without this guard every room's websocket
-    // would leak and keep running orphaned in the background forever.
-    struct AbortAllOnDrop(Vec<tokio::task::JoinHandle<()>>);
-    impl Drop for AbortAllOnDrop {
-        fn drop(&mut self) {
-            for h in &self.0 {
-                h.abort();
-            }
-        }
-    }
-    let _rooms_guard = AbortAllOnDrop(handles);
-
-    // Each room task retries forever internally, so this never resolves on
-    // its own - only ever by this whole task being aborted from outside,
-    // at which point the guard above cleans up every room task too.
+    // The rooms retry on their own and are changed from outside, so this
+    // never resolves on its own - only by the account's task being aborted,
+    // at which point the guard above stops every room as well.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Opens a room for an account that has never had any, as a courtesy.
+///
+/// Once per account. After that the room list is whatever the person made it,
+/// including empty: a person who closed every room meant to, and the account
+/// stays signed in with none open until one is added on the Join page.
+///
+/// The room comes from the site's own list, read here with the session that
+/// just signed in. If the list cannot be read the account is left with no
+/// room for now and this is tried again on the next connection.
+async fn open_first_room(state: &AppState, account_id: &str, session: &Session, host: &str) {
+    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
+    if config.rooms_chosen {
+        return;
+    }
+    // An account from before rooms could be closed already has its rooms;
+    // they stand, and are simply recorded as chosen.
+    if !config.rooms.is_empty() {
+        let _ = state.accounts.set_sneedchat_rooms(account_id, config.rooms);
+        return;
+    }
+    match read_catalogue(session, host).await {
+        Ok(catalogue) => {
+            publish_catalogue(state, account_id, &catalogue);
+            if let Some(room) = courtesy_room(&catalogue) {
+                tracing::info!("sneedchat[{account_id}]: opening #{} for a new account", room.name);
+                let _ = state.accounts.set_sneedchat_rooms(account_id, vec![room]);
+            }
+        }
+        Err(e) => tracing::warn!("sneedchat[{account_id}]: could not read the room list to open a first room: {e:#}"),
+    }
 }
 
 /// Kicks off a fresh account's first login in the background - unlike

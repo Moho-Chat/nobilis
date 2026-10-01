@@ -85,17 +85,39 @@ fn hash_candidate(buf: &mut Vec<u8>, salt_len: usize, nonce: u32) -> [u8; 32] {
     Sha256::digest(&buf[..]).into()
 }
 
+/// The arguments of the page's `ttrs_challenge("<salt>", <difficulty>,
+/// <steps>)` call: the salt, and the two numbers where they parse.
+fn script_challenge(html: &str) -> Option<(String, Option<u32>, Option<i8>)> {
+    let start = html.find("ttrs_challenge(\"")? + "ttrs_challenge(\"".len();
+    let rest = &html[start..];
+    let salt = &rest[..rest.find('"')?];
+    let args_end = rest.find(')')?;
+    let mut numbers = rest[salt.len() + 1..args_end].split(',').map(str::trim).filter(|a| !a.is_empty());
+    let difficulty = numbers.next().and_then(|d| d.parse().ok());
+    let steps = numbers.next().and_then(|s| s.parse().ok());
+    Some((salt.to_string(), difficulty, steps))
+}
+
 impl Challenge {
     /// Extract a challenge from a gate page.
     pub fn parse(html: &str) -> Result<Challenge> {
-        let salt = attr(html, "data-ttrs-challenge").context("challenge page has no data-ttrs-challenge attribute")?;
-        let difficulty = attr(html, "data-ttrs-difficulty")
-            .context("challenge page has no data-ttrs-difficulty attribute")?
-            .trim()
-            .parse::<u32>()
-            .context("data-ttrs-difficulty is not a number")?;
+        // The page used to carry the challenge as an attribute and now hands
+        // it to its script instead, as `window.ttrs_challenge("<salt>",
+        // <difficulty>, <steps>)`. Either is read; the attribute first, since
+        // it is what the page said for longest.
+        let call = script_challenge(html);
+        let salt = attr(html, "data-ttrs-challenge")
+            .or_else(|| call.as_ref().map(|c| c.0.clone()))
+            .context("challenge page carries no challenge - neither data-ttrs-challenge nor a ttrs_challenge(...) call")?;
+        let difficulty = match attr(html, "data-ttrs-difficulty") {
+            Some(d) => d.trim().parse::<u32>().context("data-ttrs-difficulty is not a number")?,
+            None => call.as_ref().and_then(|c| c.1).context("challenge page gives no difficulty")?,
+        };
         // Absent step count means a single step.
-        let steps = attr(html, "data-ttrs-steps").and_then(|s| s.trim().parse::<i8>().ok()).unwrap_or(1);
+        let steps = attr(html, "data-ttrs-steps")
+            .and_then(|s| s.trim().parse::<i8>().ok())
+            .or_else(|| call.as_ref().and_then(|c| c.2))
+            .unwrap_or(1);
 
         // Absent means the original scheme, which was SHA-256 only.
         if let Some(algorithm) = attr(html, "data-ttrs-algorithm") {
@@ -247,6 +269,23 @@ async fn submit(http: &HttpClient, url: &str, sol: &Solution) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The page as the site serves it since it moved the challenge out of
+    /// the `<html>` attributes and into its script.
+    #[test]
+    fn reads_a_challenge_handed_to_the_script() {
+        let html = r#"<html lang="en" data-ttrs-difficulty="14" data-ttrs-steps="1" data-ttrs-algorithm="sha256">
+<script>if (window.ttrs_challenge) window.ttrs_challenge("d8796909e2b5cc33b46f8b365e5cba88_6abdbf0e_14", 14, 1)</script></html>"#;
+        let c = Challenge::parse(html).expect("a challenge");
+        assert_eq!(c.salt, "d8796909e2b5cc33b46f8b365e5cba88_6abdbf0e_14");
+        assert_eq!(c.difficulty, 14);
+        assert_eq!(c.steps, 1);
+        // And from the call alone, with no attributes to lean on.
+        let bare = r#"<script>window.ttrs_challenge("abc_1", 9, 2)</script>"#;
+        let c = Challenge::parse(bare).expect("a challenge");
+        assert_eq!((c.salt.as_str(), c.difficulty, c.steps), ("abc_1", 9, 2));
+    }
+
     use super::*;
 
     #[test]

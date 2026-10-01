@@ -35,6 +35,7 @@ pub mod media;
 pub mod postimg;
 pub mod probes;
 pub mod rooms;
+pub mod live;
 pub mod send;
 pub mod auth;
 
@@ -45,6 +46,7 @@ pub use connect::*;
 pub use media::*;
 pub use postimg::*;
 pub use rooms::*;
+pub use live::{leave_room, set_rooms};
 pub use send::*;
 pub mod captcha;
 pub mod form;

@@ -2650,8 +2650,10 @@ pub async fn dispatch(
                         // room. A Discord direct message is closed, but one of
                         // a guild's channels cannot be left on its own - you
                         // are in it because you are in the guild - so that
-                        // stays a local matter, as does Sneedchat, whose rooms
-                        // are a fixed list rather than something joined.
+                        // stays a local matter. Sneedchat stops that room's
+                        // connection and deletes the room's history with it;
+                        // a whisper conversation there is only drawn, and is
+                        // simply removed.
                         if let Some(sender) = state.runtime.irc_sender(&buffer.account_id) {
                             let _ = sender.send_part(&buffer.name);
                         } else if buffer.account_id.starts_with("kick:") {
@@ -2671,6 +2673,13 @@ pub async fn dispatch(
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
                                     return (None, Some(format!("{e:#}")));
                                 }
+                            }
+                        } else if buffer.account_id.starts_with("sneedchat:") && buffer.kind == "channel" {
+                            match backend::sneedchat::leave_room(state, &buffer.account_id, &buffer.name) {
+                                // Its buffer is already gone, with its history.
+                                Ok(true) => return (Some(ok_node()), None),
+                                Ok(false) => {}
+                                Err(e) => return (None, Some(format!("{e:#}"))),
                             }
                         } else if buffer.kind == "dm" && buffer.account_id.starts_with("discord:") {
                             if let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) {
@@ -3151,6 +3160,7 @@ pub async fn dispatch(
                 use_tor: p_bool(params, "useTor", false),
                 proxy: p_str_opt(params, "proxy").map(String::from),
                 rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
+                rooms_chosen: false,
                 display_name: None,
                 user_id: None,
                 // Kept from a previous browser sign-in when this is the same
@@ -3227,6 +3237,7 @@ pub async fn dispatch(
                     use_tor: p_bool(params, "useTor", false),
                     proxy: None,
                     rooms: Vec::new(),
+                    rooms_chosen: false,
                     display_name: None,
                     user_id: None,
                     cookies: Default::default(),
@@ -3285,14 +3296,10 @@ pub async fn dispatch(
                 let Some(rooms) = parse_sneedchat_rooms(params) else {
                     return (None, Some("setSneedChatRooms requires \"rooms\": [{\"id\":.., \"name\":..}, ...]".to_string()));
                 };
-                match state.accounts.set_sneedchat_rooms(id, rooms) {
-                    Ok(true) => match state.accounts.get_sneedchat(id) {
-                        Some(cfg) => {
-                            backend::sneedchat::spawn(state.clone(), cfg);
-                            (Some(ok_node()), None)
-                        }
-                        None => (None, Some("no such account".to_string())),
-                    },
+                // Opens and closes only what changed, on the session the
+                // account already has - see backend/sneedchat/live.rs.
+                match backend::sneedchat::set_rooms(state, id, rooms) {
+                    Ok(true) => (Some(ok_node()), None),
                     Ok(false) => (None, Some("no such account".to_string())),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }

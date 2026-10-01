@@ -158,8 +158,13 @@ pub struct SneedChatAccountConfig {
     pub use_tor: bool,
     #[serde(default)]
     pub proxy: Option<String>,
-    #[serde(default = "default_sneedchat_rooms")]
+    #[serde(default)]
     pub rooms: Vec<SneedChatRoom>,
+    /// Whether the room list is somebody's choice yet. Until it is, the
+    /// account's first connection opens one room as a courtesy (see
+    /// `open_first_room`); after it, an empty list means no rooms open.
+    #[serde(default)]
+    pub rooms_chosen: bool,
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
@@ -182,10 +187,6 @@ fn default_sneedchat_host() -> String {
 
 fn default_tor_mode() -> String {
     "embedded".to_string()
-}
-
-fn default_sneedchat_rooms() -> Vec<SneedChatRoom> {
-    vec![SneedChatRoom { id: 1, name: "general".to_string() }]
 }
 
 impl SneedChatAccountConfig {
@@ -613,6 +614,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.rooms = rooms;
+                a.rooms_chosen = true;
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
