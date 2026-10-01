@@ -11,6 +11,9 @@ name = "nobilis"
 path = "src/main.rs"
 
 [dependencies]
+# A larger receive buffer for the Discord voice and stream sockets, on every
+# platform - see backend/discord/streamconn.rs `widen_receive_buffer`.
+socket2 = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "fs", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -105,7 +108,6 @@ opus2 = "0.4"
 # daemon has anything to say to its allocator.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-socket2 = "0.6"
 
 # Tor's certificate validation hangs on Windows without this.
 #

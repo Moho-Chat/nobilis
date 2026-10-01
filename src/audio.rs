@@ -483,6 +483,17 @@ where
     }
 }
 
+/// The private mix's monitor, where there is a mix - which is Linux only.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn mixed_monitor(mix: &Option<ShareMix>) -> Option<String> {
+    mix.as_ref().map(ShareMix::monitor)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn mixed_monitor(_mix: &Option<()>) -> Option<String> {
+    None
+}
+
 /// Opens a recording, converts what it delivers to 48kHz stereo, and points it
 /// where `route` says.
 fn open_input<F>(device: cpal::Device, config: cpal::SupportedStreamConfig, mut sink: F, route: Route) -> Result<Capture>
@@ -585,8 +596,8 @@ where
             // to build a mix with.
             let monitor = match std::env::var("NOBILIS_SHARE_AUDIO_SOURCE") {
                 Ok(named) if !named.is_empty() => named,
-                _ => match mix.as_ref() {
-                    Some(mix) => mix.monitor(),
+                _ => match mixed_monitor(&mix) {
+                    Some(monitor) => monitor,
                     None => format!("{}.monitor", default_device(Stream::Output)?),
                 },
             };
