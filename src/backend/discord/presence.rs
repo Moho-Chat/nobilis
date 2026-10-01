@@ -55,7 +55,7 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> b
 
     let Some(config) = state.accounts.get_discord(account_id) else { return false };
     match send_write(
-        http_client()
+        http_client_for(&config.token)
         .patch(format!("{API_BASE}/users/@me/settings"))
         .header("Authorization", &config.token)
         .json(&json!({ "status": discord_status(status) }))

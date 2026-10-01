@@ -106,6 +106,10 @@ pub struct DiscordAccountConfig {
     /// reconnects, same precedent as `username` above.
     #[serde(default)]
     pub avatar_url: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl DiscordAccountConfig {
@@ -282,6 +286,10 @@ pub struct MatrixAccountConfig {
     /// name a LiveKit JWT service here and calls go through it.
     #[serde(default)]
     pub rtc_focus_url: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl MatrixAccountConfig {
@@ -320,6 +328,10 @@ pub struct KickAccountConfig {
     /// list belongs to whoever is using it.
     #[serde(default)]
     pub followed_synced: bool,
+    /// Whether this account's connections go through Tor or the SOCKS5
+    /// proxy set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
 }
 
 impl KickAccountConfig {
@@ -449,9 +461,15 @@ impl AccountStore {
     /// added is a legitimate way to refresh a stale/revoked token, not a
     /// duplicate-creation mistake (there's no equivalent "did you mean to
     /// reconnect instead" ambiguity IRC's nick@host dedup guards against).
-    pub fn add_discord(&self, config: DiscordAccountConfig) -> Result<DiscordAccountConfig> {
+    pub fn add_discord(&self, mut config: DiscordAccountConfig) -> Result<DiscordAccountConfig> {
         let id = config.account_id();
         let mut discord = self.discord.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if discord.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         discord.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
@@ -486,9 +504,15 @@ impl AccountStore {
     /// Upserts like add_discord/add_sneedchat - re-running addMatrixAccount
     /// for an already-added user_id is how a user refreshes a changed
     /// password, not a duplicate-creation mistake.
-    pub fn add_matrix(&self, config: MatrixAccountConfig) -> Result<MatrixAccountConfig> {
+    pub fn add_matrix(&self, mut config: MatrixAccountConfig) -> Result<MatrixAccountConfig> {
         let id = config.account_id();
         let mut matrix = self.matrix.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if matrix.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         matrix.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(config)
@@ -504,9 +528,15 @@ impl AccountStore {
 
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
-    pub fn add_kick(&self, config: KickAccountConfig) -> Result<KickAccountConfig> {
+    pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
         let id = config.account_id();
         let mut kick = self.kick.lock().unwrap();
+        // Signing in again keeps a route that was on: a re-login comes from
+        // the account's own card, which does not ask, and must not quietly
+        // send an account that was going through Tor out directly.
+        if kick.get(&id).is_some_and(|old| old.use_tor) {
+            config.use_tor = true;
+        }
         kick.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(config)
@@ -589,6 +619,40 @@ impl AccountStore {
         }
     }
 
+    /// Whether any account's connections are routed, by account id. False
+    /// when there is no such account.
+    pub fn set_routed(&self, account_id: &str, routed: bool) -> Result<bool> {
+        let (irc, discord, sneedchat, matrix, kick) = (
+            &mut *self.irc.lock().unwrap(),
+            &mut *self.discord.lock().unwrap(),
+            &mut *self.sneedchat.lock().unwrap(),
+            &mut *self.matrix.lock().unwrap(),
+            &mut *self.kick.lock().unwrap(),
+        );
+        let found = if let Some(a) = discord.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = matrix.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = kick.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = sneedchat.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else if let Some(a) = irc.get_mut(account_id) {
+            a.use_tor = routed;
+            true
+        } else {
+            false
+        };
+        if found {
+            self.persist(irc, discord, sneedchat, matrix, kick)?;
+        }
+        Ok(found)
+    }
+
     /// Whether this account connects through Tor.
     pub fn set_sneedchat_use_tor(&self, account_id: &str, use_tor: bool) -> Result<bool> {
         let mut sneedchat = self.sneedchat.lock().unwrap();
@@ -602,23 +666,6 @@ impl AccountStore {
         }
     }
 
-    /// Updates the account's transport mode (embedded Tor vs an external
-    /// SOCKS5 proxy) - takes effect on the next reconnect, same as
-    /// set_sneedchat_rooms (the RPC handler re-spawns the account
-    /// immediately after this succeeds, rather than waiting for the user
-    /// to notice and reconnect manually).
-    pub fn set_sneedchat_tor_config(&self, account_id: &str, tor_mode: String, proxy: Option<String>) -> Result<bool> {
-        let mut sneedchat = self.sneedchat.lock().unwrap();
-        match sneedchat.get_mut(account_id) {
-            None => Ok(false),
-            Some(a) => {
-                a.tor_mode = tor_mode;
-                a.proxy = proxy;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
-                Ok(true)
-            }
-        }
-    }
 
     /// Called after a successful login once the `xf_user` cookie reveals the
     /// account's numeric id - best-effort, not required for the backend to
@@ -1022,7 +1069,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1101,7 +1148,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1140,7 +1187,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sneedchat_rooms: Vec::new(),
         tor_mode: None,
         tor_proxy: None,
-        use_tor: false,
+        use_tor: a.use_tor,
         has_key_backup,
         rtc_focus_url: a.rtc_focus_url.clone(),
         sliding_sync: a.prefer_sliding_sync,

@@ -142,7 +142,7 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
         }
     }
 
-    let response = http_client().get(&url).header("Authorization", &config.token).send().await;
+    let response = http_client_for(&config.token).get(&url).header("Authorization", &config.token).send().await;
     let Ok(body) = response else { return profile };
     let Ok(body) = body.json::<Value>().await else { return profile };
 
@@ -227,7 +227,7 @@ pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String
         json!({ "recipients": user_ids })
     };
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/users/@me/channels"))
         .header("Authorization", &cfg.token)
         .json(&body)
@@ -268,7 +268,7 @@ pub async fn adopt_dm_channel(state: &AppState, account_id: &str, channel_id: &s
         return Ok(buffer_id);
     }
     let config = state.accounts.get_discord(account_id).context("account is not connected")?;
-    let resp = http_client()
+    let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}"))
         .header("Authorization", &config.token)
         .send()
@@ -306,7 +306,7 @@ pub(super) const GROUP_DM_MAX_OTHERS: usize = 9;
 pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .put(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
         .header("Authorization", &cfg.token)
         .json(&json!({}))
@@ -329,7 +329,7 @@ pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &st
 pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .delete(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
         .header("Authorization", &cfg.token)
         )
@@ -361,7 +361,7 @@ pub async fn add_friend(state: &AppState, account_id: &str, username: &str, capt
     };
     send_answerable(
         with_captcha(
-            http_client()
+            http_client_for(&cfg.token)
                 .post(format!("{API_BASE}/users/@me/relationships"))
                 .header("Authorization", &cfg.token)
                 .json(&json!({ "username": name, "discriminator": discriminator })),
@@ -380,7 +380,7 @@ pub async fn add_friend(state: &AppState, account_id: &str, username: &str, capt
 /// what differs is only which of the three you were in.
 pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: &str, accept: bool) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
     let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
     let request = if accept { http.put(url).json(&json!({})) } else { http.delete(url) };
     let doing = if accept { "accepting the friend request" } else { "declining the friend request" };
@@ -406,7 +406,7 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
 /// for a friend; this only has to make the request.
 pub async fn set_blocked(state: &AppState, account_id: &str, user_id: &str, blocked: bool) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
     let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
     let doing = if blocked { "blocking them" } else { "unblocking them" };
     let request = if blocked {
@@ -610,7 +610,7 @@ fn display_name(user: &Value) -> String {
 pub async fn close_dm(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .delete(format!("{API_BASE}/channels/{channel_id}"))
         .header("Authorization", &cfg.token)
         )

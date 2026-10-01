@@ -199,7 +199,7 @@ pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Resu
 pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let _ = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "recipients": [&cfg.user_id] }))
@@ -225,7 +225,7 @@ pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) ->
 pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
             .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
             .header("Authorization", &cfg.token)
             // A null recipient list means everyone in the conversation, which
@@ -246,7 +246,7 @@ pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Resul
 pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let _ = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "recipients": Value::Null }))

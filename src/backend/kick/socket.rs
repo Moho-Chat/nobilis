@@ -38,6 +38,8 @@ pub enum Command {
 
 pub fn spawn(state: AppState, config: KickAccountConfig) {
     let account_id = config.account_id();
+    let routed = state.accounts.all_kick().iter().any(|a| a.use_tor) || config.use_tor;
+    crate::net::route::router().mark(super::api::SHARED_KEY, routed);
     state.runtime.reset_connection(&account_id);
     let join_handle = tokio::spawn({
         let account_id = account_id.clone();
@@ -193,7 +195,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
         });
     }
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(pusher_url())
+    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, pusher_url())
         .await
         .context("connecting to Kick's chat")?;
 
@@ -357,7 +359,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
 }
 
 pub(super) type Socket = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    tokio_tungstenite::MaybeTlsStream<crate::net::route::TcpOrSocks>,
 >;
 
 /// Everything about starting to follow a channel except the subscription:

@@ -71,6 +71,7 @@ mod live {
         };
 
         let config = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.clone(),
             user_id: login.user_id.clone(),
             password: password.clone(),
@@ -195,6 +196,7 @@ mod live {
         };
 
         let config = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.clone(),
             user_id: login.user_id.clone(),
             password: password.clone(),
@@ -312,6 +314,7 @@ mod live {
         };
 
         let config_a = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.clone(),
             user_id: login_a.user_id.clone(),
             password: password.clone(),
@@ -475,6 +478,7 @@ mod live {
         };
 
         let config = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.clone(),
             user_id: login.user_id.clone(),
             password: password.clone(),
@@ -637,6 +641,7 @@ mod live {
         };
 
         let config = MatrixAccountConfig {
+            use_tor: false,
             homeserver_url: homeserver.clone(),
             user_id: login.user_id.clone(),
             password: password.clone(),

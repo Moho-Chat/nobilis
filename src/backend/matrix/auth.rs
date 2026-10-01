@@ -522,6 +522,7 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
     }
 
     let config = MatrixAccountConfig {
+        use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
         homeserver_url: homeserver_url.to_string(),
         user_id,
         // Nothing to keep, and the same real difference the SSO path notes:
@@ -606,6 +607,7 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
     let login = auth::login_with_token(&homeserver_url, &token, None).await.context("finishing the sign-in")?;
 
     let config = MatrixAccountConfig {
+        use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
         homeserver_url: homeserver_url.to_string(),
         user_id: login.user_id,
         // No password to keep, and that is a real difference rather than an
@@ -703,6 +705,7 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
     let (user_id, access_token, device_id) = register(homeserver_url, username, password, token).await?;
 
     let config = MatrixAccountConfig {
+        use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
         homeserver_url: homeserver_url.to_string(),
         user_id,
         password: password.to_string(),
@@ -761,6 +764,7 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
     // is not here, and a corrected password overwrites in place because the
     // account id comes from the user id.
     let pending = MatrixAccountConfig {
+        use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
         homeserver_url: homeserver_url.to_string(),
         user_id: username.to_string(),
         password: password.to_string(),
@@ -780,6 +784,7 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
     let login = auth::login(homeserver_url, username, password, None).await.context("logging in")?;
 
     let config = MatrixAccountConfig {
+        use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
         homeserver_url: homeserver_url.to_string(),
         user_id: login.user_id,
         password: password.to_string(),

@@ -19,6 +19,7 @@ pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Ge
 /// saved account on daemon startup.
 pub fn spawn(state: AppState, config: SneedChatAccountConfig) {
     let account_id = config.account_id();
+    crate::net::route::router().mark(&account_id, config.use_tor);
     // Same guard as backend::discord::spawn - guarantees at most one live
     // connection per account (see Runtime::reset_connection's doc comment).
     state.runtime.reset_connection(&account_id);
@@ -99,19 +100,24 @@ pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountC
 /// Tor, the daemon-wide choice between the embedded client and an external
 /// proxy applies.
 pub(super) async fn transport_for(state: &AppState, config: &SneedChatAccountConfig, on_progress: impl FnOnce(&str)) -> Result<Transport> {
-    if !config.use_tor {
+    let router = crate::net::route::router();
+    if !config.use_tor && !router.tunnel_all() {
         return Ok(Transport::Direct);
     }
-    match config.tor_mode.as_str() {
-        "proxy" => {
-            let proxy = config.proxy.as_deref().ok_or_else(|| anyhow!("tor_mode is \"proxy\" but no proxy URL is configured"))?;
-            Transport::socks_from_url(proxy)
-        }
-        _ => {
-            let client = state.tor.get_or_bootstrap(on_progress).await.context("bootstrapping Tor")?;
-            Ok(Transport::Tor(client))
-        }
+    let settings = router.settings();
+    if settings.tor_mode == "proxy" {
+        let proxy = settings.proxy.as_deref().ok_or_else(|| anyhow!("the network settings name a proxy but give no address"))?;
+        return Transport::socks_from_url(proxy);
     }
+    if config.use_tor {
+        // Straight to moho's own Tor client: the onion address needs no relay.
+        let client = state.tor.get_or_bootstrap(on_progress).await.context("bootstrapping Tor")?;
+        return Ok(Transport::Tor(client));
+    }
+    // Everything routed, this account on the open internet: through Tor to
+    // kiwifarms.st, by way of the relay everything else uses.
+    let (host, port) = router.ready(on_progress).await?;
+    Ok(Transport::Socks { host, port })
 }
 
 /// Hands a session whatever cookies were captured from a browser sign-in.

@@ -16,7 +16,7 @@ pub async fn join_guild(state: &AppState, account_id: &str, invite: &str, captch
     let code = invite.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(invite.trim());
     send_answerable(
         with_captcha(
-            http_client()
+            http_client_for(&cfg.token)
                 .post(format!("{API_BASE}/invites/{code}"))
                 .header("Authorization", &cfg.token)
                 .json(&json!({})),
@@ -56,7 +56,7 @@ pub async fn create_invite(
         .get_discord_channel(buffer_id)
         .context("no known Discord channel for this conversation")?;
     let resp = send_write(with_captcha(
-        http_client()
+        http_client_for(&cfg.token)
             .post(format!("{API_BASE}/channels/{channel_id}/invites"))
             .header("Authorization", &cfg.token)
             .json(&json!({
@@ -96,7 +96,7 @@ pub async fn create_invite(
 pub async fn create_guild(state: &AppState, account_id: &str, name: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/guilds"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "name": name.trim() }))
@@ -143,7 +143,7 @@ pub(super) fn parse_perm(v: &Value) -> u64 {
 /// shown is what the server actually wrote.
 pub async fn member_verification(state: &AppState, account_id: &str, guild_id: &str) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/guilds/{guild_id}/member-verification"))
         .header("Authorization", &cfg.token)
         .send()
@@ -180,7 +180,7 @@ pub async fn accept_member_verification(state: &AppState, account_id: &str, guil
         .collect();
 
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .put(format!("{API_BASE}/guilds/{guild_id}/requests/@me"))
         .header("Authorization", &cfg.token)
         .json(&json!({ "version": version, "form_fields": fields }))
@@ -236,7 +236,7 @@ pub(super) async fn resync_guild(state: &AppState, config: &DiscordAccountConfig
 pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountConfig, guild_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
     let account_id = config.account_id();
     let fetch = |path: String| async move {
-        http_client()
+        http_client_for(&config.token)
             .get(format!("{API_BASE}/{path}"))
             .header("Authorization", &config.token)
             .send()
@@ -304,7 +304,7 @@ pub(super) async fn own_member(config: &DiscordAccountConfig, guild: &Value) -> 
     // after the lookup was added. Confirmed against both endpoints with a
     // live account behind a gate.
     let guild_id = guild["id"].as_str()?;
-    let resp = http_client()
+    let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/users/@me/guilds/{guild_id}/member"))
         .header("Authorization", &config.token)
         .send()
@@ -757,7 +757,7 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
     requests.push(format!("{API_BASE}/channels/{channel_id}/threads/archived/public?limit=25"));
 
     for url in requests {
-        let resp = match http_client().get(&url).header("Authorization", &cfg.token).send().await {
+        let resp = match http_client_for(&cfg.token).get(&url).header("Authorization", &cfg.token).send().await {
             Ok(resp) if resp.status().is_success() => resp,
             // A channel with no archive, or one this account may not read the
             // archive of, is not a failure worth refusing the whole list for.
@@ -883,7 +883,7 @@ pub async fn moderate_member(
 ) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
     let base = format!("{API_BASE}/guilds/{guild_id}");
     let (request, doing) = match action {
         "kick" => (http.delete(format!("{base}/members/{user_id}")), "removing them from the server"),
@@ -939,7 +939,7 @@ pub async fn set_member_role(
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
     let url = format!("{API_BASE}/guilds/{guild_id}/members/{user_id}/roles/{role_id}");
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
     let request = if give { http.put(url).json(&json!({})) } else { http.delete(url) };
     let doing = if give { "giving them the role" } else { "taking the role away" };
     let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
@@ -960,7 +960,7 @@ pub async fn set_member_role(
 pub async fn open_thread(state: &AppState, account_id: &str, buffer_id: &str, thread_id: &str) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let guild_id = state.runtime.get_discord_guild(buffer_id).context("that conversation is not in a server")?;
-    let http = http_client();
+    let http = http_client_for(&cfg.token);
 
     // Best-effort: already being a member answers 204 as well, and a thread
     // that refuses the join may still be readable.
@@ -1034,7 +1034,7 @@ pub fn guild_group_id(account_id: &str, guild_id: &str) -> String {
 pub async fn leave_guild(state: &AppState, account_id: &str, guild_id: &str) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
             .delete(format!("{API_BASE}/users/@me/guilds/{guild_id}"))
             .header("Authorization", &cfg.token)
             // Discord distinguishes leaving from being removed; this is a leave.

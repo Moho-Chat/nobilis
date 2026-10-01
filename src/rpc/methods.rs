@@ -60,12 +60,73 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
     }
 }
 
+/// Reconnects an account from its stored settings, whatever its service.
+fn respawn_account(state: &AppState, id: &str) {
+    if id.starts_with("discord:") {
+        if let Some(cfg) = state.accounts.get_discord(id) {
+            backend::discord::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("sneedchat:") {
+        if let Some(cfg) = state.accounts.get_sneedchat(id) {
+            backend::sneedchat::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("matrix:") {
+        if let Some(cfg) = state.accounts.get_matrix(id) {
+            backend::matrix::spawn(state.clone(), cfg);
+        }
+    } else if id.starts_with("kick:") {
+        if let Some(cfg) = state.accounts.get_kick(id) {
+            backend::kick::spawn(state.clone(), cfg);
+        }
+    } else if let Some(cfg) = state.accounts.get_irc(id) {
+        backend::irc::spawn(state.clone(), cfg);
+    }
+}
+
+/// Reconnects every connected account that goes through Tor or the proxy -
+/// after Tor itself was restarted, which leaves their connections on circuits
+/// that are gone.
+fn reconnect_routed(state: &AppState) {
+    let router = crate::net::route::router();
+    for account in state.runtime.list_accounts(state) {
+        if account.state != "disconnected" && (account.use_tor || router.tunnel_all()) {
+            respawn_account(state, &account.id);
+        }
+    }
+}
+
+/// The service an account-creating request belongs to.
+fn adding_service(method: &str) -> Option<&'static str> {
+    match method {
+        "addDiscordAccount" | "addDiscordAccountPassword" | "addDiscordAccountToken" | "submitDiscordMfa" => Some("discord"),
+        "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
+        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" => Some("matrix"),
+        "addKickAccount" => Some("kick"),
+        _ => None,
+    }
+}
+
 pub async fn dispatch(
     state: &AppState,
     method: &str,
     params: &Value,
     subscriptions: &super::Subscriptions,
 ) -> (Option<Value>, Option<String>) {
+    // An add form's Tor switch, carried by every request the form makes
+    // before the account exists: the sign-in, and what it asks along the way.
+    // Recorded for the service so those requests are routed, and so the
+    // account they create starts with the same choice. Only when the request
+    // says - a continuation such as a second factor leaves it as it was.
+    if let (Some(service), Some(use_tor)) = (adding_service(method), params.get("useTor").and_then(|v| v.as_bool())) {
+        let router = crate::net::route::router();
+        let key = crate::net::route::pending_key(service);
+        router.mark(&key, use_tor);
+        if router.routed(&key) {
+            if let Err(e) = router.ready(|_| {}).await {
+                return (None, Some(format!("couldn't start Tor or reach the proxy: {e:#}")));
+            }
+        }
+    }
     match method {
         "listAccounts" => (Some(serde_json::to_value(state.runtime.list_accounts(state)).unwrap()), None),
 
@@ -501,7 +562,7 @@ pub async fn dispatch(
                 autojoin: p_str_opt(params, "autojoin").unwrap_or("").to_string(),
                 nickserv_password: None,
                 display_name: None,
-                use_tor: false,
+                use_tor: p_bool(params, "useTor", false),
                 tor_proxy: None,
             };
             match state.accounts.add_irc(config.clone()) {
@@ -3262,19 +3323,73 @@ pub async fn dispatch(
             }
         }
 
-        "setTorConfig" => {
-            let tor_mode = p_str(params, "torMode", "embedded").to_string();
-            let proxy = p_str_opt(params, "proxy").filter(|s| !s.is_empty()).map(String::from);
-            for cfg in state.accounts.all_sneedchat() {
-                let id = cfg.account_id();
-                if let Err(e) = state.accounts.set_sneedchat_tor_config(&id, tor_mode.clone(), proxy.clone()) {
-                    return (None, Some(format!("{e:#}")));
-                }
-                if let Some(cfg) = state.accounts.get_sneedchat(&id) {
-                    backend::sneedchat::spawn(state.clone(), cfg);
-                }
+        // The daemon-wide network settings: what routed means (moho's own Tor
+        // or a SOCKS5 proxy of one's own), and whether everything is routed.
+        "getNetSettings" => {
+            let settings = crate::net::route::router().settings();
+            (
+                Some(serde_json::json!({ "torMode": settings.tor_mode, "proxy": settings.proxy, "tunnelAll": settings.tunnel_all })),
+                None,
+            )
+        }
+
+        // Changing them reconnects every connected account that the change
+        // could move: the routed ones, or all of them when what changed is
+        // whether everything is routed.
+        "setNetSettings" | "setTorConfig" => {
+            let router = crate::net::route::router();
+            let before = router.settings();
+            let next = crate::net::route::NetSettings {
+                tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| before.tor_mode.clone()),
+                proxy: match p_str_opt(params, "proxy") {
+                    Some(p) if !p.trim().is_empty() => Some(p.trim().to_string()),
+                    Some(_) => None,
+                    None => before.proxy.clone(),
+                },
+                tunnel_all: params.get("tunnelAll").and_then(|v| v.as_bool()).unwrap_or(before.tunnel_all),
+            };
+            if let Err(e) = router.set_settings(next.clone()).await {
+                return (None, Some(format!("{e:#}")));
             }
+            let everything = before.tunnel_all != next.tunnel_all;
+            for account in state.runtime.list_accounts(state) {
+                if account.state == "disconnected" || !(everything || account.use_tor || next.tunnel_all) {
+                    continue;
+                }
+                respawn_account(state, &account.id);
+            }
+            state.events.emit("netSettings", serde_json::json!({ "torMode": next.tor_mode, "proxy": next.proxy, "tunnelAll": next.tunnel_all }));
             (Some(ok_node()), None)
+        }
+
+        // Where the window's own traffic should go: the SOCKS5 address when
+        // everything is routed - started first if need be - and nothing
+        // otherwise. The window points Chromium at it.
+        "netTunnel" => {
+            let router = crate::net::route::router();
+            if !router.tunnel_all() {
+                return (Some(serde_json::json!({ "tunnelAll": false })), None);
+            }
+            match router.ready(|_| {}).await {
+                Ok((host, port)) => (Some(serde_json::json!({ "tunnelAll": true, "socks": format!("{host}:{port}") })), None),
+                Err(e) => (Some(serde_json::json!({ "tunnelAll": true, "socks": null, "error": format!("{e:#}") })), None),
+            }
+        }
+
+        // One account's switch, on any service. Reconnected at once, so the
+        // change is the connection rather than a setting waiting for one.
+        "setAccountRouted" => {
+            let Some(id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setAccountRouted requires \"accountId\"".to_string()));
+            };
+            match state.accounts.set_routed(id, p_bool(params, "enabled", false)) {
+                Ok(true) => {
+                    respawn_account(state, id);
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // Drops the shared embedded Tor client, forcing a fresh bootstrap
@@ -3285,9 +3400,7 @@ pub async fn dispatch(
         // own (see TorManager::restart's doc comment).
         "regenerateTorCircuit" => {
             state.tor.restart().await;
-            for cfg in state.accounts.all_sneedchat() {
-                backend::sneedchat::spawn(state.clone(), cfg);
-            }
+            reconnect_routed(state);
             (Some(ok_node()), None)
         }
 
@@ -3304,9 +3417,7 @@ pub async fn dispatch(
                 }
             }
             state.tor.restart().await;
-            for cfg in state.accounts.all_sneedchat() {
-                backend::sneedchat::spawn(state.clone(), cfg);
-            }
+            reconnect_routed(state);
             (Some(ok_node()), None)
         }
 
@@ -3499,6 +3610,7 @@ pub async fn dispatch(
                 // token - the second one would put back every channel the
                 // person had closed.
                 followed_synced: existing.as_ref().is_some_and(|e| e.followed_synced),
+                use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("kick")),
                 channels: existing.map(|e| e.channels).unwrap_or_default(),
             };
             match state.accounts.add_kick(config) {

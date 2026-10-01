@@ -36,13 +36,21 @@ pub const USER_AGENT: &str =
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The Kick client, routed through Tor or the configured proxy when any Kick
+/// account is - or the add form's switch is on, for the sign-in.
+///
+/// Routed as a service rather than per account: most of what is fetched here
+/// - channel cards, emotes, stream state - belongs to no account in
+/// particular, and a request that cannot say whose it is goes the safer way.
 pub fn client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(TIMEOUT)
-        .build()
-        .context("building the Kick HTTP client")
+    let router = crate::net::route::router();
+    let routed = router.routed(SHARED_KEY) || router.routed(&crate::net::route::pending_key("kick"));
+    Ok(router.client_if("kick", routed, |builder| builder.user_agent(USER_AGENT).timeout(TIMEOUT)))
 }
+
+/// Marked while any Kick account is routed; what Kick's connections are
+/// routed by.
+pub const SHARED_KEY: &str = "kick:any-routed";
 
 /// A streamer's channel, as much of it as this backend needs.
 #[derive(Debug, Clone)]

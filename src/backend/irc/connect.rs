@@ -52,6 +52,7 @@ pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// the state-setting code below it and the task just vanishes).
 pub fn spawn(state: AppState, config: IrcAccountConfig) {
     let account_id = config.account_id();
+    crate::net::route::router().mark(&account_id, config.use_tor);
     // Guarantee at most one live connection attempt per account. Without
     // this, an old task still mid-graceful-QUIT (or still stuck connecting)
     // stayed alive at the same time this new one starts, racing it as a
@@ -335,22 +336,6 @@ fn act_on_late_sasl(state: &AppState, account_id: &str, sender: &Sender, config:
     }
 }
 
-/// Standard system Tor daemon port - the sensible zero-config default when
-/// `use_tor` is on but no explicit proxy address was given (e.g. Tor
-/// Browser's 9150 instead). Split from `tor_proxy` by `:` if present.
-pub(super) fn proxy_host(config: &IrcAccountConfig) -> &str {
-    config.tor_proxy.as_deref().and_then(|p| p.split(':').next()).filter(|s| !s.is_empty()).unwrap_or("127.0.0.1")
-}
-
-pub(super) fn proxy_port(config: &IrcAccountConfig) -> u16 {
-    config
-        .tor_proxy
-        .as_deref()
-        .and_then(|p| p.rsplit(':').next())
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9050)
-}
-
 /// Everything from DNS resolution through NickServ IDENTIFY being sent -
 /// i.e. the whole "connecting" phase, up to (and including, for the
 /// non-SASL+NickServ case) the point where ConnState flips to Connected.
@@ -387,6 +372,17 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
     let config = &config;
     let port = config.port.unwrap_or(if config.ssl { 6697 } else { 6667 });
 
+    // Through Tor or the configured SOCKS5 proxy when this account asks, or
+    // when everything is routed - moho's own Tor included, by way of its
+    // relay, which is what lets the IRC client's plain SOCKS5 support use it.
+    // Started here and only here, so a direct account never starts Tor.
+    let router = crate::net::route::router();
+    let socks = if router.routed(&account_id) {
+        state.runtime.report_progress(state, &account_id, "Starting Tor or reaching the proxy...");
+        Some(router.ready(|msg| state.runtime.report_progress(state, &account_id, msg)).await?)
+    } else {
+        None
+    };
     let irc_config = Config {
         nickname: Some(config.nick.clone()),
         // A prior ungraceful disconnect (crash, killed process, dropped
@@ -414,9 +410,9 @@ pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Re
         // is nothing for the server to check.
         client_cert_path: config.sasl_cert_path.clone().filter(|p| !p.is_empty()),
         client_cert_pass: config.sasl_cert_pass.clone().filter(|p| !p.is_empty()),
-        proxy_type: config.use_tor.then_some(ProxyType::Socks5),
-        proxy_server: config.use_tor.then(|| proxy_host(config).to_string()),
-        proxy_port: config.use_tor.then(|| proxy_port(config)),
+        proxy_type: socks.is_some().then_some(ProxyType::Socks5),
+        proxy_server: socks.as_ref().map(|(host, _)| host.clone()),
+        proxy_port: socks.as_ref().map(|(_, port)| *port),
         ..Default::default()
     };
 

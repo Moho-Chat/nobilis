@@ -267,6 +267,9 @@ async fn upload_inner(
     if let Some(progress) = progress {
         progress.at(Phase::Preparing, 0, host.id());
     }
+    // Through Tor or the proxy when uploads are routed - started first, so
+    // the upload neither waits on a cold Tor nor fails for want of one.
+    crate::net::route::router().ready_for_general().await?;
     let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {path}"))?;
     if bytes.is_empty() {
         bail!("that file is empty");
@@ -541,13 +544,10 @@ fn ibb_link(status: reqwest::StatusCode, body: &str) -> Result<String> {
 /// all and every attachment sent to IRC failed. The same request over HTTP/2
 /// gets a clean 200 with the link in it. Negotiated by ALPN, so a host that
 /// only speaks 1.1 still works.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)"))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+fn http_client() -> reqwest::Client {
+    let router = crate::net::route::router();
+    router.client_if("upload", router.general_routed(), |builder| {
+        builder.user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"), " (nobilis)"))
     })
 }
 

@@ -219,7 +219,7 @@ pub async fn forward_message(
         reference["guild_id"] = json!(guild_id);
     }
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
             .post(format!("{API_BASE}/channels/{target_channel}/messages"))
             .header("Authorization", token)
             .json(&json!({ "content": "", "message_reference": reference })),
@@ -246,7 +246,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         payload["message_reference"] = reference;
     }
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .json(&payload)
@@ -286,7 +286,7 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
         .text("payload_json", payload.to_string())
         .part("files[0]", reqwest::multipart::Part::bytes(bytes).file_name(file_name));
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .multipart(form)
@@ -357,7 +357,7 @@ pub async fn send_voice_message(
                 .context("audio/ogg is a valid mime type")?,
         );
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
             .post(format!("{API_BASE}/channels/{channel_id}/messages"))
             .header("Authorization", token)
             .multipart(form),
@@ -425,7 +425,7 @@ mod live_probe {
                     .mime_str("audio/ogg")
                     .unwrap(),
             );
-        let resp = super::http_client()
+        let resp = super::http_client_for(&token)
             .post(format!("{}/channels/{channel}/messages", super::API_BASE))
             .header("Authorization", &token)
             .multipart(form)
@@ -468,7 +468,7 @@ mod receive_probe {
         let token = std::env::var("MOHO_DISCORD_TOKEN").expect("MOHO_DISCORD_TOKEN");
         let channel = std::env::var("MOHO_DISCORD_CHANNEL").expect("MOHO_DISCORD_CHANNEL");
 
-        let messages: serde_json::Value = super::http_client()
+        let messages: serde_json::Value = super::http_client_for(&token)
             .get(format!("{}/channels/{channel}/messages?limit=10", super::API_BASE))
             .header("Authorization", &token)
             .send()
@@ -510,7 +510,7 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
         .patch(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
         .json(&json!({ "content": body }))
@@ -540,7 +540,7 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     send_write(
-        http_client()
+        http_client_for(&token)
         .post(format!("{API_BASE}/channels/{channel_id}/typing"))
         .header("Authorization", token)
         .header("Content-Length", "0")
@@ -569,7 +569,7 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
         .header("Authorization", token)
         .json(&json!({ "token": serde_json::Value::Null }))
@@ -590,7 +590,7 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
-        http_client()
+        http_client_for(&token)
         .delete(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
         )
@@ -630,7 +630,7 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
     let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/reactions")).context("building reaction URL")?;
     url.path_segments_mut().map_err(|_| anyhow!("reaction URL cannot be a base"))?.push(reaction_path_segment(emoji)).push("@me");
 
-    let client = http_client();
+    let client = http_client_for(&token);
     let req = if add { client.put(url) } else { client.delete(url) };
     let resp = req.header("Authorization", token).send().await.context("toggling Discord reaction")?;
     if !resp.status().is_success() {

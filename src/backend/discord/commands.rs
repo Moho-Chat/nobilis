@@ -84,7 +84,7 @@ pub async fn list_commands(state: &AppState, account_id: &str, buffer_id: &str, 
     if !query.is_empty() {
         params.push(("query", query.to_string()));
     }
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/application-commands/search"))
         .query(&params)
         .header("Authorization", &cfg.token)
@@ -184,7 +184,7 @@ pub(super) async fn interact(state: &AppState, account_id: &str, buffer_id: &str
     // it belongs to; the conversation somebody just acted in is the answer.
     state.runtime.set_discord_last_interaction(account_id, buffer_id);
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/interactions"))
         .header("Authorization", &cfg.token)
         .json(&payload)
@@ -297,7 +297,7 @@ pub async fn use_component(
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     // Which bot to tell is on the message that carries the control, not on
     // the control itself - so it is read from the message rather than guessed.
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))
         .header("Authorization", &cfg.token)
         .send()
@@ -355,7 +355,7 @@ pub(super) async fn interact_with_message(
         payload["guild_id"] = json!(guild_id);
     }
     let resp = send_write(
-        http_client()
+        http_client_for(&cfg.token)
         .post(format!("{API_BASE}/interactions"))
         .header("Authorization", &cfg.token)
         .json(&payload)

@@ -141,7 +141,16 @@ pub async fn upload_to_postimg_reporting(
         bail!("postimg.cc only accepts images (png/jpg/gif/webp/bmp), not \"{file_name}\"");
     };
 
-    let http = http::HttpClient::new(Transport::Direct, http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
+    // Directly, unless uploads are routed - then through the same SOCKS5
+    // address everything else routed uses.
+    let router = crate::net::route::router();
+    let transport = if router.general_routed() {
+        let (host, port) = router.ready(|_| {}).await?;
+        Transport::Socks { host, port }
+    } else {
+        Transport::Direct
+    };
+    let http = http::HttpClient::new(transport, http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
     let session = postimg_upload_session();
     let bytes = Bytes::from(bytes);
     let fields = [

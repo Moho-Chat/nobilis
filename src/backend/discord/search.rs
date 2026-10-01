@@ -102,7 +102,7 @@ pub async fn search_messages(
         Some(guild) => format!("{API_BASE}/guilds/{guild}/messages/search"),
         None => format!("{API_BASE}/channels/{channel_id}/messages/search"),
     };
-    let resp = http_client()
+    let resp = http_client_for(&cfg.token)
         .get(url)
         .query(&query)
         .header("Authorization", &cfg.token)
