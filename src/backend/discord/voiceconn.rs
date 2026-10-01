@@ -1077,8 +1077,23 @@ async fn clock(
             shared.tracker.heard_from(*ssrc, super::voice::peak_of(pcm));
         }
         if let Some(playback) = playback.as_ref() {
+            // Each person at the volume they were set to, before the mix, and
+            // the whole call at its own after it. The speaking rings above
+            // were fed before either: turning somebody down is not the same
+            // as them going quiet.
+            let prefs = shared.state.voice_prefs.get();
+            let mut voices = voices;
+            if !prefs.user_volumes.is_empty() {
+                let owners = shared.owners.lock().unwrap();
+                for (ssrc, pcm) in voices.iter_mut() {
+                    if let Some(user) = owners.get(ssrc) {
+                        crate::audio::apply_gain(pcm, prefs.user_volume(&user.to_string()));
+                    }
+                }
+            }
             let refs: Vec<&[i16]> = voices.iter().map(|(_, pcm)| pcm.as_slice()).collect();
-            let mixed = super::voice::mix(&refs);
+            let mut mixed = super::voice::mix(&refs);
+            crate::audio::apply_gain(&mut mixed, prefs.output_volume);
             if !mixed.is_empty() {
                 playback.push(&mixed);
             }

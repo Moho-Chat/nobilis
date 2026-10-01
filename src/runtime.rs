@@ -15,12 +15,29 @@ use std::sync::Mutex;
 /// `streaming` is Go Live, a screen or window shared into the channel.
 /// `video` is a camera. They are independent: somebody can do both, and the
 /// two look nothing alike to the person watching.
+/// One voice channel of a guild, as listed for joining.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VoiceChannelEntry {
+    pub id: String,
+    pub name: String,
+    /// 0 is no limit.
+    pub user_limit: u64,
+    /// A stage (type 13): speakers and an audience, rather than a room
+    /// everybody talks in.
+    pub stage: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VoiceFlags {
     pub streaming: bool,
     pub video: bool,
     pub muted: bool,
     pub deafened: bool,
+    /// On a stage: in the audience, which Discord calls suppressed. Off a
+    /// stage nobody is.
+    pub suppressed: bool,
+    /// On a stage: has asked to speak and not yet been answered.
+    pub hand_raised: bool,
 }
 
 impl VoiceFlags {
@@ -34,6 +51,8 @@ impl VoiceFlags {
             // anything is audible, and this says whether anything is audible.
             muted: d["self_mute"].as_bool().unwrap_or(false) || d["mute"].as_bool().unwrap_or(false),
             deafened: d["self_deaf"].as_bool().unwrap_or(false) || d["deaf"].as_bool().unwrap_or(false),
+            suppressed: d["suppress"].as_bool().unwrap_or(false),
+            hand_raised: d["request_to_speak_timestamp"].as_str().is_some(),
         }
     }
 }
@@ -451,6 +470,8 @@ pub struct Runtime {
     /// Whether this account's subscription lets it use emoji away from where
     /// they live - Discord Nitro. Absent means no.
     emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
+    /// A live stage's topic, by (account, stage channel).
+    discord_stage_topics: Mutex<HashMap<(String, String), String>>,
     /// Each Discord account's `premium_type`, as READY gave it.
     discord_premium: Mutex<HashMap<String, u8>>,
     /// Which Kick livestreams each account is claiming to watch, by buffer -
@@ -571,7 +592,7 @@ pub struct Runtime {
     account_status: Mutex<HashMap<String, String>>,
     discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
     /// (account, guild) -> that guild's voice channels, as (id, name, limit).
-    discord_voice_channels: Mutex<HashMap<(String, String), Vec<(String, String, u64)>>>,
+    discord_voice_channels: Mutex<HashMap<(String, String), Vec<VoiceChannelEntry>>>,
     /// (account, user) -> the voice channel they are in. Absent means not in
     /// one; this is the only record of who is where, since Discord reports
     /// voice membership solely over the gateway.
@@ -1000,6 +1021,7 @@ impl Runtime {
             emoji_catalogue: Mutex::new(HashMap::new()),
             emoji_unrestricted: Mutex::new(std::collections::HashSet::new()),
             discord_premium: Mutex::new(HashMap::new()),
+            discord_stage_topics: Mutex::new(HashMap::new()),
             kick_watching: Mutex::new(HashMap::new()),
             matrix_emoticons: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
@@ -1809,12 +1831,27 @@ impl Runtime {
         self.discord_member_list_targets.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned()
     }
 
-    pub fn set_discord_voice_channels(&self, account_id: &str, guild_id: &str, channels: Vec<(String, String, u64)>) {
+    pub fn set_discord_voice_channels(&self, account_id: &str, guild_id: &str, channels: Vec<VoiceChannelEntry>) {
         self.discord_voice_channels.lock().unwrap().insert((account_id.to_string(), guild_id.to_string()), channels);
     }
 
-    pub fn discord_voice_channels(&self, account_id: &str, guild_id: &str) -> Vec<(String, String, u64)> {
+    pub fn discord_voice_channels(&self, account_id: &str, guild_id: &str) -> Vec<VoiceChannelEntry> {
         self.discord_voice_channels.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default()
+    }
+
+    /// What a stage is about right now, while it is live. Gone when the stage
+    /// ends, which is when Discord deletes the stage instance.
+    pub fn set_discord_stage_topic(&self, account_id: &str, channel_id: &str, topic: Option<&str>) {
+        let mut all = self.discord_stage_topics.lock().unwrap();
+        let key = (account_id.to_string(), channel_id.to_string());
+        match topic {
+            Some(t) => all.insert(key, t.to_string()),
+            None => all.remove(&key),
+        };
+    }
+
+    pub fn discord_stage_topic(&self, account_id: &str, channel_id: &str) -> Option<String> {
+        self.discord_stage_topics.lock().unwrap().get(&(account_id.to_string(), channel_id.to_string())).cloned()
     }
 
     /// The same, carrying what they are doing in there.
@@ -2031,7 +2068,7 @@ impl Runtime {
             .lock()
             .unwrap()
             .iter()
-            .find(|((a, _), channels)| a == account_id && channels.iter().any(|(id, _, _)| id == channel_id))
+            .find(|((a, _), channels)| a == account_id && channels.iter().any(|c| c.id == channel_id))
             .map(|((_, g), _)| g.clone())
     }
 
@@ -4731,7 +4768,7 @@ impl Runtime {
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
             matrix_own_reactions, irc_splits, matrix_widgets,
-            matrix_directs,
+            matrix_directs, discord_stage_topics,
         );
         sweep_set!(
             discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,

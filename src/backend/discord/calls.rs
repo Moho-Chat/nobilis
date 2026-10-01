@@ -303,3 +303,44 @@ pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
         .send(json!({ "op": 4, "d": { "guild_id": null, "channel_id": null, "self_mute": true, "self_deaf": true } }).to_string())
         .is_ok()
 }
+
+/// Asks to speak on a stage, or takes the request back.
+///
+/// The hand goes up as a timestamp, which is what orders the queue the
+/// stage's moderators see; down is the same field cleared.
+pub async fn set_stage_hand(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, raised: bool) -> Result<()> {
+    let when = raised.then(|| chrono::Utc::now().to_rfc3339());
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "request_to_speak_timestamp": when })).await
+}
+
+/// Moves this account onto the stage or back into the audience.
+///
+/// Back to the audience is always allowed. Onto the stage is allowed to a
+/// moderator, or to somebody a moderator has invited up; anyone else is
+/// refused by Discord, and the refusal is what the caller shows.
+pub async fn set_stage_speaker(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, speaking: bool) -> Result<()> {
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "suppress": !speaking })).await
+}
+
+async fn patch_own_voice_state(state: &AppState, account_id: &str, guild_id: &str, body: Value) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = send_write(
+        http_client_for(&cfg.token)
+            .patch(format!("{API_BASE}/guilds/{guild_id}/voice-states/@me"))
+            .header("Authorization", &cfg.token)
+            .json(&body),
+    )
+    .await
+    .context("changing your place on the stage")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // 403 is the ordinary answer to stepping up uninvited, and worth
+        // saying in words rather than as a status line.
+        if status == reqwest::StatusCode::FORBIDDEN {
+            bail!("only a stage moderator, or somebody a moderator has invited up, can speak");
+        }
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
+}

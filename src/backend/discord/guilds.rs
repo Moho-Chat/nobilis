@@ -443,19 +443,29 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
     let account_id = config.account_id();
     let mut new_channels: Vec<(String, String)> = Vec::new();
 
-    // Type 2 is a voice channel. Recorded rather than made into a buffer -
-    // there is no conversation to show - so a client can list them and join.
-    let voice: Vec<(String, String, u64)> = channels
+    // Type 2 is a voice channel and 13 a stage, which is joined the same way
+    // and listened to from the audience. Recorded rather than made into
+    // buffers - there is no conversation to show - so a client can list them
+    // and join.
+    let voice: Vec<crate::runtime::VoiceChannelEntry> = channels
         .iter()
-        .filter(|c| c["type"].as_i64() == Some(2))
+        .filter(|c| matches!(c["type"].as_i64(), Some(2) | Some(13)))
         .filter_map(|c| {
-            Some((
-                c["id"].as_str()?.to_string(),
-                c["name"].as_str().unwrap_or("voice").to_string(),
-                c["user_limit"].as_u64().unwrap_or(0),
-            ))
+            Some(crate::runtime::VoiceChannelEntry {
+                id: c["id"].as_str()?.to_string(),
+                name: c["name"].as_str().unwrap_or("voice").to_string(),
+                user_limit: c["user_limit"].as_u64().unwrap_or(0),
+                stage: c["type"].as_i64() == Some(13),
+            })
         })
         .collect();
+    // A stage already live when we connect: its topic is in the guild
+    // payload, and no STAGE_INSTANCE_CREATE will come for it.
+    for stage in guild["stage_instances"].as_array().into_iter().flatten() {
+        if let Some(channel) = stage["channel_id"].as_str() {
+            state.runtime.set_discord_stage_topic(&config.account_id(), channel, stage["topic"].as_str());
+        }
+    }
     if !voice.is_empty() {
         state.runtime.set_discord_voice_channels(&account_id, guild_id, voice);
     }

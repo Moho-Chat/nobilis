@@ -900,6 +900,16 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // at connect, so the cheapest correct answer is to
                     // register it again - which is what the role events
                     // already do for the same reason.
+                    // A stage going live, changing its topic, or ending.
+                    // The channel exists either way; what this says is
+                    // whether anything is on in it.
+                    "STAGE_INSTANCE_CREATE" | "STAGE_INSTANCE_UPDATE" | "STAGE_INSTANCE_DELETE" => {
+                        let Some(channel) = d["channel_id"].as_str() else { continue };
+                        let topic = (t != "STAGE_INSTANCE_DELETE").then(|| d["topic"].as_str().unwrap_or_default());
+                        state.runtime.set_discord_stage_topic(&account_id, channel, topic);
+                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), Some(channel));
+                    }
+
                     "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
                         let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         if guild_context.contains_key(guild_id) {
@@ -1071,6 +1081,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {
+                            // Into a stage's audience or out of it. Held off
+                            // the microphone while in it.
+                            state.voice.set_suppressed(&account_id, channel_id.is_some() && flags.suppressed);
                             // Our own move. The session id here is half of what
                             // a voice connection needs; VOICE_SERVER_UPDATE
                             // carries the other half.

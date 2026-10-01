@@ -2221,8 +2221,8 @@ pub async fn dispatch(
                                 .runtime
                                 .discord_voice_channels(id, g)
                                 .into_iter()
-                                .find(|(c, _, _)| *c == channel_id)
-                                .map(|(_, n, _)| n)
+                                .find(|c| c.id == channel_id)
+                                .map(|c| c.name)
                         })
                         .or_else(|| {
                             state
@@ -2244,6 +2244,11 @@ pub async fn dispatch(
                         // A call with no guild is a one-to-one call, which a
                         // client shows differently.
                         "isDirect": guild_id.is_none(),
+                        // And a stage is listened to, which a client shows
+                        // differently again.
+                        "stage": guild_id.as_deref().is_some_and(|g| {
+                            state.runtime.discord_voice_channels(id, g).iter().any(|c| c.id == channel_id && c.stage)
+                        }),
                     }))
                 })
                 .collect();
@@ -2597,7 +2602,8 @@ pub async fn dispatch(
                 .runtime
                 .discord_voice_channels(account_id, guild_id)
                 .into_iter()
-                .map(|(id, name, limit)| {
+                .map(|channel| {
+                    let crate::runtime::VoiceChannelEntry { id, name, user_limit: limit, stage } = channel;
                     let others = state.runtime.discord_voice_occupants(account_id, &id, &own);
                     // Everyone including us, since a channel list has to show
                     // you your own presence; `empty` deliberately still means
@@ -2612,6 +2618,9 @@ pub async fn dispatch(
                         "id": id,
                         "name": name,
                         "userLimit": limit,
+                        "stage": stage,
+                        // Only while the stage is live.
+                        "topic": if stage { state.runtime.discord_stage_topic(account_id, &id) } else { None },
                         "occupants": others.len(),
                         "empty": others.is_empty(),
                         "members": members
@@ -2636,6 +2645,46 @@ pub async fn dispatch(
                 transmit: params.get("transmit").and_then(|v| v.as_bool()).unwrap_or(false),
             };
             match backend::discord::join_voice(state, account_id, guild_id, channel_id, options) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // How loud a call is: overall, or one person in it. Answered with
+        // the preferences as they now stand, like the device choice.
+        "setVoiceVolume" => {
+            let volume = params.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let volume = volume.clamp(0.0, crate::audio::MAX_VOLUME);
+            let user = p_str_opt(params, "userId").map(str::to_string);
+            let prefs = state.voice_prefs.update(|p| match user {
+                // Back at 100% is forgotten rather than stored, so the file
+                // only lists the people somebody actually changed.
+                Some(user) if (volume - 1.0).abs() < 0.005 => {
+                    p.user_volumes.remove(&user);
+                }
+                Some(user) => {
+                    p.user_volumes.insert(user, volume);
+                }
+                None => p.output_volume = volume,
+            });
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
+        // A stage: asking to speak, and moving between the audience and the
+        // speakers. Both are this account's own voice state in that guild.
+        "setStageHand" | "setStageSpeaker" => {
+            let (account_id, guild_id, channel_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "channelId")) {
+                    (Some(a), Some(g), Some(c)) => (a, g, c),
+                    _ => return (None, Some(format!("{method} requires \"accountId\", \"guildId\" and \"channelId\""))),
+                };
+            let on = p_bool(params, "on", false);
+            let done = if method == "setStageHand" {
+                backend::discord::set_stage_hand(state, account_id, guild_id, channel_id, on).await
+            } else {
+                backend::discord::set_stage_speaker(state, account_id, guild_id, channel_id, on).await
+            };
+            match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -5796,5 +5845,8 @@ fn voice_member_json(m: &crate::runtime::VoiceRosterEntry, own: &str) -> Value {
         "video": m.flags.video,
         "muted": m.flags.muted,
         "deafened": m.flags.deafened,
+        // A stage's audience, and who among it has asked to speak.
+        "suppressed": m.flags.suppressed,
+        "handRaised": m.flags.hand_raised,
     })
 }

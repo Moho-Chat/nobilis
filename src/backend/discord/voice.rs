@@ -99,6 +99,13 @@ pub struct VoiceState {
     /// The microphone and output flags last told to the gateway, which a
     /// camera turned on has to repeat: the gateway takes the three together.
     flags: Mutex<HashMap<String, (bool, bool)>>,
+    /// Accounts in a stage's audience. Their microphone is held shut whatever
+    /// the mute button says: Discord would drop the audio, but the speaking
+    /// ring would still light on everybody's screen.
+    suppressed: Mutex<std::collections::HashSet<String>>,
+    /// The mute button's own state, so leaving the audience restores it
+    /// rather than opening a microphone somebody had closed.
+    mic_wanted_muted: Mutex<HashMap<String, bool>>,
 }
 
 /// Who is audible in one call, and how loudly.
@@ -391,13 +398,32 @@ impl VoiceState {
     /// mute, and a caller that believes it muted something that was never live
     /// would show the wrong thing.
     pub fn set_mic_muted(&self, account_id: &str, muted: bool) -> bool {
+        self.mic_wanted_muted.lock().unwrap().insert(account_id.to_string(), muted);
+        let held = self.suppressed.lock().unwrap().contains(account_id);
         let captures = self.captures.lock().unwrap();
         match captures.get(account_id) {
             Some(capture) => {
-                capture.set_muted(muted);
+                capture.set_muted(muted || held);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Moves this account between a stage's audience and its speakers, as
+    /// far as its own microphone is concerned.
+    pub fn set_suppressed(&self, account_id: &str, suppressed: bool) {
+        let changed = if suppressed {
+            self.suppressed.lock().unwrap().insert(account_id.to_string())
+        } else {
+            self.suppressed.lock().unwrap().remove(account_id)
+        };
+        if !changed {
+            return;
+        }
+        let wanted = self.mic_wanted_muted.lock().unwrap().get(account_id).copied().unwrap_or(false);
+        if let Some(capture) = self.captures.lock().unwrap().get(account_id) {
+            capture.set_muted(wanted || suppressed);
         }
     }
 
@@ -535,7 +561,9 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let mut mic = None;
     if state.voice.options(account_id).transmit {
-        match start_transmitting(prefs.input.as_deref(), prefs.mic_muted || prefs.deafened) {
+        state.voice.mic_wanted_muted.lock().unwrap().insert(account_id.to_string(), prefs.mic_muted || prefs.deafened);
+        let held = state.voice.suppressed.lock().unwrap().contains(account_id);
+        match start_transmitting(prefs.input.as_deref(), prefs.mic_muted || prefs.deafened || held) {
             Ok((capture, source)) => {
                 state.voice.captures.lock().unwrap().insert(account_id.to_string(), capture);
                 mic = Some(source);
@@ -572,6 +600,7 @@ pub fn set_camera(state: &AppState, account_id: &str, on: bool, quality: VideoQu
         state.voice.cameras.lock().unwrap().insert(account_id.to_string(), quality);
     } else {
         state.voice.cameras.lock().unwrap().remove(account_id);
+    state.voice.suppressed.lock().unwrap().remove(account_id);
     }
     conn.set_camera(on, quality);
     let (muted, deafened) = state.voice.flags(account_id);
