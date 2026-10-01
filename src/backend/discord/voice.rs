@@ -105,7 +105,10 @@ pub struct VoiceState {
     suppressed: Mutex<std::collections::HashSet<String>>,
     /// The mute button's own state, so leaving the audience restores it
     /// rather than opening a microphone somebody had closed.
-    mic_wanted_muted: Mutex<HashMap<String, bool>>,    /// Soundboard sounds waiting to be mixed into the call, as 48kHz stereo.
+    mic_wanted_muted: Mutex<HashMap<String, bool>>,    /// The loudest the microphone was after processing, since last asked:
+    /// what is actually sent, which `input_level` - the raw capture - is not.
+    sent_peaks: Mutex<HashMap<String, f32>>,
+    /// Soundboard sounds waiting to be mixed into the call, as 48kHz stereo.
     effects: Mutex<HashMap<String, std::collections::VecDeque<i16>>>,
 }
 
@@ -438,6 +441,17 @@ impl VoiceState {
     pub fn output_level(&self, account_id: &str) -> Option<(f32, u64)> {
         let playbacks = self.playbacks.lock().unwrap();
         playbacks.get(account_id).map(|p| p.take_level())
+    }
+
+    pub fn note_sent_peak(&self, account_id: &str, peak: f32) {
+        let mut all = self.sent_peaks.lock().unwrap();
+        let slot = all.entry(account_id.to_string()).or_insert(0.0);
+        *slot = slot.max(peak);
+    }
+
+    /// The loudest sent since last asked, and reset.
+    pub fn take_sent_peak(&self, account_id: &str) -> f32 {
+        self.sent_peaks.lock().unwrap().insert(account_id.to_string(), 0.0).unwrap_or(0.0)
     }
 
     /// A soundboard sound to play into this account's call. Sounds that

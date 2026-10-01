@@ -1127,6 +1127,7 @@ async fn clock(
             processor.capture(frame);
         }
         let peak = frame.as_ref().map(|f| f.iter().fold(0.0f32, |m, s| m.max(s.abs()))).unwrap_or(0.0);
+        shared.state.voice.note_sent_peak(&shared.account, peak);
         let action = gate.step(peak);
         if let Some(speaking) = action.announce {
             let _ = ws.send(WsMessage::Text(

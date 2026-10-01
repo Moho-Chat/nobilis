@@ -2285,6 +2285,9 @@ pub async fn dispatch(
                     serde_json::json!({
                         "accountId": id,
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
+                        // After echo cancellation and noise suppression: what
+                        // actually goes out, which the raw level above is not.
+                        "sentPeak": state.voice.take_sent_peak(id),
                         "heardPeak": heard,
                         "receivedSamples": received,
                         // Who is audible right now, so a call view can ring
