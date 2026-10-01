@@ -5312,62 +5312,19 @@ pub async fn dispatch(
             let (Some(source), Some(target)) = (state.runtime.get_buffer(from_buffer), state.runtime.get_buffer(to_buffer)) else {
                 return (None, Some("no such conversation".to_string()));
             };
-            // Discord forwards natively; everywhere else a forward is a copy,
-            // and a copy of somebody's words sent as your own is a different
-            // thing - so it is quoted and attributed rather than passed off.
-            if source.account_id.starts_with("discord:") && target.account_id == source.account_id {
-                let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
-                    return (None, Some("account not connected".to_string()));
-                };
-                return match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
-                    Ok(()) => (Some(ok_node()), None),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                };
+            // Only Discord has a forward of its own, and only within one
+            // account. Anywhere else it would be a copy of somebody's words
+            // posted as yours, which is not what forwarding means - so it is
+            // refused rather than imitated.
+            if !(source.account_id.starts_with("discord:") && target.account_id == source.account_id) {
+                return (None, Some("forwarding is only possible between conversations of one Discord account".to_string()));
             }
-            // The copy: what was said, who said it, quoted so it reads as
-            // theirs.
-            let Some(original) = state.store.get_message(from_buffer, message_id).ok().flatten() else {
-                return (None, Some("that message is no longer here to send on".to_string()));
+            let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
+                return (None, Some("account not connected".to_string()));
             };
-            let quoted: String = original
-                .body
-                .lines()
-                .map(|line| format!("> {line}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let body = format!("Forwarded from {}:\n{quoted}", original.from);
-            // Sent the way any other message is, per service. Not by calling
-            // back into this dispatcher: an async function that calls itself
-            // has to be boxed, and one branch of one method is not worth
-            // boxing every call in the daemon.
-            match crate::model::service_of(&target.account_id) {
-                "matrix" => match state.accounts.get_matrix(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(cfg) => match backend::matrix::send_message(state, &target.account_id, to_buffer, &cfg.access_token, &body, None, false, None).await {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
-                },
-                "discord" => match state.accounts.get_discord(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(cfg) => match backend::discord::send_message(state, to_buffer, &cfg.token, &body, None).await {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
-                },
-                "irc" => match state.runtime.irc_sender(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(sender) => match backend::irc::send_message(state, &target.account_id, &sender, &target.name, &body) {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
-                },
-                // Kick and Sneedchat both send a line of text and nothing
-                // else, which is what this is.
-                _ => (
-                    None,
-                    Some("forwarding into this conversation is not supported yet".to_string()),
-                ),
+            match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
