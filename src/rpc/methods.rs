@@ -100,7 +100,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
     match method {
         "addDiscordAccount" | "addDiscordAccountPassword" | "addDiscordAccountToken" | "submitDiscordMfa" => Some("discord"),
         "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
-        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" => Some("matrix"),
+        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
         _ => None,
     }
@@ -3477,6 +3477,28 @@ pub async fn dispatch(
         // with an OAuth provider rather than with itself. Nothing here takes
         // a password, which is the point: the approval happens in a browser
         // the person is already signed in to.
+        // Signing in by QR code: moho shows the code, the person's phone
+        // scans it and approves - see backend/matrix/qrlogin.rs.
+        "addMatrixAccountQr" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("addMatrixAccountQr requires \"homeserverUrl\"".to_string()));
+            };
+            let login_id = format!("matrix-qr-{}", crate::model::next_message_id());
+            backend::matrix::start_qr_login(state.clone(), login_id.clone(), homeserver_url.to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The two digits the phone shows, for a QR sign-in waiting on them.
+        "confirmMatrixQrCode" => {
+            let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), params.get("code").and_then(|v| v.as_u64())) else {
+                return (None, Some("confirmMatrixQrCode requires \"loginId\" and \"code\"".to_string()));
+            };
+            match backend::matrix::confirm_check_code(login_id, code.min(255) as u8) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "addMatrixAccountDeviceCode" => {
             let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
                 return (None, Some("addMatrixAccountDeviceCode requires \"homeserverUrl\"".to_string()));
@@ -3502,6 +3524,9 @@ pub async fn dispatch(
                         "delegated": true,
                         "issuer": m.issuer,
                         "accountManagementUri": m.account_management_uri,
+                        // Whether a QR sign-in can work here: the server says it
+                        // keeps sign-in mailboxes (MSC4108).
+                        "qr": backend::matrix::qrlogin::advertises_qr(&resolved).await,
                     })),
                     None,
                 ),
