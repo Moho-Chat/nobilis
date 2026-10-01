@@ -900,6 +900,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // at connect, so the cheapest correct answer is to
                     // register it again - which is what the role events
                     // already do for the same reason.
+                    // A guild's calendar changing, and people marking
+                    // themselves interested in what is on it.
+                    "GUILD_SCHEDULED_EVENT_CREATE" | "GUILD_SCHEDULED_EVENT_UPDATE" | "GUILD_SCHEDULED_EVENT_DELETE" => {
+                        super::events::note_change(state, &account_id, t, d);
+                    }
+                    "GUILD_SCHEDULED_EVENT_USER_ADD" | "GUILD_SCHEDULED_EVENT_USER_REMOVE" => {
+                        super::events::note_user(state, &account_id, &config.user_id, t == "GUILD_SCHEDULED_EVENT_USER_ADD", d);
+                    }
+
                     // A guild's soundboard: the whole list, asked for or
                     // replaced, and single sounds coming and going.
                     "SOUNDBOARD_SOUNDS" | "GUILD_SOUNDBOARD_SOUNDS_UPDATE" => {

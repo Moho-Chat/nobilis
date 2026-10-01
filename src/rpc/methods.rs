@@ -2673,6 +2673,79 @@ pub async fn dispatch(
             (Some(serde_json::to_value(prefs).unwrap()), None)
         }
 
+        // A guild's scheduled events. The count is cheap and answers whether
+        // the channel list shows an events row at all; the list reads REST,
+        // for how many are interested and whether this account is.
+        "discordEventCount" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("discordEventCount requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            (Some(serde_json::json!({ "count": backend::discord::events::count(account_id, guild_id) })), None)
+        }
+
+        "listDiscordEvents" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("listDiscordEvents requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            match backend::discord::events::list(state, account_id, guild_id).await {
+                Ok(list) => (Some(serde_json::json!(list)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "createDiscordEvent" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("createDiscordEvent requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            let new = backend::discord::events::NewEvent {
+                name: p_str(params, "name", ""),
+                description: p_str(params, "description", ""),
+                start: p_str(params, "start", ""),
+                end: p_str_opt(params, "end"),
+                kind: p_str(params, "kind", "voice"),
+                channel_id: p_str_opt(params, "channelId"),
+                location: p_str_opt(params, "location"),
+            };
+            match backend::discord::events::create(state, account_id, guild_id, &new).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Start an event now, end one that is on, or cancel one to come.
+        "setDiscordEventStatus" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("setDiscordEventStatus requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            let status = match p_str(params, "status", "") {
+                "start" => 2,
+                "end" => 3,
+                "cancel" => 4,
+                other => return (None, Some(format!("no such change to an event: {other:?}"))),
+            };
+            match backend::discord::events::set_status(state, account_id, guild_id, event_id, status).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "setDiscordEventInterest" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("setDiscordEventInterest requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            match backend::discord::events::set_interested(state, account_id, guild_id, event_id, p_bool(params, "on", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The soundboard of the call this account is in: what can be played,
         // and playing one.
         "listSoundboard" => {

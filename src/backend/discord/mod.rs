@@ -71,6 +71,7 @@ pub mod search;
 pub mod send;
 pub mod stickers;
 pub mod soundboard;
+pub mod events;
 
 pub use calls::*;
 pub use commands::*;

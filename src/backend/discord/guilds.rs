@@ -690,6 +690,11 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         }
     }
 
+    // Its calendar: what is scheduled or on now.
+    if guild.get("guild_scheduled_events").is_some() {
+        super::events::note_guild(&account_id, guild_id, &guild["guild_scheduled_events"]);
+    }
+
     // Its stickers. Where each may go is worked out when they are listed,
     // from the conversation's guild.
     super::stickers::note_guild(
