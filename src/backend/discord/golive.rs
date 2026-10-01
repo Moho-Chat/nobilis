@@ -385,6 +385,22 @@ fn sound_wanted(account_id: &str) -> bool {
     sound().lock().unwrap().get(account_id).copied().unwrap_or(true)
 }
 
+/// What the next stream from each account is sent at, as chosen when it was
+/// started.
+fn qualities() -> &'static std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>> {
+    static QUALITY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>>> =
+        std::sync::OnceLock::new();
+    QUALITY.get_or_init(Default::default)
+}
+
+pub fn set_quality(account_id: &str, quality: super::voiceconn::VideoQuality) {
+    qualities().lock().unwrap().insert(account_id.to_string(), quality);
+}
+
+pub fn quality(account_id: &str) -> super::voiceconn::VideoQuality {
+    qualities().lock().unwrap().get(account_id).copied().unwrap_or_default()
+}
+
 /// Puts one encoded frame on the wire.
 ///
 /// The encoding happens in the window - Chromium has the encoders and this
@@ -764,4 +780,38 @@ mod tests {
         assert!(!redacted(&plain).contains("redacted"));
     }
 
+}
+
+/// The best stream an account may send.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamLimit {
+    pub max_height: u32,
+    pub max_framerate: u32,
+    /// Whether the capture's own size may be sent unscaled.
+    pub source: bool,
+}
+
+/// What Discord's own client offers each tier. `premium_type` 0 is none and
+/// 3 is Nitro Basic, neither of which buys a better stream than 720p30; 1 is
+/// Nitro Classic, 1080p60; 2 is Nitro, the source at 60.
+pub fn stream_limit(premium_type: u8) -> StreamLimit {
+    match premium_type {
+        2 => StreamLimit { max_height: 2160, max_framerate: 60, source: true },
+        1 => StreamLimit { max_height: 1080, max_framerate: 60, source: false },
+        _ => StreamLimit { max_height: 720, max_framerate: 30, source: false },
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn an_account_without_nitro_streams_at_720p30() {
+        assert_eq!(stream_limit(0), StreamLimit { max_height: 720, max_framerate: 30, source: false });
+        // Nitro Basic does not include a better stream.
+        assert_eq!(stream_limit(3), stream_limit(0));
+        assert_eq!(stream_limit(1).max_height, 1080);
+        assert!(stream_limit(2).source);
+    }
 }

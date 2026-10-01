@@ -321,7 +321,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // it - `premium_type` 1 is Classic, 2 is Nitro, 3 is
                         // Basic, and all three buy the cross-guild use this
                         // cares about; 0 or absent is none.
-                        let nitro = d["user"]["premium_type"].as_u64().unwrap_or(0) > 0;
+                        let premium = d["user"]["premium_type"].as_u64().unwrap_or(0).min(255) as u8;
+                        // And which tier, because a stream's ceiling differs
+                        // between them where emoji do not.
+                        state.runtime.set_discord_premium(&account_id, premium);
+                        let nitro = premium > 0;
                         state.runtime.set_emoji_unrestricted(&account_id, nitro);
                         // What a later reconnect needs to pick this session
                         // back up rather than starting over.
@@ -896,7 +900,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // at connect, so the cheapest correct answer is to
                     // register it again - which is what the role events
                     // already do for the same reason.
-                    "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" => {
+                    "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
                         let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         if guild_context.contains_key(guild_id) {
                             resync_guild(state, config, guild_id, channel_map).await;

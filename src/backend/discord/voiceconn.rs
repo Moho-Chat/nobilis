@@ -31,7 +31,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU16;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -95,12 +95,133 @@ pub enum Ended {
 /// A running connection. Dropping it does not end it; `stop` does.
 pub struct VoiceConn {
     stop: watch::Sender<bool>,
+    camera: CameraSender,
 }
 
 impl VoiceConn {
     pub fn stop(&self) {
         let _ = self.stop.send(true);
     }
+
+    /// Turns this end's camera on or off, as far as the voice server is
+    /// concerned. The gateway's `self_video` is the other half, and the
+    /// caller's: that is what tells everybody else's client to draw a tile.
+    pub fn set_camera(&self, on: bool, quality: VideoQuality) {
+        let sender = &self.camera;
+        sender.on.store(on, Ordering::Relaxed);
+        let _ = sender.ws.send(WsMessage::Text(announce_camera(sender.audio_ssrc, sender.video_ssrc, on, quality).to_string()));
+    }
+
+    /// Whether a frame handed in now would reach anybody: the camera is on,
+    /// and the group - where there is one - can be encrypted for.
+    pub fn camera_ready(&self) -> bool {
+        self.camera.on.load(Ordering::Relaxed) && group_ready(&self.camera.shared)
+    }
+
+    /// One encoded camera frame, as however many packets it takes.
+    pub async fn send_camera_frame(&self, frame: &[u8], timestamp_micros: i64) -> Result<()> {
+        self.camera.send_frame(frame, timestamp_micros).await
+    }
+}
+
+/// What a picture is sent at - a camera or a stream - which the voice server
+/// passes on to everybody deciding what to ask for.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoQuality {
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub bitrate: u32,
+}
+
+impl Default for VideoQuality {
+    /// Discord's own client sends a camera at 720p30 whatever the account,
+    /// and 720p30 is a stream's ceiling on an account without Nitro.
+    fn default() -> Self {
+        VideoQuality { width: 1280, height: 720, framerate: 30, bitrate: 2_500_000 }
+    }
+}
+
+/// The `op 12` that says a camera is coming, or that it has gone. Turning it
+/// off is the same message with the stream inactive and no video SSRC, which
+/// is what Discord's own client sends - and what makes the far end drop the
+/// tile rather than hold the last frame.
+pub fn announce_camera(audio_ssrc: u32, video_ssrc: u32, on: bool, quality: VideoQuality) -> Value {
+    json!({
+        "op": 12,
+        "d": {
+            "audio_ssrc": audio_ssrc,
+            "video_ssrc": if on { video_ssrc } else { 0 },
+            "rtx_ssrc": if on { video_ssrc.wrapping_add(1) } else { 0 },
+            "streams": [{
+                "type": "video", "rid": "100", "ssrc": video_ssrc, "active": on,
+                "quality": 100, "rtx_ssrc": video_ssrc.wrapping_add(1),
+                "max_bitrate": quality.bitrate, "max_framerate": quality.framerate,
+                "max_resolution": { "type": "fixed", "width": quality.width, "height": quality.height }
+            }],
+        }
+    })
+}
+
+/// The sending half of this end's camera.
+///
+/// On the voice connection itself, not a connection of its own as a stream
+/// is: a camera is part of being in the call, and Discord carries it on the
+/// SSRC the voice server set aside for it in `op 2`.
+struct CameraSender {
+    udp: Arc<UdpSocket>,
+    sealer: Arc<Mutex<Sealer>>,
+    shared: Arc<Shared>,
+    ws: mpsc::UnboundedSender<WsMessage>,
+    audio_ssrc: u32,
+    video_ssrc: u32,
+    sequence: AtomicU32,
+    on: AtomicBool,
+}
+
+impl CameraSender {
+    async fn send_frame(&self, frame: &[u8], timestamp_micros: i64) -> Result<()> {
+        if !self.on.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        // As for a stream: encrypted for the group before it is cut into
+        // packets, and dropped while the group is forming, because a frame
+        // nobody can decrypt is worse than none - the next keyframe is two
+        // seconds away.
+        let frame = if self.shared.dave_version.load(Ordering::Relaxed) == 0 {
+            frame.to_vec()
+        } else {
+            let mut group = self.shared.group.lock().unwrap();
+            match group.session.as_mut() {
+                Some(session) if session.is_ready() => session
+                    .encrypt(davey::MediaType::VIDEO, davey::Codec::VP8, frame)
+                    .map_err(|e| anyhow!("could not encrypt a camera frame: {e:?}"))?
+                    .into_owned(),
+                _ => return Ok(()),
+            }
+        };
+        let needed = rtp::packet_count_vp8(&frame);
+        if needed == 0 {
+            return Ok(());
+        }
+        // Reserved before anything is built, so two frames in flight cannot
+        // interleave their sequence numbers.
+        let first = self.sequence.fetch_add(needed as u32, Ordering::Relaxed) as u16;
+        let timestamp = rtp::timestamp_from_micros(timestamp_micros);
+        for packet in rtp::packetise_vp8(&frame, self.video_ssrc, first, timestamp) {
+            let header = rtp::header(&packet);
+            let sealed = self.sealer.lock().unwrap().seal(&header, &packet.payload)?;
+            self.udp.send(&sealed).await.context("sending a camera packet")?;
+        }
+        Ok(())
+    }
+}
+
+fn group_ready(shared: &Shared) -> bool {
+    if shared.dave_version.load(Ordering::Relaxed) == 0 {
+        return true;
+    }
+    shared.group.lock().unwrap().session.as_ref().is_some_and(|s| s.is_ready())
 }
 
 /// Which close codes mean "do not come back".
@@ -162,6 +283,7 @@ pub async fn connect(
     // loses the names of everybody already in the call.
     let mut early: Vec<WsMessage> = Vec::new();
     let mut ssrc = 0u32;
+    let mut video_ssrc = 0u32;
     let mut address = String::new();
     let mut port = 0u16;
     let mut modes: Vec<String> = Vec::new();
@@ -185,6 +307,15 @@ pub async fn connect(
                         address = d["ip"].as_str().unwrap_or_default().to_string();
                         port = d["port"].as_u64().unwrap_or(0) as u16;
                         modes = d["modes"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect();
+                        // This end's camera SSRC, set aside in the streams
+                        // list rather than beside the audio one.
+                        video_ssrc = d["streams"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .find(|s| s["type"].as_str() == Some("video"))
+                            .and_then(|s| s["ssrc"].as_u64())
+                            .unwrap_or(ssrc.wrapping_add(1) as u64) as u32;
                     }
                     _ => early.push(frame.clone()),
                 }
@@ -294,7 +425,17 @@ pub async fn connect(
     let sealer = Arc::new(Mutex::new(Sealer::new(mode, &key)?));
 
     tokio::spawn(receive(shared.clone(), udp.clone(), sealer.clone(), ssrc, mode, key.clone(), stop_rx.clone()));
-    tokio::spawn(clock(shared.clone(), udp.clone(), sealer, ssrc, media.playback, media.mic, ws_tx.clone(), stop_rx.clone()));
+    tokio::spawn(clock(shared.clone(), udp.clone(), sealer.clone(), ssrc, media.playback, media.mic, ws_tx.clone(), stop_rx.clone()));
+    let camera = CameraSender {
+        udp: udp.clone(),
+        sealer,
+        shared: shared.clone(),
+        ws: ws_tx.clone(),
+        audio_ssrc: ssrc,
+        video_ssrc,
+        sequence: AtomicU32::new(rand::random::<u16>() as u32),
+        on: AtomicBool::new(false),
+    };
     tokio::spawn(async move {
         let ended = socket_loop(shared.clone(), write, read, early, beat_every, ws_rx, stop_rx).await;
         // Whatever cameras were showing are not any more.
@@ -302,7 +443,7 @@ pub async fn connect(
         on_end(ended);
     });
 
-    Ok(Arc::new(VoiceConn { stop: stop_tx }))
+    Ok(Arc::new(VoiceConn { stop: stop_tx, camera }))
 }
 
 fn describe_close(reason: &Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
@@ -1192,6 +1333,21 @@ impl Default for Jitter {
 
 #[cfg(test)]
 mod tests {
+    /// Turning a camera off is the same message with the stream inactive and
+    /// no video SSRC - what makes the far end drop the tile rather than hold
+    /// the last frame.
+    #[test]
+    fn a_camera_is_announced_on_and_off() {
+        let on = announce_camera(10, 11, true, VideoQuality::default());
+        assert_eq!(on["d"]["video_ssrc"], 11);
+        assert_eq!(on["d"]["streams"][0]["active"], true);
+        assert_eq!(on["d"]["streams"][0]["max_resolution"]["height"], 720);
+        let off = announce_camera(10, 11, false, VideoQuality::default());
+        assert_eq!(off["d"]["video_ssrc"], 0);
+        assert_eq!(off["d"]["streams"][0]["active"], false);
+        assert_eq!(off["d"]["audio_ssrc"], 10);
+    }
+
     use super::*;
 
     #[test]

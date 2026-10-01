@@ -548,6 +548,9 @@ pub async fn connect(
     // A viewer sends no media, so it claims no SSRCs. Announcing a video
     // SSRC it will never put a packet on would tell the server to expect a
     // second picture in a conversation that has one.
+    // At whatever the share was started at - the window encodes to the same
+    // numbers, so what the server tells viewers to expect is what arrives.
+    let quality = super::golive::quality(account_id);
     let announce_video = json!({
         "op": 12,
         "d": {
@@ -560,8 +563,8 @@ pub async fn connect(
             "streams": [{
                 "type": "video", "rid": "100", "ssrc": video_ssrc, "active": true,
                 "quality": 100, "rtx_ssrc": video_ssrc.wrapping_add(1),
-                "max_bitrate": 2_500_000, "max_framerate": 30,
-                "max_resolution": { "type": "fixed", "width": 1280, "height": 720 }
+                "max_bitrate": quality.bitrate, "max_framerate": quality.framerate,
+                "max_resolution": { "type": "fixed", "width": quality.width, "height": quality.height }
             }],
         }
     })

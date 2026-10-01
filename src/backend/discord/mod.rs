@@ -69,6 +69,7 @@ pub mod voiceconn;
 pub mod videorx;
 pub mod search;
 pub mod send;
+pub mod stickers;
 
 pub use calls::*;
 pub use commands::*;

@@ -13,7 +13,7 @@
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use serde_json::json;
-use super::voiceconn::{self, Ended, Handshake, Media, VoiceConn};
+use super::voiceconn::{self, VideoQuality, Ended, Handshake, Media, VoiceConn};
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -93,6 +93,12 @@ pub struct VoiceState {
     playbacks: Mutex<HashMap<String, Arc<crate::audio::Playback>>>,
     /// Who is talking right now, per account.
     speaking: Mutex<HashMap<String, Arc<SpeakingTracker>>>,
+    /// Accounts whose camera is on, and at what. Kept past a connection, so
+    /// one that drops and comes back brings the camera back with it.
+    cameras: Mutex<HashMap<String, VideoQuality>>,
+    /// The microphone and output flags last told to the gateway, which a
+    /// camera turned on has to repeat: the gateway takes the three together.
+    flags: Mutex<HashMap<String, (bool, bool)>>,
 }
 
 /// Who is audible in one call, and how loudly.
@@ -407,6 +413,20 @@ impl VoiceState {
         playbacks.get(account_id).map(|p| p.take_level())
     }
 
+    /// Whether this account's camera is on.
+    pub fn camera_on(&self, account_id: &str) -> bool {
+        self.cameras.lock().unwrap().contains_key(account_id)
+    }
+
+    pub fn note_flags(&self, account_id: &str, muted: bool, deafened: bool) {
+        self.flags.lock().unwrap().insert(account_id.to_string(), (muted, deafened));
+    }
+
+    /// The microphone and output flags last announced, or the cautious pair.
+    pub fn flags(&self, account_id: &str) -> (bool, bool) {
+        self.flags.lock().unwrap().get(account_id).copied().unwrap_or((true, true))
+    }
+
     /// Who is talking in this account's call right now, loudest first.
     pub fn speakers(&self, account_id: &str, participants: &[String]) -> Vec<(String, f32)> {
         let speaking = self.speaking.lock().unwrap();
@@ -533,8 +553,41 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
     .await
     .context("opening the voice connection")?;
 
+    // A camera that was on before the connection dropped is on after it.
+    if let Some(quality) = state.voice.cameras.lock().unwrap().get(account_id).copied() {
+        conn.set_camera(true, quality);
+    }
     state.voice.conns.lock().unwrap().insert(account_id.to_string(), conn);
     Ok(())
+}
+
+/// Turns this account's camera on or off in the call it is in.
+///
+/// Two messages to two servers, both needed: the voice server is told a
+/// picture is coming on the camera SSRC, and the gateway is told
+/// `self_video`, which is what puts a tile up on everybody else's screen.
+pub fn set_camera(state: &AppState, account_id: &str, on: bool, quality: VideoQuality) -> Result<()> {
+    let conn = state.voice.conns.lock().unwrap().get(account_id).cloned().context("not in a call")?;
+    if on {
+        state.voice.cameras.lock().unwrap().insert(account_id.to_string(), quality);
+    } else {
+        state.voice.cameras.lock().unwrap().remove(account_id);
+    }
+    conn.set_camera(on, quality);
+    let (muted, deafened) = state.voice.flags(account_id);
+    super::calls::announce_voice_flags(state, account_id, muted, deafened);
+    Ok(())
+}
+
+/// Whether a camera frame handed in now would reach anybody.
+pub fn camera_ready(state: &AppState, account_id: &str) -> bool {
+    state.voice.conns.lock().unwrap().get(account_id).is_some_and(|c| c.camera_ready())
+}
+
+/// One encoded camera frame from the window.
+pub async fn send_camera_frame(state: &AppState, account_id: &str, frame: &[u8], timestamp_micros: i64) -> Result<()> {
+    let conn = state.voice.conns.lock().unwrap().get(account_id).cloned().context("not in a call")?;
+    conn.send_camera_frame(frame, timestamp_micros).await
 }
 
 /// `connection_ended`, boxed with its thread-safety stated.
@@ -599,6 +652,7 @@ fn start_transmitting(device_id: Option<&str>, muted: bool) -> Result<(crate::au
 
 pub async fn disconnect(state: &AppState, account_id: &str) {
     let conn = state.voice.conns.lock().unwrap().remove(account_id);
+    state.voice.cameras.lock().unwrap().remove(account_id);
     state.voice.captures.lock().unwrap().remove(account_id);
     state.voice.playbacks.lock().unwrap().remove(account_id);
     state.voice.retries.lock().unwrap().remove(account_id);

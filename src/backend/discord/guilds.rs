@@ -680,6 +680,17 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         }
     }
 
+    // Its stickers. Where each may go is worked out when they are listed,
+    // from the conversation's guild.
+    super::stickers::note_guild(
+        &account_id,
+        guild_id,
+        super::stickers::GuildStickers {
+            guild_name: guild_name.clone(),
+            stickers: super::stickers::read_stickers(guild),
+        },
+    );
+
     spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_channels);
     visible
 }

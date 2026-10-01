@@ -451,6 +451,8 @@ pub struct Runtime {
     /// Whether this account's subscription lets it use emoji away from where
     /// they live - Discord Nitro. Absent means no.
     emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
+    /// Each Discord account's `premium_type`, as READY gave it.
+    discord_premium: Mutex<HashMap<String, u8>>,
     /// Which Kick livestreams each account is claiming to watch, by buffer -
     /// see backend/kick/watch.rs.
     kick_watching: Mutex<HashMap<String, crate::backend::kick::watch::Watching>>,
@@ -997,6 +999,7 @@ impl Runtime {
             discord_buffer_emojis: Mutex::new(HashMap::new()),
             emoji_catalogue: Mutex::new(HashMap::new()),
             emoji_unrestricted: Mutex::new(std::collections::HashSet::new()),
+            discord_premium: Mutex::new(HashMap::new()),
             kick_watching: Mutex::new(HashMap::new()),
             matrix_emoticons: Mutex::new(HashMap::new()),
             discord_friends: Mutex::new(HashMap::new()),
@@ -1734,6 +1737,15 @@ impl Runtime {
         } else {
             all.remove(account_id);
         }
+    }
+
+    pub fn set_discord_premium(&self, account_id: &str, premium_type: u8) {
+        self.discord_premium.lock().unwrap().insert(account_id.to_string(), premium_type);
+    }
+
+    /// The account's Nitro tier, or none where READY has not said.
+    pub fn discord_premium(&self, account_id: &str) -> u8 {
+        self.discord_premium.lock().unwrap().get(account_id).copied().unwrap_or(0)
     }
 
     pub fn emoji_unrestricted(&self, account_id: &str) -> bool {
@@ -4706,6 +4718,7 @@ impl Runtime {
             matrix_verifications, matrix_ignored, matrix_verification_peers,
             matrix_push_rules, irc_away, kick_pins,
             matrix_server_facts, irc_isupport, sneedchat_rooms,
+            discord_premium,
         );
         // Keyed by (account, something) or (buffer, something): the first
         // element carries the account either way.

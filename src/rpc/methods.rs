@@ -4622,6 +4622,21 @@ pub async fn dispatch(
                 // window says otherwise.
                 let sound = params.get("audio").and_then(|v| v.as_bool()).unwrap_or(true);
                 backend::discord::golive::set_sound(&account_id, sound);
+                // The size, rate and bitrate the window will encode at, so the
+                // server tells viewers the truth. Clamped to what this
+                // account's tier allows, which is what Discord itself enforces
+                // in its own client.
+                let limit = backend::discord::golive::stream_limit(state.runtime.discord_premium(&account_id));
+                let default = backend::discord::voiceconn::VideoQuality::default();
+                backend::discord::golive::set_quality(
+                    &account_id,
+                    backend::discord::voiceconn::VideoQuality {
+                        width: p_i64(params, "width", default.width as i64).clamp(16, 3840) as u32,
+                        height: (p_i64(params, "height", default.height as i64) as u32).clamp(16, limit.max_height),
+                        framerate: (p_i64(params, "framerate", default.framerate as i64) as u32).clamp(1, limit.max_framerate),
+                        bitrate: p_i64(params, "bitrate", default.bitrate as i64).clamp(100_000, 10_000_000) as u32,
+                    },
+                );
                 backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
             } else {
                 backend::discord::golive::close(&account_id);
@@ -4706,10 +4721,59 @@ pub async fn dispatch(
             let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(frame) else {
                 return (None, Some("that frame is not base64".to_string()));
             };
-            match backend::discord::golive::send_frame(account_id, &bytes, timestamp).await {
+            // A camera goes on the voice connection, a screen on the stream's
+            // own; the encoder in the window is the same for both.
+            let sent = if p_str(params, "kind", "screen") == "camera" {
+                backend::discord::voice::send_camera_frame(state, account_id, &bytes, timestamp).await
+            } else {
+                backend::discord::golive::send_frame(account_id, &bytes, timestamp).await
+            };
+            match sent {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // This end's camera in a Discord call, on or off. The picture itself
+        // follows as `sendDiscordVideoFrame` with `kind: "camera"`.
+        "setDiscordCamera" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setDiscordCamera requires \"accountId\"".to_string()));
+            };
+            let on = p_bool(params, "on", false);
+            let default = backend::discord::voiceconn::VideoQuality::default();
+            let quality = backend::discord::voiceconn::VideoQuality {
+                width: p_i64(params, "width", default.width as i64).clamp(16, 3840) as u32,
+                height: p_i64(params, "height", default.height as i64).clamp(16, 2160) as u32,
+                framerate: p_i64(params, "framerate", default.framerate as i64).clamp(1, 60) as u32,
+                bitrate: p_i64(params, "bitrate", default.bitrate as i64).clamp(100_000, 10_000_000) as u32,
+            };
+            match backend::discord::voice::set_camera(state, account_id, on, quality) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Whether a camera frame sent now would reach anybody - the group
+        // has formed - so the window opens the camera only once it would.
+        "discordCameraReady" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordCameraReady requires \"accountId\"".to_string()));
+            };
+            (Some(serde_json::json!({ "ready": backend::discord::voice::camera_ready(state, account_id) })), None)
+        }
+
+        // How good a stream this account may send. Discord ties it to the
+        // account's tier, and its own client offers nothing above that.
+        "discordStreamLimits" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordStreamLimits requires \"accountId\"".to_string()));
+            };
+            let limit = backend::discord::golive::stream_limit(state.runtime.discord_premium(account_id));
+            (
+                Some(serde_json::json!({ "maxHeight": limit.max_height, "maxFramerate": limit.max_framerate, "source": limit.source })),
+                None,
+            )
         }
 
         // Whether the stream connection is up and wants frames. The window
@@ -5108,6 +5172,35 @@ pub async fn dispatch(
                 }));
             }
             (Some(serde_json::json!(out)), None)
+        }
+
+        // A Discord account's stickers: every guild's, each marked with
+        // whether it can go in this conversation.
+        "listDiscordStickers" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listDiscordStickers requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id))), None)
+        }
+
+        "sendDiscordSticker" => {
+            let (buffer_id, sticker_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "stickerId")) {
+                (Some(b), Some(s)) => (b, s),
+                _ => return (None, Some("sendDiscordSticker requires \"bufferId\" and \"stickerId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
+                return (None, Some("account not connected".to_string()));
+            };
+            match backend::discord::stickers::send(state, buffer_id, &cfg.token, sticker_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         "sendMatrixSticker" => {

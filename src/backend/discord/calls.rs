@@ -92,6 +92,7 @@ pub fn join_voice(
     // Recorded before the join, since the handshake it triggers can complete
     // before this function returns.
     state.voice.set_options(account_id, options);
+    state.voice.note_flags(account_id, !options.transmit, !options.transmit);
 
     sender.send(
         json!({
@@ -261,6 +262,7 @@ pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) 
 /// microphone without saying so leaves everyone else looking at a live
 /// microphone icon wondering why you have gone quiet.
 pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, deafened: bool) -> bool {
+    state.voice.note_flags(account_id, muted, deafened);
     let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
     let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else { return false };
     sender
@@ -273,7 +275,9 @@ pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, dea
                     "channel_id": channel_id,
                     "self_mute": muted,
                     "self_deaf": deafened,
-                    "self_video": false
+                    // Repeated with every change: the gateway takes the
+                    // three together, and leaving it out turns a camera off.
+                    "self_video": state.voice.camera_on(account_id)
                 }
             })
             .to_string(),
