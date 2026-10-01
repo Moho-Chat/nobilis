@@ -150,6 +150,11 @@ pub fn message_link(channel_id: &str, guild_id: Option<&str>, message_id: &str) 
 /// `attachments[0]` was ever read, silently dropping additional files).
 /// Returns None only when there is truly nothing renderable at all.
 pub(super) fn extract_body(d: &Value) -> Option<String> {
+    // An AutoMod verdict, which is its own kind of line rather than the
+    // person's words: see automod_alert.
+    if let Some(alert) = automod_alert(d) {
+        return Some(alert);
+    }
     let mut parts: Vec<String> = Vec::new();
     let content = d["content"].as_str().unwrap_or("");
     if !content.is_empty() {
@@ -1210,5 +1215,113 @@ mod attachment_tests {
     #[test]
     fn leaves_a_plain_unicode_emoji_unchanged() {
         assert_eq!(reaction_path_segment("🔥"), "🔥");
+    }
+}
+
+/// An AutoMod verdict, as the line a moderator reads.
+///
+/// AutoMod tells a server's moderators by posting into its alert channel: a
+/// message of type 24 whose author is the person caught, whose content is
+/// what they wrote, and whose one embed - of type `auto_moderation_message`,
+/// with no title or text of its own - carries the decision as named fields:
+/// which rule, what it matched, where, and whether the message was blocked or
+/// only flagged. Read as an ordinary message it looked like that person had
+/// posted their own words in the alert channel, and the decision was nowhere.
+///
+/// So it is said outright: what AutoMod did and where, the rule and what it
+/// matched, any timeout, and the message itself quoted underneath.
+pub(super) fn automod_alert(d: &Value) -> Option<String> {
+    if d["type"].as_i64() != Some(24) {
+        return None;
+    }
+    let embed = d["embeds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["type"].as_str() == Some("auto_moderation_message"));
+    let field = |name: &str| -> Option<String> {
+        embed?["fields"]
+            .as_array()?
+            .iter()
+            .find(|f| f["name"].as_str() == Some(name))
+            .and_then(|f| f["value"].as_str())
+            .map(str::to_string)
+            .filter(|v| !v.is_empty())
+    };
+    // Blocked unless it says otherwise: blocking is the action every rule
+    // has, and the alert is the only record that it happened.
+    let verb = match field("decision_outcome").as_deref() {
+        Some("flagged") => "flagged",
+        _ => "blocked",
+    };
+    let mut line = format!("AutoMod {verb} a message");
+    if let Some(channel) = field("channel_id") {
+        line.push_str(&format!(" in <#{channel}>"));
+    }
+    let mut why: Vec<String> = Vec::new();
+    if let Some(rule) = field("rule_name") {
+        why.push(format!("rule \"{rule}\""));
+    }
+    if let Some(matched) = field("keyword_matched_content").or_else(|| field("keyword")) {
+        why.push(format!("matched \"{matched}\""));
+    }
+    if !why.is_empty() {
+        line.push_str(&format!(" - {}", why.join(", ")));
+    }
+    if let Some(secs) = field("timeout_duration").and_then(|t| t.parse::<u64>().ok()).filter(|s| *s > 0) {
+        line.push_str(&format!(", and timed them out for {}", super::send::describe_seconds(secs)));
+    }
+    let content = d["content"].as_str().unwrap_or_default();
+    if !content.is_empty() {
+        let quoted: Vec<String> = content.lines().map(|l| format!("> {l}")).collect();
+        line.push('\n');
+        line.push_str(&quoted.join("\n"));
+    }
+    Some(line)
+}
+
+#[cfg(test)]
+mod automod_tests {
+    use super::{automod_alert, extract_body};
+    use serde_json::json;
+
+    fn alert(fields: serde_json::Value, content: &str) -> serde_json::Value {
+        json!({ "type": 24, "content": content, "embeds": [{ "type": "auto_moderation_message", "fields": fields }] })
+    }
+
+    #[test]
+    fn a_blocked_message_says_where_why_and_what() {
+        let d = alert(
+            json!([
+                { "name": "rule_name", "value": "No slurs" },
+                { "name": "channel_id", "value": "42" },
+                { "name": "keyword", "value": "bad*" },
+                { "name": "keyword_matched_content", "value": "badword" },
+                { "name": "decision_outcome", "value": "blocked" }
+            ]),
+            "this has a badword in it",
+        );
+        assert_eq!(
+            extract_body(&d).unwrap(),
+            "AutoMod blocked a message in <#42> - rule \"No slurs\", matched \"badword\"\n> this has a badword in it"
+        );
+    }
+
+    #[test]
+    fn a_flag_and_a_timeout_are_said() {
+        let d = alert(
+            json!([
+                { "name": "rule_name", "value": "Spam" },
+                { "name": "decision_outcome", "value": "flagged" },
+                { "name": "timeout_duration", "value": "600" }
+            ]),
+            "",
+        );
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod flagged a message - rule \"Spam\", and timed them out for 10 minutes");
+    }
+
+    #[test]
+    fn an_ordinary_message_is_not_an_alert() {
+        assert!(automod_alert(&json!({ "type": 0, "content": "hi" })).is_none());
     }
 }

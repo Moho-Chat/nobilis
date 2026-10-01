@@ -256,7 +256,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -296,7 +296,7 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -367,7 +367,7 @@ pub async fn send_voice_message(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -520,7 +520,7 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -579,7 +579,7 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -599,7 +599,7 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", refusal_text(status, &text));
     }
     Ok(())
 }
@@ -643,4 +643,53 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
         bail!("{}", discord_error_text(status, &text, "reacting"));
     }
     Ok(())
+}
+
+/// What a refused write says, with AutoMod's refusal put in words: the
+/// message was not sent because a rule in this server stopped it, which is a
+/// different thing to do something about than a network error.
+fn refusal_text(status: reqwest::StatusCode, text: &str) -> String {
+    let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    match parsed["code"].as_u64() {
+        // 200000 a message, 200001 a forum post's title.
+        Some(200_000) | Some(200_001) => {
+            let what = if parsed["code"].as_u64() == Some(200_001) { "title" } else { "message" };
+            let said = parsed["message"].as_str().filter(|m| !m.is_empty() && !m.contains("blocked by AutoMod"));
+            match said {
+                Some(reason) => format!("AutoMod in this server blocked the {what}: {reason}"),
+                None => format!("AutoMod in this server blocked the {what}"),
+            }
+        }
+        _ => format!("Discord API error {status}: {text}"),
+    }
+}
+
+/// A duration as a person says it: "10 minutes", "1 hour", "45 seconds".
+pub(super) fn describe_seconds(secs: u64) -> String {
+    let (n, unit) = if secs % 86_400 == 0 {
+        (secs / 86_400, "day")
+    } else if secs % 3600 == 0 {
+        (secs / 3600, "hour")
+    } else if secs % 60 == 0 {
+        (secs / 60, "minute")
+    } else {
+        (secs, "second")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn an_automod_block_is_said_as_one() {
+        let body = r#"{"message": "Message was blocked by AutoMod", "code": 200000}"#;
+        assert_eq!(refusal_text(reqwest::StatusCode::BAD_REQUEST, body), "AutoMod in this server blocked the message");
+        let other = r#"{"message": "Missing Permissions", "code": 50013}"#;
+        assert!(refusal_text(reqwest::StatusCode::FORBIDDEN, other).starts_with("Discord API error 403"));
+        assert_eq!(describe_seconds(600), "10 minutes");
+        assert_eq!(describe_seconds(3600), "1 hour");
+        assert_eq!(describe_seconds(45), "45 seconds");
+    }
 }
