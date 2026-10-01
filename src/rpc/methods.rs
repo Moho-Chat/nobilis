@@ -2734,6 +2734,28 @@ pub async fn dispatch(
             }
         }
 
+        // Sharing an event: the invite link to copy, and the friends to
+        // send it to.
+        "discordEventInvite" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("discordEventInvite requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            match backend::discord::events::invite_link(state, account_id, guild_id, event_id).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "discordEventShareTargets" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("discordEventShareTargets requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            (Some(serde_json::json!(backend::discord::events::share_targets(state, account_id, guild_id).await)), None)
+        }
+
         "setDiscordEventInterest" => {
             let (account_id, guild_id, event_id) =
                 match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {

@@ -275,6 +275,97 @@ pub async fn set_interested(state: &AppState, account_id: &str, guild_id: &str, 
     refused_says(resp, "mark interest in this event").await
 }
 
+/// How long an event invite lasts: seven days, as Discord's own share makes.
+const INVITE_SECONDS: i64 = 7 * 24 * 3600;
+
+/// A link that brings somebody into the guild and onto the event:
+/// `discord.gg/<code>?event=<id>`, the shape Discord's own share copies.
+///
+/// The invite is made on the event's own channel where it has one, so a
+/// newcomer lands where it happens; an event somewhere else lands them in the
+/// guild's first text channel.
+pub async fn invite_link(state: &AppState, account_id: &str, guild_id: &str, event_id: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let event = known()
+        .lock()
+        .unwrap()
+        .get(&(account_id.to_string(), guild_id.to_string()))
+        .and_then(|l| l.iter().find(|e| e["id"].as_str() == Some(event_id)).cloned())
+        .context("that event is not on this guild's list")?;
+    let channel_id = match event["channel_id"].as_str() {
+        Some(c) => c.to_string(),
+        None => state
+            .runtime
+            .list_buffers()
+            .into_iter()
+            .filter(|b| b.account_id == account_id && b.kind == "channel")
+            .filter(|b| state.runtime.get_discord_guild(&b.id).as_deref() == Some(guild_id))
+            .find_map(|b| state.runtime.get_discord_channel(&b.id))
+            .context("this guild has no channel to invite into")?,
+    };
+    let resp = send_write(
+        http_client_for(&cfg.token)
+            .post(format!("{API_BASE}/channels/{channel_id}/invites"))
+            .header("Authorization", &cfg.token)
+            .json(&json!({ "max_age": INVITE_SECONDS, "max_uses": 0, "temporary": false })),
+    )
+    .await
+    .context("making an invite")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        if status == reqwest::StatusCode::FORBIDDEN {
+            bail!("this account is not allowed to make invites here");
+        }
+        let text = resp.text().await.unwrap_or_default();
+        bail!("Discord API error {status}: {text}");
+    }
+    let answer: Value = resp.json().await.context("reading the invite back")?;
+    let code = answer["code"].as_str().context("Discord made an invite with no code in it")?;
+    Ok(json!({
+        "link": format!("https://discord.gg/{code}?event={event_id}"),
+        "expiresDays": INVITE_SECONDS / 86_400,
+    }))
+}
+
+/// Who the share dialog offers: this account's friends, split as Discord
+/// splits them - those already in the guild, who are invited to the event,
+/// and those who are not, who are invited to the guild with it.
+///
+/// Membership from what this client has seen of the guild's members, and
+/// where it has not seen a friend, from the friend's profile - which lists
+/// the guilds the two have in common.
+pub async fn share_targets(state: &AppState, account_id: &str, guild_id: &str) -> Vec<Value> {
+    let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+    let friends: Vec<Value> = state
+        .runtime
+        .get_discord_friends(account_id)
+        .into_iter()
+        .filter(|f| f["kind"].as_str().unwrap_or("friend") == "friend")
+        .collect();
+    let mut out = Vec::new();
+    for f in friends {
+        let Some(user_id) = f["userId"].as_str() else { continue };
+        let mut in_server = state.runtime.discord_member(guild_id, user_id).is_some();
+        if !in_server {
+            if let Ok(resp) = http_client_for(&token)
+                .get(format!("{API_BASE}/users/{user_id}/profile"))
+                .query(&[("with_mutual_guilds", "true")])
+                .header("Authorization", &token)
+                .send()
+                .await
+            {
+                if let Ok(profile) = resp.json::<Value>().await {
+                    in_server = profile["mutual_guilds"].as_array().into_iter().flatten().any(|g| g["id"].as_str() == Some(guild_id));
+                }
+            }
+        }
+        let mut row = f.clone();
+        row["inServer"] = json!(in_server);
+        out.push(row);
+    }
+    out
+}
+
 async fn refused_says(resp: reqwest::Response, what: &str) -> Result<()> {
     if resp.status().is_success() {
         return Ok(());
