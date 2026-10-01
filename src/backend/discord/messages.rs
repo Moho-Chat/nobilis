@@ -1234,6 +1234,17 @@ pub(super) fn automod_alert(d: &Value) -> Option<String> {
     if d["type"].as_i64() != Some(24) {
         return None;
     }
+    // AutoMod's own news about itself, from Discord's system "automod"
+    // user: alerts switched on, a raid suspected. A different embed, with a
+    // notification type instead of a verdict.
+    if let Some(note) = d["embeds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["type"].as_str() == Some("auto_moderation_notification"))
+    {
+        return Some(automod_notification(note));
+    }
     let embed = d["embeds"]
         .as_array()
         .into_iter()
@@ -1271,13 +1282,33 @@ pub(super) fn automod_alert(d: &Value) -> Option<String> {
     if let Some(secs) = field("timeout_duration").and_then(|t| t.parse::<u64>().ok()).filter(|s| *s > 0) {
         line.push_str(&format!(", and timed them out for {}", super::send::describe_seconds(secs)));
     }
-    let content = d["content"].as_str().unwrap_or_default();
+    // What they wrote. In the embed's description, as Discord sends it; the
+    // message's own content is empty.
+    let content = d["content"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .or_else(|| embed.and_then(|e| e["description"].as_str()))
+        .unwrap_or_default();
     if !content.is_empty() {
         let quoted: Vec<String> = content.lines().map(|l| format!("> {l}")).collect();
         line.push('\n');
         line.push_str(&quoted.join("\n"));
     }
     Some(line)
+}
+
+/// AutoMod saying something about itself rather than about a message.
+fn automod_notification(embed: &Value) -> String {
+    let field = |name: &str| -> Option<&str> {
+        embed["fields"].as_array()?.iter().find(|f| f["name"].as_str() == Some(name))?["value"].as_str()
+    };
+    let by = field("action_by_user_id").map(|u| format!(" by <@{u}>")).unwrap_or_default();
+    match field("notification_type") {
+        Some("activity_alerts_enabled") => format!("AutoMod activity alerts were turned on{by}"),
+        Some("raid") | Some("mention_raid") => "AutoMod suspects a raid on this server".to_string(),
+        Some(other) => format!("AutoMod: {}{by}", other.replace('_', " ")),
+        None => "AutoMod posted a notice".to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1318,6 +1349,36 @@ mod automod_tests {
             "",
         );
         assert_eq!(automod_alert(&d).unwrap(), "AutoMod flagged a message - rule \"Spam\", and timed them out for 10 minutes");
+    }
+
+    /// As Discord actually sends it: the content empty, the blocked text in
+    /// the embed's description. Read off a real alert.
+    #[test]
+    fn the_blocked_text_is_read_from_the_embed() {
+        let d = json!({ "type": 24, "content": "", "embeds": [{
+            "type": "auto_moderation_message",
+            "description": "second automod test with moho",
+            "fields": [
+                { "name": "rule_name", "value": "Block Custom Words" },
+                { "name": "channel_id", "value": "1426929170935709916" },
+                { "name": "keyword", "value": "moho" },
+                { "name": "keyword_matched_content", "value": "moho" },
+                { "name": "decision_outcome", "value": "blocked" }
+            ]
+        }]});
+        assert_eq!(
+            automod_alert(&d).unwrap(),
+            "AutoMod blocked a message in <#1426929170935709916> - rule \"Block Custom Words\", matched \"moho\"\n> second automod test with moho"
+        );
+    }
+
+    #[test]
+    fn alerts_switched_on_is_said() {
+        let d = json!({ "type": 24, "content": "", "embeds": [{
+            "type": "auto_moderation_notification",
+            "fields": [{ "name": "notification_type", "value": "activity_alerts_enabled" }, { "name": "action_by_user_id", "value": "1677" }]
+        }]});
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod activity alerts were turned on by <@1677>");
     }
 
     #[test]
