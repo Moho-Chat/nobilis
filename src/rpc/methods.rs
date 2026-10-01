@@ -2670,6 +2670,47 @@ pub async fn dispatch(
             (Some(serde_json::to_value(prefs).unwrap()), None)
         }
 
+        // The soundboard of the call this account is in: what can be played,
+        // and playing one.
+        "listSoundboard" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("listSoundboard requires \"accountId\"".to_string()));
+            };
+            let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+            let guild = state.voice.current_channel(account_id).and_then(|(g, _)| g);
+            (Some(serde_json::json!(backend::discord::soundboard::list(state, account_id, guild.as_deref(), &token).await)), None)
+        }
+
+        "playSoundboard" => {
+            let (account_id, sound_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "soundId")) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return (None, Some("playSoundboard requires \"accountId\" and \"soundId\"".to_string())),
+            };
+            let Some((_, channel)) = state.voice.current_channel(account_id) else {
+                return (None, Some("not in a call".to_string()));
+            };
+            match backend::discord::soundboard::play(state, account_id, &channel, sound_id, p_str_opt(params, "guildId")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Echo cancellation and noise suppression on a call's microphone.
+        // Either or both; a call in progress follows within 20ms.
+        "setVoiceProcessing" => {
+            let echo = params.get("echoCancellation").and_then(|v| v.as_bool());
+            let noise = params.get("noiseSuppression").and_then(|v| v.as_bool());
+            let prefs = state.voice_prefs.update(|p| {
+                if let Some(e) = echo {
+                    p.echo_cancellation = e;
+                }
+                if let Some(n) = noise {
+                    p.noise_suppression = n;
+                }
+            });
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
         // A stage: asking to speak, and moving between the audience and the
         // speakers. Both are this account's own voice state in that guild.
         "setStageHand" | "setStageSpeaker" => {

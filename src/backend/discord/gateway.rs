@@ -900,6 +900,23 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // at connect, so the cheapest correct answer is to
                     // register it again - which is what the role events
                     // already do for the same reason.
+                    // A guild's soundboard: the whole list, asked for or
+                    // replaced, and single sounds coming and going.
+                    "SOUNDBOARD_SOUNDS" | "GUILD_SOUNDBOARD_SOUNDS_UPDATE" => {
+                        if let Some(guild) = d["guild_id"].as_str() {
+                            super::soundboard::note_guild_sounds(&account_id, guild, &d["soundboard_sounds"]);
+                        }
+                    }
+                    "GUILD_SOUNDBOARD_SOUND_CREATE" | "GUILD_SOUNDBOARD_SOUND_UPDATE" | "GUILD_SOUNDBOARD_SOUND_DELETE" => {
+                        super::soundboard::note_sound_change(&account_id, t, d);
+                    }
+                    // Somebody set a soundboard sound off in a voice channel.
+                    // Each client plays it itself; this is how it is told to.
+                    "VOICE_CHANNEL_EFFECT_SEND" => {
+                        let (s, a, d) = (state.clone(), account_id.clone(), d.clone());
+                        tokio::spawn(async move { super::soundboard::heard(&s, &a, &d).await });
+                    }
+
                     // A stage going live, changing its topic, or ending.
                     // The channel exists either way; what this says is
                     // whether anything is on in it.
@@ -1084,6 +1101,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             // Into a stage's audience or out of it. Held off
                             // the microphone while in it.
                             state.voice.set_suppressed(&account_id, channel_id.is_some() && flags.suppressed);
+                            // Into a guild's voice channel: its own soundboard
+                            // is asked for, so the board can offer it.
+                            if let (Some(guild), Some(_)) = (d["guild_id"].as_str(), channel_id) {
+                                super::soundboard::request(state, &account_id, &[guild.to_string()]);
+                            }
                             // Our own move. The session id here is half of what
                             // a voice connection needs; VOICE_SERVER_UPDATE
                             // carries the other half.

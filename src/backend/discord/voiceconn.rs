@@ -1057,6 +1057,8 @@ async fn clock(
         let _ = encoder.set_bitrate(opus2::Bitrate::Bits(64_000));
     }
     let mut gate = Gate::default();
+    let prefs = shared.state.voice_prefs.get();
+    let mut processor = crate::apm::CallProcessor::new(prefs.echo_cancellation, prefs.noise_suppression);
     let mut sequence: u16 = rand::random();
     let mut timestamp: u32 = rand::random();
     let mut next_keepalive = Instant::now();
@@ -1076,12 +1078,16 @@ async fn clock(
         for (ssrc, pcm) in &voices {
             shared.tracker.heard_from(*ssrc, super::voice::peak_of(pcm));
         }
+        let prefs = shared.state.voice_prefs.get();
+        processor.set(prefs.echo_cancellation, prefs.noise_suppression);
+        // What the speakers play this tick, which is what the echo canceller
+        // listens for in the microphone - silence when nothing is.
+        let mut played: Vec<i16> = Vec::new();
         if let Some(playback) = playback.as_ref() {
             // Each person at the volume they were set to, before the mix, and
             // the whole call at its own after it. The speaking rings above
             // were fed before either: turning somebody down is not the same
             // as them going quiet.
-            let prefs = shared.state.voice_prefs.get();
             let mut voices = voices;
             if !prefs.user_volumes.is_empty() {
                 let owners = shared.owners.lock().unwrap();
@@ -1091,21 +1097,35 @@ async fn clock(
                     }
                 }
             }
+            // A soundboard sound is one more voice in the mix, at the call's
+            // volume like everybody else.
+            if let Some(effect) = shared.state.voice.take_effect(&shared.account, FRAME_SAMPLES) {
+                voices.push((0, effect));
+            }
             let refs: Vec<&[i16]> = voices.iter().map(|(_, pcm)| pcm.as_slice()).collect();
             let mut mixed = super::voice::mix(&refs);
             crate::audio::apply_gain(&mut mixed, prefs.output_volume);
             if !mixed.is_empty() {
                 playback.push(&mixed);
+                if !crate::audio::playback_muted() {
+                    played = mixed;
+                }
             }
         }
+        played.resize(FRAME_SAMPLES, 0);
+        processor.render(&played);
         // Decoders for people who have gone quiet for good.
         if last_sweep.elapsed() > Duration::from_secs(30) {
             last_sweep = Instant::now();
             shared.speakers.lock().unwrap().retain(|_, jitter| jitter.last_arrival.elapsed() < Duration::from_secs(60));
         }
 
-        // Us.
-        let frame = mic.as_ref().and_then(|mic| mic.take(FRAME_SAMPLES));
+        // Us, with what the speakers played taken back out, before anything
+        // decides from it whether we are talking.
+        let mut frame = mic.as_ref().and_then(|mic| mic.take(FRAME_SAMPLES));
+        if let Some(frame) = frame.as_mut() {
+            processor.capture(frame);
+        }
         let peak = frame.as_ref().map(|f| f.iter().fold(0.0f32, |m, s| m.max(s.abs()))).unwrap_or(0.0);
         let action = gate.step(peak);
         if let Some(speaking) = action.announce {

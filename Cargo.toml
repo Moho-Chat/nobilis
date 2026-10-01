@@ -103,6 +103,12 @@ js_int = "=0.2.2"
 cpal = "0.18.2"
 # The Opus codec, for calls and for recording a voice message.
 opus2 = "0.4"
+# Echo cancellation, noise suppression and a high-pass filter for a call's
+# microphone: WebRTC's audio processing, ported to Rust, so a Discord call gets
+# what Chromium gives a Matrix one without a C++ library in every build.
+sonora = "0.2"
+# Soundboard sounds are MP3 or Ogg Vorbis, decoded here to be mixed into a call.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis"] }
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

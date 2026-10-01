@@ -63,6 +63,18 @@ pub struct VoicePrefs {
     /// Discord keeps it: the person who is too loud is too loud every time.
     #[serde(default)]
     pub user_volumes: std::collections::HashMap<String, f32>,
+    /// Taking what the speakers play back out of the microphone, so somebody
+    /// on speakers does not send the call back into itself. On by default,
+    /// as it is in Discord and in every browser.
+    #[serde(default = "on")]
+    pub echo_cancellation: bool,
+    /// Taking steady background noise - a fan, a hum - out of the microphone.
+    #[serde(default = "on")]
+    pub noise_suppression: bool,
+}
+
+fn on() -> bool {
+    true
 }
 
 fn unity() -> f32 {
@@ -71,7 +83,16 @@ fn unity() -> f32 {
 
 impl Default for VoicePrefs {
     fn default() -> Self {
-        VoicePrefs { input: None, output: None, mic_muted: false, deafened: false, output_volume: 1.0, user_volumes: Default::default() }
+        VoicePrefs {
+            input: None,
+            output: None,
+            mic_muted: false,
+            deafened: false,
+            output_volume: 1.0,
+            user_volumes: Default::default(),
+            echo_cancellation: true,
+            noise_suppression: true,
+        }
     }
 }
 

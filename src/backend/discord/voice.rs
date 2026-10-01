@@ -105,7 +105,8 @@ pub struct VoiceState {
     suppressed: Mutex<std::collections::HashSet<String>>,
     /// The mute button's own state, so leaving the audience restores it
     /// rather than opening a microphone somebody had closed.
-    mic_wanted_muted: Mutex<HashMap<String, bool>>,
+    mic_wanted_muted: Mutex<HashMap<String, bool>>,    /// Soundboard sounds waiting to be mixed into the call, as 48kHz stereo.
+    effects: Mutex<HashMap<String, std::collections::VecDeque<i16>>>,
 }
 
 /// Who is audible in one call, and how loudly.
@@ -439,6 +440,30 @@ impl VoiceState {
         playbacks.get(account_id).map(|p| p.take_level())
     }
 
+    /// A soundboard sound to play into this account's call. Sounds that
+    /// overlap are summed, as two people pressing at once would be heard.
+    pub fn queue_effect(&self, account_id: &str, pcm: &[i16]) {
+        let mut all = self.effects.lock().unwrap();
+        let queue = all.entry(account_id.to_string()).or_default();
+        for (i, sample) in pcm.iter().enumerate() {
+            match queue.get_mut(i) {
+                Some(slot) => *slot = slot.saturating_add(*sample),
+                None => queue.push_back(*sample),
+            }
+        }
+    }
+
+    /// The next stretch of soundboard audio for this call, if any is playing.
+    pub fn take_effect(&self, account_id: &str, samples: usize) -> Option<Vec<i16>> {
+        let mut all = self.effects.lock().unwrap();
+        let queue = all.get_mut(account_id)?;
+        if queue.is_empty() {
+            return None;
+        }
+        let n = samples.min(queue.len());
+        Some(queue.drain(..n).collect())
+    }
+
     /// Whether this account's camera is on.
     pub fn camera_on(&self, account_id: &str) -> bool {
         self.cameras.lock().unwrap().contains_key(account_id)
@@ -601,6 +626,7 @@ pub fn set_camera(state: &AppState, account_id: &str, on: bool, quality: VideoQu
     } else {
         state.voice.cameras.lock().unwrap().remove(account_id);
     state.voice.suppressed.lock().unwrap().remove(account_id);
+    state.voice.effects.lock().unwrap().remove(account_id);
     }
     conn.set_camera(on, quality);
     let (muted, deafened) = state.voice.flags(account_id);
