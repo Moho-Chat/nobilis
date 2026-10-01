@@ -116,6 +116,52 @@ pub async fn remove_third_party_id(state: &AppState, account_id: &str, medium: &
     Ok(serde_json::json!({ "idServer": answer["id_server_unbind_result"].as_str().unwrap_or("no-support") }))
 }
 
+/// How this account can be closed, as a client can tell before trying.
+///
+/// A homeserver that keeps its own accounts takes the request here, with the
+/// password. One that hands its accounts to an OAuth provider (Matrix
+/// Authentication Service - matrix.org's, among others) does not: its
+/// homeserver answers the request with M_UNRECOGNIZED, and the account is the
+/// provider's to close, on its own account page. That page may say outright
+/// that it can (MSC4191's `org.matrix.account_deactivate`), in which case the
+/// link opens that action directly; it may not, and then all a client can do
+/// is send the person to the page and say so.
+pub async fn deactivation_route(state: &AppState, account_id: &str) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
+    let base = base(&account);
+    let mut metadata = None;
+    for path in ["/_matrix/client/v1/auth_metadata", "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata"] {
+        if let Ok(v) = http::get_json_anonymous(&format!("{base}{path}")).await {
+            if v["issuer"].as_str().is_some_and(|i| !i.is_empty()) {
+                metadata = Some(v);
+                break;
+            }
+        }
+    }
+    Ok(route_from_metadata(metadata.as_ref()))
+}
+
+/// The decision behind `deactivation_route`, given what the homeserver said
+/// about who holds its accounts - or nothing, where it holds its own.
+pub(super) fn route_from_metadata(metadata: Option<&Value>) -> Value {
+    let Some(m) = metadata else {
+        return serde_json::json!({ "route": "password" });
+    };
+    let Some(page) = m["account_management_uri"].as_str().filter(|u| !u.is_empty()) else {
+        return serde_json::json!({ "route": "none" });
+    };
+    let direct = m["account_management_actions_supported"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|x| x == "org.matrix.account_deactivate"));
+    let url = if direct {
+        let separator = if page.contains('?') { '&' } else { '?' };
+        format!("{page}{separator}action=org.matrix.account_deactivate")
+    } else {
+        page.to_string()
+    };
+    serde_json::json!({ "route": "page", "url": url, "direct": direct })
+}
+
 /// Closes the account on the homeserver.
 ///
 /// Irreversible, and the client's job here is to be honest about that rather
@@ -137,6 +183,59 @@ pub async fn deactivate(state: &AppState, account_id: &str, password: &str, eras
         serde_json::json!({ "erase": erase }),
     )
     .await
-    .context("closing the account")?;
+    .map_err(|e| {
+        // What a homeserver whose accounts belong to an OAuth provider says
+        // to this request. Translated, because "unrecognized request" reads
+        // like moho sent something malformed, when the truth is that this
+        // account is closed somewhere else - see deactivation_route.
+        if format!("{e:#}").contains("M_UNRECOGNIZED") {
+            anyhow::anyhow!("this homeserver closes accounts on its own account page, not through a client")
+        } else {
+            e.context("closing the account")
+        }
+    })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod deactivation_tests {
+    use super::route_from_metadata;
+    use serde_json::json;
+
+    #[test]
+    fn a_server_that_keeps_its_own_accounts_takes_the_password() {
+        assert_eq!(route_from_metadata(None)["route"], "password");
+    }
+
+    /// matrix.org's answer: a provider, an account page, and no
+    /// deactivation among the actions it lists.
+    #[test]
+    fn a_provider_without_the_action_is_sent_to_its_page_and_said_so() {
+        let m = json!({
+            "issuer": "https://account.matrix.org/",
+            "account_management_uri": "https://account.matrix.org/account/",
+            "account_management_actions_supported": ["org.matrix.profile", "org.matrix.sessions_list"]
+        });
+        let route = route_from_metadata(Some(&m));
+        assert_eq!(route["route"], "page");
+        assert_eq!(route["direct"], false);
+        assert_eq!(route["url"], "https://account.matrix.org/account/");
+    }
+
+    #[test]
+    fn a_provider_with_the_action_opens_it_directly() {
+        let m = json!({
+            "issuer": "https://mas.example/",
+            "account_management_uri": "https://mas.example/account/",
+            "account_management_actions_supported": ["org.matrix.account_deactivate"]
+        });
+        let route = route_from_metadata(Some(&m));
+        assert_eq!(route["direct"], true);
+        assert_eq!(route["url"], "https://mas.example/account/?action=org.matrix.account_deactivate");
+    }
+
+    #[test]
+    fn a_provider_with_no_account_page_leaves_nothing_to_offer() {
+        assert_eq!(route_from_metadata(Some(&json!({ "issuer": "https://mas.example/" })))["route"], "none");
+    }
 }

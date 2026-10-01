@@ -4800,6 +4800,16 @@ pub async fn dispatch(
         // machine is cleaned up afterwards, in that order: an account removed
         // here while the server still holds it would leave somebody with an
         // account they can no longer reach from the client that made it.
+        // How an account can be closed - here with its password, or on its
+        // provider's account page - asked before offering either.
+        "matrixDeactivationRoute" => match p_str_opt(params, "accountId") {
+            None => (None, Some("matrixDeactivationRoute requires \"accountId\"".to_string())),
+            Some(id) => match backend::matrix::account::deactivation_route(state, id).await {
+                Ok(route) => (Some(route), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+        },
+
         "deactivateMatrixAccount" => {
             let (account_id, password) = match (p_str_opt(params, "accountId"), p_str_opt(params, "password")) {
                 (Some(a), Some(p)) => (a, p),
