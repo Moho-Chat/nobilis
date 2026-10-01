@@ -189,9 +189,17 @@ pub(super) fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<Strin
 /// A candidate only: somebody pasting a file link into what they wrote looks
 /// the same from here. Which links really are the message's own attachments
 /// is settled against Discord's copy of it - see `strip_attachment_links`.
+///
+/// Also a Lottie sticker stored before it could be drawn, as the line
+/// "sent a sticker: <name>".
 pub(super) fn stored_in_old_shape(m: &crate::model::Message) -> bool {
-    m.attachments.is_empty() && (m.body.contains("cdn.discordapp.com/attachments/") || m.body.contains("media.discordapp.net/attachments/"))
+    m.attachments.is_empty()
+        && (m.body.contains("cdn.discordapp.com/attachments/")
+            || m.body.contains("media.discordapp.net/attachments/")
+            || m.body.lines().any(|l| l.starts_with(STICKER_LINE)))
 }
+
+const STICKER_LINE: &str = "sent a sticker: ";
 
 /// A link without its signature, which is what stays the same when Discord
 /// signs it again - and on either of its two hosts.
@@ -203,8 +211,17 @@ fn unsigned(url: &str) -> String {
 /// whatever else it said left exactly as stored.
 pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> String {
     let own: Vec<String> = attachments.iter().filter_map(|a| a.url.as_deref()).map(unsigned).collect();
+    // The names of the Lottie stickers it carries, whose old stand-in line
+    // goes now that they can be drawn.
+    let stickers: Vec<String> = attachments
+        .iter()
+        .filter(|a| a.kind == "lottie")
+        .filter_map(|a| a.filename.as_deref())
+        .map(|f| f.trim_end_matches(".json").to_string())
+        .collect();
     let kept: Vec<String> = body
         .lines()
+        .filter(|line| !line.strip_prefix(STICKER_LINE).is_some_and(|name| stickers.iter().any(|s| s == name)))
         .filter_map(|line| {
             let left = line
                 .split(' ')
@@ -678,6 +695,14 @@ mod tests {
         );
         // The media host is the same file.
         assert_eq!(strip_attachment_links("https://media.discordapp.net/attachments/1/2/shot.png", &[own]), "");
+    }
+
+    #[test]
+    fn a_sticker_stand_in_goes_once_the_sticker_can_be_drawn() {
+        let sticker = Attachment { kind: "lottie".into(), filename: Some("wave.json".into()), ..Default::default() };
+        assert_eq!(strip_attachment_links("sent a sticker: wave", &[sticker.clone()]), "");
+        // Somebody else's sticker named in passing stays.
+        assert_eq!(strip_attachment_links("sent a sticker: dance", &[sticker]), "sent a sticker: dance");
     }
 
     #[test]

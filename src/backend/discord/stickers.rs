@@ -43,6 +43,53 @@ impl Sticker {
     }
 }
 
+/// Where a Lottie sticker's animation is. Only the CDN host serves it; the
+/// media proxy answers 400.
+pub fn lottie_url(id: &str) -> String {
+    format!("https://cdn.discordapp.com/stickers/{id}.json")
+}
+
+fn lottie_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("discord-stickers")
+}
+
+/// A Lottie sticker's animation on disk, fetched the first time it is asked
+/// for.
+///
+/// Fetched here rather than by the window because the CDN sends no CORS
+/// header, so a page cannot read it - and once fetched it never changes: a
+/// sticker id names one animation for good.
+///
+/// Through the account's own client, so it goes out the way that account is
+/// routed - over Tor, if the account is.
+pub async fn lottie_file(token: &str, id: &str) -> Result<String> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("that is not a sticker id");
+    }
+    let dir = lottie_cache_dir();
+    let path = dir.join(format!("{id}.json"));
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        let resp = http_client_for(token)
+            .get(lottie_url(id))
+            .send()
+            .await
+            .context("fetching the sticker")?;
+        if !resp.status().is_success() {
+            bail!("Discord has no animation for that sticker ({})", resp.status());
+        }
+        let bytes = resp.bytes().await.context("reading the sticker")?;
+        tokio::fs::create_dir_all(&dir).await.ok();
+        // Written beside and renamed, so a reader never finds half a file.
+        let partial = dir.join(format!("{id}.json.part"));
+        tokio::fs::write(&partial, &bytes).await.context("saving the sticker")?;
+        tokio::fs::rename(&partial, &path).await.context("saving the sticker")?;
+    }
+    Ok(format!("file://{}", path.display()))
+}
+
 /// Account to guild to its stickers.
 fn known() -> &'static Mutex<HashMap<String, HashMap<String, GuildStickers>>> {
     static KNOWN: OnceLock<Mutex<HashMap<String, HashMap<String, GuildStickers>>>> = OnceLock::new();
@@ -148,6 +195,7 @@ pub async fn list(state: &AppState, account_id: &str, buffer_id: &str, token: &s
                     "pack": pack,
                     "body": sticker.name,
                     "url": sticker.url(),
+                    "lottie": sticker.format_type == 3,
                     "locked": false,
                 })
             })
@@ -178,6 +226,7 @@ fn guild_list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value>
                 "pack": guild.guild_name,
                 "body": sticker.name,
                 "url": sticker.url(),
+                "lottie": sticker.format_type == 3,
                 "locked": !usable,
                 "guildId": guild_id,
             }));

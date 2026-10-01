@@ -162,13 +162,9 @@ pub(super) fn extract_body(d: &Value) -> Option<String> {
     for quoted in forwarded_text(d) {
         parts.push(quoted);
     }
-    // A poll is the message when there is one, and a sticker this client
-    // cannot draw is at least a message that arrived.
+    // A poll is the message when there is one.
     if let Some(poll) = extract_poll(d) {
         parts.push(poll);
-    }
-    for name in undrawable_sticker_names(d) {
-        parts.push(format!("sent a sticker: {name}"));
     }
     if let Some(embeds) = d["embeds"].as_array() {
         for embed in embeds {
@@ -421,14 +417,16 @@ mod sticker_and_poll_tests {
         assert_eq!(extract_stickers(&d)[0].url.as_deref(), Some("https://media.discordapp.net/stickers/7.gif"));
     }
 
-    /// Lottie is a vector animation format nothing here can draw, so the
-    /// sticker becomes its name - not the sticker, but a message that
-    /// arrived, which is the whole point.
+    /// A Lottie sticker is a vector animation, carried as the JSON it is
+    /// played from rather than as a name in the text.
     #[test]
-    fn a_sticker_we_cannot_draw_becomes_its_name() {
+    fn a_lottie_sticker_is_an_attachment() {
         let d = json!({ "content": "", "sticker_items": [{ "id": "9", "name": "wave", "format_type": 3 }] });
-        assert!(extract_stickers(&d).is_empty());
-        assert_eq!(extract_body(&d).as_deref(), Some("sent a sticker: wave"));
+        let stickers = extract_stickers(&d);
+        assert_eq!(stickers.len(), 1);
+        assert_eq!(stickers[0].kind, "lottie");
+        assert_eq!(stickers[0].url.as_deref(), Some("https://cdn.discordapp.com/stickers/9.json"));
+        assert_eq!(extract_body(&d), None);
     }
 
     /// A poll-only message used to arrive as nothing, so a channel went quiet
@@ -480,7 +478,17 @@ pub(super) fn extract_stickers(d: &Value) -> Vec<Attachment> {
             // 1 PNG, 2 APNG, 3 Lottie, 4 GIF - Discord's own numbering.
             let (extension, mimetype) = match sticker["format_type"].as_i64().unwrap_or(1) {
                 4 => ("gif", "image/gif"),
-                3 => return None,
+                // A vector animation, as the JSON it is played from. Only on
+                // the CDN host, which is the one that serves it.
+                3 => {
+                    return Some(Attachment {
+                        kind: "lottie".to_string(),
+                        filename: Some(format!("{name}.json")),
+                        url: Some(super::stickers::lottie_url(id)),
+                        mimetype: Some("application/json".to_string()),
+                        ..Default::default()
+                    })
+                }
                 _ => ("png", "image/png"),
             };
             Some(Attachment {
@@ -520,16 +528,6 @@ pub(super) fn extract_poll(d: &Value) -> Option<String> {
     (out.lines().count() > 1).then_some(out)
 }
 
-/// The name of a sticker nothing here can draw - a Lottie animation.
-pub(super) fn undrawable_sticker_names(d: &Value) -> Vec<String> {
-    d["sticker_items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|s| s["format_type"].as_i64() == Some(3))
-        .filter_map(|s| s["name"].as_str().map(str::to_string))
-        .collect()
-}
 
 /// What was forwarded, as lines quoting it.
 ///

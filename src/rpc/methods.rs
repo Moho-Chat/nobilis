@@ -5252,6 +5252,20 @@ pub async fn dispatch(
             (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id, &token).await)), None)
         }
 
+        // A Lottie sticker's animation, fetched once and kept: the window
+        // plays it from disk, because the CDN will not let a page read it.
+        "discordStickerArt" => {
+            let (account_id, sticker_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "stickerId")) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return (None, Some("discordStickerArt requires \"accountId\" and \"stickerId\"".to_string())),
+            };
+            let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+            match backend::discord::stickers::lottie_file(&token, sticker_id).await {
+                Ok(path) => (Some(serde_json::json!({ "path": path })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "sendDiscordSticker" => {
             let (buffer_id, sticker_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "stickerId")) {
                 (Some(b), Some(s)) => (b, s),
