@@ -175,7 +175,10 @@ fn retry_after(res: &reqwest::Response) -> Option<Duration> {
     let said = res.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let seconds: u64 = said.trim().parse().ok()?;
     // Capped: a client that obeys a ten-minute Retry-After during startup has
-    // hung, as far as anybody watching it can tell.
+    // hung, as far as anybody watching it can tell. The floor is the
+    // caller's - see `paced`: a refusal saying to wait no time at all spent
+    // all three retries in the same second (seen on a cold start, five
+    // channels refused within two seconds of connecting).
     Some(Duration::from_secs(seconds.min(10)))
 }
 
@@ -208,7 +211,11 @@ async fn paced(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Res
         // Seconds rather than milliseconds: Kick's limit is measured in
         // requests per window, and asking again immediately only spends the
         // next window's budget on the same refusal.
-        let wait = retry_after(&res).unwrap_or(Duration::from_secs(3 * attempt as u64));
+        // Never less than a growing floor, whatever Kick says: its window is
+        // longer than its Retry-After admits, and a retry that comes back as
+        // soon as it is told to is refused again.
+        let floor = Duration::from_secs(3 * attempt as u64);
+        let wait = retry_after(&res).map_or(floor, |said| said.max(floor));
         let until = tokio::time::Instant::now() + wait;
         let mut shared = not_before().lock().unwrap();
         if shared.is_none_or(|t| t < until) {
