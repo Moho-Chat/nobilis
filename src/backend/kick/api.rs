@@ -166,6 +166,21 @@ struct UserJson {
     profile_pic: Option<String>,
 }
 
+/// Kick saying a handle names no channel at all - renamed, banned, or never
+/// there. Its own type, because it is the one failure that should change what
+/// is saved: a channel refused for the rate limit is asked for again, and one
+/// that does not exist should stop being asked for.
+#[derive(Debug)]
+pub struct NoSuchChannel(pub String);
+
+impl std::fmt::Display for NoSuchChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "there is no Kick channel called \"{}\"", self.0)
+    }
+}
+
+impl std::error::Error for NoSuchChannel {}
+
 /// How many times one request waits and asks again when Kick says to slow
 /// down.
 const PACED_RETRIES: usize = 3;
@@ -243,7 +258,14 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     // restart, which is a far worse outcome than a slower connect.
     let res = paced(http.get(&url).header("Accept", "application/json")).await.context("asking Kick about that channel")?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("there is no Kick channel called \"{slug}\"");
+        // Kick's own answer, not just the status: a 404 page from something in
+        // between is not Kick saying the channel is gone, and this one leads
+        // to the channel being taken off the saved list.
+        let body = res.text().await.unwrap_or_default();
+        if body.contains("Channel not found") {
+            return Err(NoSuchChannel(slug).into());
+        }
+        bail!("Kick answered 404 for {slug}");
     }
     if !res.status().is_success() {
         bail!("Kick answered {} for {slug}", res.status());

@@ -52,6 +52,40 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
+/// Whether Kick said this handle names no channel at all.
+fn no_such_channel(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<api::NoSuchChannel>().is_some()
+}
+
+/// Takes a handle Kick does not know off the saved list, and says so.
+///
+/// A channel that does not resolve never gets a buffer, so there was nothing
+/// on screen to close it with: it stayed saved, invisible, and was asked for
+/// on every connect - drawing a 429 or a 404 each time - for as long as the
+/// account existed.
+fn forget_missing(state: &AppState, account_id: &str, slug: &str) {
+    let gone = api::normalise_slug(slug);
+    if let Some(cfg) = state.accounts.get_kick(account_id) {
+        let before = cfg.channels.len();
+        let left: Vec<String> = cfg.channels.into_iter().filter(|c| api::normalise_slug(c) != gone).collect();
+        if left.len() != before {
+            let _ = state.accounts.set_kick_channels(account_id, left);
+        }
+    }
+    tracing::info!("kick[{account_id}]: {gone} is not a Kick channel any more; taken off the saved list");
+    state.runtime.report_progress(state, account_id, &format!("{gone} is not on Kick any more - taken off your channels"));
+}
+
+/// Saves a handle, once Kick has said it is a channel.
+fn remember(state: &AppState, account_id: &str, slug: &str) {
+    if let Some(mut cfg) = state.accounts.get_kick(account_id) {
+        if !cfg.channels.iter().any(|c| api::normalise_slug(c) == slug) {
+            cfg.channels.push(slug.to_string());
+            let _ = state.accounts.set_kick_channels(account_id, cfg.channels);
+        }
+    }
+}
+
 /// How many times a rate-limited channel is asked for again before giving up.
 pub(super) const REJOIN_ATTEMPTS: u8 = 3;
 
@@ -264,6 +298,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
             // from connecting - a channel can be renamed or banned between
             // sessions, and that is this account's problem with one buffer
             // rather than with Kick.
+            Err(e) if no_such_channel(&e) => forget_missing(state, account_id, &slug),
             Err(e) => {
                 let words = format!("{e:#}");
                 tracing::warn!("kick[{account_id}]: {slug}: {words}");
@@ -323,7 +358,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                             // the channel just asked for.
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
+                            remember(state, account_id, &channel.slug);
                         }
+                        // Said, and not saved: a typo stays a typo rather
+                        // than becoming a channel asked for on every connect.
                         Err(e) => state.runtime.report_progress(state, account_id, &format!("{e:#}")),
                     }
                 }
@@ -333,6 +371,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
                         }
+                        Err(e) if no_such_channel(&e) => forget_missing(state, account_id, &handle),
                         Err(e) => {
                             let words = format!("{e:#}");
                             // Still being told to slow down: wait longer and

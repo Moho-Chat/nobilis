@@ -774,7 +774,8 @@ pub async fn dispatch(
             // Kick has no join to perform: a channel is a streamer, and naming
             // one is the whole of it. So this is "start watching", which the
             // connection does by subscribing its existing socket - and the
-            // handle is remembered, so it comes back tomorrow.
+            // handle is remembered once Kick has said it is a channel, so it
+            // comes back tomorrow.
             if id.starts_with("kick:") {
                 let slug = backend::kick::api::normalise_slug(name);
                 if slug.is_empty() {
@@ -783,14 +784,11 @@ pub async fn dispatch(
                 let Some(sender) = state.runtime.kick_sender(id) else {
                     return (None, Some("that Kick account is not connected".to_string()));
                 };
-                if sender.send(backend::kick::Command::Join(slug.clone())).is_err() {
+                // Remembered by the connection once Kick has said the handle
+                // is a channel, not here: saved first, a typo was asked for
+                // on every connect for good, with no buffer to close it by.
+                if sender.send(backend::kick::Command::Join(slug)).is_err() {
                     return (None, Some("that Kick account is not connected".to_string()));
-                }
-                if let Some(mut cfg) = state.accounts.get_kick(id) {
-                    if !cfg.channels.contains(&slug) {
-                        cfg.channels.push(slug);
-                        let _ = state.accounts.set_kick_channels(id, cfg.channels);
-                    }
                 }
                 return (Some(ok_node()), None);
             }
