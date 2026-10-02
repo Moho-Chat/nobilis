@@ -150,6 +150,11 @@ pub fn message_link(channel_id: &str, guild_id: Option<&str>, message_id: &str) 
 /// `attachments[0]` was ever read, silently dropping additional files).
 /// Returns None only when there is truly nothing renderable at all.
 pub(super) fn extract_body(d: &Value) -> Option<String> {
+    // An AutoMod verdict, which is its own kind of line rather than the
+    // person's words: see automod_alert.
+    if let Some(alert) = automod_alert(d) {
+        return Some(alert);
+    }
     let mut parts: Vec<String> = Vec::new();
     let content = d["content"].as_str().unwrap_or("");
     if !content.is_empty() {
@@ -162,13 +167,9 @@ pub(super) fn extract_body(d: &Value) -> Option<String> {
     for quoted in forwarded_text(d) {
         parts.push(quoted);
     }
-    // A poll is the message when there is one, and a sticker this client
-    // cannot draw is at least a message that arrived.
+    // A poll is the message when there is one.
     if let Some(poll) = extract_poll(d) {
         parts.push(poll);
-    }
-    for name in undrawable_sticker_names(d) {
-        parts.push(format!("sent a sticker: {name}"));
     }
     if let Some(embeds) = d["embeds"].as_array() {
         for embed in embeds {
@@ -421,14 +422,16 @@ mod sticker_and_poll_tests {
         assert_eq!(extract_stickers(&d)[0].url.as_deref(), Some("https://media.discordapp.net/stickers/7.gif"));
     }
 
-    /// Lottie is a vector animation format nothing here can draw, so the
-    /// sticker becomes its name - not the sticker, but a message that
-    /// arrived, which is the whole point.
+    /// A Lottie sticker is a vector animation, carried as the JSON it is
+    /// played from rather than as a name in the text.
     #[test]
-    fn a_sticker_we_cannot_draw_becomes_its_name() {
+    fn a_lottie_sticker_is_an_attachment() {
         let d = json!({ "content": "", "sticker_items": [{ "id": "9", "name": "wave", "format_type": 3 }] });
-        assert!(extract_stickers(&d).is_empty());
-        assert_eq!(extract_body(&d).as_deref(), Some("sent a sticker: wave"));
+        let stickers = extract_stickers(&d);
+        assert_eq!(stickers.len(), 1);
+        assert_eq!(stickers[0].kind, "lottie");
+        assert_eq!(stickers[0].url.as_deref(), Some("https://cdn.discordapp.com/stickers/9.json"));
+        assert_eq!(extract_body(&d), None);
     }
 
     /// A poll-only message used to arrive as nothing, so a channel went quiet
@@ -480,7 +483,17 @@ pub(super) fn extract_stickers(d: &Value) -> Vec<Attachment> {
             // 1 PNG, 2 APNG, 3 Lottie, 4 GIF - Discord's own numbering.
             let (extension, mimetype) = match sticker["format_type"].as_i64().unwrap_or(1) {
                 4 => ("gif", "image/gif"),
-                3 => return None,
+                // A vector animation, as the JSON it is played from. Only on
+                // the CDN host, which is the one that serves it.
+                3 => {
+                    return Some(Attachment {
+                        kind: "lottie".to_string(),
+                        filename: Some(format!("{name}.json")),
+                        url: Some(super::stickers::lottie_url(id)),
+                        mimetype: Some("application/json".to_string()),
+                        ..Default::default()
+                    })
+                }
                 _ => ("png", "image/png"),
             };
             Some(Attachment {
@@ -520,16 +533,6 @@ pub(super) fn extract_poll(d: &Value) -> Option<String> {
     (out.lines().count() > 1).then_some(out)
 }
 
-/// The name of a sticker nothing here can draw - a Lottie animation.
-pub(super) fn undrawable_sticker_names(d: &Value) -> Vec<String> {
-    d["sticker_items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|s| s["format_type"].as_i64() == Some(3))
-        .filter_map(|s| s["name"].as_str().map(str::to_string))
-        .collect()
-}
 
 /// What was forwarded, as lines quoting it.
 ///
@@ -1212,5 +1215,174 @@ mod attachment_tests {
     #[test]
     fn leaves_a_plain_unicode_emoji_unchanged() {
         assert_eq!(reaction_path_segment("🔥"), "🔥");
+    }
+}
+
+/// An AutoMod verdict, as the line a moderator reads.
+///
+/// AutoMod tells a server's moderators by posting into its alert channel: a
+/// message of type 24 whose author is the person caught, whose content is
+/// what they wrote, and whose one embed - of type `auto_moderation_message`,
+/// with no title or text of its own - carries the decision as named fields:
+/// which rule, what it matched, where, and whether the message was blocked or
+/// only flagged. Read as an ordinary message it looked like that person had
+/// posted their own words in the alert channel, and the decision was nowhere.
+///
+/// So it is said outright: what AutoMod did and where, the rule and what it
+/// matched, any timeout, and the message itself quoted underneath.
+pub(super) fn automod_alert(d: &Value) -> Option<String> {
+    if d["type"].as_i64() != Some(24) {
+        return None;
+    }
+    // AutoMod's own news about itself, from Discord's system "automod"
+    // user: alerts switched on, a raid suspected. A different embed, with a
+    // notification type instead of a verdict.
+    if let Some(note) = d["embeds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["type"].as_str() == Some("auto_moderation_notification"))
+    {
+        return Some(automod_notification(note));
+    }
+    let embed = d["embeds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|e| e["type"].as_str() == Some("auto_moderation_message"));
+    let field = |name: &str| -> Option<String> {
+        embed?["fields"]
+            .as_array()?
+            .iter()
+            .find(|f| f["name"].as_str() == Some(name))
+            .and_then(|f| f["value"].as_str())
+            .map(str::to_string)
+            .filter(|v| !v.is_empty())
+    };
+    // Blocked unless it says otherwise: blocking is the action every rule
+    // has, and the alert is the only record that it happened.
+    let verb = match field("decision_outcome").as_deref() {
+        Some("flagged") => "flagged",
+        _ => "blocked",
+    };
+    let mut line = format!("AutoMod {verb} a message");
+    if let Some(channel) = field("channel_id") {
+        line.push_str(&format!(" in <#{channel}>"));
+    }
+    let mut why: Vec<String> = Vec::new();
+    if let Some(rule) = field("rule_name") {
+        why.push(format!("rule \"{rule}\""));
+    }
+    if let Some(matched) = field("keyword_matched_content").or_else(|| field("keyword")) {
+        why.push(format!("matched \"{matched}\""));
+    }
+    if !why.is_empty() {
+        line.push_str(&format!(" - {}", why.join(", ")));
+    }
+    if let Some(secs) = field("timeout_duration").and_then(|t| t.parse::<u64>().ok()).filter(|s| *s > 0) {
+        line.push_str(&format!(", and timed them out for {}", super::send::describe_seconds(secs)));
+    }
+    // What they wrote. In the embed's description, as Discord sends it; the
+    // message's own content is empty.
+    let content = d["content"]
+        .as_str()
+        .filter(|c| !c.is_empty())
+        .or_else(|| embed.and_then(|e| e["description"].as_str()))
+        .unwrap_or_default();
+    if !content.is_empty() {
+        let quoted: Vec<String> = content.lines().map(|l| format!("> {l}")).collect();
+        line.push('\n');
+        line.push_str(&quoted.join("\n"));
+    }
+    Some(line)
+}
+
+/// AutoMod saying something about itself rather than about a message.
+fn automod_notification(embed: &Value) -> String {
+    let field = |name: &str| -> Option<&str> {
+        embed["fields"].as_array()?.iter().find(|f| f["name"].as_str() == Some(name))?["value"].as_str()
+    };
+    let by = field("action_by_user_id").map(|u| format!(" by <@{u}>")).unwrap_or_default();
+    match field("notification_type") {
+        Some("activity_alerts_enabled") => format!("AutoMod activity alerts were turned on{by}"),
+        Some("raid") | Some("mention_raid") => "AutoMod suspects a raid on this server".to_string(),
+        Some(other) => format!("AutoMod: {}{by}", other.replace('_', " ")),
+        None => "AutoMod posted a notice".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod automod_tests {
+    use super::{automod_alert, extract_body};
+    use serde_json::json;
+
+    fn alert(fields: serde_json::Value, content: &str) -> serde_json::Value {
+        json!({ "type": 24, "content": content, "embeds": [{ "type": "auto_moderation_message", "fields": fields }] })
+    }
+
+    #[test]
+    fn a_blocked_message_says_where_why_and_what() {
+        let d = alert(
+            json!([
+                { "name": "rule_name", "value": "No slurs" },
+                { "name": "channel_id", "value": "42" },
+                { "name": "keyword", "value": "bad*" },
+                { "name": "keyword_matched_content", "value": "badword" },
+                { "name": "decision_outcome", "value": "blocked" }
+            ]),
+            "this has a badword in it",
+        );
+        assert_eq!(
+            extract_body(&d).unwrap(),
+            "AutoMod blocked a message in <#42> - rule \"No slurs\", matched \"badword\"\n> this has a badword in it"
+        );
+    }
+
+    #[test]
+    fn a_flag_and_a_timeout_are_said() {
+        let d = alert(
+            json!([
+                { "name": "rule_name", "value": "Spam" },
+                { "name": "decision_outcome", "value": "flagged" },
+                { "name": "timeout_duration", "value": "600" }
+            ]),
+            "",
+        );
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod flagged a message - rule \"Spam\", and timed them out for 10 minutes");
+    }
+
+    /// As Discord actually sends it: the content empty, the blocked text in
+    /// the embed's description. Read off a real alert.
+    #[test]
+    fn the_blocked_text_is_read_from_the_embed() {
+        let d = json!({ "type": 24, "content": "", "embeds": [{
+            "type": "auto_moderation_message",
+            "description": "second automod test with moho",
+            "fields": [
+                { "name": "rule_name", "value": "Block Custom Words" },
+                { "name": "channel_id", "value": "1426929170935709916" },
+                { "name": "keyword", "value": "moho" },
+                { "name": "keyword_matched_content", "value": "moho" },
+                { "name": "decision_outcome", "value": "blocked" }
+            ]
+        }]});
+        assert_eq!(
+            automod_alert(&d).unwrap(),
+            "AutoMod blocked a message in <#1426929170935709916> - rule \"Block Custom Words\", matched \"moho\"\n> second automod test with moho"
+        );
+    }
+
+    #[test]
+    fn alerts_switched_on_is_said() {
+        let d = json!({ "type": 24, "content": "", "embeds": [{
+            "type": "auto_moderation_notification",
+            "fields": [{ "name": "notification_type", "value": "activity_alerts_enabled" }, { "name": "action_by_user_id", "value": "1677" }]
+        }]});
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod activity alerts were turned on by <@1677>");
+    }
+
+    #[test]
+    fn an_ordinary_message_is_not_an_alert() {
+        assert!(automod_alert(&json!({ "type": 0, "content": "hi" })).is_none());
     }
 }

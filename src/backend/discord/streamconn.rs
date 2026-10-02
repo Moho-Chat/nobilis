@@ -197,24 +197,13 @@ impl StreamSender {
         Ok(())
     }
 
-    /// Whether a frame handed in now would actually reach anybody.
-    ///
-    /// A connection exists some seconds before its group does, and a picture
-    /// encrypted for a group that has not formed is one nobody can read - so
-    /// the window waits for this rather than for the socket.
-    pub async fn ready(&self) -> bool {
-        if !self.live.load(Ordering::Relaxed) {
-            return false;
-        }
-        match self.dave.lock().await.as_ref() {
-            Some(dave) => dave.ready(),
-            // No group asked for, so nothing to wait on.
-            None => true,
-        }
-    }
-
     pub fn stop(&self) {
         self.live.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the connection is still up, ready or not.
+    pub fn is_live(&self) -> bool {
+        self.live.load(Ordering::Relaxed)
     }
 
     /// Sends what the computer is playing along with the picture, until the
@@ -548,6 +537,9 @@ pub async fn connect(
     // A viewer sends no media, so it claims no SSRCs. Announcing a video
     // SSRC it will never put a packet on would tell the server to expect a
     // second picture in a conversation that has one.
+    // At whatever the share was started at - the window encodes to the same
+    // numbers, so what the server tells viewers to expect is what arrives.
+    let quality = super::golive::quality(account_id);
     let announce_video = json!({
         "op": 12,
         "d": {
@@ -560,8 +552,8 @@ pub async fn connect(
             "streams": [{
                 "type": "video", "rid": "100", "ssrc": video_ssrc, "active": true,
                 "quality": 100, "rtx_ssrc": video_ssrc.wrapping_add(1),
-                "max_bitrate": 2_500_000, "max_framerate": 30,
-                "max_resolution": { "type": "fixed", "width": 1280, "height": 720 }
+                "max_bitrate": quality.bitrate, "max_framerate": quality.framerate,
+                "max_resolution": { "type": "fixed", "width": quality.width, "height": quality.height }
             }],
         }
     })

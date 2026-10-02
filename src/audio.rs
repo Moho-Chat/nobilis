@@ -39,7 +39,7 @@ pub struct AudioDevice {
 /// Kept apart from accounts.toml deliberately: that file holds credentials at
 /// mode 0600, and these are preferences that belong to the machine rather than
 /// to any account.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct VoicePrefs {
     /// Device ids, or None for "whatever the sound server considers default",
@@ -55,6 +55,66 @@ pub struct VoicePrefs {
     /// Output silenced.
     #[serde(default)]
     pub deafened: bool,
+    /// How loud a call is overall, 1.0 being as it arrives. Up to 2.0, as
+    /// Discord's own slider goes.
+    #[serde(default = "unity")]
+    pub output_volume: f32,
+    /// Somebody turned up or down, by Discord user id. Kept across calls, as
+    /// Discord keeps it: the person who is too loud is too loud every time.
+    #[serde(default)]
+    pub user_volumes: std::collections::HashMap<String, f32>,
+    /// Taking what the speakers play back out of the microphone, so somebody
+    /// on speakers does not send the call back into itself. On by default,
+    /// as it is in Discord and in every browser.
+    #[serde(default = "on")]
+    pub echo_cancellation: bool,
+    /// Taking steady background noise - a fan, a hum - out of the microphone.
+    #[serde(default = "on")]
+    pub noise_suppression: bool,
+}
+
+fn on() -> bool {
+    true
+}
+
+fn unity() -> f32 {
+    1.0
+}
+
+impl Default for VoicePrefs {
+    fn default() -> Self {
+        VoicePrefs {
+            input: None,
+            output: None,
+            mic_muted: false,
+            deafened: false,
+            output_volume: 1.0,
+            user_volumes: Default::default(),
+            echo_cancellation: true,
+            noise_suppression: true,
+        }
+    }
+}
+
+impl VoicePrefs {
+    /// The gain for one person, as set or as it arrived.
+    pub fn user_volume(&self, user_id: &str) -> f32 {
+        self.user_volumes.get(user_id).copied().unwrap_or(1.0)
+    }
+}
+
+/// The loudest a volume may be set: twice as it arrived, Discord's ceiling.
+pub const MAX_VOLUME: f32 = 2.0;
+
+/// Scales samples by a gain, clipping rather than wrapping where it goes
+/// past the edge - a clip sounds loud, a wrap sounds like a gunshot.
+pub fn apply_gain(samples: &mut [i16], gain: f32) {
+    if (gain - 1.0).abs() < f32::EPSILON {
+        return;
+    }
+    for s in samples.iter_mut() {
+        *s = (*s as f32 * gain).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+    }
 }
 
 /// The preferences file at ~/.config/nobilis/voice.toml.
@@ -973,6 +1033,26 @@ fn route_when_ready(stream: Stream, device_id: &str, existing: &std::collections
 
 #[cfg(test)]
 mod tests {
+
+    /// A gain past the edge clips rather than wrapping round to the other
+    /// extreme.
+    #[test]
+    fn a_gain_clips_rather_than_wraps() {
+        let mut loud = [20_000i16, -20_000, 100];
+        apply_gain(&mut loud, 2.0);
+        assert_eq!(loud, [i16::MAX, i16::MIN, 200]);
+        let mut quiet = [1000i16];
+        apply_gain(&mut quiet, 0.5);
+        assert_eq!(quiet, [500]);
+    }
+
+    /// Preferences written before volumes existed read as everything at 100%.
+    #[test]
+    fn old_preferences_read_as_unchanged_volume() {
+        let prefs: VoicePrefs = toml::from_str("micMuted = true").unwrap();
+        assert_eq!(prefs.output_volume, 1.0);
+        assert_eq!(prefs.user_volume("42"), 1.0);
+    }
     use super::*;
     use std::sync::atomic::AtomicUsize;
 

@@ -259,7 +259,12 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     // watching - found a complete entry and opened a second connection with
     // the same voice session. Discord answers that by invalidating one of
     // them, which is where the 4006 in the log came from.
-    if sending(account_id).await || connecting(account_id, stream_key) {
+    //
+    // "Has a live connection", not "is sending": a connection is up for
+    // some seconds before its encryption group is ready to send, and a
+    // STREAM_UPDATE in that gap - the other end of the call being told the
+    // stream exists is enough - opened a duplicate that invalidated the first.
+    if has_connection(account_id) || connecting(account_id, stream_key) {
         let mut all = pending().lock().unwrap();
         all.entry(slot(account_id, stream_key)).or_default().absorb(d);
         return;
@@ -369,6 +374,12 @@ fn senders() -> &'static std::sync::Mutex<std::collections::HashMap<String, std:
     SENDERS.get_or_init(Default::default)
 }
 
+/// Whether this account has a stream connection up, whether or not its group
+/// is ready yet.
+fn has_connection(account_id: &str) -> bool {
+    senders().lock().unwrap().get(account_id).is_some_and(|s| s.is_live())
+}
+
 /// Whether the next stream from each account carries the computer's sound.
 fn sound() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
     static SOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
@@ -383,6 +394,22 @@ pub fn set_sound(account_id: &str, wanted: bool) {
 
 fn sound_wanted(account_id: &str) -> bool {
     sound().lock().unwrap().get(account_id).copied().unwrap_or(true)
+}
+
+/// What the next stream from each account is sent at, as chosen when it was
+/// started.
+fn qualities() -> &'static std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>> {
+    static QUALITY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>>> =
+        std::sync::OnceLock::new();
+    QUALITY.get_or_init(Default::default)
+}
+
+pub fn set_quality(account_id: &str, quality: super::voiceconn::VideoQuality) {
+    qualities().lock().unwrap().insert(account_id.to_string(), quality);
+}
+
+pub fn quality(account_id: &str) -> super::voiceconn::VideoQuality {
+    qualities().lock().unwrap().get(account_id).copied().unwrap_or_default()
 }
 
 /// Puts one encoded frame on the wire.
@@ -415,15 +442,14 @@ pub fn take_last_error(account_id: &str) -> Option<String> {
 
 /// Whether this account has a stream connection ready for frames.
 ///
-/// Ready means the end-to-end encrypted group has formed, not merely that a
-/// socket is open: a picture encrypted for a group that does not exist yet is
-/// one nobody can read.
+/// Ready means the connection is up, not that its encrypted group has
+/// formed. The group forms when somebody joins to watch - a stream nobody is
+/// watching has nobody to agree keys with - so waiting for it before
+/// encoding meant a stream started into an empty room gave up after twenty
+/// seconds. Frames sent before the group exists are dropped by the sender,
+/// and the next keyframe is two seconds behind the first viewer.
 pub async fn sending(account_id: &str) -> bool {
-    let sender = senders().lock().unwrap().get(account_id).cloned();
-    match sender {
-        Some(sender) => sender.ready().await,
-        None => false,
-    }
+    has_connection(account_id)
 }
 
 /// Closes the connection, without telling the gateway - `stop` does that.
@@ -764,4 +790,38 @@ mod tests {
         assert!(!redacted(&plain).contains("redacted"));
     }
 
+}
+
+/// The best stream an account may send.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamLimit {
+    pub max_height: u32,
+    pub max_framerate: u32,
+    /// Whether the capture's own size may be sent unscaled.
+    pub source: bool,
+}
+
+/// What Discord's own client offers each tier. `premium_type` 0 is none and
+/// 3 is Nitro Basic, neither of which buys a better stream than 720p30; 1 is
+/// Nitro Classic, 1080p60; 2 is Nitro, the source at 60.
+pub fn stream_limit(premium_type: u8) -> StreamLimit {
+    match premium_type {
+        2 => StreamLimit { max_height: 2160, max_framerate: 60, source: true },
+        1 => StreamLimit { max_height: 1080, max_framerate: 60, source: false },
+        _ => StreamLimit { max_height: 720, max_framerate: 30, source: false },
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn an_account_without_nitro_streams_at_720p30() {
+        assert_eq!(stream_limit(0), StreamLimit { max_height: 720, max_framerate: 30, source: false });
+        // Nitro Basic does not include a better stream.
+        assert_eq!(stream_limit(3), stream_limit(0));
+        assert_eq!(stream_limit(1).max_height, 1080);
+        assert!(stream_limit(2).source);
+    }
 }

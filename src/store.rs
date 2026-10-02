@@ -460,6 +460,19 @@ impl Store {
         Ok(rows > 0)
     }
 
+    /// Rewrites a message stored in the old shape, where attachments were
+    /// links appended to its text: the text without them, and the list. Not
+    /// an edit, so not marked as one.
+    pub fn repair_message_media(&self, buffer_id: &str, msg_id: &str, body: &str, attachments: &[Attachment]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(attachments)?;
+        let rows = conn.execute(
+            "UPDATE messages SET body = ?1, attachments = ?2 WHERE buffer_id = ?3 AND msg_id = ?4",
+            params![body, json, buffer_id, msg_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     /// Replaces a message's attachment list without touching its text or
     /// marking it edited - for a cached preview arriving, or links being
     /// re-signed after they expired. Neither is a change the sender made.

@@ -92,6 +92,7 @@ pub fn join_voice(
     // Recorded before the join, since the handshake it triggers can complete
     // before this function returns.
     state.voice.set_options(account_id, options);
+    state.voice.note_flags(account_id, !options.transmit, !options.transmit);
 
     sender.send(
         json!({
@@ -261,6 +262,7 @@ pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) 
 /// microphone without saying so leaves everyone else looking at a live
 /// microphone icon wondering why you have gone quiet.
 pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, deafened: bool) -> bool {
+    state.voice.note_flags(account_id, muted, deafened);
     let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
     let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else { return false };
     sender
@@ -273,7 +275,9 @@ pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, dea
                     "channel_id": channel_id,
                     "self_mute": muted,
                     "self_deaf": deafened,
-                    "self_video": false
+                    // Repeated with every change: the gateway takes the
+                    // three together, and leaving it out turns a camera off.
+                    "self_video": state.voice.camera_on(account_id)
                 }
             })
             .to_string(),
@@ -298,4 +302,45 @@ pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
     sender
         .send(json!({ "op": 4, "d": { "guild_id": null, "channel_id": null, "self_mute": true, "self_deaf": true } }).to_string())
         .is_ok()
+}
+
+/// Asks to speak on a stage, or takes the request back.
+///
+/// The hand goes up as a timestamp, which is what orders the queue the
+/// stage's moderators see; down is the same field cleared.
+pub async fn set_stage_hand(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, raised: bool) -> Result<()> {
+    let when = raised.then(|| chrono::Utc::now().to_rfc3339());
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "request_to_speak_timestamp": when })).await
+}
+
+/// Moves this account onto the stage or back into the audience.
+///
+/// Back to the audience is always allowed. Onto the stage is allowed to a
+/// moderator, or to somebody a moderator has invited up; anyone else is
+/// refused by Discord, and the refusal is what the caller shows.
+pub async fn set_stage_speaker(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, speaking: bool) -> Result<()> {
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "suppress": !speaking })).await
+}
+
+async fn patch_own_voice_state(state: &AppState, account_id: &str, guild_id: &str, body: Value) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let resp = send_write(
+        http_client_for(&cfg.token)
+            .patch(format!("{API_BASE}/guilds/{guild_id}/voice-states/@me"))
+            .header("Authorization", &cfg.token)
+            .json(&body),
+    )
+    .await
+    .context("changing your place on the stage")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        // 403 is the ordinary answer to stepping up uninvited, and worth
+        // saying in words rather than as a status line.
+        if status == reqwest::StatusCode::FORBIDDEN {
+            bail!("only a stage moderator, or somebody a moderator has invited up, can speak");
+        }
+        bail!("Discord API error {status}: {text}");
+    }
+    Ok(())
 }

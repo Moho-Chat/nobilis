@@ -57,6 +57,7 @@ pub mod receipts;
 pub mod recentemoji;
 pub mod relock;
 pub mod send;
+pub mod forward;
 pub mod server;
 pub mod sync;
 pub mod timeline;
@@ -73,6 +74,7 @@ pub use sync::*;
 // the files beside it want the helpers.
 use timeline::*;
 pub use auth::*;
+pub use qrlogin::{confirm_check_code, start_qr_login};
 pub mod backup;
 pub mod crypto;
 pub mod http;
@@ -94,6 +96,7 @@ pub mod stickers;
 pub mod tags;
 pub mod rooms;
 pub mod verification;
+pub mod qrlogin;
 
 use crate::accounts::MatrixAccountConfig;
 use crate::model;

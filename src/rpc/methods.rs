@@ -98,9 +98,9 @@ fn reconnect_routed(state: &AppState) {
 /// The service an account-creating request belongs to.
 fn adding_service(method: &str) -> Option<&'static str> {
     match method {
-        "addDiscordAccount" | "addDiscordAccountPassword" | "addDiscordAccountToken" | "submitDiscordMfa" => Some("discord"),
+        "addDiscordAccount" | "addDiscordAccountToken" => Some("discord"),
         "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
-        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" => Some("matrix"),
+        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
         _ => None,
     }
@@ -1366,6 +1366,22 @@ pub async fn dispatch(
             }
         }
 
+        // Re-signs the attachment links of messages the window could not
+        // show, batched with any re-sign already running for the buffer. The
+        // fresh links arrive as messageUpdated.
+        "resignDiscordAttachments" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("resignDiscordAttachments requires \"bufferId\"".to_string()));
+            };
+            let ids: Vec<String> = params
+                .get("messageIds")
+                .and_then(|v| v.as_array())
+                .map(|list| list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            backend::discord::resign_messages(state.clone(), buffer_id.to_string(), ids);
+            (Some(ok_node()), None)
+        }
+
         // Repairs scrollback by re-reading recent history and storing only
         // what is missing. With no "bufferId" it sweeps every Discord buffer,
         // which is the useful shape after a storage bug: the messages that
@@ -2205,8 +2221,8 @@ pub async fn dispatch(
                                 .runtime
                                 .discord_voice_channels(id, g)
                                 .into_iter()
-                                .find(|(c, _, _)| *c == channel_id)
-                                .map(|(_, n, _)| n)
+                                .find(|c| c.id == channel_id)
+                                .map(|c| c.name)
                         })
                         .or_else(|| {
                             state
@@ -2228,6 +2244,11 @@ pub async fn dispatch(
                         // A call with no guild is a one-to-one call, which a
                         // client shows differently.
                         "isDirect": guild_id.is_none(),
+                        // And a stage is listened to, which a client shows
+                        // differently again.
+                        "stage": guild_id.as_deref().is_some_and(|g| {
+                            state.runtime.discord_voice_channels(id, g).iter().any(|c| c.id == channel_id && c.stage)
+                        }),
                     }))
                 })
                 .collect();
@@ -2264,6 +2285,9 @@ pub async fn dispatch(
                     serde_json::json!({
                         "accountId": id,
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
+                        // After echo cancellation and noise suppression: what
+                        // actually goes out, which the raw level above is not.
+                        "sentPeak": state.voice.take_sent_peak(id),
                         "heardPeak": heard,
                         "receivedSamples": received,
                         // Who is audible right now, so a call view can ring
@@ -2581,7 +2605,8 @@ pub async fn dispatch(
                 .runtime
                 .discord_voice_channels(account_id, guild_id)
                 .into_iter()
-                .map(|(id, name, limit)| {
+                .map(|channel| {
+                    let crate::runtime::VoiceChannelEntry { id, name, user_limit: limit, stage } = channel;
                     let others = state.runtime.discord_voice_occupants(account_id, &id, &own);
                     // Everyone including us, since a channel list has to show
                     // you your own presence; `empty` deliberately still means
@@ -2596,6 +2621,9 @@ pub async fn dispatch(
                         "id": id,
                         "name": name,
                         "userLimit": limit,
+                        "stage": stage,
+                        // Only while the stage is live.
+                        "topic": if stage { state.runtime.discord_stage_topic(account_id, &id) } else { None },
                         "occupants": others.len(),
                         "empty": others.is_empty(),
                         "members": members
@@ -2620,6 +2648,182 @@ pub async fn dispatch(
                 transmit: params.get("transmit").and_then(|v| v.as_bool()).unwrap_or(false),
             };
             match backend::discord::join_voice(state, account_id, guild_id, channel_id, options) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // How loud a call is: overall, or one person in it. Answered with
+        // the preferences as they now stand, like the device choice.
+        "setVoiceVolume" => {
+            let volume = params.get("volume").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+            let volume = volume.clamp(0.0, crate::audio::MAX_VOLUME);
+            let user = p_str_opt(params, "userId").map(str::to_string);
+            let prefs = state.voice_prefs.update(|p| match user {
+                // Back at 100% is forgotten rather than stored, so the file
+                // only lists the people somebody actually changed.
+                Some(user) if (volume - 1.0).abs() < 0.005 => {
+                    p.user_volumes.remove(&user);
+                }
+                Some(user) => {
+                    p.user_volumes.insert(user, volume);
+                }
+                None => p.output_volume = volume,
+            });
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
+        // A guild's scheduled events. The count is cheap and answers whether
+        // the channel list shows an events row at all; the list reads REST,
+        // for how many are interested and whether this account is.
+        "discordEventCount" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("discordEventCount requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            (Some(backend::discord::events::summary(state, account_id, guild_id)), None)
+        }
+
+        "listDiscordEvents" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("listDiscordEvents requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            match backend::discord::events::list(state, account_id, guild_id).await {
+                Ok(list) => (Some(serde_json::json!(list)), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "createDiscordEvent" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("createDiscordEvent requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            let new = backend::discord::events::NewEvent {
+                name: p_str(params, "name", ""),
+                description: p_str(params, "description", ""),
+                start: p_str(params, "start", ""),
+                end: p_str_opt(params, "end"),
+                kind: p_str(params, "kind", "voice"),
+                channel_id: p_str_opt(params, "channelId"),
+                location: p_str_opt(params, "location"),
+            };
+            match backend::discord::events::create(state, account_id, guild_id, &new).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Start an event now, end one that is on, or cancel one to come.
+        "setDiscordEventStatus" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("setDiscordEventStatus requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            let status = match p_str(params, "status", "") {
+                "start" => 2,
+                "end" => 3,
+                "cancel" => 4,
+                other => return (None, Some(format!("no such change to an event: {other:?}"))),
+            };
+            match backend::discord::events::set_status(state, account_id, guild_id, event_id, status).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Sharing an event: the invite link to copy, and the friends to
+        // send it to.
+        "discordEventInvite" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("discordEventInvite requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            match backend::discord::events::invite_link(state, account_id, guild_id, event_id).await {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "discordEventShareTargets" => {
+            let (account_id, guild_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId")) {
+                (Some(a), Some(g)) => (a, g),
+                _ => return (None, Some("discordEventShareTargets requires \"accountId\" and \"guildId\"".to_string())),
+            };
+            (Some(serde_json::json!(backend::discord::events::share_targets(state, account_id, guild_id).await)), None)
+        }
+
+        "setDiscordEventInterest" => {
+            let (account_id, guild_id, event_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "eventId")) {
+                    (Some(a), Some(g), Some(e)) => (a, g, e),
+                    _ => return (None, Some("setDiscordEventInterest requires \"accountId\", \"guildId\" and \"eventId\"".to_string())),
+                };
+            match backend::discord::events::set_interested(state, account_id, guild_id, event_id, p_bool(params, "on", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The soundboard of the call this account is in: what can be played,
+        // and playing one.
+        "listSoundboard" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("listSoundboard requires \"accountId\"".to_string()));
+            };
+            let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+            let guild = state.voice.current_channel(account_id).and_then(|(g, _)| g);
+            (Some(serde_json::json!(backend::discord::soundboard::list(state, account_id, guild.as_deref(), &token).await)), None)
+        }
+
+        "playSoundboard" => {
+            let (account_id, sound_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "soundId")) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return (None, Some("playSoundboard requires \"accountId\" and \"soundId\"".to_string())),
+            };
+            let Some((_, channel)) = state.voice.current_channel(account_id) else {
+                return (None, Some("not in a call".to_string()));
+            };
+            match backend::discord::soundboard::play(state, account_id, &channel, sound_id, p_str_opt(params, "guildId")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Echo cancellation and noise suppression on a call's microphone.
+        // Either or both; a call in progress follows within 20ms.
+        "setVoiceProcessing" => {
+            let echo = params.get("echoCancellation").and_then(|v| v.as_bool());
+            let noise = params.get("noiseSuppression").and_then(|v| v.as_bool());
+            let prefs = state.voice_prefs.update(|p| {
+                if let Some(e) = echo {
+                    p.echo_cancellation = e;
+                }
+                if let Some(n) = noise {
+                    p.noise_suppression = n;
+                }
+            });
+            (Some(serde_json::to_value(prefs).unwrap()), None)
+        }
+
+        // A stage: asking to speak, and moving between the audience and the
+        // speakers. Both are this account's own voice state in that guild.
+        "setStageHand" | "setStageSpeaker" => {
+            let (account_id, guild_id, channel_id) =
+                match (p_str_opt(params, "accountId"), p_str_opt(params, "guildId"), p_str_opt(params, "channelId")) {
+                    (Some(a), Some(g), Some(c)) => (a, g, c),
+                    _ => return (None, Some(format!("{method} requires \"accountId\", \"guildId\" and \"channelId\""))),
+                };
+            let on = p_bool(params, "on", false);
+            let done = if method == "setStageHand" {
+                backend::discord::set_stage_hand(state, account_id, guild_id, channel_id, on).await
+            } else {
+                backend::discord::set_stage_speaker(state, account_id, guild_id, channel_id, on).await
+            };
+            match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -3093,21 +3297,6 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
-        // Username/password as an alternative to scanning a QR code. Same
-        // async-kickoff shape: a two-factor challenge arrives as a
-        // discordLoginMfa event (answer it with submitDiscordMfa), and
-        // everything else ends in discordLoginResult.
-        "addDiscordAccountPassword" => {
-            let (login, password) = match (p_str_opt(params, "login"), p_str_opt(params, "password")) {
-                (Some(l), Some(p)) => (l.to_string(), p.to_string()),
-                _ => return (None, Some("addDiscordAccountPassword requires \"login\" and \"password\"".to_string())),
-            };
-            let login_id = format!("discord-login-{}", crate::model::next_message_id());
-            let reauth = p_str_opt(params, "accountId").map(String::from);
-            backend::discord::start_password_login(state.clone(), login_id.clone(), login, password, reauth);
-            (Some(serde_json::json!({ "loginId": login_id })), None)
-        }
-
         // A token a frontend already obtained, by signing in on Discord's own
         // login page in a real browser window.
         //
@@ -3126,17 +3315,6 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
-        }
-
-        // The authenticator (or backup) code for a login that reported
-        // discordLoginMfa. The ticket it needs is held against the loginId.
-        "submitDiscordMfa" => {
-            let (login_id, code) = match (p_str_opt(params, "loginId"), p_str_opt(params, "code")) {
-                (Some(l), Some(c)) => (l.to_string(), c.to_string()),
-                _ => return (None, Some("submitDiscordMfa requires \"loginId\" and \"code\"".to_string())),
-            };
-            backend::discord::submit_mfa_code(state.clone(), login_id, code);
-            (Some(ok_node()), None)
         }
 
         // Tor bootstrap + login (+ a possible proof-of-work solve) can take
@@ -3477,6 +3655,28 @@ pub async fn dispatch(
         // with an OAuth provider rather than with itself. Nothing here takes
         // a password, which is the point: the approval happens in a browser
         // the person is already signed in to.
+        // Signing in by QR code: moho shows the code, the person's phone
+        // scans it and approves - see backend/matrix/qrlogin.rs.
+        "addMatrixAccountQr" => {
+            let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
+                return (None, Some("addMatrixAccountQr requires \"homeserverUrl\"".to_string()));
+            };
+            let login_id = format!("matrix-qr-{}", crate::model::next_message_id());
+            backend::matrix::start_qr_login(state.clone(), login_id.clone(), homeserver_url.to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The two digits the phone shows, for a QR sign-in waiting on them.
+        "confirmMatrixQrCode" => {
+            let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), params.get("code").and_then(|v| v.as_u64())) else {
+                return (None, Some("confirmMatrixQrCode requires \"loginId\" and \"code\"".to_string()));
+            };
+            match backend::matrix::confirm_check_code(login_id, code.min(255) as u8) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "addMatrixAccountDeviceCode" => {
             let Some(homeserver_url) = p_str_opt(params, "homeserverUrl") else {
                 return (None, Some("addMatrixAccountDeviceCode requires \"homeserverUrl\"".to_string()));
@@ -3502,6 +3702,9 @@ pub async fn dispatch(
                         "delegated": true,
                         "issuer": m.issuer,
                         "accountManagementUri": m.account_management_uri,
+                        // Whether a QR sign-in can work here: the server says it
+                        // keeps sign-in mailboxes (MSC4108).
+                        "qr": backend::matrix::qrlogin::advertises_qr(&resolved).await,
                     })),
                     None,
                 ),
@@ -4575,17 +4778,26 @@ pub async fn dispatch(
         // stream; the connection it answers with is opened in the
         // background, and frames follow once it is up.
         "startDiscordScreenShare" | "stopDiscordScreenShare" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some(format!("{method} requires \"bufferId\"")));
+            // Where the stream goes: the voice channel the account is in,
+            // named by the account - which is the only way to name a guild's
+            // voice channel, since it is no conversation and has no buffer -
+            // or, as before, a DM's conversation.
+            let (account_id, guild_id, channel_id) = if let Some(buffer_id) = p_str_opt(params, "bufferId") {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                    return (None, Some("no such buffer".to_string()));
+                };
+                let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+                    return (None, Some("that conversation has no channel".to_string()));
+                };
+                (buffer.account_id.clone(), state.runtime.get_discord_guild(buffer_id), channel_id)
+            } else if let Some(account_id) = p_str_opt(params, "accountId") {
+                let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else {
+                    return (None, Some("not in a call".to_string()));
+                };
+                (account_id.to_string(), guild_id, channel_id)
+            } else {
+                return (None, Some(format!("{method} requires \"accountId\" or \"bufferId\"")));
             };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such buffer".to_string()));
-            };
-            let account_id = buffer.account_id.clone();
-            let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
-                return (None, Some("that conversation has no channel".to_string()));
-            };
-            let guild_id = state.runtime.get_discord_guild(buffer_id);
             let user_id = state.accounts.get_discord(&account_id).map(|a| a.user_id).unwrap_or_default();
             let key = backend::discord::golive::StreamKey {
                 guild_id: guild_id.clone(),
@@ -4597,6 +4809,21 @@ pub async fn dispatch(
                 // window says otherwise.
                 let sound = params.get("audio").and_then(|v| v.as_bool()).unwrap_or(true);
                 backend::discord::golive::set_sound(&account_id, sound);
+                // The size, rate and bitrate the window will encode at, so the
+                // server tells viewers the truth. Clamped to what this
+                // account's tier allows, which is what Discord itself enforces
+                // in its own client.
+                let limit = backend::discord::golive::stream_limit(state.runtime.discord_premium(&account_id));
+                let default = backend::discord::voiceconn::VideoQuality::default();
+                backend::discord::golive::set_quality(
+                    &account_id,
+                    backend::discord::voiceconn::VideoQuality {
+                        width: p_i64(params, "width", default.width as i64).clamp(16, 3840) as u32,
+                        height: (p_i64(params, "height", default.height as i64) as u32).clamp(16, limit.max_height),
+                        framerate: (p_i64(params, "framerate", default.framerate as i64) as u32).clamp(1, limit.max_framerate),
+                        bitrate: p_i64(params, "bitrate", default.bitrate as i64).clamp(100_000, 10_000_000) as u32,
+                    },
+                );
                 backend::discord::golive::start(state, &account_id, guild_id.as_deref(), &channel_id)
             } else {
                 backend::discord::golive::close(&account_id);
@@ -4681,10 +4908,59 @@ pub async fn dispatch(
             let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(frame) else {
                 return (None, Some("that frame is not base64".to_string()));
             };
-            match backend::discord::golive::send_frame(account_id, &bytes, timestamp).await {
+            // A camera goes on the voice connection, a screen on the stream's
+            // own; the encoder in the window is the same for both.
+            let sent = if p_str(params, "kind", "screen") == "camera" {
+                backend::discord::voice::send_camera_frame(state, account_id, &bytes, timestamp).await
+            } else {
+                backend::discord::golive::send_frame(account_id, &bytes, timestamp).await
+            };
+            match sent {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // This end's camera in a Discord call, on or off. The picture itself
+        // follows as `sendDiscordVideoFrame` with `kind: "camera"`.
+        "setDiscordCamera" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setDiscordCamera requires \"accountId\"".to_string()));
+            };
+            let on = p_bool(params, "on", false);
+            let default = backend::discord::voiceconn::VideoQuality::default();
+            let quality = backend::discord::voiceconn::VideoQuality {
+                width: p_i64(params, "width", default.width as i64).clamp(16, 3840) as u32,
+                height: p_i64(params, "height", default.height as i64).clamp(16, 2160) as u32,
+                framerate: p_i64(params, "framerate", default.framerate as i64).clamp(1, 60) as u32,
+                bitrate: p_i64(params, "bitrate", default.bitrate as i64).clamp(100_000, 10_000_000) as u32,
+            };
+            match backend::discord::voice::set_camera(state, account_id, on, quality) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Whether a camera frame sent now would reach anybody - the group
+        // has formed - so the window opens the camera only once it would.
+        "discordCameraReady" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordCameraReady requires \"accountId\"".to_string()));
+            };
+            (Some(serde_json::json!({ "ready": backend::discord::voice::camera_ready(state, account_id) })), None)
+        }
+
+        // How good a stream this account may send. Discord ties it to the
+        // account's tier, and its own client offers nothing above that.
+        "discordStreamLimits" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("discordStreamLimits requires \"accountId\"".to_string()));
+            };
+            let limit = backend::discord::golive::stream_limit(state.runtime.discord_premium(account_id));
+            (
+                Some(serde_json::json!({ "maxHeight": limit.max_height, "maxFramerate": limit.max_framerate, "source": limit.source })),
+                None,
+            )
         }
 
         // Whether the stream connection is up and wants frames. The window
@@ -4775,6 +5051,16 @@ pub async fn dispatch(
         // machine is cleaned up afterwards, in that order: an account removed
         // here while the server still holds it would leave somebody with an
         // account they can no longer reach from the client that made it.
+        // How an account can be closed - here with its password, or on its
+        // provider's account page - asked before offering either.
+        "matrixDeactivationRoute" => match p_str_opt(params, "accountId") {
+            None => (None, Some("matrixDeactivationRoute requires \"accountId\"".to_string())),
+            Some(id) => match backend::matrix::account::deactivation_route(state, id).await {
+                Ok(route) => (Some(route), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            },
+        },
+
         "deactivateMatrixAccount" => {
             let (account_id, password) = match (p_str_opt(params, "accountId"), p_str_opt(params, "password")) {
                 (Some(a), Some(p)) => (a, p),
@@ -5075,6 +5361,50 @@ pub async fn dispatch(
             (Some(serde_json::json!(out)), None)
         }
 
+        // A Discord account's stickers: every guild's, each marked with
+        // whether it can go in this conversation.
+        "listDiscordStickers" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listDiscordStickers requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let token = state.accounts.get_discord(&buffer.account_id).map(|c| c.token).unwrap_or_default();
+            (Some(serde_json::json!(backend::discord::stickers::list(state, &buffer.account_id, buffer_id, &token).await)), None)
+        }
+
+        // A Lottie sticker's animation, fetched once and kept: the window
+        // plays it from disk, because the CDN will not let a page read it.
+        "discordStickerArt" => {
+            let (account_id, sticker_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "stickerId")) {
+                (Some(a), Some(s)) => (a, s),
+                _ => return (None, Some("discordStickerArt requires \"accountId\" and \"stickerId\"".to_string())),
+            };
+            let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+            match backend::discord::stickers::lottie_file(&token, sticker_id).await {
+                Ok(path) => (Some(serde_json::json!({ "path": path })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "sendDiscordSticker" => {
+            let (buffer_id, sticker_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "stickerId")) {
+                (Some(b), Some(s)) => (b, s),
+                _ => return (None, Some("sendDiscordSticker requires \"bufferId\" and \"stickerId\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such buffer".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_discord(&buffer.account_id) else {
+                return (None, Some("account not connected".to_string()));
+            };
+            match backend::discord::stickers::send(state, buffer_id, &cfg.token, sticker_id).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "sendMatrixSticker" => {
             let (buffer_id, mxc) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "mxc")) {
                 (Some(b), Some(m)) => (b, m),
@@ -5277,61 +5607,39 @@ pub async fn dispatch(
             let (Some(source), Some(target)) = (state.runtime.get_buffer(from_buffer), state.runtime.get_buffer(to_buffer)) else {
                 return (None, Some("no such conversation".to_string()));
             };
-            // Discord forwards natively; everywhere else a forward is a copy,
-            // and a copy of somebody's words sent as your own is a different
-            // thing - so it is quoted and attributed rather than passed off.
-            if source.account_id.starts_with("discord:") && target.account_id == source.account_id {
-                let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
-                    return (None, Some("account not connected".to_string()));
-                };
-                return match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
+            // Forwarded the way each service forwards, or not at all. A quoted
+            // copy posted as yours is not a forward, so nothing imitates one.
+            //
+            // Discord's is its own message type and does not leave the
+            // account. Matrix's is the original content sent again - the same
+            // upload, the same formatting - and an mxc resolves from any
+            // homeserver, so it can go from one Matrix account to another.
+            match (crate::model::service_of(&source.account_id), crate::model::service_of(&target.account_id)) {
+                ("discord", "discord") if target.account_id == source.account_id => {
+                    let Some(cfg) = state.accounts.get_discord(&source.account_id) else {
+                        return (None, Some("account not connected".to_string()));
+                    };
+                    match backend::discord::forward_message(state, from_buffer, message_id, to_buffer, &cfg.token).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                ("matrix", "matrix") => match backend::matrix::forward::forward_message(
+                    state,
+                    &source.account_id,
+                    from_buffer,
+                    message_id,
+                    &target.account_id,
+                    to_buffer,
+                )
+                .await
+                {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
-                };
-            }
-            // The copy: what was said, who said it, quoted so it reads as
-            // theirs.
-            let Some(original) = state.store.get_message(from_buffer, message_id).ok().flatten() else {
-                return (None, Some("that message is no longer here to send on".to_string()));
-            };
-            let quoted: String = original
-                .body
-                .lines()
-                .map(|line| format!("> {line}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let body = format!("Forwarded from {}:\n{quoted}", original.from);
-            // Sent the way any other message is, per service. Not by calling
-            // back into this dispatcher: an async function that calls itself
-            // has to be boxed, and one branch of one method is not worth
-            // boxing every call in the daemon.
-            match crate::model::service_of(&target.account_id) {
-                "matrix" => match state.accounts.get_matrix(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(cfg) => match backend::matrix::send_message(state, &target.account_id, to_buffer, &cfg.access_token, &body, None, false, None).await {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
                 },
-                "discord" => match state.accounts.get_discord(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(cfg) => match backend::discord::send_message(state, to_buffer, &cfg.token, &body, None).await {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
-                },
-                "irc" => match state.runtime.irc_sender(&target.account_id) {
-                    None => (None, Some("account not connected".to_string())),
-                    Some(sender) => match backend::irc::send_message(state, &target.account_id, &sender, &target.name, &body) {
-                        Ok(()) => (Some(ok_node()), None),
-                        Err(e) => (None, Some(format!("{e:#}"))),
-                    },
-                },
-                // Kick and Sneedchat both send a line of text and nothing
-                // else, which is what this is.
                 _ => (
                     None,
-                    Some("forwarding into this conversation is not supported yet".to_string()),
+                    Some("forwarding goes within one Discord account, or between Matrix rooms".to_string()),
                 ),
             }
         }
@@ -5673,5 +5981,8 @@ fn voice_member_json(m: &crate::runtime::VoiceRosterEntry, own: &str) -> Value {
         "video": m.flags.video,
         "muted": m.flags.muted,
         "deafened": m.flags.deafened,
+        // A stage's audience, and who among it has asked to speak.
+        "suppressed": m.flags.suppressed,
+        "handRaised": m.flags.hand_raised,
     })
 }

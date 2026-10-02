@@ -73,11 +73,15 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
     Some(format!("file://{}", path.display()))
 }
 
-/// Buffers with a re-sign already running, so a burst of getBacklog calls
-/// (opening, scrolling, opening again) issues one sweep rather than several
-/// against a rate-limited endpoint.
-pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+/// Buffers with a re-sign running, and the messages queued behind it.
+///
+/// One sweep per buffer at a time, so a burst of getBacklog calls (opening,
+/// scrolling, opening again) does not fan out against a rate-limited
+/// endpoint. What arrives while one runs is queued for it rather than dropped:
+/// dropping was what left a page scrolled to mid-sweep with dead links for
+/// good, because nothing would ask for it again.
+pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
+    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
         std::sync::OnceLock::new();
     IN_FLIGHT.get_or_init(Default::default)
 }
@@ -100,21 +104,59 @@ pub(super) const MAX_RESIGN_FETCHES: usize = 3;
 /// Runs in the background: the buffer opens immediately showing cached
 /// previews, and re-signed links arrive as messageUpdated events.
 pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[crate::model::Message]) {
-    let stale = stale_message_ids(messages);
-    if stale.is_empty() {
+    resign_messages(state, buffer_id, stale_message_ids(messages));
+}
+
+/// Re-signs these messages' attachments, batched with whatever else this
+/// buffer has waiting.
+///
+/// The window names messages itself when a picture it is showing would not
+/// load - a link that lapsed between the page being read and being drawn, or
+/// one that failed for a reason its expiry does not show.
+pub fn resign_messages(state: AppState, buffer_id: String, ids: Vec<String>) {
+    if ids.is_empty() {
         return;
     }
-
-    if !resigning().lock().unwrap().insert(buffer_id.clone()) {
-        return;
+    {
+        let mut all = resigning().lock().unwrap();
+        if let Some(queued) = all.get_mut(&buffer_id) {
+            for id in ids {
+                if !queued.contains(&id) {
+                    queued.push(id);
+                }
+            }
+            return;
+        }
+        all.insert(buffer_id.clone(), Vec::new());
     }
 
     tokio::spawn(async move {
-        if let Err(e) = run_resign(&state, &buffer_id, stale).await {
-            tracing::debug!("discord: re-signing {buffer_id}: {e}");
+        let mut batch = ids;
+        loop {
+            sort_newest_first(&mut batch);
+            if let Err(e) = run_resign(&state, &buffer_id, batch).await {
+                tracing::debug!("discord: re-signing {buffer_id}: {e}");
+            }
+            // Whatever queued up meanwhile is the next batch; the entry goes
+            // only once there is nothing left, under the same lock a caller
+            // queues under, so nothing can be added to a sweep that has
+            // already finished.
+            let mut all = resigning().lock().unwrap();
+            match all.get_mut(&buffer_id) {
+                Some(queued) if !queued.is_empty() => batch = std::mem::take(queued),
+                _ => {
+                    all.remove(&buffer_id);
+                    break;
+                }
+            }
         }
-        resigning().lock().unwrap().remove(&buffer_id);
     });
+}
+
+/// Newest first, which is most likely what is on screen. Discord ids are
+/// snowflakes: lexicographically ordered for equal length, and longer is newer.
+fn sort_newest_first(ids: &mut [String]) {
+    ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
 }
 
 /// Which messages in a page carry a lapsed attachment link, newest first.
@@ -132,13 +174,66 @@ pub(super) fn stale_message_ids(messages: &[crate::model::Message]) -> Vec<Strin
             m.attachments
                 .iter()
                 .any(|a| a.url.as_deref().is_some_and(attachment_expired))
+                || stored_in_old_shape(m)
         })
         .map(|m| m.id.clone())
         .collect();
-    // Discord ids are snowflakes: lexicographically ordered for equal length,
-    // and longer means newer, so sort by length first.
-    ids.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| b.cmp(a)));
+    sort_newest_first(&mut ids);
     ids
+}
+
+/// Whether a message was stored before attachments were kept as a list
+/// (nobilis 9351109, 21 August 2026), when they were appended to the text as
+/// links. Nothing re-signs a link in the text, so these stayed dead.
+///
+/// A candidate only: somebody pasting a file link into what they wrote looks
+/// the same from here. Which links really are the message's own attachments
+/// is settled against Discord's copy of it - see `strip_attachment_links`.
+///
+/// Also a Lottie sticker stored before it could be drawn, as the line
+/// "sent a sticker: <name>".
+pub(super) fn stored_in_old_shape(m: &crate::model::Message) -> bool {
+    m.attachments.is_empty()
+        && (m.body.contains("cdn.discordapp.com/attachments/")
+            || m.body.contains("media.discordapp.net/attachments/")
+            || m.body.lines().any(|l| l.starts_with(STICKER_LINE)))
+}
+
+const STICKER_LINE: &str = "sent a sticker: ";
+
+/// A link without its signature, which is what stays the same when Discord
+/// signs it again - and on either of its two hosts.
+fn unsigned(url: &str) -> String {
+    url.split('?').next().unwrap_or(url).replace("media.discordapp.net", "cdn.discordapp.com")
+}
+
+/// The text with the links that are really these attachments taken out, and
+/// whatever else it said left exactly as stored.
+pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> String {
+    let own: Vec<String> = attachments.iter().filter_map(|a| a.url.as_deref()).map(unsigned).collect();
+    // The names of the Lottie stickers it carries, whose old stand-in line
+    // goes now that they can be drawn.
+    let stickers: Vec<String> = attachments
+        .iter()
+        .filter(|a| a.kind == "lottie")
+        .filter_map(|a| a.filename.as_deref())
+        .map(|f| f.trim_end_matches(".json").to_string())
+        .collect();
+    let kept: Vec<String> = body
+        .lines()
+        .filter(|line| !line.strip_prefix(STICKER_LINE).is_some_and(|name| stickers.iter().any(|s| s == name)))
+        .filter_map(|line| {
+            let left = line
+                .split(' ')
+                .filter(|word| !(word.starts_with("http") && own.contains(&unsigned(word))))
+                .collect::<Vec<_>>()
+                .join(" ");
+            // A line that was only the link goes with it; a blank line the
+            // sender wrote stays.
+            (line.trim().is_empty() || !left.trim().is_empty()).then_some(left)
+        })
+        .collect();
+    kept.join("\n").trim().to_string()
 }
 
 pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -> Result<()> {
@@ -175,7 +270,19 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
             if attachments.is_empty() {
                 continue;
             }
-            if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
+            // Stored in the old shape: the links come out of the text as the
+            // list goes in, or the picture would show twice - once as itself
+            // and once as a dead link under it.
+            let old = state.store.get_message(buffer_id, id).ok().flatten().filter(stored_in_old_shape);
+            if let Some(old) = old {
+                let body = strip_attachment_links(&old.body, &attachments);
+                if state.store.repair_message_media(buffer_id, id, &body, &attachments).unwrap_or(false) {
+                    state.events.emit(
+                        "messageUpdated",
+                        json!({ "bufferId": buffer_id, "id": id, "edited": false, "body": body, "attachments": attachments.clone() }),
+                    );
+                }
+            } else if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
                 state.events.emit(
                     "messageUpdated",
                     json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments.clone() }),
@@ -459,14 +566,24 @@ pub(super) fn thumbnail_source(url: &str, width: u32, height: u32) -> Option<Str
 /// The `ex=` query parameter is the link's expiry, as a hex unix timestamp.
 /// Reading it lets a stale link be recognised before it is requested, rather
 /// than after a failed load.
+///
+/// "Expired" includes the last ten minutes before it lapses: a page read now
+/// is looked at for a while, and a link that dies while it is on screen is the
+/// picture that goes blank for no visible reason.
 pub(super) fn attachment_expired(url: &str) -> bool {
+    expires_within(url, EXPIRY_MARGIN_SECS)
+}
+
+const EXPIRY_MARGIN_SECS: u64 = 600;
+
+fn expires_within(url: &str, margin: u64) -> bool {
     let Some(ex) = url.split(['?', '&']).find_map(|p| p.strip_prefix("ex=")) else { return false };
     let Ok(expiry) = u64::from_str_radix(ex, 16) else { return false };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now >= expiry
+    now + margin >= expiry
 }
 
 #[cfg(test)]
@@ -551,6 +668,58 @@ mod tests {
         assert!(!attachment_expired(future));
         // An unsigned link has no expiry to read, so it is never "expired".
         assert!(!attachment_expired("https://example.com/a.png"));
+    }
+
+    /// A link a few minutes from lapsing is re-signed now, not after it has
+    /// gone blank on screen.
+    #[test]
+    fn a_link_about_to_lapse_counts_as_lapsed() {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let link = |at: u64| format!("https://cdn.discordapp.com/attachments/1/2/a.png?ex={at:x}&is=1&hm=2");
+        assert!(attachment_expired(&link(now + 120)));
+        assert!(!attachment_expired(&link(now + 3600)));
+    }
+
+    /// Only the links that are the message's own attachments come out; a
+    /// link somebody wrote stays, and so does everything else they wrote.
+    #[test]
+    fn old_attachment_links_come_out_of_the_text() {
+        let own = Attachment {
+            url: Some("https://cdn.discordapp.com/attachments/1/2/shot.png?ex=aa&is=bb&hm=cc".into()),
+            ..Default::default()
+        };
+        let body = "look at this\nhttps://cdn.discordapp.com/attachments/1/2/shot.png?ex=11&is=22&hm=33\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1";
+        assert_eq!(
+            strip_attachment_links(body, &[own.clone()]),
+            "look at this\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1"
+        );
+        // The media host is the same file.
+        assert_eq!(strip_attachment_links("https://media.discordapp.net/attachments/1/2/shot.png", &[own]), "");
+    }
+
+    #[test]
+    fn a_sticker_stand_in_goes_once_the_sticker_can_be_drawn() {
+        let sticker = Attachment { kind: "lottie".into(), filename: Some("wave.json".into()), ..Default::default() };
+        assert_eq!(strip_attachment_links("sent a sticker: wave", &[sticker.clone()]), "");
+        // Somebody else's sticker named in passing stays.
+        assert_eq!(strip_attachment_links("sent a sticker: dance", &[sticker]), "sent a sticker: dance");
+    }
+
+    #[test]
+    fn a_message_with_a_link_and_no_list_is_a_candidate() {
+        let mut m = msg("5", &[]);
+        m.body = "https://cdn.discordapp.com/attachments/1/2/a.png?ex=1".into();
+        assert_eq!(stale_message_ids(&[m]), ["5"]);
+        let mut plain = msg("6", &[]);
+        plain.body = "no links here".into();
+        assert!(stale_message_ids(&[plain]).is_empty());
+    }
+
+    #[test]
+    fn newest_messages_are_re_signed_first() {
+        let mut ids = vec!["99".to_string(), "1000".to_string(), "100".to_string()];
+        sort_newest_first(&mut ids);
+        assert_eq!(ids, ["1000", "100", "99"]);
     }
 
     #[test]

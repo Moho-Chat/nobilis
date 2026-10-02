@@ -1,10 +1,16 @@
-//! Getting a token, by any of the three doors Discord opens.
+//! Getting a token, by either of the two doors that work.
 //!
-//! A QR code scanned with a phone, a password with the MFA challenge that
-//! usually follows it, or a token somebody already has. All three end in the
-//! same place - `finish_login` - because what the rest of this backend wants
-//! is a token and an account, and it does not care which door it came
-//! through.
+//! A QR code scanned with a phone, or a token from Discord's own login page
+//! signed into in a browser window - which is where a password goes, and
+//! where its captcha, two-factor and device checks are Discord's own to run.
+//! Both end in the same place - `finish_login` - because what the rest of
+//! this backend wants is a token and an account, and it does not care which
+//! door it came through.
+//!
+//! There is no third door. Posting a password at `/auth/login` from here was
+//! tried and removed: Discord answers a third-party client with a captcha it
+//! cannot render or a flat refusal, and files each attempt against the
+//! account's standing.
 
 use super::*;
 
@@ -33,205 +39,6 @@ pub fn start_qr_login(state: AppState, login_id: String, reauth_account_id: Opti
         tracing::warn!("discord qr login[{login_id}]: {error}");
         state.events.emit("discordLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
     });
-}
-
-/// A password login that stopped at the two-factor step, waiting for a code.
-/// Discord hands back a short-lived `ticket` that stands in for the password
-/// on the follow-up request, so this is what has to survive between the two
-/// RPCs.
-pub(super) struct PendingMfa {
-    ticket: String,
-    reauth_account_id: Option<String>,
-}
-
-pub(super) fn pending_mfa() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingMfa>> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PendingMfa>>> =
-        std::sync::OnceLock::new();
-    PENDING.get_or_init(Default::default)
-}
-
-/// Username/password login, as an alternative to scanning a QR code.
-///
-/// Discord may answer with any of three things rather than a token: a
-/// two-factor challenge (handled by submit_mfa_code below), a captcha, or a
-/// plain rejection. The captcha case is reported as such and cannot be worked
-/// around from here - QR login is the way through it, since approving on an
-/// already-signed-in device is exactly the proof the captcha is asking for.
-pub fn start_password_login(
-    state: AppState,
-    login_id: String,
-    login: String,
-    password: String,
-    reauth_account_id: Option<String>,
-) {
-    tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(run_password_login(
-            &state,
-            &login_id,
-            &login,
-            &password,
-            reauth_account_id,
-        ))
-        .catch_unwind()
-        .await;
-        let error = match result {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "internal error (see nobilis logs)".to_string(),
-        };
-        tracing::warn!("discord password login[{login_id}]: {error}");
-        state.events.emit("discordLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
-    });
-}
-
-pub(super) async fn run_password_login(
-    state: &AppState,
-    login_id: &str,
-    login: &str,
-    password: &str,
-    reauth_account_id: Option<String>,
-) -> Result<()> {
-    state.events.emit("discordLoginStatus", json!({ "loginId": login_id, "detail": "signing in..." }));
-    let resp: Value = anonymous_client()
-        .post(format!("{API_BASE}/auth/login"))
-        // The full shape the endpoint declares, not the three fields that
-        // happen to be interesting. Both of the nulls are meaningful absences
-        // - no gift code was redeemed on the way in, and the sign-in came from
-        // nowhere in particular - and omitting a declared field entirely is
-        // one of the things answered with "Invalid Form Body".
-        .json(&json!({
-            "login": login,
-            "password": password,
-            "undelete": false,
-            "login_source": Value::Null,
-            "gift_code_sku_id": Value::Null
-        }))
-        .send()
-        .await
-        .context("sending login request")?
-        .json()
-        .await
-        .context("parsing login response")?;
-
-    handle_login_response(state, login_id, resp, reauth_account_id).await
-}
-
-/// Both `/auth/login` and `/auth/mfa/totp` answer with the same shape, so one
-/// place decides what happened.
-pub(super) async fn handle_login_response(
-    state: &AppState,
-    login_id: &str,
-    resp: Value,
-    reauth_account_id: Option<String>,
-) -> Result<()> {
-    if let Some(token) = resp.get("token").and_then(|v| v.as_str()) {
-        return finish_login(state, login_id, token.to_string(), reauth_account_id).await;
-    }
-
-    // A captcha is a hard stop: solving one is exactly the automated
-    // circumvention Discord puts it there to prevent, so this reports it
-    // plainly and points at the route that does work.
-    if resp.get("captcha_key").is_some() {
-        bail!("Discord asked for a captcha, which can't be answered from here - use QR login instead");
-    }
-
-    if resp.get("mfa").and_then(|v| v.as_bool()).unwrap_or(false) {
-        let ticket = resp
-            .get("ticket")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("two-factor challenge without a ticket"))?
-            .to_string();
-        pending_mfa()
-            .lock()
-            .unwrap()
-            .insert(login_id.to_string(), PendingMfa { ticket, reauth_account_id });
-        // Report which factors this account actually has, so a frontend can
-        // ask for the right thing rather than always saying "authenticator".
-        state.events.emit(
-            "discordLoginMfa",
-            json!({
-                "loginId": login_id,
-                "totp": resp.get("totp").and_then(|v| v.as_bool()).unwrap_or(true),
-                "sms": resp.get("sms").and_then(|v| v.as_bool()).unwrap_or(false),
-                "backup": resp.get("backup").and_then(|v| v.as_bool()).unwrap_or(false),
-            }),
-        );
-        return Ok(());
-    }
-
-    // Discord's own wording is the most useful thing to show here.
-    let message = resp
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Discord rejected the login and gave no reason");
-
-    // "Invalid Form Body" with nothing wrong in the body is Discord declining
-    // to accept a password from a client it does not recognise, rather than a
-    // complaint about what was typed. Worth saying plainly and at length,
-    // because the obvious response to a vague rejection is to try again, and
-    // trying again is what actually costs something: each failed sign-in
-    // raises the account's risk score, which is where the warnings on the
-    // account come from. This is a dead end, so it says so instead of looking
-    // like a typo that another attempt might fix.
-    if resp.get("code").and_then(|c| c.as_u64()) == Some(50035) {
-        let detail = form_errors(&resp)
-            .map(|d| format!(" ({d})"))
-            .unwrap_or_default();
-        bail!(
-            "Discord refused the sign-in{detail}. It generally will not accept a password from a \
-             third-party client, and each attempt counts against the account - which is where the \
-             warnings on it are coming from. Use QR login instead: approving on a device already \
-             signed in is the proof Discord is actually asking for, and it does not put the \
-             account at risk."
-        );
-    }
-
-    if let Some(detail) = form_errors(&resp) {
-        bail!("{message} ({detail})");
-    }
-    bail!("{message}")
-}
-
-/// Second half of a two-factor login: exchange the stored ticket plus the
-/// code the user typed for a real token. Accepts an authenticator code or a
-/// backup code - Discord takes both on this endpoint.
-pub fn submit_mfa_code(state: AppState, login_id: String, code: String) {
-    tokio::spawn(async move {
-        let result =
-            std::panic::AssertUnwindSafe(run_mfa_submit(&state, &login_id, &code)).catch_unwind().await;
-        let error = match result {
-            Ok(Ok(())) => return,
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "internal error (see nobilis logs)".to_string(),
-        };
-        tracing::warn!("discord mfa[{login_id}]: {error}");
-        state.events.emit("discordLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
-    });
-}
-
-pub(super) async fn run_mfa_submit(state: &AppState, login_id: &str, code: &str) -> Result<()> {
-    let pending = pending_mfa()
-        .lock()
-        .unwrap()
-        .remove(login_id)
-        .ok_or_else(|| anyhow!("that login is no longer waiting for a code - start again"))?;
-
-    state.events.emit("discordLoginStatus", json!({ "loginId": login_id, "detail": "checking code..." }));
-    let resp: Value = anonymous_client()
-        .post(format!("{API_BASE}/auth/mfa/totp"))
-        // Codes are commonly pasted with a space in the middle from an
-        // authenticator app's own display.
-        .json(&json!({ "code": code.replace(char::is_whitespace, ""), "ticket": pending.ticket }))
-        .send()
-        .await
-        .context("sending two-factor code")?
-        .json()
-        .await
-        .context("parsing two-factor response")?;
-
-    // A wrong code comes back as an ordinary rejection; the ticket is spent
-    // either way, so the flow restarts rather than silently retrying.
-    handle_login_response(state, login_id, resp, pending.reauth_account_id).await
 }
 
 pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_account_id: Option<String>) -> Result<()> {
@@ -381,7 +188,7 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     finish_login(state, login_id, token, reauth_account_id).await
 }
 
-/// Shared tail of every login route (QR, password, password+MFA): identify
+/// Shared tail of both login routes (QR and browser): identify
 /// who the token belongs to, save it, and connect.
 ///
 /// `reauth_account_id` is set when refreshing an existing account's token
