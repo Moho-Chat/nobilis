@@ -167,7 +167,14 @@ fn init_logging() {
             }
         }
     };
-    tracing_subscriber::fmt().with_max_level(level).init();
+    // Colour only for a person at a terminal. Started by the app, stdout is a
+    // pipe into moho.log - the file a bug report attaches - where the escape
+    // codes are noise wrapped around every line.
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt()
+        .with_max_level(level)
+        .with_ansi(std::io::stdout().is_terminal())
+        .init();
 }
 
 
