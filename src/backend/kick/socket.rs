@@ -72,6 +72,8 @@ fn forget_missing(state: &AppState, account_id: &str, slug: &str) {
             let _ = state.accounts.set_kick_channels(account_id, left);
         }
     }
+    // Its placeholder too, put up while it was being looked up.
+    state.runtime.remove_buffer(state, &crate::model::buffer_id(account_id, &gone));
     tracing::info!("kick[{account_id}]: {gone} is not a Kick channel any more; taken off the saved list");
     state.runtime.report_progress(state, account_id, &format!("{gone} is not on Kick any more - taken off your channels"));
 }
@@ -261,6 +263,16 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
     // page of history each, through the same pacing as everything else.
     let mut fresh = Vec::new();
     for slug in &channels {
+        // On screen from the start, marked as connecting, rather than
+        // appearing one by one as their lookups land - and a channel Kick is
+        // slow to answer for was otherwise not there at all.
+        let name = api::normalise_slug(slug);
+        if !name.is_empty() {
+            let id = state.runtime.ensure_buffer(state, account_id, &name, "channel").id;
+            if state.runtime.kick_channel(&id).is_none() {
+                state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::connecting()));
+            }
+        }
         let buffer_id = crate::model::buffer_id(account_id, &api::normalise_slug(slug));
         let Some(known) = state.runtime.kick_channel(&buffer_id) else {
             fresh.push(slug.clone());
@@ -311,6 +323,8 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                     refused.push(slug);
                 } else {
                     state.runtime.report_progress(state, account_id, &format!("{slug}: {words}"));
+                    let id = crate::model::buffer_id(account_id, &api::normalise_slug(&slug));
+                    state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::down("refused", words)));
                 }
             }
         }
@@ -382,6 +396,11 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                                 retry_later(state, account_id, handle, attempt + 1);
                             } else {
                                 state.runtime.report_progress(state, account_id, &format!("{handle}: {words}"));
+                                let id = crate::model::buffer_id(account_id, &api::normalise_slug(&handle));
+                                state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::down(
+                                    "refused",
+                                    format!("Kick wouldn't answer for {handle} - it will be tried again when the account reconnects"),
+                                )));
                             }
                         }
                     }
@@ -452,6 +471,7 @@ async fn prepare(
     // group with no rail tile is a conversation with no way to reach it:
     // receiving fine, listed by the daemon, and invisible.
     let buffer = state.runtime.ensure_buffer(state, account_id, &channel.slug, "channel");
+    state.runtime.set_buffer_link(state, &buffer.id, None);
     state.runtime.set_kick_channel(
         &buffer.id,
         crate::runtime::KickChannel {

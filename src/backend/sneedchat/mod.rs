@@ -50,6 +50,7 @@ pub use live::{leave_room, set_rooms};
 pub use send::*;
 pub mod captcha;
 pub mod form;
+pub mod health;
 pub mod http;
 pub mod pow;
 pub mod protocol;

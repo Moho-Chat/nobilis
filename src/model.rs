@@ -188,6 +188,36 @@ pub struct SneedChatRoomInfo {
 
 /// Matches Buffer JSON (daemon/nobilis/model.c's nobilis_buffer_json).
 /// `id` = "<accountId>|<name>"; `kind` is "channel"|"dm"|"server".
+/// Why a buffer is not receiving, when the account itself is fine.
+///
+/// A Sneedchat room has its own connection, an IRC channel can refuse the
+/// join, a Kick channel can be waiting on Kick - so "the account is connected"
+/// does not mean every conversation under it is. Absent when the buffer is
+/// live; the account's own state covers the case where nothing is.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct BufferLink {
+    /// "connecting" while it is being joined or retried, "down" when the
+    /// service has said no, or something between here and it has.
+    pub state: String,
+    /// What a person reads: "The chat is down - the forum is up".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Which part failed, for a client that draws them differently:
+    /// "tor", "network", "site", "chat", "refused".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+}
+
+impl BufferLink {
+    pub fn connecting() -> Self {
+        Self { state: "connecting".to_string(), detail: None, cause: None }
+    }
+
+    pub fn down(cause: &str, detail: impl Into<String>) -> Self {
+        Self { state: "down".to_string(), detail: Some(detail.into()), cause: Some(cause.to_string()) }
+    }
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct Buffer {
     pub id: String,
@@ -229,6 +259,9 @@ pub struct Buffer {
     /// is many seconds later and reads as the join having done nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub syncing: bool,
+    /// Set while this buffer's own connection is not up - see BufferLink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<BufferLink>,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
     /// not `false`, for every other protocol, since "encrypted" isn't a
     /// meaningful concept for them at all). Drives the lock/unlock
@@ -835,6 +868,7 @@ mod tests {
             category: None,
             position: 0,
             syncing: false,
+            link: None,
             encrypted: None,
             channel_modes: None,
             group_id: None,

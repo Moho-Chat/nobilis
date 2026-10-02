@@ -1419,6 +1419,7 @@ impl Runtime {
             category: None,
             position: 0,
             syncing: false,
+            link: None,
             encrypted: None,
             channel_modes: None,
             group_id: Some(model::account_group_id(account_id)),
@@ -2276,6 +2277,22 @@ impl Runtime {
     /// Marks a buffer as waiting for the service to say what is in it, and
     /// tells everybody. Emitting from here rather than leaving it to callers
     /// is what makes the room appear in the list the moment it is set.
+    /// Says whether a buffer's own connection is up, and why not when it is
+    /// not - see model::BufferLink. Broadcast only when it changes, since
+    /// a retry loop sets the same answer on every attempt.
+    pub fn set_buffer_link(&self, state: &AppState, buffer_id: &str, link: Option<model::BufferLink>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.link == link {
+                return;
+            }
+            buffer.link = link;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
     pub fn set_buffer_syncing(&self, state: &AppState, buffer_id: &str, syncing: bool) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
