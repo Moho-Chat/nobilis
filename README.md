@@ -1,7 +1,7 @@
 # nobilis
 
-A chat daemon. It speaks IRC, Discord, Sneedchat (SneedChat, the Tor-only XenForo chat feature)
-and Matrix, and translates all of them into one unified JSON model — accounts, buffers, messages
+A chat daemon. It speaks IRC, Discord, Matrix, Kick and Sneedchat (SneedChat, the chat built
+into Kiwi Farms), and translates all of them into one unified JSON model — accounts, buffers, messages
 — served over a Unix socket.
 
 Frontends talk to that model and never to a protocol. Two exist today: [moho](https://git.salastil.com/Salastil/moho),
@@ -16,7 +16,7 @@ one frontend can attach at once — the socket accepts multiple clients, each wi
 subscriptions.
 
 ```
-src/backend/      one module per protocol (irc, discord, sneedchat, matrix)
+src/backend/      one module per protocol (irc, discord, sneedchat, matrix, kick)
 src/rpc/          the Unix-socket JSON-RPC server
 src/runtime.rs    protocol-agnostic connection/buffer/message state
 src/store.rs      SQLite-backed scrollback persistence
@@ -64,25 +64,36 @@ delivered to clients that called `subscribe` for that buffer; everything else br
   (`system`, `join`, `part`, `nick`, `topic`, `matrixJoin`, `matrixInvite`, `matrixKick`,
   `matrixQuit`) is a log line, and which of those to render is the frontend's choice — nobilis
   always records them.
-- Media that nobilis fetched on the client's behalf (Tor-routed Sneedchat avatars and
-  attachments, Matrix media, the Discord login QR) is handed over as a local `file://` path or
+- Media that nobilis fetched on the client's behalf (Sneedchat avatars and attachments, Matrix
+  media, shrunk Kick emotes, Discord thumbnails and stickers, the Discord login QR) is handed over as a local `file://` path or
   filesystem path, not a remote URL. This assumes the frontend runs on the same machine.
 - `listSneedchatSmilies` returns a bare filename per smiley, resolved against `resources/sneedchat-smilies/`
   in this repository. A frontend that renders them needs its own copy of that directory.
 
 ## Protocol backends
 
-- **IRC** — TLS with SASL PLAIN, NickServ auto-identify, autojoin, optional SOCKS5 proxying.
-- **Discord** — the official cross-device QR login, a real-time gateway client, and message
-  edit/delete/reaction/reply sync.
-- **Sneedchat (SneedChat)** — the Tor-only chat built into Kiwi Farms. Runs over an embedded Tor
-  client (or an external SOCKS5 proxy), solves the site's proof-of-work anti-bot gate, and holds
-  one persistent websocket per configured room behind a single login. Avatars and attachments are
-  fetched through the same Tor session and cached locally, since a frontend has no route to a
-  `.onion` host of its own.
+A summary; moho's [ARCHITECTURE.md](https://github.com/Moho-Chat/moho/blob/master/ARCHITECTURE.md)
+has each one in full.
+
+- **IRC** — TLS with SASL (PLAIN, EXTERNAL, SCRAM-SHA-256), STS, twenty-seven IRCv3
+  capabilities including chathistory, multiline and message redaction, NickServ, DCC, and image
+  uploads to catbox, postimg, ibb.co or imgur.
+- **Discord** — QR login or Discord's own sign-in page, the user gateway, messages with
+  everything the official client does to them, threads, forums, slash commands, polls,
+  stickers, events and AutoMod. Voice, camera and Go Live streams are its own connections, with
+  DAVE end-to-end encryption, echo cancellation and the soundboard. Nothing Discord puts behind
+  a captcha is attempted.
 - **Matrix** — Client-Server API with full end-to-end encryption (vodozemac-backed Olm/Megolm via
-  `matrix-sdk-crypto`), SAS device verification, server-side key backup, and room moderation.
-- **XMPP/Slack** — not implemented.
+  `matrix-sdk-crypto`), device verification by emoji or QR, cross-signing, key backup, sliding
+  sync, spaces, polls, forwarding, room moderation, and calls including Element Call.
+- **Kick** — chat over its Pusher socket with 7TV and BTTV emotes, moderation, polls,
+  predictions and redemptions, and the stream's own HLS playlist, VODs and clips.
+- **Sneedchat (SneedChat)** — on the open internet by default, or over an embedded Tor client (or
+  an external SOCKS5 proxy) at the onion address. Solves the site's proof-of-work anti-bot gate
+  and its login captcha, and holds one persistent websocket per configured room behind a single
+  login. Avatars and attachments are fetched through the same route and cached locally.
+
+Any account on any of the five can be routed through Tor or a SOCKS5 proxy.
 
 ## On-disk state
 
