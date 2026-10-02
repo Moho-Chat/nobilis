@@ -307,8 +307,6 @@ pub async fn dispatch(
                 { "id": "discord", "name": "Discord", "available": true },
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
-                { "id": "jabber", "name": "XMPP", "available": false },
-                { "id": "slack", "name": "Slack", "available": false },
             ])),
             None,
         ),
@@ -1591,29 +1589,6 @@ pub async fn dispatch(
             }
         }
 
-        // Who this account has asked never to hear from. The account's own
-        // list, so it agrees with Element and travels to every client.
-        "listMatrixIgnored" => match p_str_opt(params, "accountId") {
-            None => (None, Some("listMatrixIgnored requires \"accountId\"".to_string())),
-            Some(account_id) => {
-                let mut users: Vec<String> = state.runtime.matrix_ignored(account_id).into_iter().collect();
-                users.sort();
-                (Some(serde_json::json!({ "accountId": account_id, "users": users })), None)
-            }
-        },
-
-        "setMatrixIgnored" => {
-            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
-                (Some(a), Some(u)) => (a, u),
-                _ => return (None, Some("setMatrixIgnored requires \"accountId\" and \"userId\"".to_string())),
-            };
-            let ignored = params.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
-            match backend::matrix::set_ignored_user(state, account_id, user_id, ignored).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Which conversations a room has going on beside the main one.
         //
         // From the server rather than from scrollback: a thread whose root
@@ -1824,25 +1799,6 @@ pub async fn dispatch(
                 }
             }
             (Some(serde_json::json!({ "commands": out })), None)
-        }
-
-        // The slash commands a channel's own bots offer, on their own.
-        //
-        // Listed per channel because that is the question with the right
-        // answer: a bot installed across a guild can still be unusable in the
-        // channel somebody is typing in.
-        "listDiscordCommands" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("listDiscordCommands requires \"bufferId\"".to_string()));
-            };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            let query = p_str(params, "query", "");
-            match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
-                Ok(answer) => (Some(answer), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
         }
 
         "runDiscordCommand" => {
@@ -2894,19 +2850,6 @@ pub async fn dispatch(
         // performs it.
         "listUploadHosts" => (Some(serde_json::Value::Array(crate::upload::hosts())), None),
 
-        "uploadFile" => {
-            let Some(path) = p_str_opt(params, "path") else {
-                return (None, Some("uploadFile requires \"path\"".to_string()));
-            };
-            let host = p_str_opt(params, "host")
-                .and_then(crate::upload::Host::parse)
-                .unwrap_or(crate::upload::Host::Catbox);
-            match crate::upload::upload(host, path, p_str_opt(params, "retention")).await {
-                Ok(url) => (Some(serde_json::json!({ "url": url })), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Leaving a whole guild or space, from its tile in the rail.
         //
         // The rail entry's own id carries everything needed - it is built as
@@ -3443,30 +3386,6 @@ pub async fn dispatch(
             }
         },
 
-        // Tor is a daemon-global category in settings, not a per-account
-        // one - there's only ever one embedded TorManager, so "embedded vs
-        // external proxy" is applied uniformly to every configured
-        // Sneedchat account rather than asked per-account. Reconnects each
-        // affected account immediately, same as setSneedChatRooms above.
-        // One account's choice of Tor or the open internet, changed on an
-        // account that already exists. Reconnected at once, so the change is
-        // the connection rather than a setting waiting for one.
-        "setSneedChatUseTor" => {
-            let Some(id) = p_str_opt(params, "accountId") else {
-                return (None, Some("setSneedChatUseTor requires \"accountId\"".to_string()));
-            };
-            match state.accounts.set_sneedchat_use_tor(id, p_bool(params, "enabled", false)) {
-                Ok(true) => {
-                    if let Some(cfg) = state.accounts.get_sneedchat(id) {
-                        backend::sneedchat::spawn(state.clone(), cfg);
-                    }
-                    (Some(ok_node()), None)
-                }
-                Ok(false) => (None, Some("no such account".to_string())),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // The daemon-wide network settings: what routed means (moho's own Tor
         // or a SOCKS5 proxy of one's own), and whether everything is routed.
         "getNetSettings" => {
@@ -3480,7 +3399,7 @@ pub async fn dispatch(
         // Changing them reconnects every connected account that the change
         // could move: the routed ones, or all of them when what changed is
         // whether everything is routed.
-        "setNetSettings" | "setTorConfig" => {
+        "setNetSettings" => {
             let router = crate::net::route::router();
             let before = router.settings();
             let next = crate::net::route::NetSettings {
@@ -3564,37 +3483,6 @@ pub async fn dispatch(
             reconnect_routed(state);
             (Some(ok_node()), None)
         }
-
-        // Toggles routing an IRC account's connection through an external
-        // SOCKS5 proxy (a system Tor daemon or Tor Browser - see
-        // IrcAccountConfig::use_tor's doc comment for why this can't reuse
-        // the embedded Arti client Sneedchat uses) and reconnects.
-        "setAccountUseTor" => match p_str_opt(params, "accountId") {
-            None => (None, Some("no such account".to_string())),
-            Some(id) => {
-                let use_tor = p_bool(params, "useTor", false);
-                let proxy = p_str(params, "proxy", "");
-                match state.accounts.set_irc_use_tor(id, use_tor, proxy) {
-                    Ok(true) => match state.accounts.get_irc(id) {
-                        Some(cfg) => {
-                            backend::irc::spawn(state.clone(), cfg);
-                            (Some(ok_node()), None)
-                        }
-                        None => (None, Some("no such account".to_string())),
-                    },
-                    Ok(false) => (None, Some("no such account".to_string())),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                }
-            }
-        },
-
-        // Net-new protocols land in their own milestones (see project
-        // plan) - not implemented yet.
-        //
-        // Slack answers here too. It was advertised by listProtocols with no
-        // arm of its own, so asking for it fell through to "unknown method",
-        // which reads as a client bug rather than as work not yet done.
-        "addXmppAccount" | "addSlackAccount" => (None, Some(format!("{method}: not implemented yet"))),
 
         // Login (homeserver reachability + m.login.password) can take a
         // moment - same async-kickoff shape as addSneedChatAccount, with
@@ -3951,21 +3839,6 @@ pub async fn dispatch(
             }
         }
 
-        // And closing one, so a finished poll stops saying it is open.
-        "endMatrixPoll" => {
-            let (buffer_id, poll_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "pollId")) {
-                (Some(b), Some(p)) => (b, p),
-                _ => return (None, Some("endMatrixPoll requires \"bufferId\" and \"pollId\"".to_string())),
-            };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such buffer".to_string()));
-            };
-            match backend::matrix::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         "votePoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("votePoll requires \"bufferId\"".to_string()));
@@ -4158,10 +4031,22 @@ pub async fn dispatch(
 
         // Taking the poll down, which Kick allows the streamer and their
         // moderators and refuses to everybody else.
+        //
+        // A Matrix poll is closed rather than taken down, and a room can hold
+        // several at once, so it is named by `pollId` - the card's own id.
         "endPoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("endPoll requires \"bufferId\"".to_string()));
             };
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("matrix:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("ending a Matrix poll needs its \"pollId\"".to_string()));
+                };
+                return match backend::matrix::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -4612,17 +4497,6 @@ pub async fn dispatch(
             }
         }
 
-        "openIrcQuery" => {
-            let (account_id, nick) = match (p_str_opt(params, "accountId"), p_str_opt(params, "nick")) {
-                (Some(a), Some(n)) => (a, n),
-                _ => return (None, Some("openIrcQuery requires \"accountId\" and \"nick\"".to_string())),
-            };
-            match backend::irc::open_query(state, account_id, nick) {
-                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         "openMatrixDm" => {
             let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
                 (Some(a), Some(u)) => (a, u),
@@ -4835,21 +4709,6 @@ pub async fn dispatch(
                 Ok(()) => (Some(serde_json::json!({ "streamKey": stream_key })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
-        }
-
-        // Whether a picture is actually being received, for a window that
-        // wants to show "connecting" rather than a black rectangle.
-        "discordStreamWatched" => {
-            let Some(account_id) = p_str_opt(params, "accountId") else {
-                return (None, Some("discordStreamWatched requires \"accountId\"".to_string()));
-            };
-            let Some(stream_key) = p_str_opt(params, "streamKey") else {
-                return (None, Some("discordStreamWatched requires \"streamKey\"".to_string()));
-            };
-            (
-                Some(serde_json::json!({ "watching": backend::discord::golive::watching(account_id, stream_key) })),
-                None,
-            )
         }
 
         // One encoded frame, from the window that captured and encoded it.
@@ -5496,18 +5355,6 @@ pub async fn dispatch(
             }
         }
 
-        // The one moment the recovery code is needed: a login that has never
-        // run has no cached pickle key, and this is how it gets one.
-        "rehydrateMatrixDevice" => {
-            let (Some(account_id), Some(code)) = (p_str_opt(params, "accountId"), p_str_opt(params, "recoveryCode")) else {
-                return (None, Some("rehydrateMatrixDevice requires \"accountId\" and \"recoveryCode\"".to_string()));
-            };
-            match backend::matrix::dehydration::rehydrate_with_code(state, account_id, code).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Sliding sync, per account and off by default - see
         // MatrixAccountConfig::prefer_sliding_sync for why it is a switch
         // rather than something taken automatically. Turning it either way
@@ -5760,31 +5607,6 @@ pub async fn dispatch(
             match backend::matrix::set_space_child(state, &buffer.account_id, &space_room, &child_room, child).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        "setMatrixRoomState" => {
-            let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return (None, Some("setMatrixRoomState requires \"accountId\" and \"bufferId\"".to_string())),
-            };
-            let mut done = false;
-            if let Some(name) = p_str_opt(params, "name") {
-                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.name", serde_json::json!({ "name": name })).await {
-                    return (None, Some(format!("{e:#}")));
-                }
-                done = true;
-            }
-            if let Some(topic) = p_str_opt(params, "topic") {
-                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.topic", serde_json::json!({ "topic": topic })).await {
-                    return (None, Some(format!("{e:#}")));
-                }
-                done = true;
-            }
-            if done {
-                (Some(ok_node()), None)
-            } else {
-                (None, Some("setMatrixRoomState needs a \"name\" or a \"topic\"".to_string()))
             }
         }
 

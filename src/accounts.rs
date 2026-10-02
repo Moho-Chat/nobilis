@@ -655,19 +655,6 @@ impl AccountStore {
         Ok(found)
     }
 
-    /// Whether this account connects through Tor.
-    pub fn set_sneedchat_use_tor(&self, account_id: &str, use_tor: bool) -> Result<bool> {
-        let mut sneedchat = self.sneedchat.lock().unwrap();
-        match sneedchat.get_mut(account_id) {
-            None => Ok(false),
-            Some(a) => {
-                a.use_tor = use_tor;
-                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
-                Ok(true)
-            }
-        }
-    }
-
 
     /// Called after a successful login once the `xf_user` cookie reveals the
     /// account's numeric id - best-effort, not required for the backend to
@@ -828,21 +815,6 @@ impl AccountStore {
     pub fn set_nickserv_password(&self, account_id: &str, password: &str) -> Result<bool> {
         self.mutate(account_id, |a| {
             a.nickserv_password = if password.is_empty() { None } else { Some(password.to_string()) }
-        })
-    }
-
-    /// Toggles routing this IRC connection through a SOCKS5 proxy - see
-    /// IrcAccountConfig::use_tor's doc comment for why this is an external
-    /// proxy rather than the embedded Arti client Sneedchat uses. Empty
-    /// `proxy` means "leave whatever's stored untouched" (same convention
-    /// as set_sasl's password handling), so re-toggling on/off doesn't
-    /// clobber a previously-entered address.
-    pub fn set_irc_use_tor(&self, account_id: &str, use_tor: bool, proxy: &str) -> Result<bool> {
-        self.mutate(account_id, |a| {
-            a.use_tor = use_tor;
-            if !proxy.is_empty() {
-                a.tor_proxy = Some(proxy.to_string());
-            }
         })
     }
 
