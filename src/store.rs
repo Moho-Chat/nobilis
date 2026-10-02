@@ -268,6 +268,16 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_matrix_reactions_msg ON matrix_reactions(buffer_id, msg_id);",
         );
 
+        // Where each cached media file came from, for fetching it again once
+        // it has expired or been cleared - see media_cache.rs. Only what the
+        // file's own name cannot say: an encrypted file's key, an avatar's URL.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS media_sources (
+                 path TEXT PRIMARY KEY,
+                 source TEXT NOT NULL
+             );",
+        );
+
         // One-time repair of the counts the old arithmetic left behind.
         //
         // They cannot be corrected, only cleared: what is stored is a running
@@ -1011,6 +1021,44 @@ impl Store {
     }
 
     /// Drops the oldest transfers beyond `keep`.
+    /// Records where a cached media file came from - see media_cache.rs.
+    pub fn record_media_source(&self, path: &str, source: &serde_json::Value) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO media_sources (path, source) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET source = excluded.source",
+            params![path, source.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Where a cached media file came from, if that was recorded.
+    pub fn media_source(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let text: Option<String> = conn
+            .query_row("SELECT source FROM media_sources WHERE path = ?1", params![path], |r| r.get(0))
+            .optional()?;
+        Ok(text.and_then(|t| serde_json::from_str(&t).ok()))
+    }
+
+    /// Deletes every stored message, everywhere, and gives the space back.
+    ///
+    /// What "clear chat history" in Settings means. The services that keep
+    /// history themselves - Discord, Matrix, IRC with chathistory - load it
+    /// again as somebody scrolls back; the rest is gone. Reactions and poll
+    /// cards go with the messages they belonged to. Where media came from is
+    /// kept: it costs little and is what lets a picture be fetched again.
+    pub fn clear_history(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute("DELETE FROM messages", [])?;
+        conn.execute("DELETE FROM matrix_reactions", [])?;
+        conn.execute("DELETE FROM live_cards", [])?;
+        // A full vacuum rather than the incremental one: this is one deliberate
+        // act, and the point of it is the space.
+        conn.execute_batch("VACUUM;")?;
+        Ok(removed)
+    }
+
     pub fn prune_transfers(&self, keep: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(

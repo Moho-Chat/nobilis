@@ -56,15 +56,6 @@ fn lottie_cache_dir() -> std::path::PathBuf {
         .join("discord-stickers")
 }
 
-/// Cap on the Lottie cache. An animation is tens of kilobytes, so this is
-/// hundreds of stickers; one swept out is fetched again the next time it is
-/// drawn, and the window keeps what it has already read.
-pub const STICKER_CACHE_MAX_BYTES: u64 = 32 * 1024 * 1024;
-
-pub async fn sweep_sticker_cache() {
-    crate::backend::sneedchat::sweep_cache_dir(&lottie_cache_dir(), STICKER_CACHE_MAX_BYTES, "discord sticker").await;
-}
-
 /// A Lottie sticker's animation on disk, fetched the first time it is asked
 /// for.
 ///

@@ -200,6 +200,7 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
         state.tor.note_success().await;
     }
     remember_session(state, account_id, &session);
+    super::media::note_client(account_id, &session.http, &config.site_host());
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
     }

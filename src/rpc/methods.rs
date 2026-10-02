@@ -1326,6 +1326,32 @@ pub async fn dispatch(
         // Re-signs the attachment links of messages the window could not
         // show, batched with any re-sign already running for the buffer. The
         // fresh links arrive as messageUpdated.
+        // What each kind of stored thing takes on disk, for Settings.
+        "storageUsage" => (Some(crate::media_cache::usage().await), None),
+
+        // Empties one of the groups storageUsage reports.
+        "clearStorage" => {
+            let Some(group) = p_str_opt(params, "group") else {
+                return (None, Some("clearStorage requires \"group\"".to_string()));
+            };
+            match crate::media_cache::clear(state, group).await {
+                Ok(()) => (Some(crate::media_cache::usage().await), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A cached file the window could not load - expired, cleared or
+        // swept - fetched again from where it came from. See media_cache.rs.
+        "restoreMedia" => {
+            let Some(path) = p_str_opt(params, "path") else {
+                return (None, Some("restoreMedia requires \"path\"".to_string()));
+            };
+            match crate::media_cache::restore(state, path, p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")).await {
+                Ok(path) => (Some(serde_json::json!({ "path": path })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "resignDiscordAttachments" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("resignDiscordAttachments requires \"bufferId\"".to_string()));

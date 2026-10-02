@@ -8,6 +8,7 @@ mod export;
 mod highlights;
 mod ignores;
 mod ipc;
+mod media_cache;
 mod model;
 mod net;
 mod oggopus;
@@ -308,6 +309,7 @@ async fn run() -> Result<()> {
         highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
         ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };
+    media_cache::init(state.store.clone(), opts.data_dir.clone());
 
     // Reconnect every saved account, same as
     // daemon/nobilis/actions.c's nobilis_reconnect_saved_accounts() - without
@@ -403,16 +405,9 @@ async fn run_housekeeping(state: AppState) {
     // Let the initial reconnect burst above settle before the first pass.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
     loop {
-        backend::sneedchat::sweep_avatar_cache().await;
-        backend::sneedchat::sweep_attachment_cache().await;
-        backend::matrix::sweep_media_cache().await;
-        backend::discord::sweep_thumbnail_cache().await;
-        backend::discord::sweep_guild_icon_cache().await;
-        backend::kick::emotecache::sweep_emote_cache().await;
-        backend::discord::stickers::sweep_sticker_cache().await;
-        backend::discord::soundboard::sweep_sound_cache().await;
+        media_cache::sweep_all().await;
 
-        tokio::time::sleep(backend::sneedchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
+        tokio::time::sleep(media_cache::SWEEP_INTERVAL).await;
     }
 }
 
