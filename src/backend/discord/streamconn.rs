@@ -295,6 +295,7 @@ impl StreamSender {
 /// Returns the sender as soon as there is something to send with; the
 /// websocket keeps running behind it, heart-beating and listening, until the
 /// stream ends or the socket does.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     state: &AppState,
     account_id: &str,
@@ -522,7 +523,7 @@ pub async fn connect(
             package.len()
         );
         write
-            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into()))
+            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package)))
             .await
             .context("sending the key package")?;
     }
@@ -879,7 +880,7 @@ async fn watch_socket(
             resent,
             now,
         );
-        let lost = picture_rx.to_ask_for(now);
+        let lost = picture_rx.due_for_asking(now);
         if !lost.is_empty() {
             send_rtcp(videorx::nack(ssrc, video_ssrc, &lost)).await;
         }
@@ -1031,7 +1032,7 @@ async fn answer_dave(
         Reply::Nothing => None,
         Reply::Binary(opcode, payload) => {
             tracing::debug!("discord[{account_id}]: DAVE answering with binary op {opcode}");
-            Some(WsMessage::Binary(super::dave::write_binary(opcode, &payload).into()))
+            Some(WsMessage::Binary(super::dave::write_binary(opcode, &payload)))
         }
         Reply::Json(value) => {
             tracing::debug!("discord[{account_id}]: DAVE answering with {}", value["op"]);

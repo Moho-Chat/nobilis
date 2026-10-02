@@ -61,7 +61,7 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     let forwarder = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(text) = out_rx.recv().await {
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
+            if sink.send(WsMessage::Text(text)).await.is_err() {
                 break;
             }
         }

@@ -121,7 +121,7 @@ pub fn find_nonce(salt: &str, difficulty: u32, work: &Work, deadline: Instant) -
         // Checked rarely: a difficulty of 8 is answered in a few hundred
         // tries, and the clock is here for the case where the site raises it
         // far enough that finishing would outlive the session anyway.
-        if nonce % 512 == 0 && Instant::now() > deadline {
+        if nonce.is_multiple_of(512) && Instant::now() > deadline {
             bail!("ran out of time answering the captcha ({difficulty} zero bits, {nonce} tries)");
         }
     }

@@ -88,7 +88,7 @@ impl VideoReceiver {
     }
 
     /// The sequence numbers worth asking for now.
-    pub fn to_ask_for(&mut self, now: Instant) -> Vec<u16> {
+    pub fn due_for_asking(&mut self, now: Instant) -> Vec<u16> {
         let missing = self.window.missing(64);
         self.asked.retain(|sequence, _| missing.contains(sequence));
         let mut ask = Vec::new();
@@ -286,10 +286,10 @@ mod tests {
         let t = Instant::now();
         rx.push(vp8(1, true, true, true), false, t);
         rx.push(vp8(3, true, true, false), false, t);
-        assert_eq!(rx.to_ask_for(t), vec![2]);
-        assert!(rx.to_ask_for(t).is_empty(), "not again at once");
-        assert_eq!(rx.to_ask_for(t + NACK_AGAIN_AFTER), vec![2]);
-        assert!(rx.to_ask_for(t + NACK_AGAIN_AFTER * 5).is_empty(), "twice is enough");
+        assert_eq!(rx.due_for_asking(t), vec![2]);
+        assert!(rx.due_for_asking(t).is_empty(), "not again at once");
+        assert_eq!(rx.due_for_asking(t + NACK_AGAIN_AFTER), vec![2]);
+        assert!(rx.due_for_asking(t + NACK_AGAIN_AFTER * 5).is_empty(), "twice is enough");
     }
 
     #[test]

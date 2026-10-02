@@ -135,9 +135,12 @@ pub fn note_guild(account_id: &str, guild_id: &str, entry: GuildStickers) {
     }
 }
 
-/// Discord's standard packs: the same for every account, so fetched once.
-fn standard() -> &'static Mutex<Option<Vec<(String, Vec<Sticker>)>>> {
-    static STANDARD: OnceLock<Mutex<Option<Vec<(String, Vec<Sticker>)>>>> = OnceLock::new();
+/// Discord's standard packs, by pack name: the same for every account, so
+/// fetched once.
+type Packs = Mutex<Option<Vec<(String, Vec<Sticker>)>>>;
+
+fn standard() -> &'static Packs {
+    static STANDARD: OnceLock<Packs> = OnceLock::new();
     STANDARD.get_or_init(Default::default)
 }
 

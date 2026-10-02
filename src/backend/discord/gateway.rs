@@ -114,8 +114,8 @@ pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// the exact same credential can never succeed, so this loop stops and
 /// leaves the account in ConnState::AuthFailed instead of retrying forever
 /// against a token that will keep getting rejected. The only way out is a
-/// fresh login (spawn() gets called again from there, replacing this task)
-/// - see accounts.rs's add_discord doc comment for why that upserts the
+/// fresh login (spawn() gets called again from there, replacing this task) -
+/// see accounts.rs's add_discord doc comment for why that upserts the
 /// same account id (same buffers/scrollback) rather than creating a new one.
 ///
 /// Otherwise only stops when this task itself is aborted from outside: an
@@ -196,7 +196,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     let forwarder = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(text) = out_rx.recv().await {
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
+            if sink.send(WsMessage::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -391,7 +391,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 // 2 is blocked, which is not a friend and is
                                 // not waiting for anything.
                                 .filter(|r| matches!(r["type"].as_i64(), Some(1) | Some(3) | Some(4)))
-                                .filter_map(|r| Some(friend_json(r, &presences)?))
+                                .filter_map(|r| friend_json(r, &presences))
                                 .collect();
                             state.runtime.set_discord_friends(&account_id, friends);
                         }

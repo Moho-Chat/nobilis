@@ -58,9 +58,9 @@ fn render(body: &str) -> String {
     let mut out = String::new();
     // Fences first and whole: everything between them is text somebody
     // wanted shown exactly, so no emphasis rule may reach inside.
-    let mut fenced = body.split("```");
+    let fenced = body.split("```");
     let mut in_code = false;
-    while let Some(part) = fenced.next() {
+    for part in fenced {
         if in_code {
             // A fence often carries a language on its opening line; it is not
             // part of the code and Matrix has nowhere to put it.

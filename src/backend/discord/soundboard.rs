@@ -48,8 +48,10 @@ fn defaults() -> &'static Mutex<Option<Vec<Sound>>> {
 }
 
 /// Account and guild to that guild's sounds.
-fn guilds() -> &'static Mutex<HashMap<(String, String), Vec<Sound>>> {
-    static GUILDS: OnceLock<Mutex<HashMap<(String, String), Vec<Sound>>>> = OnceLock::new();
+type ByGuild = Mutex<HashMap<(String, String), Vec<Sound>>>;
+
+fn guilds() -> &'static ByGuild {
+    static GUILDS: OnceLock<ByGuild> = OnceLock::new();
     GUILDS.get_or_init(Default::default)
 }
 

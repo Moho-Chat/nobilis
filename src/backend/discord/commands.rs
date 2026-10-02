@@ -7,63 +7,6 @@
 
 use super::*;
 
-#[cfg(test)]
-mod modal_tests {
-    use super::modal_fields;
-    use serde_json::json;
-
-    /// A modal as Discord sends one: fields are text inputs nested inside
-    /// action rows, style 1 for a line and 2 for a box.
-    #[test]
-    fn a_form_is_read_into_its_fields() {
-        let modal = json!({
-            "title": "Report a thing",
-            "custom_id": "report_form",
-            "components": [
-                { "type": 1, "components": [
-                    { "type": 4, "custom_id": "subject", "label": "Subject", "style": 1, "required": true, "max_length": 100 }
-                ]},
-                { "type": 1, "components": [
-                    { "type": 4, "custom_id": "details", "label": "What happened", "style": 2, "required": false,
-                      "placeholder": "as much as you like" }
-                ]}
-            ]
-        });
-        let fields = modal_fields(&modal);
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0]["customId"], "subject");
-        assert_eq!(fields[0]["long"], false);
-        assert_eq!(fields[0]["required"], true);
-        assert_eq!(fields[0]["maxLength"], 100);
-        // The second is a paragraph, which is a different box to draw.
-        assert_eq!(fields[1]["long"], true);
-        assert_eq!(fields[1]["required"], false);
-        assert_eq!(fields[1]["placeholder"], "as much as you like");
-    }
-
-    #[test]
-    fn anything_that_is_not_a_text_input_is_left_alone() {
-        // Discord has begun putting other things in modals; a client that
-        // drew a button as a text box would be worse than one that ignored
-        // it, since the form would send a field the bot never asked for.
-        let modal = json!({
-            "components": [
-                { "type": 1, "components": [ { "type": 2, "custom_id": "press", "label": "Press" } ] },
-                { "type": 1, "components": [ { "type": 4, "custom_id": "name", "label": "Name", "style": 1 } ] }
-            ]
-        });
-        let fields = modal_fields(&modal);
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0]["customId"], "name");
-    }
-
-    #[test]
-    fn a_form_with_nothing_in_it_is_no_fields_rather_than_an_error() {
-        assert!(modal_fields(&json!({})).is_empty());
-        assert!(modal_fields(&json!({ "components": [] })).is_empty());
-    }
-}
-
 /// The slash commands this conversation offers.
 ///
 /// Asked of Discord per channel rather than per guild, because that is the
@@ -368,4 +311,61 @@ pub(super) async fn interact_with_message(
         bail!("{}", discord_error_text(status, &text, "pressing that"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod modal_tests {
+    use super::modal_fields;
+    use serde_json::json;
+
+    /// A modal as Discord sends one: fields are text inputs nested inside
+    /// action rows, style 1 for a line and 2 for a box.
+    #[test]
+    fn a_form_is_read_into_its_fields() {
+        let modal = json!({
+            "title": "Report a thing",
+            "custom_id": "report_form",
+            "components": [
+                { "type": 1, "components": [
+                    { "type": 4, "custom_id": "subject", "label": "Subject", "style": 1, "required": true, "max_length": 100 }
+                ]},
+                { "type": 1, "components": [
+                    { "type": 4, "custom_id": "details", "label": "What happened", "style": 2, "required": false,
+                      "placeholder": "as much as you like" }
+                ]}
+            ]
+        });
+        let fields = modal_fields(&modal);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0]["customId"], "subject");
+        assert_eq!(fields[0]["long"], false);
+        assert_eq!(fields[0]["required"], true);
+        assert_eq!(fields[0]["maxLength"], 100);
+        // The second is a paragraph, which is a different box to draw.
+        assert_eq!(fields[1]["long"], true);
+        assert_eq!(fields[1]["required"], false);
+        assert_eq!(fields[1]["placeholder"], "as much as you like");
+    }
+
+    #[test]
+    fn anything_that_is_not_a_text_input_is_left_alone() {
+        // Discord has begun putting other things in modals; a client that
+        // drew a button as a text box would be worse than one that ignored
+        // it, since the form would send a field the bot never asked for.
+        let modal = json!({
+            "components": [
+                { "type": 1, "components": [ { "type": 2, "custom_id": "press", "label": "Press" } ] },
+                { "type": 1, "components": [ { "type": 4, "custom_id": "name", "label": "Name", "style": 1 } ] }
+            ]
+        });
+        let fields = modal_fields(&modal);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["customId"], "name");
+    }
+
+    #[test]
+    fn a_form_with_nothing_in_it_is_no_fields_rather_than_an_error() {
+        assert!(modal_fields(&json!({})).is_empty());
+        assert!(modal_fields(&json!({ "components": [] })).is_empty());
+    }
 }

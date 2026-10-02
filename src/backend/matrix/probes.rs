@@ -739,7 +739,7 @@ mod live {
         println!("m.direct: {} conversation(s)", directs.as_ref().map(|c| directs::read(c).len()).unwrap_or(0));
 
         let recents = ssss::read_account_data(&base, &token, &user_id, recentemoji::EVENT).await;
-        println!("recent emoji: {:?}", recents.as_ref().map(|c| recentemoji::read(c)).unwrap_or_default());
+        println!("recent emoji: {:?}", recents.as_ref().map(recentemoji::read).unwrap_or_default());
 
         let threepids = http::get_json(&format!("{base}/_matrix/client/v3/account/3pid"), &token)
             .await

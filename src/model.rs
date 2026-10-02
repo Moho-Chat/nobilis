@@ -208,8 +208,8 @@ pub struct Buffer {
     /// set_buffer_avatar.
     #[serde(rename = "avatarUrl", skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
-    /// The heading this buffer sits under, where the service has such a thing
-    /// - a Discord category. Absent for everything else, and for channels the
+    /// The heading this buffer sits under, where the service has such a thing -
+    /// a Discord category. Absent for everything else, and for channels the
     /// server left uncategorised, which belong above the first heading.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
@@ -677,11 +677,6 @@ pub enum MemberRank {
     Founder,
 }
 
-/// Which service an account id belongs to.
-///
-/// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
-/// except IRC, whose ids are "nick@host" and predate the convention. That
-
 /// Whether this kind of line is the room reporting itself rather than
 /// somebody speaking.
 ///
@@ -718,6 +713,10 @@ pub fn is_room_event(kind: &str) -> bool {
     )
 }
 
+/// Which service an account id belongs to.
+///
+/// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
+/// except IRC, whose ids are "nick@host" and predate the convention. That
 /// exception is why this exists rather than each caller splitting on a colon.
 pub fn service_of(account_id: &str) -> &'static str {
     match account_id.split_once(':').map(|(prefix, _)| prefix) {

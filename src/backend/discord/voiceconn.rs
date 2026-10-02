@@ -403,7 +403,7 @@ pub async fn connect(
     // asking to be let in.
     if let Some(package) = shared.reinit_group()? {
         write
-            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into()))
+            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package)))
             .await
             .context("sending the key package")?;
     }
@@ -605,18 +605,17 @@ impl Shared {
                 self.execute_transition(d["transition_id"].as_u64().unwrap_or(0) as u16);
             }
             // Prepare epoch: epoch 1 is a group starting again from nothing.
-            24 => {
-                if d["epoch"].as_u64() == Some(1) {
+            24
+                if d["epoch"].as_u64() == Some(1) => {
                     self.dave_version.store(d["protocol_version"].as_u64().unwrap_or(0) as u16, Ordering::Relaxed);
                     match self.reinit_group() {
                         Ok(Some(package)) => replies.push(WsMessage::Binary(
-                            super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into(),
+                            super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package),
                         )),
                         Ok(None) => {}
                         Err(e) => tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account),
                     }
                 }
-            }
             _ => {}
         }
         replies
@@ -667,7 +666,7 @@ impl Shared {
                             if let Some(welcome) = cw.welcome {
                                 payload.extend_from_slice(&welcome);
                             }
-                            replies.push(WsMessage::Binary(super::dave::write_binary(OP_COMMIT_WELCOME, &payload).into()));
+                            replies.push(WsMessage::Binary(super::dave::write_binary(OP_COMMIT_WELCOME, &payload)));
                         }
                         Ok(None) => {}
                         Err(e) => tracing::warn!("discord[{}]: DAVE proposals failed: {e:?}", self.account),
@@ -702,7 +701,7 @@ impl Shared {
         if let Some(transition) = failed_transition {
             replies.push(WsMessage::Text(json!({ "op": 31, "d": { "transition_id": transition } }).to_string()));
             match self.reinit_group() {
-                Ok(Some(package)) => replies.push(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package).into())),
+                Ok(Some(package)) => replies.push(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package))),
                 Ok(None) => {}
                 Err(e) => tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account),
             }
@@ -930,7 +929,7 @@ async fn receive(
             Ok(payload) => payload,
             Err(_) => {
                 unopened += 1;
-                if unopened == 1 || unopened % 1000 == 0 {
+                if unopened == 1 || unopened.is_multiple_of(1000) {
                     tracing::warn!("discord[{}]: {unopened} voice packets would not open", shared.account);
                 }
                 continue;
@@ -945,7 +944,7 @@ async fn receive(
                     .lock()
                     .unwrap()
                     .entry(parsed.ssrc)
-                    .or_insert_with(Jitter::new)
+                    .or_default()
                     .push(parsed.sequence, opus);
                 continue;
             }
@@ -981,7 +980,7 @@ async fn receive(
                 resent,
                 now,
             );
-            (frames, camera.rx.to_ask_for(now))
+            (frames, camera.rx.due_for_asking(now))
         };
         if !lost.is_empty() {
             send_rtcp(&udp, &sealer, &videorx::nack(ssrc, video_ssrc, &lost)).await;
@@ -1197,8 +1196,8 @@ fn seal_for_group(shared: &Shared, opus: Vec<u8>) -> Vec<u8> {
 /// Voice activity rather than a constant stream: a microphone that is always
 /// sending is a green ring that is always lit, on everybody else's screen.
 /// Speech opens the gate at once; it stays open for half a second of quiet
-/// so the ends of words are not clipped, then five frames of silence are sent
-/// - which Discord asks for, so the far end fades rather than freezes - and
+/// so the ends of words are not clipped, then five frames of silence are sent -
+/// which Discord asks for, so the far end fades rather than freezes - and
 /// only then does speaking stop.
 #[derive(Default)]
 pub struct Gate {

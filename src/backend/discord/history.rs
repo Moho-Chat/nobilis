@@ -49,7 +49,7 @@ pub(super) async fn backfill_channel_history(state: &AppState, token: &str, user
         }
     }
 
-    let resp = match http_client_for(&token)
+    let resp = match http_client_for(token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50")])
         .header("Authorization", token)
@@ -191,7 +191,7 @@ pub async fn catch_up_channel(
         // Nothing stored means this is a first sight, which the initial
         // backfill already covers.
         let Some(after_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
-        let resp = http_client_for(&token)
+        let resp = http_client_for(token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("after", after_id.as_str())])
             .header("Authorization", token)
@@ -220,7 +220,7 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
     }
     let result: Result<()> = async {
         let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else { return Ok(()) };
-        let resp = http_client_for(&token)
+        let resp = http_client_for(token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("before", before_id.as_str())])
             .header("Authorization", token)

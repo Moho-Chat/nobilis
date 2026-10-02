@@ -197,7 +197,7 @@ pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Resu
     let resp = anonymous_client().post(url).form(fields).send().await.context("request failed")?;
     let status = resp.status().as_u16();
     let text = resp.text().await.context("reading the reply")?;
-    let body = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| Value::Null);
+    let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
     Ok((status, body))
 }
 

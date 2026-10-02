@@ -7,8 +7,8 @@
 //!
 //! The two systems answer it differently enough that a single call cannot mean
 //! the same thing on both, which is exactly why this is stated in one place
-//! rather than gated at each call site. A `#[cfg(unix)]` around the mode bits
-//! - the obvious way to make this compile on Windows - would leave the Windows
+//! rather than gated at each call site. A `#[cfg(unix)]` around the mode bits -
+//! the obvious way to make this compile on Windows - would leave the Windows
 //! build applying *no* protection while reading as though it applied some,
 //! which is the worst of the available outcomes.
 //!

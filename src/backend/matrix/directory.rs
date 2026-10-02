@@ -406,45 +406,6 @@ pub(super) fn server_name(typed: &str) -> String {
     typed.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
 }
 
-#[cfg(test)]
-mod directory_tests {
-    use super::{server_name, server_of_room, SUGGESTED_DIRECTORIES};
-
-    /// Room version 12 ids are a hash and nothing else. Reading a server out
-    /// of one gave the whole room id as a hostname, which was then asked to
-    /// search its own directory and answered M_BAD_JSON - a real error in the
-    /// server list, against a "server" that was a room.
-    #[test]
-    fn every_suggested_directory_is_a_bare_hostname_listed_once() {
-        let mut seen = std::collections::HashSet::new();
-        for &(server, about) in SUGGESTED_DIRECTORIES {
-            assert_eq!(server_name(server), server, "{server} is not written the way it is asked for");
-            assert!(server.contains('.') && !server.contains('/'), "{server}");
-            assert!(!about.is_empty(), "{server} says nothing about itself");
-            assert!(seen.insert(server), "{server} is listed twice");
-        }
-    }
-
-    #[test]
-    fn a_room_id_only_names_a_server_when_it_has_one() {
-        assert_eq!(server_of_room("!abc:matrix.org"), Some("matrix.org"));
-        assert_eq!(server_of_room("!phpQp7HD_h1IuRlU61Vop1-1RL5GxApK3Foo8E6KHxM"), None);
-        assert_eq!(server_of_room("!abc:"), None);
-        // A hostname has a dot in it; "localhost" is not something to go
-        // asking a public directory of.
-        assert_eq!(server_of_room("!abc:localhost"), None);
-        assert_eq!(server_of_room("!abc:matrix.example.com:8448"), Some("matrix.example.com:8448"));
-    }
-
-    #[test]
-    fn a_server_is_named_however_somebody_typed_it() {
-        assert_eq!(server_name("matrix.org"), "matrix.org");
-        assert_eq!(server_name("  https://matrix.org/  "), "matrix.org");
-        assert_eq!(server_name("http://glowers.club"), "glowers.club");
-        assert_eq!(server_name(""), "");
-    }
-}
-
 /// What a space contains, asked of the server rather than inferred from sync.
 ///
 /// Sync says which of a space's rooms this account is *in* - that is what
@@ -534,4 +495,43 @@ pub async fn space_hierarchy(
         "rooms": rooms,
         "next": resp["next_batch"].as_str().unwrap_or(""),
     }))
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::{server_name, server_of_room, SUGGESTED_DIRECTORIES};
+
+    /// Room version 12 ids are a hash and nothing else. Reading a server out
+    /// of one gave the whole room id as a hostname, which was then asked to
+    /// search its own directory and answered M_BAD_JSON - a real error in the
+    /// server list, against a "server" that was a room.
+    #[test]
+    fn every_suggested_directory_is_a_bare_hostname_listed_once() {
+        let mut seen = std::collections::HashSet::new();
+        for &(server, about) in SUGGESTED_DIRECTORIES {
+            assert_eq!(server_name(server), server, "{server} is not written the way it is asked for");
+            assert!(server.contains('.') && !server.contains('/'), "{server}");
+            assert!(!about.is_empty(), "{server} says nothing about itself");
+            assert!(seen.insert(server), "{server} is listed twice");
+        }
+    }
+
+    #[test]
+    fn a_room_id_only_names_a_server_when_it_has_one() {
+        assert_eq!(server_of_room("!abc:matrix.org"), Some("matrix.org"));
+        assert_eq!(server_of_room("!phpQp7HD_h1IuRlU61Vop1-1RL5GxApK3Foo8E6KHxM"), None);
+        assert_eq!(server_of_room("!abc:"), None);
+        // A hostname has a dot in it; "localhost" is not something to go
+        // asking a public directory of.
+        assert_eq!(server_of_room("!abc:localhost"), None);
+        assert_eq!(server_of_room("!abc:matrix.example.com:8448"), Some("matrix.example.com:8448"));
+    }
+
+    #[test]
+    fn a_server_is_named_however_somebody_typed_it() {
+        assert_eq!(server_name("matrix.org"), "matrix.org");
+        assert_eq!(server_name("  https://matrix.org/  "), "matrix.org");
+        assert_eq!(server_name("http://glowers.club"), "glowers.club");
+        assert_eq!(server_name(""), "");
+    }
 }

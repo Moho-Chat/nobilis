@@ -222,14 +222,13 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
             // Ours is the one that says we were invited; its sender is who
             // did the inviting. Other members' events ride along in the same
             // list, so the state_key has to be checked.
-            "m.room.member" => {
+            "m.room.member"
                 if event["state_key"].as_str() == Some(own_user_id)
                     && event["content"]["membership"].as_str() == Some("invite")
-                {
+                => {
                     inviter = event["sender"].as_str().map(str::to_string);
                     is_direct = event["content"]["is_direct"].as_bool().unwrap_or(false);
                 }
-            }
             _ => {}
         }
     }
@@ -424,7 +423,7 @@ mod space_tests {
     /// anything that was namable.
     #[test]
     fn a_named_room_is_untouched_by_the_empty_fallback() {
-        let events = vec![json!({ "type": "m.room.name", "state_key": "", "content": { "name": "real name" } })];
+        let events = [json!({ "type": "m.room.name", "state_key": "", "content": { "name": "real name" } })];
         let refs: Vec<&Value> = events.iter().collect();
         assert_eq!(derive_room_info("!x:matrix.org", "@me:matrix.org", &refs, None).name, "real name");
     }

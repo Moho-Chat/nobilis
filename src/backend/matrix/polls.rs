@@ -61,7 +61,7 @@ pub fn parse_start(content: &Value) -> Option<(String, Vec<(String, String)>)> {
     let options: Vec<(String, String)> = answers
         .iter()
         .enumerate()
-        .filter_map(|(index, answer)| {
+        .map(|(index, answer)| {
             let id = answer
                 .get("m.id")
                 .or_else(|| answer.get("id"))
@@ -71,7 +71,7 @@ pub fn parse_start(content: &Value) -> Option<(String, Vec<(String, String)>)> {
                 // position is the only handle anybody has on it.
                 .unwrap_or_else(|| index.to_string());
             let label = text_of(answer).unwrap_or_else(|| format!("Option {}", index + 1));
-            Some((id, label))
+            (id, label)
         })
         .collect();
     if options.is_empty() {
@@ -147,6 +147,7 @@ pub fn card(
 /// Handles one poll event, updating the tally and telling the client.
 ///
 /// Returns whether the event was one of ours, so the caller can stop.
+#[allow(clippy::too_many_arguments)]
 pub fn handle(
     state: &AppState,
     account_id: &str,

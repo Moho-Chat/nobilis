@@ -1047,11 +1047,7 @@ fn renamed_to(room: &Value, current: &str) -> Option<String> {
     in_state
         .chain(in_timeline)
         .filter(|e| e["type"].as_str() == Some("m.room.name") && e["state_key"].as_str() == Some(""))
-        .filter_map(|e| e["content"]["name"].as_str())
-        .filter(|n| !n.is_empty())
-        // The last one wins: a sync can carry several, and the newest is the
-        // name the room now has.
-        .last()
+        .filter_map(|e| e["content"]["name"].as_str()).rfind(|n| !n.is_empty())
         .filter(|n| *n != current)
         .map(str::to_string)
 }

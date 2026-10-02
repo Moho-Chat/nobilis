@@ -665,6 +665,7 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
 ///
 /// Returns nothing when the thread's parent is not a channel this account can
 /// see: a thread is exactly as private as what it hangs under.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_thread(
     state: &AppState,
     account_id: &str,
@@ -677,7 +678,7 @@ pub(super) fn register_thread(
 ) -> Option<(String, String)> {
     let kind_num = thread["type"].as_i64().unwrap_or(-1);
     // 10 is a thread on an announcement, 11 a public one, 12 a private one.
-    if !matches!(kind_num, 10 | 11 | 12) {
+    if !matches!(kind_num, 10..=12) {
         return None;
     }
     let thread_id = thread["id"].as_str()?;
@@ -833,7 +834,7 @@ pub fn assignable_roles(state: &AppState, buffer_id: &str) -> Value {
         })
         .collect();
     // Most senior first, the way Discord lists them.
-    roles.sort_by(|a, b| b.0.cmp(&a.0));
+    roles.sort_by_key(|r| std::cmp::Reverse(r.0));
     json!(roles.into_iter().map(|(_, r)| r).collect::<Vec<_>>())
 }
 

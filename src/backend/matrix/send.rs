@@ -653,6 +653,7 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, t
 /// upload_media_message for a plain room or upload_encrypted_media_message
 /// for an E2EE one, chosen the same way the text-message path already
 /// picks share_and_encrypt_content or not below.
+#[allow(clippy::too_many_arguments)]
 pub async fn send_message(
     state: &AppState,
     account_id: &str,
@@ -837,8 +838,8 @@ pub async fn send_voice_message(
 /// The `m.replace` an edit is sent as.
 ///
 /// The replacement carries the sender's formatting the same way a new
-/// message does - editing a formatted message should not quietly flatten it
-/// - while the outer body keeps the plain "* text" form that clients without
+/// message does - editing a formatted message should not quietly flatten it -
+/// while the outer body keeps the plain "* text" form that clients without
 /// edit support fall back to showing.
 pub(super) fn edit_content(target_event_id: &str, body: &str) -> serde_json::Value {
     let mut new_content = serde_json::json!({ "msgtype": "m.text", "body": body });

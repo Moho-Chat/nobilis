@@ -29,6 +29,7 @@ pub(super) fn relation_preview(state: &AppState, buffer_id: &str, content: &Valu
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_timeline_event(
     state: &AppState,
     account_id: &str,

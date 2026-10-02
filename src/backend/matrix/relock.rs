@@ -53,6 +53,7 @@ fn pending() -> &'static std::sync::Mutex<HashMap<String, Vec<Locked>>> {
 /// Best-effort on both counts. A key request that cannot be sent is not worth
 /// failing a sync over, and the retry below covers the case where nobody ever
 /// answers it but a key arrives another way.
+#[allow(clippy::too_many_arguments)]
 pub async fn note_locked(
     session: &CryptoSession,
     homeserver_url: &str,

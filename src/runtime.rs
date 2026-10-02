@@ -307,6 +307,10 @@ pub struct IrcHandle {
     pub quit_message: String,
 }
 
+/// A Matrix poll as the runtime keeps it: the question, its answers as
+/// (id, label), and whether it has been ended.
+pub type MatrixPoll = (String, Vec<(String, String)>, bool);
+
 /// Live, in-memory state that sits alongside the persisted AccountStore:
 /// connection state per account, active IRC senders, and the buffer
 /// registry. Mirrors what libpurple itself tracked at runtime
@@ -515,7 +519,7 @@ pub struct Runtime {
     live_cards: Mutex<HashMap<String, serde_json::Value>>,
     /// The question and answers of each Matrix poll, and whether it has been
     /// ended, by conversation and poll.
-    matrix_polls: Mutex<HashMap<(String, String), (String, Vec<(String, String)>, bool)>>,
+    matrix_polls: Mutex<HashMap<(String, String), MatrixPoll>>,
     /// Who voted for what in each Matrix poll, by conversation and poll.
     ///
     /// Matrix sends the votes as individual events rather than a running
@@ -1997,7 +2001,7 @@ impl Runtime {
             return;
         }
         list.push(transfer);
-        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        list.sort_by_key(|t| std::cmp::Reverse(t.started_at));
         list.truncate(DCC_KEEP);
     }
 
@@ -2058,7 +2062,7 @@ impl Runtime {
             })
             .collect();
         // Stable order, so a list does not reshuffle itself on every update.
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         out
     }
 
@@ -2379,8 +2383,8 @@ impl Runtime {
     }
 
     /// Records a reaction event we just learned about (ours or anyone
-    /// else's) so a later `m.room.redaction` targeting it can be resolved
-    /// - see matrix_reaction_targets's doc comment. `is_me` additionally
+    /// else's) so a later `m.room.redaction` targeting it can be resolved -
+    /// see matrix_reaction_targets's doc comment. `is_me` additionally
     /// populates matrix_own_reactions so our own un-react (toggleReaction)
     /// can find its event id by (buffer, message, emoji) without a
     /// reverse scan.
@@ -2576,7 +2580,7 @@ impl Runtime {
                 )
             })
             .collect();
-        listed.sort_by(|a, b| b.0.cmp(&a.0));
+        listed.sort_by_key(|l| std::cmp::Reverse(l.0));
         listed.into_iter().map(|(_, role)| role).collect()
     }
 
@@ -2592,7 +2596,7 @@ impl Runtime {
             .filter(|r| r["id"].as_str().is_some_and(|id| held.contains(id) && id != guild_id))
             .filter_map(|r| Some((r["position"].as_i64().unwrap_or(0), r["name"].as_str()?.to_string())))
             .collect();
-        named.sort_by(|a, b| b.0.cmp(&a.0));
+        named.sort_by_key(|n| std::cmp::Reverse(n.0));
         named.into_iter().map(|(_, name)| name).collect()
     }
 
@@ -3215,7 +3219,7 @@ impl Runtime {
         polls.insert(key, (question.to_string(), answers.to_vec(), ended));
     }
 
-    pub fn matrix_poll(&self, buffer_id: &str, poll_id: &str) -> Option<(String, Vec<(String, String)>, bool)> {
+    pub fn matrix_poll(&self, buffer_id: &str, poll_id: &str) -> Option<MatrixPoll> {
         self.matrix_polls.lock().unwrap().get(&(buffer_id.to_string(), poll_id.to_string())).cloned()
     }
 

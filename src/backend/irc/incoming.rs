@@ -824,7 +824,7 @@ pub(super) async fn handle_message(
             let body = match weight.as_str() {
                 "FAIL" if about.is_empty() => description.to_string(),
                 "FAIL" => format!("{about} failed: {description}"),
-                "WARN" => format!("{description}"),
+                "WARN" => description.to_string(),
                 _ => description.to_string(),
             };
             if body.is_empty() {
@@ -993,8 +993,8 @@ pub(super) fn rank_word(rank: MemberRank) -> &'static str {
 
 /// A message's own id, where the server gives one.
 ///
-/// Used as the message id rather than a generated one, so a message seen twice
-/// - replayed history, a reconnect, a batch that overlaps what is already
+/// Used as the message id rather than a generated one, so a message seen twice -
+/// replayed history, a reconnect, a batch that overlaps what is already
 /// stored - is stored once. That dedup already exists for every other protocol
 /// here; IRC could not use it because it had no id to dedup on.
 pub(super) fn message_id(msg: &Message) -> Option<String> {

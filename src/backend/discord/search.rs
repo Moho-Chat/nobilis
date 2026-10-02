@@ -66,15 +66,12 @@ pub async fn search_messages(
     }
     // A guild search covers every channel in it, so "in:" is a narrowing
     // rather than the search itself; a DM has one channel and no choice.
-    match &guild_id {
-        Some(_) => {
-            if let Some(name) = filters.in_channel.as_deref() {
-                let wanted = resolve_channel(state, account_id, name)
-                    .with_context(|| format!("no channel here called \"{name}\""))?;
-                query.push(("channel_id".into(), wanted));
-            }
+    if guild_id.is_some() {
+        if let Some(name) = filters.in_channel.as_deref() {
+            let wanted = resolve_channel(state, account_id, name)
+                .with_context(|| format!("no channel here called \"{name}\""))?;
+            query.push(("channel_id".into(), wanted));
         }
-        None => {}
     }
     if let Some(name) = filters.from.as_deref() {
         query.push(("author_id".into(), resolve_person(state, account_id, name)?));

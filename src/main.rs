@@ -125,6 +125,7 @@ fn acquire_singleton_lock(data_dir: &std::path::Path) -> Result<()> {
     let lock_path = data_dir.join("nobilis.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;

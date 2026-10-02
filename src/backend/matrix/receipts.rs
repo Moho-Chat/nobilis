@@ -164,38 +164,6 @@ pub async fn mark_read(state: &AppState, account_id: &str, buffer_id: &str, publ
 /// one is what gets written.
 pub const MARKED_UNREAD: [&str; 2] = ["m.marked_unread", "com.famedly.marked_unread"];
 
-#[cfg(test)]
-mod marked_unread_tests {
-    use super::*;
-
-    fn ev(kind: &str, unread: bool) -> Value {
-        serde_json::json!({ "type": kind, "content": { "unread": unread } })
-    }
-
-    #[test]
-    fn reads_either_spelling() {
-        assert_eq!(marked_unread_in(&[ev("m.marked_unread", true)]), Some(true));
-        assert_eq!(marked_unread_in(&[ev("com.famedly.marked_unread", true)]), Some(true));
-    }
-
-    /// A room that was marked and then unmarked carries an explicit false, and
-    /// that has to win over a stale true this client saw earlier - so it is a
-    /// value, not an absence.
-    #[test]
-    fn an_explicit_false_is_not_the_same_as_silence() {
-        assert_eq!(marked_unread_in(&[ev("m.marked_unread", false)]), Some(false));
-        assert_eq!(marked_unread_in(&[]), None);
-        assert_eq!(marked_unread_in(&[serde_json::json!({ "type": "m.tag", "content": {} })]), None);
-    }
-
-    /// Content that says nothing usable is silence rather than a guess.
-    #[test]
-    fn a_mark_with_no_answer_in_it_says_nothing() {
-        let odd = serde_json::json!({ "type": "m.marked_unread", "content": { "unread": "yes" } });
-        assert_eq!(marked_unread_in(&[odd]), None);
-    }
-}
-
 /// Reads a room's own account data for a deliberate unread mark.
 ///
 /// `None` when the room says nothing either way, which is not the same as
@@ -242,4 +210,36 @@ pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typi
     };
     http::put_json(&format!("{base}/_matrix/client/v3/rooms/{room}/typing/{user}"), &account.access_token, body).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod marked_unread_tests {
+    use super::*;
+
+    fn ev(kind: &str, unread: bool) -> Value {
+        serde_json::json!({ "type": kind, "content": { "unread": unread } })
+    }
+
+    #[test]
+    fn reads_either_spelling() {
+        assert_eq!(marked_unread_in(&[ev("m.marked_unread", true)]), Some(true));
+        assert_eq!(marked_unread_in(&[ev("com.famedly.marked_unread", true)]), Some(true));
+    }
+
+    /// A room that was marked and then unmarked carries an explicit false, and
+    /// that has to win over a stale true this client saw earlier - so it is a
+    /// value, not an absence.
+    #[test]
+    fn an_explicit_false_is_not_the_same_as_silence() {
+        assert_eq!(marked_unread_in(&[ev("m.marked_unread", false)]), Some(false));
+        assert_eq!(marked_unread_in(&[]), None);
+        assert_eq!(marked_unread_in(&[serde_json::json!({ "type": "m.tag", "content": {} })]), None);
+    }
+
+    /// Content that says nothing usable is silence rather than a guess.
+    #[test]
+    fn a_mark_with_no_answer_in_it_says_nothing() {
+        let odd = serde_json::json!({ "type": "m.marked_unread", "content": { "unread": "yes" } });
+        assert_eq!(marked_unread_in(&[odd]), None);
+    }
 }

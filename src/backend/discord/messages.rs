@@ -629,7 +629,7 @@ pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, m
         .and_then(|buffer| state.runtime.get_buffer(&buffer))
         .map(|buffer| buffer.name)
     {
-        Some(name) => format!(" in {}", name.rsplit('/').next().unwrap_or(&name).to_string()),
+        Some(name) => format!(" in {}", name.rsplit('/').next().unwrap_or(&name)),
         None if original["guild_id"].is_null() => " from a direct message".to_string(),
         None => String::new(),
     };

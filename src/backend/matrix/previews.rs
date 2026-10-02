@@ -66,8 +66,8 @@ pub fn first_link(body: &str) -> Option<&str> {
         // to example.org, and a word starting with a bracket is still a word
         // with a link in it.
         .map(|word| {
-            word.trim_start_matches(|c| matches!(c, '(' | '[' | '<' | '"' | '\''))
-                .trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | '>' | '!' | '?' | ';' | ':' | '"' | '\''))
+            word.trim_start_matches(['(', '[', '<', '"', '\''])
+                .trim_end_matches(['.', ',', ')', ']', '>', '!', '?', ';', ':', '"', '\''])
         })
         .find(|word| word.starts_with("https://") || word.starts_with("http://"))
         .filter(|url| url.len() > "https://".len())

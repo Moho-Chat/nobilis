@@ -610,7 +610,7 @@ impl Store {
             return Ok(HashSet::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT msg_id FROM messages WHERE buffer_id = ?1 AND msg_id IN ({placeholders})"
         ))?;
@@ -747,8 +747,8 @@ impl Store {
     /// Wanted because a roster is not always there to ask: a service may not
     /// send one until somebody joins or leaves, and a name with a space in it
     /// cannot be picked out of typed text without a list of the names it
-    /// could be. Whoever has spoken recently is the list that matters anyway
-    /// - they are who somebody is answering.
+    /// could be. Whoever has spoken recently is the list that matters anyway -
+    /// they are who somebody is answering.
     pub fn recent_senders(&self, buffer_id: &str, limit: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -875,8 +875,8 @@ impl Store {
     ///
     /// One query rather than a walk of every buffer: what makes an inbox worth
     /// having is that it answers "what wanted me" in one place, and the
-    /// highlight flag is already recorded per message at the point it arrives
-    /// - by the backend that knows whether a mention is real, which for
+    /// highlight flag is already recorded per message at the point it arrives -
+    /// by the backend that knows whether a mention is real, which for
     /// Discord is its own resolved mentions array rather than a guess at the
     /// nickname.
     /// Mentions, from the messages themselves rather than from whatever
@@ -890,7 +890,7 @@ impl Store {
     pub fn mentions(&self, known_channels: &[String], limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 100 };
-        let places = std::iter::repeat("?").take(known_channels.len()).collect::<Vec<_>>().join(",");
+        let places = std::iter::repeat_n("?", known_channels.len()).collect::<Vec<_>>().join(",");
         let legacy = if known_channels.is_empty() {
             String::new()
         } else {

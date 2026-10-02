@@ -91,8 +91,8 @@ fn worth_thumbnailing(info: &Value) -> bool {
 
 /// How big a thumbnail to ask for.
 ///
-/// Generous for a timeline picture and far short of a modern camera's output
-/// - a phone photograph is several thousand pixels across and a few
+/// Generous for a timeline picture and far short of a modern camera's output -
+/// a phone photograph is several thousand pixels across and a few
 /// megabytes, and this is tens of kilobytes. `scale` rather than `crop`
 /// because the picture in a timeline is the whole picture: cropping would
 /// quietly cut the sides off somebody's screenshot.

@@ -39,8 +39,8 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// The Kick client, routed through Tor or the configured proxy when any Kick
 /// account is - or the add form's switch is on, for the sign-in.
 ///
-/// Routed as a service rather than per account: most of what is fetched here
-/// - channel cards, emotes, stream state - belongs to no account in
+/// Routed as a service rather than per account: most of what is fetched here -
+/// channel cards, emotes, stream state - belongs to no account in
 /// particular, and a request that cannot say whose it is goes the safer way.
 pub fn client() -> Result<reqwest::Client> {
     let router = crate::net::route::router();
@@ -979,8 +979,8 @@ pub async fn delete_message(http: &reqwest::Client, token: &str, chatroom_id: u6
 
 /// How the chat is restricted: followers only, subscribers only, slow mode.
 ///
-/// Sent whole rather than as a patch, because that is what the endpoint takes
-/// - so a caller changing one setting must pass the others as they are, and
+/// Sent whole rather than as a patch, because that is what the endpoint takes -
+/// so a caller changing one setting must pass the others as they are, and
 /// the RPC reads the current values before sending.
 pub async fn set_chat_mode(
     http: &reqwest::Client,

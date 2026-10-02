@@ -71,8 +71,7 @@ pub async fn fetch_thread(state: &AppState, account_id: &str, buffer_id: &str, r
         Err(e) => tracing::debug!("matrix: reading thread {root_id}: {e:#}"),
     }
 
-    state.store.thread_messages(buffer_id, root_id).map_err(Into::into)
-}
+    state.store.thread_messages(buffer_id, root_id)}
 
 /// Fetches the conversation around one event and stores it.
 ///
@@ -247,7 +246,7 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str, l
             // its own list by this, and it is the difference between "a
             // thread happened" and "a thread you are in happened".
             "joined": relation["current_user_participated"].as_bool().unwrap_or(false),
-            "lastFrom": latest["sender"].as_str().map(|u| name_of(u)),
+            "lastFrom": latest["sender"].as_str().map(name_of),
             "lastBody": latest["content"]["body"].as_str(),
             "lastTs": latest["origin_server_ts"].as_i64().map(|ms| ms / 1000),
         }));

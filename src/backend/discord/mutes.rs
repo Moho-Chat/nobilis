@@ -27,8 +27,8 @@ pub(super) const DM_SCOPE: &str = "@me";
 /// Reads one `user_guild_settings` entry.
 ///
 /// Returns the guild it is about along with what it says. A `mute_config`
-/// carries an end time for a mute somebody set to expire - "mute for 8 hours"
-/// - so a mute whose moment has passed is read as no mute at all rather than
+/// carries an end time for a mute somebody set to expire - "mute for 8 hours" -
+/// so a mute whose moment has passed is read as no mute at all rather than
 /// as a permanent one.
 pub(super) fn parse_entry(entry: &Value, now: i64) -> (String, DiscordMute) {
     let guild = entry["guild_id"].as_str().unwrap_or(DM_SCOPE).to_string();

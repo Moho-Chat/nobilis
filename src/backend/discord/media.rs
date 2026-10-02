@@ -690,7 +690,7 @@ mod tests {
         };
         let body = "look at this\nhttps://cdn.discordapp.com/attachments/1/2/shot.png?ex=11&is=22&hm=33\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1";
         assert_eq!(
-            strip_attachment_links(body, &[own.clone()]),
+            strip_attachment_links(body, std::slice::from_ref(&own)),
             "look at this\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1"
         );
         // The media host is the same file.
@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn a_sticker_stand_in_goes_once_the_sticker_can_be_drawn() {
         let sticker = Attachment { kind: "lottie".into(), filename: Some("wave.json".into()), ..Default::default() };
-        assert_eq!(strip_attachment_links("sent a sticker: wave", &[sticker.clone()]), "");
+        assert_eq!(strip_attachment_links("sent a sticker: wave", std::slice::from_ref(&sticker)), "");
         // Somebody else's sticker named in passing stays.
         assert_eq!(strip_attachment_links("sent a sticker: dance", &[sticker]), "sent a sticker: dance");
     }

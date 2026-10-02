@@ -626,8 +626,8 @@ pub(super) async fn channel_when_ready(state: &AppState, buffer_id: &str) -> Opt
 ///
 /// The subscription it arrived on is asked first and is the reliable answer:
 /// this connection subscribed per room, so the room is in the name. The
-/// payload is the fallback, because these events disagree about what they name
-/// - some carry the chatroom, some the channel, some neither - and a fallback
+/// payload is the fallback, because these events disagree about what they name -
+/// some carry the chatroom, some the channel, some neither - and a fallback
 /// that is occasionally right beats an event dropped for lack of a field.
 pub(super) fn channel_of(watched: &Watched, subscription: &Option<String>, payload: &serde_json::Value) -> Option<String> {
     if let Some(name) = subscription.as_deref() {

@@ -369,8 +369,8 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
 /// Blocks somebody, or lifts it.
 ///
 /// A relationship of type 2, which is what Discord's own "Block" does: it is
-/// account-wide, it follows to every client, and - unlike an ignore kept here
-/// - the person is told, in the sense that their messages to you stop being
+/// account-wide, it follows to every client, and - unlike an ignore kept here -
+/// the person is told, in the sense that their messages to you stop being
 /// delivered and their friend requests stop arriving.
 ///
 /// The gateway's own RELATIONSHIP_ADD says it happened, the same way it does

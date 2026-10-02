@@ -52,7 +52,7 @@ impl CallProcessor {
             return;
         }
         let mut scratch = [0i16; CHUNK];
-        for chunk in played.chunks_exact(CHUNK) {
+        for chunk in played.as_chunks::<CHUNK>().0 {
             let _ = self.apm.process_render_i16(chunk, &mut scratch);
         }
     }
@@ -64,7 +64,7 @@ impl CallProcessor {
         }
         let mut src = [0i16; CHUNK];
         let mut out = [0i16; CHUNK];
-        for chunk in frame.chunks_exact_mut(CHUNK) {
+        for chunk in frame.as_chunks_mut::<CHUNK>().0 {
             for (s, f) in src.iter_mut().zip(chunk.iter()) {
                 *s = (f.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
             }
