@@ -208,15 +208,85 @@ fn not_before() -> &'static std::sync::Mutex<Option<tokio::time::Instant>> {
     NOT_BEFORE.get_or_init(Default::default)
 }
 
+/// Which of two queues a paced request waits in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Priority {
+    /// What a channel's messages wait on: its ids, from `/channels/<handle>`.
+    Chat,
+    /// Everything filled in afterwards - emotes, standing, history.
+    Background,
+}
+
+/// The gap kept between paced requests, across the whole daemon.
+///
+/// Kick's limit is a rate, and a cold start used to meet it as a burst: three
+/// channel lookups at a time, each starting three more requests in the
+/// background the moment it landed, so twenty channels was eighty requests in
+/// a few seconds and Kick refused a handful on every start. Spaced, the same
+/// eighty arrive over about twenty seconds - with the chat lookups first, so
+/// every channel is receiving messages within the first several.
+const SPACING: Duration = Duration::from_millis(250);
+
+/// When the next paced request may go out.
+fn next_slot() -> &'static std::sync::Mutex<Option<tokio::time::Instant>> {
+    static NEXT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> = std::sync::OnceLock::new();
+    NEXT.get_or_init(Default::default)
+}
+
+/// How many chat lookups are waiting for a slot. Background requests stand
+/// aside while there are any.
+static CHAT_WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits for this request's turn: after any pause Kick asked for, behind any
+/// chat lookup if this is background work, and a spacing after the last one.
+async fn take_turn(priority: Priority) {
+    use std::sync::atomic::Ordering;
+    if priority == Priority::Background {
+        while CHAT_WAITING.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(SPACING).await;
+        }
+    }
+    loop {
+        let paused = *not_before().lock().unwrap();
+        if let Some(until) = paused.filter(|u| *u > tokio::time::Instant::now()) {
+            tokio::time::sleep_until(until).await;
+            continue;
+        }
+        let at = {
+            let mut next = next_slot().lock().unwrap();
+            let now = tokio::time::Instant::now();
+            let at = next.filter(|n| *n > now).unwrap_or(now);
+            *next = Some(at + SPACING);
+            at
+        };
+        tokio::time::sleep_until(at).await;
+        return;
+    }
+}
+
 /// Sends a request once Kick is willing to hear it, and when told to slow
 /// down, makes every request wait - not just this one - before asking again.
-async fn paced(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+async fn paced(request: reqwest::RequestBuilder, priority: Priority) -> reqwest::Result<reqwest::Response> {
+    // Counted while waiting, and uncounted however this ends - a lookup
+    // dropped part-way (its connection closing) would otherwise leave the
+    // background queue standing aside for good.
+    struct Waiting;
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            CHAT_WAITING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _waiting = (priority == Priority::Chat).then(|| {
+        CHAT_WAITING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Waiting
+    });
+    paced_inner(request, priority).await
+}
+
+async fn paced_inner(request: reqwest::RequestBuilder, priority: Priority) -> reqwest::Result<reqwest::Response> {
     let mut attempt = 0;
     loop {
-        let until = *not_before().lock().unwrap();
-        if let Some(until) = until {
-            tokio::time::sleep_until(until).await;
-        }
+        take_turn(priority).await;
         let Some(this) = request.try_clone() else { return request.send().await };
         let res = this.send().await?;
         if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= PACED_RETRIES {
@@ -256,7 +326,7 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     // starting up rather than a failure. Answered by waiting: a channel
     // dropped here is a channel missing from the list until the next
     // restart, which is a far worse outcome than a slower connect.
-    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("asking Kick about that channel")?;
+    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Chat).await.context("asking Kick about that channel")?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         // Kick's own answer, not just the status: a 404 page from something in
         // between is not Kick saying the channel is gone, and this one leads
@@ -432,7 +502,7 @@ pub fn emote_url(id: &str) -> String {
 /// headings, and a message can carry any of them.
 pub async fn emotes(http: &reqwest::Client, slug: &str) -> Result<Vec<Emote>> {
     let url = format!("{API_ROOT}/emotes/{slug}");
-    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("fetching the channel's emotes")?;
+    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Background).await.context("fetching the channel's emotes")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for {slug}'s emotes", res.status());
     }
@@ -860,7 +930,7 @@ pub async fn history(
     if let Some(cursor) = cursor {
         url.push_str(&format!("?cursor={}", urlencode(cursor)));
     }
-    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("fetching the channel's history")?;
+    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Background).await.context("fetching the channel's history")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for that channel's history", res.status());
     }
@@ -960,7 +1030,7 @@ pub async fn set_following(http: &reqwest::Client, token: &str, slug: &str, foll
 }
 
 pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result<Standing> {
-    let res = paced(http.get(format!("{API_ROOT}/api/v2/channels/{slug}/me")).header("Accept", "application/json").bearer_auth(token))
+    let res = paced(http.get(format!("{API_ROOT}/api/v2/channels/{slug}/me")).header("Accept", "application/json").bearer_auth(token), Priority::Background)
         .await
         .context("asking Kick about this account's standing in the channel")?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1938,6 +2008,39 @@ mod pacing_tests {
         (format!("http://{addr}/"), seen)
     }
 
+    /// Requests go out a spacing apart however many are asked for at once,
+    /// and background work that arrives while chat lookups are waiting goes
+    /// after them - which is how a cold start looks.
+    #[tokio::test]
+    async fn requests_are_spaced_and_chat_goes_first() {
+        use std::sync::atomic::Ordering;
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = tokio::time::Instant::now();
+        let mut tasks = Vec::new();
+        for i in 0..3 {
+            let order = order.clone();
+            CHAT_WAITING.fetch_add(1, Ordering::SeqCst);
+            tasks.push(tokio::spawn(async move {
+                take_turn(Priority::Chat).await;
+                CHAT_WAITING.fetch_sub(1, Ordering::SeqCst);
+                order.lock().unwrap().push(i);
+            }));
+        }
+        let background = {
+            let order = order.clone();
+            tokio::spawn(async move {
+                take_turn(Priority::Background).await;
+                order.lock().unwrap().push(99);
+            })
+        };
+        for t in tasks {
+            t.await.unwrap();
+        }
+        background.await.unwrap();
+        assert!(started.elapsed() >= SPACING * 2, "three lookups, at least two gaps");
+        assert_eq!(order.lock().unwrap().last(), Some(&99), "background went after the chat lookups");
+    }
+
     /// One refusal holds back every request, not just the one refused - and
     /// for as long as Kick asked, rather than each on a clock of its own.
     #[tokio::test]
@@ -1946,7 +2049,7 @@ mod pacing_tests {
         let http = reqwest::Client::new();
         let started = tokio::time::Instant::now();
 
-        let first = paced(http.get(&url)).await.unwrap();
+        let first = paced(http.get(&url), Priority::Chat).await.unwrap();
         assert_eq!(first.status(), 200, "asked again after the wait");
         assert!(started.elapsed() >= Duration::from_secs(1), "waited as long as Retry-After said");
 
@@ -1954,7 +2057,7 @@ mod pacing_tests {
         // out too, instead of being refused on its own.
         *not_before().lock().unwrap() = Some(tokio::time::Instant::now() + Duration::from_millis(400));
         let before = tokio::time::Instant::now();
-        let second = paced(http.get(&url)).await.unwrap();
+        let second = paced(http.get(&url), Priority::Chat).await.unwrap();
         assert_eq!(second.status(), 200);
         assert!(before.elapsed() >= Duration::from_millis(400), "the shared pause held it back");
         assert_eq!(seen.load(Ordering::SeqCst), 3, "one refusal, then one request each");
