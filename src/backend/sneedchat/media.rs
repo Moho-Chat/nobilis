@@ -172,6 +172,31 @@ pub(super) async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> 
     None
 }
 
+/// Beside each cached avatar, the URL it was fetched from - what every
+/// message's `avatar_url` is checked against.
+fn avatar_source_file(dir: &std::path::Path, user_id: &str) -> std::path::PathBuf {
+    dir.join(format!("{user_id}.src"))
+}
+
+/// The local URL for a cached avatar, versioned by when its bytes last
+/// changed.
+///
+/// The file keeps one name per user, so scrollback already pointing at it
+/// shows a new picture once there is one - but a window that has drawn the
+/// old one keeps its copy for the same URL. The fragment changes when the
+/// picture does, which is what makes the window ask again; the media handler
+/// never sees it.
+async fn versioned(path: &std::path::Path) -> String {
+    let stamp = tokio::fs::metadata(path)
+        .await
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("file://{}#{stamp}", path.display())
+}
+
 /// Resolves a wire `avatar_url` (a relative path or an absolute URL)
 /// against `host`, fetches it through the same Tor-routed client used for
 /// everything else, and caches it to a local file - the frontend's plain
@@ -180,23 +205,35 @@ pub(super) async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> 
 /// never load. A `file://` path sidesteps that, the same trick already
 /// used for Discord's QR login code.
 ///
-/// Cached permanently per user id for this daemon's lifetime, not
-/// re-checked on every message - an avatar changing later isn't picked
-/// up until the cache file is manually cleared, the same precedent
-/// backend/discord/messages.rs's own avatar_url handling already set ("captured
-/// once at login... not refreshed on later reconnects").
+/// Every message carries its author's current `avatar_url`, and that is the
+/// check: it is compared with the URL the cached picture came from, and only
+/// a different one is fetched. A new avatar is a new URL, so it is picked up
+/// on that person's next message, and nothing is fetched while it stays the
+/// same - no timer, no rescan.
 pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, raw_avatar_url: &str) -> Option<String> {
     if raw_avatar_url.is_empty() {
         return None;
     }
     let url = if raw_avatar_url.starts_with('/') { format!("https://{host}{raw_avatar_url}") } else { raw_avatar_url.to_string() };
 
-    let url_ext = url.rsplit('.').next().filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("jpg");
     let dir = avatar_cache_dir();
-
-    if let Some(path) = cached_avatar_file(&dir, user_id).await {
-        return Some(format!("file://{}", path.display()));
+    let source = avatar_source_file(&dir, user_id);
+    let cached = cached_avatar_file(&dir, user_id).await;
+    if let Some(path) = &cached {
+        if tokio::fs::read_to_string(&source).await.ok().as_deref() == Some(url.as_str()) {
+            return Some(versioned(path).await);
+        }
     }
+
+    // A different URL, or a picture cached before the URL was kept beside it:
+    // fetch it. If that fails, the picture already here is still the best
+    // there is.
+    let fallback = || async {
+        match &cached {
+            Some(path) => Some(versioned(path).await),
+            None => None,
+        }
+    };
 
     // Bounded rather than left open-ended: this runs inline in the room's
     // own read loop (see handle_frame), so a slow/stuck fetch (a fresh Tor
@@ -205,36 +242,53 @@ pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user
     // processing until it resolved.
     let Ok(fetch) = tokio::time::timeout(std::time::Duration::from_secs(15), http.get_bytes(&url)).await else {
         tracing::debug!("sneedchat: avatar fetch for user {user_id} timed out");
-        return None;
+        return fallback().await;
     };
-
-    match fetch {
-        Ok((status, bytes)) if (200..300).contains(&status) && !bytes.is_empty() => {
-            if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-                tracing::debug!("sneedchat: creating avatar cache dir: {e}");
-                return None;
-            }
-            // Name the file after what it actually is. The site's avatar URLs
-            // end in .jpg while the CDN transparently serves WebP, so trusting
-            // the URL wrote WebP into a .jpg - which anything that dispatches
-            // on extension then refuses to load.
-            let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
-            let path = dir.join(format!("{user_id}.{ext}"));
-            if let Err(e) = tokio::fs::write(&path, &bytes).await {
-                tracing::debug!("sneedchat: caching avatar for user {user_id}: {e}");
-                return None;
-            }
-            Some(format!("file://{}", path.display()))
-        }
+    let bytes = match fetch {
+        Ok((status, bytes)) if (200..300).contains(&status) && !bytes.is_empty() => bytes,
         Ok((status, _)) => {
             tracing::debug!("sneedchat: avatar fetch for user {user_id} returned HTTP {status}");
-            None
+            return fallback().await;
         }
         Err(e) => {
             tracing::debug!("sneedchat: fetching avatar for user {user_id}: {e}");
-            None
+            return fallback().await;
+        }
+    };
+
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        tracing::debug!("sneedchat: creating avatar cache dir: {e}");
+        return fallback().await;
+    }
+    // Name the file after what it actually is. The site's avatar URLs end in
+    // .jpg while the CDN transparently serves WebP, so trusting the URL wrote
+    // WebP into a .jpg - which anything that dispatches on extension then
+    // refuses to load.
+    let url_ext = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(&url)
+        .rsplit('.')
+        .next()
+        .filter(|e| e.len() <= 4 && !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .unwrap_or("jpg");
+    let ext = sniff_image_ext(&bytes).unwrap_or(url_ext);
+    let path = dir.join(format!("{user_id}.{ext}"));
+    // Unchanged bytes are not rewritten, so the version a window holds only
+    // moves when the picture does.
+    if tokio::fs::read(&path).await.ok().as_deref() != Some(&bytes[..]) {
+        // A picture that changed format replaces the old file rather than
+        // sitting beside it, where the lookup could find the old one first.
+        for other in CACHED_AVATAR_EXTS.iter().filter(|e| **e != ext) {
+            let _ = tokio::fs::remove_file(dir.join(format!("{user_id}.{other}"))).await;
+        }
+        if let Err(e) = tokio::fs::write(&path, &bytes).await {
+            tracing::debug!("sneedchat: caching avatar for user {user_id}: {e}");
+            return fallback().await;
         }
     }
+    let _ = tokio::fs::write(&source, &url).await;
+    Some(versioned(&path).await)
 }
 
 /// Recognized image/video file extensions for attachment links - shares
