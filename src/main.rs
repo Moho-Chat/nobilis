@@ -397,6 +397,7 @@ async fn run_housekeeping(state: AppState) {
     // back a minute would only mean a minute of pictures that should move
     // sitting still.
     backend::discord::retire_still_thumbnails().await;
+    backend::sneedchat::remove_retired_caches().await;
 
     // Let the initial reconnect burst above settle before the first pass.
     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -407,6 +408,8 @@ async fn run_housekeeping(state: AppState) {
         backend::discord::sweep_thumbnail_cache().await;
         backend::discord::sweep_guild_icon_cache().await;
         backend::kick::emotecache::sweep_emote_cache().await;
+        backend::discord::stickers::sweep_sticker_cache().await;
+        backend::discord::soundboard::sweep_sound_cache().await;
 
         tokio::time::sleep(backend::sneedchat::AVATAR_CACHE_SWEEP_INTERVAL).await;
     }

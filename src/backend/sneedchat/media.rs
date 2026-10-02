@@ -69,10 +69,27 @@ pub async fn sweep_cache_dir(dir: &std::path::Path, max_bytes: u64, label: &str)
         }
     }
     tracing::info!(
-        "sneedchat: {label} cache was {}MB over its {}MB cap, evicted {removed} oldest file(s)",
+        "{label} cache was {}MB over its {}MB cap, evicted {removed} oldest file(s)",
         overage / 1024 / 1024,
         max_bytes / 1024 / 1024
     );
+}
+
+/// Removes the caches Sneedchat kept while it was called Sockchat.
+///
+/// The message store moved its ids to the new name; nothing moved or read the
+/// files, which sat at a hundred-odd megabytes unread ever since. A cache, so
+/// nothing is lost: anything still wanted is fetched again under the new name.
+pub async fn remove_retired_caches() {
+    let root = dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis");
+    for name in ["sockchat-attachments", "sockchat-avatars"] {
+        let dir = root.join(name);
+        if tokio::fs::remove_dir_all(&dir).await.is_ok() {
+            tracing::info!("removed the retired {name} cache");
+        }
+    }
 }
 
 pub async fn sweep_avatar_cache() {

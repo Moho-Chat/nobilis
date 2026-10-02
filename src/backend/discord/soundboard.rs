@@ -209,6 +209,14 @@ fn cache_dir() -> std::path::PathBuf {
         .join("discord-sounds")
 }
 
+/// Cap on the sound cache. A sound is at most a few hundred kilobytes, and
+/// one swept out is fetched again the next time it is played.
+pub const SOUND_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+pub async fn sweep_sound_cache() {
+    crate::backend::sneedchat::sweep_cache_dir(&cache_dir(), SOUND_CACHE_MAX_BYTES, "discord sound").await;
+}
+
 /// The sound's file, kept: a sound id names one recording for good.
 async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     if !id.bytes().all(|b| b.is_ascii_digit()) {
