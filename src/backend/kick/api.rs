@@ -166,14 +166,9 @@ struct UserJson {
     profile_pic: Option<String>,
 }
 
-/// Looks a streamer up by the handle somebody typed.
-///
-/// The handle is what appears after kick.com/, and people paste it in every
-/// form they have seen it: with the URL still attached, with an @ in front
-/// because that is how handles work everywhere else, in the wrong case. All of
-/// those name the same channel, so all of them are accepted; see `normalise_slug`.
-/// How many times to wait and ask again when Kick says to slow down.
-const CHANNEL_RETRIES: usize = 3;
+/// How many times one request waits and asks again when Kick says to slow
+/// down.
+const PACED_RETRIES: usize = 3;
 
 /// How long Kick asked us to wait, where it said.
 fn retry_after(res: &reqwest::Response) -> Option<Duration> {
@@ -184,6 +179,50 @@ fn retry_after(res: &reqwest::Response) -> Option<Duration> {
     Some(Duration::from_secs(seconds.min(10)))
 }
 
+/// When Kick said this client may ask again, if it has said to wait.
+///
+/// One for the whole daemon, because the limit is: Kick counts this client's
+/// requests, not one channel's. Each request used to wait out its own 429 on
+/// its own clock, so fifty channels refused together came back together and
+/// were refused together again - a reconnect drew hundreds of them.
+fn not_before() -> &'static std::sync::Mutex<Option<tokio::time::Instant>> {
+    static NOT_BEFORE: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> = std::sync::OnceLock::new();
+    NOT_BEFORE.get_or_init(Default::default)
+}
+
+/// Sends a request once Kick is willing to hear it, and when told to slow
+/// down, makes every request wait - not just this one - before asking again.
+async fn paced(request: reqwest::RequestBuilder) -> reqwest::Result<reqwest::Response> {
+    let mut attempt = 0;
+    loop {
+        let until = *not_before().lock().unwrap();
+        if let Some(until) = until {
+            tokio::time::sleep_until(until).await;
+        }
+        let Some(this) = request.try_clone() else { return request.send().await };
+        let res = this.send().await?;
+        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= PACED_RETRIES {
+            return Ok(res);
+        }
+        attempt += 1;
+        // Seconds rather than milliseconds: Kick's limit is measured in
+        // requests per window, and asking again immediately only spends the
+        // next window's budget on the same refusal.
+        let wait = retry_after(&res).unwrap_or(Duration::from_secs(3 * attempt as u64));
+        let until = tokio::time::Instant::now() + wait;
+        let mut shared = not_before().lock().unwrap();
+        if shared.is_none_or(|t| t < until) {
+            *shared = Some(until);
+        }
+    }
+}
+
+/// Looks a streamer up by the handle somebody typed.
+///
+/// The handle is what appears after kick.com/, and people paste it in every
+/// form they have seen it: with the URL still attached, with an @ in front
+/// because that is how handles work everywhere else, in the wrong case. All of
+/// those name the same channel, so all of them are accepted; see `normalise_slug`.
 pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     let slug = normalise_slug(slug);
     if slug.is_empty() {
@@ -195,18 +234,7 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     // starting up rather than a failure. Answered by waiting: a channel
     // dropped here is a channel missing from the list until the next
     // restart, which is a far worse outcome than a slower connect.
-    let mut res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
-    for attempt in 1..=CHANNEL_RETRIES {
-        if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
-            break;
-        }
-        // Seconds rather than milliseconds: Kick's limit is measured in
-        // requests per window, and asking again immediately only spends the
-        // next window's budget on the same refusal.
-        let wait = retry_after(&res).unwrap_or(Duration::from_secs(2 * attempt as u64));
-        tokio::time::sleep(wait).await;
-        res = http.get(&url).header("Accept", "application/json").send().await.context("asking Kick about that channel")?;
-    }
+    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("asking Kick about that channel")?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         bail!("there is no Kick channel called \"{slug}\"");
     }
@@ -375,7 +403,7 @@ pub fn emote_url(id: &str) -> String {
 /// headings, and a message can carry any of them.
 pub async fn emotes(http: &reqwest::Client, slug: &str) -> Result<Vec<Emote>> {
     let url = format!("{API_ROOT}/emotes/{slug}");
-    let res = http.get(&url).header("Accept", "application/json").send().await.context("fetching the channel's emotes")?;
+    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("fetching the channel's emotes")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for {slug}'s emotes", res.status());
     }
@@ -803,7 +831,7 @@ pub async fn history(
     if let Some(cursor) = cursor {
         url.push_str(&format!("?cursor={}", urlencode(cursor)));
     }
-    let res = http.get(&url).header("Accept", "application/json").send().await.context("fetching the channel's history")?;
+    let res = paced(http.get(&url).header("Accept", "application/json")).await.context("fetching the channel's history")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for that channel's history", res.status());
     }
@@ -903,11 +931,7 @@ pub async fn set_following(http: &reqwest::Client, token: &str, slug: &str, foll
 }
 
 pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result<Standing> {
-    let res = http
-        .get(format!("{API_ROOT}/api/v2/channels/{slug}/me"))
-        .header("Accept", "application/json")
-        .bearer_auth(token)
-        .send()
+    let res = paced(http.get(format!("{API_ROOT}/api/v2/channels/{slug}/me")).header("Accept", "application/json").bearer_auth(token))
         .await
         .context("asking Kick about this account's standing in the channel")?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -1849,6 +1873,62 @@ pub fn redeem_allowed(account_id: &str) -> bool {
             seen.insert(account_id.to_string(), now);
             true
         }
+    }
+}
+
+#[cfg(test)]
+mod pacing_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that refuses its first request with a 429 and a one-second
+    /// Retry-After, and answers every one after that.
+    async fn server() -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let reply = if n == 0 {
+                        "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                    };
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/"), seen)
+    }
+
+    /// One refusal holds back every request, not just the one refused - and
+    /// for as long as Kick asked, rather than each on a clock of its own.
+    #[tokio::test]
+    async fn a_refusal_makes_everybody_wait_as_long_as_kick_said() {
+        let (url, seen) = server().await;
+        let http = reqwest::Client::new();
+        let started = tokio::time::Instant::now();
+
+        let first = paced(http.get(&url)).await.unwrap();
+        assert_eq!(first.status(), 200, "asked again after the wait");
+        assert!(started.elapsed() >= Duration::from_secs(1), "waited as long as Retry-After said");
+
+        // A second caller arriving while the pause is still in force waits it
+        // out too, instead of being refused on its own.
+        *not_before().lock().unwrap() = Some(tokio::time::Instant::now() + Duration::from_millis(400));
+        let before = tokio::time::Instant::now();
+        let second = paced(http.get(&url)).await.unwrap();
+        assert_eq!(second.status(), 200);
+        assert!(before.elapsed() >= Duration::from_millis(400), "the shared pause held it back");
+        assert_eq!(seen.load(Ordering::SeqCst), 3, "one refusal, then one request each");
     }
 }
 

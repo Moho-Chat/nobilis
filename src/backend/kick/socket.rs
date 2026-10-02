@@ -52,8 +52,6 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
-/// How many channels to resolve at once when connecting.
-///
 /// How many times a rate-limited channel is asked for again before giving up.
 pub(super) const REJOIN_ATTEMPTS: u8 = 3;
 
@@ -72,10 +70,12 @@ pub(super) fn retry_later(state: &AppState, account_id: &str, slug: String, atte
     });
 }
 
+/// How many channels to look up at once on a first connect.
+///
 /// Measured, not guessed: eight at a time drew 429s from Kick on an account
 /// watching thirty channels, and the channels that were refused went missing
-/// from the list entirely. Four, with the retry in `api::channel` behind it,
-/// connects the same thirty in a few seconds and asks nothing twice.
+/// from the list entirely. Three, with every request paced behind one shared
+/// wait (see `api::paced`), connects the same thirty in a few seconds.
 pub(super) const CONNECT_CONCURRENCY: usize = 3;
 
 /// How many followed channels to open on a first connect.
@@ -218,7 +218,29 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
     // Subscribing stays serial, because the socket is one thing and only one
     // subscription can be written to it at a time. It is the waiting that is
     // parallel, not the writing.
-    let queue: Vec<_> = channels
+    // A reconnect, for every channel this daemon has already joined: its ids
+    // are known and never change, so it is subscribed again at once, with no
+    // request to Kick at all. Asking `/channels/<handle>` again for each - and
+    // its emotes, its standing, its history - on every dropped socket was most
+    // of the 429s in a day's log, and none of it told us anything new. The
+    // one thing a reconnect does need is what was said while it was down: one
+    // page of history each, through the same pacing as everything else.
+    let mut fresh = Vec::new();
+    for slug in &channels {
+        let buffer_id = crate::model::buffer_id(account_id, &api::normalise_slug(slug));
+        let Some(known) = state.runtime.kick_channel(&buffer_id) else {
+            fresh.push(slug.clone());
+            continue;
+        };
+        subscribe(&mut socket, known.chatroom_id, known.channel_id).await?;
+        watched.add_ids(&known.slug, known.chatroom_id, known.channel_id);
+        let (state, http, account_id) = (state.clone(), http.clone(), account_id.to_string());
+        tokio::spawn(async move {
+            backfill(&state, &http, &account_id, &known.slug, known.channel_id, None).await;
+        });
+    }
+
+    let queue: Vec<_> = fresh
         .iter()
         .cloned()
         .map(|slug| {
