@@ -4164,26 +4164,21 @@ pub async fn dispatch(
                 Err(e) => return (None, Some(format!("{e:#}"))),
             };
 
-            let mut channels = cfg.channels.clone();
             let mut added: Vec<String> = Vec::new();
             for slug in followed {
                 if added.len() >= backend::kick::MAX_FOLLOWED {
                     break;
                 }
-                if !channels.contains(&slug) {
-                    channels.push(slug.clone());
+                if !cfg.channels.contains(&slug) && !added.contains(&slug) {
                     added.push(slug);
                 }
             }
 
-            if !added.is_empty() {
-                if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
-                    return (None, Some(format!("{e:#}")));
-                }
-            }
-            // Told to the live connection so they open now rather than at the
-            // next restart. A disconnected account keeps them anyway - they
-            // are persisted above - which is why this is not an error.
+            // Nothing is saved until Kick has answered for it. Connected, the
+            // live connection opens each and saves the ones that open; not
+            // connected, each is looked up here and only the channels that
+            // exist are kept. Saved first, a follow Kick no longer knows
+            // stayed in the list for good with nothing on screen to close it.
             let connected = match state.runtime.kick_sender(account_id) {
                 Some(sender) => {
                     for slug in &added {
@@ -4191,7 +4186,23 @@ pub async fn dispatch(
                     }
                     true
                 }
-                None => false,
+                None => {
+                    let mut channels = cfg.channels.clone();
+                    let mut kept = Vec::new();
+                    for slug in added {
+                        if let Ok(channel) = backend::kick::api::channel(&http, &slug).await {
+                            channels.push(channel.slug.clone());
+                            kept.push(channel.slug);
+                        }
+                    }
+                    if !kept.is_empty() {
+                        if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
+                            return (None, Some(format!("{e:#}")));
+                        }
+                    }
+                    added = kept;
+                    false
+                }
             };
             (Some(serde_json::json!({ "added": added.len(), "channels": added, "connected": connected })), None)
         }

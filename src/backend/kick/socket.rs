@@ -197,7 +197,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                         }
                     }
                     let added = channels.len() - before;
-                    let _ = state.accounts.set_kick_channels(account_id, channels.clone());
+                    // Opened below like any other channel, and saved by that
+                    // when Kick answers for each - not written to the list
+                    // here, where a handle Kick no longer knows would be kept
+                    // for good with nothing on screen to close it by.
                     let _ = state.accounts.mark_kick_follows_synced(account_id);
                     if added > 0 {
                         state.runtime.report_progress(state, account_id, &format!("opened {added} channels you follow on Kick"));
@@ -305,6 +308,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
             Ok(channel) => {
                 subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                 watched.add(&channel);
+                // Saved now that Kick has answered for it - which is what
+                // keeps the follows read in on a first connect from being
+                // written to the list before anybody knew they existed.
+                remember(state, account_id, &channel.slug);
             }
             // One bad handle in a saved list must not stop the other twenty
             // from connecting - a channel can be renamed or banned between
@@ -384,6 +391,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                         Ok(channel) => {
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
+                            remember(state, account_id, &channel.slug);
                         }
                         Err(e) if no_such_channel(&e) => forget_missing(state, account_id, &handle),
                         Err(e) => {
