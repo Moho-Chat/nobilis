@@ -297,6 +297,23 @@ impl Store {
             let _ = conn.execute_batch("PRAGMA user_version = 1;");
         }
 
+        // One-time move of Sneedchat's cached attachments out of the text.
+        //
+        // They used to be written into the message body as a `file://` link,
+        // and the window drew any such link as a picture - which let anybody
+        // type one and have the reader's computer load a file of their
+        // choosing (#247). The window now takes no local path from text, and
+        // a cached file is an attachment; rows written before that are moved
+        // across here so their pictures still show.
+        if version < 2 {
+            match move_cached_links_to_attachments(&conn) {
+                Ok(n) if n > 0 => tracing::info!("scrollback: moved {n} cached Sneedchat picture(s) from message text to attachments"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("scrollback: could not move cached pictures to attachments: {e}"),
+            }
+            let _ = conn.execute_batch("PRAGMA user_version = 2;");
+        }
+
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -505,7 +522,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let bodies: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT body FROM messages WHERE buffer_id = ?1")?;
+            // The attachments as well as the text: a cached Sneedchat file is
+            // named by its attachment now, and only in the text in rows
+            // written before that (see the version 2 migration).
+            let mut stmt = tx.prepare("SELECT body || char(10) || attachments FROM messages WHERE buffer_id = ?1")?;
             let rows = stmt.query_map(params![buffer_id], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
@@ -1282,6 +1302,70 @@ impl Store {
     }
 }
 
+
+/// Takes the daemon's own cached-file links out of stored message text and
+/// makes them attachments - see the version 2 migration in `Store::open`.
+///
+/// Only links into the Sneedchat attachment cache, which only the daemon ever
+/// wrote. Any other `file://` in a body was typed by somebody and stays text.
+fn move_cached_links_to_attachments(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, body, attachments FROM messages WHERE body LIKE '%file://%/sneedchat-attachments/%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut moved = 0;
+    for (id, body, attachments) in rows {
+        let (text, found) = cached_links_in(&body);
+        if found.is_empty() {
+            continue;
+        }
+        let mut list: Vec<crate::model::Attachment> = serde_json::from_str(&attachments).unwrap_or_default();
+        list.extend(found);
+        conn.execute(
+            "UPDATE messages SET body = ?1, attachments = ?2 WHERE id = ?3",
+            params![text, serde_json::to_string(&list)?, id],
+        )?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// The text without its cached-attachment links, and those links as
+/// attachments.
+fn cached_links_in(body: &str) -> (String, Vec<crate::model::Attachment>) {
+    let mut text = String::with_capacity(body.len());
+    let mut found = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("file://") {
+        text.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let end = tail.find(|c: char| c.is_whitespace() || c == '[' || c == ']').unwrap_or(tail.len());
+        let link = &tail[..end];
+        let path = link.trim_start_matches("file://");
+        let parent = std::path::Path::new(path).parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if parent == Some("sneedchat-attachments") && !name.is_empty() {
+            let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+            found.push(crate::model::Attachment {
+                kind: if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" }.to_string(),
+                filename: Some(name.to_string()),
+                path: Some(link.to_string()),
+                ..Default::default()
+            });
+        } else {
+            text.push_str(link);
+        }
+        rest = &tail[end..];
+    }
+    text.push_str(rest);
+    // An [img] that held only the link is now empty; it would draw nothing.
+    let text = text.replace("[img][/img]", "").replace("[IMG][/IMG]", "");
+    (text.trim().to_string(), found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{drop_missing_local_copies, Store};
@@ -1827,5 +1911,22 @@ mod dedupe_tests {
         put(&s, "acct|#two", "abc", "hello");
         assert_eq!(s.get_backlog("acct|#one", 0, 100).unwrap().len(), 1);
         assert_eq!(s.get_backlog("acct|#two", 0, 100).unwrap().len(), 1);
+    }
+
+    /// The daemon's own cached-picture links leave the text and become
+    /// attachments; a `file://` somebody typed stays as text.
+    #[test]
+    fn cached_links_move_and_typed_ones_stay() {
+        let body = "look [img]file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg[/img] and file:///etc/passwd";
+        let (text, found) = cached_links_in(body);
+        assert_eq!(text, "look  and file:///etc/passwd");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, "image");
+        assert_eq!(found[0].filename.as_deref(), Some("9623396.jpeg"));
+        assert_eq!(found[0].path.as_deref(), Some("file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg"));
+
+        let (same, none) = cached_links_in("nothing cached here");
+        assert_eq!(same, "nothing cached here");
+        assert!(none.is_empty());
     }
 }

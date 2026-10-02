@@ -3468,6 +3468,11 @@ impl Runtime {
     /// Records one published fact. An absent value clears the key, which is
     /// somebody taking their avatar down rather than never having had one.
     pub fn set_irc_metadata(&self, account_id: &str, nick: &str, key: &str, value: Option<String>) {
+        // Anybody can publish any string as their avatar, and it is drawn as a
+        // picture. Only a web address is kept: a `file://` URL or a bare path
+        // would have the window load a file from this computer on somebody
+        // else's say-so (#247).
+        let value = if key == "avatar" { value.filter(|v| crate::model::is_web_url(v)) } else { value };
         let mut all = self.irc_metadata.lock().unwrap();
         let people = all.entry(account_id.to_string()).or_default();
         let nick = nick.to_ascii_lowercase();

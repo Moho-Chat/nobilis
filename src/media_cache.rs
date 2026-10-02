@@ -43,6 +43,9 @@ pub const CACHES: &[Cache] = &[
     Cache { dir: "kick-emotes", group: "emotes", max_bytes: 64 * MB },
     Cache { dir: "discord-stickers", group: "emotes", max_bytes: 32 * MB },
     Cache { dir: "discord-sounds", group: "emotes", max_bytes: 16 * MB },
+    // QR codes and voice messages on their way out; normally removed as soon
+    // as they are used, and swept in case something was not.
+    Cache { dir: "transient", group: "media", max_bytes: 16 * MB },
 ];
 
 /// How long a cached file is kept after it was written, whatever the size.
@@ -63,6 +66,18 @@ pub fn root() -> PathBuf {
 
 pub fn dir(name: &str) -> PathBuf {
     root().join(name)
+}
+
+/// Where something drawn once and thrown away is written - a sign-in QR code,
+/// a voice message on its way to being sent - created if need be.
+///
+/// Inside the cache rather than the system temp directory, because the window
+/// is only allowed to read the daemon's named cache folders: the temp
+/// directory as a whole holds every program's files, and was once served.
+pub fn transient_dir() -> PathBuf {
+    let dir = dir("transient");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
 }
 
 static STORE: OnceLock<Arc<Store>> = OnceLock::new();

@@ -329,7 +329,7 @@ fn failure(reason: &str) -> Value {
 }
 
 fn qr_path(login_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("moho-matrix-qr-{}.png", login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")))
+    crate::media_cache::transient_dir().join(format!("moho-matrix-qr-{}.png", login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")))
 }
 
 /// The code as an image. Binary data in the QR code's byte mode, which is

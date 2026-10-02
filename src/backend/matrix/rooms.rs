@@ -215,7 +215,11 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
                 }
             }
             "m.room.avatar" => {
-                if let Some(u) = event["content"]["url"].as_str().filter(|u| !u.is_empty()) {
+                // Only a Matrix content address. The inviter writes this state
+                // and anyone can invite anyone, so a `file://` or a bare path
+                // here would be a stranger choosing a file on this computer
+                // for the window to load (#247).
+                if let Some(u) = event["content"]["url"].as_str().filter(|u| u.starts_with("mxc://")) {
                     avatar = Some(u.to_string());
                 }
             }

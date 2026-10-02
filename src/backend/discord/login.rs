@@ -91,7 +91,8 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     // directly. Cleaned up on every exit path (success/error/panic) via
     // this drop guard, including the panic case: unwinding still runs
     // destructors for values already on the stack.
-    let qr_path = std::env::temp_dir().join(format!("nobilis-discord-qr-{login_id}.png"));
+    let safe_id = login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let qr_path = crate::media_cache::transient_dir().join(format!("nobilis-discord-qr-{safe_id}.png"));
     struct RemoveOnDrop(std::path::PathBuf);
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {

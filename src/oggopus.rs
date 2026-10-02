@@ -224,7 +224,7 @@ pub fn to_mono(interleaved: &[f32], channels: u16) -> Vec<f32> {
 
 /// Writes the encoded recording somewhere it can be uploaded from.
 pub fn write_temp(bytes: &[u8]) -> Result<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join("moho-voice");
+    let dir = crate::media_cache::transient_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = dir.join(format!("voice-message-{}.ogg", rand_serial()));
     std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;

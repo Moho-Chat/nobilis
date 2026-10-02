@@ -478,9 +478,31 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
             }
         };
 
+        // As an attachment, not written into the text. The text is the
+        // sender's, and the window takes no local path from text at all
+        // (#247) - so a cached file goes where every other protocol puts one,
+        // and the link it replaces leaves the text, as the old rewrite did.
         if let Some(local_url) = local_url {
-            let new_body = body.replace(&matched, &local_url);
-            state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, &new_body);
+            let kind = if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" };
+            let page = matched.find("/attachments/").map(|at| format!("https://{KIWIFARMS_CLEARNET_HOST}{}", &matched[at..]));
+            let attachment = crate::model::Attachment {
+                kind: kind.to_string(),
+                filename: Some(format!("{id}.{ext}")),
+                path: Some(local_url),
+                url: page,
+                ..Default::default()
+            };
+            let new_body = body.replace(&matched, "");
+            state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, new_body.trim());
+            let attachments = vec![attachment];
+            if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
+                tracing::debug!("sneedchat: recording attachment {id}: {e}");
+                return;
+            }
+            state.events.emit(
+                "messageUpdated",
+                serde_json::json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "attachments": attachments }),
+            );
         }
     });
 }

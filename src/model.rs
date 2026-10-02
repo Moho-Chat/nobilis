@@ -188,6 +188,17 @@ pub struct SneedChatRoomInfo {
 
 /// Matches Buffer JSON (daemon/nobilis/model.c's nobilis_buffer_json).
 /// `id` = "<accountId>|<name>"; `kind` is "channel"|"dm"|"server".
+/// Whether a URL some other party supplied points at the web.
+///
+/// The test for anything a remote sender controls that will be drawn or
+/// fetched - an avatar, a picture link. Local paths are only ever ones the
+/// daemon wrote itself (#247), so a sender's `file://`, a bare path or any
+/// other scheme is not a URL to pass on.
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
+}
+
 /// Why a buffer is not receiving, when the account itself is fine.
 ///
 /// A Sneedchat room has its own connection, an IRC channel can refuse the
