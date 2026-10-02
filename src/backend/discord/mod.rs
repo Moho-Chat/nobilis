@@ -78,12 +78,9 @@ pub use commands::*;
 pub use gateway::*;
 pub use guilds::*;
 pub use history::*;
-// Nearly nothing in `http` is for outside this folder - the plain import is
-// what puts it in reach of the files beside it. The exception is the captcha
-// pair, which crosses the boundary by nature: a challenge has to reach the
-// client that can put it on screen, and the answer has to come back.
+// Nothing in `http` is for outside this folder - the plain import is what
+// puts it in reach of the files beside it.
 use http::*;
-pub use http::{CaptchaAnswer, CaptchaAsked};
 pub use login::*;
 pub use media::*;
 pub use messages::*;
