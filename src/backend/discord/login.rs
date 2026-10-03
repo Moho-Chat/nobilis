@@ -250,7 +250,7 @@ pub(super) async fn finish_login(
         .map(|hash| format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.png"));
 
     let use_tor = crate::net::route::router().wanted(&crate::net::route::pending_key("discord"));
-    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor };
+    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor, strict_route: false };
     if let Some(expected) = reauth_account_id {
         if config.account_id() != expected {
             bail!("that is a different Discord account - re-authenticating {expected} needs the same account");

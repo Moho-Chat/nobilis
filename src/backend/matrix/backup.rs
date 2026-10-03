@@ -260,6 +260,7 @@ mod tests {
         };
         let config = crate::accounts::MatrixAccountConfig {
             use_tor: false,
+            strict_route: false,
             homeserver_url: homeserver.to_string(),
             user_id: login.user_id.clone(),
             password: password.to_string(),

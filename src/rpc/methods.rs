@@ -561,6 +561,9 @@ pub async fn dispatch(
                 nickserv_password: None,
                 display_name: None,
                 use_tor: p_bool(params, "useTor", false),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 tor_proxy: None,
             };
             match state.accounts.add_irc(config.clone()) {
@@ -3262,6 +3265,9 @@ pub async fn dispatch(
                 tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| "embedded".to_string()),
                 // The open internet unless asked otherwise.
                 use_tor: p_bool(params, "useTor", false),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 proxy: p_str_opt(params, "proxy").map(String::from),
                 rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
                 rooms_chosen: false,
@@ -3339,6 +3345,9 @@ pub async fn dispatch(
                     // Chosen on the add form before the window opened; an
                     // account that already exists keeps its own setting.
                     use_tor: p_bool(params, "useTor", false),
+                    // Never strict at sign-in; the account store keeps an existing
+                    // account's strict routing across a re-login.
+                    strict_route: false,
                     proxy: None,
                     rooms: Vec::new(),
                     rooms_chosen: false,
@@ -3460,6 +3469,44 @@ pub async fn dispatch(
             match router.ready(|_| {}).await {
                 Ok((host, port)) => (Some(serde_json::json!({ "tunnelAll": true, "socks": format!("{host}:{port}") })), None),
                 Err(e) => (Some(serde_json::json!({ "tunnelAll": true, "socks": null, "error": format!("{e:#}") })), None),
+            }
+        }
+
+        // Where a strict account's media goes (#257): the SOCKS address of
+        // the route - moho's own Tor through its loopback relay, or the proxy
+        // the user named - whether or not everything is tunnelled. Asked by
+        // the main process for the session it fetches strict media through;
+        // an error is answered as such, and the window then loads nothing for
+        // that account rather than loading it directly.
+        "netRoute" => match crate::net::route::router().ready(|_| {}).await {
+            Ok((host, port)) => (Some(serde_json::json!({ "socks": format!("{host}:{port}") })), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
+
+        // One account's routing, in three positions: "clearnet", "service"
+        // (the connection, and the media the daemon fetches for it) or
+        // "strict" (that, and everything the window loads for it - #257).
+        // Reconnected only when the connection's own route changes; strict
+        // on or off is the window's business alone.
+        "setAccountRoute" => {
+            let Some(id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setAccountRoute requires \"accountId\"".to_string()));
+            };
+            let level = p_str(params, "level", "clearnet");
+            if !matches!(level, "clearnet" | "service" | "strict") {
+                return (None, Some(format!("\"{level}\" is not a routing level")));
+            }
+            let was = state.accounts.route_level_of(id);
+            match state.accounts.set_route_level(id, level) {
+                Ok(true) => {
+                    let tunnelled = |l: &Option<String>| l.as_deref().is_some_and(|l| l != "clearnet");
+                    if tunnelled(&was) != (level != "clearnet") {
+                        respawn_account(state, id);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3692,6 +3739,9 @@ pub async fn dispatch(
                 // person had closed.
                 followed_synced: existing.as_ref().is_some_and(|e| e.followed_synced),
                 use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("kick")),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 channels: existing.map(|e| e.channels).unwrap_or_default(),
             };
             match state.accounts.add_kick(config) {

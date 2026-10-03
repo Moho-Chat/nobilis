@@ -74,6 +74,11 @@ pub struct IrcAccountConfig {
     /// listening at `tor_proxy` (defaults to the standard system Tor port).
     #[serde(default)]
     pub use_tor: bool,
+    /// Strict routing: on top of `use_tor`, everything the window loads for
+    /// this account's conversations goes through the route too - see
+    /// Account::route_level.
+    #[serde(default)]
+    pub strict_route: bool,
     #[serde(default)]
     pub tor_proxy: Option<String>,
 }
@@ -110,6 +115,11 @@ pub struct DiscordAccountConfig {
     /// proxy set in the network settings. Off by default.
     #[serde(default)]
     pub use_tor: bool,
+    /// Strict routing: on top of `use_tor`, everything the window loads for
+    /// this account's conversations goes through the route too - see
+    /// Account::route_level.
+    #[serde(default)]
+    pub strict_route: bool,
 }
 
 impl DiscordAccountConfig {
@@ -156,6 +166,11 @@ pub struct SneedChatAccountConfig {
     /// account does.
     #[serde(default)]
     pub use_tor: bool,
+    /// Strict routing: on top of `use_tor`, everything the window loads for
+    /// this account's conversations goes through the route too - see
+    /// Account::route_level.
+    #[serde(default)]
+    pub strict_route: bool,
     #[serde(default)]
     pub proxy: Option<String>,
     #[serde(default)]
@@ -291,6 +306,11 @@ pub struct MatrixAccountConfig {
     /// proxy set in the network settings. Off by default.
     #[serde(default)]
     pub use_tor: bool,
+    /// Strict routing: on top of `use_tor`, everything the window loads for
+    /// this account's conversations goes through the route too - see
+    /// Account::route_level.
+    #[serde(default)]
+    pub strict_route: bool,
 }
 
 impl MatrixAccountConfig {
@@ -333,6 +353,11 @@ pub struct KickAccountConfig {
     /// proxy set in the network settings. Off by default.
     #[serde(default)]
     pub use_tor: bool,
+    /// Strict routing: on top of `use_tor`, everything the window loads for
+    /// this account's conversations goes through the route too - see
+    /// Account::route_level.
+    #[serde(default)]
+    pub strict_route: bool,
 }
 
 impl KickAccountConfig {
@@ -477,6 +502,11 @@ impl AccountStore {
         // Signing in again keeps a route that was on: a re-login comes from
         // the account's own card, which does not ask, and must not quietly
         // send an account that was going through Tor out directly.
+        // Strict routing survives a re-login too: dropping it silently would
+        // send this account's media straight out again (#257).
+        if discord.get(&id).is_some_and(|old| old.strict_route) {
+            config.strict_route = true;
+        }
         if discord.get(&id).is_some_and(|old| old.use_tor) {
             config.use_tor = true;
         }
@@ -495,9 +525,14 @@ impl AccountStore {
 
     /// Upserts like add_discord - re-adding the same username is how a user
     /// updates a changed password/TOTP secret, not a duplicate mistake.
-    pub fn add_sneedchat(&self, config: SneedChatAccountConfig) -> Result<SneedChatAccountConfig> {
+    pub fn add_sneedchat(&self, mut config: SneedChatAccountConfig) -> Result<SneedChatAccountConfig> {
         let id = config.account_id();
         let mut sneedchat = self.sneedchat.lock().unwrap();
+        // Strict routing survives signing in again, as long as the form still
+        // asks for Tor - see add_discord.
+        if config.use_tor && sneedchat.get(&id).is_some_and(|old| old.strict_route) {
+            config.strict_route = true;
+        }
         sneedchat.insert(id, config.clone());
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
@@ -520,6 +555,11 @@ impl AccountStore {
         // Signing in again keeps a route that was on: a re-login comes from
         // the account's own card, which does not ask, and must not quietly
         // send an account that was going through Tor out directly.
+        // Strict routing survives a re-login too: dropping it silently would
+        // send this account's media straight out again (#257).
+        if matrix.get(&id).is_some_and(|old| old.strict_route) {
+            config.strict_route = true;
+        }
         if matrix.get(&id).is_some_and(|old| old.use_tor) {
             config.use_tor = true;
         }
@@ -544,6 +584,11 @@ impl AccountStore {
         // Signing in again keeps a route that was on: a re-login comes from
         // the account's own card, which does not ask, and must not quietly
         // send an account that was going through Tor out directly.
+        // Strict routing survives a re-login too: dropping it silently would
+        // send this account's media straight out again (#257).
+        if kick.get(&id).is_some_and(|old| old.strict_route) {
+            config.strict_route = true;
+        }
         if kick.get(&id).is_some_and(|old| old.use_tor) {
             config.use_tor = true;
         }
@@ -632,7 +677,12 @@ impl AccountStore {
 
     /// Whether any account's connections are routed, by account id. False
     /// when there is no such account.
-    pub fn set_routed(&self, account_id: &str, routed: bool) -> Result<bool> {
+    pub fn set_route_level(&self, account_id: &str, level: &str) -> Result<bool> {
+        let (routed, strict) = match level {
+            "strict" => (true, true),
+            "service" => (true, false),
+            _ => (false, false),
+        };
         let (irc, discord, sneedchat, matrix, kick) = (
             &mut *self.irc.lock().unwrap(),
             &mut *self.discord.lock().unwrap(),
@@ -642,18 +692,23 @@ impl AccountStore {
         );
         let found = if let Some(a) = discord.get_mut(account_id) {
             a.use_tor = routed;
+            a.strict_route = strict;
             true
         } else if let Some(a) = matrix.get_mut(account_id) {
             a.use_tor = routed;
+            a.strict_route = strict;
             true
         } else if let Some(a) = kick.get_mut(account_id) {
             a.use_tor = routed;
+            a.strict_route = strict;
             true
         } else if let Some(a) = sneedchat.get_mut(account_id) {
             a.use_tor = routed;
+            a.strict_route = strict;
             true
         } else if let Some(a) = irc.get_mut(account_id) {
             a.use_tor = routed;
+            a.strict_route = strict;
             true
         } else {
             false
@@ -662,6 +717,29 @@ impl AccountStore {
             self.persist(irc, discord, sneedchat, matrix, kick)?;
         }
         Ok(found)
+    }
+
+    /// An account's routing level, if there is such an account.
+    pub fn route_level_of(&self, account_id: &str) -> Option<String> {
+        let pick = |use_tor: bool, strict: bool| Some(route_level(use_tor, strict));
+        if let Some(a) = self.get_irc(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_discord(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_sneedchat(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_matrix(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
+    }
+
+    /// The old two-way switch: the service tunnel, or none.
+    pub fn set_routed(&self, account_id: &str, routed: bool) -> Result<bool> {
+        self.set_route_level(account_id, if routed { "service" } else { "clearnet" })
     }
 
 
@@ -988,6 +1066,18 @@ impl AccountStore {
 /// `state` ("connected"/"connecting"/"disconnected") comes from the
 /// runtime's live connection tracking, not from AccountStore, which only
 /// knows the persisted config - see runtime.rs.
+/// The three positions an account's routing can be in, as the window shows
+/// them: none, the service tunnel (the connection and the media the daemon
+/// fetches for it), or strict (that, and everything the window loads).
+pub fn route_level(use_tor: bool, strict: bool) -> String {
+    match (use_tor, strict) {
+        (true, true) => "strict",
+        (true, false) => "service",
+        _ => "clearnet",
+    }
+    .to_string()
+}
+
 pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
     let id = a.account_id();
     Account {
@@ -1017,6 +1107,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         tor_mode: None,
         tor_proxy: a.tor_proxy.clone(),
         use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1053,6 +1144,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         tor_mode: None,
         tor_proxy: None,
         use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1088,6 +1180,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
         use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1132,6 +1225,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         tor_mode: None,
         tor_proxy: None,
         use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
         has_key_backup: false,
         rtc_focus_url: None,
         sliding_sync: false,
@@ -1171,6 +1265,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         tor_mode: None,
         tor_proxy: None,
         use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
         has_key_backup,
         rtc_focus_url: a.rtc_focus_url.clone(),
         sliding_sync: a.prefer_sliding_sync,

@@ -159,6 +159,9 @@ pub struct Account {
     /// false for every other service.
     #[serde(rename = "useTor")]
     pub use_tor: bool,
+    /// "clearnet", "service" or "strict" - see accounts::route_level.
+    #[serde(rename = "routeLevel")]
+    pub route_level: String,
     /// Matrix-only: whether this account currently has server-side room
     /// key backup (a recovery key) set up - see backend/matrix/backup.rs.
     /// Always false for every other service.

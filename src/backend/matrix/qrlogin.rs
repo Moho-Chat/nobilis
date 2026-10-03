@@ -256,6 +256,9 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.clone(),
         user_id: user_id.clone(),
         password: String::new(),
