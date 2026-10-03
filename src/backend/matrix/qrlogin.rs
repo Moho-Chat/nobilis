@@ -33,6 +33,7 @@ use anyhow::{bail, Context, Result};
 use matrix_sdk_crypto::types::qr_login::{Msc4108IntentData, QrCodeData};
 use matrix_sdk_crypto::types::SecretsBundle;
 use matrix_sdk_crypto::vodozemac::ecies::{Ecies, EstablishedEcies, InitialMessage, Message};
+use matrix_sdk_crypto::vodozemac::hpke::DigitMode;
 use serde_json::{json, Value};
 
 use super::*;
@@ -139,7 +140,10 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
         .await
         .context("nobody entered the code in time")?
         .context("the sign-in was cancelled")?;
-    if typed != channel.ecies.check_code().to_digit() {
+    // The original MSC4108 rendering, which is the one this ECIES channel
+    // speaks: a leading zero allowed. (MSC4388's HPKE channel forbids one;
+    // vodozemac now asks which is meant.)
+    if typed != channel.ecies.check_code().to_digit(DigitMode::AllowLeadingZero) {
         let _ = channel.send_json(failure("user_cancelled")).await;
         bail!("those digits do not match the ones on your phone - start again, and check you scanned this screen");
     }
@@ -496,7 +500,7 @@ mod tests {
         let phone = Ecies::new().establish_outbound_channel(moho_key, LOGIN_INITIATE.as_bytes()).unwrap();
         let inbound = moho.establish_inbound_channel(&InitialMessage::decode(&phone.message.encode()).unwrap()).unwrap();
         assert_eq!(inbound.message, LOGIN_INITIATE.as_bytes());
-        assert_eq!(inbound.ecies.check_code().to_digit(), phone.ecies.check_code().to_digit());
+        assert_eq!(inbound.ecies.check_code().to_digit(DigitMode::AllowLeadingZero), phone.ecies.check_code().to_digit(DigitMode::AllowLeadingZero));
 
         let (mut moho, mut phone) = (inbound.ecies, phone.ecies);
         let sealed = moho.encrypt(LOGIN_OK.as_bytes()).encode();

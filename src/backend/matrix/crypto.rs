@@ -36,7 +36,7 @@ use js_int::UInt;
 use matrix_sdk_crypto::olm::EncryptionSettings;
 use matrix_sdk_crypto::types::requests::AnyOutgoingRequest;
 use matrix_sdk_crypto::{
-    CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, TrustRequirement,
+    CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder, TrustRequirement,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
 // For `event_type()` on a verification step's content - the wire needs the
@@ -128,7 +128,7 @@ impl CryptoSession {
         let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
         tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
         let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = match OlmMachine::with_store(user_id, device_id, store, None).await {
+        let machine = match OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).build().await {
             Ok(machine) => machine,
             // A store belonging to a different device, which happens whenever
             // somebody signs in again: the homeserver mints a new device, and
@@ -149,7 +149,7 @@ impl CryptoSession {
                 forget(data_dir, account_id);
                 tokio::fs::create_dir_all(&dir).await.context("recreating matrix crypto store directory")?;
                 let store = SqliteCryptoStore::open(&dir, None).await.context("reopening matrix crypto store")?;
-                OlmMachine::with_store(user_id, device_id, store, None)
+                OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).build()
                     .await
                     .context("initializing OlmMachine on a fresh store")?
             }
@@ -184,7 +184,7 @@ impl CryptoSession {
         let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
         tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
         let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = OlmMachine::with_store(user_id, device_id, store, Some(account))
+        let machine = OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).with_custom_account(Some(account)).build()
             .await
             .context("initializing OlmMachine with the QR sign-in's account")?;
         if let Some(secrets) = secrets {
