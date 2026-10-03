@@ -205,7 +205,7 @@ pub fn is_web_url(url: &str) -> bool {
 /// join, a Kick channel can be waiting on Kick - so "the account is connected"
 /// does not mean every conversation under it is. Absent when the buffer is
 /// live; the account's own state covers the case where nothing is.
-#[derive(Serialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BufferLink {
     /// "connecting" while it is being joined or retried, "down" when the
     /// service has said no, or something between here and it has.
@@ -229,7 +229,7 @@ impl BufferLink {
     }
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Buffer {
     pub id: String,
     #[serde(rename = "accountId")]

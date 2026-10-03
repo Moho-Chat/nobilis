@@ -432,6 +432,15 @@ impl AccountStore {
         self.irc.lock().unwrap().get(account_id).cloned()
     }
 
+    /// Whether an account with this id is configured, on any service.
+    pub fn has_account(&self, account_id: &str) -> bool {
+        self.get_irc(account_id).is_some()
+            || self.get_discord(account_id).is_some()
+            || self.get_sneedchat(account_id).is_some()
+            || self.get_matrix(account_id).is_some()
+            || self.get_kick(account_id).is_some()
+    }
+
     pub fn all_irc(&self) -> Vec<IrcAccountConfig> {
         self.irc.lock().unwrap().values().cloned().collect()
     }

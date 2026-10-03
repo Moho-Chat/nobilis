@@ -271,6 +271,14 @@ impl Store {
         // Where each cached media file came from, for fetching it again once
         // it has expired or been cleared - see media_cache.rs. Only what the
         // file's own name cannot say: an encrypted file's key, an avatar's URL.
+        // What the window last showed: every conversation and rail entry, so
+        // the next start can show them at once, before any account has
+        // connected - see Runtime::restore_layout.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS known_buffers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS known_groups (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        );
+
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS media_sources (
                  path TEXT PRIMARY KEY,
@@ -1041,6 +1049,40 @@ impl Store {
     }
 
     /// Drops the oldest transfers beyond `keep`.
+    /// Replaces the saved layout - every buffer and rail entry - in one go.
+    pub fn save_layout(&self, buffers: &[crate::model::Buffer], groups: &[crate::model::BufferGroup]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM known_buffers", [])?;
+        tx.execute("DELETE FROM known_groups", [])?;
+        {
+            let mut put = tx.prepare("INSERT INTO known_buffers (id, data) VALUES (?1, ?2)")?;
+            for b in buffers {
+                put.execute(params![b.id, serde_json::to_string(b)?])?;
+            }
+            let mut put = tx.prepare("INSERT INTO known_groups (id, data) VALUES (?1, ?2)")?;
+            for g in groups {
+                put.execute(params![g.id, serde_json::to_string(g)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The saved layout, as last written. Rows that no longer read are
+    /// skipped rather than failing the start.
+    pub fn load_layout(&self) -> Result<(Vec<crate::model::Buffer>, Vec<crate::model::BufferGroup>)> {
+        let conn = self.conn.lock().unwrap();
+        let read = |table: &str| -> Result<Vec<String>> {
+            let mut stmt = conn.prepare(&format!("SELECT data FROM {table}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        };
+        let buffers = read("known_buffers")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
+        let groups = read("known_groups")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
+        Ok((buffers, groups))
+    }
+
     /// Records where a cached media file came from - see media_cache.rs.
     pub fn record_media_source(&self, path: &str, source: &serde_json::Value) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -1928,5 +1970,32 @@ mod dedupe_tests {
         let (same, none) = cached_links_in("nothing cached here");
         assert_eq!(same, "nothing cached here");
         assert!(none.is_empty());
+    }
+
+    /// What the window showed is read back as it was written, and a second
+    /// save replaces the first rather than adding to it.
+    #[test]
+    fn the_layout_reads_back_and_is_replaced_whole() {
+        let s = store();
+        let buffer: crate::model::Buffer = serde_json::from_value(serde_json::json!({
+            "id": "acct|#one", "accountId": "acct", "kind": "channel", "name": "#one",
+            "groupId": "account:acct", "category": "Text", "position": 3
+        }))
+        .unwrap();
+        let group: crate::model::BufferGroup = serde_json::from_value(serde_json::json!({
+            "id": "acct|guild:1", "accountId": "acct", "service": "discord", "kind": "guild", "name": "A server"
+        }))
+        .unwrap();
+        s.save_layout(&[buffer.clone()], &[group.clone()]).unwrap();
+        let (buffers, groups) = s.load_layout().unwrap();
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].id, "acct|#one");
+        assert_eq!(buffers[0].category.as_deref(), Some("Text"));
+        assert_eq!(buffers[0].position, 3);
+        assert_eq!(groups, vec![group]);
+
+        s.save_layout(&[], &[]).unwrap();
+        let (buffers, groups) = s.load_layout().unwrap();
+        assert!(buffers.is_empty() && groups.is_empty());
     }
 }

@@ -324,6 +324,15 @@ pub struct Runtime {
     /// account-level entry every other protocol gets. Held here rather than
     /// per-backend so listBufferGroups is one lookup regardless of protocol.
     buffer_groups: Mutex<HashMap<String, crate::model::BufferGroup>>,
+    /// Buffers and rail entries put back from the last run's layout and not
+    /// yet seen again from their service - see restore_layout. Cleared as the
+    /// backends recreate them; what is left once an account has connected
+    /// and gone quiet went away while the daemon was not running.
+    restored_buffers: Mutex<HashMap<String, ()>>,
+    restored_groups: Mutex<HashMap<String, ()>>,
+    /// When each account last had something confirmed, so pruning waits for
+    /// a backend to finish listing rather than racing it.
+    layout_confirmed: Mutex<HashMap<String, std::time::Instant>>,
     /// Registered the instant a connection task is spawned - before there's
     /// any IrcHandle/Sender to gracefully QUIT with. Lets setAccountConnected
     /// (and removeAccount) actually stop a connection attempt that's still
@@ -1019,6 +1028,9 @@ impl Runtime {
             discord_gateway_sessions: Mutex::new(HashMap::new()),
             ringing_calls: Mutex::new(HashMap::new()),
             buffer_groups: Mutex::new(HashMap::new()),
+            restored_buffers: Mutex::new(HashMap::new()),
+            restored_groups: Mutex::new(HashMap::new()),
+            layout_confirmed: Mutex::new(HashMap::new()),
             discord_guild_id: Mutex::new(HashMap::new()),
             discord_history_inflight: Mutex::new(HashSet::new()),
             discord_buffer_emojis: Mutex::new(HashMap::new()),
@@ -1197,7 +1209,168 @@ impl Runtime {
     /// Registers or updates a rail entry, broadcasting only when something
     /// actually changed - a reconnect re-registers every guild it sees, and
     /// re-broadcasting identical entries would churn every connected frontend.
+    /// Puts back what the window showed last time, before any account has
+    /// connected.
+    ///
+    /// Without it a start was a blank rail filling in one account at a time,
+    /// in whatever order they finished connecting - a Discord account's
+    /// servers appeared only once its gateway had sent every one of them. Now
+    /// every conversation is where it was from the first frame, drawn as not
+    /// yet connected (its account's state says so) until its service confirms
+    /// it. Only accounts that still exist; nothing is announced, because no
+    /// client is attached yet.
+    pub fn restore_layout(&self, state: &AppState) {
+        let (buffers, groups) = match state.store.load_layout() {
+            Ok(layout) => layout,
+            Err(e) => {
+                tracing::warn!("layout: could not read the saved layout: {e:#}");
+                return;
+            }
+        };
+        let known = |account: &str| state.accounts.has_account(account);
+        let mut restored = 0;
+        {
+            let mut live = self.buffers.lock().unwrap();
+            let mut pending = self.restored_buffers.lock().unwrap();
+            for mut buffer in buffers.into_iter().filter(|b| known(&b.account_id)) {
+                // Nothing about its connection carries over; the account's own
+                // state and the backend say that afresh.
+                buffer.link = None;
+                buffer.syncing = false;
+                buffer.last_activity_ts = state.store.last_activity(&buffer.id).unwrap_or(buffer.last_activity_ts);
+                pending.insert(buffer.id.clone(), ());
+                live.entry(buffer.id.clone()).or_insert(buffer);
+                restored += 1;
+            }
+        }
+        {
+            let mut live = self.buffer_groups.lock().unwrap();
+            let mut pending = self.restored_groups.lock().unwrap();
+            for group in groups.into_iter().filter(|g| known(&g.account_id)) {
+                pending.insert(group.id.clone(), ());
+                live.entry(group.id.clone()).or_insert(group);
+            }
+        }
+        if restored > 0 {
+            tracing::info!("layout: restored {restored} conversation(s) from the last run");
+        }
+    }
+
+    /// Marks a restored entry as seen again from its service.
+    fn confirm_restored(&self, account_id: &str, id: &str, group: bool) {
+        let map = if group { &self.restored_groups } else { &self.restored_buffers };
+        if map.lock().unwrap().remove(id).is_some() {
+            self.layout_confirmed.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
+        }
+    }
+
+    /// A hash of what the window draws of the layout - ignoring activity
+    /// times and connection state, which change constantly and are not saved
+    /// for their own sake.
+    pub fn layout_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        let mut buffers: Vec<String> = self
+            .buffers
+            .lock()
+            .unwrap()
+            .values()
+            .map(|b| {
+                let mut b = b.clone();
+                b.last_activity_ts = 0;
+                b.link = None;
+                b.syncing = false;
+                serde_json::to_string(&b).unwrap_or_default()
+            })
+            .collect();
+        buffers.sort();
+        buffers.hash(&mut h);
+        let mut groups: Vec<String> =
+            self.buffer_groups.lock().unwrap().values().map(|g| serde_json::to_string(g).unwrap_or_default()).collect();
+        groups.sort();
+        groups.hash(&mut h);
+        h.finish()
+    }
+
+    /// Writes the layout as it stands, for the next start to put back.
+    pub fn save_layout(&self, state: &AppState) {
+        let buffers: Vec<Buffer> = self.buffers.lock().unwrap().values().cloned().collect();
+        let groups: Vec<crate::model::BufferGroup> = self.buffer_groups.lock().unwrap().values().cloned().collect();
+        if let Err(e) = state.store.save_layout(&buffers, &groups) {
+            tracing::debug!("layout: saving it failed: {e:#}");
+        }
+    }
+
+    /// Once an account is connected and its backend has stopped confirming
+    /// entries, removes the restored ones it never confirmed: a server left,
+    /// a room closed or a channel deleted while the daemon was not running.
+    ///
+    /// Waits for quiet rather than a fixed time, because how long a backend
+    /// takes to list everything varies by service and by size - a Discord
+    /// account's servers arrive one by one after its gateway connects. Gives
+    /// up waiting after five minutes; and stops if the account drops again,
+    /// since an unconfirmed entry then means nothing.
+    pub fn prune_restored_after_connect(self: &std::sync::Arc<Self>, state: &AppState, account_id: &str) {
+        let has_pending = self.restored_buffers.lock().unwrap().keys().any(|k| belongs_to(account_id, k)) || {
+            let groups = self.buffer_groups.lock().unwrap();
+            self.restored_groups.lock().unwrap().keys().any(|id| groups.get(id).is_some_and(|g| g.account_id == account_id))
+        };
+        if !has_pending {
+            return;
+        }
+        let (state, account_id) = (state.clone(), account_id.to_string());
+        tokio::spawn(async move {
+            const QUIET: std::time::Duration = std::time::Duration::from_secs(30);
+            let started = std::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                if !matches!(state.runtime.conn_state(&account_id), Some(ConnState::Connected)) {
+                    return;
+                }
+                let last = state.runtime.layout_confirmed.lock().unwrap().get(&account_id).copied().unwrap_or(started);
+                if last.elapsed() >= QUIET || started.elapsed() >= std::time::Duration::from_secs(300) {
+                    break;
+                }
+            }
+            let stale: Vec<String> = {
+                let mut pending = state.runtime.restored_buffers.lock().unwrap();
+                let ids: Vec<String> = pending.keys().filter(|k| belongs_to(&account_id, k)).cloned().collect();
+                for id in &ids {
+                    pending.remove(id);
+                }
+                ids
+            };
+            let stale_groups: Vec<String> = {
+                let groups = state.runtime.buffer_groups.lock().unwrap();
+                let mut pending = state.runtime.restored_groups.lock().unwrap();
+                let ids: Vec<String> = pending
+                    .keys()
+                    .filter(|id| groups.get(*id).is_some_and(|g| g.account_id == account_id))
+                    .cloned()
+                    .collect();
+                for id in &ids {
+                    pending.remove(id);
+                }
+                ids
+            };
+            for id in &stale {
+                state.runtime.remove_buffer(&state, id);
+            }
+            for id in &stale_groups {
+                state.runtime.remove_buffer_group(&state, id);
+            }
+            if !stale.is_empty() || !stale_groups.is_empty() {
+                tracing::info!(
+                    "layout: {account_id}: {} conversation(s) and {} group(s) from the last run are gone",
+                    stale.len(),
+                    stale_groups.len()
+                );
+            }
+        });
+    }
+
     pub fn upsert_buffer_group(&self, state: &AppState, group: crate::model::BufferGroup) {
+        self.confirm_restored(&group.account_id, &group.id, true);
         {
             let mut groups = self.buffer_groups.lock().unwrap();
             if groups.get(&group.id) == Some(&group) {
@@ -1399,6 +1572,7 @@ impl Runtime {
     /// bufferListChange; no-ops (does not re-emit) if already present.
     pub fn ensure_buffer(&self, state: &AppState, account_id: &str, name: &str, kind: &str) -> Buffer {
         let id = model::buffer_id(account_id, name);
+        self.confirm_restored(account_id, &id, false);
         let mut buffers = self.buffers.lock().unwrap();
         if let Some(existing) = buffers.get(&id) {
             return existing.clone();
@@ -1526,7 +1700,14 @@ impl Runtime {
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
+    pub fn conn_state(&self, account_id: &str) -> Option<ConnState> {
+        self.conn_states.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn set_conn_state(&self, state: &AppState, account_id: &str, conn: ConnState, error: Option<&str>) {
+        if conn == ConnState::Connected {
+            state.runtime.prune_restored_after_connect(state, account_id);
+        }
         self.conn_states.lock().unwrap().insert(account_id.to_string(), conn.clone());
         let mut data = json!({ "accountId": account_id, "state": conn.as_str() });
         if let Some(e) = error {
@@ -4765,6 +4946,7 @@ impl Runtime {
         sweep!(
             conn_states, irc_handles, buffers,
             buffer_groups, task_handles, last_connect_attempt,
+            restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,
             discord_own_roles, discord_guild_roles, discord_guild_owners,
             discord_member_windows, presence, own_identity,

@@ -310,6 +310,9 @@ async fn run() -> Result<()> {
         ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };
     media_cache::init(state.store.clone(), opts.data_dir.clone());
+    // Before any account connects, so the first client to attach sees every
+    // conversation it saw last time - see Runtime::restore_layout.
+    state.runtime.restore_layout(&state);
 
     // Reconnect every saved account, same as
     // daemon/nobilis/actions.c's nobilis_reconnect_saved_accounts() - without
@@ -336,6 +339,7 @@ async fn run() -> Result<()> {
     backend::irc::dcc::restore_transfers(&state);
 
     tokio::spawn(run_housekeeping(state.clone()));
+    tokio::spawn(keep_layout(state.clone()));
 
     let socket_path = opts.socket_path.unwrap_or_else(rpc::default_socket_path);
     let rpc_state = state.clone();
@@ -355,14 +359,35 @@ async fn run() -> Result<()> {
             // give them a moment to reach the network before exiting.
             tracing::info!("shutting down, sending QUIT to all connected accounts");
             state.runtime.quit_all("Leaving");
+            state.runtime.save_layout(&state);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Ok(())
         }
         _ = shutdown_rpc.notified() => {
             tracing::info!("shutdown requested over the socket, sending QUIT to all connected accounts");
             state.runtime.quit_all("Leaving");
+            state.runtime.save_layout(&state);
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             Ok(())
+        }
+    }
+}
+
+/// Writes the layout - every conversation and rail entry - whenever it has
+/// changed, so the next start can show it at once (Runtime::restore_layout).
+///
+/// Compared on what the window draws, not on activity: a busy channel bumps
+/// its last-activity time on every message, and rewriting the whole layout
+/// for that would be work for nothing.
+async fn keep_layout(state: AppState) {
+    let mut last: Option<u64> = None;
+    let mut every = tokio::time::interval(std::time::Duration::from_secs(20));
+    loop {
+        every.tick().await;
+        let print = state.runtime.layout_fingerprint();
+        if last != Some(print) {
+            state.runtime.save_layout(&state);
+            last = Some(print);
         }
     }
 }
