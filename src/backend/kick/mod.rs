@@ -96,8 +96,12 @@ impl Watched {
     }
 
     fn add(&mut self, channel: &api::Channel) {
-        self.by_chatroom.insert(channel.chatroom_id, channel.slug.clone());
-        self.by_channel.insert(channel.id, channel.slug.clone());
+        self.add_ids(&channel.slug, channel.chatroom_id, channel.id);
+    }
+
+    fn add_ids(&mut self, slug: &str, chatroom_id: u64, channel_id: u64) {
+        self.by_chatroom.insert(chatroom_id, slug.to_string());
+        self.by_channel.insert(channel_id, slug.to_string());
     }
 
     /// Forgets a channel, and names every subscription it was using so the

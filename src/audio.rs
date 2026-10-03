@@ -618,13 +618,13 @@ where
     let err = |e| tracing::warn!("audio: capture stream error: {e}");
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
-            config.clone().into(),
+            config.into(),
             move |data: &[f32], _: &_| convert(data),
             err,
             None,
         ),
         cpal::SampleFormat::I16 => device.build_input_stream(
-            config.clone().into(),
+            config.into(),
             move |data: &[i16], _: &_| {
                 let f: Vec<f32> = data.iter().map(|s| *s as f32 / i16::MAX as f32).collect();
                 convert(&f)
@@ -804,7 +804,7 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
     let err = |e| tracing::warn!("audio: output stream error: {e}");
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_output_stream(
-            config.clone().into(),
+            config.into(),
             move |data: &mut [f32], _: &_| {
                 let frames = data.len() / channels.max(1) as usize;
                 fill(frames, Box::new(|i, v| data[i] = v));
@@ -813,7 +813,7 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
             None,
         ),
         cpal::SampleFormat::I16 => device.build_output_stream(
-            config.clone().into(),
+            config.into(),
             move |data: &mut [i16], _: &_| {
                 let frames = data.len() / channels.max(1) as usize;
                 fill(frames, Box::new(|i, v| data[i] = (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16));
@@ -1028,6 +1028,47 @@ fn route_when_ready(stream: Stream, device_id: &str, existing: &std::collections
     match last {
         Ok(_) => Err(anyhow!("the stream never appeared to the sound server")),
         Err(e) => Err(e),
+    }
+}
+
+
+/// A live microphone, read in 20ms frames by whatever is sending it.
+///
+/// Filled by the capture callback on the audio thread and drained by the voice
+/// connection's clock. The two run at the same nominal rate and never in step,
+/// so the buffer absorbs the difference - and is capped, because a sender that
+/// stalls for a second must not come back to a second of old speech.
+pub struct MicSource {
+    buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
+}
+
+impl MicSource {
+    /// The source, and the sink a capture callback feeds it through.
+    pub fn new() -> (Self, impl FnMut(&[f32]) + Send + 'static) {
+        let buffer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let writer = buffer.clone();
+        let sink = move |pcm: &[f32]| {
+            let mut buf = writer.lock().unwrap();
+            buf.extend(pcm.iter().copied());
+            const MAX_SAMPLES: usize = TARGET_RATE as usize * TARGET_CHANNELS as usize; // one second
+            let backlog = buf.len();
+            if backlog > MAX_SAMPLES {
+                buf.drain(..backlog - MAX_SAMPLES);
+            }
+        };
+        (Self { buffer }, sink)
+    }
+
+    /// The next `samples` interleaved samples, or None if fewer have arrived.
+    ///
+    /// Nothing is handed out partially: a frame that is half speech and half
+    /// padding is a click, and waiting one more tick for the rest is not.
+    pub fn take(&self, samples: usize) -> Option<Vec<f32>> {
+        let mut buf = self.buffer.lock().unwrap();
+        if buf.len() < samples {
+            return None;
+        }
+        Some(buf.drain(..samples).collect())
     }
 }
 
@@ -1294,46 +1335,5 @@ mod tests {
         // Three seconds of wall clock should yield roughly three seconds of
         // audio; a badly wrong resample ratio shows up here.
         assert!(seconds > 1.5, "far less audio than elapsed time: {seconds:.2}s");
-    }
-}
-
-
-/// A live microphone, read in 20ms frames by whatever is sending it.
-///
-/// Filled by the capture callback on the audio thread and drained by the voice
-/// connection's clock. The two run at the same nominal rate and never in step,
-/// so the buffer absorbs the difference - and is capped, because a sender that
-/// stalls for a second must not come back to a second of old speech.
-pub struct MicSource {
-    buffer: Arc<Mutex<std::collections::VecDeque<f32>>>,
-}
-
-impl MicSource {
-    /// The source, and the sink a capture callback feeds it through.
-    pub fn new() -> (Self, impl FnMut(&[f32]) + Send + 'static) {
-        let buffer = Arc::new(Mutex::new(std::collections::VecDeque::new()));
-        let writer = buffer.clone();
-        let sink = move |pcm: &[f32]| {
-            let mut buf = writer.lock().unwrap();
-            buf.extend(pcm.iter().copied());
-            const MAX_SAMPLES: usize = TARGET_RATE as usize * TARGET_CHANNELS as usize; // one second
-            let backlog = buf.len();
-            if backlog > MAX_SAMPLES {
-                buf.drain(..backlog - MAX_SAMPLES);
-            }
-        };
-        (Self { buffer }, sink)
-    }
-
-    /// The next `samples` interleaved samples, or None if fewer have arrived.
-    ///
-    /// Nothing is handed out partially: a frame that is half speech and half
-    /// padding is a click, and waiting one more tick for the rest is not.
-    pub fn take(&self, samples: usize) -> Option<Vec<f32>> {
-        let mut buf = self.buffer.lock().unwrap();
-        if buf.len() < samples {
-            return None;
-        }
-        Some(buf.drain(..samples).collect())
     }
 }

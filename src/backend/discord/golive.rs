@@ -558,11 +558,6 @@ pub fn stop_watching(account_id: &str, stream_key: &str) {
     pending().lock().unwrap().remove(&key);
 }
 
-/// Whether this account is watching that stream right now.
-pub fn watching(account_id: &str, stream_key: &str) -> bool {
-    watchers().lock().unwrap().contains_key(&slot(account_id, stream_key))
-}
-
 /// Opens the receiving end, once both halves of somebody else's handshake
 /// have arrived.
 async fn join_stream(state: &AppState, account_id: &str, stream_key: &str, d: &Value) {

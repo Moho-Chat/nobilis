@@ -7,31 +7,7 @@
 
 use super::*;
 
-/// Accepts an invite.
-///
-/// Discord commonly wants a captcha for this, so the answer may be a question
-/// rather than a yes - see `send_answerable`.
-pub async fn join_guild(state: &AppState, account_id: &str, invite: &str, captcha: Option<&CaptchaAnswer>) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let code = invite.trim().trim_end_matches('/').rsplit('/').next().unwrap_or(invite.trim());
-    send_answerable(
-        with_captcha(
-            http_client_for(&cfg.token)
-                .post(format!("{API_BASE}/invites/{code}"))
-                .header("Authorization", &cfg.token)
-                .json(&json!({})),
-            captcha,
-        ),
-        "joining that server",
-    )
-    .await
-}
-
 /// Makes an invite to a conversation, and returns the link.
-///
-/// The other half of `join_guild`, which has been here on its own: this
-/// client could accept an invite somebody else made but not make one, so
-/// inviting anybody meant opening the official client for a link.
 ///
 /// The three options are Discord's own, and the defaults are its defaults: a
 /// day, unlimited uses, and full membership. Zero means "never" for the
@@ -48,14 +24,13 @@ pub async fn create_invite(
     max_age: i64,
     max_uses: i64,
     temporary: bool,
-    captcha: Option<&CaptchaAnswer>,
 ) -> Result<Value> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .context("no known Discord channel for this conversation")?;
-    let resp = send_write(with_captcha(
+    let resp = send_write(
         http_client_for(&cfg.token)
             .post(format!("{API_BASE}/channels/{channel_id}/invites"))
             .header("Authorization", &cfg.token)
@@ -64,19 +39,12 @@ pub async fn create_invite(
                 "max_uses": max_uses,
                 "temporary": temporary,
             })),
-        captcha,
-    ))
+    )
     .await
     .context("making an invite")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        // Not known to be captcha'd for a member who already holds the
-        // permission, but it costs one branch to be ready if it ever is.
-        if let Some(asked) = CaptchaAsked::read(&parsed) {
-            return Ok(asked.to_question());
-        }
         bail!("{}", discord_error_text(status, &text, "making an invite"));
     }
     let answer: Value = resp.json().await.context("reading the invite back")?;
@@ -86,29 +54,6 @@ pub async fn create_invite(
     // the short form the official client copies.
     let code = answer["code"].as_str().context("Discord made an invite with no code in it")?;
     Ok(json!({ "invite": format!("https://discord.gg/{code}") }))
-}
-
-/// Creates a brand-new guild owned by this account - Discord's own "Create
-/// My Own" server flow, same endpoint real clients use. Discord auto-
-/// creates a default #general channel; the gateway's own GUILD_CREATE
-/// dispatch for it (handled above in run_gateway) is what actually turns
-/// it into a buffer, so nothing else is needed here.
-pub async fn create_guild(state: &AppState, account_id: &str, name: &str) -> Result<()> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let resp = send_write(
-        http_client_for(&cfg.token)
-        .post(format!("{API_BASE}/guilds"))
-        .header("Authorization", &cfg.token)
-        .json(&json!({ "name": name.trim() }))
-        )
-    .await
-        .context("creating Discord guild")?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        bail!("{}", discord_error_text(status, &text, "creating that server"));
-    }
-    Ok(())
 }
 
 pub(super) const PERM_ADMINISTRATOR: u64 = 1 << 3;
@@ -720,6 +665,7 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
 ///
 /// Returns nothing when the thread's parent is not a channel this account can
 /// see: a thread is exactly as private as what it hangs under.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_thread(
     state: &AppState,
     account_id: &str,
@@ -732,7 +678,7 @@ pub(super) fn register_thread(
 ) -> Option<(String, String)> {
     let kind_num = thread["type"].as_i64().unwrap_or(-1);
     // 10 is a thread on an announcement, 11 a public one, 12 a private one.
-    if !matches!(kind_num, 10 | 11 | 12) {
+    if !matches!(kind_num, 10..=12) {
         return None;
     }
     let thread_id = thread["id"].as_str()?;
@@ -888,7 +834,7 @@ pub fn assignable_roles(state: &AppState, buffer_id: &str) -> Value {
         })
         .collect();
     // Most senior first, the way Discord lists them.
-    roles.sort_by(|a, b| b.0.cmp(&a.0));
+    roles.sort_by_key(|r| std::cmp::Reverse(r.0));
     json!(roles.into_iter().map(|(_, r)| r).collect::<Vec<_>>())
 }
 

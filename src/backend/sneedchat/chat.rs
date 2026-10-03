@@ -95,8 +95,32 @@ pub(super) async fn run_room(
     whisper_room: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     let mut delay = ROOM_RECONNECT_INITIAL_DELAY;
+    // The room is on screen before it is joined, saying so, rather than
+    // appearing only once its socket is up - a room that cannot connect at
+    // all was otherwise simply absent, with nothing to say why.
+    let buffer_id = state.runtime.ensure_buffer(state, account_id, &room_buffer_name(&room.name), "channel").id;
+    state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
+    let mut failures = 0u32;
     loop {
+        let started = std::time::Instant::now();
         let result = std::panic::AssertUnwindSafe(run_room_once(state, transport, session, account_id, host, room, &whisper_room)).catch_unwind().await;
+        // A connection that lasted a while and then dropped is a new run of
+        // trouble, not the next failure in one.
+        if started.elapsed() > ROOM_RECONNECT_MAX_DELAY {
+            failures = 0;
+        }
+        failures += 1;
+        if failures == 1 {
+            // Once is a blip - a socket dropped after hours, the next attempt
+            // a few seconds away. Saying "the chat is down" over that would
+            // be wrong far more often than right.
+            state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
+        } else {
+            // Twice running: ask which part is down - Tor, the forum, or only
+            // the chat - so the room can say so while it waits. See health.rs.
+            let outage = super::health::diagnose(account_id, transport, host).await;
+            state.runtime.set_buffer_link(state, &buffer_id, Some(outage.link(host)));
+        }
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
@@ -138,7 +162,7 @@ pub(super) async fn run_room_once(
     let forwarder = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(text) = out_rx.recv().await {
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
+            if sink.send(WsMessage::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -170,7 +194,9 @@ pub(super) async fn run_room_once(
     // Created eagerly rather than waiting for the first live message - a
     // quiet room would otherwise show no buffer/tab at all despite being
     // connected and joined.
-    state.runtime.ensure_buffer(state, account_id, &buffer_name, "channel");
+    let joined = state.runtime.ensure_buffer(state, account_id, &buffer_name, "channel");
+    state.runtime.set_buffer_link(state, &joined.id, None);
+    super::health::recovered(account_id);
     // The server follows a join with the room's whole roster, so anything left
     // from a previous connection would only be stale.
     state.runtime.set_presence(&crate::model::buffer_id(account_id, &buffer_name), serde_json::json!([]));

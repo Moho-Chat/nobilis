@@ -219,7 +219,7 @@ pub async fn forward_message(
         reference["guild_id"] = json!(guild_id);
     }
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
             .post(format!("{API_BASE}/channels/{target_channel}/messages"))
             .header("Authorization", token)
             .json(&json!({ "content": "", "message_reference": reference })),
@@ -246,7 +246,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         payload["message_reference"] = reference;
     }
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .json(&payload)
@@ -286,7 +286,7 @@ pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, bod
         .text("payload_json", payload.to_string())
         .part("files[0]", reqwest::multipart::Part::bytes(bytes).file_name(file_name));
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
         .header("Authorization", token)
         .multipart(form)
@@ -357,7 +357,7 @@ pub async fn send_voice_message(
                 .context("audio/ogg is a valid mime type")?,
         );
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
             .post(format!("{API_BASE}/channels/{channel_id}/messages"))
             .header("Authorization", token)
             .multipart(form),
@@ -510,7 +510,7 @@ pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .patch(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
         .json(&json!({ "content": body }))
@@ -540,7 +540,7 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/typing"))
         .header("Authorization", token)
         .header("Content-Length", "0")
@@ -569,7 +569,7 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
         .header("Authorization", token)
         .json(&json!({ "token": serde_json::Value::Null }))
@@ -590,7 +590,7 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
-        http_client_for(&token)
+        http_client_for(token)
         .delete(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
         .header("Authorization", token)
         )
@@ -607,8 +607,8 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
 /// Discord's reaction endpoint wants a custom emoji as `name:id` (no
 /// angle brackets, no leading `a:` animated marker), but every reaction
 /// this app already tracks (extract_reactions above, the live
-/// MESSAGE_REACTION_ADD/REMOVE handling) stores it wrapped as `<:name:id>`
-/// - that's the one place besides here needing the raw form, so it's
+/// MESSAGE_REACTION_ADD/REMOVE handling) stores it wrapped as `<:name:id>` -
+/// that's the one place besides here needing the raw form, so it's
 /// unwrapped here rather than changing the stored shape everywhere else.
 /// A plain Unicode emoji (no wrapper) passes through unchanged.
 pub(super) fn reaction_path_segment(emoji: &str) -> &str {
@@ -630,7 +630,7 @@ pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg
     let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/reactions")).context("building reaction URL")?;
     url.path_segments_mut().map_err(|_| anyhow!("reaction URL cannot be a base"))?.push(reaction_path_segment(emoji)).push("@me");
 
-    let client = http_client_for(&token);
+    let client = http_client_for(token);
     let req = if add { client.put(url) } else { client.delete(url) };
     let resp = req.header("Authorization", token).send().await.context("toggling Discord reaction")?;
     if !resp.status().is_success() {
@@ -666,11 +666,11 @@ fn refusal_text(status: reqwest::StatusCode, text: &str) -> String {
 
 /// A duration as a person says it: "10 minutes", "1 hour", "45 seconds".
 pub(super) fn describe_seconds(secs: u64) -> String {
-    let (n, unit) = if secs % 86_400 == 0 {
+    let (n, unit) = if secs.is_multiple_of(86_400) {
         (secs / 86_400, "day")
-    } else if secs % 3600 == 0 {
+    } else if secs.is_multiple_of(3600) {
         (secs / 3600, "hour")
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         (secs / 60, "minute")
     } else {
         (secs, "second")

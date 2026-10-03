@@ -73,7 +73,7 @@ mod imp {
         // none, where the 0700 directory above does the same job by hand.
         std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .or_else(|| dirs::runtime_dir())
+            .or_else(dirs::runtime_dir)
             .unwrap_or_else(std::env::temp_dir)
             .join("nobilis")
             .join("nobilis.sock")

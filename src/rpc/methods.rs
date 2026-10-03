@@ -307,8 +307,6 @@ pub async fn dispatch(
                 { "id": "discord", "name": "Discord", "available": true },
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
-                { "id": "jabber", "name": "XMPP", "available": false },
-                { "id": "slack", "name": "Slack", "available": false },
             ])),
             None,
         ),
@@ -563,6 +561,9 @@ pub async fn dispatch(
                 nickserv_password: None,
                 display_name: None,
                 use_tor: p_bool(params, "useTor", false),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 tor_proxy: None,
             };
             match state.accounts.add_irc(config.clone()) {
@@ -776,7 +777,8 @@ pub async fn dispatch(
             // Kick has no join to perform: a channel is a streamer, and naming
             // one is the whole of it. So this is "start watching", which the
             // connection does by subscribing its existing socket - and the
-            // handle is remembered, so it comes back tomorrow.
+            // handle is remembered once Kick has said it is a channel, so it
+            // comes back tomorrow.
             if id.starts_with("kick:") {
                 let slug = backend::kick::api::normalise_slug(name);
                 if slug.is_empty() {
@@ -785,14 +787,11 @@ pub async fn dispatch(
                 let Some(sender) = state.runtime.kick_sender(id) else {
                     return (None, Some("that Kick account is not connected".to_string()));
                 };
-                if sender.send(backend::kick::Command::Join(slug.clone())).is_err() {
+                // Remembered by the connection once Kick has said the handle
+                // is a channel, not here: saved first, a typo was asked for
+                // on every connect for good, with no buffer to close it by.
+                if sender.send(backend::kick::Command::Join(slug)).is_err() {
                     return (None, Some("that Kick account is not connected".to_string()));
-                }
-                if let Some(mut cfg) = state.accounts.get_kick(id) {
-                    if !cfg.channels.contains(&slug) {
-                        cfg.channels.push(slug);
-                        let _ = state.accounts.set_kick_channels(id, cfg.channels);
-                    }
                 }
                 return (Some(ok_node()), None);
             }
@@ -1091,23 +1090,6 @@ pub async fn dispatch(
             }
         }
 
-        // Any of the three below may answer with a captcha rather than with a
-        // yes. That is not an error - it is Discord's turn asking a question,
-        // and the client can put it on screen - so it comes back as a result
-        // carrying the challenge, and the same call is made again with the
-        // answer in `captchaKey`.
-        "joinDiscordGuild" => {
-            let (account_id, invite) = match (p_str_opt(params, "accountId"), p_str_opt(params, "invite")) {
-                (Some(a), Some(i)) => (a, i),
-                _ => return (None, Some("joinDiscordGuild requires \"accountId\" and \"invite\"".to_string())),
-            };
-            let answer = backend::discord::CaptchaAnswer::from_params(params);
-            match backend::discord::join_guild(state, account_id, invite, answer.as_ref()).await {
-                Ok(v) => (Some(v), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         "openDiscordDm" => {
             let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
                 (Some(a), Some(u)) => (a, u),
@@ -1269,18 +1251,6 @@ pub async fn dispatch(
             Some(account_id) => (Some(serde_json::json!(state.runtime.get_discord_friends(account_id))), None),
         },
 
-        "addDiscordFriend" => {
-            let (account_id, username) = match (p_str_opt(params, "accountId"), p_str_opt(params, "username")) {
-                (Some(a), Some(u)) => (a, u),
-                _ => return (None, Some("addDiscordFriend requires \"accountId\" and \"username\"".to_string())),
-            };
-            let answer = backend::discord::CaptchaAnswer::from_params(params);
-            match backend::discord::add_friend(state, account_id, username, answer.as_ref()).await {
-                Ok(v) => (Some(v), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Answering a request somebody sent, or taking back one this account
         // sent. Both are the same pair of calls to Discord; which of the
         // three states you were in decides what it means.
@@ -1315,20 +1285,8 @@ pub async fn dispatch(
             let max_age = params.get("maxAge").and_then(|v| v.as_i64()).unwrap_or(86_400);
             let max_uses = params.get("maxUses").and_then(|v| v.as_i64()).unwrap_or(0);
             let temporary = params.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false);
-            let answer = backend::discord::CaptchaAnswer::from_params(params);
-            match backend::discord::create_invite(state, &buffer.account_id, buffer_id, max_age, max_uses, temporary, answer.as_ref()).await {
+            match backend::discord::create_invite(state, &buffer.account_id, buffer_id, max_age, max_uses, temporary).await {
                 Ok(v) => (Some(v), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        "createDiscordGuild" => {
-            let (account_id, name) = match (p_str_opt(params, "accountId"), p_str_opt(params, "name")) {
-                (Some(a), Some(n)) => (a, n),
-                _ => return (None, Some("createDiscordGuild requires \"accountId\" and \"name\"".to_string())),
-            };
-            match backend::discord::create_guild(state, account_id, name).await {
-                Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
@@ -1369,6 +1327,32 @@ pub async fn dispatch(
         // Re-signs the attachment links of messages the window could not
         // show, batched with any re-sign already running for the buffer. The
         // fresh links arrive as messageUpdated.
+        // What each kind of stored thing takes on disk, for Settings.
+        "storageUsage" => (Some(crate::media_cache::usage().await), None),
+
+        // Empties one of the groups storageUsage reports.
+        "clearStorage" => {
+            let Some(group) = p_str_opt(params, "group") else {
+                return (None, Some("clearStorage requires \"group\"".to_string()));
+            };
+            match crate::media_cache::clear(state, group).await {
+                Ok(()) => (Some(crate::media_cache::usage().await), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A cached file the window could not load - expired, cleared or
+        // swept - fetched again from where it came from. See media_cache.rs.
+        "restoreMedia" => {
+            let Some(path) = p_str_opt(params, "path") else {
+                return (None, Some("restoreMedia requires \"path\"".to_string()));
+            };
+            match crate::media_cache::restore(state, path, p_str_opt(params, "bufferId"), p_str_opt(params, "messageId")).await {
+                Ok(path) => (Some(serde_json::json!({ "path": path })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "resignDiscordAttachments" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("resignDiscordAttachments requires \"bufferId\"".to_string()));
@@ -1632,29 +1616,6 @@ pub async fn dispatch(
             }
         }
 
-        // Who this account has asked never to hear from. The account's own
-        // list, so it agrees with Element and travels to every client.
-        "listMatrixIgnored" => match p_str_opt(params, "accountId") {
-            None => (None, Some("listMatrixIgnored requires \"accountId\"".to_string())),
-            Some(account_id) => {
-                let mut users: Vec<String> = state.runtime.matrix_ignored(account_id).into_iter().collect();
-                users.sort();
-                (Some(serde_json::json!({ "accountId": account_id, "users": users })), None)
-            }
-        },
-
-        "setMatrixIgnored" => {
-            let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
-                (Some(a), Some(u)) => (a, u),
-                _ => return (None, Some("setMatrixIgnored requires \"accountId\" and \"userId\"".to_string())),
-            };
-            let ignored = params.get("ignored").and_then(|v| v.as_bool()).unwrap_or(true);
-            match backend::matrix::set_ignored_user(state, account_id, user_id, ignored).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Which conversations a room has going on beside the main one.
         //
         // From the server rather than from scrollback: a thread whose root
@@ -1865,25 +1826,6 @@ pub async fn dispatch(
                 }
             }
             (Some(serde_json::json!({ "commands": out })), None)
-        }
-
-        // The slash commands a channel's own bots offer, on their own.
-        //
-        // Listed per channel because that is the question with the right
-        // answer: a bot installed across a guild can still be unusable in the
-        // channel somebody is typing in.
-        "listDiscordCommands" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("listDiscordCommands requires \"bufferId\"".to_string()));
-            };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            let query = p_str(params, "query", "");
-            match backend::discord::list_commands(state, &buffer.account_id, buffer_id, query).await {
-                Ok(answer) => (Some(answer), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
         }
 
         "runDiscordCommand" => {
@@ -2935,19 +2877,6 @@ pub async fn dispatch(
         // performs it.
         "listUploadHosts" => (Some(serde_json::Value::Array(crate::upload::hosts())), None),
 
-        "uploadFile" => {
-            let Some(path) = p_str_opt(params, "path") else {
-                return (None, Some("uploadFile requires \"path\"".to_string()));
-            };
-            let host = p_str_opt(params, "host")
-                .and_then(crate::upload::Host::parse)
-                .unwrap_or(crate::upload::Host::Catbox);
-            match crate::upload::upload(host, path, p_str_opt(params, "retention")).await {
-                Ok(url) => (Some(serde_json::json!({ "url": url })), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Leaving a whole guild or space, from its tile in the rail.
         //
         // The rail entry's own id carries everything needed - it is built as
@@ -3336,6 +3265,9 @@ pub async fn dispatch(
                 tor_mode: p_str_opt(params, "torMode").map(String::from).unwrap_or_else(|| "embedded".to_string()),
                 // The open internet unless asked otherwise.
                 use_tor: p_bool(params, "useTor", false),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 proxy: p_str_opt(params, "proxy").map(String::from),
                 rooms: parse_sneedchat_rooms(params).unwrap_or_default(),
                 rooms_chosen: false,
@@ -3413,6 +3345,9 @@ pub async fn dispatch(
                     // Chosen on the add form before the window opened; an
                     // account that already exists keeps its own setting.
                     use_tor: p_bool(params, "useTor", false),
+                    // Never strict at sign-in; the account store keeps an existing
+                    // account's strict routing across a re-login.
+                    strict_route: false,
                     proxy: None,
                     rooms: Vec::new(),
                     rooms_chosen: false,
@@ -3484,30 +3419,6 @@ pub async fn dispatch(
             }
         },
 
-        // Tor is a daemon-global category in settings, not a per-account
-        // one - there's only ever one embedded TorManager, so "embedded vs
-        // external proxy" is applied uniformly to every configured
-        // Sneedchat account rather than asked per-account. Reconnects each
-        // affected account immediately, same as setSneedChatRooms above.
-        // One account's choice of Tor or the open internet, changed on an
-        // account that already exists. Reconnected at once, so the change is
-        // the connection rather than a setting waiting for one.
-        "setSneedChatUseTor" => {
-            let Some(id) = p_str_opt(params, "accountId") else {
-                return (None, Some("setSneedChatUseTor requires \"accountId\"".to_string()));
-            };
-            match state.accounts.set_sneedchat_use_tor(id, p_bool(params, "enabled", false)) {
-                Ok(true) => {
-                    if let Some(cfg) = state.accounts.get_sneedchat(id) {
-                        backend::sneedchat::spawn(state.clone(), cfg);
-                    }
-                    (Some(ok_node()), None)
-                }
-                Ok(false) => (None, Some("no such account".to_string())),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // The daemon-wide network settings: what routed means (moho's own Tor
         // or a SOCKS5 proxy of one's own), and whether everything is routed.
         "getNetSettings" => {
@@ -3521,7 +3432,7 @@ pub async fn dispatch(
         // Changing them reconnects every connected account that the change
         // could move: the routed ones, or all of them when what changed is
         // whether everything is routed.
-        "setNetSettings" | "setTorConfig" => {
+        "setNetSettings" => {
             let router = crate::net::route::router();
             let before = router.settings();
             let next = crate::net::route::NetSettings {
@@ -3558,6 +3469,44 @@ pub async fn dispatch(
             match router.ready(|_| {}).await {
                 Ok((host, port)) => (Some(serde_json::json!({ "tunnelAll": true, "socks": format!("{host}:{port}") })), None),
                 Err(e) => (Some(serde_json::json!({ "tunnelAll": true, "socks": null, "error": format!("{e:#}") })), None),
+            }
+        }
+
+        // Where a strict account's media goes (#257): the SOCKS address of
+        // the route - moho's own Tor through its loopback relay, or the proxy
+        // the user named - whether or not everything is tunnelled. Asked by
+        // the main process for the session it fetches strict media through;
+        // an error is answered as such, and the window then loads nothing for
+        // that account rather than loading it directly.
+        "netRoute" => match crate::net::route::router().ready(|_| {}).await {
+            Ok((host, port)) => (Some(serde_json::json!({ "socks": format!("{host}:{port}") })), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        },
+
+        // One account's routing, in three positions: "clearnet", "service"
+        // (the connection, and the media the daemon fetches for it) or
+        // "strict" (that, and everything the window loads for it - #257).
+        // Reconnected only when the connection's own route changes; strict
+        // on or off is the window's business alone.
+        "setAccountRoute" => {
+            let Some(id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setAccountRoute requires \"accountId\"".to_string()));
+            };
+            let level = p_str(params, "level", "clearnet");
+            if !matches!(level, "clearnet" | "service" | "strict") {
+                return (None, Some(format!("\"{level}\" is not a routing level")));
+            }
+            let was = state.accounts.route_level_of(id);
+            match state.accounts.set_route_level(id, level) {
+                Ok(true) => {
+                    let tunnelled = |l: &Option<String>| l.as_deref().is_some_and(|l| l != "clearnet");
+                    if tunnelled(&was) != (level != "clearnet") {
+                        respawn_account(state, id);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -3605,37 +3554,6 @@ pub async fn dispatch(
             reconnect_routed(state);
             (Some(ok_node()), None)
         }
-
-        // Toggles routing an IRC account's connection through an external
-        // SOCKS5 proxy (a system Tor daemon or Tor Browser - see
-        // IrcAccountConfig::use_tor's doc comment for why this can't reuse
-        // the embedded Arti client Sneedchat uses) and reconnects.
-        "setAccountUseTor" => match p_str_opt(params, "accountId") {
-            None => (None, Some("no such account".to_string())),
-            Some(id) => {
-                let use_tor = p_bool(params, "useTor", false);
-                let proxy = p_str(params, "proxy", "");
-                match state.accounts.set_irc_use_tor(id, use_tor, proxy) {
-                    Ok(true) => match state.accounts.get_irc(id) {
-                        Some(cfg) => {
-                            backend::irc::spawn(state.clone(), cfg);
-                            (Some(ok_node()), None)
-                        }
-                        None => (None, Some("no such account".to_string())),
-                    },
-                    Ok(false) => (None, Some("no such account".to_string())),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                }
-            }
-        },
-
-        // Net-new protocols land in their own milestones (see project
-        // plan) - not implemented yet.
-        //
-        // Slack answers here too. It was advertised by listProtocols with no
-        // arm of its own, so asking for it fell through to "unknown method",
-        // which reads as a client bug rather than as work not yet done.
-        "addXmppAccount" | "addSlackAccount" => (None, Some(format!("{method}: not implemented yet"))),
 
         // Login (homeserver reachability + m.login.password) can take a
         // moment - same async-kickoff shape as addSneedChatAccount, with
@@ -3821,6 +3739,9 @@ pub async fn dispatch(
                 // person had closed.
                 followed_synced: existing.as_ref().is_some_and(|e| e.followed_synced),
                 use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("kick")),
+                // Never strict at sign-in; the account store keeps an existing
+                // account's strict routing across a re-login.
+                strict_route: false,
                 channels: existing.map(|e| e.channels).unwrap_or_default(),
             };
             match state.accounts.add_kick(config) {
@@ -3987,21 +3908,6 @@ pub async fn dispatch(
             // one is the deliberate choice.
             let disclosed = params.get("disclosed").and_then(Value::as_bool).unwrap_or(true);
             match backend::matrix::start_poll(state, &buffer.account_id, buffer_id, question, &answers, disclosed).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        // And closing one, so a finished poll stops saying it is open.
-        "endMatrixPoll" => {
-            let (buffer_id, poll_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "pollId")) {
-                (Some(b), Some(p)) => (b, p),
-                _ => return (None, Some("endMatrixPoll requires \"bufferId\" and \"pollId\"".to_string())),
-            };
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such buffer".to_string()));
-            };
-            match backend::matrix::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -4199,10 +4105,22 @@ pub async fn dispatch(
 
         // Taking the poll down, which Kick allows the streamer and their
         // moderators and refuses to everybody else.
+        //
+        // A Matrix poll is closed rather than taken down, and a room can hold
+        // several at once, so it is named by `pollId` - the card's own id.
         "endPoll" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("endPoll requires \"bufferId\"".to_string()));
             };
+            if let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("matrix:")) {
+                let Some(poll_id) = p_str_opt(params, "pollId") else {
+                    return (None, Some("ending a Matrix poll needs its \"pollId\"".to_string()));
+                };
+                return match backend::matrix::end_poll(state, &buffer.account_id, buffer_id, poll_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -4296,26 +4214,21 @@ pub async fn dispatch(
                 Err(e) => return (None, Some(format!("{e:#}"))),
             };
 
-            let mut channels = cfg.channels.clone();
             let mut added: Vec<String> = Vec::new();
             for slug in followed {
                 if added.len() >= backend::kick::MAX_FOLLOWED {
                     break;
                 }
-                if !channels.contains(&slug) {
-                    channels.push(slug.clone());
+                if !cfg.channels.contains(&slug) && !added.contains(&slug) {
                     added.push(slug);
                 }
             }
 
-            if !added.is_empty() {
-                if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
-                    return (None, Some(format!("{e:#}")));
-                }
-            }
-            // Told to the live connection so they open now rather than at the
-            // next restart. A disconnected account keeps them anyway - they
-            // are persisted above - which is why this is not an error.
+            // Nothing is saved until Kick has answered for it. Connected, the
+            // live connection opens each and saves the ones that open; not
+            // connected, each is looked up here and only the channels that
+            // exist are kept. Saved first, a follow Kick no longer knows
+            // stayed in the list for good with nothing on screen to close it.
             let connected = match state.runtime.kick_sender(account_id) {
                 Some(sender) => {
                     for slug in &added {
@@ -4323,7 +4236,23 @@ pub async fn dispatch(
                     }
                     true
                 }
-                None => false,
+                None => {
+                    let mut channels = cfg.channels.clone();
+                    let mut kept = Vec::new();
+                    for slug in added {
+                        if let Ok(channel) = backend::kick::api::channel(&http, &slug).await {
+                            channels.push(channel.slug.clone());
+                            kept.push(channel.slug);
+                        }
+                    }
+                    if !kept.is_empty() {
+                        if let Err(e) = state.accounts.set_kick_channels(account_id, channels) {
+                            return (None, Some(format!("{e:#}")));
+                        }
+                    }
+                    added = kept;
+                    false
+                }
             };
             (Some(serde_json::json!({ "added": added.len(), "channels": added, "connected": connected })), None)
         }
@@ -4653,17 +4582,6 @@ pub async fn dispatch(
             }
         }
 
-        "openIrcQuery" => {
-            let (account_id, nick) = match (p_str_opt(params, "accountId"), p_str_opt(params, "nick")) {
-                (Some(a), Some(n)) => (a, n),
-                _ => return (None, Some("openIrcQuery requires \"accountId\" and \"nick\"".to_string())),
-            };
-            match backend::irc::open_query(state, account_id, nick) {
-                Ok(buffer_id) => (Some(serde_json::json!({ "bufferId": buffer_id })), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         "openMatrixDm" => {
             let (account_id, user_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "userId")) {
                 (Some(a), Some(u)) => (a, u),
@@ -4876,21 +4794,6 @@ pub async fn dispatch(
                 Ok(()) => (Some(serde_json::json!({ "streamKey": stream_key })), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
-        }
-
-        // Whether a picture is actually being received, for a window that
-        // wants to show "connecting" rather than a black rectangle.
-        "discordStreamWatched" => {
-            let Some(account_id) = p_str_opt(params, "accountId") else {
-                return (None, Some("discordStreamWatched requires \"accountId\"".to_string()));
-            };
-            let Some(stream_key) = p_str_opt(params, "streamKey") else {
-                return (None, Some("discordStreamWatched requires \"streamKey\"".to_string()));
-            };
-            (
-                Some(serde_json::json!({ "watching": backend::discord::golive::watching(account_id, stream_key) })),
-                None,
-            )
         }
 
         // One encoded frame, from the window that captured and encoded it.
@@ -5537,18 +5440,6 @@ pub async fn dispatch(
             }
         }
 
-        // The one moment the recovery code is needed: a login that has never
-        // run has no cached pickle key, and this is how it gets one.
-        "rehydrateMatrixDevice" => {
-            let (Some(account_id), Some(code)) = (p_str_opt(params, "accountId"), p_str_opt(params, "recoveryCode")) else {
-                return (None, Some("rehydrateMatrixDevice requires \"accountId\" and \"recoveryCode\"".to_string()));
-            };
-            match backend::matrix::dehydration::rehydrate_with_code(state, account_id, code).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
         // Sliding sync, per account and off by default - see
         // MatrixAccountConfig::prefer_sliding_sync for why it is a switch
         // rather than something taken automatically. Turning it either way
@@ -5801,31 +5692,6 @@ pub async fn dispatch(
             match backend::matrix::set_space_child(state, &buffer.account_id, &space_room, &child_room, child).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        "setMatrixRoomState" => {
-            let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return (None, Some("setMatrixRoomState requires \"accountId\" and \"bufferId\"".to_string())),
-            };
-            let mut done = false;
-            if let Some(name) = p_str_opt(params, "name") {
-                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.name", serde_json::json!({ "name": name })).await {
-                    return (None, Some(format!("{e:#}")));
-                }
-                done = true;
-            }
-            if let Some(topic) = p_str_opt(params, "topic") {
-                if let Err(e) = backend::matrix::set_room_state(state, account_id, buffer_id, "m.room.topic", serde_json::json!({ "topic": topic })).await {
-                    return (None, Some(format!("{e:#}")));
-                }
-                done = true;
-            }
-            if done {
-                (Some(ok_node()), None)
-            } else {
-                (None, Some("setMatrixRoomState needs a \"name\" or a \"topic\"".to_string()))
             }
         }
 

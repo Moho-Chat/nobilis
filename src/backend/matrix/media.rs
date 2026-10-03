@@ -91,8 +91,8 @@ fn worth_thumbnailing(info: &Value) -> bool {
 
 /// How big a thumbnail to ask for.
 ///
-/// Generous for a timeline picture and far short of a modern camera's output
-/// - a phone photograph is several thousand pixels across and a few
+/// Generous for a timeline picture and far short of a modern camera's output -
+/// a phone photograph is several thousand pixels across and a few
 /// megabytes, and this is tens of kilobytes. `scale` rather than `crop`
 /// because the picture in a timeline is the whole picture: cropping would
 /// quietly cut the sides off somebody's screenshot.
@@ -175,8 +175,7 @@ pub(super) fn extension_for_mimetype(mimetype: &str) -> &'static str {
 /// endpoint requires, so the raw remote URL would simply never load (same
 /// reasoning backend/sneedchat/mod.rs's own avatar caching already
 /// documents). Cached permanently per media id for this daemon's
-/// lifetime - see MEDIA_CACHE_MAX_BYTES/sweep_media_cache for the size
-/// cap that keeps that bounded. `extension` (from extension_for_mimetype,
+/// lifetime - media_cache.rs holds the cache to a size and an age. `extension` (from extension_for_mimetype,
 /// empty string if unknown) is appended to the cache filename - see that
 /// function's own doc comment on why this can't just be left off.
 pub(crate) async fn cached_media_path(homeserver_url: &str, access_token: &str, mxc_uri: &str, extension: &str) -> Option<String> {
@@ -238,6 +237,11 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
     let dir = media_cache_dir();
     let filename = if extension.is_empty() { format!("{server_name}_{media_id}") } else { format!("{server_name}_{media_id}.{extension}") };
     let path = dir.join(filename);
+    // The key is in the event and nowhere else, so it is kept with the file:
+    // without it, a picture that expires out of the cache could only ever be
+    // fetched back as ciphertext. Kept for a file already here too, so one
+    // cached before this was recorded can still come back.
+    crate::media_cache::record(&path, serde_json::json!({ "file": file, "ext": extension }));
 
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Some(format!("file://{}", path.display()));
@@ -311,50 +315,6 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
 /// here on first startup after this changed).
 pub(super) fn media_cache_dir() -> std::path::PathBuf {
     dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("matrix-media")
-}
-
-/// Cap on the media cache's total size on disk - same unbounded-growth
-/// concern (and same fix) as backend/sneedchat/mod.rs's avatar/attachment
-/// caches: every distinct piece of media ever seen would otherwise
-/// accumulate its own permanently-cached file forever.
-pub const MEDIA_CACHE_MAX_BYTES: u64 = 250 * 1024 * 1024;
-
-/// Evicts the oldest-written files in the media cache until it's back
-/// under MEDIA_CACHE_MAX_BYTES - oldest-by-mtime, same simplification
-/// backend/sneedchat/mod.rs's own sweep_cache_dir documents (not true LRU,
-/// but a reasonable approximation without an extra dependency).
-pub async fn sweep_media_cache() {
-    let dir = media_cache_dir();
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { return };
-
-    let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
-    let mut total: u64 = 0;
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(meta) = entry.metadata().await else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        total += meta.len();
-        files.push((entry.path(), meta.len(), mtime));
-    }
-    if total <= MEDIA_CACHE_MAX_BYTES {
-        return;
-    }
-
-    files.sort_by_key(|(_, _, mtime)| *mtime);
-    let mut to_free = total - MEDIA_CACHE_MAX_BYTES;
-    let mut removed = 0usize;
-    for (path, size, _) in files {
-        if to_free == 0 {
-            break;
-        }
-        if tokio::fs::remove_file(&path).await.is_ok() {
-            to_free = to_free.saturating_sub(size);
-            removed += 1;
-        }
-    }
-    tracing::info!("matrix: media cache was over its {}MB cap, evicted {removed} oldest file(s)", MEDIA_CACHE_MAX_BYTES / 1024 / 1024);
 }
 
 /// `m.room.message` msgtype + upload Content-Type for a local file, chosen
@@ -570,6 +530,58 @@ pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, conten
         anyhow::bail!("HTTP {status}: {body}");
     }
     Ok(body)
+}
+
+
+/// Fetches a cached Matrix file again, after it expired or was cleared.
+///
+/// The file's name says which media it was - `server_mediaid`, with
+/// `_thumb...` for a thumbnail the server scaled. An encrypted one also needs
+/// the key its event carried, which `cached_encrypted_media_path` recorded.
+/// An unencrypted one with nothing recorded is only kept if its bytes are a
+/// picture or a video: a file cached as plaintext before keys were recorded
+/// looks exactly like this, and its ciphertext written back would turn a
+/// missing picture into a broken one.
+pub(crate) async fn restore_cached(state: &AppState, path: &std::path::Path, account_hint: Option<&str>) -> Result<std::path::PathBuf> {
+    let account = account_hint
+        .and_then(|a| state.accounts.get_matrix(a))
+        .or_else(|| state.accounts.all_matrix().into_iter().find(|a| !a.access_token.is_empty()))
+        .context("no Matrix account to fetch it with")?;
+    let (base, token) = (account.homeserver_url.as_str(), account.access_token.as_str());
+    let name = path.file_name().and_then(|n| n.to_str()).context("not a cached file")?;
+
+    if let Some(source) = crate::media_cache::source(path) {
+        if source["file"].is_object() {
+            let ext = source["ext"].as_str().unwrap_or("");
+            cached_encrypted_media_path(base, token, &source["file"], ext).await.context("the homeserver did not send it")?;
+            return Ok(path.to_path_buf());
+        }
+    }
+
+    let (server, rest) = name.split_once('_').context("not a cached Matrix file")?;
+    if let Some(id) = rest.strip_suffix(&format!("_thumb{THUMBNAIL_W}x{THUMBNAIL_H}")) {
+        cached_thumbnail_path(base, token, &format!("mxc://{server}/{id}")).await.context("the homeserver did not send it")?;
+        return Ok(path.to_path_buf());
+    }
+    let id = rest.split('.').next().unwrap_or(rest);
+    let url = format!(
+        "{}/_matrix/client/v1/media/download/{}/{}",
+        base.trim_end_matches('/'),
+        url::form_urlencoded::byte_serialize(server.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>(),
+    );
+    let (status, bytes) = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&url, token))
+        .await
+        .context("the homeserver took too long")??;
+    if !(200..300).contains(&status) || bytes.is_empty() {
+        anyhow::bail!("the homeserver answered HTTP {status}");
+    }
+    if crate::backend::sneedchat::sniff_image_ext(&bytes).is_none() {
+        anyhow::bail!("that file cannot be fetched again: it is not a picture or video, or it was encrypted and its key was not kept");
+    }
+    tokio::fs::create_dir_all(media_cache_dir()).await?;
+    tokio::fs::write(path, &bytes).await?;
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]

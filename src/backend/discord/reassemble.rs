@@ -150,9 +150,7 @@ impl Reassembler {
     /// Every complete frame currently in the window, oldest first.
     fn drain(&mut self, now: Instant) -> Vec<Frame> {
         let mut out = Vec::new();
-        loop {
-            let Some(range) = self.first_complete() else { break };
-            let (start, end) = range;
+        while let Some((start, end)) = self.first_complete() {
             // A hole before this frame: hold it a moment for the hole to be
             // filled by a resend, then give up on the hole and say so.
             let after_gap = self.emitted && start > self.floor;

@@ -85,8 +85,8 @@ pub fn notify_list(config: &IrcAccountConfig) -> Vec<String> {
 ///
 /// `None` for a nick nothing is known about yet, which is the whole point of
 /// keeping it: an arrival is only worth announcing against a previous state.
-/// A first sighting - on connect, or the moment somebody is added to the list
-/// - records silently, so signing on does not print a paragraph about people
+/// A first sighting - on connect, or the moment somebody is added to the list -
+/// records silently, so signing on does not print a paragraph about people
 /// who were already there.
 pub(super) fn notify_seen() -> &'static std::sync::Mutex<HashMap<String, HashMap<String, bool>>> {
     static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, bool>>>> =

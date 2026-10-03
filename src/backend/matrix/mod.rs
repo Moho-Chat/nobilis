@@ -64,7 +64,7 @@ pub mod timeline;
 
 pub use directory::*;
 pub use history::*;
-pub use media::*;
+pub(crate) use media::*;
 pub use notifications::*;
 pub use profile::*;
 pub use receipts::*;

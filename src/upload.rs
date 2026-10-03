@@ -231,20 +231,12 @@ pub fn hosts() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Uploads a file and returns the URL to link to.
+/// Uploads a file and returns the URL to link to, saying how it is going
+/// where there is a window waiting on it.
 ///
 /// `retention` applies only to the host that has any: it is passed through
 /// rather than interpreted, so a value that host does not know is its own
 /// error to report rather than something to be silently corrected here.
-pub async fn upload(host: Host, path: &str, retention: Option<&str>) -> Result<String> {
-    upload_reporting(host, path, retention, None).await
-}
-
-/// The same, with somewhere to say how it is going.
-///
-/// Separate entry point rather than an extra argument everywhere, because
-/// most callers have no window waiting on them - a voice note's upload, or a
-/// probe - and threading `None` through those would be noise.
 pub async fn upload_reporting(
     host: Host,
     path: &str,
@@ -708,7 +700,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("clip.mp4");
         std::fs::write(&file, b"not really a video").unwrap();
-        let err = upload(Host::Postimg, file.to_str().unwrap(), None).await.unwrap_err().to_string();
+        let err = upload_reporting(Host::Postimg, file.to_str().unwrap(), None, None).await.unwrap_err().to_string();
         assert!(err.contains("does not take"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -868,7 +860,7 @@ PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("empty.png");
         std::fs::write(&file, b"").unwrap();
-        let err = upload(Host::Catbox, file.to_str().unwrap(), None).await.unwrap_err().to_string();
+        let err = upload_reporting(Host::Catbox, file.to_str().unwrap(), None, None).await.unwrap_err().to_string();
         assert!(err.contains("empty"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

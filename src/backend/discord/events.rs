@@ -16,8 +16,10 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 /// Account and guild to that guild's events, as Discord sends them.
-fn known() -> &'static Mutex<HashMap<(String, String), Vec<Value>>> {
-    static KNOWN: OnceLock<Mutex<HashMap<(String, String), Vec<Value>>>> = OnceLock::new();
+type ByGuild = Mutex<HashMap<(String, String), Vec<Value>>>;
+
+fn known() -> &'static ByGuild {
+    static KNOWN: OnceLock<ByGuild> = OnceLock::new();
     KNOWN.get_or_init(Default::default)
 }
 

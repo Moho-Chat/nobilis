@@ -523,6 +523,9 @@ pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserve
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.to_string(),
         user_id,
         // Nothing to keep, and the same real difference the SSO path notes:
@@ -608,6 +611,9 @@ pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_u
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.to_string(),
         user_id: login.user_id,
         // No password to keep, and that is a real difference rather than an
@@ -706,6 +712,9 @@ async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.to_string(),
         user_id,
         password: password.to_string(),
@@ -765,6 +774,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
     // account id comes from the user id.
     let pending = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.to_string(),
         user_id: username.to_string(),
         password: password.to_string(),
@@ -785,6 +797,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: 
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
+        // Never strict at sign-in; the account store keeps an existing
+        // account's strict routing across a re-login.
+        strict_route: false,
         homeserver_url: homeserver_url.to_string(),
         user_id: login.user_id,
         password: password.to_string(),

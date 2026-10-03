@@ -32,22 +32,11 @@ use std::path::PathBuf;
 /// going soft, and at this size the saving is already two orders of magnitude.
 pub const EMOTE_PX: u32 = 64;
 
-/// Cap on the emote cache, swept like every other one here.
-///
-/// Generous next to what it holds - a shrunk emote is tens of kilobytes, so
-/// this is thousands of them - because re-fetching means going back to Kick
-/// for a megabyte to rebuild something that was 77KB.
-pub const EMOTE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-
 pub fn emote_cache_dir() -> PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
         .join("nobilis")
         .join("kick-emotes")
-}
-
-pub async fn sweep_emote_cache() {
-    crate::backend::sneedchat::sweep_cache_dir(&emote_cache_dir(), EMOTE_CACHE_MAX_BYTES, "kick emote").await;
 }
 
 /// Whether these bytes are a GIF, by its magic number.
@@ -290,6 +279,19 @@ pub async fn resolve(ids: &[String]) -> std::collections::BTreeMap<String, Strin
         }
     }
     out
+}
+
+/// Fetches a cached emote again, after it expired or was cleared. Its file is
+/// named by the emote's id, which is all Kick needs.
+pub async fn restore_cached(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    let id = path.file_stem().and_then(|n| n.to_str()).context("not a cached emote")?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("not a cached emote");
+    }
+    let client = http().context("no client to fetch it with")?;
+    let url = local_copy(&client, id).await.context("Kick did not send the emote")?;
+    Ok(std::path::PathBuf::from(url.strip_prefix("file://").unwrap_or(&url)))
 }
 
 #[cfg(test)]

@@ -61,6 +61,23 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
         state.runtime.clear_sneedchat_senders(account_id);
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
 
+        // Signing in failed, so no room got as far as trying. Asked which
+        // part is down, so each room can say - unless the forum answers, in
+        // which case this was a refusal (a password, a captcha) rather than an
+        // outage, and the account's own message says that better.
+        let outage = match transport_for(state, config, |_| {}).await {
+            Ok(transport) => super::health::diagnose(account_id, &transport, &config.site_host()).await,
+            Err(e) => super::health::Outage::Tor(format!("Tor isn't connecting: {e:#}")),
+        };
+        if outage != super::health::Outage::Chat {
+            let host = config.site_host();
+            detail = outage.describe(&host);
+            for room in &config.rooms {
+                let buffer_id = state.runtime.ensure_buffer(state, account_id, &super::rooms::room_buffer_name(&room.name), "channel").id;
+                state.runtime.set_buffer_link(state, &buffer_id, Some(outage.link(&host)));
+            }
+        }
+
         // A failure inside Tor is one this loop can do something about, and a
         // run of them is one it must: retrying the same broken client is what
         // turns a bad hour into a bad week. What it decides to do is the Tor
@@ -200,6 +217,7 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
         state.tor.note_success().await;
     }
     remember_session(state, account_id, &session);
+    super::media::note_client(account_id, &session.http, &config.site_host());
     if let Some(uid) = session.user_id() {
         let _ = state.accounts.set_sneedchat_user_id(account_id, uid);
     }

@@ -66,8 +66,8 @@ pub fn first_link(body: &str) -> Option<&str> {
         // to example.org, and a word starting with a bracket is still a word
         // with a link in it.
         .map(|word| {
-            word.trim_start_matches(|c| matches!(c, '(' | '[' | '<' | '"' | '\''))
-                .trim_end_matches(|c| matches!(c, '.' | ',' | ')' | ']' | '>' | '!' | '?' | ';' | ':' | '"' | '\''))
+            word.trim_start_matches(['(', '[', '<', '"', '\''])
+                .trim_end_matches(['.', ',', ')', ']', '>', '!', '?', ';', ':', '"', '\''])
         })
         .find(|word| word.starts_with("https://") || word.starts_with("http://"))
         .filter(|url| url.len() > "https://".len())
@@ -116,6 +116,7 @@ pub async fn fetch(state: &AppState, account_id: &str, url: &str, ts_ms: i64) ->
         timestamp: None,
         url: Some(url.to_string()),
         image_url: image,
+        ..Default::default()
     })
 }
 
@@ -137,6 +138,12 @@ pub(super) fn unfurl_later(
         return;
     }
     let Some(link) = first_link(body) else { return };
+    // A YouTube link is described by YouTube itself, with its channel, for
+    // every service alike (unfurl.rs) - two cards racing to be the one on the
+    // message would only flicker.
+    if crate::unfurl::youtube_id(link).is_some() {
+        return;
+    }
     let (state, account_id, buffer_id, event_id, body, link) = (
         state.clone(),
         account_id.to_string(),
@@ -147,9 +154,10 @@ pub(super) fn unfurl_later(
     );
     tokio::spawn(async move {
         let Some(embed) = fetch(&state, &account_id, &link, ts_ms).await else { return };
-        // The body again, unchanged: update_message takes the whole message
-        // and this only means to add the card to it.
-        state.runtime.update_message(&state, &buffer_id, &event_id, &body, &[embed], &[]);
+        // Not an edit: nobody changed the message, and its attachments are
+        // its own business.
+        let _ = body;
+        state.runtime.set_message_embeds(&state, &buffer_id, &event_id, &[embed]);
     });
 }
 

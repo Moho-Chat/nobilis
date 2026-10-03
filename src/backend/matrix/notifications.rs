@@ -214,23 +214,23 @@ mod push_rule_tests {
     #[test]
     fn a_muted_room_is_muted_here_too() {
         let rules = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": ["dont_notify"] }] } });
-        assert_eq!(push_rule_verdict(&rules, "!quiet:example.org", "anything").0, true);
-        assert_eq!(push_rule_verdict(&rules, "!other:example.org", "anything").0, false);
+        assert!(push_rule_verdict(&rules, "!quiet:example.org", "anything").0);
+        assert!(!push_rule_verdict(&rules, "!other:example.org", "anything").0);
         // The newer spelling of the same thing.
         let empty = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [] }] } });
-        assert_eq!(push_rule_verdict(&empty, "!quiet:example.org", "x").0, true);
+        assert!(push_rule_verdict(&empty, "!quiet:example.org", "x").0);
         // A rule somebody switched off says nothing.
         let off = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [], "enabled": false }] } });
-        assert_eq!(push_rule_verdict(&off, "!quiet:example.org", "x").0, false);
+        assert!(!push_rule_verdict(&off, "!quiet:example.org", "x").0);
     }
 
     #[test]
     fn a_keyword_notifies() {
         let rules = json!({ "global": { "content": [{ "rule_id": "moho", "pattern": "moho", "actions": ["notify"] }] } });
-        assert_eq!(push_rule_verdict(&rules, "!r:example.org", "look at MOHO today").1, true);
-        assert_eq!(push_rule_verdict(&rules, "!r:example.org", "nothing here").1, false);
+        assert!(push_rule_verdict(&rules, "!r:example.org", "look at MOHO today").1);
+        assert!(!push_rule_verdict(&rules, "!r:example.org", "nothing here").1);
         // Inside a longer word is not the word.
-        assert_eq!(push_rule_verdict(&rules, "!r:example.org", "mohoism").1, false);
+        assert!(!push_rule_verdict(&rules, "!r:example.org", "mohoism").1);
     }
 
     /// The default rule is the account's own name, which this client already
@@ -241,7 +241,7 @@ mod push_rule_tests {
         let rules = json!({ "global": { "content": [
             { "rule_id": ".m.rule.contains_user_name", "pattern": "someone", "actions": ["notify"] }
         ]}});
-        assert_eq!(push_rule_verdict(&rules, "!r:example.org", "hello someone").1, false);
+        assert!(!push_rule_verdict(&rules, "!r:example.org", "hello someone").1);
     }
 
     #[test]

@@ -195,7 +195,7 @@ pub fn matching(service: &str, query: &str) -> Vec<&'static Builtin> {
         .collect();
     // Stable, so an exact tie keeps the order the table is written in - which
     // is roughly how often each is wanted.
-    hits.sort_by(|a, b| b.0.cmp(&a.0));
+    hits.sort_by_key(|h| std::cmp::Reverse(h.0));
     hits.into_iter().map(|(_, c)| c).collect()
 }
 

@@ -212,7 +212,8 @@ pub(super) async fn handle_message(
             // as they arrive rather than after a WHOIS.
             who.learn(userhost_of(prefix.as_ref()).as_deref(), account.as_deref(), None);
             if from == own_nick {
-                state.runtime.ensure_buffer(state, account_id, &channel, "channel");
+                let joined = state.runtime.ensure_buffer(state, account_id, &channel, "channel");
+                state.runtime.set_buffer_link(state, &joined.id, None);
                 // What was said before we arrived. Asked for on join rather
                 // than on connect, because a channel nobody opens is a request
                 // for history nobody reads - and asked for at all only where
@@ -824,7 +825,7 @@ pub(super) async fn handle_message(
             let body = match weight.as_str() {
                 "FAIL" if about.is_empty() => description.to_string(),
                 "FAIL" => format!("{about} failed: {description}"),
-                "WARN" => format!("{description}"),
+                "WARN" => description.to_string(),
                 _ => description.to_string(),
             };
             if body.is_empty() {
@@ -922,6 +923,15 @@ pub(super) async fn handle_message(
                 let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
                 state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
             }
+            // A join the server refused leaves the channel on screen and not
+            // joined - after a reconnect, a ban or a +i set while away. Said
+            // on the channel itself, where somebody opening it will look.
+            if is_join_refusal(code) {
+                if let (Some(channel), Some(reason)) = (args.get(1), args.last()) {
+                    let buffer_id = crate::model::buffer_id(account_id, channel);
+                    state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::down("refused", format!("Not in {channel}: {reason}"))));
+                }
+            }
         }
 
         // Somebody composing. A TAGMSG carries tags and nothing else, which
@@ -939,6 +949,14 @@ pub(super) async fn handle_message(
     }
 
     let _ = sender; // reserved for future PING/PONG or raw passthrough handling
+}
+
+/// The refusals that mean a JOIN did not happen.
+pub(super) fn is_join_refusal(code: Response) -> bool {
+    matches!(
+        code,
+        Response::ERR_CHANNELISFULL | Response::ERR_INVITEONLYCHAN | Response::ERR_BANNEDFROMCHAN | Response::ERR_BADCHANNELKEY
+    )
 }
 
 pub(super) fn is_channel_error(code: Response) -> bool {
@@ -993,8 +1011,8 @@ pub(super) fn rank_word(rank: MemberRank) -> &'static str {
 
 /// A message's own id, where the server gives one.
 ///
-/// Used as the message id rather than a generated one, so a message seen twice
-/// - replayed history, a reconnect, a batch that overlaps what is already
+/// Used as the message id rather than a generated one, so a message seen twice -
+/// replayed history, a reconnect, a batch that overlaps what is already
 /// stored - is stored once. That dedup already exists for every other protocol
 /// here; IRC could not use it because it had no id to dedup on.
 pub(super) fn message_id(msg: &Message) -> Option<String> {

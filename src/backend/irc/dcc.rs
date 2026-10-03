@@ -1506,8 +1506,8 @@ const PASSIVE_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
 /// Receives a passive (reverse) offer: we listen, they dial.
 ///
 /// The shape is the ordinary one turned around. A sender that cannot accept a
-/// connection - behind NAT, or a firewall, which is most bots that offer this
-/// - sends port 0 and a token, and asks us to publish somewhere to connect
+/// connection - behind NAT, or a firewall, which is most bots that offer this -
+/// sends port 0 and a token, and asks us to publish somewhere to connect
 /// to. We open a port, answer with the same token so they can match it to the
 /// offer they made, and then wait.
 ///

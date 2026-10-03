@@ -49,9 +49,7 @@ pub(super) async fn following_now(
 ) -> Option<bool> {
     // Nothing to ask with. This is the one honest "cannot say", and the
     // client draws it as an account that is not signed in.
-    let Some(token) = state.accounts.get_kick(account_id).and_then(|c| c.token).filter(|t| !t.is_empty()) else {
-        return None;
-    };
+    let token = state.accounts.get_kick(account_id).and_then(|c| c.token).filter(|t| !t.is_empty())?;
     match api::standing(http, &token, slug).await {
         Ok(standing) => Some(standing.following),
         // A question that could not be asked is not an answer of "no idea".

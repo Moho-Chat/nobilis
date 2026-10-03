@@ -15,8 +15,8 @@ use super::*;
 
 /// A matrix.to link to one message.
 ///
-/// By alias where the room has one, because an alias names a room to a person
-/// - `#moho:poa.st` says what `!vjSZEo74ZIjCajgM:poa.st` cannot - and because
+/// By alias where the room has one, because an alias names a room to a person -
+/// `#moho:poa.st` says what `!vjSZEo74ZIjCajgM:poa.st` cannot - and because
 /// an alias carries its own server, so the link needs no routing hints.
 ///
 /// Failing that, the room id and a `via`: a room id says nothing about who

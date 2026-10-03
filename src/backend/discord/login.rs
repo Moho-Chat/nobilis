@@ -61,7 +61,7 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     let forwarder = tokio::spawn(async move {
         let mut sink = sink;
         while let Some(text) = out_rx.recv().await {
-            if sink.send(WsMessage::Text(text.into())).await.is_err() {
+            if sink.send(WsMessage::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -91,7 +91,8 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     // directly. Cleaned up on every exit path (success/error/panic) via
     // this drop guard, including the panic case: unwinding still runs
     // destructors for values already on the stack.
-    let qr_path = std::env::temp_dir().join(format!("nobilis-discord-qr-{login_id}.png"));
+    let safe_id = login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let qr_path = crate::media_cache::transient_dir().join(format!("nobilis-discord-qr-{safe_id}.png"));
     struct RemoveOnDrop(std::path::PathBuf);
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
@@ -249,7 +250,7 @@ pub(super) async fn finish_login(
         .map(|hash| format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.png"));
 
     let use_tor = crate::net::route::router().wanted(&crate::net::route::pending_key("discord"));
-    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor };
+    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor, strict_route: false };
     if let Some(expected) = reauth_account_id {
         if config.account_id() != expected {
             bail!("that is a different Discord account - re-authenticating {expected} needs the same account");

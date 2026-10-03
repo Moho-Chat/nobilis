@@ -343,35 +343,6 @@ pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id
     Ok(())
 }
 
-/// Sends a friend request - a pending request the target still has to
-/// accept, exactly like clicking "Add Friend" in any real Discord client
-/// (the request never completes to a full friendship synchronously here).
-/// `username` accepts either a modern unique username or a legacy
-/// `name#1234` pair; the discriminator half only still means anything for
-/// accounts that never migrated off the old system.
-///
-/// Discord asks for a captcha on this one more than on anything else, so the
-/// answer may be a question rather than a yes: see `send_answerable`. Handed
-/// one, the same request goes out again with it attached.
-pub async fn add_friend(state: &AppState, account_id: &str, username: &str, captcha: Option<&CaptchaAnswer>) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let (name, discriminator) = match username.trim().rsplit_once('#') {
-        Some((n, d)) if d.chars().all(|c| c.is_ascii_digit()) && !d.is_empty() => (n, Some(d)),
-        _ => (username.trim(), None),
-    };
-    send_answerable(
-        with_captcha(
-            http_client_for(&cfg.token)
-                .post(format!("{API_BASE}/users/@me/relationships"))
-                .header("Authorization", &cfg.token)
-                .json(&json!({ "username": name, "discriminator": discriminator })),
-            captcha,
-        ),
-        "adding a friend",
-    )
-    .await
-}
-
 /// Answers a friend request: accepts it, or refuses it.
 ///
 /// Accepting is the same call that sends one - PUT on the person - which is
@@ -398,8 +369,8 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
 /// Blocks somebody, or lifts it.
 ///
 /// A relationship of type 2, which is what Discord's own "Block" does: it is
-/// account-wide, it follows to every client, and - unlike an ignore kept here
-/// - the person is told, in the sense that their messages to you stop being
+/// account-wide, it follows to every client, and - unlike an ignore kept here -
+/// the person is told, in the sense that their messages to you stop being
 /// delivered and their friend requests stop arriving.
 ///
 /// The gateway's own RELATIONSHIP_ADD says it happened, the same way it does

@@ -159,6 +159,9 @@ pub struct Account {
     /// false for every other service.
     #[serde(rename = "useTor")]
     pub use_tor: bool,
+    /// "clearnet", "service" or "strict" - see accounts::route_level.
+    #[serde(rename = "routeLevel")]
+    pub route_level: String,
     /// Matrix-only: whether this account currently has server-side room
     /// key backup (a recovery key) set up - see backend/matrix/backup.rs.
     /// Always false for every other service.
@@ -188,7 +191,48 @@ pub struct SneedChatRoomInfo {
 
 /// Matches Buffer JSON (daemon/nobilis/model.c's nobilis_buffer_json).
 /// `id` = "<accountId>|<name>"; `kind` is "channel"|"dm"|"server".
-#[derive(Serialize, Clone, Debug)]
+/// Whether a URL some other party supplied points at the web.
+///
+/// The test for anything a remote sender controls that will be drawn or
+/// fetched - an avatar, a picture link. Local paths are only ever ones the
+/// daemon wrote itself (#247), so a sender's `file://`, a bare path or any
+/// other scheme is not a URL to pass on.
+pub fn is_web_url(url: &str) -> bool {
+    let lower = url.trim_start().to_ascii_lowercase();
+    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
+}
+
+/// Why a buffer is not receiving, when the account itself is fine.
+///
+/// A Sneedchat room has its own connection, an IRC channel can refuse the
+/// join, a Kick channel can be waiting on Kick - so "the account is connected"
+/// does not mean every conversation under it is. Absent when the buffer is
+/// live; the account's own state covers the case where nothing is.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BufferLink {
+    /// "connecting" while it is being joined or retried, "down" when the
+    /// service has said no, or something between here and it has.
+    pub state: String,
+    /// What a person reads: "The chat is down - the forum is up".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Which part failed, for a client that draws them differently:
+    /// "tor", "network", "site", "chat", "refused".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+}
+
+impl BufferLink {
+    pub fn connecting() -> Self {
+        Self { state: "connecting".to_string(), detail: None, cause: None }
+    }
+
+    pub fn down(cause: &str, detail: impl Into<String>) -> Self {
+        Self { state: "down".to_string(), detail: Some(detail.into()), cause: Some(cause.to_string()) }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Buffer {
     pub id: String,
     #[serde(rename = "accountId")]
@@ -208,8 +252,8 @@ pub struct Buffer {
     /// set_buffer_avatar.
     #[serde(rename = "avatarUrl", skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
-    /// The heading this buffer sits under, where the service has such a thing
-    /// - a Discord category. Absent for everything else, and for channels the
+    /// The heading this buffer sits under, where the service has such a thing -
+    /// a Discord category. Absent for everything else, and for channels the
     /// server left uncategorised, which belong above the first heading.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
@@ -229,6 +273,9 @@ pub struct Buffer {
     /// is many seconds later and reads as the join having done nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub syncing: bool,
+    /// Set while this buffer's own connection is not up - see BufferLink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<BufferLink>,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
     /// not `false`, for every other protocol, since "encrypted" isn't a
     /// meaningful concept for them at all). Drives the lock/unlock
@@ -420,7 +467,7 @@ pub struct Reaction {
 /// Discord's own client does, and re-renders it live if a later edit
 /// changes it (a webhook can restyle an existing embed - status-bridge
 /// bots commonly do this to signal connected/degraded/down).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Embed {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -442,6 +489,14 @@ pub struct Embed {
     /// unfurled link is, whoever unfurled it.
     #[serde(rename = "imageUrl", skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
+    /// Who serves what the card is about - "YouTube" - drawn small above the
+    /// rest, as Discord does. Discord's embeds carry it; an unfurled link
+    /// gets it from whoever described it (see unfurl.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Who made it: a video's channel, an article's byline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// Something on a message that can be pressed.
@@ -677,11 +732,6 @@ pub enum MemberRank {
     Founder,
 }
 
-/// Which service an account id belongs to.
-///
-/// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
-/// except IRC, whose ids are "nick@host" and predate the convention. That
-
 /// Whether this kind of line is the room reporting itself rather than
 /// somebody speaking.
 ///
@@ -718,6 +768,10 @@ pub fn is_room_event(kind: &str) -> bool {
     )
 }
 
+/// Which service an account id belongs to.
+///
+/// Account ids are prefixed by their service - "matrix:@a:b", "kick:name" -
+/// except IRC, whose ids are "nick@host" and predate the convention. That
 /// exception is why this exists rather than each caller splitting on a colon.
 pub fn service_of(account_id: &str) -> &'static str {
     match account_id.split_once(':').map(|(prefix, _)| prefix) {
@@ -836,6 +890,7 @@ mod tests {
             category: None,
             position: 0,
             syncing: false,
+            link: None,
             encrypted: None,
             channel_modes: None,
             group_id: None,

@@ -268,6 +268,24 @@ impl Store {
              CREATE INDEX IF NOT EXISTS idx_matrix_reactions_msg ON matrix_reactions(buffer_id, msg_id);",
         );
 
+        // Where each cached media file came from, for fetching it again once
+        // it has expired or been cleared - see media_cache.rs. Only what the
+        // file's own name cannot say: an encrypted file's key, an avatar's URL.
+        // What the window last showed: every conversation and rail entry, so
+        // the next start can show them at once, before any account has
+        // connected - see Runtime::restore_layout.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS known_buffers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS known_groups (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
+        );
+
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS media_sources (
+                 path TEXT PRIMARY KEY,
+                 source TEXT NOT NULL
+             );",
+        );
+
         // One-time repair of the counts the old arithmetic left behind.
         //
         // They cannot be corrected, only cleared: what is stored is a running
@@ -285,6 +303,23 @@ impl Store {
                 Err(e) => tracing::warn!("scrollback: could not clear old reaction counts: {e}"),
             }
             let _ = conn.execute_batch("PRAGMA user_version = 1;");
+        }
+
+        // One-time move of Sneedchat's cached attachments out of the text.
+        //
+        // They used to be written into the message body as a `file://` link,
+        // and the window drew any such link as a picture - which let anybody
+        // type one and have the reader's computer load a file of their
+        // choosing (#247). The window now takes no local path from text, and
+        // a cached file is an attachment; rows written before that are moved
+        // across here so their pictures still show.
+        if version < 2 {
+            match move_cached_links_to_attachments(&conn) {
+                Ok(n) if n > 0 => tracing::info!("scrollback: moved {n} cached Sneedchat picture(s) from message text to attachments"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("scrollback: could not move cached pictures to attachments: {e}"),
+            }
+            let _ = conn.execute_batch("PRAGMA user_version = 2;");
         }
 
         Ok(Self { conn: Mutex::new(conn) })
@@ -454,6 +489,18 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Puts the cards on a message without marking it edited: a link being
+    /// described after the fact is not something its sender did.
+    pub fn set_message_embeds(&self, buffer_id: &str, msg_id: &str, embeds: &[Embed]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(embeds)?;
+        let rows = conn.execute(
+            "UPDATE messages SET embeds = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![json, buffer_id, msg_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_message_body_silent(&self, buffer_id: &str, msg_id: &str, body: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("UPDATE messages SET body = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![body, buffer_id, msg_id])?;
@@ -495,7 +542,10 @@ impl Store {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let bodies: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT body FROM messages WHERE buffer_id = ?1")?;
+            // The attachments as well as the text: a cached Sneedchat file is
+            // named by its attachment now, and only in the text in rows
+            // written before that (see the version 2 migration).
+            let mut stmt = tx.prepare("SELECT body || char(10) || attachments FROM messages WHERE buffer_id = ?1")?;
             let rows = stmt.query_map(params![buffer_id], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
@@ -610,7 +660,7 @@ impl Store {
             return Ok(HashSet::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT msg_id FROM messages WHERE buffer_id = ?1 AND msg_id IN ({placeholders})"
         ))?;
@@ -747,8 +797,8 @@ impl Store {
     /// Wanted because a roster is not always there to ask: a service may not
     /// send one until somebody joins or leaves, and a name with a space in it
     /// cannot be picked out of typed text without a list of the names it
-    /// could be. Whoever has spoken recently is the list that matters anyway
-    /// - they are who somebody is answering.
+    /// could be. Whoever has spoken recently is the list that matters anyway -
+    /// they are who somebody is answering.
     pub fn recent_senders(&self, buffer_id: &str, limit: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -875,8 +925,8 @@ impl Store {
     ///
     /// One query rather than a walk of every buffer: what makes an inbox worth
     /// having is that it answers "what wanted me" in one place, and the
-    /// highlight flag is already recorded per message at the point it arrives
-    /// - by the backend that knows whether a mention is real, which for
+    /// highlight flag is already recorded per message at the point it arrives -
+    /// by the backend that knows whether a mention is real, which for
     /// Discord is its own resolved mentions array rather than a guess at the
     /// nickname.
     /// Mentions, from the messages themselves rather than from whatever
@@ -890,7 +940,7 @@ impl Store {
     pub fn mentions(&self, known_channels: &[String], limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 100 };
-        let places = std::iter::repeat("?").take(known_channels.len()).collect::<Vec<_>>().join(",");
+        let places = std::iter::repeat_n("?", known_channels.len()).collect::<Vec<_>>().join(",");
         let legacy = if known_channels.is_empty() {
             String::new()
         } else {
@@ -1011,6 +1061,78 @@ impl Store {
     }
 
     /// Drops the oldest transfers beyond `keep`.
+    /// Replaces the saved layout - every buffer and rail entry - in one go.
+    pub fn save_layout(&self, buffers: &[crate::model::Buffer], groups: &[crate::model::BufferGroup]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM known_buffers", [])?;
+        tx.execute("DELETE FROM known_groups", [])?;
+        {
+            let mut put = tx.prepare("INSERT INTO known_buffers (id, data) VALUES (?1, ?2)")?;
+            for b in buffers {
+                put.execute(params![b.id, serde_json::to_string(b)?])?;
+            }
+            let mut put = tx.prepare("INSERT INTO known_groups (id, data) VALUES (?1, ?2)")?;
+            for g in groups {
+                put.execute(params![g.id, serde_json::to_string(g)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The saved layout, as last written. Rows that no longer read are
+    /// skipped rather than failing the start.
+    pub fn load_layout(&self) -> Result<(Vec<crate::model::Buffer>, Vec<crate::model::BufferGroup>)> {
+        let conn = self.conn.lock().unwrap();
+        let read = |table: &str| -> Result<Vec<String>> {
+            let mut stmt = conn.prepare(&format!("SELECT data FROM {table}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        };
+        let buffers = read("known_buffers")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
+        let groups = read("known_groups")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
+        Ok((buffers, groups))
+    }
+
+    /// Records where a cached media file came from - see media_cache.rs.
+    pub fn record_media_source(&self, path: &str, source: &serde_json::Value) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO media_sources (path, source) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET source = excluded.source",
+            params![path, source.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Where a cached media file came from, if that was recorded.
+    pub fn media_source(&self, path: &str) -> Result<Option<serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let text: Option<String> = conn
+            .query_row("SELECT source FROM media_sources WHERE path = ?1", params![path], |r| r.get(0))
+            .optional()?;
+        Ok(text.and_then(|t| serde_json::from_str(&t).ok()))
+    }
+
+    /// Deletes every stored message, everywhere, and gives the space back.
+    ///
+    /// What "clear chat history" in Settings means. The services that keep
+    /// history themselves - Discord, Matrix, IRC with chathistory - load it
+    /// again as somebody scrolls back; the rest is gone. Reactions and poll
+    /// cards go with the messages they belonged to. Where media came from is
+    /// kept: it costs little and is what lets a picture be fetched again.
+    pub fn clear_history(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let removed = conn.execute("DELETE FROM messages", [])?;
+        conn.execute("DELETE FROM matrix_reactions", [])?;
+        conn.execute("DELETE FROM live_cards", [])?;
+        // A full vacuum rather than the incremental one: this is one deliberate
+        // act, and the point of it is the space.
+        conn.execute_batch("VACUUM;")?;
+        Ok(removed)
+    }
+
     pub fn prune_transfers(&self, keep: i64) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(
@@ -1232,6 +1354,70 @@ impl Store {
         }
         Ok(reclaimed as usize)
     }
+}
+
+
+/// Takes the daemon's own cached-file links out of stored message text and
+/// makes them attachments - see the version 2 migration in `Store::open`.
+///
+/// Only links into the Sneedchat attachment cache, which only the daemon ever
+/// wrote. Any other `file://` in a body was typed by somebody and stays text.
+fn move_cached_links_to_attachments(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT id, body, attachments FROM messages WHERE body LIKE '%file://%/sneedchat-attachments/%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<std::result::Result<_, _>>()?
+    };
+    let mut moved = 0;
+    for (id, body, attachments) in rows {
+        let (text, found) = cached_links_in(&body);
+        if found.is_empty() {
+            continue;
+        }
+        let mut list: Vec<crate::model::Attachment> = serde_json::from_str(&attachments).unwrap_or_default();
+        list.extend(found);
+        conn.execute(
+            "UPDATE messages SET body = ?1, attachments = ?2 WHERE id = ?3",
+            params![text, serde_json::to_string(&list)?, id],
+        )?;
+        moved += 1;
+    }
+    Ok(moved)
+}
+
+/// The text without its cached-attachment links, and those links as
+/// attachments.
+fn cached_links_in(body: &str) -> (String, Vec<crate::model::Attachment>) {
+    let mut text = String::with_capacity(body.len());
+    let mut found = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("file://") {
+        text.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let end = tail.find(|c: char| c.is_whitespace() || c == '[' || c == ']').unwrap_or(tail.len());
+        let link = &tail[..end];
+        let path = link.trim_start_matches("file://");
+        let parent = std::path::Path::new(path).parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if parent == Some("sneedchat-attachments") && !name.is_empty() {
+            let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+            found.push(crate::model::Attachment {
+                kind: if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" }.to_string(),
+                filename: Some(name.to_string()),
+                path: Some(link.to_string()),
+                ..Default::default()
+            });
+        } else {
+            text.push_str(link);
+        }
+        rest = &tail[end..];
+    }
+    text.push_str(rest);
+    // An [img] that held only the link is now empty; it would draw nothing.
+    let text = text.replace("[img][/img]", "").replace("[IMG][/IMG]", "");
+    (text.trim().to_string(), found)
 }
 
 #[cfg(test)]
@@ -1779,5 +1965,49 @@ mod dedupe_tests {
         put(&s, "acct|#two", "abc", "hello");
         assert_eq!(s.get_backlog("acct|#one", 0, 100).unwrap().len(), 1);
         assert_eq!(s.get_backlog("acct|#two", 0, 100).unwrap().len(), 1);
+    }
+
+    /// The daemon's own cached-picture links leave the text and become
+    /// attachments; a `file://` somebody typed stays as text.
+    #[test]
+    fn cached_links_move_and_typed_ones_stay() {
+        let body = "look [img]file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg[/img] and file:///etc/passwd";
+        let (text, found) = cached_links_in(body);
+        assert_eq!(text, "look  and file:///etc/passwd");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].kind, "image");
+        assert_eq!(found[0].filename.as_deref(), Some("9623396.jpeg"));
+        assert_eq!(found[0].path.as_deref(), Some("file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg"));
+
+        let (same, none) = cached_links_in("nothing cached here");
+        assert_eq!(same, "nothing cached here");
+        assert!(none.is_empty());
+    }
+
+    /// What the window showed is read back as it was written, and a second
+    /// save replaces the first rather than adding to it.
+    #[test]
+    fn the_layout_reads_back_and_is_replaced_whole() {
+        let s = store();
+        let buffer: crate::model::Buffer = serde_json::from_value(serde_json::json!({
+            "id": "acct|#one", "accountId": "acct", "kind": "channel", "name": "#one",
+            "groupId": "account:acct", "category": "Text", "position": 3
+        }))
+        .unwrap();
+        let group: crate::model::BufferGroup = serde_json::from_value(serde_json::json!({
+            "id": "acct|guild:1", "accountId": "acct", "service": "discord", "kind": "guild", "name": "A server"
+        }))
+        .unwrap();
+        s.save_layout(&[buffer.clone()], &[group.clone()]).unwrap();
+        let (buffers, groups) = s.load_layout().unwrap();
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].id, "acct|#one");
+        assert_eq!(buffers[0].category.as_deref(), Some("Text"));
+        assert_eq!(buffers[0].position, 3);
+        assert_eq!(groups, vec![group]);
+
+        s.save_layout(&[], &[]).unwrap();
+        let (buffers, groups) = s.load_layout().unwrap();
+        assert!(buffers.is_empty() && groups.is_empty());
     }
 }

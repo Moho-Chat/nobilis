@@ -128,7 +128,13 @@ pub async fn enable(
         .await
         .context("caching the pickle key")?;
 
-    let uploaded = upload(&session, base, token, &pickle_key).await;
+    // Collect before replacing. On a new sign-in to an account that already
+    // has a spare device, that device is holding the keys sent while no
+    // session was there to receive them - which is the whole of what it is
+    // for. Uploading over it threw them away. `rehydrate` takes down
+    // whatever is there, collects it, and puts a fresh one back; with
+    // nothing there it is just the upload.
+    let uploaded = rehydrate(account_id, &session, &config).await;
     match (uploaded, &fresh_code) {
         (Ok(()), _) => {
             let _ = state.accounts.set_matrix_dehydration(account_id, true);
@@ -172,32 +178,6 @@ async fn upload(session: &CryptoSession, base: &str, token: &str, pickle_key: &D
     });
     http::put_json(&format!("{base}{BASE}"), token, body).await.context("uploading the dehydrated device")?;
     Ok(())
-}
-
-/// Opens the safe with a recovery code, caches the pickle key, and collects.
-///
-/// The one moment the code is needed: a login that has never run before has no
-/// cached key, and this is how it gets one. Every connect after this uses the
-/// cache, so the code is typed once rather than kept.
-pub async fn rehydrate_with_code(state: &crate::state::AppState, account_id: &str, code: &str) -> Result<()> {
-    let config = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
-    let session = state.runtime.get_matrix_machine(account_id).context("account is not connected")?;
-    let base = config.homeserver_url.trim_end_matches('/');
-
-    let key = ssss::unlock(base, &config.access_token, &config.user_id, code).await?;
-    let Some(bytes) = ssss::read_secret(base, &config.access_token, &config.user_id, &key, ssss::DEHYDRATION_SECRET).await? else {
-        bail!("this account's secret storage holds no dehydrated device key")
-    };
-    let pickle_key = key_from_stored(&bytes)?;
-    session
-        .machine
-        .dehydrated_devices()
-        .save_dehydrated_device_pickle_key(&pickle_key)
-        .await
-        .context("caching the pickle key")?;
-    let _ = state.accounts.set_matrix_dehydration(account_id, true);
-
-    rehydrate(account_id, &session, &config).await
 }
 
 /// Takes down whatever was left last time, collects what it was sent, and puts

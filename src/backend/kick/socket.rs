@@ -52,8 +52,42 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
-/// How many channels to resolve at once when connecting.
+/// Whether Kick said this handle names no channel at all.
+fn no_such_channel(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<api::NoSuchChannel>().is_some()
+}
+
+/// Takes a handle Kick does not know off the saved list, and says so.
 ///
+/// A channel that does not resolve never gets a buffer, so there was nothing
+/// on screen to close it with: it stayed saved, invisible, and was asked for
+/// on every connect - drawing a 429 or a 404 each time - for as long as the
+/// account existed.
+fn forget_missing(state: &AppState, account_id: &str, slug: &str) {
+    let gone = api::normalise_slug(slug);
+    if let Some(cfg) = state.accounts.get_kick(account_id) {
+        let before = cfg.channels.len();
+        let left: Vec<String> = cfg.channels.into_iter().filter(|c| api::normalise_slug(c) != gone).collect();
+        if left.len() != before {
+            let _ = state.accounts.set_kick_channels(account_id, left);
+        }
+    }
+    // Its placeholder too, put up while it was being looked up.
+    state.runtime.remove_buffer(state, &crate::model::buffer_id(account_id, &gone));
+    tracing::info!("kick[{account_id}]: {gone} is not a Kick channel any more; taken off the saved list");
+    state.runtime.report_progress(state, account_id, &format!("{gone} is not on Kick any more - taken off your channels"));
+}
+
+/// Saves a handle, once Kick has said it is a channel.
+fn remember(state: &AppState, account_id: &str, slug: &str) {
+    if let Some(mut cfg) = state.accounts.get_kick(account_id) {
+        if !cfg.channels.iter().any(|c| api::normalise_slug(c) == slug) {
+            cfg.channels.push(slug.to_string());
+            let _ = state.accounts.set_kick_channels(account_id, cfg.channels);
+        }
+    }
+}
+
 /// How many times a rate-limited channel is asked for again before giving up.
 pub(super) const REJOIN_ATTEMPTS: u8 = 3;
 
@@ -72,10 +106,12 @@ pub(super) fn retry_later(state: &AppState, account_id: &str, slug: String, atte
     });
 }
 
+/// How many channels to look up at once on a first connect.
+///
 /// Measured, not guessed: eight at a time drew 429s from Kick on an account
 /// watching thirty channels, and the channels that were refused went missing
-/// from the list entirely. Four, with the retry in `api::channel` behind it,
-/// connects the same thirty in a few seconds and asks nothing twice.
+/// from the list entirely. Three, with every request paced behind one shared
+/// wait (see `api::paced`), connects the same thirty in a few seconds.
 pub(super) const CONNECT_CONCURRENCY: usize = 3;
 
 /// How many followed channels to open on a first connect.
@@ -161,7 +197,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                         }
                     }
                     let added = channels.len() - before;
-                    let _ = state.accounts.set_kick_channels(account_id, channels.clone());
+                    // Opened below like any other channel, and saved by that
+                    // when Kick answers for each - not written to the list
+                    // here, where a handle Kick no longer knows would be kept
+                    // for good with nothing on screen to close it by.
                     let _ = state.accounts.mark_kick_follows_synced(account_id);
                     if added > 0 {
                         state.runtime.report_progress(state, account_id, &format!("opened {added} channels you follow on Kick"));
@@ -218,7 +257,39 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
     // Subscribing stays serial, because the socket is one thing and only one
     // subscription can be written to it at a time. It is the waiting that is
     // parallel, not the writing.
-    let queue: Vec<_> = channels
+    // A reconnect, for every channel this daemon has already joined: its ids
+    // are known and never change, so it is subscribed again at once, with no
+    // request to Kick at all. Asking `/channels/<handle>` again for each - and
+    // its emotes, its standing, its history - on every dropped socket was most
+    // of the 429s in a day's log, and none of it told us anything new. The
+    // one thing a reconnect does need is what was said while it was down: one
+    // page of history each, through the same pacing as everything else.
+    let mut fresh = Vec::new();
+    for slug in &channels {
+        // On screen from the start, marked as connecting, rather than
+        // appearing one by one as their lookups land - and a channel Kick is
+        // slow to answer for was otherwise not there at all.
+        let name = api::normalise_slug(slug);
+        if !name.is_empty() {
+            let id = state.runtime.ensure_buffer(state, account_id, &name, "channel").id;
+            if state.runtime.kick_channel(&id).is_none() {
+                state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::connecting()));
+            }
+        }
+        let buffer_id = crate::model::buffer_id(account_id, &api::normalise_slug(slug));
+        let Some(known) = state.runtime.kick_channel(&buffer_id) else {
+            fresh.push(slug.clone());
+            continue;
+        };
+        subscribe(&mut socket, known.chatroom_id, known.channel_id).await?;
+        watched.add_ids(&known.slug, known.chatroom_id, known.channel_id);
+        let (state, http, account_id) = (state.clone(), http.clone(), account_id.to_string());
+        tokio::spawn(async move {
+            backfill(&state, &http, &account_id, &known.slug, known.channel_id, None).await;
+        });
+    }
+
+    let queue: Vec<_> = fresh
         .iter()
         .cloned()
         .map(|slug| {
@@ -237,11 +308,16 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
             Ok(channel) => {
                 subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                 watched.add(&channel);
+                // Saved now that Kick has answered for it - which is what
+                // keeps the follows read in on a first connect from being
+                // written to the list before anybody knew they existed.
+                remember(state, account_id, &channel.slug);
             }
             // One bad handle in a saved list must not stop the other twenty
             // from connecting - a channel can be renamed or banned between
             // sessions, and that is this account's problem with one buffer
             // rather than with Kick.
+            Err(e) if no_such_channel(&e) => forget_missing(state, account_id, &slug),
             Err(e) => {
                 let words = format!("{e:#}");
                 tracing::warn!("kick[{account_id}]: {slug}: {words}");
@@ -254,6 +330,8 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                     refused.push(slug);
                 } else {
                     state.runtime.report_progress(state, account_id, &format!("{slug}: {words}"));
+                    let id = crate::model::buffer_id(account_id, &api::normalise_slug(&slug));
+                    state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::down("refused", words)));
                 }
             }
         }
@@ -301,7 +379,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                             // the channel just asked for.
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
+                            remember(state, account_id, &channel.slug);
                         }
+                        // Said, and not saved: a typo stays a typo rather
+                        // than becoming a channel asked for on every connect.
                         Err(e) => state.runtime.report_progress(state, account_id, &format!("{e:#}")),
                     }
                 }
@@ -310,7 +391,9 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                         Ok(channel) => {
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
+                            remember(state, account_id, &channel.slug);
                         }
+                        Err(e) if no_such_channel(&e) => forget_missing(state, account_id, &handle),
                         Err(e) => {
                             let words = format!("{e:#}");
                             // Still being told to slow down: wait longer and
@@ -321,6 +404,11 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                                 retry_later(state, account_id, handle, attempt + 1);
                             } else {
                                 state.runtime.report_progress(state, account_id, &format!("{handle}: {words}"));
+                                let id = crate::model::buffer_id(account_id, &api::normalise_slug(&handle));
+                                state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::down(
+                                    "refused",
+                                    format!("Kick wouldn't answer for {handle} - it will be tried again when the account reconnects"),
+                                )));
                             }
                         }
                     }
@@ -391,6 +479,7 @@ async fn prepare(
     // group with no rail tile is a conversation with no way to reach it:
     // receiving fine, listed by the daemon, and invisible.
     let buffer = state.runtime.ensure_buffer(state, account_id, &channel.slug, "channel");
+    state.runtime.set_buffer_link(state, &buffer.id, None);
     state.runtime.set_kick_channel(
         &buffer.id,
         crate::runtime::KickChannel {
@@ -626,8 +715,8 @@ pub(super) async fn channel_when_ready(state: &AppState, buffer_id: &str) -> Opt
 ///
 /// The subscription it arrived on is asked first and is the reliable answer:
 /// this connection subscribed per room, so the room is in the name. The
-/// payload is the fallback, because these events disagree about what they name
-/// - some carry the chatroom, some the channel, some neither - and a fallback
+/// payload is the fallback, because these events disagree about what they name -
+/// some carry the chatroom, some the channel, some neither - and a fallback
 /// that is occasionally right beats an event dropped for lack of a field.
 pub(super) fn channel_of(watched: &Watched, subscription: &Option<String>, payload: &serde_json::Value) -> Option<String> {
     if let Some(name) = subscription.as_deref() {

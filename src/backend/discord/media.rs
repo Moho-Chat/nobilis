@@ -394,14 +394,6 @@ pub(super) fn guild_icon_cache_dir() -> std::path::PathBuf {
         .join("discord-icons")
 }
 
-pub async fn sweep_guild_icon_cache() {
-    crate::backend::sneedchat::sweep_cache_dir(&guild_icon_cache_dir(), GUILD_ICON_CACHE_MAX_BYTES, "discord guild icon").await;
-}
-
-/// Guild icons are small and there are only as many as the user has servers,
-/// so this is a much smaller cap than the message thumbnail cache.
-pub(super) const GUILD_ICON_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
-
 /// Where a guild's icon would already be on disk, if it has been fetched.
 ///
 /// Keyed by the icon hash as well as the guild id, so a server changing its
@@ -474,14 +466,6 @@ pub(super) fn thumbnail_cache_dir() -> std::path::PathBuf {
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
         .join("nobilis")
         .join("discord-thumbnails")
-}
-
-/// Deliberately smaller than the attachment caches: these are previews, not
-/// the originals, and the full-size image is always one refresh away.
-pub(super) const THUMBNAIL_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
-
-pub async fn sweep_thumbnail_cache() {
-    crate::backend::sneedchat::sweep_cache_dir(&thumbnail_cache_dir(), THUMBNAIL_CACHE_MAX_BYTES, "discord thumbnail").await;
 }
 
 /// Throw away the previews taken before animation was asked for.
@@ -584,6 +568,54 @@ fn expires_within(url: &str, margin: u64) -> bool {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     now + margin >= expiry
+}
+
+/// Fetches a cached thumbnail again, after it expired or was cleared.
+///
+/// The file is named by a hash of its picture's URL, so only the message says
+/// which picture it was. Its link may have expired as well - Discord's do, in
+/// a day - in which case the message is re-fetched for a freshly signed one
+/// first, as a lapsed link already is.
+pub async fn restore_thumbnail(state: &AppState, path: &std::path::Path, buffer_id: &str, message_id: &str) -> Result<std::path::PathBuf> {
+    let wanted = format!("file://{}", path.display());
+    let find = |attachments: &[Attachment]| {
+        attachments
+            .iter()
+            .find(|a| a.thumbnail_path.as_deref() == Some(wanted.as_str()))
+            .and_then(|a| Some((a.url.clone()?, a.width.unwrap_or(0), a.height.unwrap_or(0))))
+    };
+    let message = state.store.get_message(buffer_id, message_id)?.context("that message is not stored here")?;
+    let (url, width, height) = find(&message.attachments).context("that message has no such picture")?;
+    let src = thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
+    if fetch_thumbnail(&src, &url).await.is_some() {
+        return Ok(path.to_path_buf());
+    }
+    let fresh = refresh_attachments(state, buffer_id, message_id).await?;
+    let (url, width, height) = find(&fresh).context("that message no longer has the picture")?;
+    let src = thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
+    fetch_thumbnail(&src, &url).await.context("Discord did not send the picture")?;
+    Ok(path.to_path_buf())
+}
+
+/// Fetches a cached server icon again. Its name is the server and the icon's
+/// hash, which is the whole of its CDN address.
+pub async fn restore_guild_icon(path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let name = path.file_stem().and_then(|n| n.to_str()).context("not a cached icon")?;
+    let (guild_id, hash) = name.split_once('-').context("not a cached icon")?;
+    if !guild_id.bytes().all(|b| b.is_ascii_digit()) || !hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        bail!("not a cached icon");
+    }
+    let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128");
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), anonymous_client().get(&url).send())
+        .await
+        .context("Discord took too long")??;
+    if !resp.status().is_success() {
+        bail!("Discord answered {} for that icon", resp.status());
+    }
+    let bytes = resp.bytes().await?;
+    tokio::fs::create_dir_all(guild_icon_cache_dir()).await?;
+    tokio::fs::write(path, &bytes).await?;
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -690,7 +722,7 @@ mod tests {
         };
         let body = "look at this\nhttps://cdn.discordapp.com/attachments/1/2/shot.png?ex=11&is=22&hm=33\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1";
         assert_eq!(
-            strip_attachment_links(body, &[own.clone()]),
+            strip_attachment_links(body, std::slice::from_ref(&own)),
             "look at this\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1"
         );
         // The media host is the same file.
@@ -700,7 +732,7 @@ mod tests {
     #[test]
     fn a_sticker_stand_in_goes_once_the_sticker_can_be_drawn() {
         let sticker = Attachment { kind: "lottie".into(), filename: Some("wave.json".into()), ..Default::default() };
-        assert_eq!(strip_attachment_links("sent a sticker: wave", &[sticker.clone()]), "");
+        assert_eq!(strip_attachment_links("sent a sticker: wave", std::slice::from_ref(&sticker)), "");
         // Somebody else's sticker named in passing stays.
         assert_eq!(strip_attachment_links("sent a sticker: dance", &[sticker]), "sent a sticker: dance");
     }
