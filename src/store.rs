@@ -489,6 +489,18 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Puts the cards on a message without marking it edited: a link being
+    /// described after the fact is not something its sender did.
+    pub fn set_message_embeds(&self, buffer_id: &str, msg_id: &str, embeds: &[Embed]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(embeds)?;
+        let rows = conn.execute(
+            "UPDATE messages SET embeds = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![json, buffer_id, msg_id],
+        )?;
+        Ok(rows > 0)
+    }
+
     pub fn update_message_body_silent(&self, buffer_id: &str, msg_id: &str, body: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("UPDATE messages SET body = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![body, buffer_id, msg_id])?;

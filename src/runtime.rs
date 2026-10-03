@@ -4226,6 +4226,13 @@ impl Runtime {
         };
         state.events.emit("message", serde_json::to_value(&message).unwrap());
 
+        // A YouTube link with nothing describing it - every service but
+        // Discord, which describes its own. After the line is out, never
+        // holding it up.
+        if message.embeds.is_empty() && kind != "system" {
+            crate::unfurl::youtube_later(state, account_id, &message.buffer_id, &message.id, &message.body);
+        }
+
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
@@ -4262,6 +4269,22 @@ impl Runtime {
             Ok(false) => false,
             Err(e) => {
                 tracing::warn!("failed to update message: {e}");
+                false
+            }
+        }
+    }
+
+    /// A message's cards, arriving after the message did - a link unfurled.
+    /// Not an edit, in storage or in the event.
+    pub fn set_message_embeds(&self, state: &AppState, buffer_id: &str, msg_id: &str, embeds: &[Embed]) -> bool {
+        match state.store.set_message_embeds(buffer_id, msg_id, embeds) {
+            Ok(true) => {
+                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": embeds }));
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!("failed to put a card on a message: {e}");
                 false
             }
         }

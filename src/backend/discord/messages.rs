@@ -716,6 +716,8 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 // message's media sniffing, which pairs them with the embed
                 // in the frontend. Nothing to fetch here.
                 image_url: None,
+                provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                author: embed["author"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
             })
         })
         .collect()

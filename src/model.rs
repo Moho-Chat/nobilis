@@ -467,7 +467,7 @@ pub struct Reaction {
 /// Discord's own client does, and re-renders it live if a later edit
 /// changes it (a webhook can restyle an existing embed - status-bridge
 /// bots commonly do this to signal connected/degraded/down).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Embed {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -489,6 +489,14 @@ pub struct Embed {
     /// unfurled link is, whoever unfurled it.
     #[serde(rename = "imageUrl", skip_serializing_if = "Option::is_none")]
     pub image_url: Option<String>,
+    /// Who serves what the card is about - "YouTube" - drawn small above the
+    /// rest, as Discord does. Discord's embeds carry it; an unfurled link
+    /// gets it from whoever described it (see unfurl.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Who made it: a video's channel, an article's byline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
 }
 
 /// Something on a message that can be pressed.

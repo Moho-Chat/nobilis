@@ -18,6 +18,7 @@ mod runtime;
 mod secure;
 mod state;
 mod store;
+mod unfurl;
 mod upload;
 mod voicenote;
 
