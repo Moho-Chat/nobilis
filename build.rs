@@ -18,7 +18,30 @@ fn main() {
     let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty());
     let stamp = if dirty { format!("{commit}-modified") } else { commit };
     println!("cargo:rustc-env=NOBILIS_BUILD_COMMIT={stamp}");
+    println!("cargo:rustc-env=NOBILIS_VERSION_LABEL={}", version_label());
+    println!("cargo:rerun-if-env-changed=NOBILIS_CHANNEL");
     watch_head();
+}
+
+/// What this build calls itself: its version for a release build,
+/// "development" for anything else - a build from in-between commits is not
+/// the release its Cargo.toml names.
+///
+/// Built inside moho, moho decides (NOBILIS_CHANNEL, from its
+/// scripts/version-label.mjs): there the submodule is checked out as a bare
+/// commit, on no branch, and cannot tell. Built on its own, the same rule on
+/// this checkout: the master branch, or sitting exactly on the version's tag.
+fn version_label() -> String {
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let release = match std::env::var("NOBILIS_CHANNEL").ok().as_deref() {
+        Some("release") => true,
+        Some(_) => false,
+        None => {
+            git(&["rev-parse", "--abbrev-ref", "HEAD"]).is_some_and(|b| b.trim() == "master")
+                || git(&["tag", "--points-at", "HEAD"]).is_some_and(|tags| tags.lines().any(|t| t.trim() == format!("v{version}")))
+        }
+    };
+    if release { version } else { "development".to_string() }
 }
 
 /// Asks cargo to run this again when the checkout moves.
