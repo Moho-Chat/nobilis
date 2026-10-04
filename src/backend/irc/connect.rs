@@ -121,9 +121,9 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 state.runtime.clear_irc_caps(&account_id);
                 state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
                 let because = detail.unwrap_or_else(|| "Connection closed".to_string());
-                state.runtime.report_progress(&state, &account_id, &format!("{because} - reconnecting in {}s...", backoff.as_secs()));
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RECONNECT_MAX_DELAY);
+                let wait = state.runtime.next_retry_delay(&account_id, &mut backoff, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+                state.runtime.report_retry(&state, &account_id, &because, wait);
+                tokio::time::sleep(wait).await;
 
                 let pace = state.runtime.throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
                 if !pace.is_zero() {

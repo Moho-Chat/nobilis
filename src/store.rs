@@ -1998,7 +1998,7 @@ mod dedupe_tests {
             "id": "acct|guild:1", "accountId": "acct", "service": "discord", "kind": "guild", "name": "A server"
         }))
         .unwrap();
-        s.save_layout(&[buffer.clone()], &[group.clone()]).unwrap();
+        s.save_layout(std::slice::from_ref(&buffer), std::slice::from_ref(&group)).unwrap();
         let (buffers, groups) = s.load_layout().unwrap();
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].id, "acct|#one");
