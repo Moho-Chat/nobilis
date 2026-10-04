@@ -12,6 +12,7 @@ mod media_cache;
 mod model;
 mod net;
 mod oggopus;
+mod opus_packet;
 mod profile;
 mod rpc;
 mod runtime;

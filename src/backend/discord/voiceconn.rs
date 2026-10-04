@@ -1354,6 +1354,15 @@ impl Jitter {
     fn decode(&mut self, opus: &[u8]) -> Option<Vec<i16>> {
         let decoder = self.decoder.as_mut()?;
         let mut pcm = vec![0i16; FRAME_SAMPLES * 3];
+        // What another person's client sent, checked in Rust before libopus
+        // reads it (#251). Not a packet, or longer than this buffer: treated
+        // as lost, which the decoder conceals as it does any gap. Empty is
+        // our own request for exactly that.
+        let opus = if opus.is_empty() || crate::opus_packet::plausible(opus, pcm.len() / 2).is_some() {
+            opus
+        } else {
+            &[]
+        };
         let per_channel = decoder.decode(opus, &mut pcm, false).ok()?;
         pcm.truncate(per_channel * 2);
         Some(pcm)

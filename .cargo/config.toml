@@ -1,0 +1,11 @@
+[env]
+# The version a bundled libopus reports (#251). libopus works its version out
+# from git, which a crate's copy of its source does not have, so the bundled
+# build - every release: CI and the Windows cross-build have no system
+# libopus - otherwise calls itself "unknown". A machine with libopus
+# installed links that instead, and it reports its own; this is not read then.
+#
+# libopus_sys 0.3.3 bundles 1.5.2: checked file by file against upstream's
+# tags. A test (audio.rs, bundled_libopus_is_the_one_named) fails when the
+# crate changes, so this cannot quietly go stale.
+OPUS_PACKAGE_VERSION = "1.5.2"

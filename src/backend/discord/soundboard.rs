@@ -211,6 +211,11 @@ fn cache_dir() -> std::path::PathBuf {
         .join("discord-sounds")
 }
 
+/// The largest sound file accepted. Discord takes uploads up to 512 KB for
+/// at most 5.2 seconds; anything much bigger is not a soundboard sound, and
+/// what gets decoded here was uploaded by anyone in the server (#251).
+const LARGEST_BYTES: usize = 1024 * 1024;
+
 /// The sound's file, kept: a sound id names one recording for good.
 async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     if !id.bytes().all(|b| b.is_ascii_digit()) {
@@ -218,7 +223,9 @@ async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     }
     let path = cache_dir().join(id);
     if let Ok(bytes) = tokio::fs::read(&path).await {
-        return Ok(bytes);
+        if bytes.len() <= LARGEST_BYTES {
+            return Ok(bytes);
+        }
     }
     let resp = http_client_for(token)
         .get(format!("https://cdn.discordapp.com/soundboard-sounds/{id}"))
@@ -228,7 +235,19 @@ async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         bail!("Discord has no file for that sound ({})", resp.status());
     }
-    let bytes = resp.bytes().await.context("reading the sound")?.to_vec();
+    if resp.content_length().is_some_and(|n| n as usize > LARGEST_BYTES) {
+        bail!("that sound is larger than any soundboard sound can be");
+    }
+    // Read a piece at a time and stopped at the limit, rather than trusting
+    // a Content-Length that need not be there or be true.
+    let mut resp = resp;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("reading the sound")? {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > LARGEST_BYTES {
+            bail!("that sound is larger than any soundboard sound can be");
+        }
+    }
     tokio::fs::create_dir_all(cache_dir()).await.ok();
     let _ = tokio::fs::write(&path, &bytes).await;
     Ok(bytes)
@@ -264,6 +283,11 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i16>> {
         let mut frame = vec![0i16; 5760 * 2];
         while let Ok(packet) = format.next_packet() {
             if packet.track_id() != track_id {
+                continue;
+            }
+            // Checked in Rust before libopus sees it (#251); a packet that
+            // is not one, or is longer than the buffer, is left out.
+            if crate::opus_packet::plausible(&packet.data, frame.len() / 2).is_none() {
                 continue;
             }
             if let Ok(n) = opus.decode(&packet.data, &mut frame, false) {
@@ -351,3 +375,49 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod opus_guard_tests {
+    /// A real Ogg Opus file - what a guild's own sounds are - still decodes in
+    /// full with every packet checked before libopus sees it (#251).
+    #[test]
+    fn a_real_ogg_opus_sound_decodes_whole() {
+        // Two seconds of a tone at 48 kHz mono, written as Ogg Opus the way
+        // voice messages are.
+        let samples: Vec<f32> = (0..96_000).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
+        let file = crate::oggopus::encode(&samples).unwrap();
+        let pcm = super::decode(&file).unwrap();
+        let seconds = pcm.len() as f64 / 2.0 / 48_000.0;
+        assert!((1.9..=2.1).contains(&seconds), "decoded {seconds:.2}s of a 2s sound");
+    }
+
+    /// Packets that are not Opus are left out rather than handed over.
+    #[test]
+    fn a_damaged_ogg_opus_sound_does_not_reach_the_decoder_whole() {
+        let samples: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
+        let mut file = crate::oggopus::encode(&samples).unwrap();
+        // Corrupt the audio pages (after the two header pages) without
+        // touching the Ogg framing: each packet's first byte becomes a code 3
+        // header claiming 63 frames, which no valid packet can.
+        let mut i = 0;
+        let mut pages = 0;
+        while i + 27 < file.len() {
+            if &file[i..i + 4] != b"OggS" {
+                i += 1;
+                continue;
+            }
+            let segments = file[i + 26] as usize;
+            let body = i + 27 + segments;
+            pages += 1;
+            if pages > 2 && body + 1 < file.len() {
+                file[body] = (31 << 3) | 3;
+                file[body + 1] = 63;
+            }
+            let len: usize = file[i + 27..i + 27 + segments].iter().map(|&b| b as usize).sum();
+            i = body + len;
+        }
+        // Still a file symphonia can read, and the check keeps the bad
+        // packets out; it must not panic or error the whole sound.
+        let _ = super::decode(&file);
+    }
+}

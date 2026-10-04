@@ -296,6 +296,10 @@ pub async fn dispatch(
             Some(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "commit": env!("NOBILIS_BUILD_COMMIT"),
+                // The C decoder every Discord voice packet and soundboard
+                // sound goes through (#251) - bundled in a release, the
+                // system's own where one was installed when this was built.
+                "opus": opus2::version(),
             })),
             None,
         ),
