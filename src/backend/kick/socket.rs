@@ -27,8 +27,10 @@ pub(super) fn pusher_url() -> String {
 /// because the socket is owned by its own task and these arrive from RPC.
 #[derive(Debug)]
 pub enum Command {
-    /// Watch a channel, by whatever the user typed as a handle.
-    Join(String),
+    /// Watch a channel, by whatever the user typed as a handle. With a
+    /// reply when somebody is waiting to hear how it went: a join that
+    /// fails on a connected account has nowhere else to say so.
+    Join(String, Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     /// Try a channel Kick refused for the rate limit again, counting the
     /// attempts so this cannot become a connection that asks forever.
     Rejoin(String, u8),
@@ -161,6 +163,19 @@ pub(super) async fn run_with_retry(state: &AppState, config: &KickAccountConfig,
 }
 
 pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> Result<()> {
+    // The route first, then the client that uses it. Built the other way
+    // round - the chat socket below being what used to start Tor - a routed
+    // account's client was made before there was anywhere to send it, got
+    // the address that goes nowhere, and kept it for the whole session:
+    // every channel looked up through Kick's API failed at once until
+    // something forced a reconnect.
+    let router = crate::net::route::router();
+    if router.routed(super::api::SHARED_KEY) {
+        router
+            .ready(|msg| state.runtime.report_progress(state, account_id, msg))
+            .await
+            .context("starting Tor or reaching the proxy")?;
+    }
     let http = api::client()?;
 
     // Signed in or not is settled first, because everything downstream reads
@@ -370,7 +385,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
         tokio::select! {
             command = rx.recv() => match command {
                 None => return Ok(()),
-                Some(Command::Join(handle)) => {
+                Some(Command::Join(handle, reply)) => {
                     match prepare(state, &http, config, account_id, &handle).await {
                         Ok(channel) => {
                             // Propagated, not reported: a subscribe that will
@@ -380,10 +395,27 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                             subscribe(&mut socket, channel.chatroom_id, channel.id).await?;
                             watched.add(&channel);
                             remember(state, account_id, &channel.slug);
+                            if let Some(reply) = reply {
+                                let _ = reply.send(Ok(()));
+                            }
                         }
                         // Said, and not saved: a typo stays a typo rather
                         // than becoming a channel asked for on every connect.
-                        Err(e) => state.runtime.report_progress(state, account_id, &format!("{e:#}")),
+                        //
+                        // Said to whoever asked. report_progress only speaks
+                        // while an account is connecting, and a join is asked
+                        // of a connected one - so every failed join, a typo or
+                        // Kick refusing the request, used to vanish: the join
+                        // page sat there and nothing appeared.
+                        Err(e) => {
+                            tracing::warn!("kick[{account_id}]: could not watch {handle}: {e:#}");
+                            match reply {
+                                Some(reply) => {
+                                    let _ = reply.send(Err(format!("{e:#}")));
+                                }
+                                None => state.runtime.report_progress(state, account_id, &format!("{e:#}")),
+                            }
+                        }
                     }
                 }
                 Some(Command::Rejoin(handle, attempt)) => {

@@ -1337,3 +1337,21 @@ mod tests {
         assert!(seconds > 1.5, "far less audio than elapsed time: {seconds:.2}s");
     }
 }
+
+#[cfg(test)]
+mod libopus_version_tests {
+    /// `.cargo/config.toml` names the libopus a bundled build carries
+    /// (OPUS_PACKAGE_VERSION) for the libopus_sys it was checked against.
+    /// A different libopus_sys may bundle a different libopus, and then the
+    /// version every release reports would be wrong without anything saying so.
+    #[test]
+    fn bundled_libopus_is_the_one_named() {
+        let lock = include_str!("../Cargo.lock");
+        assert!(
+            lock.contains("name = \"libopus_sys\"\nversion = \"0.3.3\""),
+            "libopus_sys is no longer 0.3.3 - find which libopus it bundles and update OPUS_PACKAGE_VERSION in .cargo/config.toml"
+        );
+        let config = include_str!("../.cargo/config.toml");
+        assert!(config.contains("OPUS_PACKAGE_VERSION = \"1.5.2\""));
+    }
+}

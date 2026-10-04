@@ -296,9 +296,25 @@ pub async fn dispatch(
             Some(serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "commit": env!("NOBILIS_BUILD_COMMIT"),
+                // The C decoder every Discord voice packet and soundboard
+                // sound goes through (#251) - bundled in a release, the
+                // system's own where one was installed when this was built.
+                "opus": opus2::version(),
             })),
             None,
         ),
+
+        // The newest real release of a project, so a frontend can say when
+        // there is one newer than itself. Null while the project has none.
+        "latestRelease" => {
+            let Some(repo) = p_str_opt(params, "repo") else {
+                return (None, Some("latestRelease requires \"repo\"".to_string()));
+            };
+            match crate::releases::latest(repo).await {
+                Ok(found) => (Some(serde_json::to_value(found).unwrap()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
 
         "listProtocols" => (
             Some(serde_json::json!([
@@ -790,10 +806,19 @@ pub async fn dispatch(
                 // Remembered by the connection once Kick has said the handle
                 // is a channel, not here: saved first, a typo was asked for
                 // on every connect for good, with no buffer to close it by.
-                if sender.send(backend::kick::Command::Join(slug)).is_err() {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                if sender.send(backend::kick::Command::Join(slug, Some(reply))).is_err() {
                     return (None, Some("that Kick account is not connected".to_string()));
                 }
-                return (Some(ok_node()), None);
+                // Waited for, so a refusal reaches the person who asked
+                // rather than nobody. Bounded: looking a channel up goes
+                // through Kick's API, over Tor for a routed account.
+                return match tokio::time::timeout(std::time::Duration::from_secs(45), answer).await {
+                    Ok(Ok(Ok(()))) => (Some(ok_node()), None),
+                    Ok(Ok(Err(e))) => (None, Some(e)),
+                    Ok(Err(_)) => (None, Some("the Kick connection dropped before the channel opened".to_string())),
+                    Err(_) => (None, Some("Kick took too long to answer for that channel".to_string())),
+                };
             }
             match state.runtime.irc_sender(id) {
                 None => (None, Some("join failed (account not connected?)".to_string())),
@@ -4232,7 +4257,7 @@ pub async fn dispatch(
             let connected = match state.runtime.kick_sender(account_id) {
                 Some(sender) => {
                     for slug in &added {
-                        let _ = sender.send(backend::kick::Command::Join(slug.clone()));
+                        let _ = sender.send(backend::kick::Command::Join(slug.clone(), None));
                     }
                     true
                 }

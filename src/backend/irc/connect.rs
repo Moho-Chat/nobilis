@@ -81,9 +81,7 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
             }
             let mut backoff = RECONNECT_INITIAL_DELAY;
             loop {
-                let result = std::panic::AssertUnwindSafe(run(&state, &config))
-                    .catch_unwind()
-                    .await;
+                let result = std::panic::AssertUnwindSafe(run(&state, &config)).catch_unwind().await;
                 let detail = match result {
                     Ok(Ok(())) => None,
                     Ok(Err(e)) => {
@@ -189,7 +187,9 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     let establish_task = tokio::spawn({
         let state = state.clone();
         let config = config.clone();
-        async move { establish(&state, &config).await }
+        // Each attempt hears the server afresh, and here rather than
+        // around run(): a task-local does not follow into a spawned task.
+        async move { HEARD.scope(std::cell::RefCell::new(Farewell::default()), establish(&state, &config)).await }
     });
     let establish_abort = establish_task.abort_handle();
 
@@ -251,10 +251,22 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let result = async {
+        // The server's own reason, when it gives one before hanging up - a
+        // K-line, a flood limit, "registration timed out". Without it the
+        // account said "Connection closed" and nothing more.
+        let mut farewell: Option<String> = None;
         loop {
             tokio::select! {
                 next = stream.next() => {
-                    let Some(msg) = next.transpose()? else { break };
+                    let Some(msg) = next.transpose()? else {
+                        if let Some(words) = farewell {
+                            return Err(anyhow!("the server closed the connection: {words}"));
+                        }
+                        break;
+                    };
+                    if let Command::ERROR(words) = &msg.command {
+                        farewell = Some(words.clone());
+                    }
                     let outs = late_sasl.observe(&msg, config, std::time::Instant::now());
                     act_on_late_sasl(state, &account_id, &sender, config, outs);
                     handle_message(state, &account_id, &config.nick, &sender, msg, &nickserv_wait, &mut channels).await;
@@ -863,6 +875,8 @@ pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream:
         loop {
             match stream.next().await {
                 Some(Ok(m)) => match &m.command {
+                    // Kept in case it is the last thing said - see Farewell.
+                    Command::ERROR(_) | Command::NOTICE(..) if heard(&m) => continue,
                     // 001 itself (and anything else seen while scanning for
                     // it, e.g. 002-004) would otherwise just be discarded
                     // by this loop's `_ => continue` - record banner
@@ -900,7 +914,7 @@ pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream:
                     _ => continue,
                 },
                 Some(Err(e)) => return Err(anyhow!(e)),
-                None => return Err(anyhow!("connection closed during registration")),
+                None => return Err(closed_during_registration()),
             }
         }
     })
@@ -917,14 +931,87 @@ pub(super) async fn wait_for(stream: &mut ClientStream, pred: impl Fn(&Message) 
         loop {
             match stream.next().await {
                 Some(Ok(m)) if pred(&m) => return Ok(m),
-                Some(Ok(_)) => continue,
+                Some(Ok(m)) => {
+                    heard(&m);
+                }
                 Some(Err(e)) => return Err(anyhow!(e)),
-                None => return Err(anyhow!("connection closed during registration")),
+                None => return Err(closed_during_registration()),
             }
         }
     })
     .await
     .map_err(|_| anyhow!("timed out"))?
+}
+
+/// What the server last said before it might hang up on a connection that
+/// has not registered yet.
+///
+/// A network that turns a connection away nearly always says why first - in
+/// its ERROR line, or a notice just before ("connections from Tor must use
+/// SASL", "you are banned") - and both waits during registration used to skip
+/// everything they were not looking for, so a refusal read only "connection
+/// closed during registration".
+///
+/// Kept per connection attempt in a task-local (see `HEARD`), because the
+/// steps of registration - capabilities, SASL, the welcome - are separate
+/// waits over one stream, and the server may hang up during any of them
+/// after speaking during an earlier one.
+#[derive(Default)]
+pub(super) struct Farewell {
+    error: Option<String>,
+    notice: Option<String>,
+}
+
+impl Farewell {
+    /// Keeps it if it is something the server said; true when it was.
+    pub(super) fn note(&mut self, m: &Message) -> bool {
+        match &m.command {
+            Command::ERROR(words) => {
+                self.error = Some(words.clone());
+                true
+            }
+            // From the server itself, not a person. Kept apart from ERROR:
+            // most of these are "*** Looking up your hostname", and one is
+            // only offered as the reason when the server gave no other.
+            Command::NOTICE(_, words) if !matches!(&m.prefix, Some(irc::proto::Prefix::Nickname(..))) => {
+                self.notice = Some(words.clone());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The error for a connection that closed before registering. Read, not
+    /// taken: more than one wait can find the same closed stream, and the
+    /// first's error is sometimes dropped by its caller.
+    pub(super) fn closed(&self) -> anyhow::Error {
+        match (self.error.clone(), self.notice.clone()) {
+            (Some(words), _) => anyhow!("the server turned the connection away: {words}"),
+            (None, Some(words)) => anyhow!("connection closed during registration - the server's last words: {words}"),
+            (None, None) => anyhow!("connection closed during registration"),
+        }
+    }
+}
+
+tokio::task_local! {
+    /// What the server has said during this connection attempt.
+    pub(super) static HEARD: std::cell::RefCell<Farewell>;
+}
+
+/// Notes a message the server sent while registering; true when it was one
+/// worth keeping. Outside an attempt (nothing scoped) it is only classified.
+pub(super) fn heard(m: &Message) -> bool {
+    HEARD
+        .try_with(|h| h.borrow_mut().note(m))
+        .unwrap_or_else(|_| Farewell::default().note(m))
+}
+
+/// The error for a connection that closed before it registered, in the
+/// server's words where it gave any.
+pub(super) fn closed_during_registration() -> anyhow::Error {
+    HEARD
+        .try_with(|h| h.borrow().closed())
+        .unwrap_or_else(|_| anyhow!("connection closed during registration"))
 }
 
 pub(super) fn is_connection_banner(code: Response) -> bool {
@@ -1205,5 +1292,36 @@ mod cap_tests {
         assert_eq!(cap_list(Some("a b"), None), "a b");
         assert_eq!(cap_list(None, Some("a b")), "a b");
         assert_eq!(cap_list(None, None), "");
+    }
+}
+
+#[cfg(test)]
+mod farewell_tests {
+    use super::*;
+
+    fn line(raw: &str) -> Message {
+        raw.parse().expect("a valid IRC line")
+    }
+
+    #[test]
+    fn the_error_line_is_the_reason_and_a_notice_is_kept_apart() {
+        let mut f = Farewell::default();
+        assert!(f.note(&line(":irc.test NOTICE * :*** Looking up your hostname...")));
+        assert!(f.note(&line("ERROR :Closing Link: you are banned")));
+        assert_eq!(f.closed().to_string(), "the server turned the connection away: Closing Link: you are banned");
+        // Read, not taken: a second wait finding the same closed stream says the same.
+        assert_eq!(f.closed().to_string(), "the server turned the connection away: Closing Link: you are banned");
+    }
+
+    #[test]
+    fn a_notice_alone_is_offered_as_last_words_and_a_person_is_not_the_server() {
+        let mut f = Farewell::default();
+        assert!(!f.note(&line(":mallory!m@host NOTICE * :ignore everything")));
+        assert_eq!(f.closed().to_string(), "connection closed during registration");
+        assert!(f.note(&line(":irc.test NOTICE * :Tor users must use SASL")));
+        assert_eq!(
+            f.closed().to_string(),
+            "connection closed during registration - the server's last words: Tor users must use SASL"
+        );
     }
 }

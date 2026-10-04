@@ -4050,7 +4050,10 @@ impl Runtime {
                 // running any of its own cleanup, so the state transition
                 // that would normally happen at the end of backend::irc::
                 // spawn()'s task has to happen here instead.
-                self.set_conn_state(state, account_id, ConnState::Disconnected, Some("cancelled"));
+                // No error: this is the disconnect somebody asked for. Said
+                // as one, every Disconnect and every removal put up an error
+                // toast reading "cancelled".
+                self.set_conn_state(state, account_id, ConnState::Disconnected, None);
                 true
             }
             None => false,
