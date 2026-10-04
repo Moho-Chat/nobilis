@@ -267,7 +267,13 @@ impl Router {
             builder = builder.no_proxy();
         }
         let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
-        self.clients.lock().unwrap().insert(cache_key, client.clone());
+        // Not kept when it goes nowhere. A client asked for before the route
+        // was ready points at the address that refuses everything, which is
+        // right for that moment - but cached, every later caller got it too,
+        // long after Tor was up.
+        if proxy.as_deref() != Some(NOWHERE) {
+            self.clients.lock().unwrap().insert(cache_key, client.clone());
+        }
         client
     }
 
@@ -473,6 +479,20 @@ mod tests {
         r.mark("discord:1", true);
         assert_eq!(r.proxy_for("discord:1").as_deref(), Some(NOWHERE));
         assert_eq!(r.proxy_for("discord:2"), None, "only the account that asked");
+    }
+
+    /// A client made before the route is ready goes nowhere - and must not
+    /// be what everybody gets afterwards. Cached, it was: a Tor Kick account
+    /// built its client before Tor started and failed every lookup for the
+    /// rest of the session.
+    #[test]
+    fn a_client_that_goes_nowhere_is_not_kept() {
+        let r = router_at("early");
+        r.client_if("svc", true, |b| b);
+        assert!(r.clients.lock().unwrap().is_empty(), "the nowhere client was cached");
+        *r.socks.lock().unwrap() = Some(("127.0.0.1".into(), 9150));
+        r.client_if("svc", true, |b| b);
+        assert_eq!(r.clients.lock().unwrap().len(), 1, "a client with a real route is kept");
     }
 
     #[tokio::test]
