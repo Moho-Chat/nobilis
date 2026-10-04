@@ -5,6 +5,10 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// How long a connection has to have stayed up for its retry wait to start
+/// again from the beginning - see `Runtime::next_retry_delay`.
+const HELD_CONNECTION: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// What somebody is doing in a voice channel, beyond being in it.
 ///
 /// All four ride on the voice state itself - Discord sends no separate
@@ -318,6 +322,10 @@ pub type MatrixPoll = (String, Vec<(String, String)>, bool);
 /// version queried directly - here it's ours to maintain explicitly.
 pub struct Runtime {
     conn_states: Mutex<HashMap<String, ConnState>>,
+    /// When each account last became connected - so a retry loop can tell a
+    /// connection that held from one that fell straight over. See
+    /// `connection_lasted`.
+    connected_at: Mutex<HashMap<String, std::time::Instant>>,
     irc_handles: Mutex<HashMap<String, IrcHandle>>,
     buffers: Mutex<HashMap<String, Buffer>>,
     /// Rail entries by group id - Discord guilds, Matrix spaces, and the
@@ -1007,6 +1015,7 @@ impl Runtime {
     pub fn new() -> Self {
         Self {
             conn_states: Mutex::new(HashMap::new()),
+            connected_at: Mutex::new(HashMap::new()),
             irc_handles: Mutex::new(HashMap::new()),
             task_handles: Mutex::new(HashMap::new()),
             last_connect_attempt: Mutex::new(HashMap::new()),
@@ -1708,6 +1717,9 @@ impl Runtime {
         if conn == ConnState::Connected {
             state.runtime.prune_restored_after_connect(state, account_id);
         }
+        if conn == ConnState::Connected {
+            self.connected_at.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
+        }
         self.conn_states.lock().unwrap().insert(account_id.to_string(), conn.clone());
         let mut data = json!({ "accountId": account_id, "state": conn.as_str() });
         if let Some(e) = error {
@@ -1737,6 +1749,54 @@ impl Runtime {
             return;
         }
         state.events.emit("connectionState", json!({ "accountId": account_id, "state": "connecting", "detail": detail }));
+    }
+
+    /// How long the connection that just ended had been up, if it got as far
+    /// as connecting at all. Taken, not read: each ended attempt answers once.
+    pub fn connection_lasted(&self, account_id: &str) -> Option<std::time::Duration> {
+        self.connected_at.lock().unwrap().remove(account_id).map(|at| at.elapsed())
+    }
+
+    /// The wait before the next attempt, given the last one, for a retry loop
+    /// that doubles its wait on every failure.
+    ///
+    /// A connection that held for a while starts the count again. Without
+    /// this the wait only ever grew: every loop doubled it on each drop and
+    /// nothing put it back, so a daemon that had been up a day reconnected
+    /// from every ordinary blip - Discord asks for one every hour or so - a
+    /// full minute late. One that falls over straight after connecting keeps
+    /// doubling, so a server that accepts and then drops is not hammered.
+    pub fn next_retry_delay(
+        &self,
+        account_id: &str,
+        delay: &mut std::time::Duration,
+        initial: std::time::Duration,
+        max: std::time::Duration,
+    ) -> std::time::Duration {
+        if self.connection_lasted(account_id).is_some_and(|up| up >= HELD_CONNECTION) {
+            *delay = initial;
+        }
+        let wait = *delay;
+        *delay = (*delay * 2).min(max);
+        wait
+    }
+
+    /// Says why an account is reconnecting and when the next attempt is.
+    ///
+    /// The time, not a sentence with a number in it: "reconnecting in 60s"
+    /// was sent once and then sat there - saying 60s for the whole minute,
+    /// and still saying it once the attempt was under way. A frontend counts
+    /// down to `retryAt` (milliseconds since the epoch) itself.
+    pub fn report_retry(&self, state: &AppState, account_id: &str, reason: &str, wait: std::time::Duration) {
+        if self.conn_states.lock().unwrap().get(account_id) != Some(&ConnState::Connecting) {
+            return;
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let retry_at = (now + wait).as_millis() as u64;
+        state.events.emit(
+            "connectionState",
+            json!({ "accountId": account_id, "state": "connecting", "detail": reason, "retryAt": retry_at }),
+        );
     }
 
     pub fn insert_irc_handle(&self, account_id: &str, handle: IrcHandle) {
@@ -4967,7 +5027,7 @@ impl Runtime {
         }
 
         sweep!(
-            conn_states, irc_handles, buffers,
+            conn_states, connected_at, irc_handles, buffers,
             buffer_groups, task_handles, last_connect_attempt,
             restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,

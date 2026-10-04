@@ -38,6 +38,19 @@ impl std::fmt::Display for GatewayAuthFailed {
 
 impl std::error::Error for GatewayAuthFailed {}
 
+/// Discord's op 7: move to another server, resuming where this left off.
+/// Its own type so the retry loop can tell it from a failure.
+#[derive(Debug)]
+pub(super) struct ReconnectRequested;
+
+impl std::fmt::Display for ReconnectRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gateway requested a reconnect")
+    }
+}
+
+impl std::error::Error for ReconnectRequested {}
+
 pub(super) async fn next_json<S>(stream: &mut S) -> Result<Value>
 where
     S: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -152,6 +165,8 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session)).catch_unwind().await;
+        let requested_reconnect =
+            matches!(&result, Ok(Err(e)) if e.downcast_ref::<ReconnectRequested>().is_some());
         let detail = match result {
             Ok(Ok(())) => "gateway session ended".to_string(),
             Ok(Err(e)) => {
@@ -168,14 +183,22 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
                 "internal error (see nobilis logs)".to_string()
             }
         };
+        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+        // Discord asking for a reconnect (op 7) is routine - it does it to
+        // every client every hour or so, to move it between servers - and
+        // asks that it be done at once, picking the session up where it
+        // left off. A session that was working goes straight back without
+        // passing through "connecting": nothing has gone wrong to show. If
+        // the resume is refused, the next time round is an ordinary failure.
+        if requested_reconnect && wait == RECONNECT_INITIAL_DELAY && session.resume.is_some() {
+            continue;
+        }
         // set_conn_state() first (in case run_gateway got as far as
-        // Connected before dying, which report_progress() alone can't
-        // correct - it only ever re-stamps an *already*-"connecting"
-        // state), then report_progress() for the live countdown text.
+        // Connected before dying, which report_retry() alone can't correct -
+        // it only ever re-stamps an *already*-"connecting" state).
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
-        state.runtime.report_progress(state, account_id, &format!("{detail} - reconnecting in {}s...", delay.as_secs()));
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+        state.runtime.report_retry(state, account_id, &detail, wait);
+        tokio::time::sleep(wait).await;
     }
 }
 
@@ -307,6 +330,18 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
                 let d = &msg["d"];
                 match t {
+                    // A resume taken up. Discord sends no READY for it - the
+                    // session carries on, and what was missed is replayed as
+                    // ordinary dispatches after this - so this is the only
+                    // word that the account is back. Unhandled, every resume
+                    // left the account showing "connecting", banner and all,
+                    // while it was receiving perfectly well: for a whole day
+                    // of Discord's hourly reconnects, until something forced
+                    // a fresh login.
+                    "RESUMED" => {
+                        state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
+                        tracing::info!("discord[{account_id}]: resumed");
+                    }
                     "READY" => {
                         let username = d["user"]["global_name"]
                             .as_str()
@@ -1251,7 +1286,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
                 }
             }
-            7 => bail!("gateway requested a reconnect"),
+            7 => return Err(ReconnectRequested.into()),
             // The resume was refused, or the session is gone. Everything
             // carried across goes with it: the next connection gets a fresh
             // READY and GUILD_CREATE, and keeping stale maps would mean

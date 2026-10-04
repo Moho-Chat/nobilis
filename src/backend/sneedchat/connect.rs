@@ -98,9 +98,9 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
             }
         }
 
-        state.runtime.report_progress(state, account_id, &format!("{detail} - reconnecting in {}s...", delay.as_secs()));
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(RECONNECT_MAX_DELAY);
+        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+        state.runtime.report_retry(state, account_id, &detail, wait);
+        tokio::time::sleep(wait).await;
     }
 }
 
