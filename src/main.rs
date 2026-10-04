@@ -14,6 +14,7 @@ mod net;
 mod oggopus;
 mod opus_packet;
 mod profile;
+mod releases;
 mod rpc;
 mod runtime;
 mod secure;

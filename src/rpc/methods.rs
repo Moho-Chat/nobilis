@@ -304,6 +304,18 @@ pub async fn dispatch(
             None,
         ),
 
+        // The newest real release of a project, so a frontend can say when
+        // there is one newer than itself. Null while the project has none.
+        "latestRelease" => {
+            let Some(repo) = p_str_opt(params, "repo") else {
+                return (None, Some("latestRelease requires \"repo\"".to_string()));
+            };
+            match crate::releases::latest(repo).await {
+                Ok(found) => (Some(serde_json::to_value(found).unwrap()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "listProtocols" => (
             Some(serde_json::json!([
                 { "id": "irc", "name": "IRC", "available": true },
