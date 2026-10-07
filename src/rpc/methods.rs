@@ -3001,9 +3001,19 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("discord:") => match state.accounts.get_discord(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => {
-                        let result = match attachment_path {
-                            Some(path) => backend::discord::send_attachment(state, buffer_id, &cfg.token, body, path, reply_to_id).await,
-                            None => backend::discord::send_message(state, buffer_id, &cfg.token, body, reply_to_id).await,
+                        // One path, or several that make one message.
+                        let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                            Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                            None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                        };
+                        let result = if paths.is_empty() {
+                            backend::discord::send_message(state, buffer_id, &cfg.token, body, reply_to_id).await
+                        } else {
+                            let sent = backend::discord::send_attachments(state, buffer_id, &cfg.token, body, &paths, reply_to_id, progress).await;
+                            if let Some(p) = progress {
+                                p.done(sent.as_ref().err().map(|e| e.to_string()).as_deref());
+                            }
+                            sent
                         };
                         match result {
                             Ok(()) => (Some(ok_node()), None),

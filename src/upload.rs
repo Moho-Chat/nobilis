@@ -29,6 +29,7 @@ use serde::Serialize;
 /// HTTP/1.1). What can be said honestly is which of the three waits this is,
 /// and how long it has been - which is what somebody looking at a spinner
 /// actually wants to know.
+#[derive(Clone)]
 pub struct Progress {
     events: crate::events::EventBus,
     id: String,
@@ -74,6 +75,26 @@ impl Progress {
                 "uploadId": self.id,
                 "phase": phase.name(),
                 "bytes": bytes,
+                "host": host,
+            }),
+        );
+    }
+
+    /// How many of the file's bytes have been handed to the connection.
+    ///
+    /// Only sent by an upload that counts them - Discord's, which streams the
+    /// files - so the window can draw a ring that fills. Everything else says
+    /// its phase and stays a turning ring, because for them a percentage
+    /// would be invented.
+    pub fn sent(&self, sent: u64, total: u64, host: &str) {
+        self.events.emit(
+            "uploadProgress",
+            serde_json::json!({
+                "uploadId": self.id,
+                "phase": "sending",
+                "bytes": total,
+                "sent": sent,
+                "total": total,
                 "host": host,
             }),
         );

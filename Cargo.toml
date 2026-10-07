@@ -28,10 +28,11 @@ anyhow = "1"
 irc = { version = "1", default-features = false, features = ["ctcp", "tls-rust", "proxy"] }
 base64 = "0.22"
 futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Discord backend (QR remote-auth login + gateway client)
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "http2", "socks", "stream"] }
 # Pulled in transitively by both of the above, but with conflicting default
 # crypto-provider features (ring vs aws-lc-rs) - direct so main.rs can pin
 # one explicitly at startup (see rustls::crypto::ring::default_provider()
