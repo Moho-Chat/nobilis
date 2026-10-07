@@ -24,14 +24,27 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 /// Where each form of link keeps the video id.
-const MARKERS: [&str; 6] = [
-    "youtube.com/watch?v=",
+const MARKERS: [&str; 9] = [
     "youtube.com/shorts/",
     "youtube.com/embed/",
+    "youtube-nocookie.com/embed/",
     "youtube.com/live/",
     "youtube.com/v/",
+    "youtube.com/e/",
+    "youtube.com/watch/",
     "youtu.be/",
+    // A watch link whose query puts the id anywhere: `?feature=share&v=`,
+    // `?t=30&v=`. Found by `watch_query_id`, not by what follows the marker.
+    "youtube.com/watch?",
 ];
+
+/// The id in a watch link's query, wherever among its parameters `v=` sits.
+fn watch_query_id(after_question_mark: &str) -> Option<String> {
+    let query = after_question_mark.split(|c: char| c.is_whitespace() || c == '#').next()?;
+    let id = query.split('&').find_map(|pair| pair.strip_prefix("v="))?;
+    let id: String = id.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').take(11).collect();
+    (id.len() == 11).then_some(id)
+}
 
 /// The video id from the first YouTube link in `text`, in any form a link
 /// arrives in. The same forms the frontend recognises (lib/format.ts), so a
@@ -42,11 +55,15 @@ pub fn youtube_id(text: &str) -> Option<String> {
         let mut from = 0;
         while let Some(at) = text[from..].find(marker) {
             let start = from + at + marker.len();
-            let id: String = text[start..]
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                .take(11)
-                .collect();
+            let id: String = if marker.ends_with("watch?") {
+                watch_query_id(&text[start..]).unwrap_or_default()
+            } else {
+                text[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .take(11)
+                    .collect()
+            };
             if id.len() == 11 {
                 if best.as_ref().is_none_or(|(pos, _)| from + at < *pos) {
                     best = Some((from + at, id));
@@ -157,6 +174,11 @@ mod tests {
             "https://www.youtube.com/shorts/dQw4w9WgXcQ",
             "https://www.youtube.com/embed/dQw4w9WgXcQ",
             "https://www.youtube.com/live/dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?feature=share&v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?t=30&list=PLx&v=dQw4w9WgXcQ&index=2",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ&si=x",
+            "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+            "https://youtube.com/watch/dQw4w9WgXcQ",
         ] {
             assert_eq!(youtube_id(url).as_deref(), Some("dQw4w9WgXcQ"), "{url}");
         }
