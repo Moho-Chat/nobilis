@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.0.0-rc.1"
+version = "1.0.0-rc.2"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
