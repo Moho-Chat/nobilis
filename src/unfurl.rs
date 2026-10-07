@@ -124,25 +124,42 @@ async fn describe(state: &AppState, account_id: &str, id: &str) -> Option<Embed>
         "https://www.youtube.com/oembed?format=json&url={}",
         url::form_urlencoded::byte_serialize(watch.as_bytes()).collect::<String>()
     );
-    let response = client.get(&asked).send().await.ok()?;
-    let status = response.status();
-    let found = if status.is_success() {
-        let answer: serde_json::Value = response.json().await.ok()?;
-        parse(&answer, &watch)
-    } else if status.is_client_error() {
-        // Private, removed, or not embeddable: YouTube's answer, and it will
-        // be the same next time.
-        None
-    } else {
-        // Its trouble rather than the video's. Try again another time.
-        return None;
-    };
+    // Asked up to three times. Over Tor - Sneedchat's route - YouTube
+    // regularly turns an exit node away with a 403 or 429 that says nothing
+    // about the video, and a later try leaves by another one.
+    let mut found = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(3 * attempt)).await;
+        }
+        let Ok(response) = client.get(&asked).send().await else { continue };
+        let status = response.status();
+        if status.is_success() {
+            let Ok(answer) = response.json::<serde_json::Value>().await else { continue };
+            found = Some(parse(&answer, &watch));
+            break;
+        } else if answers_for_the_video(status.as_u16()) {
+            // Private, removed, or not embeddable: YouTube's answer, and it
+            // will be the same next time.
+            found = Some(None);
+            break;
+        }
+    }
+    // Nothing settled: not remembered, so the next message tries afresh.
+    let found = found?;
     let mut known = KNOWN.lock().unwrap();
     if known.len() >= KNOWN_LIMIT {
         known.clear();
     }
     known.insert(id.to_string(), found.clone());
     found
+}
+
+/// Whether an oEmbed status is about the video rather than about who asked:
+/// bad request, unauthorised (age-restricted, members only) and not found.
+/// 403 and 429 are a refused client, and 5xx is YouTube's own trouble.
+fn answers_for_the_video(status: u16) -> bool {
+    matches!(status, 400 | 401 | 404)
 }
 
 /// The card, from YouTube's answer. None without a title: a card that says
@@ -193,6 +210,16 @@ mod tests {
         assert_eq!(youtube_id(body).as_deref(), Some("aaaaaaaaaaa"));
         let body = "first https://youtu.be/bbbbbbbbbbb then https://www.youtube.com/watch?v=aaaaaaaaaaa";
         assert_eq!(youtube_id(body).as_deref(), Some("bbbbbbbbbbb"));
+    }
+
+    #[test]
+    fn a_refused_client_is_not_a_verdict_on_the_video() {
+        for status in [400, 401, 404] {
+            assert!(answers_for_the_video(status), "{status}");
+        }
+        for status in [403, 408, 429, 500, 502, 503] {
+            assert!(!answers_for_the_video(status), "{status}");
+        }
     }
 
     #[test]
