@@ -294,7 +294,9 @@ pub async fn dispatch(
         // older than the other without anything looking wrong.
         "version" => (
             Some(serde_json::json!({
-                "version": env!("CARGO_PKG_VERSION"),
+                // Its version for a release build, "development" otherwise -
+                // see build.rs.
+                "version": env!("NOBILIS_VERSION_LABEL"),
                 "commit": env!("NOBILIS_BUILD_COMMIT"),
                 // The C decoder every Discord voice packet and soundboard
                 // sound goes through (#251) - bundled in a release, the
