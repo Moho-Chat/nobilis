@@ -796,6 +796,42 @@ fn split_transition(payload: &[u8]) -> Option<(u16, &[u8])> {
     Some((u16::from_be_bytes([payload[0], payload[1]]), &payload[2..]))
 }
 
+/// How long the last heartbeat took to come back, per account, in
+/// milliseconds: the one honest measure of how this call's connection is.
+///
+/// Held here rather than on the connection because the window asks for it
+/// by account and the connection comes and goes with every reconnect.
+static ROUND_TRIPS: std::sync::LazyLock<Mutex<HashMap<String, u32>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The last heartbeat's round trip for this account's call, if one has
+/// completed since it connected.
+pub fn round_trip_ms(account: &str) -> Option<u32> {
+    ROUND_TRIPS.lock().unwrap().get(account).copied()
+}
+
+/// Forgets an account's round trip when its connection ends, so a call that
+/// is gone is not reported as a good one.
+struct RoundTripGuard(String);
+
+impl Drop for RoundTripGuard {
+    fn drop(&mut self) {
+        ROUND_TRIPS.lock().unwrap().remove(&self.0);
+    }
+}
+
+/// If `message` is the answer to the heartbeat sent as `sent`, how long it took.
+fn heartbeat_answer(message: &WsMessage, sent: &Option<(u32, Instant)>) -> Option<u32> {
+    let WsMessage::Text(text) = message else { return None };
+    let value: Value = serde_json::from_str(text).ok()?;
+    if value["op"].as_u64() != Some(6) {
+        return None;
+    }
+    let (nonce, at) = (*sent)?;
+    // The server echoes the nonce back; an answer to anything else (an
+    // older beat, a different session) says nothing about this one.
+    (value["d"]["t"].as_u64() == Some(nonce as u64)).then(|| at.elapsed().as_millis().min(u32::MAX as u128) as u32)
+}
+
 /// The websocket: heartbeats, the server's news, and DAVE.
 async fn socket_loop(
     shared: Arc<Shared>,
@@ -813,6 +849,8 @@ async fn socket_loop(
 ) -> Ended {
     let account = shared.account.clone();
     let mut seq_ack: u64 = 0;
+    let _round_trip = RoundTripGuard(account.clone());
+    let mut beat_sent: Option<(u32, Instant)> = None;
     let handle = |message: &WsMessage, seq_ack: &mut u64| -> Vec<WsMessage> {
         match message {
             WsMessage::Binary(bytes) => {
@@ -852,7 +890,9 @@ async fn socket_loop(
             }
             _ = beat.tick() => {
                 // v8's heartbeat carries the last sequence number seen.
-                let frame = json!({ "op": 3, "d": { "t": rand::random::<u32>(), "seq_ack": seq_ack } });
+                let nonce = rand::random::<u32>();
+                beat_sent = Some((nonce, Instant::now()));
+                let frame = json!({ "op": 3, "d": { "t": nonce, "seq_ack": seq_ack } });
                 if write.send(WsMessage::Text(frame.to_string())).await.is_err() {
                     return Ended::Retry("the voice socket would not take a heartbeat".into());
                 }
@@ -871,6 +911,9 @@ async fn socket_loop(
                         return if close_is_final(code) { Ended::Final(said) } else { Ended::Retry(said) };
                     }
                     Some(Ok(message)) => {
+                        if let Some(ms) = heartbeat_answer(&message, &beat_sent) {
+                            ROUND_TRIPS.lock().unwrap().insert(account.clone(), ms);
+                        }
                         for reply in handle(&message, &mut seq_ack) {
                             if write.send(reply).await.is_err() {
                                 return Ended::Retry("the voice socket went away".into());
@@ -1372,6 +1415,45 @@ impl Jitter {
 impl Default for Jitter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+
+    fn ack(nonce: u64) -> WsMessage {
+        WsMessage::Text(json!({ "op": 6, "d": { "t": nonce } }).to_string())
+    }
+
+    #[test]
+    fn an_answer_to_the_beat_sent_gives_its_round_trip() {
+        let sent = Some((77u32, Instant::now() - Duration::from_millis(42)));
+        let ms = heartbeat_answer(&ack(77), &sent).expect("an answer");
+        assert!((42..200).contains(&ms), "got {ms}");
+    }
+
+    #[test]
+    fn an_answer_to_some_other_beat_says_nothing() {
+        let sent = Some((77u32, Instant::now()));
+        assert_eq!(heartbeat_answer(&ack(78), &sent), None);
+        assert_eq!(heartbeat_answer(&ack(77), &None), None);
+    }
+
+    #[test]
+    fn only_the_heartbeat_ack_counts() {
+        let sent = Some((77u32, Instant::now()));
+        let other = WsMessage::Text(json!({ "op": 4, "d": { "t": 77 } }).to_string());
+        assert_eq!(heartbeat_answer(&other, &sent), None);
+        assert_eq!(heartbeat_answer(&WsMessage::Binary(vec![1, 2, 3]), &sent), None);
+    }
+
+    #[test]
+    fn a_connection_that_ends_forgets_its_round_trip() {
+        ROUND_TRIPS.lock().unwrap().insert("discord:test-guard".into(), 30);
+        assert_eq!(round_trip_ms("discord:test-guard"), Some(30));
+        drop(RoundTripGuard("discord:test-guard".into()));
+        assert_eq!(round_trip_ms("discord:test-guard"), None);
     }
 }
 

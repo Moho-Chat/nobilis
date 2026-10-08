@@ -2254,6 +2254,10 @@ pub async fn dispatch(
                     serde_json::json!({
                         "accountId": id,
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
+                        // How long the voice server takes to answer, from the
+                        // connection's own heartbeat; absent until the first
+                        // one has come back.
+                        "rttMs": backend::discord::voiceconn::round_trip_ms(id),
                         // After echo cancellation and noise suppression: what
                         // actually goes out, which the raw level above is not.
                         "sentPeak": state.voice.take_sent_peak(id),
