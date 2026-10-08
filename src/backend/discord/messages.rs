@@ -1388,3 +1388,39 @@ mod automod_tests {
         assert!(automod_alert(&json!({ "type": 0, "content": "hi" })).is_none());
     }
 }
+
+/// Who has reacted with one emoji: the first few, by name.
+///
+/// Asked for when somebody points at a reaction rather than kept up to date -
+/// Discord's gateway says that a reaction was added, never who has them all -
+/// and capped, because the tooltip it is for names a handful and says how many
+/// more. The name is the account's own ("global name"), which is what Discord
+/// shows beside it; a server nickname would be better and is not in this answer.
+pub async fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, emoji: &str, limit: u8) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions")).context("building the reactions URL")?;
+    url.path_segments_mut().map_err(|_| anyhow!("reactions URL cannot be a base"))?.push(super::send::reaction_path_segment(emoji));
+    url.query_pairs_mut().append_pair("limit", &limit.clamp(1, 100).to_string());
+    let resp = http_client_for(&cfg.token)
+        .get(url)
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading who reacted")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading who reacted"));
+    }
+    let people: Vec<Value> = resp.json().await.context("reading who reacted")?;
+    let users: Vec<Value> = people
+        .iter()
+        .filter_map(|u| {
+            let id = u["id"].as_str()?;
+            let name = u["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| u["username"].as_str()).unwrap_or("unknown");
+            Some(json!({ "id": id, "name": name }))
+        })
+        .collect();
+    Ok(json!({ "users": users }))
+}

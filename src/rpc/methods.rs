@@ -2029,6 +2029,31 @@ pub async fn dispatch(
             }
         }
 
+        // Who has reacted with one emoji, for the tooltip over a reaction.
+        // Asked on hover and not carried on every message, since the services
+        // that can say do so only on request.
+        "listReactors" => {
+            let (buffer_id, message_id, emoji) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId"), p_str_opt(params, "emoji")) {
+                (Some(b), Some(m), Some(e)) => (b, m, e),
+                _ => return (None, Some("listReactors requires \"bufferId\", \"messageId\" and \"emoji\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let answer = if buffer.account_id.starts_with("discord:") {
+                backend::discord::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji, 10).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
+            } else {
+                // Nothing else says who: the count is all there is.
+                Ok(serde_json::json!({ "users": [] }))
+            };
+            match answer {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Pinning one, or taking the pin off. Whether this account may is the
         // server's decision, and its refusal is passed through in its words.
         "setPinned" => {

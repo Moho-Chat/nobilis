@@ -315,6 +315,15 @@ pub struct IrcHandle {
 /// (id, label), and whether it has been ended.
 pub type MatrixPoll = (String, Vec<(String, String)>, bool);
 
+/// One reaction seen on a Matrix message: what it is on, and who sent it.
+struct ReactionEvent {
+    buffer_id: String,
+    msg_id: String,
+    emoji: String,
+    is_me: bool,
+    sender: String,
+}
+
 /// Live, in-memory state that sits alongside the persisted AccountStore:
 /// connection state per account, active IRC senders, and the buffer
 /// registry. Mirrors what libpurple itself tracked at runtime
@@ -669,7 +678,7 @@ pub struct Runtime {
     /// this there'd be no way to know which reaction to decrement (or
     /// which message to delete, if the redacted id isn't in this map at
     /// all - see handle_timeline_event's redaction branch).
-    matrix_reaction_targets: Mutex<HashMap<String, (String, String, String, bool)>>,
+    matrix_reaction_targets: Mutex<HashMap<String, ReactionEvent>>,
     /// Matrix-specific: verification id (generated - see backend/matrix/
     /// verification.rs's start_verification) -> in-progress SAS
     /// verification state. One at a time per account for v1 - a second
@@ -2646,14 +2655,17 @@ impl Runtime {
     /// populates matrix_own_reactions so our own un-react (toggleReaction)
     /// can find its event id by (buffer, message, emoji) without a
     /// reverse scan.
-    pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool) {
+    pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool, sender: &str) {
         {
             let mut targets = self.matrix_reaction_targets.lock().unwrap();
             // One entry per reaction seen, and only a redaction takes one out
             // again - which most reactions never get. Left alone it is a list
             // of everything anybody has ever reacted with in front of us.
             cap_cache(&mut targets, CACHE_LIMIT);
-            targets.insert(event_id.to_string(), (buffer_id.to_string(), msg_id.to_string(), emoji.to_string(), is_me));
+            targets.insert(
+                event_id.to_string(),
+                ReactionEvent { buffer_id: buffer_id.to_string(), msg_id: msg_id.to_string(), emoji: emoji.to_string(), is_me, sender: sender.to_string() },
+            );
         }
         if is_me {
             let mut mine = self.matrix_own_reactions.lock().unwrap();
@@ -2672,10 +2684,39 @@ impl Runtime {
     /// maps from growing unboundedly over a long-running buffer's life.
     pub fn take_matrix_reaction_target(&self, event_id: &str) -> Option<(String, String, String, bool)> {
         let target = self.matrix_reaction_targets.lock().unwrap().remove(event_id);
-        if let Some((buffer_id, msg_id, emoji, true)) = &target {
+        if let Some(ReactionEvent { buffer_id, msg_id, emoji, is_me: true, .. }) = &target {
             self.matrix_own_reactions.lock().unwrap().remove(&(buffer_id.clone(), msg_id.clone(), emoji.clone()));
         }
-        target
+        target.map(|r| (r.buffer_id, r.msg_id, r.emoji, r.is_me))
+    }
+
+    /// Who has reacted to a message with one emoji, as far as this session has
+    /// seen: the ids of the senders, in no particular order. A reaction seen
+    /// before this started is only here if the room's history was read again,
+    /// so a short list is an honest answer and an empty one is "not known".
+    pub fn matrix_reactors(&self, buffer_id: &str, msg_id: &str, emoji: &str) -> Vec<String> {
+        let mut who: Vec<String> = self
+            .matrix_reaction_targets
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.buffer_id == buffer_id && r.msg_id == msg_id && r.emoji == emoji)
+            .map(|r| r.sender.clone())
+            .collect();
+        who.sort();
+        who.dedup();
+        who
+    }
+
+    /// What a room member is called in this room, if it is known.
+    pub fn matrix_member_name(&self, account_id: &str, room_id: &str, user_id: &str) -> Option<String> {
+        self.matrix_room_members
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .and_then(|roster| roster.get(user_id))
+            .cloned()
+            .filter(|n| !n.is_empty())
     }
 
     pub fn insert_matrix_verification(&self, id: &str, v: crate::backend::matrix::verification::ActiveVerification) {
@@ -4671,6 +4712,28 @@ mod tests {
         assert!(runtime.set_ringing("acct|alex", "acct", "chan", true));
         assert!(runtime.set_ringing("other|sam", "other", "chan2", true));
         assert_eq!(runtime.ringing_calls().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod reactor_tests {
+    use super::*;
+
+    #[test]
+    fn who_reacted_is_what_was_seen_and_loses_the_redacted() {
+        let rt = Runtime::new();
+        rt.record_matrix_reaction_event("b", "m1", "👍", "$e1", false, "@ann:x");
+        rt.record_matrix_reaction_event("b", "m1", "👍", "$e2", false, "@bob:x");
+        rt.record_matrix_reaction_event("b", "m1", "🎉", "$e3", false, "@cat:x");
+        rt.record_matrix_reaction_event("b", "m2", "👍", "$e4", true, "@me:x");
+        assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@ann:x", "@bob:x"]);
+        assert_eq!(rt.matrix_reactors("b", "m1", "🎉"), vec!["@cat:x"]);
+        assert_eq!(rt.matrix_reactors("b", "m2", "👍"), vec!["@me:x"]);
+
+        // A redaction takes that person out and leaves the others.
+        assert_eq!(rt.take_matrix_reaction_target("$e1"), Some(("b".into(), "m1".into(), "👍".into(), false)));
+        assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@bob:x"]);
+        assert!(rt.matrix_reactors("b", "m3", "👍").is_empty());
     }
 }
 
