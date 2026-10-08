@@ -166,6 +166,7 @@ pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, 
         // present, and their own status word says the rest.
         "away": status == "offline",
         "status": status,
+        "avatarUrl": super::author_avatar_url(user),
         "roles": roles
     }))
 }
