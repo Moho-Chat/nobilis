@@ -717,6 +717,8 @@ pub struct Runtime {
     /// buffer's own lastActivityTs bump already just re-sends the whole
     /// buffer object rather than a bespoke event per changed field.
     matrix_room_avatars: Mutex<HashMap<(String, String), String>>,
+    /// A room's topic by (account, room), kept for the buffer that does not exist yet.
+    matrix_room_topics: Mutex<HashMap<(String, String), String>>,
     /// Matrix-specific: (account id, room id) -> that room's current
     /// `m.room.power_levels` content, verbatim (not parsed into a struct -
     /// see backend/matrix/moderation.rs's own doc comment on why raw
@@ -1100,6 +1102,7 @@ impl Runtime {
             matrix_backup_enabled: Mutex::new(HashSet::new()),
             matrix_member_avatars: Mutex::new(HashMap::new()),
             matrix_room_avatars: Mutex::new(HashMap::new()),
+            matrix_room_topics: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
             matrix_widgets: Mutex::new(HashMap::new()),
@@ -1628,6 +1631,7 @@ impl Runtime {
             favourite: false,
             low_priority: false,
             service_room: false,
+            topic: None,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -3044,6 +3048,40 @@ impl Runtime {
         if let Some(b) = updated {
             state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
+    }
+
+    /// Sets what a conversation says it is for, whatever service it came from.
+    /// Empty clears it. Broadcast only when it changed: a channel's topic is
+    /// sent again on every reconnect.
+    pub fn set_buffer_topic(&self, state: &AppState, buffer_id: &str, topic: &str) {
+        let topic = topic.trim();
+        let new = (!topic.is_empty()).then(|| topic.to_string());
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.topic != new => {
+                    b.topic = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// A Matrix room's topic, kept against the room so a buffer made after it
+    /// was read still gets it.
+    pub fn set_matrix_room_topic(&self, state: &AppState, account_id: &str, room_id: &str, topic: &str) {
+        self.matrix_room_topics.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), topic.to_string());
+        if let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) {
+            self.set_buffer_topic(state, &buffer_id, topic);
+        }
+    }
+
+    pub fn get_matrix_room_topic(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_room_topics.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
     }
 
     /// Files a buffer under a heading, in the order the service puts it.
@@ -5138,7 +5176,7 @@ impl Runtime {
             matrix_poll_votes, matrix_room_names, matrix_space_parents,
             discord_member_list_targets, discord_voice_channels, discord_voice_states,
             discord_voice_names, discord_voice_avatars, matrix_member_avatars,
-            matrix_room_avatars, matrix_power_levels, matrix_pinned,
+            matrix_room_avatars, matrix_room_topics, matrix_power_levels, matrix_pinned,
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
             matrix_own_reactions, irc_splits, matrix_widgets,

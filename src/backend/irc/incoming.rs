@@ -594,6 +594,14 @@ pub(super) async fn handle_message(
             if let (Some(channel), Some(topic)) = (args.get(1), args.get(2)) {
                 let body = format!("Topic for {channel}: {topic}");
                 state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), topic);
+            }
+        }
+
+        // No topic set: the channel has none to show.
+        Command::Response(Response::RPL_NOTOPIC, args) => {
+            if let Some(channel) = args.get(1) {
+                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), "");
             }
         }
 
@@ -601,6 +609,7 @@ pub(super) async fn handle_message(
         Command::TOPIC(channel, Some(topic)) => {
             let body = format!("{from} changed the topic to: {topic}");
             state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
+            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, &channel), &topic);
         }
 
         // Connection banner (001-005), LUSERS (251-255, 265-266), and MOTD

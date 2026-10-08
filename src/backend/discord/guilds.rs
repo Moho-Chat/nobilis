@@ -533,6 +533,8 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             None => channel_pos,
         };
         state.runtime.set_buffer_category(state, &buf.id, parent.map(|(name, _)| *name), sort);
+        // What the channel says it is for, which Discord sends with the channel.
+        state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
 
         // Custom emoji are per-guild, not per-channel, but buffers only
         // carry a channel id (see discord_channels) - simplest to just

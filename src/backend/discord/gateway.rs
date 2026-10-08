@@ -582,6 +582,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
                                     let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
                                     if new_name.as_deref() == Some(old_name.as_str()) {
+                                        // Nothing to re-register, but the topic is edited
+                                        // in place and arrives this way.
+                                        if let Some(topic) = d.get("topic") {
+                                            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(&account_id, &old_name), topic.as_str().unwrap_or_default());
+                                        }
                                         continue;
                                     }
                                     state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));

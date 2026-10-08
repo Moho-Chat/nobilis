@@ -351,6 +351,10 @@ pub struct Buffer {
     /// thing - so it is named for what it is rather than after the tag.
     #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
     pub service_room: bool,
+    /// What the conversation says it is for: an IRC channel's topic, a Matrix
+    /// room's, a Discord channel's. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -904,6 +908,7 @@ mod tests {
             favourite: false,
             low_priority: false,
             service_room: false,
+            topic: None,
         }
     }
 

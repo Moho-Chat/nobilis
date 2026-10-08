@@ -127,6 +127,13 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             previews::ROOM_SETTING => {
                 state.runtime.set_matrix_previews_off(account_id, room_id, previews::disabled_by(&event["content"]));
             }
+            // What the room is for. The structured form (MSC3765) says it in
+            // several formats and the plain one is always there as well, so the
+            // plain one is read; an empty or missing topic clears it.
+            "m.room.topic" => {
+                let topic = event["content"]["topic"].as_str().unwrap_or_default();
+                state.runtime.set_matrix_room_topic(state, account_id, room_id, topic);
+            }
             "m.room.avatar" => {
                 if let Some(mxc) = event["content"]["url"].as_str() {
                     if let Some(path) = cached_media_path(homeserver_url, access_token, mxc, "").await {
