@@ -22,6 +22,19 @@ pub(super) fn reply_reference(reply_to_id: Option<&str>) -> Option<Value> {
     reply_to_id.map(|id| json!({ "message_id": id }))
 }
 
+/// A message's reply fields: the reference, and - when the person turned the
+/// "@ ON" switch off - the instruction not to ping the author. Discord pings
+/// the one answered by default, and `allowed_mentions` is how its own client
+/// says not to; everything else the message mentions stays allowed.
+pub(super) fn put_reply(payload: &mut Value, reply_to_id: Option<&str>, ping_author: bool) {
+    if let Some(reference) = reply_reference(reply_to_id) {
+        payload["message_reference"] = reference;
+        if !ping_author {
+            payload["allowed_mentions"] = json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
+        }
+    }
+}
+
 /// REST message send - Discord's gateway is receive-only from the client's
 /// perspective for user accounts; sending is always a plain HTTP POST.
 /// Turns the names somebody typed into the mentions Discord understands.
@@ -234,7 +247,7 @@ pub async fn forward_message(
     Ok(())
 }
 
-pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>) -> Result<()> {
+pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>, reply_ping: bool) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
@@ -242,9 +255,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
-    if let Some(reference) = reply_reference(reply_to_id) {
-        payload["message_reference"] = reference;
-    }
+    put_reply(&mut payload, reply_to_id, reply_ping);
     let resp = send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -332,10 +343,12 @@ pub async fn send_attachments(
     token: &str,
     body: &str,
     attachment_paths: &[String],
-    reply_to_id: Option<&str>,
+    reply: (Option<&str>, bool),
     progress: Option<&crate::upload::Progress>,
 ) -> Result<()> {
     use crate::upload::Phase;
+    // Who is answered, and whether they are told.
+    let (reply_to_id, reply_ping) = reply;
     if attachment_paths.is_empty() {
         bail!("no file to send");
     }
@@ -364,9 +377,7 @@ pub async fn send_attachments(
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
-    if let Some(reference) = reply_reference(reply_to_id) {
-        payload["message_reference"] = reference;
-    }
+    put_reply(&mut payload, reply_to_id, reply_ping);
     if let Some(p) = progress {
         p.sent(0, total, Meter::HOST);
     }
@@ -468,6 +479,32 @@ pub async fn send_voice_message(
         bail!("{}", refusal_text(status, &text));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_pings_its_author_unless_told_not_to() {
+        let mut ping = json!({ "content": "hi" });
+        put_reply(&mut ping, Some("42"), true);
+        assert_eq!(ping["message_reference"]["message_id"], "42");
+        assert!(ping.get("allowed_mentions").is_none(), "Discord's own default stands");
+
+        let mut quiet = json!({ "content": "hi" });
+        put_reply(&mut quiet, Some("42"), false);
+        assert_eq!(quiet["allowed_mentions"]["replied_user"], false);
+        // Whatever else the message mentions is still allowed.
+        assert_eq!(quiet["allowed_mentions"]["parse"], json!(["users", "roles", "everyone"]));
+    }
+
+    #[test]
+    fn a_message_that_answers_nothing_has_neither() {
+        let mut plain = json!({ "content": "hi" });
+        put_reply(&mut plain, None, false);
+        assert!(plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none());
+    }
 }
 
 #[cfg(test)]
