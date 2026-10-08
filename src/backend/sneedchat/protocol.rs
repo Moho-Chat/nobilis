@@ -335,10 +335,13 @@ pub fn prepare_outgoing(text: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
+    // A line break is a `[br]`, which is what the site itself writes for one
+    // and what every message arriving from it already says.
+    let text = text.replace("\r\n", "\n").replace('\n', "[br]");
     if text.starts_with('>') && !text.starts_with(">>") {
         return Some(format!("[color=#72ff72]{text}"));
     }
-    Some(text.to_string())
+    Some(text)
 }
 
 /// `/edit {"uuid": "...", "message": "..."}` - the site's own client sends
@@ -491,6 +494,13 @@ impl ServerResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_line_break_is_sent_as_the_site_writes_one() {
+        assert_eq!(prepare_outgoing("one\ntwo\r\nthree").as_deref(), Some("one[br]two[br]three"));
+        assert_eq!(prepare_outgoing("  hi\n  ").as_deref(), Some("hi"));
+        assert_eq!(prepare_outgoing(">green\ntext").as_deref(), Some("[color=#72ff72]>green[br]text"));
+    }
 
     #[test]
     fn parses_message_batches() {
