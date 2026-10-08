@@ -654,6 +654,11 @@ pub struct Message {
     pub reply_to: Option<ReplyPreview>,
     #[serde(default)]
     pub edited: bool,
+    /// When it was edited, in Unix seconds, where this client saw the edit
+    /// happen. Absent for an edit that was already there when the message was
+    /// first read, and for what was never edited.
+    #[serde(rename = "editedTs", default, skip_serializing_if = "Option::is_none")]
+    pub edited_ts: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
     /// Whether the account viewing this sent it - the same identity check

@@ -465,8 +465,8 @@ impl Store {
         let embeds_json = serde_json::to_string(embeds)?;
         let attachments_json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
-            "UPDATE messages SET body = ?1, edited = 1, embeds = ?4, attachments = ?5 WHERE buffer_id = ?2 AND msg_id = ?3",
-            params![body, buffer_id, msg_id, embeds_json, attachments_json],
+            "UPDATE messages SET body = ?1, edited = ?6, embeds = ?4, attachments = ?5 WHERE buffer_id = ?2 AND msg_id = ?3",
+            params![body, buffer_id, msg_id, embeds_json, attachments_json, chrono::Utc::now().timestamp().max(2)],
         )?;
         Ok(rows > 0)
     }
@@ -744,6 +744,9 @@ impl Store {
             kind: row.get::<_, Option<String>>("kind")?.unwrap_or_else(|| "chat".to_string()),
             reply_to,
             edited: row.get::<_, i64>("edited")? != 0,
+            // The column is 0 for never edited, 1 for edited at a time nobody
+            // wrote down, and a Unix time past that: no schema change for it.
+            edited_ts: Some(row.get::<_, i64>("edited")?).filter(|&v| v > 1),
             reactions,
             is_own: row.get::<_, i64>("is_own")? != 0,
             avatar_url: row.get("avatar_url")?,
@@ -1440,6 +1443,20 @@ mod tests {
     fn append(s: &Store, buffer: &str, id: &str) {
         s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    #[test]
+    fn an_edit_is_stamped_with_when_it_was_seen() {
+        let (s, dir) = store();
+        append(&s, "b", "m1");
+        let before = s.get_message("b", "m1").unwrap().unwrap();
+        assert!(!before.edited && before.edited_ts.is_none());
+        assert!(s.update_message_body("b", "m1", "hi again", &[], &[]).unwrap());
+        let after = s.get_message("b", "m1").unwrap().unwrap();
+        assert!(after.edited);
+        let at = after.edited_ts.expect("the time it was edited");
+        assert!((chrono::Utc::now().timestamp() - at).abs() < 5);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The mode is a property of the file, so an existing scrollback.db -

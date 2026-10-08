@@ -4374,6 +4374,7 @@ impl Runtime {
             kind: kind.to_string(),
             reply_to,
             edited: false,
+            edited_ts: None,
             reactions: Vec::new(),
             is_own,
             avatar_url: avatar_url.clone(),
@@ -4422,7 +4423,7 @@ impl Runtime {
     pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
         match state.store.update_message_body(buffer_id, msg_id, body, embeds, attachments) {
             Ok(true) => {
-                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "embeds": embeds, "attachments": attachments }));
+                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "editedTs": chrono::Utc::now().timestamp(), "embeds": embeds, "attachments": attachments }));
                 true
             }
             Ok(false) => false,
