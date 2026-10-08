@@ -330,6 +330,18 @@ fn counted_part(path: &str, name: &str, len: u64, meter: std::sync::Arc<Meter>) 
     Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(counted), len).file_name(name.to_string()))
 }
 
+/// The name a file goes up under. Discord hides an attachment behind a
+/// spoiler when its name starts with `SPOILER_` - there is no flag for it - so
+/// that is how one is sent, and every other client reads it the same way.
+fn upload_name(name: &str, spoiler: bool) -> String {
+    const MARK: &str = "SPOILER_";
+    if spoiler && !name.starts_with(MARK) {
+        format!("{MARK}{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// The "+" attachment button's backend: a single multipart POST carrying
 /// both the message JSON (as a `payload_json` part) and the files (as
 /// `files[0]`, `files[1]`...) - Discord's documented way to send attachments
@@ -342,17 +354,17 @@ pub async fn send_attachments(
     buffer_id: &str,
     token: &str,
     body: &str,
-    attachment_paths: &[String],
+    attachments: &[(String, bool)],
     reply: (Option<&str>, bool),
     progress: Option<&crate::upload::Progress>,
 ) -> Result<()> {
     use crate::upload::Phase;
     // Who is answered, and whether they are told.
     let (reply_to_id, reply_ping) = reply;
-    if attachment_paths.is_empty() {
+    if attachments.is_empty() {
         bail!("no file to send");
     }
-    if attachment_paths.len() > MAX_ATTACHMENTS {
+    if attachments.len() > MAX_ATTACHMENTS {
         bail!("Discord takes at most {MAX_ATTACHMENTS} files in one message");
     }
     let channel_id = state
@@ -364,11 +376,12 @@ pub async fn send_attachments(
     }
     // Sizes first, from the files themselves, so the ring has its whole
     // length before the first byte goes.
-    let mut files = Vec::with_capacity(attachment_paths.len());
+    let mut files = Vec::with_capacity(attachments.len());
     let mut total = 0u64;
-    for path in attachment_paths {
+    for (path, spoiler) in attachments {
         let len = tokio::fs::metadata(path).await.with_context(|| format!("reading {path}"))?.len();
-        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let name = upload_name(name, *spoiler);
         total += len;
         files.push((path.clone(), name, len));
     }
@@ -504,6 +517,22 @@ mod reply_tests {
         let mut plain = json!({ "content": "hi" });
         put_reply(&mut plain, None, false);
         assert!(plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none());
+    }
+}
+
+#[cfg(test)]
+mod spoiler_tests {
+    use super::upload_name;
+
+    #[test]
+    fn a_spoiler_goes_up_under_the_name_discord_hides() {
+        assert_eq!(upload_name("cat.png", true), "SPOILER_cat.png");
+    }
+
+    #[test]
+    fn it_is_not_marked_twice_or_when_it_is_not_one() {
+        assert_eq!(upload_name("SPOILER_cat.png", true), "SPOILER_cat.png");
+        assert_eq!(upload_name("cat.png", false), "cat.png");
     }
 }
 
