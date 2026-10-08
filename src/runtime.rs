@@ -620,6 +620,8 @@ pub struct Runtime {
     /// account id -> "online" | "idle". Absent means online, which is what
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
+    /// What each account says beside its status, where the service has a place for it.
+    account_status_text: Mutex<HashMap<String, String>>,
     discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
     /// (account, guild) -> that guild's voice channels, as (id, name, limit).
     discord_voice_channels: Mutex<HashMap<(String, String), Vec<VoiceChannelEntry>>>,
@@ -1080,6 +1082,7 @@ impl Runtime {
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
+            account_status_text: Mutex::new(HashMap::new()),
             discord_member_list_targets: Mutex::new(HashMap::new()),
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
@@ -1141,6 +1144,7 @@ impl Runtime {
         // runtime is actually holding is filled in here.
         for account in &mut out {
             account.status = self.account_status(&account.id);
+            account.status_text = self.account_status_text(&account.id);
             // Who the service knows this account as, which is not the same
             // question as what it is called here: a local rename moves
             // `display_name` and must leave this alone, or the client would
@@ -2786,6 +2790,19 @@ impl Runtime {
     /// different field. A no-op broadcast-wise if the buffer doesn't exist
     /// yet (the avatar is still cached for whenever ensure_buffer creates
     /// it - see get_matrix_room_avatar, checked at that point).
+    pub fn set_account_status_text(&self, account_id: &str, text: &str) {
+        let mut all = self.account_status_text.lock().unwrap();
+        if text.is_empty() {
+            all.remove(account_id);
+        } else {
+            all.insert(account_id.to_string(), text.to_string());
+        }
+    }
+
+    pub fn account_status_text(&self, account_id: &str) -> String {
+        self.account_status_text.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
     pub fn set_account_status(&self, account_id: &str, status: &str) {
         self.account_status.lock().unwrap().insert(account_id.to_string(), status.to_string());
     }
@@ -5107,7 +5124,7 @@ impl Runtime {
             irc_channel_lists, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
             matrix_call_members, matrix_stickers, matrix_rooms,
-            account_status, discord_voice_self, irc_transports,
+            account_status, account_status_text, discord_voice_self, irc_transports,
             discord_gateway_senders, matrix_machines, matrix_reaction_targets,
             matrix_verifications, matrix_ignored, matrix_verification_peers,
             matrix_push_rules, irc_away, kick_pins,

@@ -27,11 +27,17 @@ pub(super) fn discord_status(status: &str) -> &'static str {
     }
 }
 
-pub(super) fn presence_payload(status: &str) -> serde_json::Value {
+pub(super) fn presence_payload(status: &str, text: &str) -> serde_json::Value {
+    // A custom status is an activity of type 4, whose `state` is the words.
+    let activities = if text.is_empty() {
+        json!([])
+    } else {
+        json!([{ "type": 4, "name": "Custom Status", "state": text, "emoji": null }])
+    };
     json!({
         "status": discord_status(status),
         "since": 0,
-        "activities": [],
+        "activities": activities,
         // Only idle means away. Do-not-disturb is somebody who is here and
         // does not want to be interrupted, and invisible is somebody who is
         // here and would rather nobody knew.
@@ -47,10 +53,15 @@ pub(super) fn presence_payload(status: &str) -> serde_json::Value {
 /// every new session starts from. Setting only the opcode leaves the account
 /// still holding its old choice - which is how an account left on "invisible"
 /// keeps reverting - and setting only the account is slow to show.
-pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> bool {
+///
+/// `text` is the custom status when it is being set or cleared (`Some("")`), and
+/// `None` when only the status is being changed: the account's own setting is
+/// then left alone, rather than cleared by a change of colour.
+pub async fn apply_status(state: &AppState, account_id: &str, status: &str, text: Option<&str>) -> bool {
     if let Some(sender) = state.runtime.discord_gateway_sender(account_id) {
         // Opcode 3 is presence update.
-        let _ = sender.send(json!({ "op": 3, "d": presence_payload(status) }).to_string());
+        let said = state.runtime.account_status_text(account_id);
+        let _ = sender.send(json!({ "op": 3, "d": presence_payload(status, &said) }).to_string());
     }
 
     let Some(config) = state.accounts.get_discord(account_id) else { return false };
@@ -58,7 +69,7 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> b
         http_client_for(&config.token)
         .patch(format!("{API_BASE}/users/@me/settings"))
         .header("Authorization", &config.token)
-        .json(&json!({ "status": discord_status(status) }))
+        .json(&settings_body(status, text))
         )
     .await
     {
@@ -72,6 +83,16 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str) -> b
             false
         }
     }
+}
+
+/// What goes to Discord's settings: the status, and the custom status only when
+/// it is being changed. Null clears it; an object sets it.
+fn settings_body(status: &str, text: Option<&str>) -> serde_json::Value {
+    let mut body = json!({ "status": discord_status(status) });
+    if let Some(text) = text {
+        body["custom_status"] = if text.is_empty() { serde_json::Value::Null } else { json!({ "text": text }) };
+    }
+    body
 }
 
 /// Asks Discord for a channel's member list.
@@ -506,5 +527,26 @@ mod window_tests {
         ]});
         apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync);
         assert_eq!(names(&window), ["anna", "bob"]);
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn a_custom_status_is_an_activity_of_type_four() {
+        let p = presence_payload("online", "off to the craft fair");
+        assert_eq!(p["activities"][0]["type"], 4);
+        assert_eq!(p["activities"][0]["state"], "off to the craft fair");
+        assert_eq!(presence_payload("online", "")["activities"], json!([]));
+    }
+
+    #[test]
+    fn the_settings_leave_the_custom_status_alone_unless_it_is_being_changed() {
+        assert!(settings_body("idle", None).get("custom_status").is_none());
+        assert_eq!(settings_body("idle", Some(""))["custom_status"], serde_json::Value::Null);
+        assert_eq!(settings_body("idle", Some("brb"))["custom_status"]["text"], "brb");
+        assert_eq!(settings_body("idle", None)["status"], "idle");
     }
 }

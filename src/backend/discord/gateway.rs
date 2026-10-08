@@ -297,7 +297,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 "large_threshold": 50,
                 // Carried in IDENTIFY as well as pushed live, so a status set
                 // before a reconnect survives it.
-                "presence": presence_payload(&state.runtime.account_status(&account_id)),
+                "presence": presence_payload(&state.runtime.account_status(&account_id), &state.runtime.account_status_text(&account_id)),
             }
         })
         .to_string(),

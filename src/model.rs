@@ -86,6 +86,11 @@ pub struct Account {
     /// disconnected account still remembers the status it will reconnect with.
     #[serde(default)]
     pub status: String,
+    /// What the account says beside its status - Discord's custom status,
+    /// Matrix's status message. Empty for none, and for every service with
+    /// nowhere to put one.
+    #[serde(rename = "statusText", default)]
+    pub status_text: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,

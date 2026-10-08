@@ -1460,9 +1460,15 @@ pub async fn dispatch(
             // Recorded before it is applied: a status set while disconnected
             // still has to survive to the next connection.
             state.runtime.set_account_status(account_id, status);
+            // What is said beside it, where the account has anywhere to say
+            // it. Present means set it (empty clears); absent means leave it.
+            let text = params.get("statusText").and_then(|v| v.as_str()).map(|t| t.trim().chars().take(128).collect::<String>());
+            if let Some(text) = &text {
+                state.runtime.set_account_status_text(account_id, text);
+            }
 
             let applied = if state.accounts.get_discord(account_id).is_some() {
-                backend::discord::apply_status(state, account_id, status).await
+                backend::discord::apply_status(state, account_id, status, text.as_deref()).await
             } else if let Some(config) = state.accounts.get_matrix(account_id) {
                 match backend::matrix::apply_status(state, &config, status).await {
                     Ok(()) => true,
