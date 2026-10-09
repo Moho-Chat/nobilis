@@ -6,6 +6,28 @@
 
 use super::*;
 
+/// Holds a conversation's place in the queue of history fetches, and gives it
+/// up however the fetch ends - an error, a panic, or being dropped half way.
+/// It used to be given up by a line after the fetch, which a fetch that never
+/// got there left set for good: every later catch-up of that conversation
+/// answered at once, having done nothing.
+struct HistoryFetch<'a> {
+    state: &'a AppState,
+    buffer_id: &'a str,
+}
+
+impl<'a> HistoryFetch<'a> {
+    fn begin(state: &'a AppState, buffer_id: &'a str) -> Option<Self> {
+        state.runtime.try_start_discord_history_fetch(buffer_id).then_some(Self { state, buffer_id })
+    }
+}
+
+impl Drop for HistoryFetch<'_> {
+    fn drop(&mut self) {
+        self.state.runtime.finish_discord_history_fetch(self.buffer_id);
+    }
+}
+
 /// Fires off history backfill for a batch of newly-registered buffers as a
 /// background task, sequentially with a small delay between requests - a
 /// guild can easily have 30+ channels (confirmed live), and firing that
@@ -184,9 +206,10 @@ pub async fn catch_up_channel(
     buffer_id: &str,
     channel_id: &str,
 ) {
-    if !state.runtime.try_start_discord_history_fetch(buffer_id) {
+    let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else {
+        tracing::info!("discord: catching up {buffer_id} skipped - a fetch for it is already under way");
         return;
-    }
+    };
     let result: Result<()> = async {
         // Nothing stored means this is a first sight, which the initial
         // backfill already covers.
@@ -204,6 +227,8 @@ pub async fn catch_up_channel(
                 tracing::info!("discord: {} message(s) missed in {buffer_id}", messages.len());
             }
             store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
+        } else {
+            tracing::info!("discord: catching up {buffer_id}: Discord answered {}", resp.status());
         }
         Ok(())
     }
@@ -211,13 +236,10 @@ pub async fn catch_up_channel(
     if let Err(e) = result {
         tracing::warn!("discord: catching up {buffer_id}: {e}");
     }
-    state.runtime.finish_discord_history_fetch(buffer_id);
 }
 
 pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
-    if !state.runtime.try_start_discord_history_fetch(buffer_id) {
-        return;
-    }
+    let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else { return };
     let result: Result<()> = async {
         let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else { return Ok(()) };
         let resp = http_client_for(token)
@@ -237,7 +259,6 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
     if let Err(e) = result {
         tracing::warn!("discord: extending history for {buffer_id}: {e}");
     }
-    state.runtime.finish_discord_history_fetch(buffer_id);
 }
 
 /// Reads forward from a message, for a reader who arrived in the middle of a

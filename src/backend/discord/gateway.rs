@@ -312,6 +312,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // rebuilding them here would leave every incoming message addressed to a
     // channel this connection had never heard of.
 
+    // What this connection has been handed, by kind, said once a minute. A
+    // gateway that stays connected and heartbeating while the messages stop
+    // looks the same from outside as a quiet night, and this is what tells the
+    // two apart in the log afterwards.
+    let mut tally: HashMap<String, u32> = HashMap::new();
+    let mut tally_since = std::time::Instant::now();
+
     loop {
         let msg = tokio::select! {
             result = next_json(&mut stream) => result?,
@@ -329,6 +336,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             0 => {
                 let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
                 let d = &msg["d"];
+                *tally.entry(t.to_string()).or_default() += 1;
+                if tally_since.elapsed() >= Duration::from_secs(60) {
+                    let mut kinds: Vec<_> = tally.iter().collect();
+                    kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    let line: Vec<String> = kinds.iter().take(8).map(|(k, n)| format!("{k}={n}")).collect();
+                    tracing::info!("discord[{account_id}]: the last minute, by kind: {} ({} channels known)", line.join(", "), channel_map.len());
+                    tally.clear();
+                    tally_since = std::time::Instant::now();
+                }
                 match t {
                     // A resume taken up. Discord sends no READY for it - the
                     // session carries on, and what was missed is replayed as
@@ -781,7 +797,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, kind)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some((buffer_name, kind)) = channel_map.get(channel_id).cloned() else {
+                            tracing::info!("discord[{account_id}]: a message in {channel_id} was dropped - that channel is not one this connection knows ({} are)", channel_map.len());
+                            continue;
+                        };
                         let author = &d["author"];
                         let from = author["global_name"]
                             .as_str()
@@ -797,6 +816,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         attachments.extend(forwarded_attachments(d));
                         let body = extract_body(d).unwrap_or_default();
                         if is_empty_message(&body, &embeds, &attachments) {
+                            tracing::info!("discord[{account_id}]: a message in {buffer_name} was dropped - it has nothing to show (type {})", d["type"]);
                             continue;
                         }
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
