@@ -722,6 +722,19 @@ pub async fn dispatch(
         // Global ones and one account's own are the same call with and
         // without an account: they are the same kind of thing, and a message
         // only has to match one of them.
+        // A page of the channel directory `/list` gathered: the network's
+        // channels matching a word, busiest first. The window searches here
+        // rather than being sent forty thousand of them.
+        "getIrcChannels" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("getIrcChannels requires \"accountId\"".to_string()));
+            };
+            let query = p_str_opt(params, "query").unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200).min(1000) as usize;
+            let (total, matching, channels) = state.runtime.irc_channels(account_id, query, limit);
+            (Some(serde_json::json!({ "total": total, "matching": matching, "channels": channels })), None)
+        }
+
         "getHighlightKeywords" => (
             Some(serde_json::json!({ "global": state.highlights.global() })),
             None,

@@ -212,6 +212,9 @@ pub const DCC_KEEP: usize = 100;
 /// real prompt among fifty fake ones at worst.
 const DCC_PENDING_PER_NICK: usize = 3;
 
+/// The most channels one network's directory keeps: past what anybody scrolls, and a bound on memory.
+const IRC_DIRECTORY_LIMIT: usize = 150_000;
+
 /// A channel the server has told us about, for the directory `/list` builds.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct IrcChannelListing {
@@ -556,6 +559,10 @@ pub struct Runtime {
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
+    /// The last finished directory of each account, busiest first. Kept here and
+    /// asked for in pieces: a network's list is tens of thousands of entries, and
+    /// sending the whole of it to a window to be searched there froze the window.
+    irc_channel_directory: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
     /// Which capabilities each IRC connection was actually granted.
     ///
     /// Asked for is not the same as given: capabilities are requested without
@@ -1072,6 +1079,7 @@ impl Runtime {
             matrix_polls: Mutex::new(HashMap::new()),
             matrix_poll_votes: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
+            irc_channel_directory: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             irc_metadata: Mutex::new(HashMap::new()),
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
@@ -4060,15 +4068,18 @@ impl Runtime {
 
     pub fn push_irc_channel_list(&self, account_id: &str, name: &str, users: u32, topic: &str) {
         // Started implicitly if the server sent no 321, which many do not.
-        self.irc_channel_lists
-            .lock()
-            .unwrap()
-            .entry(account_id.to_string())
-            .or_default()
-            .push(IrcChannelListing { name: name.to_string(), users, topic: topic.to_string() });
+        let mut lists = self.irc_channel_lists.lock().unwrap();
+        let list = lists.entry(account_id.to_string()).or_default();
+        // A ceiling, so a network that never stops cannot grow this without end;
+        // and a topic is cut to what a row can show.
+        if list.len() < IRC_DIRECTORY_LIMIT {
+            list.push(IrcChannelListing { name: name.to_string(), users, topic: topic.chars().take(300).collect() });
+        }
     }
 
-    /// Announces the finished directory, busiest first.
+    /// Announces the finished directory, busiest first - by how many there are,
+    /// not by what they are: the list itself is asked for in pieces with
+    /// `irc_channels`.
     ///
     /// Sorted here rather than in the client because every client would want
     /// the same order, and because "which of these has anybody in it" is the
@@ -4077,10 +4088,36 @@ impl Runtime {
     pub fn finish_irc_channel_list(&self, state: &AppState, account_id: &str) {
         let mut channels = self.irc_channel_lists.lock().unwrap().remove(account_id).unwrap_or_default();
         channels.sort_by(|a, b| b.users.cmp(&a.users).then_with(|| a.name.cmp(&b.name)));
-        state.events.emit(
-            "ircChannelList",
-            json!({ "accountId": account_id, "channels": channels }),
-        );
+        let count = channels.len();
+        self.irc_channel_directory.lock().unwrap().insert(account_id.to_string(), channels);
+        state.events.emit("ircChannelList", json!({ "accountId": account_id, "count": count }));
+    }
+
+    /// The server refused the list, or said to come back later: what it said,
+    /// to whoever is waiting on it.
+    pub fn fail_irc_channel_list(&self, state: &AppState, account_id: &str, reason: &str) {
+        self.irc_channel_lists.lock().unwrap().remove(account_id);
+        state.events.emit("ircChannelList", json!({ "accountId": account_id, "error": reason }));
+    }
+
+    /// A page of the last directory, those matching `query` in a name or topic,
+    /// busiest first. Returns how many there are in all and how many match.
+    pub fn irc_channels(&self, account_id: &str, query: &str, limit: usize) -> (usize, usize, Vec<IrcChannelListing>) {
+        let all = self.irc_channel_directory.lock().unwrap();
+        let Some(list) = all.get(account_id) else { return (0, 0, Vec::new()) };
+        let q = query.trim().to_lowercase();
+        let mut matching = 0;
+        let mut page = Vec::new();
+        for c in list {
+            if !q.is_empty() && !c.name.to_lowercase().contains(&q) && !c.topic.to_lowercase().contains(&q) {
+                continue;
+            }
+            matching += 1;
+            if page.len() < limit {
+                page.push(c.clone());
+            }
+        }
+        (list.len(), matching, page)
     }
 
     pub fn clear_kick_sender(&self, account_id: &str) {
@@ -4772,6 +4809,43 @@ mod tests {
 }
 
 #[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    fn directory() -> Runtime {
+        let rt = Runtime::new();
+        rt.irc_channel_directory.lock().unwrap().insert(
+            "a".into(),
+            vec![
+                IrcChannelListing { name: "#busy".into(), users: 900, topic: "all about birds".into() },
+                IrcChannelListing { name: "#quiet".into(), users: 3, topic: "".into() },
+                IrcChannelListing { name: "#birdwatch".into(), users: 2, topic: "".into() },
+            ],
+        );
+        rt
+    }
+
+    #[test]
+    fn a_page_is_the_matches_in_order_with_the_counts() {
+        let rt = directory();
+        let (total, matching, page) = rt.irc_channels("a", "bird", 10);
+        assert_eq!((total, matching), (3, 2));
+        assert_eq!(page.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["#busy", "#birdwatch"]);
+    }
+
+    #[test]
+    fn a_page_is_cut_to_the_limit_but_still_counts_everything() {
+        let (total, matching, page) = directory().irc_channels("a", "", 1);
+        assert_eq!((total, matching, page.len()), (3, 3, 1));
+    }
+
+    #[test]
+    fn an_account_with_no_directory_has_nothing() {
+        assert_eq!(directory().irc_channels("b", "", 10).0, 0);
+    }
+}
+
+#[cfg(test)]
 mod reactor_tests {
     use super::*;
 
@@ -5160,7 +5234,7 @@ impl Runtime {
             kick_watching, matrix_emoticons, discord_friends,
             sneedchat_senders, kick_senders, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
-            irc_channel_lists, irc_caps, irc_metadata,
+            irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
             matrix_call_members, matrix_stickers, matrix_rooms,
             account_status, account_status_text, discord_voice_self, irc_transports,

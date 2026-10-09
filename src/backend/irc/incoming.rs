@@ -926,6 +926,12 @@ pub(super) async fn handle_message(
             }
         }
         Command::Response(Response::RPL_LISTEND, _) => state.runtime.finish_irc_channel_list(state, account_id),
+        // "Try again later": the answer a busy network gives instead of a list,
+        // and the one thing that told nobody anything.
+        Command::Response(Response::RPL_TRYAGAIN, args) => {
+            let reason = args.last().cloned().unwrap_or_default();
+            state.runtime.fail_irc_channel_list(state, account_id, if reason.is_empty() { "the network says to try again later" } else { &reason });
+        }
 
         Command::Response(code, args) if is_channel_error(code) => {
             if let Some(text) = channel_error_text(&args) {
