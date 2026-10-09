@@ -701,6 +701,9 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
     embeds
         .iter()
         .filter_map(|embed| {
+            if embed["type"].as_str() == Some("safety_system_notification") {
+                return Some(safety_notice(embed));
+            }
             let title = embed["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let description = embed["description"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let fields: Vec<model::EmbedField> = embed["fields"]
@@ -733,9 +736,56 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 author: embed["author"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                 fields,
                 footer,
+                ..Default::default()
             })
         })
         .collect()
+}
+
+/// One of the platform's own notices to an account - a warning, a removed
+/// violation, a limit on the account - which arrive as an embed of this type
+/// whose content is a list of labelled values: `header`, `body`, `icon_type`,
+/// `theme`, a `timestamp` in seconds, and `ctas` naming what its button is.
+/// The embed's own title is only a stand-in for clients too old to read it.
+fn safety_notice(embed: &Value) -> Embed {
+    let value = |name: &str| -> Option<String> {
+        embed["fields"]
+            .as_array()?
+            .iter()
+            .find(|f| f["name"].as_str() == Some(name))
+            .and_then(|f| f["value"].as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let link = value("learn_more_link");
+    let danger = matches!(value("theme").as_deref(), Some("danger" | "warning"));
+    let icon = match value("icon_type").as_deref() {
+        Some("warning" | "danger") => Some("warning".to_string()),
+        _ => None,
+    };
+    // The button's words, from what the notice says it is for. A link opens in
+    // the browser; "see details" is a page inside Discord's own app, which has
+    // nowhere to go from here, so it is drawn without one.
+    let cta = match value("ctas").as_deref() {
+        Some("learn_more_link") => Some(model::EmbedLink { label: "Learn more".to_string(), url: link.clone() }),
+        Some("policy_violation_detail") => Some(model::EmbedLink { label: "See details in Discord".to_string(), url: None }),
+        _ => link.clone().map(|url| model::EmbedLink { label: "Learn more".to_string(), url: Some(url) }),
+    };
+    let timestamp = value("timestamp")
+        .and_then(|t| t.parse::<f64>().ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
+        .map(|dt| dt.to_rfc3339());
+    Embed {
+        title: value("header").or_else(|| embed["title"].as_str().map(str::to_string)),
+        description: value("body"),
+        // Discord's red for what acts on the account, its own blue otherwise.
+        color: Some(if danger { 0xDA373C } else { 0x5865F2 }),
+        timestamp,
+        cta,
+        icon,
+        kind: Some("notice".to_string()),
+        ..Default::default()
+    }
 }
 
 /// Discord-native replies: `message_reference.message_id` names what's
@@ -1510,11 +1560,63 @@ pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
                 msg["type"]
             );
         }
-        let richer = |list: &[model::Embed]| list.iter().filter(|e| !thin(e)).count();
-        if richer(&fresh) > richer(&stored.embeds) && state.store.set_message_embeds(buffer_id, msg_id, &fresh).unwrap_or(false) {
+        // Different, not just richer: a card read better than before replaces
+        // the one saved.
+        let same = serde_json::to_value(&fresh).ok() == serde_json::to_value(&stored.embeds).ok();
+        if !fresh.is_empty() && !same && state.store.set_message_embeds(buffer_id, msg_id, &fresh).unwrap_or(false) {
             state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": fresh }));
             updated += 1;
         }
     }
     Ok(updated)
+}
+
+#[cfg(test)]
+mod safety_notice_tests {
+    use super::extract_embeds;
+    use serde_json::json;
+
+    fn notice(theme: &str, cta: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut fields = vec![
+            json!({ "name": "header", "value": "We removed a violation from your account" }),
+            json!({ "name": "body", "value": "We reviewed a violation and removed it." }),
+            json!({ "name": "theme", "value": theme }),
+            json!({ "name": "ctas", "value": cta }),
+            json!({ "name": "timestamp", "value": "1787270697.310243" }),
+            json!({ "name": "client_version_message", "value": "Please update the app." }),
+        ];
+        if let Some(more) = extra.as_array() {
+            fields.extend(more.iter().cloned());
+        }
+        json!({ "embeds": [{ "type": "safety_system_notification", "title": "Important message from Discord regarding your account", "fields": fields }] })
+    }
+
+    #[test]
+    fn the_notice_is_read_as_a_card_not_as_a_list_of_fields() {
+        let e = extract_embeds(&notice("default", "learn_more_link", json!([{ "name": "learn_more_link", "value": "https://support.discord.com/x" }])));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].title.as_deref(), Some("We removed a violation from your account"));
+        assert_eq!(e[0].description.as_deref(), Some("We reviewed a violation and removed it."));
+        assert!(e[0].fields.is_empty(), "its own labelled values are not shown as lines");
+        assert_eq!(e[0].kind.as_deref(), Some("notice"));
+        let cta = e[0].cta.as_ref().unwrap();
+        assert_eq!((cta.label.as_str(), cta.url.as_deref()), ("Learn more", Some("https://support.discord.com/x")));
+        assert!(e[0].timestamp.as_deref().unwrap().starts_with("2026-"));
+    }
+
+    #[test]
+    fn what_acts_on_the_account_is_red_and_the_rest_is_blue() {
+        let red = extract_embeds(&notice("danger", "learn_more_link", json!([])));
+        let blue = extract_embeds(&notice("default", "learn_more_link", json!([])));
+        assert_eq!(red[0].color, Some(0xDA373C));
+        assert_eq!(blue[0].color, Some(0x5865F2));
+    }
+
+    #[test]
+    fn a_page_inside_discords_own_app_is_a_button_with_nowhere_to_go() {
+        let e = extract_embeds(&notice("default", "policy_violation_detail", json!([])));
+        let cta = e[0].cta.as_ref().unwrap();
+        assert_eq!(cta.label, "See details in Discord");
+        assert!(cta.url.is_none());
+    }
 }

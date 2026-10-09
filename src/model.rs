@@ -516,6 +516,24 @@ pub struct Embed {
     /// The small line along the bottom.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub footer: Option<String>,
+    /// A button along the bottom of the card, where the service puts one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta: Option<EmbedLink>,
+    /// "notice" for the platform's own notices to an account, which are drawn as
+    /// what they are rather than as a bot's card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// A glyph for the card's heading: "warning" for the ones that act on an account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// A link with its words.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EmbedLink {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// One of an embed's labelled lines.

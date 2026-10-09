@@ -28,6 +28,18 @@ pub(super) fn register_dm_channel(
     // Discord's own notices come from an account flagged `system`, and nothing
     // sent back to it goes anywhere.
     state.runtime.set_buffer_read_only(state, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
+    // Its notices were saved before their cards could be read whole, and saved
+    // history is not fetched again, so they are read once a run, a little after
+    // connecting - one request, for the latest page.
+    if is_system_dm(ch) {
+        let (state, buffer_id) = (state.clone(), buf.id.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            if let Err(e) = super::messages::reread_embeds(&state, &buffer_id).await {
+                tracing::debug!("discord: could not re-read the notices: {e:#}");
+            }
+        });
+    }
     if let Some(avatar) = dm_avatar_url(ch) {
         state.runtime.set_buffer_avatar(state, &buf.id, &avatar);
     }
