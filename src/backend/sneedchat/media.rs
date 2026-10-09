@@ -382,6 +382,112 @@ pub(super) fn find_attachment_url(text: &str) -> Option<(&str, &str, &str)> {
 
 pub const KIWIFARMS_CLEARNET_HOST: &str = "kiwifarms.st";
 
+/// The forum's direct file links: what an `[img]` tag or a pasted address holds
+/// when the picture is served from its uploads host rather than through an
+/// attachment page.
+///
+/// `https://uploads.kiwifarms.st/data/attachments/9671/9671535-<hash>-alt.avif?hash=...`
+/// for a picture - the `-alt` is XenForo's AVIF copy of one - and
+/// `.../data/video/9667/9667943-<hash>.mp4?hash=...` for a video. The `hash` is
+/// what the host asks for in place of a login, so the address is fetched with it
+/// and as written.
+///
+/// Recognised so they can be fetched the way an attachment page is: through the
+/// account's own route, to a file kept here. Left to the window they are asked
+/// for from the reader's own address, which the host turns away and which, for
+/// somebody on Tor, is the leak routing was meant to prevent.
+///
+/// Returns the matched substring, the attachment's id and extension, and the
+/// path and query to ask the forum for.
+pub(super) fn find_upload_url(text: &str) -> Option<(&str, String, String, String)> {
+    let mut best: Option<(&str, String, String, String)> = None;
+    for prefix in [
+        format!("https://uploads.{KIWIFARMS_CLEARNET_HOST}/data/"),
+        format!("https://{DEFAULT_ONION}/data/"),
+        format!("http://{DEFAULT_ONION}/data/"),
+    ] {
+        let Some(start) = text.find(&prefix) else { continue };
+        let tail_start = start + prefix.len();
+        let rest = &text[tail_start..];
+        let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\'')).unwrap_or(rest.len());
+        let tail = &rest[..len];
+        let (path, query) = tail.split_once('?').map_or((tail, ""), |(p, q)| (p, q));
+        // `attachments/<bucket>/<id>-<hash>[-alt].<ext>` or `video/<bucket>/...`.
+        let mut parts = path.split('/');
+        let (Some(kind), Some(bucket), Some(file), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        if !matches!(kind, "attachments" | "video") || bucket.is_empty() || !bucket.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Some((stem, ext)) = file.rsplit_once('.') else { continue };
+        let ext = ext.to_ascii_lowercase();
+        if !ATTACHMENT_EXTS.contains(&ext.as_str()) {
+            continue;
+        }
+        let id: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if id.is_empty() || !stem[id.len()..].starts_with('-') {
+            continue;
+        }
+        let matched_end = tail_start + path.len() + if query.is_empty() { 0 } else { 1 + query.len() };
+        let ask = format!("/data/{path}{}", if query.is_empty() { String::new() } else { format!("?{query}") });
+        if best.as_ref().is_none_or(|(m, ..)| start < text.find(m).unwrap_or(usize::MAX)) {
+            best = Some((&text[start..matched_end], id, ext, ask));
+        }
+    }
+    best
+}
+
+/// What a message links to that is fetched and kept for the window, by either
+/// kind of link, and where to ask for it.
+struct Resolvable {
+    /// The link as written, to be taken out of the text once the file is kept.
+    matched: String,
+    id: String,
+    ext: String,
+    fetch_url: String,
+    /// Where the same thing is on the open internet, for "open in browser".
+    page_url: Option<String>,
+}
+
+/// The earliest link in `body` of either kind, with where this account asks
+/// for it: the address it reaches the forum at, which through Tor is the onion
+/// address, and on the open internet is the forum's own - its uploads host for
+/// a direct file link.
+fn find_resolvable(body: &str, host: &str) -> Option<Resolvable> {
+    let page = find_attachment_url(body).and_then(|(matched, id, ext)| {
+        let at = matched.find("/attachments/")?;
+        Some((
+            body.find(matched)?,
+            Resolvable {
+                matched: matched.to_string(),
+                id: id.to_string(),
+                ext: ext.to_ascii_lowercase(),
+                fetch_url: format!("https://{host}{}", &matched[at..]),
+                page_url: Some(format!("https://{KIWIFARMS_CLEARNET_HOST}{}", &matched[at..])),
+            },
+        ))
+    });
+    let upload = find_upload_url(body).and_then(|(matched, id, ext, ask)| {
+        let fetch_host = upload_host(host);
+        Some((
+            body.find(matched)?,
+            Resolvable { matched: matched.to_string(), id, ext, fetch_url: format!("https://{fetch_host}{ask}"), page_url: Some(matched.to_string()) },
+        ))
+    });
+    match (page, upload) {
+        (Some((a, page)), Some((b, upload))) => Some(if a <= b { page } else { upload }),
+        (Some((_, page)), None) => Some(page),
+        (None, Some((_, upload))) => Some(upload),
+        (None, None) => None,
+    }
+}
+
+/// The text with a link taken out, and the `[img]` tags that held it with it:
+/// left behind they are an empty tag, which draws as nothing and still takes a
+/// line.
+fn without_link(body: &str, link: &str) -> String {
+    body.replace(&format!("[img]{link}[/img]"), "").replace(link, "").trim().to_string()
+}
+
 /// Writes the forum's short attachment form out in full.
 ///
 /// People type only the path - `/attachments/seal-png.9609686/` - and the
@@ -396,6 +502,89 @@ pub const KIWIFARMS_CLEARNET_HOST: &str = "kiwifarms.st";
 /// with a media extension) - so `https://example.com/attachments/...`, or a
 /// path somebody is merely talking about, is left as it is.
 pub(super) fn expand_attachment_paths<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str> {
+    let pages = expand_attachment_pages(body, host);
+    match expand_data_links(&pages, host) {
+        std::borrow::Cow::Borrowed(_) => pages,
+        std::borrow::Cow::Owned(done) => std::borrow::Cow::Owned(done),
+    }
+}
+
+/// The address a direct file link is asked for at: the onion address through
+/// Tor, and on the open internet the forum's uploads host, which is where its
+/// files are served from.
+fn upload_host(host: &str) -> String {
+    if host == KIWIFARMS_CLEARNET_HOST { format!("uploads.{KIWIFARMS_CLEARNET_HOST}") } else { host.to_string() }
+}
+
+/// The forum's direct file links - `/data/attachments/...` and `/data/video/...`
+/// - written for this account, whatever way they arrived.
+///
+/// Said bare, they are given the address this account reaches the forum at,
+/// as `/attachments/...` is. Said with a domain - the uploads host, the
+/// forum's own, or its onion - the domain is taken off first and the same is
+/// done, so a link copied out of a browser is the same thing as one typed
+/// short: it goes through the account's own route, and the address of a site
+/// the account is routed away from never reaches the window at all. Written
+/// with the domain left on, the window asked the clearnet host for the picture
+/// from the reader's own address, which it refuses and which is the leak that
+/// routing exists to prevent.
+///
+/// Only a link shaped like one of the forum's files, on one of the forum's
+/// own addresses (or with none), so a link to anywhere else - or a path
+/// somebody is merely talking about - is left as it is.
+fn expand_data_links<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str> {
+    if !body.contains("/data/") {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let origins: [String; 6] = [
+        format!("https://uploads.{KIWIFARMS_CLEARNET_HOST}"),
+        format!("https://{KIWIFARMS_CLEARNET_HOST}"),
+        format!("http://{KIWIFARMS_CLEARNET_HOST}"),
+        format!("https://www.{KIWIFARMS_CLEARNET_HOST}"),
+        format!("https://{DEFAULT_ONION}"),
+        format!("http://{DEFAULT_ONION}"),
+    ];
+    let mut out = String::with_capacity(body.len() + 80);
+    let mut cursor = 0usize;
+    let mut search = 0usize;
+    let mut changed = false;
+    while let Some(found) = body[search..].find("/data/") {
+        let at = search + found;
+        search = at + "/data/".len();
+        let tail = &body[at..];
+        let len = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\'' | ')')).unwrap_or(tail.len());
+        let path = &tail[..len];
+        // Which domain, if any, is written in front of it.
+        let before = &body[..at];
+        let origin = origins.iter().find(|o| before.ends_with(o.as_str()));
+        let start = at - origin.map_or(0, |o| o.len());
+        if origin.is_none() {
+            // Bare: only standing on its own, as the short attachment form must.
+            let standing = matches!(before.chars().next_back(), None | Some(' ' | '\n' | '\t' | ']' | '(' | '>'));
+            if !standing {
+                continue;
+            }
+        } else if start < cursor {
+            continue;
+        }
+        let probe = format!("https://uploads.{KIWIFARMS_CLEARNET_HOST}{path}");
+        if !find_upload_url(&probe).is_some_and(|(matched, ..)| matched == probe) {
+            continue;
+        }
+        out.push_str(&body[cursor..start]);
+        out.push_str(&format!("https://{}{path}", upload_host(host)));
+        cursor = at + len;
+        search = cursor;
+        changed = true;
+    }
+    if !changed {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    out.push_str(&body[cursor..]);
+    std::borrow::Cow::Owned(out)
+}
+
+fn expand_attachment_pages<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str> {
     const MARKER: &str = "/attachments/";
     if !body.contains(MARKER) {
         return std::borrow::Cow::Borrowed(body);
@@ -440,12 +629,7 @@ pub(super) fn expand_attachment_paths<'a>(body: &'a str, host: &str) -> std::bor
 /// the same message with a working embed a moment later instead of
 /// stalling the whole room's message processing on one slow Tor fetch.
 pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, host: &str, buffer_id: String, msg_id: String, body: String) {
-    let Some((matched, id, ext)) = find_attachment_url(&body) else { return };
-    let (matched, id, ext) = (matched.to_string(), id.to_string(), ext.to_ascii_lowercase());
-    let fetch_url = match matched.find("/attachments/") {
-        Some(at) => format!("https://{host}{}", &matched[at..]),
-        None => return,
-    };
+    let Some(Resolvable { matched, id, ext, fetch_url, page_url: page }) = find_resolvable(&body, host) else { return };
 
     tokio::spawn(async move {
         let dir = attachment_cache_dir();
@@ -464,15 +648,15 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
                     }
                 }
                 Ok(Ok((status, _))) => {
-                    tracing::debug!("sneedchat: attachment {id} fetch returned HTTP {status}");
+                    tracing::info!("sneedchat: attachment {id} ({fetch_url}) answered HTTP {status}");
                     None
                 }
                 Ok(Err(e)) => {
-                    tracing::debug!("sneedchat: fetching attachment {id}: {e}");
+                    tracing::info!("sneedchat: fetching attachment {id}: {e}");
                     None
                 }
                 Err(_) => {
-                    tracing::debug!("sneedchat: attachment {id} fetch timed out");
+                    tracing::info!("sneedchat: attachment {id} fetch timed out");
                     None
                 }
             }
@@ -484,7 +668,6 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
         // and the link it replaces leaves the text, as the old rewrite did.
         if let Some(local_url) = local_url {
             let kind = if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" };
-            let page = matched.find("/attachments/").map(|at| format!("https://{KIWIFARMS_CLEARNET_HOST}{}", &matched[at..]));
             let attachment = crate::model::Attachment {
                 kind: kind.to_string(),
                 filename: Some(format!("{id}.{ext}")),
@@ -492,8 +675,7 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
                 url: page,
                 ..Default::default()
             };
-            let new_body = body.replace(&matched, "");
-            state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, new_body.trim());
+            state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, &without_link(&body, &matched));
             let attachments = vec![attachment];
             if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
                 tracing::debug!("sneedchat: recording attachment {id}: {e}");
@@ -656,5 +838,123 @@ mod tests {
         std::fs::write(&jpg, b"\xff\xd8\xff\xe0 jfif payload").unwrap();
         assert_eq!(cached_avatar_file(&dir, "8").await.as_deref(), Some(jpg.as_path()));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_direct_picture_link_from_the_uploads_host_is_found() {
+        let body = "[img]https://uploads.kiwifarms.st/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41[/img]";
+        let (matched, id, ext, ask) = find_upload_url(body).expect("a link");
+        assert_eq!(matched, "https://uploads.kiwifarms.st/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41");
+        assert_eq!((id.as_str(), ext.as_str()), ("9671535", "avif"));
+        assert_eq!(ask, "/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41");
+    }
+
+    #[test]
+    fn a_video_link_with_or_without_its_hash_is_found() {
+        let (matched, id, ext, ask) = find_upload_url("look https://uploads.kiwifarms.st/data/video/9667/9667943-6f0fa527b905c385fe7c60efee19011c.mp4?hash=pj-hdmJ9mQ so good").unwrap();
+        assert!(matched.ends_with("hash=pj-hdmJ9mQ"));
+        assert_eq!((id.as_str(), ext.as_str()), ("9667943", "mp4"));
+        assert!(ask.starts_with("/data/video/9667/"));
+        let (matched, ..) = find_upload_url("@skrod, https://uploads.kiwifarms.st/data/video/9663/9663232-d3e363a800d4828bc2fd29edbde6dfbd.mp4").unwrap();
+        assert!(matched.ends_with(".mp4"));
+    }
+
+    #[test]
+    fn nothing_but_the_forums_own_uploads_host_and_shape_is_taken() {
+        for not in [
+            "https://example.com/data/attachments/9671/9671535-abc-alt.avif",
+            "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc.exe",
+            "https://uploads.kiwifarms.st/data/other/9671/9671535-abc.avif",
+            "https://uploads.kiwifarms.st/data/attachments/x/9671535-abc.avif",
+            "https://uploads.kiwifarms.st/data/attachments/9671/notanumber-abc.avif",
+            "https://uploads.kiwifarms.st/data/attachments/9671/9671535.avif",
+            "https://uploads.kiwifarms.st/data/attachments/9671/../9671535-abc.avif",
+        ] {
+            assert!(find_upload_url(not).is_none(), "{not}");
+        }
+    }
+
+    #[test]
+    fn the_earliest_of_the_two_kinds_is_the_one_fetched() {
+        let page = "https://kiwifarms.st/attachments/cat-png.123/";
+        let upload = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
+        let r = find_resolvable(&format!("{upload} then {page}"), "kiwifarms.st").unwrap();
+        assert_eq!(r.id, "9671535");
+        let r = find_resolvable(&format!("{page} then {upload}"), "kiwifarms.st").unwrap();
+        assert_eq!(r.id, "123");
+    }
+
+    #[test]
+    fn it_is_asked_for_where_this_account_reaches_the_forum() {
+        let upload = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
+        assert_eq!(find_resolvable(upload, "kiwifarms.st").unwrap().fetch_url, upload, "on the open internet, its uploads host");
+        let through_tor = find_resolvable(upload, DEFAULT_ONION).unwrap().fetch_url;
+        assert_eq!(through_tor, format!("https://{DEFAULT_ONION}/data/attachments/9671/9671535-abc-alt.avif?hash=x"), "through Tor, the onion address");
+    }
+
+    #[test]
+    fn the_tags_that_held_a_link_go_with_it() {
+        let link = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
+        assert_eq!(without_link(&format!("[img]{link}[/img]"), link), "");
+        assert_eq!(without_link(&format!("reminds me of him [img]{link}[/img]"), link), "reminds me of him");
+        assert_eq!(without_link(&format!("look {link}"), link), "look");
+    }
+
+    const UPLOAD: &str = "/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41";
+
+    #[test]
+    fn a_direct_file_link_loses_its_domain_and_is_given_the_one_this_account_reaches_the_forum_at() {
+        // As the chat has it: wrapped, with the uploads host.
+        let theirs = format!("[img]https://uploads.kiwifarms.st{UPLOAD}[/img]");
+        assert_eq!(expand_attachment_paths(&theirs, KIWIFARMS_CLEARNET_HOST), theirs, "on the open internet it is already the right one");
+        // Through Tor, the onion address: the clearnet one is not asked.
+        assert_eq!(expand_attachment_paths(&theirs, DEFAULT_ONION), format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]"));
+    }
+
+    #[test]
+    fn whichever_address_the_link_was_copied_with_it_comes_out_as_this_accounts_own() {
+        let want_clear = format!("https://uploads.kiwifarms.st{UPLOAD}");
+        let want_onion = format!("https://{DEFAULT_ONION}{UPLOAD}");
+        for origin in ["https://uploads.kiwifarms.st", "https://kiwifarms.st", "https://www.kiwifarms.st", &format!("https://{DEFAULT_ONION}"), &format!("http://{DEFAULT_ONION}")] {
+            let text = format!("look {origin}{UPLOAD} lol");
+            assert_eq!(expand_attachment_paths(&text, KIWIFARMS_CLEARNET_HOST), format!("look {want_clear} lol"), "{origin}");
+            assert_eq!(expand_attachment_paths(&text, DEFAULT_ONION), format!("look {want_onion} lol"), "{origin}");
+        }
+    }
+
+    #[test]
+    fn typed_short_it_is_the_same() {
+        assert_eq!(expand_attachment_paths(UPLOAD, KIWIFARMS_CLEARNET_HOST), format!("https://uploads.kiwifarms.st{UPLOAD}"));
+        assert_eq!(expand_attachment_paths(&format!("[img]{UPLOAD}[/img]"), DEFAULT_ONION), format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]"));
+        assert_eq!(
+            expand_attachment_paths("/data/video/9667/9667943-6f0fa527b905c385fe7c60efee19011c.mp4?hash=pj-hdmJ9mQ", DEFAULT_ONION),
+            format!("https://{DEFAULT_ONION}/data/video/9667/9667943-6f0fa527b905c385fe7c60efee19011c.mp4?hash=pj-hdmJ9mQ")
+        );
+    }
+
+    #[test]
+    fn only_the_forums_own_files_on_its_own_addresses_are_touched() {
+        for left_alone in [
+            "https://example.com/data/attachments/9671/9671535-abc-alt.avif",
+            "https://kiwifarms.st/threads/some-thread.123/",
+            "https://kiwifarms.st/data/other/9671/9671535-abc.avif",
+            "see site/data/attachments/9671/9671535-abc-alt.avif",
+            "/data/attachments/9671/9671535-abc.exe",
+            "the /data/ folder",
+        ] {
+            assert_eq!(expand_attachment_paths(left_alone, DEFAULT_ONION), left_alone, "{left_alone}");
+        }
+    }
+
+    #[test]
+    fn what_comes_out_is_something_the_resolver_fetches_through_the_account() {
+        let text = expand_attachment_paths(&format!("[img]https://uploads.kiwifarms.st{UPLOAD}[/img]"), DEFAULT_ONION).into_owned();
+        let r = find_resolvable(&text, DEFAULT_ONION).expect("fetchable");
+        assert_eq!(r.id, "9671535");
+        assert_eq!(r.fetch_url, format!("https://{DEFAULT_ONION}{UPLOAD}"));
+        // And both kinds of link in one message are each written for the account.
+        let both = expand_attachment_paths("/attachments/seal-png.9609686/ and https://uploads.kiwifarms.st/data/video/9667/9667943-abc.mp4", DEFAULT_ONION);
+        assert!(both.contains(&format!("https://{DEFAULT_ONION}/attachments/seal-png.9609686/")));
+        assert!(both.contains(&format!("https://{DEFAULT_ONION}/data/video/9667/9667943-abc.mp4")));
     }
 }
