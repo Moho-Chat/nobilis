@@ -29,7 +29,20 @@ fn matrix_client(routed: bool) -> reqwest::Client {
         // set outright (see auth::DEVICE_DISPLAY_NAME), so this is no longer
         // load-bearing for that; it is simply what a well-behaved client
         // says about itself.
-        builder.http1_only().user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+        //
+        // And a request that hears nothing back is given up on. A homeserver
+        // that accepts the connection and then never answers - or a connection
+        // that died without saying so - left every request waiting for ever, and
+        // an action that depended on one (an unmute) sat there doing nothing and
+        // saying nothing. Reads rather than the whole request: the sync is a
+        // long poll of thirty seconds, and a large upload that is still moving
+        // is not stalled.
+        builder
+            .http1_only()
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(120))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
     })
 }
 

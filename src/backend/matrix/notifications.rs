@@ -6,6 +6,7 @@
 //! belongs.
 
 use super::*;
+use anyhow::bail;
 
 /// Says that this account is composing something in a room.
 ///
@@ -90,11 +91,17 @@ pub async fn set_ignored_user(state: &AppState, account_id: &str, user_id: &str,
 }
 
 pub(super) async fn fetch_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) {
-    let base = homeserver_url.trim_end_matches('/');
-    match http::get_json(&format!("{base}/_matrix/client/v3/pushrules/"), access_token).await {
-        Ok(rules) => state.runtime.set_matrix_push_rules(account_id, rules),
-        Err(e) => tracing::debug!("matrix[{account_id}]: reading push rules: {e:#}"),
+    if let Err(e) = read_push_rules(state, account_id, homeserver_url, access_token).await {
+        tracing::debug!("matrix[{account_id}]: reading push rules: {e:#}");
     }
+}
+
+/// Reads the account's push rules and keeps them, saying so if it cannot.
+async fn read_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) -> Result<Value> {
+    let base = homeserver_url.trim_end_matches('/');
+    let rules = http::get_json(&format!("{base}/_matrix/client/v3/pushrules/"), access_token).await?;
+    state.runtime.set_matrix_push_rules(account_id, rules.clone());
+    Ok(rules)
 }
 
 /// Mutes a room for this account, everywhere it is signed in - or stops.
@@ -129,12 +136,46 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
             }
         }
     }
-    state.runtime.set_silenced(state, buffer_id, muted);
-
-    // The rules are cached; re-read rather than patch the copy, so what is
-    // held is what the server actually has.
-    fetch_push_rules(state, account_id, &account.homeserver_url, &account.access_token).await;
+    // What the server now says, read back rather than assumed. A write it
+    // accepted is not the same as a room that is muted, or no longer muted:
+    // another rule can still silence it, or the server can say yes and keep the
+    // old answer, and "it worked" with the room unchanged is the worst thing
+    // this could report. So the rules are read again, and the room is judged by
+    // them; if they do not agree with what was asked, that is the answer.
+    let rules = read_push_rules(state, account_id, &account.homeserver_url, &account.access_token)
+        .await
+        .context("the change was sent, but the server's rules could not be read back to check it")?;
+    let (now_muted, _) = push_rule_verdict(&rules, &room_id, "");
+    // Whatever the answer, the room is shown as the server has it.
+    state.runtime.set_silenced(state, buffer_id, now_muted);
+    if now_muted != muted {
+        let remaining = silencing_rules(&rules, &room_id);
+        if muted {
+            bail!("the server accepted the mute but does not list it - it is not muted on {}", account.homeserver_url);
+        }
+        bail!(
+            "the server did not take the mute off: it still lists {}",
+            if remaining.is_empty() { "a rule silencing this room".to_string() } else { remaining.join(", ") }
+        );
+    }
     Ok(())
+}
+
+/// The rules that silence a room, by kind and what they are named, for saying
+/// what is still in the way.
+fn silencing_rules(rules: &Value, room_id: &str) -> Vec<String> {
+    ["room", "override"]
+        .iter()
+        .flat_map(|kind| {
+            rules["global"][kind]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
+                .filter(|rule| rule["enabled"].as_bool().unwrap_or(true) && silences(&rule["actions"]))
+                .map(move |_| if *kind == "room" { "a room rule for it".to_string() } else { "an override rule for it".to_string() })
+        })
+        .collect()
 }
 
 /// Whether a room's messages should announce themselves, per the account's
@@ -222,8 +263,18 @@ pub(super) fn matches_keyword(body: &str, pattern: &str) -> bool {
 #[cfg(test)]
 mod push_rule_tests {
     use super::notices_are_suppressed;
-    use super::{matches_keyword, push_rule_verdict};
+    use super::{matches_keyword, push_rule_verdict, silencing_rules};
     use serde_json::json;
+
+    #[test]
+    fn what_is_still_in_the_way_is_named() {
+        let rules = json!({ "global": {
+            "room": [{ "rule_id": "!q:x", "actions": [] }],
+            "override": [{ "rule_id": "!q:x", "actions": ["dont_notify"] }, { "rule_id": "!other:x", "actions": [] }]
+        } });
+        assert_eq!(silencing_rules(&rules, "!q:x"), vec!["a room rule for it".to_string(), "an override rule for it".to_string()]);
+        assert!(silencing_rules(&rules, "!none:x").is_empty());
+    }
 
     #[test]
     fn a_room_muted_by_an_override_rule_is_muted_too() {
