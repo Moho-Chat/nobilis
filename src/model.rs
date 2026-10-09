@@ -359,6 +359,10 @@ pub struct Buffer {
     /// read but not write in, or Discord's own notices. Absent where it can.
     #[serde(rename = "readOnly", default, skip_serializing_if = "Option::is_none")]
     pub read_only: Option<String>,
+    /// A Discord forum (or media channel): not a conversation but a list of
+    /// posts, each of which is a thread. Opened as a pane of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forum: bool,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -950,6 +954,7 @@ mod tests {
             service_room: false,
             topic: None,
             read_only: None,
+            forum: false,
         }
     }
 

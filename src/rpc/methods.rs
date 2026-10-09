@@ -1809,6 +1809,38 @@ pub async fn dispatch(
             }
         }
 
+        // A page of a forum's posts, each with its first message.
+        "listForumPosts" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listForumPosts requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let sort = p_str_opt(params, "sort").unwrap_or("active");
+            let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            match backend::discord::list_forum_posts(state, &buffer.account_id, buffer_id, sort, offset).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Makes a post in a forum, and answers with the thread it made.
+        "createForumPost" => {
+            let (buffer_id, title, body) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "title"), p_str_opt(params, "body")) {
+                (Some(b), Some(t), Some(m)) => (b, t, m),
+                _ => return (None, Some("createForumPost requires \"bufferId\", \"title\" and \"body\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let tags: Vec<String> = params.get("tags").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            match backend::discord::create_forum_post(state, &buffer.account_id, buffer_id, title, body, &tags).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Opens one of them as a conversation of its own.
         "openDiscordThread" => {
             let (buffer_id, thread_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "threadId")) {

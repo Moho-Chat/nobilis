@@ -606,6 +606,20 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             Some((_, cat_pos)) => (cat_pos + 1) * 10_000 + channel_pos,
             None => channel_pos,
         };
+        // Also a place in the list in its own right, opened as the list of posts
+        // it is. It has no history of its own to read - what it holds is the
+        // threads - so it is not backfilled, and what can be said in it is said in
+        // a post.
+        let name = format!("{guild_name}/#{chan_name}");
+        let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
+        state.runtime.set_discord_channel(state, &buf.id, channel_id);
+        state.runtime.set_discord_guild(&buf.id, guild_id);
+        state.runtime.set_buffer_group(state, &buf.id, &group_id);
+        state.runtime.set_buffer_category(state, &buf.id, parent.map(|(n, _)| *n), sort);
+        state.runtime.set_buffer_forum(state, &buf.id, true);
+        state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
+        state.runtime.set_discord_forum_tags(&account_id, channel_id, ch["available_tags"].as_array().cloned().unwrap_or_default());
+        channel_map.insert(channel_id.to_string(), (name, "channel".to_string()));
         parents.insert(channel_id.to_string(), (chan_name, sort));
     }
 

@@ -72,9 +72,11 @@ pub mod send;
 pub mod stickers;
 pub mod soundboard;
 pub mod events;
+pub mod forums;
 
 pub use calls::*;
 pub use commands::*;
+pub use forums::*;
 pub use gateway::*;
 pub use guilds::*;
 pub use history::*;

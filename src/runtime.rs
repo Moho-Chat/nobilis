@@ -641,6 +641,8 @@ pub struct Runtime {
     /// in no loaded member list - a channel list showing raw snowflakes would
     /// be useless.
     discord_voice_names: Mutex<HashMap<(String, String), String>>,
+    /// A forum's tags by (account, channel).
+    discord_forum_tags: Mutex<HashMap<(String, String), Vec<Value>>>,
     /// (account, user) -> their picture. Alongside the names and filled from
     /// the same places, because a call view is mostly faces: a row of coloured
     /// initials is legible but it is not who is in the room, and the member
@@ -1097,6 +1099,7 @@ impl Runtime {
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
             discord_voice_names: Mutex::new(HashMap::new()),
+            discord_forum_tags: Mutex::new(HashMap::new()),
             discord_voice_avatars: Mutex::new(HashMap::new()),
             discord_voice_self: Mutex::new(HashMap::new()),
             dcc_transfers: Mutex::new(Vec::new()),
@@ -1641,6 +1644,7 @@ impl Runtime {
             service_room: false,
             topic: None,
             read_only: None,
+            forum: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -3078,6 +3082,32 @@ impl Runtime {
         if let Some(b) = updated {
             state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
+    }
+
+    /// Marks a buffer as a forum: a list of posts rather than a conversation.
+    pub fn set_buffer_forum(&self, state: &AppState, buffer_id: &str, forum: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.forum != forum => {
+                    b.forum = forum;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// The tags a forum offers its posts, as Discord described them.
+    pub fn set_discord_forum_tags(&self, account_id: &str, channel_id: &str, tags: Vec<Value>) {
+        self.discord_forum_tags.lock().unwrap().insert((account_id.to_string(), channel_id.to_string()), tags);
+    }
+
+    pub fn discord_forum_tags(&self, account_id: &str, channel_id: &str) -> Vec<Value> {
+        self.discord_forum_tags.lock().unwrap().get(&(account_id.to_string(), channel_id.to_string())).cloned().unwrap_or_default()
     }
 
     /// Says a conversation cannot be written in, and why; `None` says it can.
@@ -5270,7 +5300,7 @@ impl Runtime {
             discord_members, matrix_back_tokens, matrix_polls,
             matrix_poll_votes, matrix_room_names, matrix_space_parents,
             discord_member_list_targets, discord_voice_channels, discord_voice_states,
-            discord_voice_names, discord_voice_avatars, matrix_member_avatars,
+            discord_voice_names, discord_voice_avatars, discord_forum_tags, matrix_member_avatars,
             matrix_room_avatars, matrix_room_topics, matrix_power_levels, matrix_pinned,
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
