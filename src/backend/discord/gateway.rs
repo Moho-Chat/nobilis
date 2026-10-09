@@ -38,6 +38,27 @@ impl std::fmt::Display for GatewayAuthFailed {
 
 impl std::error::Error for GatewayAuthFailed {}
 
+/// Discord's close code for "you are sending to the gateway too fast": more
+/// commands than it allows in a window, or too many logins close together.
+pub(super) const CLOSE_CODE_RATE_LIMITED: u16 = 4008;
+
+/// How long to stay away after being told so. Its window is a minute; trying
+/// again in a couple of seconds, as any other dropped connection would, is
+/// answered the same way and keeps the account in a loop of its own making.
+const RATE_LIMITED_WAIT: Duration = Duration::from_secs(75);
+
+/// The gateway closed the connection for being asked too often.
+#[derive(Debug)]
+pub(super) struct GatewayRateLimited;
+
+impl std::fmt::Display for GatewayRateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Discord says this account is connecting or sending too often - waiting a little over a minute before trying again")
+    }
+}
+
+impl std::error::Error for GatewayRateLimited {}
+
 /// Discord's op 7: move to another server, resuming where this left off.
 /// Its own type so the retry loop can tell it from a failure.
 #[derive(Debug)]
@@ -61,6 +82,9 @@ where
             Some(Ok(WsMessage::Close(frame))) => {
                 if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_AUTH_FAILED) {
                     return Err(GatewayAuthFailed.into());
+                }
+                if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_RATE_LIMITED) {
+                    return Err(GatewayRateLimited.into());
                 }
                 bail!("connection closed: {frame:?}")
             }
@@ -167,6 +191,7 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session)).catch_unwind().await;
         let requested_reconnect =
             matches!(&result, Ok(Err(e)) if e.downcast_ref::<ReconnectRequested>().is_some());
+        let rate_limited = matches!(&result, Ok(Err(e)) if e.downcast_ref::<GatewayRateLimited>().is_some());
         let detail = match result {
             Ok(Ok(())) => "gateway session ended".to_string(),
             Ok(Err(e)) => {
@@ -184,6 +209,8 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
             }
         };
         let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+        // Told to slow down: not before the window it speaks of is over.
+        let wait = if rate_limited { wait.max(RATE_LIMITED_WAIT) } else { wait };
         // Discord asking for a reconnect (op 7) is routine - it does it to
         // every client every hour or so, to move it between servers - and
         // asks that it be done at once, picking the session up where it
@@ -312,6 +339,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // rebuilding them here would leave every incoming message addressed to a
     // channel this connection had never heard of.
 
+    // What this connection has been handed, by kind, said once a minute. A
+    // gateway that stays connected and heartbeating while the messages stop
+    // looks the same from outside as a quiet night, and this is what tells the
+    // two apart in the log afterwards.
+    let mut tally: HashMap<String, u32> = HashMap::new();
+    let mut tally_since = std::time::Instant::now();
+
     loop {
         let msg = tokio::select! {
             result = next_json(&mut stream) => result?,
@@ -329,6 +363,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             0 => {
                 let t = msg.get("t").and_then(|v| v.as_str()).unwrap_or("");
                 let d = &msg["d"];
+                *tally.entry(t.to_string()).or_default() += 1;
+                if tally_since.elapsed() >= Duration::from_secs(60) {
+                    let mut kinds: Vec<_> = tally.iter().collect();
+                    kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    let line: Vec<String> = kinds.iter().take(8).map(|(k, n)| format!("{k}={n}")).collect();
+                    tracing::info!("discord[{account_id}]: the last minute, by kind: {} ({} channels known)", line.join(", "), channel_map.len());
+                    tally.clear();
+                    tally_since = std::time::Instant::now();
+                }
                 match t {
                     // A resume taken up. Discord sends no READY for it - the
                     // session carries on, and what was missed is replayed as
@@ -781,7 +824,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, kind)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some((buffer_name, kind)) = channel_map.get(channel_id).cloned() else {
+                            tracing::info!("discord[{account_id}]: a message in {channel_id} was dropped - that channel is not one this connection knows ({} are)", channel_map.len());
+                            continue;
+                        };
                         let author = &d["author"];
                         let from = author["global_name"]
                             .as_str()
@@ -797,6 +843,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         attachments.extend(forwarded_attachments(d));
                         let body = extract_body(d).unwrap_or_default();
                         if is_empty_message(&body, &embeds, &attachments) {
+                            tracing::info!("discord[{account_id}]: a message in {buffer_name} was dropped - it has nothing to show (type {})", d["type"]);
                             continue;
                         }
                         let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
@@ -1374,3 +1421,29 @@ mod brief_tests {
     }
 }
 
+
+#[cfg(test)]
+mod close_code_tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+    async fn closed_with(code: u16) -> anyhow::Error {
+        let frame = CloseFrame { code: CloseCode::from(code), reason: "Rate limited.".into() };
+        let mut stream = futures::stream::iter(vec![Ok::<_, tokio_tungstenite::tungstenite::Error>(WsMessage::Close(Some(frame)))]);
+        next_json(&mut stream).await.unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn being_told_to_slow_down_is_not_taken_for_a_dropped_connection() {
+        let e = closed_with(4008).await;
+        assert!(e.downcast_ref::<GatewayRateLimited>().is_some(), "{e:#}");
+        assert!(e.downcast_ref::<GatewayAuthFailed>().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_login_and_an_ordinary_close_stay_what_they_were() {
+        assert!(closed_with(4004).await.downcast_ref::<GatewayAuthFailed>().is_some());
+        let plain = closed_with(1000).await;
+        assert!(plain.downcast_ref::<GatewayRateLimited>().is_none() && plain.downcast_ref::<GatewayAuthFailed>().is_none());
+    }
+}

@@ -172,9 +172,44 @@ pub(super) async fn joined_member_ids(base: &str, access_token: &str, room_id: &
 
 /// Pushes a status to the homeserver.
 ///
-/// Matrix has three presence values - online, unavailable and offline. Idle
-/// maps to unavailable, which is the closest honest answer to "am I here".
+/// Matrix has three presence values - online, unavailable and offline. Unavailable
+/// is idle, which is not offered: only online and offline (invisible) are sent.
 pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
+    match push_presence(state, config, status).await {
+        // A homeserver limits how often presence may change, and some ask for
+        // a long wait. The status is already recorded, so it is applied when
+        // the wait is over rather than reported as a failure: what was asked
+        // for happens, a little later, and nobody has to do it twice.
+        Err(e) if e.downcast_ref::<http::RateLimited>().is_some() => {
+            let wait = e.downcast_ref::<http::RateLimited>().map(|r| r.0).unwrap_or_default();
+            defer_presence(state.clone(), config.clone(), wait);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// Accounts with a presence change waiting out a limit; one is enough, since
+/// what it sends is whatever the status is when its time comes.
+static DEFERRED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+fn defer_presence(state: AppState, config: MatrixAccountConfig, wait: std::time::Duration) {
+    let account_id = config.account_id();
+    if !DEFERRED.lock().unwrap().insert(account_id.clone()) {
+        return;
+    }
+    tokio::spawn(async move {
+        tracing::info!("matrix[{account_id}]: the server limits presence changes; the status will be sent in {}s", wait.as_secs().max(1));
+        tokio::time::sleep(wait + std::time::Duration::from_millis(500)).await;
+        DEFERRED.lock().unwrap().remove(&account_id);
+        let status = state.runtime.account_status(&account_id);
+        if let Err(e) = apply_status(&state, &config, &status).await {
+            tracing::warn!("matrix[{account_id}]: setting presence: {e:#}");
+        }
+    });
+}
+
+async fn push_presence(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
     // Re-read rather than trusting the config passed in: a re-login rotates
     // the token, and a stale one fails with a bare 401.
     let account = state
@@ -182,12 +217,11 @@ pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status
         .get_matrix(&config.account_id())
         .context("account is no longer configured")?;
     let access_token = account.access_token;
-    // Matrix has three, and they do not line up one for one. Do-not-disturb
-    // is somebody present who does not want interrupting, which is closest to
-    // unavailable; invisible has no equivalent at all, and offline is the
-    // honest answer - it is what invisible means to everybody looking.
+    // Matrix has online, unavailable and offline. Unavailable is idle, which is
+    // not offered here, so what is sent is online - do-not-disturb is moho's own
+    // switch for its notifications and has nothing to say to the server - or
+    // offline for invisible, which is what invisible means to everybody looking.
     let presence = match status {
-        "idle" | "dnd" => "unavailable",
         "invisible" => "offline",
         _ => "online",
     };

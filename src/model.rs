@@ -976,3 +976,57 @@ mod tests {
         assert!(!v.as_object().unwrap().contains_key("remoteId"));
     }
 }
+
+/// Whether a service has anything to make of a status.
+///
+/// Offered by what each can actually express, and not by what could be faked
+/// out of something nearby: Discord has all four; IRC has away and back, which
+/// are idle and online; Matrix has
+/// online and offline presence, so invisible is real and idle is not; Kick and
+/// Sneedchat have no presence at all.
+///
+/// Do-not-disturb is online with moho's own desktop notifications silenced,
+/// which every service can have, so it is offered everywhere. Only Discord has
+/// a real state for it - which also keeps its phone notifications from being
+/// pushed - and is sent it; for everything else the account stays online.
+pub fn status_supported(account_id: &str, status: &str) -> bool {
+    match status {
+        "online" | "dnd" => true,
+        "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:"),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::status_supported;
+
+    #[test]
+    fn discord_has_all_of_them() {
+        for s in ["online", "idle", "dnd", "invisible"] {
+            assert!(status_supported("discord:1", s), "{s}");
+        }
+    }
+
+    #[test]
+    fn irc_has_away_and_back_and_no_invisible() {
+        assert!(status_supported("me@irc.libera.chat", "idle"));
+        assert!(status_supported("me@irc.libera.chat", "dnd"));
+        assert!(!status_supported("me@irc.libera.chat", "invisible"));
+    }
+
+    #[test]
+    fn matrix_has_offline_presence_and_no_idle() {
+        assert!(status_supported("matrix:@me:poa.st", "invisible"));
+        assert!(!status_supported("matrix:@me:poa.st", "idle"));
+    }
+
+    #[test]
+    fn kick_and_sneedchat_have_nothing_but_do_not_disturb_is_still_a_switch() {
+        for account in ["kick:me", "sneedchat:me"] {
+            assert!(status_supported(account, "online") && status_supported(account, "dnd"), "{account}");
+            assert!(!status_supported(account, "idle") && !status_supported(account, "invisible"), "{account}");
+        }
+    }
+}

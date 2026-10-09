@@ -145,7 +145,18 @@ fn discord_client(routed: bool) -> reqwest::Client {
         // let every client here negotiate h2 as a side effect, changing the
         // transport under a backend that works and is tested as it stands.
         // Nothing here wants h2; if it ever does, that is its own change.
-        builder.user_agent(USER_AGENT).http1_only()
+        // A request that hears nothing back is given up on. Without this one
+        // sent down a connection that had silently died waited for ever: the
+        // gateway handler awaiting it stopped handling messages, and a history
+        // fetch holding its in-flight mark never released it. Reads, not the
+        // whole request, so a large upload that is still moving is left alone.
+        builder
+            .user_agent(USER_AGENT)
+            .http1_only()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(std::time::Duration::from_secs(120))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(45))
     })
 }
 

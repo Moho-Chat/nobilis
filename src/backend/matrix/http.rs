@@ -211,9 +211,46 @@ pub async fn delete_json(url: &str, token: &str) -> Result<Value> {
     handle_response(resp).await
 }
 
+/// The server is limiting how often this may be done, and says when to try again.
+#[derive(Debug)]
+pub struct RateLimited(pub std::time::Duration);
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "M_LIMIT_EXCEEDED: the server asks for {} seconds before this is done again", self.0.as_secs().max(1))
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+/// The longest a request waits out a limit by itself before handing it back.
+const LIMIT_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(10);
+const LIMIT_TRIES: usize = 3;
+
+/// How long a homeserver asked for, from the body of its 429: `retry_after_ms`,
+/// or a couple of seconds where it did not say.
+fn limit_wait(body: &Value) -> std::time::Duration {
+    std::time::Duration::from_millis(body["retry_after_ms"].as_u64().unwrap_or(2000).max(100))
+}
+
+/// PUTs, and where the server says it is being asked too often, waits as long
+/// as it asks - up to a few seconds - and asks again. Presence, state events
+/// and sends are all PUTs, and a server's limit on any of them is a delay, not
+/// a refusal. A wait longer than that is returned as `RateLimited` for the
+/// caller to decide about.
 pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
-    let resp = http_client_for(token).put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
-    handle_response(resp).await
+    for attempt in 1..=LIMIT_TRIES {
+        let resp = http_client_for(token).put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return handle_response(resp).await;
+        }
+        let wait = limit_wait(&resp.json::<Value>().await.unwrap_or(Value::Null));
+        if wait > LIMIT_WAIT_MAX || attempt == LIMIT_TRIES {
+            return Err(RateLimited(wait).into());
+        }
+        tokio::time::sleep(wait).await;
+    }
+    unreachable!("the last try returns")
 }
 
 /// Raw bytes, not JSON - for media downloads (see mod.rs's media caching).
@@ -320,6 +357,58 @@ mod tests {
         // Nothing left once the prefix goes: keep what there was, because an
         // errcode alone still says more than an empty string.
         assert_eq!(without_errcode("M_LIMIT_EXCEEDED", "M_LIMIT_EXCEEDED"), "M_LIMIT_EXCEEDED");
+    }
+
+    #[test]
+    fn a_limit_is_waited_out_as_long_as_the_server_asks() {
+        assert_eq!(limit_wait(&serde_json::json!({ "errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 4500 })), std::time::Duration::from_millis(4500));
+        // Said nothing, or said zero: a short pause, not a spin.
+        assert_eq!(limit_wait(&serde_json::json!({})), std::time::Duration::from_secs(2));
+        assert_eq!(limit_wait(&serde_json::json!({ "retry_after_ms": 0 })), std::time::Duration::from_millis(100));
+    }
+
+    /// A server that answers each connection with the next canned reply.
+    async fn server_saying(replies: Vec<&'static str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for reply in replies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+        format!("http://{addr}/presence")
+    }
+
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 63\r\n\r\n{\"errcode\":\"M_LIMIT_EXCEEDED\",\"error\":\"x\",\"retry_after_ms\":100}  ";
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}";
+
+    #[tokio::test]
+    async fn a_put_the_server_limits_is_asked_again_after_the_wait() {
+        let url = server_saying(vec![LIMITED, OK]).await;
+        let started = std::time::Instant::now();
+        let answer = put_json(&url, "token", serde_json::json!({ "presence": "online" })).await;
+        assert!(answer.is_ok(), "{answer:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100), "it waited as asked");
+    }
+
+    #[tokio::test]
+    async fn a_wait_too_long_to_sit_through_is_handed_back_as_the_wait() {
+        const LONG: &str = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 66\r\n\r\n{\"errcode\":\"M_LIMIT_EXCEEDED\",\"error\":\"x\",\"retry_after_ms\":60000}  ";
+        let url = server_saying(vec![LONG]).await;
+        let err = put_json(&url, "token", serde_json::json!({})).await.unwrap_err();
+        let limited = err.downcast_ref::<RateLimited>().expect("the wait, to be decided about");
+        assert_eq!(limited.0, std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_limit_reads_as_the_wait_and_not_a_bare_code() {
+        let text = RateLimited(std::time::Duration::from_millis(45_000)).to_string();
+        assert!(text.contains("45 seconds"), "{text}");
     }
 
     #[test]

@@ -117,7 +117,17 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
         // client reading it back expects to find.
         http::put_json(&url, &account.access_token, serde_json::json!({ "actions": [] })).await.context("muting the room")?;
     } else {
-        http::delete_json(&url, &account.access_token).await.context("unmuting the room")?;
+        // Both kinds that can hold a mute, whichever client made it: this one
+        // writes a room rule, Element an override rule named for the room. One
+        // that is not there is the ordinary case, not a failure.
+        for kind in ["room", "override"] {
+            let url = format!("{base}/_matrix/client/v3/pushrules/global/{kind}/{encoded}");
+            if let Err(e) = http::delete_json(&url, &account.access_token).await {
+                if !format!("{e:#}").contains("M_NOT_FOUND") {
+                    return Err(e).context("unmuting the room");
+                }
+            }
+        }
     }
     state.runtime.set_silenced(state, buffer_id, muted);
 
@@ -136,13 +146,17 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
 /// sender display names, arbitrary event fields - is left to the server, whose
 /// job it is, and to the clients that edit it.
 pub(super) fn push_rule_verdict(rules: &Value, room_id: &str, body: &str) -> (bool, bool) {
-    let muted = rules["global"]["room"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
-        .filter(|rule| rule["enabled"].as_bool().unwrap_or(true))
-        .any(|rule| silences(&rule["actions"]));
+    // A room rule is what this client writes. Element writes an override rule
+    // named for the room, which beats everything else, so both are a mute.
+    let muted = ["room", "override"].iter().any(|kind| {
+        rules["global"][kind]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
+            .filter(|rule| rule["enabled"].as_bool().unwrap_or(true))
+            .any(|rule| silences(&rule["actions"]))
+    });
 
     let lower = body.to_lowercase();
     let keyword = rules["global"]["content"]
@@ -210,6 +224,21 @@ mod push_rule_tests {
     use super::notices_are_suppressed;
     use super::{matches_keyword, push_rule_verdict};
     use serde_json::json;
+
+    #[test]
+    fn a_room_muted_by_an_override_rule_is_muted_too() {
+        // How Element mutes a room: an override rule named for it.
+        let rules = json!({ "global": { "override": [{
+            "rule_id": "!quiet:example.org",
+            "conditions": [{ "kind": "event_match", "key": "room_id", "pattern": "!quiet:example.org" }],
+            "actions": []
+        }] } });
+        assert!(push_rule_verdict(&rules, "!quiet:example.org", "x").0);
+        assert!(!push_rule_verdict(&rules, "!other:example.org", "x").0);
+        // The spec's own override rules are not somebody's mute.
+        let stock = json!({ "global": { "override": [{ "rule_id": ".m.rule.suppress_notices", "actions": [] }] } });
+        assert!(!push_rule_verdict(&stock, "!quiet:example.org", "x").0);
+    }
 
     #[test]
     fn a_muted_room_is_muted_here_too() {
