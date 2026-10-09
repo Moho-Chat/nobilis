@@ -1482,6 +1482,13 @@ pub async fn dispatch(
             if !matches!(status, "online" | "idle" | "dnd" | "invisible") {
                 return (None, Some("status must be online, idle, dnd or invisible".to_string()));
             }
+            // What the service has no such state for is left alone: nothing is
+            // recorded and nothing is sent, so an account stays what it was.
+            // Matrix has no idle and answers an idle request by saying nothing
+            // of the kind; Kick and Sneedchat have no status at all.
+            if !crate::model::status_supported(account_id, status) {
+                return (Some(serde_json::json!({ "ok": true, "applied": false, "ignored": true })), None);
+            }
             // Recorded before it is applied: a status set while disconnected
             // still has to survive to the next connection.
             state.runtime.set_account_status(account_id, status);
@@ -1502,7 +1509,9 @@ pub async fn dispatch(
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
-                    "online" => sender.send(irc::proto::Command::AWAY(None)),
+                    // Do not disturb is moho's own switch for its notifications:
+                    // to the network it is still online, and not away.
+                    "online" | "dnd" => sender.send(irc::proto::Command::AWAY(None)),
                     _ => sender.send(irc::proto::Command::AWAY(Some("Idle".to_string()))),
                 };
                 result.is_ok()

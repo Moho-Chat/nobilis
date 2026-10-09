@@ -172,8 +172,8 @@ pub(super) async fn joined_member_ids(base: &str, access_token: &str, room_id: &
 
 /// Pushes a status to the homeserver.
 ///
-/// Matrix has three presence values - online, unavailable and offline. Idle
-/// maps to unavailable, which is the closest honest answer to "am I here".
+/// Matrix has three presence values - online, unavailable and offline. Unavailable
+/// is idle, which is not offered: only online and offline (invisible) are sent.
 pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
     match push_presence(state, config, status).await {
         // A homeserver limits how often presence may change, and some ask for
@@ -217,12 +217,11 @@ async fn push_presence(state: &AppState, config: &MatrixAccountConfig, status: &
         .get_matrix(&config.account_id())
         .context("account is no longer configured")?;
     let access_token = account.access_token;
-    // Matrix has three, and they do not line up one for one. Do-not-disturb
-    // is somebody present who does not want interrupting, which is closest to
-    // unavailable; invisible has no equivalent at all, and offline is the
-    // honest answer - it is what invisible means to everybody looking.
+    // Matrix has online, unavailable and offline. Unavailable is idle, which is
+    // not offered here, so what is sent is online - do-not-disturb is moho's own
+    // switch for its notifications and has nothing to say to the server - or
+    // offline for invisible, which is what invisible means to everybody looking.
     let presence = match status {
-        "idle" | "dnd" => "unavailable",
         "invisible" => "offline",
         _ => "online",
     };
