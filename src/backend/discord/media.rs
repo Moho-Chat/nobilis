@@ -639,6 +639,7 @@ mod tests {
             kind: "chat".into(),
             reply_to: None,
             edited: false,
+            edited_ts: None,
             reactions: Vec::new(),
             is_own: false,
             avatar_url: None,

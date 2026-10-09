@@ -212,6 +212,9 @@ pub const DCC_KEEP: usize = 100;
 /// real prompt among fifty fake ones at worst.
 const DCC_PENDING_PER_NICK: usize = 3;
 
+/// The most channels one network's directory keeps: past what anybody scrolls, and a bound on memory.
+const IRC_DIRECTORY_LIMIT: usize = 150_000;
+
 /// A channel the server has told us about, for the directory `/list` builds.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct IrcChannelListing {
@@ -314,6 +317,15 @@ pub struct IrcHandle {
 /// A Matrix poll as the runtime keeps it: the question, its answers as
 /// (id, label), and whether it has been ended.
 pub type MatrixPoll = (String, Vec<(String, String)>, bool);
+
+/// One reaction seen on a Matrix message: what it is on, and who sent it.
+struct ReactionEvent {
+    buffer_id: String,
+    msg_id: String,
+    emoji: String,
+    is_me: bool,
+    sender: String,
+}
 
 /// Live, in-memory state that sits alongside the persisted AccountStore:
 /// connection state per account, active IRC senders, and the buffer
@@ -547,6 +559,10 @@ pub struct Runtime {
     /// A `/list` in progress, by account. Gathered rather than announced a
     /// line at a time - a network answers with tens of thousands of channels.
     irc_channel_lists: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
+    /// The last finished directory of each account, busiest first. Kept here and
+    /// asked for in pieces: a network's list is tens of thousands of entries, and
+    /// sending the whole of it to a window to be searched there froze the window.
+    irc_channel_directory: Mutex<HashMap<String, Vec<IrcChannelListing>>>,
     /// Which capabilities each IRC connection was actually granted.
     ///
     /// Asked for is not the same as given: capabilities are requested without
@@ -611,6 +627,8 @@ pub struct Runtime {
     /// account id -> "online" | "idle". Absent means online, which is what
     /// every backend does on connect anyway.
     account_status: Mutex<HashMap<String, String>>,
+    /// What each account says beside its status, where the service has a place for it.
+    account_status_text: Mutex<HashMap<String, String>>,
     discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
     /// (account, guild) -> that guild's voice channels, as (id, name, limit).
     discord_voice_channels: Mutex<HashMap<(String, String), Vec<VoiceChannelEntry>>>,
@@ -623,6 +641,8 @@ pub struct Runtime {
     /// in no loaded member list - a channel list showing raw snowflakes would
     /// be useless.
     discord_voice_names: Mutex<HashMap<(String, String), String>>,
+    /// A forum's tags by (account, channel).
+    discord_forum_tags: Mutex<HashMap<(String, String), Vec<Value>>>,
     /// (account, user) -> their picture. Alongside the names and filled from
     /// the same places, because a call view is mostly faces: a row of coloured
     /// initials is legible but it is not who is in the room, and the member
@@ -669,7 +689,7 @@ pub struct Runtime {
     /// this there'd be no way to know which reaction to decrement (or
     /// which message to delete, if the redacted id isn't in this map at
     /// all - see handle_timeline_event's redaction branch).
-    matrix_reaction_targets: Mutex<HashMap<String, (String, String, String, bool)>>,
+    matrix_reaction_targets: Mutex<HashMap<String, ReactionEvent>>,
     /// Matrix-specific: verification id (generated - see backend/matrix/
     /// verification.rs's start_verification) -> in-progress SAS
     /// verification state. One at a time per account for v1 - a second
@@ -706,6 +726,8 @@ pub struct Runtime {
     /// buffer's own lastActivityTs bump already just re-sends the whole
     /// buffer object rather than a bespoke event per changed field.
     matrix_room_avatars: Mutex<HashMap<(String, String), String>>,
+    /// A room's topic by (account, room), kept for the buffer that does not exist yet.
+    matrix_room_topics: Mutex<HashMap<(String, String), String>>,
     /// Matrix-specific: (account id, room id) -> that room's current
     /// `m.room.power_levels` content, verbatim (not parsed into a struct -
     /// see backend/matrix/moderation.rs's own doc comment on why raw
@@ -1059,6 +1081,7 @@ impl Runtime {
             matrix_polls: Mutex::new(HashMap::new()),
             matrix_poll_votes: Mutex::new(HashMap::new()),
             irc_channel_lists: Mutex::new(HashMap::new()),
+            irc_channel_directory: Mutex::new(HashMap::new()),
             irc_caps: Mutex::new(HashMap::new()),
             irc_metadata: Mutex::new(HashMap::new()),
             irc_monitor: Mutex::new(std::collections::HashSet::new()),
@@ -1071,10 +1094,12 @@ impl Runtime {
             matrix_room_names: Mutex::new(HashMap::new()),
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
+            account_status_text: Mutex::new(HashMap::new()),
             discord_member_list_targets: Mutex::new(HashMap::new()),
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
             discord_voice_names: Mutex::new(HashMap::new()),
+            discord_forum_tags: Mutex::new(HashMap::new()),
             discord_voice_avatars: Mutex::new(HashMap::new()),
             discord_voice_self: Mutex::new(HashMap::new()),
             dcc_transfers: Mutex::new(Vec::new()),
@@ -1088,6 +1113,7 @@ impl Runtime {
             matrix_backup_enabled: Mutex::new(HashSet::new()),
             matrix_member_avatars: Mutex::new(HashMap::new()),
             matrix_room_avatars: Mutex::new(HashMap::new()),
+            matrix_room_topics: Mutex::new(HashMap::new()),
             matrix_power_levels: Mutex::new(HashMap::new()),
             matrix_pinned: Mutex::new(HashMap::new()),
             matrix_widgets: Mutex::new(HashMap::new()),
@@ -1132,6 +1158,7 @@ impl Runtime {
         // runtime is actually holding is filled in here.
         for account in &mut out {
             account.status = self.account_status(&account.id);
+            account.status_text = self.account_status_text(&account.id);
             // Who the service knows this account as, which is not the same
             // question as what it is called here: a local rename moves
             // `display_name` and must leave this alone, or the client would
@@ -1615,6 +1642,9 @@ impl Runtime {
             favourite: false,
             low_priority: false,
             service_room: false,
+            topic: None,
+            read_only: None,
+            forum: false,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -2646,14 +2676,17 @@ impl Runtime {
     /// populates matrix_own_reactions so our own un-react (toggleReaction)
     /// can find its event id by (buffer, message, emoji) without a
     /// reverse scan.
-    pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool) {
+    pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool, sender: &str) {
         {
             let mut targets = self.matrix_reaction_targets.lock().unwrap();
             // One entry per reaction seen, and only a redaction takes one out
             // again - which most reactions never get. Left alone it is a list
             // of everything anybody has ever reacted with in front of us.
             cap_cache(&mut targets, CACHE_LIMIT);
-            targets.insert(event_id.to_string(), (buffer_id.to_string(), msg_id.to_string(), emoji.to_string(), is_me));
+            targets.insert(
+                event_id.to_string(),
+                ReactionEvent { buffer_id: buffer_id.to_string(), msg_id: msg_id.to_string(), emoji: emoji.to_string(), is_me, sender: sender.to_string() },
+            );
         }
         if is_me {
             let mut mine = self.matrix_own_reactions.lock().unwrap();
@@ -2672,10 +2705,39 @@ impl Runtime {
     /// maps from growing unboundedly over a long-running buffer's life.
     pub fn take_matrix_reaction_target(&self, event_id: &str) -> Option<(String, String, String, bool)> {
         let target = self.matrix_reaction_targets.lock().unwrap().remove(event_id);
-        if let Some((buffer_id, msg_id, emoji, true)) = &target {
+        if let Some(ReactionEvent { buffer_id, msg_id, emoji, is_me: true, .. }) = &target {
             self.matrix_own_reactions.lock().unwrap().remove(&(buffer_id.clone(), msg_id.clone(), emoji.clone()));
         }
-        target
+        target.map(|r| (r.buffer_id, r.msg_id, r.emoji, r.is_me))
+    }
+
+    /// Who has reacted to a message with one emoji, as far as this session has
+    /// seen: the ids of the senders, in no particular order. A reaction seen
+    /// before this started is only here if the room's history was read again,
+    /// so a short list is an honest answer and an empty one is "not known".
+    pub fn matrix_reactors(&self, buffer_id: &str, msg_id: &str, emoji: &str) -> Vec<String> {
+        let mut who: Vec<String> = self
+            .matrix_reaction_targets
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| r.buffer_id == buffer_id && r.msg_id == msg_id && r.emoji == emoji)
+            .map(|r| r.sender.clone())
+            .collect();
+        who.sort();
+        who.dedup();
+        who
+    }
+
+    /// What a room member is called in this room, if it is known.
+    pub fn matrix_member_name(&self, account_id: &str, room_id: &str, user_id: &str) -> Option<String> {
+        self.matrix_room_members
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .and_then(|roster| roster.get(user_id))
+            .cloned()
+            .filter(|n| !n.is_empty())
     }
 
     pub fn insert_matrix_verification(&self, id: &str, v: crate::backend::matrix::verification::ActiveVerification) {
@@ -2745,6 +2807,19 @@ impl Runtime {
     /// different field. A no-op broadcast-wise if the buffer doesn't exist
     /// yet (the avatar is still cached for whenever ensure_buffer creates
     /// it - see get_matrix_room_avatar, checked at that point).
+    pub fn set_account_status_text(&self, account_id: &str, text: &str) {
+        let mut all = self.account_status_text.lock().unwrap();
+        if text.is_empty() {
+            all.remove(account_id);
+        } else {
+            all.insert(account_id.to_string(), text.to_string());
+        }
+    }
+
+    pub fn account_status_text(&self, account_id: &str) -> String {
+        self.account_status_text.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
     pub fn set_account_status(&self, account_id: &str, status: &str) {
         self.account_status.lock().unwrap().insert(account_id.to_string(), status.to_string());
     }
@@ -2986,6 +3061,85 @@ impl Runtime {
         if let Some(b) = updated {
             state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
+    }
+
+    /// Sets what a conversation says it is for, whatever service it came from.
+    /// Empty clears it. Broadcast only when it changed: a channel's topic is
+    /// sent again on every reconnect.
+    pub fn set_buffer_topic(&self, state: &AppState, buffer_id: &str, topic: &str) {
+        let topic = topic.trim();
+        let new = (!topic.is_empty()).then(|| topic.to_string());
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.topic != new => {
+                    b.topic = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Marks a buffer as a forum: a list of posts rather than a conversation.
+    pub fn set_buffer_forum(&self, state: &AppState, buffer_id: &str, forum: bool) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.forum != forum => {
+                    b.forum = forum;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// The tags a forum offers its posts, as Discord described them.
+    pub fn set_discord_forum_tags(&self, account_id: &str, channel_id: &str, tags: Vec<Value>) {
+        self.discord_forum_tags.lock().unwrap().insert((account_id.to_string(), channel_id.to_string()), tags);
+    }
+
+    pub fn discord_forum_tags(&self, account_id: &str, channel_id: &str) -> Vec<Value> {
+        self.discord_forum_tags.lock().unwrap().get(&(account_id.to_string(), channel_id.to_string())).cloned().unwrap_or_default()
+    }
+
+    /// Says a conversation cannot be written in, and why; `None` says it can.
+    /// Broadcast only when it changes.
+    pub fn set_buffer_read_only(&self, state: &AppState, buffer_id: &str, reason: Option<&str>) {
+        let new = reason.map(str::to_string);
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.read_only != new => {
+                    b.read_only = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// A Matrix room's topic, kept against the room so a buffer made after it
+    /// was read still gets it.
+    pub fn set_matrix_room_topic(&self, state: &AppState, account_id: &str, room_id: &str, topic: &str) {
+        self.matrix_room_topics.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), topic.to_string());
+        if let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) {
+            self.set_buffer_topic(state, &buffer_id, topic);
+        }
+    }
+
+    pub fn get_matrix_room_topic(&self, account_id: &str, room_id: &str) -> Option<String> {
+        self.matrix_room_topics.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
     }
 
     /// Files a buffer under a heading, in the order the service puts it.
@@ -3964,15 +4118,18 @@ impl Runtime {
 
     pub fn push_irc_channel_list(&self, account_id: &str, name: &str, users: u32, topic: &str) {
         // Started implicitly if the server sent no 321, which many do not.
-        self.irc_channel_lists
-            .lock()
-            .unwrap()
-            .entry(account_id.to_string())
-            .or_default()
-            .push(IrcChannelListing { name: name.to_string(), users, topic: topic.to_string() });
+        let mut lists = self.irc_channel_lists.lock().unwrap();
+        let list = lists.entry(account_id.to_string()).or_default();
+        // A ceiling, so a network that never stops cannot grow this without end;
+        // and a topic is cut to what a row can show.
+        if list.len() < IRC_DIRECTORY_LIMIT {
+            list.push(IrcChannelListing { name: name.to_string(), users, topic: topic.chars().take(300).collect() });
+        }
     }
 
-    /// Announces the finished directory, busiest first.
+    /// Announces the finished directory, busiest first - by how many there are,
+    /// not by what they are: the list itself is asked for in pieces with
+    /// `irc_channels`.
     ///
     /// Sorted here rather than in the client because every client would want
     /// the same order, and because "which of these has anybody in it" is the
@@ -3981,10 +4138,36 @@ impl Runtime {
     pub fn finish_irc_channel_list(&self, state: &AppState, account_id: &str) {
         let mut channels = self.irc_channel_lists.lock().unwrap().remove(account_id).unwrap_or_default();
         channels.sort_by(|a, b| b.users.cmp(&a.users).then_with(|| a.name.cmp(&b.name)));
-        state.events.emit(
-            "ircChannelList",
-            json!({ "accountId": account_id, "channels": channels }),
-        );
+        let count = channels.len();
+        self.irc_channel_directory.lock().unwrap().insert(account_id.to_string(), channels);
+        state.events.emit("ircChannelList", json!({ "accountId": account_id, "count": count }));
+    }
+
+    /// The server refused the list, or said to come back later: what it said,
+    /// to whoever is waiting on it.
+    pub fn fail_irc_channel_list(&self, state: &AppState, account_id: &str, reason: &str) {
+        self.irc_channel_lists.lock().unwrap().remove(account_id);
+        state.events.emit("ircChannelList", json!({ "accountId": account_id, "error": reason }));
+    }
+
+    /// A page of the last directory, those matching `query` in a name or topic,
+    /// busiest first. Returns how many there are in all and how many match.
+    pub fn irc_channels(&self, account_id: &str, query: &str, limit: usize) -> (usize, usize, Vec<IrcChannelListing>) {
+        let all = self.irc_channel_directory.lock().unwrap();
+        let Some(list) = all.get(account_id) else { return (0, 0, Vec::new()) };
+        let q = query.trim().to_lowercase();
+        let mut matching = 0;
+        let mut page = Vec::new();
+        for c in list {
+            if !q.is_empty() && !c.name.to_lowercase().contains(&q) && !c.topic.to_lowercase().contains(&q) {
+                continue;
+            }
+            matching += 1;
+            if page.len() < limit {
+                page.push(c.clone());
+            }
+        }
+        (list.len(), matching, page)
     }
 
     pub fn clear_kick_sender(&self, account_id: &str) {
@@ -4278,6 +4461,7 @@ impl Runtime {
             kind: kind.to_string(),
             reply_to,
             edited: false,
+            edited_ts: None,
             reactions: Vec::new(),
             is_own,
             avatar_url: avatar_url.clone(),
@@ -4326,7 +4510,7 @@ impl Runtime {
     pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
         match state.store.update_message_body(buffer_id, msg_id, body, embeds, attachments) {
             Ok(true) => {
-                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "embeds": embeds, "attachments": attachments }));
+                state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "editedTs": chrono::Utc::now().timestamp(), "embeds": embeds, "attachments": attachments }));
                 true
             }
             Ok(false) => false,
@@ -4671,6 +4855,65 @@ mod tests {
         assert!(runtime.set_ringing("acct|alex", "acct", "chan", true));
         assert!(runtime.set_ringing("other|sam", "other", "chan2", true));
         assert_eq!(runtime.ringing_calls().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    fn directory() -> Runtime {
+        let rt = Runtime::new();
+        rt.irc_channel_directory.lock().unwrap().insert(
+            "a".into(),
+            vec![
+                IrcChannelListing { name: "#busy".into(), users: 900, topic: "all about birds".into() },
+                IrcChannelListing { name: "#quiet".into(), users: 3, topic: "".into() },
+                IrcChannelListing { name: "#birdwatch".into(), users: 2, topic: "".into() },
+            ],
+        );
+        rt
+    }
+
+    #[test]
+    fn a_page_is_the_matches_in_order_with_the_counts() {
+        let rt = directory();
+        let (total, matching, page) = rt.irc_channels("a", "bird", 10);
+        assert_eq!((total, matching), (3, 2));
+        assert_eq!(page.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["#busy", "#birdwatch"]);
+    }
+
+    #[test]
+    fn a_page_is_cut_to_the_limit_but_still_counts_everything() {
+        let (total, matching, page) = directory().irc_channels("a", "", 1);
+        assert_eq!((total, matching, page.len()), (3, 3, 1));
+    }
+
+    #[test]
+    fn an_account_with_no_directory_has_nothing() {
+        assert_eq!(directory().irc_channels("b", "", 10).0, 0);
+    }
+}
+
+#[cfg(test)]
+mod reactor_tests {
+    use super::*;
+
+    #[test]
+    fn who_reacted_is_what_was_seen_and_loses_the_redacted() {
+        let rt = Runtime::new();
+        rt.record_matrix_reaction_event("b", "m1", "👍", "$e1", false, "@ann:x");
+        rt.record_matrix_reaction_event("b", "m1", "👍", "$e2", false, "@bob:x");
+        rt.record_matrix_reaction_event("b", "m1", "🎉", "$e3", false, "@cat:x");
+        rt.record_matrix_reaction_event("b", "m2", "👍", "$e4", true, "@me:x");
+        assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@ann:x", "@bob:x"]);
+        assert_eq!(rt.matrix_reactors("b", "m1", "🎉"), vec!["@cat:x"]);
+        assert_eq!(rt.matrix_reactors("b", "m2", "👍"), vec!["@me:x"]);
+
+        // A redaction takes that person out and leaves the others.
+        assert_eq!(rt.take_matrix_reaction_target("$e1"), Some(("b".into(), "m1".into(), "👍".into(), false)));
+        assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@bob:x"]);
+        assert!(rt.matrix_reactors("b", "m3", "👍").is_empty());
     }
 }
 
@@ -5041,10 +5284,10 @@ impl Runtime {
             kick_watching, matrix_emoticons, discord_friends,
             sneedchat_senders, kick_senders, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
-            irc_channel_lists, irc_caps, irc_metadata,
+            irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
             matrix_call_members, matrix_stickers, matrix_rooms,
-            account_status, discord_voice_self, irc_transports,
+            account_status, account_status_text, discord_voice_self, irc_transports,
             discord_gateway_senders, matrix_machines, matrix_reaction_targets,
             matrix_verifications, matrix_ignored, matrix_verification_peers,
             matrix_push_rules, irc_away, kick_pins,
@@ -5057,8 +5300,8 @@ impl Runtime {
             discord_members, matrix_back_tokens, matrix_polls,
             matrix_poll_votes, matrix_room_names, matrix_space_parents,
             discord_member_list_targets, discord_voice_channels, discord_voice_states,
-            discord_voice_names, discord_voice_avatars, matrix_member_avatars,
-            matrix_room_avatars, matrix_power_levels, matrix_pinned,
+            discord_voice_names, discord_voice_avatars, discord_forum_tags, matrix_member_avatars,
+            matrix_room_avatars, matrix_room_topics, matrix_power_levels, matrix_pinned,
             matrix_room_members, matrix_read_receipts, sneedchat_motds,
             irc_whois, discord_mutes, matrix_presence,
             matrix_own_reactions, irc_splits, matrix_widgets,

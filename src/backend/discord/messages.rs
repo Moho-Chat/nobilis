@@ -701,10 +701,26 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
     embeds
         .iter()
         .filter_map(|embed| {
+            if embed["type"].as_str() == Some("safety_system_notification") {
+                return Some(safety_notice(embed));
+            }
             let title = embed["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let description = embed["description"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
-            if title.is_none() && description.is_none() {
+            let fields: Vec<model::EmbedField> = embed["fields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| Some(model::EmbedField { name: f["name"].as_str()?.to_string(), value: f["value"].as_str()?.to_string() }))
+                .collect();
+            let footer = embed["footer"]["text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            if title.is_none() && description.is_none() && fields.is_empty() {
                 return None;
+            }
+            // A card with a name and nothing under it is how an embed that holds
+            // its content somewhere this does not read looks. Logged whole, so
+            // what Discord actually sent is on record rather than guessed at.
+            if description.is_none() && fields.is_empty() && embed["image"].is_null() && embed["thumbnail"].is_null() {
+                tracing::info!("discord: an embed with only a title, as sent: {embed}");
             }
             Some(Embed {
                 title,
@@ -718,9 +734,58 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 image_url: None,
                 provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                 author: embed["author"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                fields,
+                footer,
+                ..Default::default()
             })
         })
         .collect()
+}
+
+/// One of the platform's own notices to an account - a warning, a removed
+/// violation, a limit on the account - which arrive as an embed of this type
+/// whose content is a list of labelled values: `header`, `body`, `icon_type`,
+/// `theme`, a `timestamp` in seconds, and `ctas` naming what its button is.
+/// The embed's own title is only a stand-in for clients too old to read it.
+fn safety_notice(embed: &Value) -> Embed {
+    let value = |name: &str| -> Option<String> {
+        embed["fields"]
+            .as_array()?
+            .iter()
+            .find(|f| f["name"].as_str() == Some(name))
+            .and_then(|f| f["value"].as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    let link = value("learn_more_link");
+    let danger = matches!(value("theme").as_deref(), Some("danger" | "warning"));
+    let icon = match value("icon_type").as_deref() {
+        Some("warning" | "danger") => Some("warning".to_string()),
+        _ => None,
+    };
+    // The button's words, from what the notice says it is for. A link opens in
+    // the browser; "see details" is a page inside Discord's own app, which has
+    // nowhere to go from here, so it is drawn without one.
+    let cta = match value("ctas").as_deref() {
+        Some("learn_more_link") => Some(model::EmbedLink { label: "Learn more".to_string(), url: link.clone() }),
+        Some("policy_violation_detail") => Some(model::EmbedLink { label: "See details in Discord".to_string(), url: None }),
+        _ => link.clone().map(|url| model::EmbedLink { label: "Learn more".to_string(), url: Some(url) }),
+    };
+    let timestamp = value("timestamp")
+        .and_then(|t| t.parse::<f64>().ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs as i64, 0))
+        .map(|dt| dt.to_rfc3339());
+    Embed {
+        title: value("header").or_else(|| embed["title"].as_str().map(str::to_string)),
+        description: value("body"),
+        // Discord's red for what acts on the account, its own blue otherwise.
+        color: Some(if danger { 0xDA373C } else { 0x5865F2 }),
+        timestamp,
+        cta,
+        icon,
+        kind: Some("notice".to_string()),
+        ..Default::default()
+    }
 }
 
 /// Discord-native replies: `message_reference.message_id` names what's
@@ -837,6 +902,11 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
         let reply_to = extract_reply(msg);
         let reactions = extract_reactions(msg);
         let avatar_url = author_avatar_url(author);
+        // Discord's own account says what it is on every message it sends, which
+        // is a second way to know this conversation cannot be written in.
+        if author["system"].as_bool() == Some(true) && state.runtime.buffer_kind_of(buffer_id) == "dm" {
+            state.runtime.set_buffer_read_only(state, buffer_id, Some(super::people::OFFICIAL_ONLY));
+        }
         let ts = msg["timestamp"]
             .as_str()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -1386,5 +1456,167 @@ mod automod_tests {
     #[test]
     fn an_ordinary_message_is_not_an_alert() {
         assert!(automod_alert(&json!({ "type": 0, "content": "hi" })).is_none());
+    }
+}
+
+/// Who has reacted with one emoji: the first few, by name.
+///
+/// Asked for when somebody points at a reaction rather than kept up to date -
+/// Discord's gateway says that a reaction was added, never who has them all -
+/// and capped, because the tooltip it is for names a handful and says how many
+/// more. The name is the account's own ("global name"), which is what Discord
+/// shows beside it; a server nickname would be better and is not in this answer.
+pub async fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, emoji: &str, limit: u8) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions")).context("building the reactions URL")?;
+    url.path_segments_mut().map_err(|_| anyhow!("reactions URL cannot be a base"))?.push(super::send::reaction_path_segment(emoji));
+    url.query_pairs_mut().append_pair("limit", &limit.clamp(1, 100).to_string());
+    let resp = http_client_for(&cfg.token)
+        .get(url)
+        .header("Authorization", &cfg.token)
+        .send()
+        .await
+        .context("reading who reacted")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "reading who reacted"));
+    }
+    let people: Vec<Value> = resp.json().await.context("reading who reacted")?;
+    let users: Vec<Value> = people
+        .iter()
+        .filter_map(|u| {
+            let id = u["id"].as_str()?;
+            let name = u["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| u["username"].as_str()).unwrap_or("unknown");
+            Some(json!({ "id": id, "name": name }))
+        })
+        .collect();
+    Ok(json!({ "users": users }))
+}
+
+#[cfg(test)]
+mod embed_extract_tests {
+    use super::extract_embeds;
+    use serde_json::json;
+
+    #[test]
+    fn fields_and_the_footer_are_kept() {
+        let d = json!({ "embeds": [{
+            "title": "Ticket", "description": "Opened",
+            "fields": [{ "name": "Status", "value": "Open", "inline": true }, { "name": "Owner" }],
+            "footer": { "text": "via the desk" }
+        }] });
+        let e = extract_embeds(&d);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].fields.len(), 1, "a field with no value is not one");
+        assert_eq!((e[0].fields[0].name.as_str(), e[0].fields[0].value.as_str()), ("Status", "Open"));
+        assert_eq!(e[0].footer.as_deref(), Some("via the desk"));
+    }
+
+    #[test]
+    fn an_embed_of_only_fields_is_still_a_card() {
+        let d = json!({ "embeds": [{ "fields": [{ "name": "a", "value": "b" }] }] });
+        assert_eq!(extract_embeds(&d).len(), 1);
+    }
+}
+
+/// Reads a conversation's latest messages again, for the cards on them.
+///
+/// For messages stored before the embed reader knew a part of the shape: the
+/// history that is kept is not fetched again, so a card saved with only its
+/// title stays that way for good. One request for the latest page - what opening
+/// a conversation costs anyway - and any message whose stored cards say less
+/// than the fresh ones is updated, without being marked edited. A message whose
+/// card was thin is also logged whole, so that what Discord really sent is on
+/// record.
+pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
+    let resp = http_client_for(&config.token)
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", "50")])
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .context("re-reading the conversation")?;
+    if !resp.status().is_success() {
+        bail!("Discord refused the request ({})", resp.status());
+    }
+    let messages: Vec<Value> = resp.json().await.context("reading the conversation")?;
+    let mut updated = 0;
+    for msg in &messages {
+        let Some(msg_id) = msg["id"].as_str() else { continue };
+        let Ok(Some(stored)) = state.store.get_message(buffer_id, msg_id) else { continue };
+        let fresh = extract_embeds(msg);
+        let thin = |e: &model::Embed| e.description.is_none() && e.fields.is_empty();
+        if !stored.embeds.is_empty() && stored.embeds.iter().all(thin) {
+            tracing::info!(
+                "discord: a message whose card was only a title, whole: embeds={} components={} flags={} type={}",
+                msg["embeds"],
+                msg["components"],
+                msg["flags"],
+                msg["type"]
+            );
+        }
+        // Different, not just richer: a card read better than before replaces
+        // the one saved.
+        let same = serde_json::to_value(&fresh).ok() == serde_json::to_value(&stored.embeds).ok();
+        if !fresh.is_empty() && !same && state.store.set_message_embeds(buffer_id, msg_id, &fresh).unwrap_or(false) {
+            state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": fresh }));
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
+#[cfg(test)]
+mod safety_notice_tests {
+    use super::extract_embeds;
+    use serde_json::json;
+
+    fn notice(theme: &str, cta: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut fields = vec![
+            json!({ "name": "header", "value": "We removed a violation from your account" }),
+            json!({ "name": "body", "value": "We reviewed a violation and removed it." }),
+            json!({ "name": "theme", "value": theme }),
+            json!({ "name": "ctas", "value": cta }),
+            json!({ "name": "timestamp", "value": "1787270697.310243" }),
+            json!({ "name": "client_version_message", "value": "Please update the app." }),
+        ];
+        if let Some(more) = extra.as_array() {
+            fields.extend(more.iter().cloned());
+        }
+        json!({ "embeds": [{ "type": "safety_system_notification", "title": "Important message from Discord regarding your account", "fields": fields }] })
+    }
+
+    #[test]
+    fn the_notice_is_read_as_a_card_not_as_a_list_of_fields() {
+        let e = extract_embeds(&notice("default", "learn_more_link", json!([{ "name": "learn_more_link", "value": "https://support.discord.com/x" }])));
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].title.as_deref(), Some("We removed a violation from your account"));
+        assert_eq!(e[0].description.as_deref(), Some("We reviewed a violation and removed it."));
+        assert!(e[0].fields.is_empty(), "its own labelled values are not shown as lines");
+        assert_eq!(e[0].kind.as_deref(), Some("notice"));
+        let cta = e[0].cta.as_ref().unwrap();
+        assert_eq!((cta.label.as_str(), cta.url.as_deref()), ("Learn more", Some("https://support.discord.com/x")));
+        assert!(e[0].timestamp.as_deref().unwrap().starts_with("2026-"));
+    }
+
+    #[test]
+    fn what_acts_on_the_account_is_red_and_the_rest_is_blue() {
+        let red = extract_embeds(&notice("danger", "learn_more_link", json!([])));
+        let blue = extract_embeds(&notice("default", "learn_more_link", json!([])));
+        assert_eq!(red[0].color, Some(0xDA373C));
+        assert_eq!(blue[0].color, Some(0x5865F2));
+    }
+
+    #[test]
+    fn a_page_inside_discords_own_app_is_a_button_with_nowhere_to_go() {
+        let e = extract_embeds(&notice("default", "policy_violation_detail", json!([])));
+        let cta = e[0].cta.as_ref().unwrap();
+        assert_eq!(cta.label, "See details in Discord");
+        assert!(cta.url.is_none());
     }
 }

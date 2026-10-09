@@ -56,9 +56,14 @@ pub async fn create_invite(
     Ok(json!({ "invite": format!("https://discord.gg/{code}") }))
 }
 
+/// What the banner says where a channel's message box would be, when the account may read but not write.
+pub(super) const NO_SEND_PERMISSION: &str = "You do not have permission to send messages in this channel.";
+
 pub(super) const PERM_ADMINISTRATOR: u64 = 1 << 3;
 
 pub(super) const PERM_VIEW_CHANNEL: u64 = 1 << 10;
+
+pub(super) const PERM_SEND_MESSAGES: u64 = 1 << 11;
 
 pub(super) const PERM_KICK_MEMBERS: u64 = 1 << 1;
 
@@ -295,9 +300,9 @@ pub(super) fn member_role_ids(member: Option<&Value>) -> Vec<String> {
 /// owner account (confirmed live: missed 3 channels in a server this
 /// account owns outright before this was added).
 #[allow(clippy::too_many_arguments)]
-pub(super) fn can_view_channel(is_owner: bool, guild_id: &str, roles: &[Value], member_role_ids: &[String], user_id: &str, channel: &Value) -> bool {
+pub(super) fn channel_permissions(is_owner: bool, guild_id: &str, roles: &[Value], member_role_ids: &[String], user_id: &str, channel: &Value) -> u64 {
     if is_owner {
-        return true;
+        return u64::MAX;
     }
     let mut base: u64 = 0;
     for role in roles {
@@ -307,7 +312,7 @@ pub(super) fn can_view_channel(is_owner: bool, guild_id: &str, roles: &[Value], 
         }
     }
     if base & PERM_ADMINISTRATOR != 0 {
-        return true;
+        return u64::MAX;
     }
 
     let mut perms = base;
@@ -335,7 +340,21 @@ pub(super) fn can_view_channel(is_owner: bool, guild_id: &str, roles: &[Value], 
         perms = (perms & !parse_perm(&ow["deny"])) | parse_perm(&ow["allow"]);
     }
 
-    perms & PERM_VIEW_CHANNEL != 0
+    perms
+}
+
+/// Whether this account may see a channel at all.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn can_view_channel(is_owner: bool, guild_id: &str, roles: &[Value], member_role_ids: &[String], user_id: &str, channel: &Value) -> bool {
+    channel_permissions(is_owner, guild_id, roles, member_role_ids, user_id, channel) & PERM_VIEW_CHANNEL != 0
+}
+
+/// Whether it may also write there. A channel can be read by everybody and
+/// written by almost nobody - rules, announcements - and showing a message box
+/// that every send is refused from is a worse answer than saying so.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn can_send_in_channel(is_owner: bool, guild_id: &str, roles: &[Value], member_role_ids: &[String], user_id: &str, channel: &Value) -> bool {
+    channel_permissions(is_owner, guild_id, roles, member_role_ids, user_id, channel) & PERM_SEND_MESSAGES != 0
 }
 
 /// Shared by both READY's embedded `guilds` array and live GUILD_CREATE
@@ -513,12 +532,18 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             continue;
         }
         visible.insert(channel_id.to_string());
-        if channel_map.contains_key(channel_id) {
-            continue;
-        }
         let chan_name = ch["name"].as_str().unwrap_or("channel");
         let name = format!("{guild_name}/#{chan_name}");
+        // Said on the conversation, so the window can put a banner where the
+        // message box would be. Re-asked every time the guild is read, since
+        // permissions change under a channel that is already registered.
+        let read_only = (!can_send_in_channel(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch)).then_some(NO_SEND_PERMISSION);
+        if channel_map.contains_key(channel_id) {
+            state.runtime.set_buffer_read_only(state, &crate::model::buffer_id(&account_id, &name), read_only);
+            continue;
+        }
         let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
+        state.runtime.set_buffer_read_only(state, &buf.id, read_only);
         state.runtime.set_discord_channel(state, &buf.id, channel_id);
         state.runtime.set_discord_guild(&buf.id, guild_id);
         state.runtime.set_buffer_group(state, &buf.id, &group_id);
@@ -533,6 +558,8 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             None => channel_pos,
         };
         state.runtime.set_buffer_category(state, &buf.id, parent.map(|(name, _)| *name), sort);
+        // What the channel says it is for, which Discord sends with the channel.
+        state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
 
         // Custom emoji are per-guild, not per-channel, but buffers only
         // carry a channel id (see discord_channels) - simplest to just
@@ -579,6 +606,20 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
             Some((_, cat_pos)) => (cat_pos + 1) * 10_000 + channel_pos,
             None => channel_pos,
         };
+        // Also a place in the list in its own right, opened as the list of posts
+        // it is. It has no history of its own to read - what it holds is the
+        // threads - so it is not backfilled, and what can be said in it is said in
+        // a post.
+        let name = format!("{guild_name}/#{chan_name}");
+        let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
+        state.runtime.set_discord_channel(state, &buf.id, channel_id);
+        state.runtime.set_discord_guild(&buf.id, guild_id);
+        state.runtime.set_buffer_group(state, &buf.id, &group_id);
+        state.runtime.set_buffer_category(state, &buf.id, parent.map(|(n, _)| *n), sort);
+        state.runtime.set_buffer_forum(state, &buf.id, true);
+        state.runtime.set_buffer_topic(state, &buf.id, ch["topic"].as_str().unwrap_or_default());
+        state.runtime.set_discord_forum_tags(&account_id, channel_id, ch["available_tags"].as_array().cloned().unwrap_or_default());
+        channel_map.insert(channel_id.to_string(), (name, "channel".to_string()));
         parents.insert(channel_id.to_string(), (chan_name, sort));
     }
 
@@ -733,7 +774,12 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(resp) if resp.status().is_success() => resp,
             // A channel with no archive, or one this account may not read the
             // archive of, is not a failure worth refusing the whole list for.
-            Ok(_) => continue,
+            Ok(resp) => {
+                let status = resp.status();
+                let said = resp.text().await.unwrap_or_default();
+                tracing::debug!("discord: the thread list {url} answered {status}: {}", said.chars().take(300).collect::<String>());
+                continue;
+            }
             Err(e) => {
                 tracing::debug!("discord: reading threads: {e}");
                 continue;
@@ -743,6 +789,11 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(answer) => answer,
             Err(_) => continue,
         };
+        tracing::debug!(
+            "discord: the thread list {url} held {} thread(s), {} under this channel",
+            answer["threads"].as_array().map(|t| t.len()).unwrap_or(0),
+            answer["threads"].as_array().map(|t| t.iter().filter(|t| t["parent_id"].as_str() == Some(channel_id.as_str())).count()).unwrap_or(0)
+        );
         for thread in answer["threads"].as_array().cloned().unwrap_or_default() {
             // The active list covers the whole guild, so the ones under other
             // channels are somebody else's question.
@@ -1105,5 +1156,64 @@ mod tests {
         );
         // A member object with no roles at all is ordinary, not an error.
         assert_eq!(member_role_ids(Some(&json!({ "pending": true }))), Vec::<String>::new());
+    }
+}
+
+#[cfg(test)]
+mod send_permission_tests {
+    use super::*;
+    use serde_json::json;
+
+    const EVERYONE: &str = "g1";
+
+    fn roles(everyone_perms: u64) -> Vec<Value> {
+        vec![json!({ "id": EVERYONE, "permissions": everyone_perms.to_string() })]
+    }
+
+    #[test]
+    fn a_member_who_can_see_and_send_may_write() {
+        let r = roles(PERM_VIEW_CHANNEL | PERM_SEND_MESSAGES);
+        assert!(can_send_in_channel(false, EVERYONE, &r, &[], "me", &json!({})));
+    }
+
+    #[test]
+    fn a_channel_that_denies_everyone_sending_is_read_only() {
+        let r = roles(PERM_VIEW_CHANNEL | PERM_SEND_MESSAGES);
+        let rules = json!({ "permission_overwrites": [{ "id": EVERYONE, "type": 0, "allow": "0", "deny": PERM_SEND_MESSAGES.to_string() }] });
+        assert!(can_view_channel(false, EVERYONE, &r, &[], "me", &rules));
+        assert!(!can_send_in_channel(false, EVERYONE, &r, &[], "me", &rules));
+    }
+
+    #[test]
+    fn a_role_can_allow_what_everyone_is_denied() {
+        let mut r = roles(PERM_VIEW_CHANNEL);
+        r.push(json!({ "id": "mod", "permissions": "0" }));
+        let rules = json!({ "permission_overwrites": [{ "id": "mod", "type": 0, "allow": PERM_SEND_MESSAGES.to_string(), "deny": "0" }] });
+        assert!(!can_send_in_channel(false, EVERYONE, &r, &[], "me", &rules));
+        assert!(can_send_in_channel(false, EVERYONE, &r, &["mod".to_string()], "me", &rules));
+    }
+
+    #[test]
+    fn the_owner_and_an_administrator_may_always_write() {
+        let rules = json!({ "permission_overwrites": [{ "id": EVERYONE, "type": 0, "allow": "0", "deny": PERM_SEND_MESSAGES.to_string() }] });
+        assert!(can_send_in_channel(true, EVERYONE, &roles(0), &[], "me", &rules));
+        assert!(can_send_in_channel(false, EVERYONE, &roles(PERM_ADMINISTRATOR), &[], "me", &rules));
+    }
+}
+
+#[cfg(test)]
+mod system_dm_tests {
+    use super::super::people::is_system_dm;
+    use serde_json::json;
+
+    #[test]
+    fn discords_own_account_is_a_system_dm() {
+        assert!(is_system_dm(&json!({ "recipients": [{ "id": "1", "username": "Discord", "system": true }] })));
+    }
+
+    #[test]
+    fn an_ordinary_person_or_a_group_is_not() {
+        assert!(!is_system_dm(&json!({ "recipients": [{ "id": "2", "username": "alice" }] })));
+        assert!(!is_system_dm(&json!({ "recipients": [{ "id": "1", "system": true }, { "id": "2" }] })));
     }
 }

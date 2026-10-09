@@ -297,7 +297,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 "large_threshold": 50,
                 // Carried in IDENTIFY as well as pushed live, so a status set
                 // before a reconnect survives it.
-                "presence": presence_payload(&state.runtime.account_status(&account_id)),
+                "presence": presence_payload(&state.runtime.account_status(&account_id), &state.runtime.account_status_text(&account_id)),
             }
         })
         .to_string(),
@@ -582,6 +582,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
                                     let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
                                     if new_name.as_deref() == Some(old_name.as_str()) {
+                                        // Nothing to re-register, but the topic is edited
+                                        // in place and arrives this way.
+                                        if let Some(topic) = d.get("topic") {
+                                            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(&account_id, &old_name), topic.as_str().unwrap_or_default());
+                                        }
                                         continue;
                                     }
                                     state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
@@ -799,6 +804,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let reply_to = extract_reply(d);
                         let real_msg_id = d["id"].as_str().map(|s| s.to_string());
                         let avatar_url = author_avatar_url(author);
+                        if author["system"].as_bool() == Some(true) && kind == "dm" {
+                            state.runtime.set_buffer_read_only(state, &model::buffer_id(&account_id, &buffer_name), Some(super::people::OFFICIAL_ONLY));
+                        }
                         // Kept against their id as well as put on the message.
                         // A direct call's voice states carry no member object,
                         // so a face seen here is the only one its call view

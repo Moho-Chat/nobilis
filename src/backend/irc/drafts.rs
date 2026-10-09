@@ -26,6 +26,25 @@ use super::*;
 /// we do not.
 pub(super) const SAFE_LINE: usize = 400;
 
+/// A message as lines and as the pieces of them: the lines the person wrote,
+/// each cut to fit the wire, with whether each piece continues the one before.
+///
+/// Blank lines are dropped - a batch may not be empty text, and a gap between
+/// paragraphs is not worth a refusal - and the carriage returns a paste brings.
+pub(super) fn plan_lines(body: &str) -> Vec<(String, bool)> {
+    let mut pieces = Vec::new();
+    for line in body.replace('\r', "").split('\n') {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        for (i, piece) in split_for_wire(line, SAFE_LINE).into_iter().enumerate() {
+            pieces.push((piece, i > 0));
+        }
+    }
+    pieces
+}
+
 /// Splits a message into pieces that will each fit on the wire.
 ///
 /// Split on character boundaries, never inside one: a UTF-8 sequence cut in
@@ -83,10 +102,12 @@ pub(super) fn split_for_wire(body: &str, limit: usize) -> Vec<String> {
 /// batch sees one message; one that does not sees the pieces, which is the
 /// same thing every client sees today and therefore no worse.
 ///
-/// The pieces carry `draft/multiline-concat` so a receiver joins them without
-/// inserting the newline that would otherwise separate them - this splits a
-/// long paragraph, not a poem.
-pub(super) fn send_multiline(sender: &Sender, target: &str, pieces: &[String]) -> Result<()> {
+/// Each piece says whether it continues the one before: a line too long for
+/// the wire is cut into pieces that carry `draft/multiline-concat`, so a
+/// receiver joins them without the newline that would otherwise separate them,
+/// while the first piece of each line the person wrote does not, so their
+/// line breaks arrive as line breaks.
+pub(super) fn send_multiline(sender: &Sender, target: &str, pieces: &[(String, bool)]) -> Result<()> {
     // A reference this client picked, unique for as long as the batch is
     // open. The clock is enough: batches do not overlap here, because a send
     // completes before the next one starts.
@@ -99,12 +120,15 @@ pub(super) fn send_multiline(sender: &Sender, target: &str, pieces: &[String]) -
         Some(irc::proto::BatchSubCommand::CUSTOM("draft/multiline".to_string())),
         Some(vec![target.to_string()]),
     ))?;
-    for piece in pieces {
+    for (piece, joins_previous) in pieces {
         let mut line = Message::new(None, "PRIVMSG", vec![target, piece])?;
-        line.tags = Some(vec![
-            irc::proto::message::Tag("batch".to_string(), Some(reference.clone())),
-            irc::proto::message::Tag("draft/multiline-concat".to_string(), None),
-        ]);
+        let mut tags = vec![irc::proto::message::Tag("batch".to_string(), Some(reference.clone()))];
+        // Only a piece that continues a line joins it; the first piece of each
+        // line the person wrote starts a new one, which is the newline.
+        if *joins_previous {
+            tags.push(irc::proto::message::Tag("draft/multiline-concat".to_string(), None));
+        }
+        line.tags = Some(tags);
         sender.send(line)?;
     }
     sender.send(Command::BATCH(format!("-{reference}"), None, None))?;
@@ -213,6 +237,33 @@ pub(super) fn read_marker(args: &[String]) -> Option<(String, i64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lines_the_person_wrote_start_lines_and_only_cut_ones_continue() {
+        let plan = plan_lines("first\nsecond\r\nthird");
+        assert_eq!(
+            plan,
+            vec![("first".to_string(), false), ("second".to_string(), false), ("third".to_string(), false)]
+        );
+        // A line too long for the wire is cut; only its later pieces continue it.
+        let long = format!("{} tail", "word ".repeat(120));
+        let plan = plan_lines(&format!("short\n{long}"));
+        assert_eq!(plan[0], ("short".to_string(), false));
+        assert!(plan.len() > 2, "{plan:?}");
+        assert!(!plan[1].1, "a line's first piece starts it");
+        assert!(plan[2..].iter().all(|(_, joins)| *joins), "its later pieces continue it");
+    }
+
+    #[test]
+    fn blank_lines_and_trailing_space_are_dropped() {
+        assert_eq!(plan_lines("one\n\n\ntwo  \n"), vec![("one".to_string(), false), ("two".to_string(), false)]);
+        assert!(plan_lines("\n \n").is_empty());
+    }
+
+    #[test]
+    fn one_line_is_one_piece_as_it_was() {
+        assert_eq!(plan_lines("just this"), vec![("just this".to_string(), false)]);
+    }
 
     /// The limit is in bytes and the text is in characters, which is the
     /// whole difficulty: a cut inside a multi-byte character produces

@@ -22,6 +22,19 @@ pub(super) fn reply_reference(reply_to_id: Option<&str>) -> Option<Value> {
     reply_to_id.map(|id| json!({ "message_id": id }))
 }
 
+/// A message's reply fields: the reference, and - when the person turned the
+/// "@ ON" switch off - the instruction not to ping the author. Discord pings
+/// the one answered by default, and `allowed_mentions` is how its own client
+/// says not to; everything else the message mentions stays allowed.
+pub(super) fn put_reply(payload: &mut Value, reply_to_id: Option<&str>, ping_author: bool) {
+    if let Some(reference) = reply_reference(reply_to_id) {
+        payload["message_reference"] = reference;
+        if !ping_author {
+            payload["allowed_mentions"] = json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
+        }
+    }
+}
+
 /// REST message send - Discord's gateway is receive-only from the client's
 /// perspective for user accounts; sending is always a plain HTTP POST.
 /// Turns the names somebody typed into the mentions Discord understands.
@@ -234,7 +247,7 @@ pub async fn forward_message(
     Ok(())
 }
 
-pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>) -> Result<()> {
+pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>, reply_ping: bool) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
@@ -242,9 +255,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
-    if let Some(reference) = reply_reference(reply_to_id) {
-        payload["message_reference"] = reference;
-    }
+    put_reply(&mut payload, reply_to_id, reply_ping);
     let resp = send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -261,38 +272,149 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     Ok(())
 }
 
+/// The most files Discord takes in one message.
+pub const MAX_ATTACHMENTS: usize = 10;
+
+/// Counts the bytes of an upload as they are taken from the files, and says
+/// how far it has got.
+///
+/// The files are streamed rather than read whole, so the count is real: what
+/// has been handed to the connection, which can run a little ahead of what the
+/// network has carried - by about what its buffers hold - until the last chunk,
+/// after which the wait for Discord's answer is said separately.
+struct Meter {
+    sent: std::sync::atomic::AtomicU64,
+    total: u64,
+    /// When the last report went out, and what it said.
+    last: std::sync::Mutex<(std::time::Instant, u64)>,
+    progress: Option<crate::upload::Progress>,
+    /// The least time between two reports.
+    gap: std::time::Duration,
+}
+
+impl Meter {
+    const HOST: &'static str = "Discord";
+    const GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+    fn add(&self, n: usize) {
+        use std::sync::atomic::Ordering;
+        let Some(progress) = &self.progress else { return };
+        let sent = self.sent.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        let mut last = self.last.lock().unwrap();
+        if sent >= self.total {
+            // Everything is out; what is left is Discord's answer.
+            if last.1 != self.total {
+                *last = (std::time::Instant::now(), self.total);
+                progress.at(crate::upload::Phase::Waiting, self.total as usize, Self::HOST);
+            }
+        } else if last.0.elapsed() >= self.gap && sent - last.1 >= self.total / 200 {
+            // Often enough to look like movement, not so often that a fast
+            // link floods the socket to the window with events.
+            *last = (std::time::Instant::now(), sent);
+            progress.sent(sent, self.total, Self::HOST);
+        }
+    }
+}
+
+/// A file as one part of the upload, read from disk as it is sent and counted
+/// by `meter` as it goes.
+fn counted_part(path: &str, name: &str, len: u64, meter: std::sync::Arc<Meter>) -> Result<reqwest::multipart::Part> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {path}"))?;
+    let stream = tokio_util::io::ReaderStream::with_capacity(tokio::fs::File::from_std(file), 64 * 1024);
+    let counted = futures::StreamExt::map(stream, move |chunk| {
+        if let Ok(bytes) = &chunk {
+            meter.add(bytes.len());
+        }
+        chunk
+    });
+    Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(counted), len).file_name(name.to_string()))
+}
+
+/// The name a file goes up under. Discord hides an attachment behind a
+/// spoiler when its name starts with `SPOILER_` - there is no flag for it - so
+/// that is how one is sent, and every other client reads it the same way.
+fn upload_name(name: &str, spoiler: bool) -> String {
+    const MARK: &str = "SPOILER_";
+    if spoiler && !name.starts_with(MARK) {
+        format!("{MARK}{name}")
+    } else {
+        name.to_string()
+    }
+}
+
 /// The "+" attachment button's backend: a single multipart POST carrying
-/// both the message JSON (as a `payload_json` part) and the file bytes
-/// (as a `files[0]` part) - Discord's documented way to send an attachment
-/// inline with a message in one request, no separate upload-then-attach
-/// step needed for files under the account's size limit.
-pub async fn send_attachment(state: &AppState, buffer_id: &str, token: &str, body: &str, attachment_path: &str, reply_to_id: Option<&str>) -> Result<()> {
+/// both the message JSON (as a `payload_json` part) and the files (as
+/// `files[0]`, `files[1]`...) - Discord's documented way to send attachments
+/// inline with a message in one request, no separate upload-then-attach step
+/// needed for files under the account's size limit. Up to ten files make one
+/// message, which is what Discord's own client does with several chosen at
+/// once.
+pub async fn send_attachments(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    body: &str,
+    attachments: &[(String, bool)],
+    reply: (Option<&str>, bool),
+    progress: Option<&crate::upload::Progress>,
+) -> Result<()> {
+    use crate::upload::Phase;
+    // Who is answered, and whether they are told.
+    let (reply_to_id, reply_ping) = reply;
+    if attachments.is_empty() {
+        bail!("no file to send");
+    }
+    if attachments.len() > MAX_ATTACHMENTS {
+        bail!("Discord takes at most {MAX_ATTACHMENTS} files in one message");
+    }
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let path = std::path::Path::new(attachment_path);
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-    let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {attachment_path}"))?;
+    if let Some(p) = progress {
+        p.at(Phase::Preparing, 0, Meter::HOST);
+    }
+    // Sizes first, from the files themselves, so the ring has its whole
+    // length before the first byte goes.
+    let mut files = Vec::with_capacity(attachments.len());
+    let mut total = 0u64;
+    for (path, spoiler) in attachments {
+        let len = tokio::fs::metadata(path).await.with_context(|| format!("reading {path}"))?.len();
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let name = upload_name(name, *spoiler);
+        total += len;
+        files.push((path.clone(), name, len));
+    }
     // A caption is a message like any other, so a name typed in one is a
     // mention like any other.
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
-    if let Some(reference) = reply_reference(reply_to_id) {
-        payload["message_reference"] = reference;
+    put_reply(&mut payload, reply_to_id, reply_ping);
+    if let Some(p) = progress {
+        p.sent(0, total, Meter::HOST);
     }
-    let form = reqwest::multipart::Form::new()
-        .text("payload_json", payload.to_string())
-        .part("files[0]", reqwest::multipart::Part::bytes(bytes).file_name(file_name));
-    let resp = send_write(
-        http_client_for(token)
-        .post(format!("{API_BASE}/channels/{channel_id}/messages"))
-        .header("Authorization", token)
-        .multipart(form)
-        )
+
+    let client = http_client_for(token);
+    let url = format!("{API_BASE}/channels/{channel_id}/messages");
+    let resp = send_write_rebuilt(|| {
+        // Built afresh for every try: a streamed body is used up by sending
+        // it, so a rate-limited request has to open its files again.
+        let meter = std::sync::Arc::new(Meter {
+            sent: std::sync::atomic::AtomicU64::new(0),
+            total,
+            last: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+            progress: progress.cloned(),
+            gap: Meter::GAP,
+        });
+        let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
+        for (i, (path, name, len)) in files.iter().enumerate() {
+            form = form.part(format!("files[{i}]"), counted_part(path, name, *len, meter.clone())?);
+        }
+        Ok(client.post(&url).header("Authorization", token).multipart(form))
+    })
     .await
-        .context("uploading Discord attachment")?;
+    .context("uploading Discord attachment")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -370,6 +492,140 @@ pub async fn send_voice_message(
         bail!("{}", refusal_text(status, &text));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_pings_its_author_unless_told_not_to() {
+        let mut ping = json!({ "content": "hi" });
+        put_reply(&mut ping, Some("42"), true);
+        assert_eq!(ping["message_reference"]["message_id"], "42");
+        assert!(ping.get("allowed_mentions").is_none(), "Discord's own default stands");
+
+        let mut quiet = json!({ "content": "hi" });
+        put_reply(&mut quiet, Some("42"), false);
+        assert_eq!(quiet["allowed_mentions"]["replied_user"], false);
+        // Whatever else the message mentions is still allowed.
+        assert_eq!(quiet["allowed_mentions"]["parse"], json!(["users", "roles", "everyone"]));
+    }
+
+    #[test]
+    fn a_message_that_answers_nothing_has_neither() {
+        let mut plain = json!({ "content": "hi" });
+        put_reply(&mut plain, None, false);
+        assert!(plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none());
+    }
+}
+
+#[cfg(test)]
+mod spoiler_tests {
+    use super::upload_name;
+
+    #[test]
+    fn a_spoiler_goes_up_under_the_name_discord_hides() {
+        assert_eq!(upload_name("cat.png", true), "SPOILER_cat.png");
+    }
+
+    #[test]
+    fn it_is_not_marked_twice_or_when_it_is_not_one() {
+        assert_eq!(upload_name("SPOILER_cat.png", true), "SPOILER_cat.png");
+        assert_eq!(upload_name("cat.png", false), "cat.png");
+    }
+}
+
+#[cfg(test)]
+mod upload_tests {
+    //! Several files in one request, counted as they go - against a server of
+    //! our own, since Discord's address is not ours to point at.
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn several_files_make_one_counted_request() {
+        let dir = std::env::temp_dir().join(format!("nobilis-multi-{}", crate::model::next_message_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = vec![b'a'; 700_000];
+        let second = vec![b'b'; 500_000];
+        std::fs::write(dir.join("one.png"), &first).unwrap();
+        std::fs::write(dir.join("two.png"), &second).unwrap();
+
+        // A server that reads one whole request and says what it saw.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut chunk = vec![0u8; 65536];
+            let mut header_end = None;
+            let mut want = usize::MAX;
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(at + 4);
+                        let head = String::from_utf8_lossy(&seen[..at]).to_lowercase();
+                        let length = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length: "))
+                            .map(|v| v.trim().parse::<usize>().unwrap());
+                        want = at + 4 + length.expect("a known content-length, not chunked");
+                    }
+                }
+                if seen.len() >= want {
+                    break;
+                }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            seen
+        });
+
+        let bus = crate::events::EventBus::new();
+        let mut rx = bus.subscribe();
+        let total = (first.len() + second.len()) as u64;
+        let meter = std::sync::Arc::new(Meter {
+            sent: std::sync::atomic::AtomicU64::new(0),
+            total,
+            last: std::sync::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(1), 0)),
+            progress: Some(crate::upload::Progress::new(bus, "up-1")),
+            gap: std::time::Duration::ZERO,
+        });
+        let form = reqwest::multipart::Form::new()
+            .text("payload_json", "{}")
+            .part("files[0]", counted_part(dir.join("one.png").to_str().unwrap(), "one.png", first.len() as u64, meter.clone()).unwrap())
+            .part("files[1]", counted_part(dir.join("two.png").to_str().unwrap(), "two.png", second.len() as u64, meter.clone()).unwrap());
+        let resp = reqwest::Client::new().post(format!("http://{addr}/")).multipart(form).send().await.unwrap();
+        assert!(resp.status().is_success());
+
+        let seen = server.await.unwrap();
+        let text = String::from_utf8_lossy(&seen);
+        assert!(text.contains("name=\"files[0]\"") && text.contains("filename=\"one.png\""));
+        assert!(text.contains("name=\"files[1]\"") && text.contains("filename=\"two.png\""));
+        assert!(seen.windows(1000).any(|w| w.iter().all(|&b| b == b'a')), "the first file's bytes arrived");
+        assert!(seen.windows(1000).any(|w| w.iter().all(|&b| b == b'b')), "the second file's bytes arrived");
+
+        // Reported as it went: counts that only rise, then the wait for the answer.
+        let mut counts = Vec::new();
+        let mut last_phase = String::new();
+        while let Ok(event) = rx.try_recv() {
+            last_phase = event.data["phase"].as_str().unwrap_or_default().to_string();
+            if let Some(sent) = event.data["sent"].as_u64() {
+                assert_eq!(event.data["total"].as_u64(), Some(total));
+                counts.push(sent);
+            }
+        }
+        assert!(counts.len() >= 3, "progress was reported along the way: {counts:?}");
+        assert!(counts.windows(2).all(|w| w[0] <= w[1]), "counts only rise: {counts:?}");
+        assert!(counts.iter().all(|&c| c < total), "the last of it is the wait, not more sending: {counts:?}");
+        assert_eq!(last_phase, "waiting");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

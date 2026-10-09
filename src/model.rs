@@ -86,6 +86,11 @@ pub struct Account {
     /// disconnected account still remembers the status it will reconnect with.
     #[serde(default)]
     pub status: String,
+    /// What the account says beside its status - Discord's custom status,
+    /// Matrix's status message. Empty for none, and for every service with
+    /// nowhere to put one.
+    #[serde(rename = "statusText", default)]
+    pub status_text: String,
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,
@@ -346,6 +351,18 @@ pub struct Buffer {
     /// thing - so it is named for what it is rather than after the tag.
     #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
     pub service_room: bool,
+    /// What the conversation says it is for: an IRC channel's topic, a Matrix
+    /// room's, a Discord channel's. Absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    /// Why nothing can be said here, when that is so: a channel this account may
+    /// read but not write in, or Discord's own notices. Absent where it can.
+    #[serde(rename = "readOnly", default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<String>,
+    /// A Discord forum (or media channel): not a conversation but a list of
+    /// posts, each of which is a thread. Opened as a pane of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forum: bool,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -497,6 +514,37 @@ pub struct Embed {
     /// Who made it: a video's channel, an article's byline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// The labelled lines a bot puts under the description: "Status - Open".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<EmbedField>,
+    /// The small line along the bottom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+    /// A button along the bottom of the card, where the service puts one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cta: Option<EmbedLink>,
+    /// "notice" for the platform's own notices to an account, which are drawn as
+    /// what they are rather than as a bot's card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// A glyph for the card's heading: "warning" for the ones that act on an account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+}
+
+/// A link with its words.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EmbedLink {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// One of an embed's labelled lines.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
 }
 
 /// Something on a message that can be pressed.
@@ -645,6 +693,11 @@ pub struct Message {
     pub reply_to: Option<ReplyPreview>,
     #[serde(default)]
     pub edited: bool,
+    /// When it was edited, in Unix seconds, where this client saw the edit
+    /// happen. Absent for an edit that was already there when the message was
+    /// first read, and for what was never edited.
+    #[serde(rename = "editedTs", default, skip_serializing_if = "Option::is_none")]
+    pub edited_ts: Option<i64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reactions: Vec<Reaction>,
     /// Whether the account viewing this sent it - the same identity check
@@ -899,6 +952,9 @@ mod tests {
             favourite: false,
             low_priority: false,
             service_room: false,
+            topic: None,
+            read_only: None,
+            forum: false,
         }
     }
 

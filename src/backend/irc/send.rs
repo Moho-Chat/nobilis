@@ -15,6 +15,11 @@ use super::*;
 /// see project plan). Returns Err with a user-facing message on failure.
 pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_buffer: &str, body: &str) -> Result<()> {
     if let Some(rest) = body.strip_prefix('/') {
+        // A command takes its argument from the rest of the line; a second line
+        // would be sent as part of it, into a nick change or a topic.
+        if body.contains('\n') && !rest.starts_with('/') {
+            bail!("a command is one line");
+        }
         if let Some(literal) = rest.strip_prefix('/') {
             return send_plain(state, account_id, sender, target_buffer, &format!("/{literal}"));
         }
@@ -341,7 +346,15 @@ pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, ta
     // here that loses what somebody wrote - so where the network offers the
     // capability the message goes as one message in several pieces, and where
     // it does not the pieces go as separate messages rather than as a cut.
-    let pieces = drafts::split_for_wire(body, drafts::SAFE_LINE);
+    //
+    // Line breaks the person typed are a second reason to do this: IRC has no
+    // way to put a newline inside a PRIVMSG, so a message of several lines goes
+    // as a batch where the network has the capability and as one message per
+    // line where it does not.
+    let pieces = drafts::plan_lines(body);
+    if pieces.is_empty() {
+        return Ok(());
+    }
     if pieces.len() > 1 {
         let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
         if state.runtime.irc_has_cap(account_id, "draft/multiline") {
@@ -354,11 +367,14 @@ pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, ta
             }
             return Ok(());
         }
-        for piece in &pieces {
+        // One message per piece: each is short enough to go as it is.
+        for (piece, _) in &pieces {
             send_plain(state, account_id, sender, target, piece)?;
         }
         return Ok(());
     }
+    // One line, which may have had a break or a carriage return at its end.
+    let body = pieces[0].0.as_str();
 
     // Where the server echoes what we send, it is the echo that gets written:
     // it carries the server's id and time, and it is proof the message was

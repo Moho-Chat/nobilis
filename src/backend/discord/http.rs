@@ -39,6 +39,40 @@ pub(super) const RATE_LIMIT_RETRIES: usize = 3;
 /// When the last write went out, so the next one can wait its turn.
 pub(super) static LAST_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
+/// Waits for this write's turn, and takes it.
+async fn pace() {
+    // The gap is held across every account, because the traffic Discord sees
+    // is this machine's rather than one account's.
+    let wait = {
+        let mut last = LAST_WRITE.lock().unwrap();
+        let wait = last.map(|at| WRITE_GAP.saturating_sub(at.elapsed())).unwrap_or_default();
+        *last = Some(std::time::Instant::now() + wait);
+        wait
+    };
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Like `send_write`, for a request whose body cannot be copied - a file
+/// streamed from disk - and so is built again for every try.
+pub(super) async fn send_write_rebuilt<F>(mut build: F) -> Result<reqwest::Response>
+where
+    F: FnMut() -> Result<reqwest::RequestBuilder>,
+{
+    pace().await;
+    for attempt in 0..=RATE_LIMIT_RETRIES {
+        let resp = build()?.send().await.context("talking to Discord")?;
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
+            return Ok(resp);
+        }
+        let pause = retry_after(&resp);
+        tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
+        tokio::time::sleep(pause).await;
+    }
+    bail!("Discord kept rate-limiting that request")
+}
+
 /// Sends something that changes state, at a civilised pace, and waits out a
 /// rate limit rather than reporting it.
 ///
@@ -51,17 +85,7 @@ pub(super) static LAST_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std
 /// history quickly would be a slow client, and what Discord judges an account
 /// on is what it sends.
 pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-    // The gap is held across every account, because the traffic Discord sees
-    // is this machine's rather than one account's.
-    let wait = {
-        let mut last = LAST_WRITE.lock().unwrap();
-        let wait = last.map(|at| WRITE_GAP.saturating_sub(at.elapsed())).unwrap_or_default();
-        *last = Some(std::time::Instant::now() + wait);
-        wait
-    };
-    if !wait.is_zero() {
-        tokio::time::sleep(wait).await;
-    }
+    pace().await;
 
     let mut pending = Some(request);
     for attempt in 0..=RATE_LIMIT_RETRIES {

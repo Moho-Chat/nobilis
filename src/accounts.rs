@@ -1082,6 +1082,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
     let id = a.account_id();
     Account {
         status: "online".to_string(),
+        status_text: String::new(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| id.clone()),
         id,
         service: "irc".to_string(),
@@ -1123,6 +1124,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         id: a.account_id(),
         service: "discord".to_string(),
         status: "online".to_string(),
+        status_text: String::new(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
@@ -1159,6 +1161,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         id: a.account_id(),
         service: "sneedchat".to_string(),
         status: "online".to_string(),
+        status_text: String::new(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
@@ -1200,6 +1203,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         id: a.account_id(),
         service: "kick".to_string(),
         status: "online".to_string(),
+        status_text: String::new(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         // The watched channels are deliberately not reported as `autojoin`.
@@ -1244,6 +1248,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         id: a.account_id(),
         service: "matrix".to_string(),
         status: "online".to_string(),
+        status_text: String::new(),
         display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.user_id.clone()),
         state: state.to_string(),
         autojoin: String::new(),

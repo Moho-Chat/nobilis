@@ -840,6 +840,10 @@ pub(super) async fn process_sync_response(state: &AppState, account_id: &str, ow
         if let Some(avatar) = state.runtime.get_matrix_room_avatar(account_id, room_id) {
             state.runtime.set_matrix_room_avatar(state, account_id, room_id, &avatar);
         }
+        // And the topic, for the same reason.
+        if let Some(topic) = state.runtime.get_matrix_room_topic(account_id, room_id) {
+            state.runtime.set_matrix_room_topic(state, account_id, room_id, &topic);
+        }
 
         // Checked every sync (not just first-seen, unlike naming above) -
         // a room can turn encryption on mid-session, and it's sticky once

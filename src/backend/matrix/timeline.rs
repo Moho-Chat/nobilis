@@ -131,7 +131,7 @@ pub(super) async fn handle_timeline_event(
     if effective_type == protocol::EVENT_REACTION {
         let Some((target_event, emoji)) = protocol::reaction_target(&content) else { return };
         let is_me = sender == own_user_id;
-        state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me);
+        state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me, sender);
         // By event id, so a replayed timeline counts for nothing. An initial
         // sync hands back the recent timeline again on every reconnect, and
         // this used to add each of those reactions a second time.

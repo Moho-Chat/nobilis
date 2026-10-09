@@ -594,6 +594,14 @@ pub(super) async fn handle_message(
             if let (Some(channel), Some(topic)) = (args.get(1), args.get(2)) {
                 let body = format!("Topic for {channel}: {topic}");
                 state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), topic);
+            }
+        }
+
+        // No topic set: the channel has none to show.
+        Command::Response(Response::RPL_NOTOPIC, args) => {
+            if let Some(channel) = args.get(1) {
+                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), "");
             }
         }
 
@@ -601,6 +609,7 @@ pub(super) async fn handle_message(
         Command::TOPIC(channel, Some(topic)) => {
             let body = format!("{from} changed the topic to: {topic}");
             state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
+            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, &channel), &topic);
         }
 
         // Connection banner (001-005), LUSERS (251-255, 265-266), and MOTD
@@ -917,6 +926,12 @@ pub(super) async fn handle_message(
             }
         }
         Command::Response(Response::RPL_LISTEND, _) => state.runtime.finish_irc_channel_list(state, account_id),
+        // "Try again later": the answer a busy network gives instead of a list,
+        // and the one thing that told nobody anything.
+        Command::Response(Response::RPL_TRYAGAIN, args) => {
+            let reason = args.last().cloned().unwrap_or_default();
+            state.runtime.fail_irc_channel_list(state, account_id, if reason.is_empty() { "the network says to try again later" } else { &reason });
+        }
 
         Command::Response(code, args) if is_channel_error(code) => {
             if let Some(text) = channel_error_text(&args) {

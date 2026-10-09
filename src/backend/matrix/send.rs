@@ -1210,7 +1210,7 @@ pub async fn toggle_reaction(state: &AppState, account_id: &str, buffer_id: &str
     // path) - record it locally right away too, so an immediate un-react
     // (before that sync arrives) can still find its event id.
     if let Some(event_id) = resp["event_id"].as_str() {
-        state.runtime.record_matrix_reaction_event(buffer_id, msg_id, emoji, event_id, true);
+        state.runtime.record_matrix_reaction_event(buffer_id, msg_id, emoji, event_id, true, &account.user_id);
     }
     Ok(())
 }
@@ -1297,4 +1297,21 @@ mod typed_msgtype_tests {
         assert_eq!(typed_msgtype("/noticeboard").unwrap(), ("m.text", "/noticeboard"));
         assert_eq!(typed_msgtype("/whois someone").unwrap(), ("m.text", "/whois someone"));
     }
+}
+
+/// Who has reacted to a message with one emoji, by name. Matrix keeps no list
+/// of its own to ask for: this is what the session has seen go by, which for a
+/// room being read is nearly everything recent.
+pub fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, emoji: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let users: Vec<Value> = state
+        .runtime
+        .matrix_reactors(buffer_id, msg_id, emoji)
+        .into_iter()
+        .map(|id| {
+            let name = state.runtime.matrix_member_name(account_id, &room_id, &id).unwrap_or_else(|| id.trim_start_matches('@').split(':').next().unwrap_or(&id).to_string());
+            serde_json::json!({ "id": id, "name": name })
+        })
+        .collect();
+    Ok(serde_json::json!({ "users": users }))
 }

@@ -722,6 +722,31 @@ pub async fn dispatch(
         // Global ones and one account's own are the same call with and
         // without an account: they are the same kind of thing, and a message
         // only has to match one of them.
+        // A page of the channel directory `/list` gathered: the network's
+        // channels matching a word, busiest first. The window searches here
+        // rather than being sent forty thousand of them.
+        "getIrcChannels" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("getIrcChannels requires \"accountId\"".to_string()));
+            };
+            let query = p_str_opt(params, "query").unwrap_or("");
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(200).min(1000) as usize;
+            let (total, matching, channels) = state.runtime.irc_channels(account_id, query, limit);
+            (Some(serde_json::json!({ "total": total, "matching": matching, "channels": channels })), None)
+        }
+
+        // Reads a Discord conversation's latest messages again for their cards,
+        // for the ones stored before the card reader knew all of the shape.
+        "rereadDiscordEmbeds" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("rereadDiscordEmbeds requires \"bufferId\"".to_string()));
+            };
+            match backend::discord::reread_embeds(state, buffer_id).await {
+                Ok(updated) => (Some(serde_json::json!({ "updated": updated })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "getHighlightKeywords" => (
             Some(serde_json::json!({ "global": state.highlights.global() })),
             None,
@@ -1460,9 +1485,15 @@ pub async fn dispatch(
             // Recorded before it is applied: a status set while disconnected
             // still has to survive to the next connection.
             state.runtime.set_account_status(account_id, status);
+            // What is said beside it, where the account has anywhere to say
+            // it. Present means set it (empty clears); absent means leave it.
+            let text = params.get("statusText").and_then(|v| v.as_str()).map(|t| t.trim().chars().take(128).collect::<String>());
+            if let Some(text) = &text {
+                state.runtime.set_account_status_text(account_id, text);
+            }
 
             let applied = if state.accounts.get_discord(account_id).is_some() {
-                backend::discord::apply_status(state, account_id, status).await
+                backend::discord::apply_status(state, account_id, status, text.as_deref()).await
             } else if let Some(config) = state.accounts.get_matrix(account_id) {
                 match backend::matrix::apply_status(state, &config, status).await {
                     Ok(()) => true,
@@ -1778,6 +1809,38 @@ pub async fn dispatch(
             }
         }
 
+        // A page of a forum's posts, each with its first message.
+        "listForumPosts" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listForumPosts requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let sort = p_str_opt(params, "sort").unwrap_or("active");
+            let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            match backend::discord::list_forum_posts(state, &buffer.account_id, buffer_id, sort, offset).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Makes a post in a forum, and answers with the thread it made.
+        "createForumPost" => {
+            let (buffer_id, title, body) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "title"), p_str_opt(params, "body")) {
+                (Some(b), Some(t), Some(m)) => (b, t, m),
+                _ => return (None, Some("createForumPost requires \"bufferId\", \"title\" and \"body\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let tags: Vec<String> = params.get("tags").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            match backend::discord::create_forum_post(state, &buffer.account_id, buffer_id, title, body, &tags).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Opens one of them as a conversation of its own.
         "openDiscordThread" => {
             let (buffer_id, thread_id) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "threadId")) {
@@ -2029,6 +2092,31 @@ pub async fn dispatch(
             }
         }
 
+        // Who has reacted with one emoji, for the tooltip over a reaction.
+        // Asked on hover and not carried on every message, since the services
+        // that can say do so only on request.
+        "listReactors" => {
+            let (buffer_id, message_id, emoji) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "messageId"), p_str_opt(params, "emoji")) {
+                (Some(b), Some(m), Some(e)) => (b, m, e),
+                _ => return (None, Some("listReactors requires \"bufferId\", \"messageId\" and \"emoji\"".to_string())),
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            let answer = if buffer.account_id.starts_with("discord:") {
+                backend::discord::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji, 10).await
+            } else if buffer.account_id.starts_with("matrix:") {
+                backend::matrix::list_reactors(state, &buffer.account_id, buffer_id, message_id, emoji)
+            } else {
+                // Nothing else says who: the count is all there is.
+                Ok(serde_json::json!({ "users": [] }))
+            };
+            match answer {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Pinning one, or taking the pin off. Whether this account may is the
         // server's decision, and its refusal is passed through in its words.
         "setPinned" => {
@@ -2254,6 +2342,10 @@ pub async fn dispatch(
                     serde_json::json!({
                         "accountId": id,
                         "micPeak": state.voice.input_level(id).unwrap_or(0.0),
+                        // How long the voice server takes to answer, from the
+                        // connection's own heartbeat; absent until the first
+                        // one has come back.
+                        "rttMs": backend::discord::voiceconn::round_trip_ms(id),
                         // After echo cancellation and noise suppression: what
                         // actually goes out, which the raw level above is not.
                         "sentPeak": state.voice.take_sent_peak(id),
@@ -2951,6 +3043,9 @@ pub async fn dispatch(
                 .map(|id| crate::upload::Progress::new(state.events.clone(), id));
             let progress = progress.as_ref();
             let reply_to_id = p_str_opt(params, "replyToId");
+            // Whether answering pings the author: on, as Discord has it, unless
+            // the window says it was switched off for this reply.
+            let reply_ping = params.get("replyPing").and_then(|v| v.as_bool()).unwrap_or(true);
             // The commands that are only a way of writing something, applied
             // before anybody decides how to send it: they mean the same on
             // every service because they are just text, and doing it here is
@@ -3001,9 +3096,26 @@ pub async fn dispatch(
                 Some(buffer) if buffer.account_id.starts_with("discord:") => match state.accounts.get_discord(&buffer.account_id) {
                     None => (None, Some("account not connected".to_string())),
                     Some(cfg) => {
-                        let result = match attachment_path {
-                            Some(path) => backend::discord::send_attachment(state, buffer_id, &cfg.token, body, path, reply_to_id).await,
-                            None => backend::discord::send_message(state, buffer_id, &cfg.token, body, reply_to_id).await,
+                        // One path, or several that make one message.
+                        let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                            Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                            None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                        };
+                        // Which of them are to be hidden behind a spoiler.
+                        let spoilers: Vec<&str> = params
+                            .get("spoilerPaths")
+                            .and_then(|v| v.as_array())
+                            .map(|list| list.iter().filter_map(|v| v.as_str()).collect())
+                            .unwrap_or_default();
+                        let attachments: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                        let result = if paths.is_empty() {
+                            backend::discord::send_message(state, buffer_id, &cfg.token, body, reply_to_id, reply_ping).await
+                        } else {
+                            let sent = backend::discord::send_attachments(state, buffer_id, &cfg.token, body, &attachments, (reply_to_id, reply_ping), progress).await;
+                            if let Some(p) = progress {
+                                p.done(sent.as_ref().err().map(|e| e.to_string()).as_deref());
+                            }
+                            sent
                         };
                         match result {
                             Ok(()) => (Some(ok_node()), None),

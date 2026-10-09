@@ -196,7 +196,17 @@ pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status
     http::put_json(
         &format!("{base}/_matrix/client/v3/presence/{user}/status"),
         &access_token,
-        serde_json::json!({ "presence": presence }),
+        {
+            // What is said beside it. A PUT replaces the whole of it, so it is
+            // sent every time rather than only when it changes - which would
+            // clear it with the next change of colour.
+            let said = state.runtime.account_status_text(&config.account_id());
+            let mut body = serde_json::json!({ "presence": presence });
+            if !said.is_empty() {
+                body["status_msg"] = serde_json::Value::String(said);
+            }
+            body
+        },
     )
     .await
     .context("setting presence")?;

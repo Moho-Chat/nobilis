@@ -25,6 +25,21 @@ pub(super) fn register_dm_channel(
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_discord_channel(state, &buf.id, channel_id);
+    // Discord's own notices come from an account flagged `system`, and nothing
+    // sent back to it goes anywhere.
+    state.runtime.set_buffer_read_only(state, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
+    // Its notices were saved before their cards could be read whole, and saved
+    // history is not fetched again, so they are read once a run, a little after
+    // connecting - one request, for the latest page.
+    if is_system_dm(ch) {
+        let (state, buffer_id) = (state.clone(), buf.id.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            if let Err(e) = super::messages::reread_embeds(&state, &buffer_id).await {
+                tracing::debug!("discord: could not re-read the notices: {e:#}");
+            }
+        });
+    }
     if let Some(avatar) = dm_avatar_url(ch) {
         state.runtime.set_buffer_avatar(state, &buf.id, &avatar);
     }
@@ -35,6 +50,15 @@ pub(super) fn register_dm_channel(
     state.runtime.set_buffer_group(state, &buf.id, &dm_group_id(account_id));
     channel_map.insert(channel_id.to_string(), (name, "dm".to_string()));
     Some((buf.id, channel_id.to_string()))
+}
+
+/// What the banner says in Discord's own notices channel.
+pub(super) const OFFICIAL_ONLY: &str = "This chat is reserved for official Discord notifications.";
+
+/// A direct message with Discord itself: one recipient, and it is the platform's
+/// own `system` account.
+pub(super) fn is_system_dm(ch: &Value) -> bool {
+    ch["recipients"].as_array().is_some_and(|r| r.len() == 1 && r[0]["system"].as_bool() == Some(true))
 }
 
 /// The picture to show for a direct message: the other person's.

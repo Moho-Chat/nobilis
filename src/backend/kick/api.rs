@@ -1164,6 +1164,11 @@ async fn moderate(
     }
 }
 
+/// A message on one line: breaks and the runs of space they leave become one space.
+pub(crate) fn one_line(body: &str) -> String {
+    body.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Posts a line to a channel's chat.
 ///
 /// The CSRF token is asked for at send time rather than stored. Kick's API is
@@ -1178,6 +1183,9 @@ pub async fn send_message(
     body: &str,
     reply_to: Option<&ReplyTo>,
 ) -> Result<()> {
+    // Kick's chat is one line a message. A line break typed in the box becomes
+    // a space rather than being sent as something the site may refuse or drop.
+    let body = &one_line(body);
     // A reply is its own message type carrying the original, not a mention
     // pasted on the front. Sent as Kick's own client sends it, so it threads
     // in everybody's chat window rather than only reading like a reply here.
@@ -1309,6 +1317,15 @@ fn percent_decode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::one_line;
+
+    #[test]
+    fn a_message_for_kick_is_one_line() {
+        assert_eq!(one_line("hello\nworld"), "hello world");
+        assert_eq!(one_line("  a \r\n\n b  "), "a b");
+        assert_eq!(one_line("plain"), "plain");
+    }
+
     use super::*;
 
     /// The two follow lists have different shapes - the live one carries the
