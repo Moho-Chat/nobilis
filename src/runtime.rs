@@ -629,6 +629,9 @@ pub struct Runtime {
     account_status: Mutex<HashMap<String, String>>,
     /// What each account says beside its status, where the service has a place for it.
     account_status_text: Mutex<HashMap<String, String>>,
+    /// Whether the person has stepped away from the machine, as the window last
+    /// said: what turns an account that is online into one that is idle.
+    user_idle: std::sync::atomic::AtomicBool,
     discord_member_list_targets: Mutex<HashMap<(String, String), String>>,
     /// (account, guild) -> that guild's voice channels, as (id, name, limit).
     discord_voice_channels: Mutex<HashMap<(String, String), Vec<VoiceChannelEntry>>>,
@@ -1095,6 +1098,7 @@ impl Runtime {
             matrix_space_parents: Mutex::new(HashMap::new()),
             account_status: Mutex::new(HashMap::new()),
             account_status_text: Mutex::new(HashMap::new()),
+            user_idle: std::sync::atomic::AtomicBool::new(false),
             discord_member_list_targets: Mutex::new(HashMap::new()),
             discord_voice_channels: Mutex::new(HashMap::new()),
             discord_voice_states: Mutex::new(HashMap::new()),
@@ -1157,7 +1161,8 @@ impl Runtime {
         // The constructors have no view of live state, so the status the
         // runtime is actually holding is filled in here.
         for account in &mut out {
-            account.status = self.account_status(&account.id);
+            account.auto_idle = self.auto_idle_applies(state, &account.id);
+            account.status = self.effective_status(state, &account.id);
             account.status_text = self.account_status_text(&account.id);
             // Who the service knows this account as, which is not the same
             // question as what it is called here: a local rename moves
@@ -2818,6 +2823,42 @@ impl Runtime {
 
     pub fn account_status_text(&self, account_id: &str) -> String {
         self.account_status_text.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Records whether the person is away, and whether that changed.
+    pub fn set_user_idle(&self, idle: bool) -> bool {
+        self.user_idle.swap(idle, std::sync::atomic::Ordering::SeqCst) != idle
+    }
+
+    pub fn user_idle(&self) -> bool {
+        self.user_idle.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether this account is idle because its person is away, rather than
+    /// because they chose it.
+    ///
+    /// Only an account that is online is ever moved: Idle, Do not disturb and
+    /// Invisible are what somebody said, and are kept until they say otherwise.
+    /// Only where the service has an idle to move to, and not while in a call,
+    /// which is somebody here by definition - the same two rules Discord's own
+    /// client keeps.
+    pub fn auto_idle_applies(&self, state: &AppState, account_id: &str) -> bool {
+        auto_idle_rule(
+            self.user_idle(),
+            &self.account_status(account_id),
+            crate::model::status_supported(account_id, "idle"),
+            state.voice.current_channel(account_id).is_some(),
+        )
+    }
+
+    /// What the account shows as: what its person chose, unless they are away
+    /// and it is online.
+    pub fn effective_status(&self, state: &AppState, account_id: &str) -> String {
+        if self.auto_idle_applies(state, account_id) {
+            "idle".to_string()
+        } else {
+            self.account_status(account_id)
+        }
     }
 
     pub fn set_account_status(&self, account_id: &str, status: &str) {
@@ -5215,6 +5256,43 @@ mod rename_tests {
         assert_eq!(rename_own_mentions("hello there", "sal", ""), "hello there");
         // The rename that is not one - the same name in different case.
         assert_eq!(rename_own_mentions("hi Sal", "sal", "Sal"), "hi Sal");
+    }
+}
+
+/// Whether an account should show as idle because its person is away.
+///
+/// Only one that is online is moved: what somebody chose - idle, do not
+/// disturb, invisible - stays until they choose again. Only where the service
+/// has an idle, and not in a call.
+pub(crate) fn auto_idle_rule(away: bool, chosen: &str, service_has_idle: bool, in_call: bool) -> bool {
+    away && chosen == "online" && service_has_idle && !in_call
+}
+
+#[cfg(test)]
+mod auto_idle_tests {
+    use super::auto_idle_rule;
+
+    #[test]
+    fn an_online_account_goes_idle_when_its_person_is_away() {
+        assert!(auto_idle_rule(true, "online", true, false));
+        assert!(!auto_idle_rule(false, "online", true, false));
+    }
+
+    #[test]
+    fn what_somebody_chose_is_kept() {
+        for chosen in ["idle", "dnd", "invisible"] {
+            assert!(!auto_idle_rule(true, chosen, true, false), "{chosen}");
+        }
+    }
+
+    #[test]
+    fn a_service_with_no_idle_is_left_alone() {
+        assert!(!auto_idle_rule(true, "online", false, false));
+    }
+
+    #[test]
+    fn nobody_is_idle_in_a_call() {
+        assert!(!auto_idle_rule(true, "online", true, true));
     }
 }
 

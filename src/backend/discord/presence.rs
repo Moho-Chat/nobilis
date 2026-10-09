@@ -85,6 +85,19 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str, text
     }
 }
 
+/// Shows the account as `status` on this session and leaves the saved setting
+/// alone.
+///
+/// For being idle because the person has walked away, which is a fact about
+/// this session and not a choice: Discord's own client does the same, and
+/// writing it to the account's settings would turn a coffee break into the
+/// status every other device starts from.
+pub fn apply_session_presence(state: &AppState, account_id: &str, status: &str) -> bool {
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    let said = state.runtime.account_status_text(account_id);
+    sender.send(json!({ "op": 3, "d": presence_payload(status, &said) }).to_string()).is_ok()
+}
+
 /// What goes to Discord's settings: the status, and the custom status only when
 /// it is being changed. Null clears it; an object sets it.
 fn settings_body(status: &str, text: Option<&str>) -> serde_json::Value {

@@ -1522,6 +1522,43 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
         }
 
+        // The person has stepped away from the machine, or come back.
+        //
+        // Said once by whoever watches for it - the window, which can see how
+        // long it has been since anything was touched - and applied here, where
+        // the accounts and what each was set to are known. Only an account that
+        // is online is moved to idle and back; anything somebody chose is theirs
+        // until they change it (see Runtime::auto_idle_applies).
+        "setUserIdle" => {
+            let idle = params.get("idle").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !state.runtime.set_user_idle(idle) {
+                return (Some(ok_node()), None);
+            }
+            let mut changed = Vec::new();
+            for account in state.runtime.list_accounts(state) {
+                let id = account.id.as_str();
+                if !crate::model::status_supported(id, "idle") || state.runtime.account_status(id) != "online" {
+                    continue;
+                }
+                let shown = state.runtime.effective_status(state, id);
+                let applied = if state.accounts.get_discord(id).is_some() {
+                    backend::discord::apply_session_presence(state, id, &shown)
+                } else if let Some(sender) = state.runtime.irc_sender(id) {
+                    let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
+                    sender.send(irc::proto::Command::AWAY(away)).is_ok()
+                } else {
+                    false
+                };
+                if applied {
+                    changed.push(serde_json::json!({ "accountId": id, "status": shown, "autoIdle": shown == "idle" }));
+                }
+            }
+            if !changed.is_empty() {
+                state.events.emit("accountStatus", serde_json::json!({ "accounts": changed }));
+            }
+            (Some(ok_node()), None)
+        }
+
         // Asks for a channel's member list.
         //
         // Separate from subscribe because a client subscribes to every buffer

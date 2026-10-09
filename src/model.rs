@@ -91,6 +91,11 @@ pub struct Account {
     /// nowhere to put one.
     #[serde(rename = "statusText", default)]
     pub status_text: String,
+    /// Shown as idle because the person has stepped away, and not because they
+    /// said so: `status` then reads idle while what they chose is online, and
+    /// coming back puts it right without anyone touching it.
+    #[serde(rename = "autoIdle", default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_idle: bool,
     #[serde(rename = "displayName")]
     pub display_name: String,
     pub state: String,
