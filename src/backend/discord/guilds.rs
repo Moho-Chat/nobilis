@@ -777,7 +777,7 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(resp) => {
                 let status = resp.status();
                 let said = resp.text().await.unwrap_or_default();
-                tracing::info!("discord: the thread list {url} answered {status}: {}", said.chars().take(300).collect::<String>());
+                tracing::debug!("discord: the thread list {url} answered {status}: {}", said.chars().take(300).collect::<String>());
                 continue;
             }
             Err(e) => {
@@ -789,7 +789,7 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(answer) => answer,
             Err(_) => continue,
         };
-        tracing::info!(
+        tracing::debug!(
             "discord: the thread list {url} held {} thread(s), {} under this channel",
             answer["threads"].as_array().map(|t| t.len()).unwrap_or(0),
             answer["threads"].as_array().map(|t| t.iter().filter(|t| t["parent_id"].as_str() == Some(channel_id.as_str())).count()).unwrap_or(0)

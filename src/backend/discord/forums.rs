@@ -96,27 +96,21 @@ fn index_not_ready(answer: &Value) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs_f64(secs))
 }
 
-/// A page of a forum's posts, newest or most recently active first.
-///
-/// `offset` is how many have been read already. Where the search endpoint will
-/// not answer - some servers and some accounts are refused it - the plain lists
-/// of live and archived threads stand in, with what they carry: a title, a
-/// count and a time, and no first message.
-pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &str, sort: &str, offset: usize) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this forum")?;
-    let tags = state.runtime.discord_forum_tags(account_id, &channel_id);
-    let sort_by = if sort == "created" { "creation_time" } else { "last_message_time" };
+/// One page of the thread search.
+struct SearchPage {
+    threads: Vec<Value>,
+    firsts: Vec<Value>,
+    has_more: bool,
+}
 
+/// Asks the thread search for one page - of the archive, or of the live posts.
+/// `None` where it will not answer (a refusal, or an index that never became
+/// ready); an empty page is an answer.
+async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: bool, offset: usize) -> Result<Option<SearchPage>> {
     // Discord builds a search index the first time one is asked for, and says so
-    // with a success status and an answer that holds no threads - "not yet
-    // available", with how long to wait. That looked like an empty forum. So it is
-    // asked again after the wait it names, a few times, before giving up on it.
-    let mut status = reqwest::StatusCode::OK;
-    // Asked with the archive included, then - if that finds nothing - without
-    // saying either way: which of the two Discord answers for a forum that has
-    // only live posts is not something this has been able to see.
-    for attempt in 0..4 {
+    // with a success status and no threads - "not yet available", with how long to
+    // wait. That is waited for, a few times, before it is given up on.
+    for attempt in 0..3 {
         let mut query: Vec<(&str, String)> = vec![
             ("sort_by", sort_by.to_string()),
             ("sort_order", "desc".to_string()),
@@ -124,19 +118,19 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
             ("offset", offset.to_string()),
             ("tag_setting", "match_some".to_string()),
         ];
-        if attempt != 3 {
+        if archived {
             query.push(("archived", "true".to_string()));
         }
-        let resp = http_client_for(&cfg.token)
+        let resp = http_client_for(token)
             .get(format!("{API_BASE}/channels/{channel_id}/threads/search"))
             .query(&query)
-            .header("Authorization", &cfg.token)
+            .header("Authorization", token)
             .send()
             .await
             .context("reading the forum")?;
-        status = resp.status();
-        if !status.is_success() {
-            break;
+        if !resp.status().is_success() {
+            tracing::debug!("discord: thread search (archived={archived}) answered {}", resp.status());
+            return Ok(None);
         }
         let answer: Value = resp.json().await.context("reading the forum")?;
         if let Some(wait) = index_not_ready(&answer) {
@@ -145,33 +139,61 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
             continue;
         }
         let threads = answer["threads"].as_array().cloned().unwrap_or_default();
-        // A forum with nothing found by a search that answered properly is empty
-        // - but only the first page can say so; the plain lists below are asked
-        // too, so that a search that quietly knows nothing is not believed.
-        if threads.is_empty() && offset == 0 {
-            // Logged, so what a forum's search says when it says nothing is on record.
-            let said = answer.to_string();
-            tracing::info!("discord: the search of forum {channel_id} found no posts (attempt {attempt}): {}", said.chars().take(400).collect::<String>());
-            // The last variant is the one that decides; the earlier ones go on.
-            if attempt < 3 {
-                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                continue;
-            }
-            break;
-        }
-        let firsts = answer["first_messages"].as_array().cloned().unwrap_or_default();
-        let posts: Vec<Value> = threads
-            .iter()
-            .map(|t| {
-                let id = t["id"].as_str().unwrap_or_default();
-                let first = firsts.iter().find(|m| m["channel_id"].as_str() == Some(id) || m["id"].as_str() == Some(id));
-                post_card(t, first, &tags, &cfg.user_id, cfg.display_name.as_deref())
-            })
-            .collect();
-        let has_more = answer["has_more"].as_bool().unwrap_or(posts.len() >= PAGE);
-        return Ok(json!({ "posts": posts, "hasMore": has_more, "total": answer["total_results"], "tags": tag_list(&tags) }));
+        let has_more = answer["has_more"].as_bool().unwrap_or(threads.len() >= PAGE);
+        return Ok(Some(SearchPage { threads, firsts: answer["first_messages"].as_array().cloned().unwrap_or_default(), has_more }));
     }
-    tracing::debug!("discord: thread search gave nothing usable ({status}); using the plain lists");
+    Ok(None)
+}
+
+/// A page of a forum's posts, live ones first and then the archived.
+///
+/// Discord keeps them apart: the search answers for the archive when it is told
+/// `archived=true` and for the live posts when it is not, and neither answer
+/// holds the other's. A forum read one way showed only half of what is in it.
+/// So the first page is every live post (they are few) and the first page of
+/// the archive; later pages are the archive's, `offset` being how many of those
+/// have been read. Where the search will not answer at all - some servers and
+/// some accounts are refused it - the plain lists of live and archived threads
+/// stand in, with what they carry.
+pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &str, sort: &str, offset: usize) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this forum")?;
+    let tags = state.runtime.discord_forum_tags(account_id, &channel_id);
+    let sort_by = if sort == "created" { "creation_time" } else { "last_message_time" };
+
+    let card = |t: &Value, firsts: &[Value]| -> Value {
+        let id = t["id"].as_str().unwrap_or_default();
+        let first = firsts.iter().find(|m| m["channel_id"].as_str() == Some(id) || m["id"].as_str() == Some(id));
+        post_card(t, first, &tags, &cfg.user_id, cfg.display_name.as_deref())
+    };
+
+    let mut posts: Vec<Value> = Vec::new();
+    let mut answered = false;
+    let mut has_more = false;
+    if offset == 0 {
+        // The live posts, as many pages as there are (capped: a forum with a
+        // hundred live posts is not one anybody reads in one go).
+        let mut at = 0;
+        while at < 100 {
+            let Some(page) = search_page(&cfg.token, &channel_id, sort_by, false, at).await? else { break };
+            answered = true;
+            let more = page.has_more;
+            posts.extend(page.threads.iter().map(|t| card(t, &page.firsts)));
+            at += PAGE;
+            if !more {
+                break;
+            }
+        }
+    }
+    if let Some(page) = search_page(&cfg.token, &channel_id, sort_by, true, offset).await? {
+        answered = true;
+        has_more = page.has_more;
+        posts.extend(page.threads.iter().map(|t| card(t, &page.firsts)));
+    }
+    if answered {
+        return Ok(json!({ "posts": posts, "hasMore": has_more, "total": posts.len(), "tags": tag_list(&tags) }));
+    }
+    tracing::debug!("discord: the thread search is not answering; using the plain lists");
 
     // The fallback: the plain lists, and no paging.
     let listed = list_threads(state, account_id, buffer_id).await?;
