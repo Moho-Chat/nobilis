@@ -703,8 +703,21 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
         .filter_map(|embed| {
             let title = embed["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let description = embed["description"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
-            if title.is_none() && description.is_none() {
+            let fields: Vec<model::EmbedField> = embed["fields"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|f| Some(model::EmbedField { name: f["name"].as_str()?.to_string(), value: f["value"].as_str()?.to_string() }))
+                .collect();
+            let footer = embed["footer"]["text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
+            if title.is_none() && description.is_none() && fields.is_empty() {
                 return None;
+            }
+            // A card with a name and nothing under it is how an embed that holds
+            // its content somewhere this does not read looks. Logged whole, so
+            // what Discord actually sent is on record rather than guessed at.
+            if description.is_none() && fields.is_empty() && embed["image"].is_null() && embed["thumbnail"].is_null() {
+                tracing::info!("discord: an embed with only a title, as sent: {embed}");
             }
             Some(Embed {
                 title,
@@ -718,6 +731,8 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 image_url: None,
                 provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                 author: embed["author"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                fields,
+                footer,
             })
         })
         .collect()
@@ -837,6 +852,11 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
         let reply_to = extract_reply(msg);
         let reactions = extract_reactions(msg);
         let avatar_url = author_avatar_url(author);
+        // Discord's own account says what it is on every message it sends, which
+        // is a second way to know this conversation cannot be written in.
+        if author["system"].as_bool() == Some(true) && state.runtime.buffer_kind_of(buffer_id) == "dm" {
+            state.runtime.set_buffer_read_only(state, buffer_id, Some(super::people::OFFICIAL_ONLY));
+        }
         let ts = msg["timestamp"]
             .as_str()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -1423,4 +1443,30 @@ pub async fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, 
         })
         .collect();
     Ok(json!({ "users": users }))
+}
+
+#[cfg(test)]
+mod embed_extract_tests {
+    use super::extract_embeds;
+    use serde_json::json;
+
+    #[test]
+    fn fields_and_the_footer_are_kept() {
+        let d = json!({ "embeds": [{
+            "title": "Ticket", "description": "Opened",
+            "fields": [{ "name": "Status", "value": "Open", "inline": true }, { "name": "Owner" }],
+            "footer": { "text": "via the desk" }
+        }] });
+        let e = extract_embeds(&d);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].fields.len(), 1, "a field with no value is not one");
+        assert_eq!((e[0].fields[0].name.as_str(), e[0].fields[0].value.as_str()), ("Status", "Open"));
+        assert_eq!(e[0].footer.as_deref(), Some("via the desk"));
+    }
+
+    #[test]
+    fn an_embed_of_only_fields_is_still_a_card() {
+        let d = json!({ "embeds": [{ "fields": [{ "name": "a", "value": "b" }] }] });
+        assert_eq!(extract_embeds(&d).len(), 1);
+    }
 }

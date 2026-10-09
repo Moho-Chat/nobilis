@@ -804,6 +804,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let reply_to = extract_reply(d);
                         let real_msg_id = d["id"].as_str().map(|s| s.to_string());
                         let avatar_url = author_avatar_url(author);
+                        if author["system"].as_bool() == Some(true) && kind == "dm" {
+                            state.runtime.set_buffer_read_only(state, &model::buffer_id(&account_id, &buffer_name), Some(super::people::OFFICIAL_ONLY));
+                        }
                         // Kept against their id as well as put on the message.
                         // A direct call's voice states carry no member object,
                         // so a face seen here is the only one its call view

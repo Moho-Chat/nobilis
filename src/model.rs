@@ -355,6 +355,10 @@ pub struct Buffer {
     /// room's, a Discord channel's. Absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
+    /// Why nothing can be said here, when that is so: a channel this account may
+    /// read but not write in, or Discord's own notices. Absent where it can.
+    #[serde(rename = "readOnly", default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<String>,
 }
 
 /// The rail entry a buffer belongs to when its protocol has no grouping of
@@ -506,6 +510,19 @@ pub struct Embed {
     /// Who made it: a video's channel, an article's byline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// The labelled lines a bot puts under the description: "Status - Open".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<EmbedField>,
+    /// The small line along the bottom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub footer: Option<String>,
+}
+
+/// One of an embed's labelled lines.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EmbedField {
+    pub name: String,
+    pub value: String,
 }
 
 /// Something on a message that can be pressed.
@@ -914,6 +931,7 @@ mod tests {
             low_priority: false,
             service_room: false,
             topic: None,
+            read_only: None,
         }
     }
 

@@ -1640,6 +1640,7 @@ impl Runtime {
             low_priority: false,
             service_room: false,
             topic: None,
+            read_only: None,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -3069,6 +3070,25 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.topic != new => {
                     b.topic = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// Says a conversation cannot be written in, and why; `None` says it can.
+    /// Broadcast only when it changes.
+    pub fn set_buffer_read_only(&self, state: &AppState, buffer_id: &str, reason: Option<&str>) {
+        let new = reason.map(str::to_string);
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.read_only != new => {
+                    b.read_only = new;
                     Some(b.clone())
                 }
                 _ => None,
