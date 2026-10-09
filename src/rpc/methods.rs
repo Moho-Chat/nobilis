@@ -735,6 +735,18 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "total": total, "matching": matching, "channels": channels })), None)
         }
 
+        // Reads a Discord conversation's latest messages again for their cards,
+        // for the ones stored before the card reader knew all of the shape.
+        "rereadDiscordEmbeds" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("rereadDiscordEmbeds requires \"bufferId\"".to_string()));
+            };
+            match backend::discord::reread_embeds(state, buffer_id).await {
+                Ok(updated) => (Some(serde_json::json!({ "updated": updated })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "getHighlightKeywords" => (
             Some(serde_json::json!({ "global": state.highlights.global() })),
             None,

@@ -1470,3 +1470,51 @@ mod embed_extract_tests {
         assert_eq!(extract_embeds(&d).len(), 1);
     }
 }
+
+/// Reads a conversation's latest messages again, for the cards on them.
+///
+/// For messages stored before the embed reader knew a part of the shape: the
+/// history that is kept is not fetched again, so a card saved with only its
+/// title stays that way for good. One request for the latest page - what opening
+/// a conversation costs anyway - and any message whose stored cards say less
+/// than the fresh ones is updated, without being marked edited. A message whose
+/// card was thin is also logged whole, so that what Discord really sent is on
+/// record.
+pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
+    let resp = http_client_for(&config.token)
+        .get(format!("{API_BASE}/channels/{channel_id}/messages"))
+        .query(&[("limit", "50")])
+        .header("Authorization", &config.token)
+        .send()
+        .await
+        .context("re-reading the conversation")?;
+    if !resp.status().is_success() {
+        bail!("Discord refused the request ({})", resp.status());
+    }
+    let messages: Vec<Value> = resp.json().await.context("reading the conversation")?;
+    let mut updated = 0;
+    for msg in &messages {
+        let Some(msg_id) = msg["id"].as_str() else { continue };
+        let Ok(Some(stored)) = state.store.get_message(buffer_id, msg_id) else { continue };
+        let fresh = extract_embeds(msg);
+        let thin = |e: &model::Embed| e.description.is_none() && e.fields.is_empty();
+        if !stored.embeds.is_empty() && stored.embeds.iter().all(thin) {
+            tracing::info!(
+                "discord: a message whose card was only a title, whole: embeds={} components={} flags={} type={}",
+                msg["embeds"],
+                msg["components"],
+                msg["flags"],
+                msg["type"]
+            );
+        }
+        let richer = |list: &[model::Embed]| list.iter().filter(|e| !thin(e)).count();
+        if richer(&fresh) > richer(&stored.embeds) && state.store.set_message_embeds(buffer_id, msg_id, &fresh).unwrap_or(false) {
+            state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": fresh }));
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
