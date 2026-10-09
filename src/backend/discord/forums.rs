@@ -86,6 +86,16 @@ fn post_card(thread: &Value, first: Option<&Value>, tags: &[Value], own_user_id:
     })
 }
 
+/// How long Discord asks to wait when its search index is not built yet, if
+/// that is what an answer says: code 110000, with `retry_after` in seconds.
+fn index_not_ready(answer: &Value) -> Option<std::time::Duration> {
+    if answer["code"].as_u64() != Some(110_000) {
+        return None;
+    }
+    let secs = answer["retry_after"].as_f64().unwrap_or(2.0).clamp(0.5, 6.0);
+    Some(std::time::Duration::from_secs_f64(secs))
+}
+
 /// A page of a forum's posts, newest or most recently active first.
 ///
 /// `offset` is how many have been read already. Where the search endpoint will
@@ -98,23 +108,46 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
     let tags = state.runtime.discord_forum_tags(account_id, &channel_id);
     let sort_by = if sort == "created" { "creation_time" } else { "last_message_time" };
 
-    let resp = http_client_for(&cfg.token)
-        .get(format!("{API_BASE}/channels/{channel_id}/threads/search"))
-        .query(&[
-            ("archived", "true"),
-            ("sort_by", sort_by),
-            ("sort_order", "desc"),
-            ("limit", &PAGE.to_string()),
-            ("offset", &offset.to_string()),
-            ("tag_setting", "match_some"),
-        ])
-        .header("Authorization", &cfg.token)
-        .send()
-        .await
-        .context("reading the forum")?;
-    if resp.status().is_success() {
+    // Discord builds a search index the first time one is asked for, and says so
+    // with a success status and an answer that holds no threads - "not yet
+    // available", with how long to wait. That looked like an empty forum. So it is
+    // asked again after the wait it names, a few times, before giving up on it.
+    let mut status = reqwest::StatusCode::OK;
+    for attempt in 0..3 {
+        let resp = http_client_for(&cfg.token)
+            .get(format!("{API_BASE}/channels/{channel_id}/threads/search"))
+            .query(&[
+                ("archived", "true"),
+                ("sort_by", sort_by),
+                ("sort_order", "desc"),
+                ("limit", &PAGE.to_string()),
+                ("offset", &offset.to_string()),
+                ("tag_setting", "match_some"),
+            ])
+            .header("Authorization", &cfg.token)
+            .send()
+            .await
+            .context("reading the forum")?;
+        status = resp.status();
+        if !status.is_success() {
+            break;
+        }
         let answer: Value = resp.json().await.context("reading the forum")?;
+        if let Some(wait) = index_not_ready(&answer) {
+            tracing::debug!("discord: the forum's search index is not ready (attempt {attempt}); waiting {wait:?}");
+            tokio::time::sleep(wait).await;
+            continue;
+        }
         let threads = answer["threads"].as_array().cloned().unwrap_or_default();
+        // A forum with nothing found by a search that answered properly is empty
+        // - but only the first page can say so; the plain lists below are asked
+        // too, so that a search that quietly knows nothing is not believed.
+        if threads.is_empty() && offset == 0 {
+            // Logged, so what a forum's search says when it says nothing is on record.
+            let said = answer.to_string();
+            tracing::info!("discord: the search of forum {channel_id} found no posts: {}", said.chars().take(400).collect::<String>());
+            break;
+        }
         let firsts = answer["first_messages"].as_array().cloned().unwrap_or_default();
         let posts: Vec<Value> = threads
             .iter()
@@ -127,17 +160,45 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
         let has_more = answer["has_more"].as_bool().unwrap_or(posts.len() >= PAGE);
         return Ok(json!({ "posts": posts, "hasMore": has_more, "total": answer["total_results"], "tags": tag_list(&tags) }));
     }
-    tracing::debug!("discord: thread search answered {}; using the plain lists", resp.status());
+    tracing::debug!("discord: thread search gave nothing usable ({status}); using the plain lists");
 
-    // The fallback: no first messages, no paging.
+    // The fallback: the plain lists, and no paging.
     let listed = list_threads(state, account_id, buffer_id).await?;
-    let mut posts: Vec<Value> = listed["threads"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| t["thread"].as_object().map(|_| post_card(&t["thread"], None, &tags, &cfg.user_id, cfg.display_name.as_deref())))
+    let threads: Vec<Value> = listed["threads"].as_array().into_iter().flatten().filter_map(|t| t["thread"].as_object().map(|_| t["thread"].clone())).collect();
+    let key = |t: &Value| -> i64 {
+        let last = t["last_message_id"].as_str().map(snowflake_secs).unwrap_or(0);
+        if sort == "created" { t["id"].as_str().map(snowflake_secs).unwrap_or(0) } else { last.max(t["id"].as_str().map(snowflake_secs).unwrap_or(0)) }
+    };
+    let mut threads = threads;
+    threads.sort_by_key(|t| std::cmp::Reverse(key(t)));
+    // The words that began each of the first few, which the lists do not carry:
+    // one request each for the posts at the top, which is what is on screen.
+    let http = http_client_for(&cfg.token);
+    let reads = threads.iter().take(10).map(|t| {
+        let id = t["id"].as_str().unwrap_or_default().to_string();
+        let http = http.clone();
+        let token = cfg.token.clone();
+        async move {
+            let resp = http
+                .get(format!("{API_BASE}/channels/{id}/messages"))
+                .query(&[("limit", "1"), ("after", "0")])
+                .header("Authorization", token)
+                .send()
+                .await
+                .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let list: Vec<Value> = resp.json().await.ok()?;
+            list.into_iter().next()
+        }
+    });
+    let firsts: Vec<Option<Value>> = futures::future::join_all(reads).await;
+    let posts: Vec<Value> = threads
+        .iter()
+        .enumerate()
+        .map(|(i, t)| post_card(t, firsts.get(i).and_then(|f| f.as_ref()), &tags, &cfg.user_id, cfg.display_name.as_deref()))
         .collect();
-    posts.sort_by_key(|p| std::cmp::Reverse(if sort == "created" { p["createdTs"].as_i64() } else { p["lastTs"].as_i64() }));
     Ok(json!({ "posts": posts, "hasMore": false, "total": posts.len(), "tags": tag_list(&tags) }))
 }
 
@@ -233,6 +294,15 @@ mod tests {
         assert_eq!(card["tags"][0]["name"], "Tools");
         assert_eq!(card["thumbnail"], "https://cdn.discordapp.com/a.png");
         assert_eq!(card["reaction"]["count"], 1);
+    }
+
+    #[test]
+    fn an_index_still_being_built_is_waited_for_not_read_as_an_empty_forum() {
+        let building = json!({ "message": "Index not yet available. Try again later", "code": 110000, "documents_indexed": 0, "retry_after": 3 });
+        assert_eq!(index_not_ready(&building), Some(std::time::Duration::from_secs(3)));
+        assert_eq!(index_not_ready(&json!({ "threads": [], "total_results": 0 })), None);
+        // A wait that is absurdly long is not taken.
+        assert_eq!(index_not_ready(&json!({ "code": 110000, "retry_after": 600 })), Some(std::time::Duration::from_secs(6)));
     }
 
     #[test]
