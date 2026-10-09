@@ -113,17 +113,23 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
     // available", with how long to wait. That looked like an empty forum. So it is
     // asked again after the wait it names, a few times, before giving up on it.
     let mut status = reqwest::StatusCode::OK;
-    for attempt in 0..3 {
+    // Asked with the archive included, then - if that finds nothing - without
+    // saying either way: which of the two Discord answers for a forum that has
+    // only live posts is not something this has been able to see.
+    for attempt in 0..4 {
+        let mut query: Vec<(&str, String)> = vec![
+            ("sort_by", sort_by.to_string()),
+            ("sort_order", "desc".to_string()),
+            ("limit", PAGE.to_string()),
+            ("offset", offset.to_string()),
+            ("tag_setting", "match_some".to_string()),
+        ];
+        if attempt != 3 {
+            query.push(("archived", "true".to_string()));
+        }
         let resp = http_client_for(&cfg.token)
             .get(format!("{API_BASE}/channels/{channel_id}/threads/search"))
-            .query(&[
-                ("archived", "true"),
-                ("sort_by", sort_by),
-                ("sort_order", "desc"),
-                ("limit", &PAGE.to_string()),
-                ("offset", &offset.to_string()),
-                ("tag_setting", "match_some"),
-            ])
+            .query(&query)
             .header("Authorization", &cfg.token)
             .send()
             .await
@@ -145,7 +151,12 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
         if threads.is_empty() && offset == 0 {
             // Logged, so what a forum's search says when it says nothing is on record.
             let said = answer.to_string();
-            tracing::info!("discord: the search of forum {channel_id} found no posts: {}", said.chars().take(400).collect::<String>());
+            tracing::info!("discord: the search of forum {channel_id} found no posts (attempt {attempt}): {}", said.chars().take(400).collect::<String>());
+            // The last variant is the one that decides; the earlier ones go on.
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                continue;
+            }
             break;
         }
         let firsts = answer["first_messages"].as_array().cloned().unwrap_or_default();

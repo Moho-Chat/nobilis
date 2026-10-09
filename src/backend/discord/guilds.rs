@@ -774,7 +774,12 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(resp) if resp.status().is_success() => resp,
             // A channel with no archive, or one this account may not read the
             // archive of, is not a failure worth refusing the whole list for.
-            Ok(_) => continue,
+            Ok(resp) => {
+                let status = resp.status();
+                let said = resp.text().await.unwrap_or_default();
+                tracing::info!("discord: the thread list {url} answered {status}: {}", said.chars().take(300).collect::<String>());
+                continue;
+            }
             Err(e) => {
                 tracing::debug!("discord: reading threads: {e}");
                 continue;
@@ -784,6 +789,11 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
             Ok(answer) => answer,
             Err(_) => continue,
         };
+        tracing::info!(
+            "discord: the thread list {url} held {} thread(s), {} under this channel",
+            answer["threads"].as_array().map(|t| t.len()).unwrap_or(0),
+            answer["threads"].as_array().map(|t| t.iter().filter(|t| t["parent_id"].as_str() == Some(channel_id.as_str())).count()).unwrap_or(0)
+        );
         for thread in answer["threads"].as_array().cloned().unwrap_or_default() {
             // The active list covers the whole guild, so the ones under other
             // channels are somebody else's question.
