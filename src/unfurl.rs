@@ -95,8 +95,23 @@ pub fn youtube_later(state: &AppState, account_id: &str, buffer_id: &str, msg_id
         (state.clone(), account_id.to_string(), buffer_id.to_string(), msg_id.to_string());
     tokio::spawn(async move {
         let Some(embed) = describe(&state, &account_id, &id).await else { return };
-        state.runtime.set_message_embeds(&state, &buffer_id, &msg_id, &[embed]);
+        add_embed(&state, &buffer_id, &msg_id, embed);
     });
+}
+
+/// Puts a card on a message beside whatever it already has.
+///
+/// More than one thing can describe a line - a YouTube link and a GIF in the
+/// same message, each worked out on its own and finishing in either order - so
+/// a card is added to what is there, not written over it. One that a message
+/// already carries of the same link is not added twice.
+pub fn add_embed(state: &AppState, buffer_id: &str, msg_id: &str, embed: Embed) {
+    let mut embeds = state.store.get_message(buffer_id, msg_id).ok().flatten().map(|m| m.embeds).unwrap_or_default();
+    if embeds.iter().any(|e| e.url.is_some() && e.url == embed.url) {
+        return;
+    }
+    embeds.push(embed);
+    state.runtime.set_message_embeds(state, buffer_id, msg_id, &embeds);
 }
 
 async fn describe(state: &AppState, account_id: &str, id: &str) -> Option<Embed> {

@@ -535,6 +535,20 @@ pub struct Embed {
     /// A glyph for the card's heading: "warning" for the ones that act on an account.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Where the moving picture itself is, for `kind` "gif": a video or an image
+    /// a window can play as it stands, which is not the page the link led to.
+    #[serde(rename = "mediaUrl", default, skip_serializing_if = "Option::is_none")]
+    pub media_url: Option<String>,
+    /// "video" or "image": which of the two `media_url` is, said outright because
+    /// the address often cannot say - a proxied one ends in whatever the original
+    /// did, and a guess from the ending is wrong for the ones that have none.
+    #[serde(rename = "mediaKind", default, skip_serializing_if = "Option::is_none")]
+    pub media_kind: Option<String>,
+    /// Its size, so the row can be laid out before a byte of it has arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
 }
 
 /// A link with its words.

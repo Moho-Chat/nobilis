@@ -1522,6 +1522,16 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
         }
 
+        // GIFs to browse: what is trending, or what matches a search. Found
+        // through a Discord account, and sent anywhere.
+        "listGifs" => {
+            let query = p_str_opt(params, "query").unwrap_or("");
+            match backend::discord::list_gifs(state, query).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The person has stepped away from the machine, or come back.
         //
         // Said once by whoever watches for it - the window, which can see how

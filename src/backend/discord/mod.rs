@@ -73,10 +73,12 @@ pub mod stickers;
 pub mod soundboard;
 pub mod events;
 pub mod forums;
+pub mod gifpicker;
 
 pub use calls::*;
 pub use commands::*;
 pub use forums::*;
+pub use gifpicker::*;
 pub use gateway::*;
 pub use guilds::*;
 pub use history::*;
