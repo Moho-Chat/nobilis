@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -130,3 +130,9 @@ libc = "0.2"
 # which it has. Reported upstream; drop this once a release carries the fix.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+
+# Local debug builds keep line numbers for backtraces and not the full debug
+# information, which made each one several times the size of the program. A
+# release build, which is what ships, is not affected.
+[profile.dev]
+debug = "line-tables-only"

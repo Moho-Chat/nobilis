@@ -7,9 +7,10 @@
 //! months ago was as loud in moho as anything else - and the busiest servers
 //! are exactly the ones people mute.
 //!
-//! Reading it, not writing it. Being *told* is the half that matters and the
-//! half that can go wrong quietly; setting it from here is a separate thing
-//! and can follow.
+//! Read first, and then written for a channel: muting one from here sets it on
+//! the account, so it is quiet on a phone as well as in this window - which
+//! is what somebody means by muting it. Discord answers with the account's
+//! settings as they now stand, and those are taken in like any others.
 //!
 //! Applying is deliberately its own step. The settings arrive in READY, and
 //! the channels they name arrive afterwards in GUILD_CREATE - so a mute
@@ -81,6 +82,42 @@ pub(super) fn note_settings(state: &AppState, account_id: &str, settings: &Value
     apply(state, account_id);
 }
 
+/// What to send to mute or unmute one channel: its own setting inside its
+/// guild's, with no end time - a mute that does not expire.
+fn override_body(channel_id: &str, muted: bool) -> Value {
+    json!({ "channel_overrides": { channel_id: { "muted": muted, "mute_config": null } } })
+}
+
+/// Mutes or unmutes a conversation on the account itself.
+///
+/// A muted channel still counts what was said to its reader - Discord keeps
+/// the mention badge on one - and stops sounding on every device signed in to
+/// the account. Direct messages are the `@me` scope.
+pub async fn set_muted(state: &AppState, account_id: &str, buffer_id: &str, muted: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let config = state.accounts.get_discord(account_id).context("no such account")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("not a Discord conversation")?;
+    let guild = state.runtime.get_discord_guild(buffer_id).unwrap_or_else(|| DM_SCOPE.to_string());
+    let response = send_write(
+        http_client_for(&config.token)
+            .patch(format!("{API_BASE}/users/@me/guilds/{guild}/settings"))
+            .header("Authorization", &config.token)
+            .json(&override_body(&channel_id, muted)),
+    )
+    .await?;
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("Discord refused to {} it (HTTP {})", if muted { "mute" } else { "unmute" }, status.as_u16());
+    }
+    // The account's settings as they now are. The gateway says the same a
+    // moment later; taking it here as well is what makes the change show
+    // without waiting on that.
+    if let Ok(now) = response.json::<Value>().await {
+        note_settings(state, account_id, &now);
+    }
+    Ok(())
+}
+
 /// Puts what is known onto the buffers that exist.
 ///
 /// Cheap enough to run whenever anything might have changed - one pass over
@@ -111,6 +148,15 @@ mod tests {
     use serde_json::json;
 
     const NOW: i64 = 1_800_000_000;
+
+    #[test]
+    fn muting_a_channel_is_its_own_setting_with_no_end() {
+        assert_eq!(
+            override_body("100", true),
+            json!({ "channel_overrides": { "100": { "muted": true, "mute_config": null } } })
+        );
+        assert_eq!(override_body("100", false)["channel_overrides"]["100"]["muted"], false);
+    }
 
     /// A muted guild and, inside it, one channel muted on its own. Both are
     /// read; neither is inferred from the other.

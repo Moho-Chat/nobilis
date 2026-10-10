@@ -341,7 +341,10 @@ pub async fn dispatch(
                 if after > 0 {
                     let limit = p_i64(params, "limit", 200);
                     return match state.store.messages_after(buffer_id, after, limit) {
-                        Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                        Ok(rows) => {
+                            crate::unfurl::backlog_later(state, buffer_id, &rows);
+                            (Some(serde_json::to_value(rows).unwrap_or_default()), None)
+                        }
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
@@ -444,6 +447,8 @@ pub async fn dispatch(
                         // previews are already showing, and re-signed links
                         // arrive as messageUpdated.
                         backend::discord::resign_stale_attachments(state.clone(), buffer_id.to_string(), &messages);
+                        // And any link in it that was stored without a card.
+                        crate::unfurl::backlog_later(state, buffer_id, &messages);
                         (Some(serde_json::to_value(messages).unwrap()), None)
                     }
                     Err(e) => (None, Some(format!("{e:#}"))),
@@ -964,6 +969,25 @@ pub async fn dispatch(
                 return (Some(ok_node()), None);
             }
             match backend::matrix::set_room_muted(state, &buffer.account_id, buffer_id, muted).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The same for a Discord channel or direct message: set on the
+        // account, so it is quiet on a phone as well.
+        "setDiscordChannelMuted" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setDiscordChannelMuted requires \"bufferId\"".to_string()));
+            };
+            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("discord:") {
+                return (Some(ok_node()), None);
+            }
+            match backend::discord::mutes::set_muted(state, &buffer.account_id, buffer_id, muted).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
@@ -1520,6 +1544,53 @@ pub async fn dispatch(
             };
 
             (Some(serde_json::json!({ "ok": true, "applied": applied })), None)
+        }
+
+        // GIFs to browse: what is trending, or what matches a search. Found
+        // through a Discord account, and sent anywhere.
+        "listGifs" => {
+            let query = p_str_opt(params, "query").unwrap_or("");
+            match backend::discord::list_gifs(state, query).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The person has stepped away from the machine, or come back.
+        //
+        // Said once by whoever watches for it - the window, which can see how
+        // long it has been since anything was touched - and applied here, where
+        // the accounts and what each was set to are known. Only an account that
+        // is online is moved to idle and back; anything somebody chose is theirs
+        // until they change it (see Runtime::auto_idle_applies).
+        "setUserIdle" => {
+            let idle = params.get("idle").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !state.runtime.set_user_idle(idle) {
+                return (Some(ok_node()), None);
+            }
+            let mut changed = Vec::new();
+            for account in state.runtime.list_accounts(state) {
+                let id = account.id.as_str();
+                if !crate::model::status_supported(id, "idle") || state.runtime.account_status(id) != "online" {
+                    continue;
+                }
+                let shown = state.runtime.effective_status(state, id);
+                let applied = if state.accounts.get_discord(id).is_some() {
+                    backend::discord::apply_session_presence(state, id, &shown)
+                } else if let Some(sender) = state.runtime.irc_sender(id) {
+                    let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
+                    sender.send(irc::proto::Command::AWAY(away)).is_ok()
+                } else {
+                    false
+                };
+                if applied {
+                    changed.push(serde_json::json!({ "accountId": id, "status": shown, "autoIdle": shown == "idle" }));
+                }
+            }
+            if !changed.is_empty() {
+                state.events.emit("accountStatus", serde_json::json!({ "accounts": changed }));
+            }
+            (Some(ok_node()), None)
         }
 
         // Asks for a channel's member list.

@@ -5,6 +5,7 @@ mod backend;
 mod commands;
 mod events;
 mod export;
+mod gifs;
 mod highlights;
 mod ignores;
 mod ipc;

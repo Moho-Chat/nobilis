@@ -187,6 +187,12 @@ pub(super) fn extract_body(d: &Value) -> Option<String> {
                     continue;
                 }
             }
+            // A GIF is drawn from its embed. Passing its media address on as
+            // well would be the same picture twice, and was how a GIF whose
+            // link was not in the text showed as a bare mp4 address.
+            if embed["type"].as_str() == Some("gifv") {
+                continue;
+            }
             if let Some(url) = embed["video"]["url"].as_str() {
                 parts.push(url.to_string());
             } else if let Some(url) = embed["image"]["url"].as_str() {
@@ -704,6 +710,9 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
             if embed["type"].as_str() == Some("safety_system_notification") {
                 return Some(safety_notice(embed));
             }
+            if embed["type"].as_str() == Some("gifv") {
+                return gif_embed(embed);
+            }
             let title = embed["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let description = embed["description"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let fields: Vec<model::EmbedField> = embed["fields"]
@@ -740,6 +749,41 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
             })
         })
         .collect()
+}
+
+/// A GIF from Tenor, Klipy, Giphy or whoever Discord unfurled it from.
+///
+/// Discord answers a link to one with an embed of type `gifv` whose `video` is
+/// the moving picture itself - an mp4 - and whose `url` is the page that was
+/// linked, which has no file extension to recognise it by. That is why a
+/// posted GIF used to show as nothing but its address.
+///
+/// The proxied copy is preferred where there is one: it is served from
+/// Discord's own CDN, so reading a message does not tell a third party's server
+/// who read it, which is the same arrangement Discord's own client makes.
+fn gif_embed(embed: &Value) -> Option<Embed> {
+    let video = &embed["video"];
+    let from_video = video["proxy_url"].as_str().or_else(|| video["url"].as_str()).filter(|u| !u.is_empty());
+    let media = from_video
+        .or_else(|| embed["thumbnail"]["proxy_url"].as_str().filter(|u| !u.is_empty()))
+        .or_else(|| embed["thumbnail"]["url"].as_str().filter(|u| !u.is_empty()))?;
+    let size = |key: &str| {
+        video[key]
+            .as_u64()
+            .or_else(|| embed["thumbnail"][key].as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n > 0)
+    };
+    Some(Embed {
+        kind: Some("gif".to_string()),
+        url: embed["url"].as_str().map(str::to_string),
+        media_url: Some(media.to_string()),
+        media_kind: Some(if from_video.is_some() { "video" } else { "image" }.to_string()),
+        width: size("width"),
+        height: size("height"),
+        provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+        ..Default::default()
+    })
 }
 
 /// One of the platform's own notices to an account - a warning, a removed
@@ -1618,5 +1662,65 @@ mod safety_notice_tests {
         let cta = e[0].cta.as_ref().unwrap();
         assert_eq!(cta.label, "See details in Discord");
         assert!(cta.url.is_none());
+    }
+}
+
+#[cfg(test)]
+mod gif_tests {
+    use super::{extract_body, extract_embeds};
+    use serde_json::json;
+
+    /// A Tenor GIF as Discord unfurls it.
+    fn gifv() -> serde_json::Value {
+        json!({
+            "id": "1", "channel_id": "2", "content": "https://tenor.com/view/rickroll-gif-22954713",
+            "embeds": [{
+                "type": "gifv", "url": "https://tenor.com/view/rickroll-gif-22954713",
+                "provider": { "name": "Tenor", "url": "https://tenor.co" },
+                "thumbnail": { "url": "https://media.tenor.com/x.png", "width": 640, "height": 640 },
+                "video": { "url": "https://media.tenor.com/x.mp4", "proxy_url": "https://images-ext-1.discordapp.net/external/x.mp4", "width": 640, "height": 640 }
+            }]
+        })
+    }
+
+    #[test]
+    fn a_gifv_is_a_gif_with_somewhere_to_play_it() {
+        let e = extract_embeds(&gifv());
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].kind.as_deref(), Some("gif"));
+        assert_eq!(e[0].url.as_deref(), Some("https://tenor.com/view/rickroll-gif-22954713"));
+        assert_eq!((e[0].width, e[0].height), (Some(640), Some(640)));
+        assert_eq!(e[0].provider.as_deref(), Some("Tenor"));
+        assert_eq!(e[0].media_kind.as_deref(), Some("video"));
+    }
+
+    #[test]
+    fn a_gifv_with_only_a_thumbnail_is_a_picture() {
+        let d = json!({ "embeds": [{ "type": "gifv", "url": "https://x/y", "thumbnail": { "url": "https://x/t.png" } }] });
+        assert_eq!(extract_embeds(&d)[0].media_kind.as_deref(), Some("image"));
+    }
+
+    #[test]
+    fn it_is_played_from_discords_own_copy_so_the_third_party_is_not_told() {
+        let e = extract_embeds(&gifv());
+        assert_eq!(e[0].media_url.as_deref(), Some("https://images-ext-1.discordapp.net/external/x.mp4"));
+        let mut direct = gifv();
+        direct["embeds"][0]["video"].as_object_mut().unwrap().remove("proxy_url");
+        assert_eq!(extract_embeds(&direct)[0].media_url.as_deref(), Some("https://media.tenor.com/x.mp4"));
+    }
+
+    #[test]
+    fn a_gifv_with_no_picture_anywhere_is_not_one() {
+        let d = json!({ "embeds": [{ "type": "gifv", "url": "https://tenor.com/view/x" }] });
+        assert!(extract_embeds(&d).is_empty());
+    }
+
+    #[test]
+    fn the_picture_is_not_also_added_to_the_words() {
+        // Whether or not the link is in the text: the embed is what carries it.
+        assert_eq!(extract_body(&gifv()).as_deref(), Some("https://tenor.com/view/rickroll-gif-22954713"));
+        let mut quiet = gifv();
+        quiet["content"] = json!("");
+        assert_eq!(extract_body(&quiet), None);
     }
 }
