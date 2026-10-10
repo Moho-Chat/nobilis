@@ -142,21 +142,32 @@ async fn describe(state: &AppState, account_id: &str, id: &str) -> Option<Embed>
     // Asked up to three times. Over Tor - Sneedchat's route - YouTube
     // regularly turns an exit node away with a 403 or 429 that says nothing
     // about the video, and a later try leaves by another one.
+    //
+    // And when oEmbed is refused outright, the video's own page is read for
+    // the same two facts. YouTube answers oEmbed with a 403 to every Tor exit,
+    // whichever circuit asks, while the page itself loads - so for an account
+    // on Tor the page is the only way a card is ever made.
     let mut found = None;
     for attempt in 0..3 {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(3 * attempt)).await;
         }
-        let Ok(response) = client.get(&asked).send().await else { continue };
-        let status = response.status();
-        if status.is_success() {
-            let Ok(answer) = response.json::<serde_json::Value>().await else { continue };
-            found = Some(parse(&answer, &watch));
-            break;
-        } else if answers_for_the_video(status.as_u16()) {
-            // Private, removed, or not embeddable: YouTube's answer, and it
-            // will be the same next time.
-            found = Some(None);
+        if let Ok(response) = client.get(&asked).send().await {
+            let status = response.status();
+            if status.is_success() {
+                if let Ok(answer) = response.json::<serde_json::Value>().await {
+                    found = Some(parse(&answer, &watch));
+                    break;
+                }
+            } else if answers_for_the_video(status.as_u16()) {
+                // Private, removed, or not embeddable: YouTube's answer, and it
+                // will be the same next time.
+                found = Some(None);
+                break;
+            }
+        }
+        if let Some(card) = read_page(&client, &watch).await {
+            found = Some(Some(card));
             break;
         }
     }
@@ -187,6 +198,73 @@ fn parse(answer: &serde_json::Value, watch: &str) -> Option<Embed> {
         provider: Some(text("provider_name").unwrap_or_else(|| "YouTube".to_string())),
         author: text("author_name"),
         // YouTube's own red, the bar down the card's edge.
+        color: Some(0xFF0000),
+        ..Default::default()
+    })
+}
+
+/// The card from the video's own page, for when oEmbed will not answer.
+///
+/// The page is a JavaScript application that carries its data inline, and
+/// the title and channel are in it as JSON. Nothing promises where, so this
+/// looks for the renderers that have held them and takes the first that is
+/// there; a page that has none of them - a consent wall, a removed video, a
+/// layout YouTube has since changed - makes no card, the same as no answer.
+async fn read_page(client: &reqwest::Client, watch: &str) -> Option<Embed> {
+    let response = client
+        .get(watch)
+        .header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0")
+        .header("Accept-Language", "en-US,en;q=0.9")
+        // Declines the consent page an exit in Europe is otherwise sent to.
+        .header("Cookie", "SOCS=CAI")
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    parse_page(&response.text().await.ok()?, watch)
+}
+
+/// The JSON string that follows `marker`, decoded.
+fn string_after(page: &str, marker: &str) -> Option<String> {
+    let rest = &page[page.find(marker)? + marker.len()..];
+    let mut end = None;
+    let mut escaped = false;
+    for (i, c) in rest.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => {
+                end = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let literal = format!("\"{}\"", &rest[..end?]);
+    serde_json::from_str::<String>(&literal).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// The card from a watch page's text. None without a title.
+fn parse_page(page: &str, watch: &str) -> Option<Embed> {
+    let title = [
+        "\"videoDescriptionHeaderRenderer\":{\"title\":{\"runs\":[{\"text\":\"",
+        "\"videoPrimaryInfoRenderer\":{\"title\":{\"runs\":[{\"text\":\"",
+        "\"playerOverlayVideoDetailsRenderer\":{\"title\":{\"simpleText\":\"",
+    ]
+    .iter()
+    .find_map(|marker| string_after(page, marker))?;
+    // The channel follows the title in the same renderer.
+    let author = page
+        .find("\"videoDescriptionHeaderRenderer\":{")
+        .and_then(|at| string_after(&page[at..], "\"channel\":{\"simpleText\":\""))
+        .or_else(|| string_after(page, "\"ownerChannelName\":\""));
+    Some(Embed {
+        title: Some(title),
+        url: Some(watch.to_string()),
+        provider: Some("YouTube".to_string()),
+        author,
         color: Some(0xFF0000),
         ..Default::default()
     })
@@ -250,5 +328,22 @@ mod tests {
         assert_eq!(card.provider.as_deref(), Some("YouTube"));
         assert_eq!(card.url.as_deref(), Some(watch));
         assert!(parse(&serde_json::json!({ "title": "  ", "author_name": "x" }), watch).is_none());
+    }
+    #[test]
+    fn a_card_from_the_page_when_oembed_is_refused() {
+        let watch = "https://www.youtube.com/watch?v=_-agl0pOQfs";
+        let page = r#"<script>var x={"contents":{"videoDescriptionHeaderRenderer":{"title":{"runs":[{"text":"Insane Clown Posse -  \"Miracles\" (Official Music Video)"}]},"channel":{"simpleText":"Psychopathic Records"},"views":{"simpleText":"19,675,62"}}}}</script>"#;
+        let card = parse_page(page, watch).unwrap();
+        assert_eq!(card.title.as_deref(), Some("Insane Clown Posse -  \"Miracles\" (Official Music Video)"));
+        assert_eq!(card.author.as_deref(), Some("Psychopathic Records"));
+        assert_eq!(card.url.as_deref(), Some(watch));
+        assert_eq!(card.provider.as_deref(), Some("YouTube"));
+        // The older layout, which names no channel in the same place.
+        let page = r#"{"videoPrimaryInfoRenderer":{"title":{"runs":[{"text":"A \u0026 B"}]},"viewCount":{}}}"#;
+        let card = parse_page(page, watch).unwrap();
+        assert_eq!(card.title.as_deref(), Some("A & B"));
+        assert_eq!(card.author, None);
+        // A consent wall, or a removed video, has no title: no card.
+        assert!(parse_page("<html><title> - YouTube</title></html>", watch).is_none());
     }
 }
