@@ -4551,9 +4551,36 @@ impl Runtime {
     /// never actually stored, e.g. seeing a message for the first time
     /// that already carries prior edit history.
     pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
+        // An edit from a service that describes no links itself says nothing
+        // about cards, and is not a reason to lose them: the ones the daemon
+        // put on the message stay while their link is still in the text.
+        let describes_nothing = embeds.is_empty();
+        let embeds: Vec<Embed> = if describes_nothing {
+            state
+                .store
+                .get_message(buffer_id, msg_id)
+                .ok()
+                .flatten()
+                .map(|m| m.embeds)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.url.as_deref().is_some_and(|u| body.contains(u) || crate::unfurl::youtube_id(u).is_some_and(|id| crate::unfurl::youtube_id(body).as_deref() == Some(id.as_str()))))
+                .collect()
+        } else {
+            embeds.to_vec()
+        };
+        let embeds = &embeds[..];
         match state.store.update_message_body(buffer_id, msg_id, body, embeds, attachments) {
             Ok(true) => {
                 state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "editedTs": chrono::Utc::now().timestamp(), "embeds": embeds, "attachments": attachments }));
+                // A link the edit added is described like any other; one
+                // already described is not asked about again.
+                if describes_nothing {
+                    if let Some(buffer) = self.get_buffer(buffer_id) {
+                        crate::unfurl::youtube_later(state, &buffer.account_id, buffer_id, msg_id, body);
+                        crate::gifs::gif_later(state, &buffer.account_id, buffer_id, msg_id, body);
+                    }
+                }
                 true
             }
             Ok(false) => false,

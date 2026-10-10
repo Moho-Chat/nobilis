@@ -341,7 +341,10 @@ pub async fn dispatch(
                 if after > 0 {
                     let limit = p_i64(params, "limit", 200);
                     return match state.store.messages_after(buffer_id, after, limit) {
-                        Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                        Ok(rows) => {
+                            crate::unfurl::backlog_later(state, buffer_id, &rows);
+                            (Some(serde_json::to_value(rows).unwrap_or_default()), None)
+                        }
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
@@ -444,6 +447,8 @@ pub async fn dispatch(
                         // previews are already showing, and re-signed links
                         // arrive as messageUpdated.
                         backend::discord::resign_stale_attachments(state.clone(), buffer_id.to_string(), &messages);
+                        // And any link in it that was stored without a card.
+                        crate::unfurl::backlog_later(state, buffer_id, &messages);
                         (Some(serde_json::to_value(messages).unwrap()), None)
                     }
                     Err(e) => (None, Some(format!("{e:#}"))),

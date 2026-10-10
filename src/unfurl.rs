@@ -99,6 +99,44 @@ pub fn youtube_later(state: &AppState, account_id: &str, buffer_id: &str, msg_id
     });
 }
 
+/// Messages already asked about, and when. A conversation is read many times;
+/// a link that could not be described should be tried again, but not on every
+/// glance.
+static ASKED: LazyLock<Mutex<HashMap<String, std::time::Instant>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+const ASK_AGAIN_AFTER: Duration = Duration::from_secs(600);
+/// How many of a page's messages are described at once, newest first.
+const BACKLOG_LIMIT: usize = 30;
+
+/// Describes the links in messages that were stored without a card.
+///
+/// Live messages are described as they arrive (`Runtime::record_message_at`),
+/// but not everything reaches the store that way: Matrix history read back
+/// from the server, Discord's catch-up, scrollback from before cards existed,
+/// and a link that could not be described when it was said. Reading a
+/// conversation is the moment to make up for those, whichever service it is
+/// on.
+pub fn backlog_later(state: &AppState, buffer_id: &str, messages: &[crate::model::Message]) {
+    let Some(account_id) = state.runtime.get_buffer(buffer_id).map(|b| b.account_id) else { return };
+    let now = std::time::Instant::now();
+    let mut asked = ASKED.lock().unwrap();
+    if asked.len() > 4096 {
+        asked.clear();
+    }
+    for message in messages.iter().rev().filter(|m| {
+        m.embeds.is_empty()
+            && m.kind != "system"
+            && (youtube_id(&m.body).is_some() || crate::gifs::find_link(&m.body).is_some())
+    }).take(BACKLOG_LIMIT) {
+        let key = format!("{buffer_id}\u{0}{}", message.id);
+        if asked.get(&key).is_some_and(|at| now.duration_since(*at) < ASK_AGAIN_AFTER) {
+            continue;
+        }
+        asked.insert(key, now);
+        youtube_later(state, &account_id, buffer_id, &message.id, &message.body);
+        crate::gifs::gif_later(state, &account_id, buffer_id, &message.id, &message.body);
+    }
+}
+
 /// Puts a card on a message beside whatever it already has.
 ///
 /// More than one thing can describe a line - a YouTube link and a GIF in the
