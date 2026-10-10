@@ -974,6 +974,25 @@ pub async fn dispatch(
             }
         }
 
+        // The same for a Discord channel or direct message: set on the
+        // account, so it is quiet on a phone as well.
+        "setDiscordChannelMuted" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("setDiscordChannelMuted requires \"bufferId\"".to_string()));
+            };
+            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+                return (None, Some("no such conversation".to_string()));
+            };
+            if !buffer.account_id.starts_with("discord:") {
+                return (Some(ok_node()), None);
+            }
+            match backend::discord::mutes::set_muted(state, &buffer.account_id, buffer_id, muted).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "listMentionRoles" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("listMentionRoles requires \"bufferId\"".to_string()));
