@@ -130,3 +130,9 @@ libc = "0.2"
 # which it has. Reported upstream; drop this once a release carries the fix.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+
+# Local debug builds keep line numbers for backtraces and not the full debug
+# information, which made each one several times the size of the program. A
+# release build, which is what ships, is not affected.
+[profile.dev]
+debug = "line-tables-only"
