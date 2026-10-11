@@ -4,7 +4,7 @@ A chat daemon. It speaks IRC, Discord, Matrix, Kick and Sneedchat (SneedChat, th
 into Kiwi Farms), and translates all of them into one unified JSON model — accounts, buffers, messages
 — served over a Unix socket.
 
-Frontends talk to that model and never to a protocol. Two exist today: [moho](https://git.salastil.com/Salastil/moho),
+Frontends talk to that model and never to a protocol. Two exist today: [moho](https://github.com/Moho-Chat/moho),
 an Electron desktop client, and dms-chat, a Quickshell/QML shell plugin.
 
 ## Why a daemon
