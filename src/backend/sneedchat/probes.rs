@@ -77,6 +77,12 @@ pub(super) mod live_probe {
                 println!("{i}: {}", line.trim().chars().take(400).collect::<String>());
             }
         }
+
+        // And the part that can fail: the reader this client really uses must
+        // still find the rooms on the page the site really serves.
+        let rooms = crate::backend::sneedchat::rooms::parse_rooms(&body);
+        println!("{} room(s) read: {:?}", rooms.len(), rooms.iter().map(|r| r.name.as_str()).collect::<Vec<_>>());
+        assert!(!rooms.is_empty(), "the room switcher is no longer where parse_rooms looks for it");
     }
 
     /// Whether the session this account already holds is still good.
@@ -146,13 +152,8 @@ pub(super) mod live_probe {
             pow::clear(&http, &login, 8).await.expect("failed to clear the gate");
             page = http.get(&login).await.expect("GET after clearing gate failed");
         }
-        let sitekey = page
-            .body
-            .split("data-sitekey=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .expect("no data-sitekey on the login page")
-            .to_string();
+        let sitekey = crate::backend::sneedchat::captcha::site_key(&page.body)
+            .expect("site_key finds no captcha widget on the login page - the markup has changed");
         println!("sitekey: {sitekey}");
 
         // The widget opens with a GET of `<apiBase>/start?key=...`; every
@@ -228,7 +229,7 @@ pub(super) mod live_probe {
                     println!("  {name} = {shown:?}");
                 }
             }
-            None => println!("!! no /login/login form section found - the layout has changed"),
+            None => panic!("no /login/login form section found - the layout has changed"),
         }
 
         println!("--- captcha markers anywhere on the page ---");

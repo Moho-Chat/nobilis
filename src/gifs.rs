@@ -379,8 +379,20 @@ mod tests {
     fn what_was_looked_at_is_remembered_until_the_table_is_full() {
         remember("https://tenor.com/view/remember-a", None);
         remember("https://tenor.com/view/remember-b", Some(Embed::default()));
+        {
+            let known = KNOWN.lock().unwrap();
+            assert!(known.contains_key("https://tenor.com/view/remember-a"), "a page that said nothing is remembered too");
+            assert!(known.get("https://tenor.com/view/remember-b").is_some_and(|e| e.is_some()));
+        }
+
+        // And until the table is full: past the limit it starts again rather
+        // than growing for as long as the daemon runs, and what was just
+        // learned is never the thing thrown away.
+        for i in 0..KNOWN_LIMIT + 5 {
+            remember(&format!("https://tenor.com/view/fill-{i}"), None);
+        }
         let known = KNOWN.lock().unwrap();
-        assert!(known.contains_key("https://tenor.com/view/remember-a"), "a page that said nothing is remembered too");
-        assert!(known.get("https://tenor.com/view/remember-b").is_some_and(|e| e.is_some()));
+        assert!(known.len() <= KNOWN_LIMIT, "{} remembered", known.len());
+        assert!(known.contains_key(&format!("https://tenor.com/view/fill-{}", KNOWN_LIMIT + 4)), "the newest is kept");
     }
 }

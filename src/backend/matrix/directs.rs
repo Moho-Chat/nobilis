@@ -118,35 +118,6 @@ pub(super) async fn record(state: &AppState, account_id: &str, peer_user_id: &st
     }
 }
 
-/// The list without a room, wherever it appears.
-///
-/// A person is dropped entirely when their last room goes: an empty array
-/// left behind is a person the account claims to have a DM list for and no
-/// DMs with, which other clients render as an empty conversation.
-///
-/// Only the tests call it. The live path rewrites the whole map rather than
-/// subtracting from it, which is a difference worth keeping an eye on: this
-/// is the rule the tests pin down, and nothing enforces that the live path
-/// still agrees with it.
-#[cfg(test)]
-pub fn without(content: &Value, room_id: &str) -> Value {
-    let Some(by_user) = content.as_object() else { return json!({}) };
-    let mut out = Map::new();
-    for (user_id, rooms) in by_user {
-        let kept: Vec<Value> = rooms
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| r.as_str() != Some(room_id))
-            .cloned()
-            .collect();
-        if !kept.is_empty() {
-            out.insert(user_id.clone(), Value::Array(kept));
-        }
-    }
-    Value::Object(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,18 +164,5 @@ mod tests {
         // conversation.
         let again = with(&after, "@anna:poa.st", "!new:poa.st");
         assert_eq!(again["@anna:poa.st"], json!(["!one:poa.st", "!new:poa.st"]));
-    }
-
-    #[test]
-    fn removing_a_room_takes_the_person_with_it_when_it_was_the_last_one() {
-        let before = json!({ "@anna:poa.st": ["!one:poa.st", "!two:poa.st"], "@bob:poa.st": ["!three:poa.st"] });
-        let after = without(&before, "!three:poa.st");
-        assert_eq!(after["@anna:poa.st"], json!(["!one:poa.st", "!two:poa.st"]));
-        // Not an empty list: a person with no rooms reads to other clients
-        // as a conversation with nothing in it.
-        assert!(after.get("@bob:poa.st").is_none());
-
-        let one_left = without(&before, "!one:poa.st");
-        assert_eq!(one_left["@anna:poa.st"], json!(["!two:poa.st"]));
     }
 }

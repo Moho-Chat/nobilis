@@ -595,21 +595,6 @@ async fn openid_again(state: &AppState, account_id: &str) -> anyhow::Result<Valu
     .context("asking the homeserver to vouch for this account")
 }
 
-/// Who to call, and who to wait for./// Who to call, and who to wait for./// Who to call, and who to wait for.
-///
-/// Both ends of every pair see each other arrive, and if both call, both
-/// answer, and the call collides with itself. So the rule is one line and the
-/// same on both sides: the smaller id calls the larger. It has to be a
-/// property of the pair rather than of who arrived first, because "first" is
-/// not something two clients can agree on.
-///
-/// Kept for the tests that pin the rule down; nothing in the call path
-/// asks it yet, which is its own gap rather than a reason to lose it.
-#[cfg(test)]
-pub fn should_offer(own_key: &str, their_key: &str) -> bool {
-    own_key < their_key
-}
-
 #[cfg(test)]
 mod member_tests {
     use super::*;
@@ -697,17 +682,6 @@ mod member_tests {
             membership_state_key("@me:example.org", "DEV", "org.matrix.msc3757.10"),
             "@me:example.org_DEV_m.call"
         );
-    }
-
-    #[test]
-    fn exactly_one_end_of_every_pair_offers() {
-        // Whichever way round the two clients ask, they must not agree.
-        assert!(should_offer("@a:example.org|AAA", "@b:example.org|BBB"));
-        assert!(!should_offer("@b:example.org|BBB", "@a:example.org|AAA"));
-        // Including two devices of the same person, which is the case that
-        // makes a user-id comparison alone wrong.
-        assert!(should_offer("@a:example.org|AAA", "@a:example.org|ZZZ"));
-        assert!(!should_offer("@a:example.org|ZZZ", "@a:example.org|AAA"));
     }
 
     /// The fallback rides along whether or not the homeserver offered a relay:

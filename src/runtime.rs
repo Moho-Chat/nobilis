@@ -5416,7 +5416,8 @@ impl Runtime {
         );
         sweep_set!(
             discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,
-            emoji_unrestricted,
+            emoji_unrestricted, wants_connected, discord_gated, irc_monitor, replaying,
+            silenced, irc_rostered,
         );
         sweep_set_pairs!(matrix_previews_off);
     }
@@ -5444,8 +5445,12 @@ mod forget_tests {
                 // Sets as well as maps. Three of them escaped this test for
                 // as long as it only looked for HashMap - which is the
                 // failure it exists to catch, happening to itself.
-                let name = line.split(": Mutex<HashMap<").next()?.split(": Mutex<HashSet<").next()?;
-                ((line.contains(": Mutex<HashMap<") || line.contains(": Mutex<HashSet<")) && !name.contains(' '))
+                // Also the ones written `std::collections::HashSet<`, which
+                // the plain match above never saw: `wants_connected`,
+                // `irc_monitor`, `silenced` and others were outside the test,
+                // and outside the sweep with it.
+                let (name, ty) = line.split_once(": Mutex<")?;
+                ((ty.starts_with("HashMap<") || ty.starts_with("HashSet<") || ty.starts_with("std::collections::HashSet<")) && !name.contains(' '))
                     .then_some(name)
             })
             .collect();
@@ -5457,8 +5462,46 @@ mod forget_tests {
         let sweep = src.find("pub fn forget_account").expect("the sweep");
         let end = src[sweep..].find("\n    }\n}").expect("its end") + sweep;
         let sweep_body = &src[sweep..end];
-        let missing: Vec<&&str> = fields.iter().filter(|f| !sweep_body.contains(**f)).collect();
+        // As a whole word: `buffers` is inside `restored_buffers`, and
+        // `presence` inside `matrix_presence`, so a plain substring test
+        // passed with either of them missing from the sweep.
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let swept = |name: &str| {
+            sweep_body.match_indices(name).any(|(at, _)| {
+                let before = sweep_body[..at].chars().next_back();
+                let after = sweep_body[at + name.len()..].chars().next();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            })
+        };
+        let missing: Vec<&&str> = fields.iter().filter(|f| !swept(f)).collect();
         assert!(missing.is_empty(), "these maps would survive removing an account: {missing:?}");
+    }
+
+    /// The sweep itself, run: the other test reads the list, this one checks
+    /// that what it names is actually emptied - for this account and its
+    /// buffers, and for nobody else's.
+    #[test]
+    fn forgetting_an_account_empties_it_and_only_it() {
+        let rt = super::Runtime::new();
+        rt.set_own_identity("irc:a", "alice");
+        rt.set_own_identity("irc:ab", "bob");
+        rt.matrix_rooms.lock().unwrap().insert("irc:a|#one".into(), "!one".into());
+        rt.matrix_rooms.lock().unwrap().insert("irc:ab|#one".into(), "!one".into());
+        rt.set_wants_connected("irc:a", true);
+        rt.set_wants_connected("irc:ab", true);
+        rt.silenced.lock().unwrap().insert("irc:a|#one".into());
+        rt.silenced.lock().unwrap().insert("irc:ab|#one".into());
+        rt.discord_members.lock().unwrap().insert(("irc:a|#one".into(), "u".into()), serde_json::json!({}));
+
+        rt.forget_account("irc:a");
+
+        assert!(rt.own_identity.lock().unwrap().get("irc:a").is_none());
+        assert!(rt.own_identity.lock().unwrap().get("irc:ab").is_some(), "a longer id that starts the same is another account");
+        assert_eq!(rt.matrix_rooms.lock().unwrap().keys().collect::<Vec<_>>(), ["irc:ab|#one"]);
+        assert!(rt.discord_members.lock().unwrap().is_empty());
+        assert!(!rt.wants_connected("irc:a"), "a removed account is not wanted online");
+        assert!(rt.wants_connected("irc:ab"));
+        assert_eq!(rt.silenced.lock().unwrap().len(), 1);
     }
 
     /// The whole of forgetting an account rests on this one test, so it is

@@ -112,12 +112,13 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
 /// number is not a reason to hammer, and one asking for half an hour is not a
 /// wait anybody would sit through inside a request.
 pub(super) fn retry_after(resp: &reqwest::Response) -> Duration {
-    let seconds = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(1.0);
+    pause_for(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()))
+}
+
+/// The wait a `Retry-After` value asks for; none given, or none that reads as
+/// a number, is a second.
+fn pause_for(seconds: Option<&str>) -> Duration {
+    let seconds = seconds.and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
     Duration::from_millis(((seconds.max(0.0) * 1000.0) as u64).clamp(200, 30_000))
 }
 
@@ -217,18 +218,8 @@ pub(super) fn form_errors(resp: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod pacing_tests {
+    use super::pause_for;
     use std::time::Duration;
-
-    /// The wait Discord asked for, read the way it sends it: seconds, with a
-    /// decimal point, in a header.
-    ///
-    /// Clamped at both ends on purpose - a limit with no number is not a
-    /// reason to hammer, and a half-hour one is not a wait to sit through
-    /// inside a request - and this is the arithmetic that decides both.
-    fn pause_for(seconds: Option<&str>) -> Duration {
-        let seconds = seconds.and_then(|v| v.parse::<f64>().ok()).unwrap_or(1.0);
-        Duration::from_millis(((seconds.max(0.0) * 1000.0) as u64).clamp(200, 30_000))
-    }
 
     #[test]
     fn a_wait_is_taken_as_asked() {

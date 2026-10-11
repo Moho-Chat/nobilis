@@ -600,7 +600,8 @@ pub(super) fn describe_action(event: &str, p: &serde_json::Value) -> Option<(&'s
         "StreamHostEvent" => {
             let who = text("host_username").or_else(who)?;
             Some(("raid", match p.get("number_viewers").and_then(|v| v.as_u64()) {
-                Some(n) if n > 0 => format!("{who} raided with {n} viewers"),
+                Some(1) => format!("{who} raided with 1 viewer"),
+                Some(n) if n > 1 => format!("{who} raided with {n} viewers"),
                 _ => format!("{who} raided the channel"),
             }))
         }
@@ -1334,7 +1335,7 @@ mod tests {
         let none = serde_json::json!({ "host_username": "friend", "number_viewers": 0 });
         assert_eq!(describe_action("StreamHostEvent", &none).map(|(_, l)| l).as_deref(), Some("friend raided the channel"));
         let one = serde_json::json!({ "host_username": "friend", "number_viewers": 1 });
-        assert_eq!(describe_action("StreamHostEvent", &one).map(|(_, l)| l).as_deref(), Some("friend raided with 1 viewers"));
+        assert_eq!(describe_action("StreamHostEvent", &one).map(|(_, l)| l).as_deref(), Some("friend raided with 1 viewer"));
         assert_eq!(action_card("StreamHostEvent", &none).unwrap().title, None, "no count to put on the card");
     }
 

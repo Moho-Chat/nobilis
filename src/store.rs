@@ -1606,7 +1606,7 @@ mod tests {
         let gone = s.forget_account("matrix:@a:server").expect("forgetting");
         assert_eq!(gone, 2, "should have taken exactly its own two");
 
-        let left = |buffer: &str| s.get_backlog(buffer, 50, 0).expect("backlog").len();
+        let left = |buffer: &str| s.get_backlog(buffer, 0, 50).expect("backlog").len();
         assert_eq!(left("matrix:@a:server|!room"), 0);
         assert_eq!(left("matrix:@a:server|!other"), 0);
         assert_eq!(left("matrix:@a:server.uk|!room"), 1, "a different account was emptied");

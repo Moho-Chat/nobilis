@@ -517,7 +517,7 @@ mod tests {
         assert!(matches!(id_in_subscription("chatrooms.53906513.v2"), Some(Subscribed::Chatroom(53906513))));
     }
 
-    /// A poll is one thing happening over a minute    /// A poll is one thing happening over a minute, not a stream of events -
+    /// A poll is one thing happening over a minute, not a stream of events -
     /// Kick sends its update on every vote, and a line each would bury the
     /// conversation the poll is about.
     #[test]
