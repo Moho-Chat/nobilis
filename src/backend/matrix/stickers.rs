@@ -346,6 +346,8 @@ mod place_tests {
         assert!(parse_place("the pub").is_none());
         assert!(parse_place("91.0, 0.0").is_none());
         assert!(parse_place("0.0, 181.0").is_none());
+        // A latitude past the pole is somebody's phone number, not a place.
+        assert!(parse_place("910, 20").is_none());
     }
 
     /// Coordinates are written with a space after the comma as often as not,
@@ -363,6 +365,11 @@ mod place_tests {
         assert!(label.is_empty());
 
         assert!(split_place_and_label("just some words").is_none());
+
+        // A map link is a place in one word, and the name still follows it.
+        let (place, label) = split_place_and_label("https://www.openstreetmap.org/#map=15/51.5074/-0.1278 home").expect("a place");
+        assert_eq!(place, "https://www.openstreetmap.org/#map=15/51.5074/-0.1278");
+        assert_eq!(label, "home");
     }
 }
 
@@ -470,47 +477,6 @@ mod tests {
     fn nothing_at_all_is_not_an_error() {
         assert!(read_pack(&serde_json::json!({}), "x").is_empty());
         assert!(read_pack(&serde_json::json!({ "images": [] }), "x").is_empty());
-    }
-
-    #[test]
-    fn a_place_is_read_from_what_people_actually_paste() {
-        assert_eq!(parse_place("51.5074, -0.1278"), Some((51.5074, -0.1278)));
-        assert_eq!(parse_place("geo:51.5074,-0.1278;u=35"), Some((51.5074, -0.1278)));
-        assert_eq!(
-            parse_place("https://www.openstreetmap.org/#map=15/51.5074/-0.1278"),
-            Some((51.5074, -0.1278))
-        );
-        assert_eq!(
-            parse_place("https://www.google.com/maps/@51.5074,-0.1278,15z"),
-            Some((51.5074, -0.1278))
-        );
-    }
-
-    #[test]
-    fn two_numbers_that_are_not_a_place_are_refused() {
-        // A latitude past the pole is somebody's phone number, not a place.
-        assert_eq!(parse_place("910, 20"), None);
-        assert_eq!(parse_place("hello"), None);
-        assert_eq!(parse_place(""), None);
-    }
-
-    #[test]
-    fn a_place_and_its_name_come_apart() {
-        // The comma-space form is how people write coordinates, so the place
-        // is two words and the name is the rest.
-        assert_eq!(
-            split_place_and_label("51.5074, -0.1278 the pub"),
-            Some(("51.5074, -0.1278".to_string(), "the pub".to_string()))
-        );
-        assert_eq!(
-            split_place_and_label("51.5074,-0.1278"),
-            Some(("51.5074,-0.1278".to_string(), String::new()))
-        );
-        assert_eq!(
-            split_place_and_label("https://www.openstreetmap.org/#map=15/51.5074/-0.1278 home"),
-            Some(("https://www.openstreetmap.org/#map=15/51.5074/-0.1278".to_string(), "home".to_string()))
-        );
-        assert_eq!(split_place_and_label("where are you"), None);
     }
 
     #[test]

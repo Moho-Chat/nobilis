@@ -56,14 +56,6 @@ pub fn parse_keyvalue(args: &[String]) -> Option<(String, String, Option<String>
     Some((target, key, value))
 }
 
-/// Whether a capability name is one of the two spellings of metadata.
-/// Only the tests reach this - the capability names are matched inline
-/// where they are negotiated.
-#[cfg(test)]
-pub fn is_metadata_cap(cap: &str) -> bool {
-    matches!(cap, "draft/metadata" | "metadata-2")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,13 +83,5 @@ mod tests {
     fn a_line_too_short_to_mean_anything_is_not_read() {
         assert_eq!(parse_keyvalue(&args(&["alice"])), None);
         assert_eq!(parse_keyvalue(&[]), None);
-    }
-
-    #[test]
-    fn both_spellings_of_the_capability_count() {
-        assert!(is_metadata_cap("draft/metadata"));
-        assert!(is_metadata_cap("metadata-2"));
-        assert!(!is_metadata_cap("metadata"));
-        assert!(!is_metadata_cap("away-notify"));
     }
 }

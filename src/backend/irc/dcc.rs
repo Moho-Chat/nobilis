@@ -1082,6 +1082,35 @@ pub async fn offer_file(state: &AppState, account_id: &str, nick: &str, path: &s
     Ok(id)
 }
 
+/// Waits for whoever the offer was made to, for as long as the offer stands.
+///
+/// Looks at the cancel flag as it waits. It used to look only once somebody
+/// had connected, so cancelling an offer nobody had taken did nothing for the
+/// three minutes the offer lasted, with the port open and the transfer shown
+/// as still going.
+async fn wait_for_taker(
+    listener: &tokio::net::TcpListener,
+    wait: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(tokio::net::TcpStream, std::net::SocketAddr)> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            bail!("cancelled");
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            bail!("they did not accept it within {} seconds", wait.as_secs());
+        }
+        let slice = left.min(std::time::Duration::from_millis(250));
+        match tokio::time::timeout(slice, listener.accept()).await {
+            Err(_) => continue,
+            Ok(Err(e)) => return Err(anyhow!("waiting for them to connect: {e}")),
+            Ok(Ok(pair)) => return Ok(pair),
+        }
+    }
+}
+
 /// Waits for them to connect, then hands the file over.
 ///
 /// Takes what to do about progress rather than the state to do it to, the same
@@ -1096,14 +1125,9 @@ async fn serve_file(
     on_accepted: impl FnOnce(),
     mut on_progress: impl FnMut(Progress),
 ) -> Result<()> {
-    let accepted = tokio::time::timeout(OFFER_TIMEOUT, listener.accept()).await;
     // The listener is dropped either way once this returns, so an offer that
     // nobody took does not leave a port open behind it.
-    let (mut sock, peer) = match accepted {
-        Err(_) => bail!("they did not accept it within {} seconds", OFFER_TIMEOUT.as_secs()),
-        Ok(Err(e)) => return Err(anyhow!("waiting for them to connect: {e}")),
-        Ok(Ok(pair)) => pair,
-    };
+    let (mut sock, peer) = wait_for_taker(&listener, OFFER_TIMEOUT, cancel).await?;
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         bail!("cancelled");
     }
@@ -2122,21 +2146,40 @@ mod transfer_tests {
 
     #[tokio::test]
     async fn an_offer_nobody_takes_gives_up_rather_than_waiting_forever() {
-        let dir = temp_dir("nobody");
-        let path = dir.join("ignored.bin");
-        std::fs::write(&path, b"x").unwrap();
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let cancel = AtomicBool::new(false);
+        let began = std::time::Instant::now();
+        let err = wait_for_taker(&listener, std::time::Duration::from_millis(300), &cancel).await.unwrap_err();
+        assert!(format!("{err:#}").contains("did not accept"), "{err:#}");
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "it waited {:?}", began.elapsed());
+    }
 
-        let cancel = AtomicBool::new(true);
-        // Cancelled before anyone connects stands in for the timeout, which
-        // is three minutes and not worth a test's patience.
-        let err = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
-            serve_file(listener, path.to_str().unwrap(), 1, 0, &cancel, || {}, |_| {}),
-        )
-        .await;
-        assert!(err.is_err() || err.unwrap().is_err(), "an offer nobody takes must not succeed");
-        let _ = std::fs::remove_dir_all(dir);
+    #[tokio::test]
+    async fn cancelling_an_offer_nobody_has_taken_ends_it_at_once() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let began = std::time::Instant::now();
+        // An hour's patience, so only the cancel can be what ends it.
+        let err = wait_for_taker(&listener, std::time::Duration::from_secs(3600), &cancel).await.unwrap_err();
+        assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "it waited {:?}", began.elapsed());
+    }
+
+    #[tokio::test]
+    async fn someone_who_connects_is_the_one_taken() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        });
+        let cancel = AtomicBool::new(false);
+        let (_, peer) = wait_for_taker(&listener, std::time::Duration::from_secs(5), &cancel).await.expect("should accept");
+        assert!(peer.ip().is_loopback());
     }
 
     #[tokio::test]

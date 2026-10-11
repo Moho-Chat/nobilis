@@ -122,19 +122,34 @@ pub fn backlog_later(state: &AppState, buffer_id: &str, messages: &[crate::model
     if asked.len() > 4096 {
         asked.clear();
     }
-    for message in messages.iter().rev().filter(|m| {
-        m.embeds.is_empty()
-            && m.kind != "system"
-            && (youtube_id(&m.body).is_some() || crate::gifs::find_link(&m.body).is_some())
-    }).take(BACKLOG_LIMIT) {
-        let key = format!("{buffer_id}\u{0}{}", message.id);
-        if asked.get(&key).is_some_and(|at| now.duration_since(*at) < ASK_AGAIN_AFTER) {
+    for message in messages
+        .iter()
+        .rev()
+        .filter(|m| wants_a_card(!m.embeds.is_empty(), &m.kind, &m.body))
+        .take(BACKLOG_LIMIT)
+    {
+        if !first_asking(&mut asked, format!("{buffer_id}\u{0}{}", message.id), now) {
             continue;
         }
-        asked.insert(key, now);
         youtube_later(state, &account_id, buffer_id, &message.id, &message.body);
         crate::gifs::gif_later(state, &account_id, buffer_id, &message.id, &message.body);
     }
+}
+
+/// Whether a stored message is one that could be given a card: it has none,
+/// somebody said it, and it carries a link that is described.
+fn wants_a_card(has_cards: bool, kind: &str, body: &str) -> bool {
+    !has_cards && kind != "system" && (youtube_id(body).is_some() || crate::gifs::find_link(body).is_some())
+}
+
+/// Whether this message has not been asked about lately - and if so, notes that
+/// it is being asked about now.
+fn first_asking(asked: &mut HashMap<String, std::time::Instant>, key: String, now: std::time::Instant) -> bool {
+    if asked.get(&key).is_some_and(|at| now.duration_since(*at) < ASK_AGAIN_AFTER) {
+        return false;
+    }
+    asked.insert(key, now);
+    true
 }
 
 /// Puts a card on a message beside whatever it already has.
@@ -367,6 +382,7 @@ mod tests {
         assert_eq!(card.url.as_deref(), Some(watch));
         assert!(parse(&serde_json::json!({ "title": "  ", "author_name": "x" }), watch).is_none());
     }
+
     #[test]
     fn a_card_from_the_page_when_oembed_is_refused() {
         let watch = "https://www.youtube.com/watch?v=_-agl0pOQfs";
@@ -383,5 +399,86 @@ mod tests {
         assert_eq!(card.author, None);
         // A consent wall, or a removed video, has no title: no card.
         assert!(parse_page("<html><title> - YouTube</title></html>", watch).is_none());
+    }
+
+    #[test]
+    fn ids_with_hyphens_and_underscores_are_whole_in_every_form() {
+        // The ones that were lost: an id may start with either, and holds both.
+        for url in [
+            "https://www.youtube.com/watch?v=_-agl0pOQfs",
+            "https://www.youtube.com/watch?v=_-agl0pOQfs&t=3",
+            "https://www.youtube.com/watch?t=3&v=_-agl0pOQfs",
+            "https://youtu.be/_-agl0pOQfs?si=abc",
+            "https://www.youtube.com/shorts/_-agl0pOQfs",
+            "https://www.youtube.com/embed/_-agl0pOQfs",
+        ] {
+            assert_eq!(youtube_id(url).as_deref(), Some("_-agl0pOQfs"), "{url}");
+        }
+        assert_eq!(youtube_id("https://youtu.be/a-b_c-d_e-f").as_deref(), Some("a-b_c-d_e-f"));
+        // Exactly eleven, not a character more.
+        assert_eq!(youtube_id("https://youtu.be/aaaaaaaaaaaXYZ").as_deref(), Some("aaaaaaaaaaa"));
+    }
+
+    #[test]
+    fn a_v_that_is_not_in_the_link_is_not_its_video() {
+        // After whitespace the link has ended, and after a # it is a fragment.
+        assert_eq!(youtube_id("https://www.youtube.com/watch?x=1 and v=aaaaaaaaaaa"), None);
+        assert_eq!(youtube_id("https://www.youtube.com/watch?x=1#v=aaaaaaaaaaa"), None);
+        assert_eq!(youtube_id("https://www.youtube.com/watch?v=aaaaaaaaaaa#t=1").as_deref(), Some("aaaaaaaaaaa"));
+        // And a character that is not part of an id ends it, short.
+        assert_eq!(youtube_id("https://www.youtube.com/watch?v=aaaaa!aaaaa"), None);
+    }
+
+    #[test]
+    fn both_kinds_of_card_are_youtube_red() {
+        let watch = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        let card = parse(&serde_json::json!({ "title": "T" }), watch).unwrap();
+        assert_eq!(card.color, Some(0xFF0000));
+        let page = r#"{"videoPrimaryInfoRenderer":{"title":{"runs":[{"text":"T"}]}}}"#;
+        assert_eq!(parse_page(page, watch).unwrap().color, Some(0xFF0000));
+    }
+
+    #[test]
+    fn a_message_wants_a_card_when_it_has_none_and_a_link_that_is_described() {
+        let yt = "look https://youtu.be/dQw4w9WgXcQ";
+        assert!(wants_a_card(false, "chat", yt));
+        assert!(wants_a_card(false, "chat", "https://tenor.com/view/cat-gif-123"));
+        assert!(!wants_a_card(true, "chat", yt), "it already has a card");
+        assert!(!wants_a_card(false, "system", yt), "nobody said it");
+        assert!(!wants_a_card(false, "chat", "no links here"));
+        assert!(!wants_a_card(false, "chat", "https://example.com/page"));
+    }
+
+    #[test]
+    fn a_message_is_asked_about_once_in_a_while() {
+        let mut asked = HashMap::new();
+        let t = std::time::Instant::now();
+        assert!(first_asking(&mut asked, "a".into(), t), "never asked");
+        assert!(!first_asking(&mut asked, "a".into(), t), "asked just now");
+        assert!(!first_asking(&mut asked, "a".into(), t + ASK_AGAIN_AFTER - Duration::from_secs(1)), "still too soon");
+        assert!(first_asking(&mut asked, "a".into(), t + ASK_AGAIN_AFTER), "long enough to try again");
+        assert!(first_asking(&mut asked, "b".into(), t), "another message is its own question");
+    }
+
+    #[test]
+    fn a_card_is_added_beside_what_a_message_has_and_not_twice() {
+        let state = crate::backend::kick::testkit::simulated_daemon("add-embed");
+        state.runtime.record_message(
+            &state, "kick:tester", "chan", "channel", "bob", "hello", false, "chat", None,
+            Some("m1".into()), false, None, Vec::new(), Vec::new(), None,
+        );
+        let buffer = crate::model::buffer_id("kick:tester", "chan");
+        let card = |url: &str| Embed { title: Some("T".into()), url: Some(url.into()), ..Default::default() };
+        add_embed(&state, &buffer, "m1", card("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        add_embed(&state, &buffer, "m1", card("https://tenor.com/view/x-gif-1"));
+        // The same link again - from the other road it can arrive by.
+        add_embed(&state, &buffer, "m1", card("https://www.youtube.com/watch?v=dQw4w9WgXcQ"));
+        let stored = state.store.get_message(&buffer, "m1").unwrap().unwrap();
+        let urls: Vec<_> = stored.embeds.iter().filter_map(|e| e.url.as_deref()).collect();
+        assert_eq!(urls, vec!["https://www.youtube.com/watch?v=dQw4w9WgXcQ", "https://tenor.com/view/x-gif-1"]);
+        // A card with no address is never taken for a repeat of another with none.
+        add_embed(&state, &buffer, "m1", Embed { title: Some("one".into()), ..Default::default() });
+        add_embed(&state, &buffer, "m1", Embed { title: Some("two".into()), ..Default::default() });
+        assert_eq!(state.store.get_message(&buffer, "m1").unwrap().unwrap().embeds.len(), 4);
     }
 }

@@ -701,6 +701,21 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
     param.or(suffix).unwrap_or("")
 }
 
+/// One line of a `CAP LS` answer: whether another is coming, and what this one
+/// lists.
+///
+/// A multiline answer puts "*" in one field and the list in the other, and a
+/// live network is what proved that which field is which cannot be assumed:
+/// looking for the star in one only meant the last continuation line was taken
+/// for the whole answer, and every capability advertised after it was silently
+/// never requested. Libera offers nineteen; this client was seeing nine.
+pub(super) fn cap_ls_page<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> (bool, Vec<&'a str>) {
+    let fields = [param, suffix];
+    let more = fields.iter().any(|f| f.map(str::trim) == Some("*"));
+    let caps = fields.into_iter().flatten().filter(|f| f.trim() != "*").flat_map(str::split_whitespace).collect();
+    (more, caps)
+}
+
 /// Which of a `CAP NEW` offer are worth asking for.
 ///
 /// The intersection with `WANTED_CAPS`, because a server offering something
@@ -854,13 +869,8 @@ pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream)
     loop {
         let msg = wait_for(stream, |m| matches!(&m.command, Command::CAP(_, CapSubCommand::LS, _, _))).await.ok()?;
         let Command::CAP(_, _, ref param, ref suffix) = msg.command else { return None };
-        // A multiline answer puts "*" where a single-line one puts the list,
-        // so the list is whichever field is not the continuation marker.
-        let more = param.as_deref() == Some("*");
-        let list = if more { suffix.as_deref().unwrap_or("") } else { cap_list(param.as_deref(), suffix.as_deref()) };
-        for cap in list.split_whitespace() {
-            offered.push(cap.to_string());
-        }
+        let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
+        offered.extend(caps.into_iter().map(str::to_string));
         if !more {
             tracing::debug!("irc: server offers {} capabilities: {}", offered.len(), offered.join(" "));
             return Some(offered);
@@ -1200,6 +1210,21 @@ mod quit_tests {
 }
 
 #[cfg(test)]
+mod wanted_cap_tests {
+    use super::WANTED_CAPS;
+
+    /// Both spellings of metadata, because networks that shipped it first
+    /// still advertise the draft one; a rename in the list would end the
+    /// negotiation for one of them without anything saying so.
+    #[test]
+    fn both_spellings_of_metadata_are_asked_for() {
+        assert!(WANTED_CAPS.contains(&"draft/metadata"));
+        assert!(WANTED_CAPS.contains(&"metadata-2"));
+        assert!(!WANTED_CAPS.contains(&"metadata"));
+    }
+}
+
+#[cfg(test)]
 mod cap_new_tests {
     use super::caps_worth_requesting;
 
@@ -1239,7 +1264,7 @@ mod cap_new_tests {
 
 #[cfg(test)]
 mod cap_tests {
-    use super::cap_list;
+    use super::{cap_list, cap_ls_page};
     use irc::proto::{CapSubCommand, Command, Message};
 
     /// Which field of a CAP LS line holds the list, and which holds the "*"
@@ -1254,21 +1279,37 @@ mod cap_tests {
     fn a_multiline_offer_is_read_to_the_end() {
         // Both orderings of (param, suffix), because both occur.
         for (param, suffix) in [(Some("*"), Some("a b")), (Some("a b"), Some("*"))] {
-            let fields = [param, suffix];
-            let more = fields.iter().any(|f| f.map(str::trim) == Some("*"));
-            let caps: Vec<&str> = fields
-                .into_iter()
-                .flatten()
-                .filter(|f| f.trim() != "*")
-                .flat_map(str::split_whitespace)
-                .collect();
-            assert!(more, "a line carrying a star has more to come");
-            assert_eq!(caps, vec!["a", "b"]);
+            let (more, caps) = cap_ls_page(param, suffix);
+            assert!(more, "a line carrying a star has more to come: {param:?} {suffix:?}");
+            assert_eq!(caps, vec!["a", "b"], "{param:?} {suffix:?}");
         }
+        // The final line carries no star and is the end of the answer, whichever
+        // field its list is in.
+        for (param, suffix) in [(None, Some("c d")), (Some("c d"), None)] {
+            let (more, caps) = cap_ls_page(param, suffix);
+            assert!(!more, "{param:?} {suffix:?}");
+            assert_eq!(caps, vec!["c", "d"]);
+        }
+        // Nothing to list is an empty page, not a failure.
+        assert_eq!(cap_ls_page(Some("*"), None), (true, vec![]));
+        assert_eq!(cap_ls_page(None, None), (false, vec![]));
+    }
 
-        // The final line carries no star and is the end of the answer.
-        let fields = [None, Some("c d")];
-        assert!(!fields.iter().any(|f| f.map(str::trim) == Some("*")));
+    /// The same, through the parser the connection uses: a real server line
+    /// and the fields the crate makes of it.
+    #[test]
+    fn a_continuation_line_off_the_wire_says_more_is_coming() {
+        let msg: Message = ":irc.example CAP * LS * :multi-prefix away-notify\r\n".parse().unwrap();
+        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &msg.command else { panic!("not CAP LS: {:?}", msg.command) };
+        let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
+        assert!(more);
+        assert_eq!(caps, vec!["multi-prefix", "away-notify"]);
+
+        let last: Message = ":irc.example CAP * LS :sasl chghost\r\n".parse().unwrap();
+        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &last.command else { panic!("not CAP LS: {:?}", last.command) };
+        let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
+        assert!(!more);
+        assert_eq!(caps, vec!["sasl", "chghost"]);
     }
 
     /// Where the granted capabilities actually live in a parsed CAP ACK.

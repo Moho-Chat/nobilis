@@ -391,11 +391,26 @@ mod opus_guard_tests {
         assert!((1.9..=2.1).contains(&seconds), "decoded {seconds:.2}s of a 2s sound");
     }
 
+    /// Ogg's page checksum: CRC-32 with polynomial 0x04c11db7, not reflected,
+    /// starting from zero, over the whole page with its own field zeroed.
+    fn ogg_crc(page: &[u8]) -> u32 {
+        let mut crc = 0u32;
+        for &byte in page {
+            crc ^= (byte as u32) << 24;
+            for _ in 0..8 {
+                crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04c1_1db7 } else { crc << 1 };
+            }
+        }
+        crc
+    }
+
     /// Packets that are not Opus are left out rather than handed over.
     #[test]
     fn a_damaged_ogg_opus_sound_does_not_reach_the_decoder_whole() {
         let samples: Vec<f32> = (0..48_000).map(|i| (i as f32 * 0.03).sin() * 0.5).collect();
         let mut file = crate::oggopus::encode(&samples).unwrap();
+        let whole = super::decode(&file).expect("the undamaged sound decodes");
+        assert!(!whole.is_empty(), "the undamaged sound has audio in it");
         // Corrupt the audio pages (after the two header pages) without
         // touching the Ogg framing: each packet's first byte becomes a code 3
         // header claiming 63 frames, which no valid packet can.
@@ -414,10 +429,18 @@ mod opus_guard_tests {
                 file[body + 1] = 63;
             }
             let len: usize = file[i + 27..i + 27 + segments].iter().map(|&b| b as usize).sum();
+            // The page's checksum covers what was just changed. Left as it was
+            // the container rejects the whole file before any packet is read,
+            // and this would be testing that and not the check it is named for.
+            file[i + 22..i + 26].copy_from_slice(&[0; 4]);
+            let crc = ogg_crc(&file[i..body + len]);
+            file[i + 22..i + 26].copy_from_slice(&crc.to_le_bytes());
             i = body + len;
         }
         // Still a file symphonia can read, and the check keeps the bad
-        // packets out; it must not panic or error the whole sound.
-        let _ = super::decode(&file);
+        // packets out; it must not panic or error the whole sound, and what
+        // comes back is what was left of it - less than there was.
+        let damaged = super::decode(&file).expect("a damaged sound is decoded as far as it goes");
+        assert!(damaged.len() < whole.len(), "{} of {} samples came through", damaged.len(), whole.len());
     }
 }

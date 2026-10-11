@@ -641,7 +641,7 @@ async fn prepare(
 
 /// Asks the socket for everything that happens in a channel's chat.
 ///
-/// Four subscriptions, not one, because Kick scatters them and only the first
+/// Five subscriptions, not one, because Kick scatters them and only the first
 /// carries what people say. Watching that one alone is why a chat can look
 /// quiet while the stream is visibly reacting to something. Measured against a
 /// live subathon rather than guessed - each name here is one an event was
@@ -651,6 +651,7 @@ async fn prepare(
 ///   - `chatrooms.<room>`     rewards, and the info lines Kick's own UI draws
 ///   - `chatroom_<room>`      gifted subscriptions, on an older name entirely
 ///   - `channel.<channel>`    going live, and the channel's own subscriptions
+///   - `channel_<channel>`    KICKs sent to the streamer, and goal and leaderboard updates
 ///
 /// The overlap is real and deliberate on Kick's part: one subscription arrives
 /// three times over three of these. Which of the three is believed is settled
@@ -665,6 +666,12 @@ pub(super) async fn subscribe(socket: &mut Socket, chatroom_id: u64, channel_id:
         format!("chatrooms.{chatroom_id}"),
         format!("chatroom_{chatroom_id}"),
         format!("channel.{channel_id}"),
+        // A third name for the channel, with an underscore, which is where
+        // KICKs sent to the streamer arrive and nothing else this client
+        // listened to carries them - found by listening to a live channel's
+        // public events rather than guessed, which is why a gift of KICKs was
+        // never drawn: nobody had asked for the subscription it came on.
+        format!("channel_{channel_id}"),
         // Predictions are broadcast nowhere near the chat: Kick's own viewer
         // panel listens on this one, and this client heard none of them
         // because it never asked. Named with hyphens rather than dots, which
@@ -792,7 +799,7 @@ pub(super) fn id_in_subscription(name: &str) -> Option<Subscribed> {
     if let Some(rest) = name.strip_prefix("chatrooms.").or_else(|| name.strip_prefix("chatroom_")) {
         return rest.split('.').next()?.parse().ok().map(Subscribed::Chatroom);
     }
-    if let Some(rest) = name.strip_prefix("channel.") {
+    if let Some(rest) = name.strip_prefix("channel.").or_else(|| name.strip_prefix("channel_")) {
         return rest.split('.').next()?.parse().ok().map(Subscribed::Channel);
     }
     if let Some(rest) = name.strip_prefix("predictions-channel-") {
@@ -876,7 +883,7 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["channel.2401072", "chatroom_2393554", "chatrooms.2393554", "chatrooms.2393554.v2"]
+            vec!["channel.2401072", "channel_2401072", "chatroom_2393554", "chatrooms.2393554", "chatrooms.2393554.v2"]
         );
         // And it is gone from both maps, so a straggling event has nowhere to
         // land rather than reopening the buffer that was just closed.
@@ -890,6 +897,7 @@ mod tests {
         assert_eq!(id_in_subscription("chatrooms.123"), Some(Subscribed::Chatroom(123)));
         assert_eq!(id_in_subscription("chatroom_123"), Some(Subscribed::Chatroom(123)));
         assert_eq!(id_in_subscription("channel.123"), Some(Subscribed::Channel(123)));
+        assert_eq!(id_in_subscription("channel_123"), Some(Subscribed::Channel(123)));
         assert_eq!(id_in_subscription("chatrooms.abc"), None);
         assert_eq!(id_in_subscription("something-else"), None);
     }

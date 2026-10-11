@@ -48,6 +48,23 @@ fn pending() -> &'static std::sync::Mutex<HashMap<String, Vec<Locked>>> {
     PENDING.get_or_init(Default::default)
 }
 
+/// Adds a message to those waiting, and says whether it was new.
+///
+/// The same event twice is the same event: a sync that overlaps what was
+/// already seen would otherwise ask for one key repeatedly. And the list is
+/// held to `MAX_PENDING`, oldest first.
+fn hold(waiting: &mut Vec<Locked>, locked: Locked) -> bool {
+    if waiting.iter().any(|l| l.event_id == locked.event_id) {
+        return false;
+    }
+    waiting.push(locked);
+    if waiting.len() > MAX_PENDING {
+        let over = waiting.len() - MAX_PENDING;
+        waiting.drain(..over);
+    }
+    true
+}
+
 /// Remembers a message that could not be read, and asks for its key.
 ///
 /// Best-effort on both counts. A key request that cannot be sent is not worth
@@ -67,20 +84,14 @@ pub async fn note_locked(
     {
         let mut all = pending().lock().unwrap();
         let waiting = all.entry(account_id.to_string()).or_default();
-        // The same event twice is the same event: a sync that overlaps what
-        // was already seen would otherwise ask for one key repeatedly.
-        if waiting.iter().any(|l| l.event_id == event_id) {
-            return;
-        }
-        waiting.push(Locked {
+        let locked = Locked {
             buffer_id: buffer_id.to_string(),
             room_id: room_id.to_string(),
             event_id: event_id.to_string(),
             event: event.clone(),
-        });
-        if waiting.len() > MAX_PENDING {
-            let over = waiting.len() - MAX_PENDING;
-            waiting.drain(..over);
+        };
+        if !hold(waiting, locked) {
+            return;
         }
     }
 
@@ -158,10 +169,9 @@ mod tests {
     /// neighbours, and what anybody can see is a screen's worth.
     #[test]
     fn the_oldest_are_dropped_rather_than_growing_without_end() {
-        let mut waiting: Vec<Locked> = (0..MAX_PENDING + 50).map(|i| locked(&format!("${i}"))).collect();
-        if waiting.len() > MAX_PENDING {
-            let over = waiting.len() - MAX_PENDING;
-            waiting.drain(..over);
+        let mut waiting: Vec<Locked> = Vec::new();
+        for i in 0..MAX_PENDING + 50 {
+            assert!(hold(&mut waiting, locked(&format!("${i}"))));
         }
         assert_eq!(waiting.len(), MAX_PENDING);
         // The newest survive, which are the ones somebody is looking at.
@@ -174,11 +184,8 @@ mod tests {
     #[test]
     fn the_same_message_is_only_waited_on_once() {
         let mut waiting = vec![locked("$a")];
-        for id in ["$a", "$b", "$a"] {
-            if !waiting.iter().any(|l| l.event_id == id) {
-                waiting.push(locked(id));
-            }
-        }
+        let news: Vec<bool> = ["$a", "$b", "$a"].iter().map(|id| hold(&mut waiting, locked(id))).collect();
+        assert_eq!(news, [false, true, false], "only a message not already waiting is news");
         assert_eq!(waiting.len(), 2);
     }
 }

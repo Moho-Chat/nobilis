@@ -312,12 +312,7 @@ pub(super) async fn handle_message(
                     let Some(slot) = members.get_mut(target.as_str()) else { continue };
                     slot.rank = if granting { rank } else { MemberRank::None };
                     changed = true;
-                    let body = format!(
-                        "{from} {} {} {} {target}",
-                        if granting { "gives" } else { "takes" },
-                        rank_word(rank),
-                        if granting { "to" } else { "from" },
-                    );
+                    let body = rank_change_line(&from, granting, rank, target);
                     state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                 }
                 if changed {
@@ -1024,6 +1019,16 @@ pub(super) fn rank_word(rank: MemberRank) -> &'static str {
     }
 }
 
+/// The line for somebody being given a rank or losing one.
+pub(super) fn rank_change_line(from: &str, granting: bool, rank: MemberRank, target: &str) -> String {
+    format!(
+        "{from} {} {} {} {target}",
+        if granting { "gives" } else { "takes" },
+        rank_word(rank),
+        if granting { "to" } else { "from" },
+    )
+}
+
 /// A message's own id, where the server gives one.
 ///
 /// Used as the message id rather than a generated one, so a message seen twice -
@@ -1229,14 +1234,8 @@ mod tests {
     /// words are used for granting and for taking away.
     #[test]
     fn a_rank_change_reads_as_a_sentence() {
-        assert_eq!(
-            format!("bob {} {} {} carol", "gives", rank_word(MemberRank::Op), "to"),
-            "bob gives operator status to carol"
-        );
-        assert_eq!(
-            format!("bob {} {} {} carol", "takes", rank_word(MemberRank::Voice), "from"),
-            "bob takes voice from carol"
-        );
+        assert_eq!(rank_change_line("bob", true, MemberRank::Op, "carol"), "bob gives operator status to carol");
+        assert_eq!(rank_change_line("bob", false, MemberRank::Voice, "carol"), "bob takes voice from carol");
     }
 
     #[test]

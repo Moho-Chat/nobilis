@@ -125,6 +125,13 @@ mod tests {
         // Still ours to write into, which is the point - a directory nobody
         // can enter would be secure and useless.
         std::fs::write(dir.join("inside"), b"x").unwrap();
+        // And closed to everybody else.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "mode {mode:o}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

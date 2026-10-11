@@ -1177,16 +1177,18 @@ mod tests {
         assert!(!devices[1].is_default);
     }
 
+    /// Ignored by default: with no sound server there is nothing to resolve,
+    /// and a test that returned early there passed having tested nothing.
+    ///   cargo test -- --ignored the_system_default
     #[test]
+    #[ignore]
     fn the_system_default_is_a_destination_rather_than_an_absence() {
         // Choosing "system default" has to actively move the stream. The sound
         // server puts an application back on the device it was last moved to,
         // so treating the default as "do not route" silently means "keep
         // whatever was chosen before" - which is how audio ends up playing
         // into a device nobody is listening to.
-        let Ok(output) = default_device(Stream::Output) else {
-            return; // no sound server here; nothing to assert against
-        };
+        let output = default_device(Stream::Output).expect("a sound server to ask");
         assert!(!output.is_empty(), "the default sink resolved to nothing");
         let input = default_device(Stream::Input).expect("a server with a sink should name a source");
         assert!(!input.is_empty(), "the default source resolved to nothing");

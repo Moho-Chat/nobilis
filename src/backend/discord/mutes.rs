@@ -216,4 +216,42 @@ mod tests {
         let forever = json!({ "guild_id": "9", "muted": true });
         assert!(parse_entry(&forever, NOW).1.muted);
     }
+
+    /// A timed mute ends at its end time, to the second: at that moment it is
+    /// over, and a second before it is not.
+    #[test]
+    fn a_mute_is_over_at_its_end_time() {
+        let ends = |at: i64| {
+            let end = chrono::DateTime::from_timestamp(at, 0).unwrap().to_rfc3339();
+            json!({ "muted": true, "mute_config": { "end_time": end } })
+        };
+        assert!(still_muted(&ends(NOW + 1), NOW), "a second to go");
+        assert!(!still_muted(&ends(NOW), NOW), "its moment");
+        assert!(!still_muted(&ends(NOW - 1), NOW), "past");
+        // An end time nobody can read is not a reason to say it is over.
+        assert!(still_muted(&json!({ "muted": true, "mute_config": { "end_time": "someday" } }), NOW));
+        assert!(!still_muted(&json!({ "muted": false, "mute_config": null }), NOW), "never muted");
+    }
+
+    /// Settings in the three shapes, and an entry that is not an object at all
+    /// is skipped rather than read as an empty one.
+    #[test]
+    fn what_is_read_is_kept_and_what_is_not_an_entry_is_skipped() {
+        let state = crate::backend::kick::testkit::simulated_daemon("discord-mutes");
+        let acct = "discord:me";
+        note_settings(&state, acct, &json!([
+            { "guild_id": "9", "muted": true },
+            "not an entry",
+            42,
+            { "guild_id": null, "muted": false, "channel_overrides": [{ "channel_id": "5", "muted": true }] }
+        ]));
+        assert!(state.runtime.discord_muted(acct, "9", "anything"), "a muted guild mutes what is in it");
+        assert!(state.runtime.discord_muted(acct, DM_SCOPE, "5"), "a muted direct message");
+        assert!(!state.runtime.discord_muted(acct, DM_SCOPE, "6"));
+        // One entry on its own, as an update sends it, and the wrapped form.
+        note_settings(&state, acct, &json!({ "guild_id": "9", "muted": false }));
+        assert!(!state.runtime.discord_muted(acct, "9", "anything"));
+        note_settings(&state, acct, &json!({ "entries": [{ "guild_id": "9", "muted": true }] }));
+        assert!(state.runtime.discord_muted(acct, "9", "anything"));
+    }
 }
