@@ -37,7 +37,7 @@ pub mod pins;
 pub mod socket;
 pub mod watch;
 #[cfg(test)]
-mod testkit;
+pub(crate) mod testkit;
 pub mod api;
 
 pub use cards::*;

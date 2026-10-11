@@ -194,4 +194,20 @@ mod tests {
         assert!(store.for_account("irc:a").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_removed_accounts_list_goes_with_it_and_nobody_elses_does() {
+        let dir = std::env::temp_dir().join(format!("moho-ignores-forget-{}", std::process::id()));
+        let path = dir.join("ignores.toml");
+        let store = IgnoreStore::open(path.clone());
+        store.set("irc:gone", "Spammer", true);
+        store.set("irc:kept", "Other", true);
+        store.forget("irc:gone");
+        assert!(store.for_account("irc:gone").is_empty());
+        assert_eq!(store.for_account("irc:kept"), vec!["Other"]);
+        let reopened = IgnoreStore::open(path);
+        assert!(reopened.for_account("irc:gone").is_empty(), "the file forgot too");
+        assert_eq!(reopened.for_account("irc:kept"), vec!["Other"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

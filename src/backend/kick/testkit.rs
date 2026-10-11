@@ -14,7 +14,7 @@ use super::*;
 /// real channel - they happen when a streamer decides to run one - so the
 /// only way to know this code works is to hand it the payload and look at
 /// what lands in the store. That is what these do.
-pub(super) fn simulated_daemon(name: &str) -> AppState {
+pub(crate) fn simulated_daemon(name: &str) -> AppState {
     // The same convention the audio and Tor probes use for a scratch
     // directory - a dependency for one test would be a poor trade.
     let dir = std::env::temp_dir().join(format!("nobilis-kick-{name}-{}", std::process::id()));

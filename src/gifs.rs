@@ -313,4 +313,74 @@ mod tests {
         assert!(from_tenor_page(page, "https://tenor.com/view/x-gif-1").is_none());
         assert!(from_tenor_page("<html></html>", "https://tenor.com/view/x-gif-1").is_none());
     }
+
+    #[test]
+    fn a_link_says_what_it_is_for() {
+        let tenor = GifLink::Tenor { url: "https://tenor.com/view/x-gif-1".into() };
+        let giphy = GifLink::Giphy { url: "https://giphy.com/gifs/x-abc".into(), id: "abc".into() };
+        assert_eq!(tenor.url(), "https://tenor.com/view/x-gif-1");
+        assert_eq!(giphy.url(), "https://giphy.com/gifs/x-abc");
+    }
+
+    #[test]
+    fn a_locale_is_skipped_only_when_it_is_one() {
+        let url = |locale: &str| format!("https://tenor.com/{locale}/view/cat-gif-9");
+        assert!(find_link(&url("de")).is_some());
+        assert!(find_link(&url("en-GB")).is_some(), "five characters is the longest");
+        assert!(find_link(&url("en-GBxx")).is_none(), "seven is not a locale");
+        assert!(find_link("https://tenor.com/view/cat-gif-9").is_some(), "and none is fine");
+        assert!(find_link("https://tenor.com/de/").is_none());
+    }
+
+    #[test]
+    fn a_tenor_page_is_read_from_its_own_tags() {
+        let html = r#"<head><meta property="og:video" content="https://media.tenor.com/abc/cat.mp4?a=1&amp;b=2">
+            <meta property='og:video:width' content='480'><meta property="og:video:height" content="270"></head>"#;
+        let e = from_tenor_page(html, "https://tenor.com/view/cat-gif-9").unwrap();
+        assert_eq!(e.kind.as_deref(), Some("gif"));
+        assert_eq!(e.url.as_deref(), Some("https://tenor.com/view/cat-gif-9"));
+        assert_eq!(e.media_url.as_deref(), Some("https://media.tenor.com/abc/cat.mp4?a=1&b=2"));
+        assert_eq!(e.media_kind.as_deref(), Some("video"));
+        assert_eq!((e.width, e.height), (Some(480), Some(270)));
+        assert_eq!(e.provider.as_deref(), Some("Tenor"));
+    }
+
+    #[test]
+    fn a_tenor_page_with_only_a_picture_gives_the_picture() {
+        let html = r#"<meta property="og:image" content="https://media.tenor.com/abc/cat.gif"><meta property="og:image:width" content="1"><meta property="og:image:height" content="0">"#;
+        let e = from_tenor_page(html, "https://tenor.com/view/cat-gif-9").unwrap();
+        assert_eq!(e.media_kind.as_deref(), Some("image"));
+        // A size of one is a size; a size of nothing is not one.
+        assert_eq!((e.width, e.height), (Some(1), None));
+    }
+
+    #[test]
+    fn a_page_cannot_point_the_window_at_somewhere_else() {
+        let from = |media: &str| from_tenor_page(&format!(r#"<meta property="og:video" content="{media}">"#), "https://tenor.com/view/x-gif-1");
+        assert!(from("https://media.tenor.com/a.mp4").is_some());
+        assert!(from("https://tenor.com/a.mp4").is_some());
+        assert!(from("https://evil.example/a.mp4").is_none());
+        assert!(from("https://notenor.com/a.mp4").is_none(), "a host that only ends the same way");
+        assert!(from("http://media.tenor.com/a.mp4").is_none(), "and only over https");
+        assert!(from_tenor_page("<html>nothing</html>", "https://tenor.com/view/x-gif-1").is_none());
+    }
+
+    #[test]
+    fn a_giphy_gif_is_made_of_its_id() {
+        let e = from_giphy_id("https://giphy.com/gifs/dog-Z7wFi5b2VEAr6", "Z7wFi5b2VEAr6");
+        assert_eq!(e.kind.as_deref(), Some("gif"));
+        assert_eq!(e.url.as_deref(), Some("https://giphy.com/gifs/dog-Z7wFi5b2VEAr6"));
+        assert_eq!(e.media_url.as_deref(), Some("https://media.giphy.com/media/Z7wFi5b2VEAr6/giphy.mp4"));
+        assert_eq!(e.media_kind.as_deref(), Some("video"));
+        assert_eq!(e.provider.as_deref(), Some("Giphy"));
+    }
+
+    #[test]
+    fn what_was_looked_at_is_remembered_until_the_table_is_full() {
+        remember("https://tenor.com/view/remember-a", None);
+        remember("https://tenor.com/view/remember-b", Some(Embed::default()));
+        let known = KNOWN.lock().unwrap();
+        assert!(known.contains_key("https://tenor.com/view/remember-a"), "a page that said nothing is remembered too");
+        assert!(known.get("https://tenor.com/view/remember-b").is_some_and(|e| e.is_some()));
+    }
 }

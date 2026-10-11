@@ -241,7 +241,10 @@ pub(super) fn handle_event(
         // too, or moho shows a different chat from the one everybody else is
         // looking at - which on a stream where moderation is public is the
         // wrong way round entirely.
-        e if e.ends_with("MessageDeletedEvent") => {
+        // Not a pin coming down, which Kick calls `PinnedMessageDeletedEvent` and
+        // which ends the same way: that is the pin's, below, and taking it for a
+        // message deleted left a pin on screen for ever after it was removed.
+        e if e.ends_with("MessageDeletedEvent") && !pins::is_pin_event(e) => {
             let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             // The id is nested under `message` on this event and flat on
             // others Kick has sent; both name the same thing.
@@ -1192,5 +1195,130 @@ mod tests {
         assert_eq!(rows[0].embeds[0].author_color.as_deref(), Some("#FF2C56"));
         assert_eq!((rows[1].kind.as_str(), rows[1].body.as_str()), ("sub", "kufallen gifted 2 subscriptions"));
         assert_eq!(rows[1].embeds[0].description.as_deref(), Some("a\nb"));
+    }
+
+    fn spoken(state: &AppState, watched: &mut Watched, id: &str, text: &str) {
+        feed(state, watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": id, "chatroom_id": 2393554, "content": text, "sender": { "id": 9, "username": "bob", "identity": null }
+        }));
+    }
+
+    #[tokio::test]
+    async fn going_live_and_ending_are_said_in_the_channel() {
+        let state = testkit::simulated_daemon("live-lines");
+        let mut watched = testkit::watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\StreamerIsLive", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\StopStreamBroadcast", serde_json::json!({}));
+        assert_eq!(testkit::lines(&state, "odablock"), vec!["went live", "ended the stream"]);
+    }
+
+    #[test]
+    fn a_message_taken_down_leaves_the_log() {
+        let state = testkit::simulated_daemon("deleted");
+        let mut watched = testkit::watching_odablock();
+        spoken(&state, &mut watched, "keep", "stays");
+        spoken(&state, &mut watched, "nested", "goes");
+        spoken(&state, &mut watched, "flat", "goes too");
+        // Kick nests the id under `message` on one event and sends it flat on another.
+        feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "message": { "id": "nested" } }));
+        feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "id": "flat" }));
+        assert_eq!(testkit::lines(&state, "odablock"), vec!["stays"]);
+    }
+
+    #[test]
+    fn a_moderator_emptying_the_room_is_said() {
+        let state = testkit::simulated_daemon("cleared");
+        let mut watched = testkit::watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\ChatroomClearEvent", serde_json::json!({}));
+        assert_eq!(testkit::lines(&state, "odablock"), vec!["a moderator cleared the chat"]);
+    }
+
+    #[test]
+    fn the_chat_rules_changing_are_kept_for_the_next_message_to_be_explained_by() {
+        let state = testkit::simulated_daemon("chat-modes");
+        let mut watched = testkit::watching_odablock();
+        let buffer = crate::model::buffer_id("kick:tester", "odablock");
+        state.runtime.set_kick_channel(&buffer, crate::runtime::KickChannel {
+            slug: "odablock".into(), channel_id: 2401072, history_cursor: None, chatroom_id: 2393554, subscribed: false,
+            followers_only: false, subscribers_only: false, slow_seconds: None, emotes: Vec::new(),
+        });
+        feed(&state, &mut watched, "App\\Events\\ChatroomUpdatedEvent", serde_json::json!({
+            "followers_mode": { "enabled": true },
+            "subscribers_mode": { "enabled": false },
+            "slow_mode": { "enabled": true, "message_interval": 30 }
+        }));
+        let now = state.runtime.kick_channel(&buffer).unwrap();
+        assert_eq!((now.followers_only, now.subscribers_only, now.slow_seconds), (true, false, Some(30)));
+        // A slow mode that is switched off has no interval, whatever it still says.
+        feed(&state, &mut watched, "App\\Events\\ChatroomUpdatedEvent", serde_json::json!({
+            "subscribers_mode": { "enabled": true }, "slow_mode": { "enabled": false, "message_interval": 30 }
+        }));
+        let now = state.runtime.kick_channel(&buffer).unwrap();
+        assert_eq!((now.followers_only, now.subscribers_only, now.slow_seconds), (false, true, None));
+    }
+
+    #[test]
+    fn a_pin_and_its_removal_reach_the_channel() {
+        let state = testkit::simulated_daemon("pins");
+        let mut watched = testkit::watching_odablock();
+        let buffer = crate::model::buffer_id("kick:tester", "odablock");
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageCreatedEvent", serde_json::json!({
+            "message": { "id": "p1", "content": "read the rules", "sender": { "username": "mod" } }
+        }));
+        assert_eq!(state.runtime.kick_pin(&buffer).map(|p| p.body), Some("read the rules".to_string()));
+        // An event about a pin that says nothing readable leaves the pin up.
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageCreatedEvent", serde_json::json!({}));
+        assert!(state.runtime.kick_pin(&buffer).is_some());
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageDeletedEvent", serde_json::json!({}));
+        assert!(state.runtime.kick_pin(&buffer).is_none());
+    }
+
+    #[test]
+    fn a_gifts_tier_is_a_colour_and_an_ordinary_one_is_green() {
+        assert_eq!(tier_colour("BASIC"), 0x53FC18);
+        assert_eq!(tier_colour("anything else"), 0x53FC18);
+        assert_eq!(tier_colour("mid"), 0x2E9BFF);
+        assert_eq!(tier_colour("PREMIUM"), 0xB45CFF);
+        assert_eq!(tier_colour("Legendary"), 0xFFA800);
+    }
+
+    #[test]
+    fn a_raid_with_nobody_in_it_says_only_that_it_came() {
+        let none = serde_json::json!({ "host_username": "friend", "number_viewers": 0 });
+        assert_eq!(describe_action("StreamHostEvent", &none).map(|(_, l)| l).as_deref(), Some("friend raided the channel"));
+        let one = serde_json::json!({ "host_username": "friend", "number_viewers": 1 });
+        assert_eq!(describe_action("StreamHostEvent", &one).map(|(_, l)| l).as_deref(), Some("friend raided with 1 viewers"));
+        assert_eq!(action_card("StreamHostEvent", &none).unwrap().title, None, "no count to put on the card");
+    }
+
+    #[test]
+    fn a_sender_is_drawn_in_their_colour_with_the_badges_that_say_something() {
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        assert_eq!(style_of(None).color, None);
+        let style = style_of(Some(&api::ChatIdentity {
+            color: Some("#75FD46".into()),
+            badges: vec![badge("moderator"), badge("level"), badge(""), badge("subscriber")],
+        }));
+        assert_eq!(style.color.as_deref(), Some("#75FD46"));
+        // An engagement level and a nameless badge say nothing about the person.
+        assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "subscriber"]);
+        // A colour that is empty is no colour.
+        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), badges: vec![] })).color, None);
+    }
+
+    #[test]
+    fn a_reply_needs_both_who_and_what() {
+        let whole = serde_json::json!({
+            "original_sender": { "id": 1, "username": "Greg" },
+            "original_message": { "id": "abc", "content": "hello" }
+        });
+        let preview = reply_preview_from_value(Some(&whole)).unwrap();
+        assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.body.as_str()), ("abc", "Greg", "hello"));
+        // Half of one is a hole above the message, and is left out.
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } }))).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } }))).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } }))).is_none());
+        assert!(reply_preview_from_value(None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata"))).is_none());
     }
 }

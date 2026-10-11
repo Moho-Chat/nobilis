@@ -180,4 +180,23 @@ mod tests {
         assert_eq!(reopened.account("kick:me"), vec!["raid".to_string(), "gifted".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn a_removed_accounts_words_go_with_it_and_nobody_elses_do() {
+        let dir = std::env::temp_dir().join(format!("moho-highlights-forget-{}", std::process::id()));
+        let path = dir.join("highlights.toml");
+        let store = HighlightStore::open(path.clone());
+        store.set_global(vec!["everyone".into()]);
+        store.set_account("irc:gone", vec!["mine".into()]);
+        store.set_account("irc:kept", vec!["yours".into()]);
+        store.forget("irc:gone");
+        assert!(store.account("irc:gone").is_empty());
+        assert_eq!(store.account("irc:kept"), vec!["yours".to_string()]);
+        assert_eq!(store.global(), vec!["everyone".to_string()]);
+        // And it is the file that forgot, not only this copy of it.
+        let reopened = HighlightStore::open(path);
+        assert!(reopened.account("irc:gone").is_empty());
+        assert_eq!(reopened.account("irc:kept"), vec!["yours".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
