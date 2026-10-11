@@ -957,4 +957,108 @@ mod tests {
         assert!(both.contains(&format!("https://{DEFAULT_ONION}/attachments/seal-png.9609686/")));
         assert!(both.contains(&format!("https://{DEFAULT_ONION}/data/video/9667/9667943-abc.mp4")));
     }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("nobilis-sneed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A file of `size` bytes whose last write was `age` seconds ago.
+    fn aged(dir: &std::path::Path, name: &str, size: usize, age: u64) {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'x'; size]).unwrap();
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        found.sort();
+        found
+    }
+
+    #[tokio::test]
+    async fn a_cache_over_its_cap_loses_its_oldest_files_first_and_no_more_than_it_must() {
+        let dir = scratch("sweep");
+        // Fifty bytes in five files, the numbers saying how old they are.
+        for (name, age) in [("e", 50), ("d", 40), ("c", 30), ("b", 20), ("a", 10)] {
+            aged(&dir, name, 10, age);
+        }
+        std::fs::create_dir(dir.join("subdirectory")).unwrap();
+        // Twenty-five over: the three oldest go (thirty bytes), because two
+        // (twenty) would still leave it over.
+        sweep_cache_dir(&dir, 25, "test").await;
+        assert_eq!(names(&dir), vec!["a", "b", "subdirectory"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_cache_at_its_cap_is_left_alone() {
+        let dir = scratch("sweep-exact");
+        aged(&dir, "old", 10, 100);
+        aged(&dir, "new", 10, 1);
+        sweep_cache_dir(&dir, 20, "test").await;
+        assert_eq!(names(&dir), vec!["new", "old"], "exactly at the cap is not over it");
+        sweep_cache_dir(&dir, 19, "test").await;
+        assert_eq!(names(&dir), vec!["new"], "one byte over costs the oldest");
+        // A directory that is not there is not an error.
+        sweep_cache_dir(&dir.join("missing"), 1, "test").await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_container_brands_are_told_apart() {
+        let boxed = |brand: &[u8; 4]| {
+            let mut bytes = vec![0, 0, 0, 24, b'f', b't', b'y', b'p'];
+            bytes.extend_from_slice(brand);
+            bytes.extend_from_slice(&[0; 4]);
+            bytes
+        };
+        assert_eq!(sniff_image_ext(&boxed(b"avif")), Some("avif"));
+        assert_eq!(sniff_image_ext(&boxed(b"avis")), Some("avif"));
+        assert_eq!(sniff_image_ext(&boxed(b"heic")), Some("heic"));
+        assert_eq!(sniff_image_ext(&boxed(b"heix")), Some("heic"));
+        assert_eq!(sniff_image_ext(&boxed(b"isom")), Some("mp4"));
+        assert_eq!(sniff_image_ext(b"not an image at all"), None);
+    }
+
+    #[tokio::test]
+    async fn a_cached_avatar_is_what_its_name_says_it_is_or_it_is_gone() {
+        let dir = scratch("avatars");
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let jpg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
+        // Right: a PNG called png; a JPEG called either of its names.
+        std::fs::write(dir.join("1.png"), png).unwrap();
+        assert_eq!(cached_avatar_file(&dir, "1").await, Some(dir.join("1.png")));
+        std::fs::write(dir.join("2.jpeg"), jpg).unwrap();
+        assert_eq!(cached_avatar_file(&dir, "2").await, Some(dir.join("2.jpeg")));
+        // Wrong: a PNG called jpg is from before sniffing, and is removed so it is fetched again.
+        std::fs::write(dir.join("3.jpg"), png).unwrap();
+        assert_eq!(cached_avatar_file(&dir, "3").await, None);
+        assert!(!dir.join("3.jpg").exists(), "the mislabelled file is gone");
+        // Bytes nobody recognises are kept - nothing better to go on.
+        std::fs::write(dir.join("4.png"), b"???").unwrap();
+        assert_eq!(cached_avatar_file(&dir, "4").await, Some(dir.join("4.png")));
+        // Somebody never cached, and somebody whose id only starts the same.
+        assert_eq!(cached_avatar_file(&dir, "5").await, None);
+        assert_eq!(cached_avatar_file(&dir, "").await, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_picture_changing_changes_the_address_it_is_known_by() {
+        let dir = scratch("versioned");
+        let path = dir.join("1.png");
+        std::fs::write(&path, b"x").unwrap();
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
+        assert_eq!(versioned(&path).await, format!("file://{}#1700000000", path.display()));
+        // One that is not there still has an address, and a stamp of nothing.
+        let gone = dir.join("2.png");
+        assert_eq!(versioned(&gone).await, format!("file://{}#0", gone.display()));
+        assert_eq!(avatar_key(&dir, "7"), dir.join("7"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
