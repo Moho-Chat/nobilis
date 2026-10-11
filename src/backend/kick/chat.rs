@@ -227,7 +227,14 @@ pub(super) fn handle_event(
         e if e.ends_with("StreamerIsLive") || e.ends_with("StopStreamBroadcast") => {
             let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             let live = e.ends_with("StreamerIsLive");
-            system_line(state, account_id, &slug, if live { "went live" } else { "ended the stream" }, "stream");
+            let what = if live { "went live" } else { "ended the stream" };
+            event_card(state, account_id, &slug, what, "stream", crate::model::Embed {
+                kind: Some("stream".to_string()),
+                author: Some(slug.clone()),
+                title: Some(what.to_string()),
+                icon: Some(if live { "live" } else { "offline" }.to_string()),
+                ..Default::default()
+            });
             // And the header, which is otherwise still describing the stream
             // that just ended. Asked of Kick rather than assembled from this
             // event: the title and the game arrive with the channel, not with
@@ -363,7 +370,12 @@ pub(super) fn handle_event(
         // A moderator emptying the room.
         e if e.ends_with("ChatroomClearEvent") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                system_line(state, account_id, &slug, "a moderator cleared the chat", "moderation");
+                event_card(state, account_id, &slug, "a moderator cleared the chat", "moderation", crate::model::Embed {
+                    kind: Some("moderation".to_string()),
+                    author: Some("A moderator".to_string()),
+                    title: Some("cleared the chat".to_string()),
+                    ..Default::default()
+                });
             }
         }
 
@@ -671,6 +683,10 @@ fn tier_colour(tier: &str) -> i64 {
 ///   received them, one name to a line.
 /// - `raid`: `author` raids, `title` is how many came (absent when unsaid), and
 ///   `description` what they said.
+/// - `subscribe`: `author` subscribes, `title` is how many months when more than one.
+/// - `moderation`: `author` is who it happened to, `title` what happened ("was banned",
+///   "was timed out", "is allowed back") and `description` who did it, where it says.
+/// - `stream`: `author` is the channel, `title` what it did, and `icon` is "live" or "offline".
 /// - `redeem`: `author` redeems, `title` is the reward, `description` what they
 ///   typed with it, and `color` the streamer's colour for the reward.
 pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::model::Embed> {
@@ -689,6 +705,37 @@ pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::m
                 provider: text(gift.and_then(|g| g.get("name"))),
                 description: text(gift.and_then(|g| g.get("message"))).or_else(|| text(p.get("message"))),
                 color: Some(tier.as_deref().map_or(0x53FC18, tier_colour)),
+                ..Default::default()
+            })
+        }
+        "SubscriptionEvent" => {
+            let who = text(p.get("username"))
+                .or_else(|| text(p.get("sender").and_then(|s| s.get("username"))))
+                .or_else(|| text(p.get("user").and_then(|s| s.get("username"))))?;
+            Some(crate::model::Embed {
+                kind: Some("subscribe".to_string()),
+                author: Some(who),
+                // Months, where they are more than the first one.
+                title: p.get("months").and_then(|v| v.as_u64()).filter(|n| *n > 1).map(|n| n.to_string()),
+                ..Default::default()
+            })
+        }
+        "UserBannedEvent" => {
+            let who = text(p.get("user").and_then(|u| u.get("username")))?;
+            Some(crate::model::Embed {
+                kind: Some("moderation".to_string()),
+                author: Some(who),
+                title: Some(if p.get("expires_at").and_then(|v| v.as_str()).is_some() { "was timed out" } else { "was banned" }.to_string()),
+                description: text(p.get("banned_by").and_then(|u| u.get("username"))),
+                ..Default::default()
+            })
+        }
+        "UserUnbannedEvent" => {
+            let who = text(p.get("user").and_then(|u| u.get("username")))?;
+            Some(crate::model::Embed {
+                kind: Some("moderation".to_string()),
+                author: Some(who),
+                title: Some("is allowed back".to_string()),
                 ..Default::default()
             })
         }
@@ -1320,5 +1367,49 @@ mod tests {
         assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } }))).is_none());
         assert!(reply_preview_from_value(None).is_none());
         assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata"))).is_none());
+    }
+
+    #[test]
+    fn every_kind_of_kick_event_is_a_card() {
+        let sub = serde_json::json!({ "username": "bigkhernandez", "months": 21 });
+        assert_eq!(describe_action("SubscriptionEvent", &sub).map(|(_, l)| l).as_deref(), Some("bigkhernandez subscribed - 21 months"));
+        let card = action_card("SubscriptionEvent", &sub).unwrap();
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("subscribe"), Some("bigkhernandez"), Some("21")));
+        // The first month has none to say.
+        assert_eq!(action_card("SubscriptionEvent", &serde_json::json!({ "username": "x", "months": 1 })).unwrap().title, None);
+        assert_eq!(action_card("SubscriptionEvent", &serde_json::json!({ "username": "x" })).unwrap().title, None);
+
+        let ban = serde_json::json!({ "user": { "username": "troll" }, "banned_by": { "username": "mod" } });
+        let card = action_card("App\\Events\\UserBannedEvent", &ban).unwrap();
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref(), card.description.as_deref()),
+            (Some("moderation"), Some("troll"), Some("was banned"), Some("mod")));
+        let timeout = serde_json::json!({ "user": { "username": "troll" }, "expires_at": "2026-10-11T00:10:00Z" });
+        let card = action_card("UserBannedEvent", &timeout).unwrap();
+        assert_eq!((card.title.as_deref(), card.description.as_deref()), (Some("was timed out"), None));
+        let back = action_card("UserUnbannedEvent", &serde_json::json!({ "user": { "username": "troll" } })).unwrap();
+        assert_eq!((back.author.as_deref(), back.title.as_deref()), (Some("troll"), Some("is allowed back")));
+        // Nobody named is nobody to draw a card about.
+        assert!(action_card("UserBannedEvent", &serde_json::json!({})).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_stream_and_the_room_are_cards_too() {
+        let state = testkit::simulated_daemon("event-cards");
+        let mut watched = testkit::watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\StreamerIsLive", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\StopStreamBroadcast", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\ChatroomClearEvent", serde_json::json!({}));
+        feed(&state, &mut watched, "SubscriptionEvent", serde_json::json!({ "username": "newcomer", "months": 3 }));
+        let rows = state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).unwrap();
+        let cards: Vec<_> = rows.iter().map(|m| (m.kind.as_str(), m.embeds[0].kind.as_deref().unwrap(), m.embeds[0].title.as_deref().unwrap())).collect();
+        assert_eq!(cards, vec![
+            ("stream", "stream", "went live"),
+            ("stream", "stream", "ended the stream"),
+            ("moderation", "moderation", "cleared the chat"),
+            ("sub", "subscribe", "3"),
+        ]);
+        assert_eq!(rows[0].embeds[0].icon.as_deref(), Some("live"));
+        assert_eq!(rows[1].embeds[0].icon.as_deref(), Some("offline"));
+        assert_eq!(rows[0].embeds[0].author.as_deref(), Some("odablock"));
     }
 }
