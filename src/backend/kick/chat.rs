@@ -883,6 +883,7 @@ mod tests {
     fn closing_a_channel_forgets_who_was_talking_in_it() {
         let mut w = watching_odablock();
         w.heard("odablock", Speaker { nick: "someone".into(), user_id: None, badge: None });
+        assert_eq!(w.roster("odablock").len(), 1, "somebody was heard to begin with");
         w.remove("odablock");
         assert!(w.roster("odablock").is_empty());
     }

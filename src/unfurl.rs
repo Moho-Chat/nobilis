@@ -367,6 +367,7 @@ mod tests {
         assert_eq!(card.url.as_deref(), Some(watch));
         assert!(parse(&serde_json::json!({ "title": "  ", "author_name": "x" }), watch).is_none());
     }
+
     #[test]
     fn a_card_from_the_page_when_oembed_is_refused() {
         let watch = "https://www.youtube.com/watch?v=_-agl0pOQfs";
