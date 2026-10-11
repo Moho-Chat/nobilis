@@ -42,58 +42,40 @@ response: {"id": 1, "result": {...}}  or  {"id": 1, "error": "..."}
 push:     {"event": "message", "data": {...}}
 ```
 
-Core methods: `listAccounts`, `listBuffers`, `listProtocols`, `addAccount`, `removeAccount`,
-`setAccountConnected`, `joinBuffer`, `partBuffer`, `sendMessage`, `editMessage`, `deleteMessage`,
-`toggleReaction`, `subscribe`/`unsubscribe`, `getBacklog`. Each protocol also has its own
-account-creation method (`addAccount` for IRC, `addDiscordAccount`, `addSneedChatAccount`,
-`addMatrixAccount`).
-
-Push events: `message`, `messageUpdated`, `messageDeleted`, `reactionsChanged`, `presenceChange`,
-`bufferListChange`, `connectionState`, `notification`, plus per-protocol login-flow events
-(`discordLoginQr`/`discordLoginScanned`/`discordLoginResult`, `sneedChatLoginStatus`/
-`sneedChatLoginResult`, `matrixLoginStatus`/`matrixLoginResult`) and Matrix verification events
-(`matrixVerificationStatus`/`matrixVerificationEmoji`/`matrixVerificationResult`).
+The calls and events are whatever `src/rpc/methods.rs` matches on and the runtime emits - that
+is the one list that cannot go stale, and moho's
+[ARCHITECTURE.md](https://github.com/Moho-Chat/moho/blob/master/ARCHITECTURE.md) describes the
+shape of it and what each backend implements. The ones every service shares are `listAccounts`,
+`listBuffers`, `sendMessage`, `editMessage`, `deleteMessage`, `toggleReaction`, `subscribe` and
+`getBacklog`; everything a service has that the others do not is a call of its own.
 
 `message`, `presenceChange`, `messageUpdated`, `messageDeleted` and `reactionsChanged` are only
 delivered to clients that called `subscribe` for that buffer; everything else broadcasts.
 
 ### Notes for frontend authors
 
-- An ordinary message arrives with `kind` `"chat"` from IRC, Discord and Sneedchat, but
-  `"message"` from Matrix. Treat both as "something a person said"; every other kind
-  (`system`, `join`, `part`, `nick`, `topic`, `matrixJoin`, `matrixInvite`, `matrixKick`,
-  `matrixQuit`) is a log line, and which of those to render is the frontend's choice — nobilis
-  always records them.
+- An ordinary message arrives with `kind` `"chat"` from IRC, Discord, Kick and Sneedchat, but
+  `"message"` from Matrix. Treat both as "something a person said". Every other kind is a log
+  line or an event - a join, a topic change, a Kick raid or redeemed reward - and which of them
+  to draw is the frontend's choice; nobilis always records them. A kind a frontend does not know
+  is best drawn as a log line.
+- A message can carry `embeds`: what a service sent with it (a Discord embed, a Matrix link
+  preview) and what nobilis worked out for it - a YouTube link's title and channel, a GIF's
+  address, and for a Kick event the amount, the recipients and the colours. They are added
+  after the message, as a `messageUpdated` with `edited: false`.
 - Media that nobilis fetched on the client's behalf (Sneedchat avatars and attachments, Matrix
-  media, shrunk Kick emotes, Discord thumbnails and stickers, the Discord login QR) is handed over as a local `file://` path or
-  filesystem path, not a remote URL. This assumes the frontend runs on the same machine.
-- `listSneedchatSmilies` returns a bare filename per smiley, resolved against `resources/sneedchat-smilies/`
-  in this repository. A frontend that renders them needs its own copy of that directory.
+  media, shrunk Kick emotes, Discord thumbnails and stickers, the Discord login QR) is handed over
+  as a local `file://` path or filesystem path, not a remote URL. This assumes the frontend runs
+  on the same machine.
+- `listSneedchatSmilies` returns a bare filename per smiley, resolved against
+  `resources/sneedchat-smilies/` in this repository. A frontend that renders them needs its own
+  copy of that directory.
 
 ## Protocol backends
 
-A summary; moho's [ARCHITECTURE.md](https://github.com/Moho-Chat/moho/blob/master/ARCHITECTURE.md)
-has each one in full.
-
-- **IRC** — TLS with SASL (PLAIN, EXTERNAL, SCRAM-SHA-256), STS, twenty-seven IRCv3
-  capabilities including chathistory, multiline and message redaction, NickServ, DCC, and image
-  uploads to catbox, postimg, ibb.co or imgur.
-- **Discord** — QR login or Discord's own sign-in page, the user gateway, messages with
-  everything the official client does to them, threads, forums, slash commands, polls,
-  stickers, events and AutoMod. Voice, camera and Go Live streams are its own connections, with
-  DAVE end-to-end encryption, echo cancellation and the soundboard. Nothing Discord puts behind
-  a captcha is attempted.
-- **Matrix** — Client-Server API with full end-to-end encryption (vodozemac-backed Olm/Megolm via
-  `matrix-sdk-crypto`), device verification by emoji or QR, cross-signing, key backup, sliding
-  sync, spaces, polls, forwarding, room moderation, and calls including Element Call.
-- **Kick** — chat over its Pusher socket with 7TV and BTTV emotes, moderation, polls,
-  predictions and redemptions, and the stream's own HLS playlist, VODs and clips.
-- **Sneedchat (SneedChat)** — on the open internet by default, or over an embedded Tor client (or
-  an external SOCKS5 proxy) at the onion address. Solves the site's proof-of-work anti-bot gate
-  and its login captcha, and holds one persistent websocket per configured room behind a single
-  login. Avatars and attachments are fetched through the same route and cached locally.
-
-Any account on any of the five can be routed through Tor or a SOCKS5 proxy.
+IRC, Discord, Matrix, Kick and Sneedchat, each one module under `src/backend/`. Any account on
+any of them can be routed through Tor or a SOCKS5 proxy. What each one implements is in moho's
+[ARCHITECTURE.md](https://github.com/Moho-Chat/moho/blob/master/ARCHITECTURE.md).
 
 ## On-disk state
 
@@ -102,6 +84,10 @@ Any account on any of the five can be routed through Tor or a SOCKS5 proxy.
 | `~/.config/nobilis/accounts.toml` | account config and credentials |
 | `~/.config/nobilis/scrollback.db` | SQLite scrollback |
 | `~/.config/nobilis/matrix-crypto/` | Matrix E2EE device keys and Olm sessions |
+| `~/.config/nobilis/voice.toml` | microphone, speakers, volumes and voice processing |
+| `~/.config/nobilis/highlights.toml`, `ignores.toml` | what counts as a mention, and who is ignored |
+| `~/.config/nobilis/dcc.toml`, `irc-sts.toml` | DCC settings, and IRC networks that have pinned TLS |
+| `~/.config/nobilis/tor-state/`, `tor-cache/` | the embedded Tor client's state |
 | `~/.cache/nobilis/` | re-derivable media caches |
 | `$XDG_RUNTIME_DIR/nobilis/nobilis.sock` | the control socket |
 
