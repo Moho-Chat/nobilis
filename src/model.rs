@@ -519,6 +519,10 @@ pub struct Embed {
     /// Who made it: a video's channel, an article's byline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
+    /// The colour the service draws that name in, as `#rrggbb` - Kick lets
+    /// everybody pick one, and a gift card in somebody's own colour is theirs.
+    #[serde(default, rename = "authorColor", skip_serializing_if = "Option::is_none")]
+    pub author_color: Option<String>,
     /// The labelled lines a bot puts under the description: "Status - Open".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fields: Vec<EmbedField>,

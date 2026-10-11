@@ -105,7 +105,7 @@ impl Watched {
     }
 
     /// Forgets a channel, and names every subscription it was using so the
-    /// caller can cancel each one. All four, or the socket keeps delivering
+    /// caller can cancel each one. All of them, or the socket keeps delivering
     /// events for a conversation that has been closed.
     fn remove(&mut self, slug: &str) -> Vec<String> {
         self.speakers.remove(slug);
@@ -119,6 +119,7 @@ impl Watched {
         if let Some(channel) = self.by_channel.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
             self.by_channel.remove(&channel);
             names.push(format!("channel.{channel}"));
+            names.push(format!("channel_{channel}"));
         }
         names
     }

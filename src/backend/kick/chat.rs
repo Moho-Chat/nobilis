@@ -368,7 +368,16 @@ pub(super) fn handle_event(
         e => {
             if let Some((kind, line)) = describe_action(e, &payload) {
                 if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                    system_line(state, account_id, &slug, &line, kind);
+                    // A KICKs gift or a gifted subscription is drawn as the
+                    // card it is, from what the line cannot hold: who it was
+                    // for, how much it was, what was said with it.
+                    match action_card(e, &payload) {
+                        Some(card) if !already_seen(&slug, &line, &payload) => {
+                            event_card(state, account_id, &slug, &line, kind, card)
+                        }
+                        Some(_) => {}
+                        None => system_line(state, account_id, &slug, &line, kind),
+                    }
                 }
             }
         }
@@ -557,7 +566,23 @@ pub(super) fn describe_action(event: &str, p: &serde_json::Value) -> Option<(&'s
             }))
         }
 
-        "StreamHostEvent" | "StreamHostedEvent" => {
+        // KICKs sent to a streamer: Kick's own money, spent in the chat. The
+        // payload is not documented; what is read is what its webhook form
+        // (`kicks.gifted`) names, and an event with no sender or no amount is
+        // skipped rather than drawn as "someone sent 0".
+        "KicksGifted" | "KicksGiftedEvent" => {
+            let (sender, amount) = kicks_of(p)?;
+            Some(("kicks", format!("{sender} sent {amount} {}", if amount == 1 { "Kick" } else { "Kicks" })))
+        }
+
+        // Kick sends one raid as two events on two subscriptions, measured
+        // on a live channel: `StreamHostEvent`, with the host and how many
+        // came, and `StreamHostedEvent`, the same raid with the viewer count
+        // under another name. The first is the one believed; reading both
+        // drew every raid twice, once without its number.
+        "StreamHostedEvent" => None,
+
+        "StreamHostEvent" => {
             let who = text("host_username").or_else(who)?;
             Some(("raid", match p.get("number_viewers").and_then(|v| v.as_u64()) {
                 Some(n) if n > 0 => format!("{who} raided with {n} viewers"),
@@ -595,6 +620,147 @@ pub(super) fn describe_action(event: &str, p: &serde_json::Value) -> Option<(&'s
 
         _ => None,
     }
+}
+
+/// Who sent KICKs and how many, from the payload wherever Kick puts them.
+fn kicks_of(p: &serde_json::Value) -> Option<(String, u64)> {
+    let name = |v: &serde_json::Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let sender = p
+        .get("sender")
+        .and_then(|s| s.get("username"))
+        .and_then(name)
+        .or_else(|| p.get("username").and_then(name))
+        .or_else(|| p.get("sender_username").and_then(name))
+        .or_else(|| p.get("user").and_then(|u| u.get("username")).and_then(name))?;
+    let number = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
+    let amount = p
+        .get("gift")
+        .and_then(|g| g.get("amount"))
+        .and_then(number)
+        .or_else(|| p.get("amount").and_then(number))
+        .or_else(|| p.get("kicks").and_then(number))
+        .or_else(|| p.get("kicks_amount").and_then(number))
+        .filter(|n| *n > 0)?;
+    Some((sender, amount))
+}
+
+/// The colour of a gift's tier, as the decimal RGB an embed carries. Kick's
+/// green for the ordinary kind; the others are told apart by hue, because
+/// what matters at a glance is that one is bigger than the rest.
+fn tier_colour(tier: &str) -> i64 {
+    match tier.to_ascii_uppercase().as_str() {
+        "MID" | "MEDIUM" | "STANDARD" => 0x2E9BFF,
+        "HIGH" | "PREMIUM" | "RARE" => 0xB45CFF,
+        "LEGENDARY" | "EPIC" | "ULTRA" => 0xFFA800,
+        _ => 0x53FC18,
+    }
+}
+
+/// The card a KICKs gift or a gifted subscription is drawn as.
+///
+/// An embed, because that is the shape every frontend already has for "more
+/// than a line": the line stays as the text of the message - what a search, a
+/// copy or a frontend that draws no cards sees - and the card carries the parts.
+///
+/// - `kicks`: `author` sends, `title` is the amount, `provider` the gift's name
+///   ("Full Send"), `description` what was said with it, `color` its tier.
+/// - `gift-sub`: `author` gifts, `title` is how many, and `description` is who
+///   received them, one name to a line.
+/// - `raid`: `author` raids, `title` is how many came (absent when unsaid), and
+///   `description` what they said.
+/// - `redeem`: `author` redeems, `title` is the reward, `description` what they
+///   typed with it, and `color` the streamer's colour for the reward.
+pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::model::Embed> {
+    let name = event.rsplit('\\').next().unwrap_or(event);
+    let text = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    match name {
+        "KicksGifted" | "KicksGiftedEvent" => {
+            let (sender, amount) = kicks_of(p)?;
+            let gift = p.get("gift");
+            let tier = text(gift.and_then(|g| g.get("tier"))).or_else(|| text(gift.and_then(|g| g.get("type"))));
+            Some(crate::model::Embed {
+                kind: Some("kicks".to_string()),
+                author: Some(sender),
+                author_color: text(p.get("sender").and_then(|s| s.get("username_color"))),
+                title: Some(amount.to_string()),
+                provider: text(gift.and_then(|g| g.get("name"))),
+                description: text(gift.and_then(|g| g.get("message"))).or_else(|| text(p.get("message"))),
+                color: Some(tier.as_deref().map_or(0x53FC18, tier_colour)),
+                ..Default::default()
+            })
+        }
+        "StreamHostEvent" => {
+            let host = text(p.get("host_username")).or_else(|| text(p.get("username")))?;
+            Some(crate::model::Embed {
+                kind: Some("raid".to_string()),
+                author: Some(host),
+                title: p.get("number_viewers").and_then(|v| v.as_u64()).filter(|n| *n > 0).map(|n| n.to_string()),
+                description: text(p.get("optional_message")),
+                ..Default::default()
+            })
+        }
+        "RewardRedeemedEvent" => {
+            let who = text(p.get("username"))?;
+            let reward = text(p.get("reward_title")).or_else(|| text(p.get("title")))?;
+            Some(crate::model::Embed {
+                kind: Some("redeem".to_string()),
+                author: Some(who),
+                title: Some(reward),
+                description: text(p.get("user_input")),
+                // The streamer's own colour for the reward, which Kick draws
+                // the card's bar and the name in.
+                color: text(p.get("reward_background_color"))
+                    .and_then(|c| i64::from_str_radix(c.trim_start_matches('#'), 16).ok()),
+                ..Default::default()
+            })
+        }
+        "GiftedSubscriptionsEvent" => {
+            let gifter = text(p.get("gifter_username")).or_else(|| text(p.get("username")))?;
+            let names: Vec<String> = p
+                .get("gifted_usernames")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|n| text(Some(n))).collect())
+                .unwrap_or_default();
+            let count = if names.is_empty() {
+                p.get("gifted_total").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
+            } else {
+                names.len() as u64
+            };
+            Some(crate::model::Embed {
+                kind: Some("gift-sub".to_string()),
+                author: Some(gifter),
+                title: Some(count.to_string()),
+                description: (!names.is_empty()).then(|| names.join("\n")),
+                ..Default::default()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Kick sends an event more than once when it reaches more than one of a
+/// channel's subscriptions, so the same gift is recognised for a few seconds
+/// rather than drawn twice.
+fn already_seen(slug: &str, line: &str, p: &serde_json::Value) -> bool {
+    static RECENT: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    let now = std::time::Instant::now();
+    let key = format!("{slug}\u{0}{line}\u{0}{}", p.get("gift_transaction_id").or_else(|| p.get("created_at")).or_else(|| p.get("message")).map(|v| v.to_string()).unwrap_or_default());
+    let mut recent = RECENT.lock().unwrap();
+    recent.retain(|_, at| now.duration_since(*at) < Duration::from_secs(10));
+    if recent.contains_key(&key) {
+        return true;
+    }
+    recent.insert(key, now);
+    false
+}
+
+/// A line that carries a card.
+pub(super) fn event_card(state: &AppState, account_id: &str, slug: &str, what: &str, kind: &str, card: crate::model::Embed) {
+    state.runtime.record_message(
+        state, account_id, slug, "channel", slug, what, false, kind, None, None, false, None,
+        vec![card], Vec::new(), None,
+    );
 }
 
 /// A line that nobody said.
@@ -915,5 +1081,115 @@ mod tests {
             describe_action("GiftedSubscriptionsEvent", &p).map(|(_, line)| line).as_deref(),
             Some("ItsDez gifted 5 subscriptions")
         );
+    }
+
+    #[test]
+    fn a_gifted_subscription_keeps_who_received_it() {
+        let p = serde_json::json!({
+            "chatroom_id": 2393554,
+            "gifted_usernames": ["Interstelar", "Ron_OSRS", "Auzzzii"],
+            "gifter_username": "ItsDez",
+            "gifted_total": 3
+        });
+        let card = action_card("GiftedSubscriptionsEvent", &p).unwrap();
+        assert_eq!(card.kind.as_deref(), Some("gift-sub"));
+        assert_eq!(card.author.as_deref(), Some("ItsDez"));
+        assert_eq!(card.title.as_deref(), Some("3"));
+        assert_eq!(card.description.as_deref(), Some("Interstelar\nRon_OSRS\nAuzzzii"));
+        // One with no names - the count alone - is still a card.
+        let bare = action_card("GiftedSubscriptionsEvent", &serde_json::json!({ "gifter_username": "a", "gifted_total": 10 })).unwrap();
+        assert_eq!(bare.title.as_deref(), Some("10"));
+        assert_eq!(bare.description, None);
+    }
+
+    #[test]
+    fn kicks_are_read_wherever_kick_puts_them() {
+        let nested = serde_json::json!({
+            "sender": { "id": 7, "username": "Currington" },
+            "gift": { "amount": 100, "name": "Full Send", "tier": "BASIC", "message": "lets go" }
+        });
+        assert_eq!(describe_action("KicksGifted", &nested), Some(("kicks", "Currington sent 100 Kicks".to_string())));
+        let card = action_card("App\\Events\\KicksGifted", &nested).unwrap();
+        assert_eq!(card.kind.as_deref(), Some("kicks"));
+        assert_eq!(card.author.as_deref(), Some("Currington"));
+        assert_eq!(card.title.as_deref(), Some("100"));
+        assert_eq!(card.provider.as_deref(), Some("Full Send"));
+        assert_eq!(card.description.as_deref(), Some("lets go"));
+        assert_eq!(card.color, Some(0x53FC18));
+        // One Kick is singular, and a flat shape reads the same.
+        let flat = serde_json::json!({ "username": "a", "amount": "1", "message": "hi" });
+        assert_eq!(describe_action("KicksGifted", &flat).map(|(_, l)| l).as_deref(), Some("a sent 1 Kick"));
+        assert_eq!(action_card("KicksGifted", &flat).unwrap().description.as_deref(), Some("hi"));
+        // Nobody, or nothing, is not a gift.
+        assert!(describe_action("KicksGifted", &serde_json::json!({ "gift": { "amount": 5 } })).is_none());
+        assert!(describe_action("KicksGifted", &serde_json::json!({ "sender": { "username": "a" }, "gift": { "amount": 0 } })).is_none());
+    }
+
+    #[test]
+    fn reads_a_real_kicks_payload() {
+        // Copied from a live channel's `channel_<id>` subscription.
+        let p = serde_json::json!({
+            "gift_transaction_id": "2bd6023b-020b-4c91-a47b-e43eff66656f",
+            "sender": { "id": 93750218, "username": "BlestRS", "username_color": "#FF2C56", "profile_picture": "https://kick.com/img/x.webp" },
+            "gift": { "gift_id": "full_send", "name": "Full Send", "amount": 100, "type": "BASIC", "tier": "BASIC", "character_limit": 0, "pinned_time": 0 },
+            "created_at": "2026-10-11T00:42:57.551767966Z"
+        });
+        assert_eq!(describe_action("KicksGifted", &p).map(|(_, l)| l).as_deref(), Some("BlestRS sent 100 Kicks"));
+        let card = action_card("KicksGifted", &p).unwrap();
+        assert_eq!(card.author.as_deref(), Some("BlestRS"));
+        assert_eq!(card.author_color.as_deref(), Some("#FF2C56"));
+        assert_eq!(card.provider.as_deref(), Some("Full Send"));
+        assert_eq!(card.description, None);
+    }
+
+    #[test]
+    fn a_gift_arriving_twice_is_drawn_once() {
+        let p = serde_json::json!({ "created_at": "2026-10-10T20:00:00Z" });
+        assert!(!already_seen("dupe-channel", "a sent 5 Kicks", &p));
+        assert!(already_seen("dupe-channel", "a sent 5 Kicks", &p));
+        assert!(!already_seen("dupe-channel", "a sent 6 Kicks", &p));
+    }
+
+    #[test]
+    fn a_raid_is_one_card_and_a_redeem_keeps_its_colour() {
+        let raid = serde_json::json!({ "chatroom_id": 1, "optional_message": null, "number_viewers": 25, "host_username": "kreationX" });
+        let card = action_card("App\\Events\\StreamHostEvent", &raid).unwrap();
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("raid"), Some("kreationX"), Some("25")));
+        // The same raid, said again on another subscription, is not another line.
+        let again = serde_json::json!({ "message": { "numberOfViewers": 25 }, "user": { "username": "kreationX" } });
+        assert!(describe_action("App\\Events\\StreamHostedEvent", &again).is_none());
+
+        let redeem = serde_json::json!({ "reward_title": "5 TONGUE TWISTERS", "user_id": 1, "username": "onkhell", "user_input": "", "reward_background_color": "#FF55B3" });
+        let card = action_card("RewardRedeemedEvent", &redeem).unwrap();
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("redeem"), Some("onkhell"), Some("5 TONGUE TWISTERS")));
+        assert_eq!(card.color, Some(0xFF55B3));
+        assert_eq!(card.description, None);
+    }
+
+    #[test]
+    fn kicks_and_gifted_subs_land_in_the_store_as_cards() {
+        let state = testkit::simulated_daemon("cards");
+        let mut watched = testkit::watching_odablock();
+        // On the subscription they were measured arriving on.
+        let kicks = serde_json::json!({
+            "gift_transaction_id": "t-1",
+            "sender": { "id": 1, "username": "BlestRS", "username_color": "#FF2C56" },
+            "gift": { "gift_id": "full_send", "name": "Full Send", "amount": 100, "type": "BASIC", "tier": "BASIC" },
+            "created_at": "2026-10-11T00:42:57.551767966Z"
+        });
+        for _ in 0..2 {
+            handle_event(&state, "kick:tester", &mut watched, "KicksGifted", Some("channel_2401072"), kicks.clone()).unwrap();
+        }
+        let gift = serde_json::json!({ "chatroom_id": 2393554, "gifted_usernames": ["a", "b"], "gifter_username": "kufallen", "gifted_total": 2 });
+        handle_event(&state, "kick:tester", &mut watched, "GiftedSubscriptionsEvent", Some("chatroom_2393554"), gift).unwrap();
+
+        let rows = state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).unwrap();
+        // The same gift on two subscriptions is one row.
+        assert_eq!(rows.len(), 2, "{:?}", rows.iter().map(|m| &m.body).collect::<Vec<_>>());
+        assert_eq!((rows[0].kind.as_str(), rows[0].body.as_str()), ("kicks", "BlestRS sent 100 Kicks"));
+        assert_eq!(rows[0].embeds[0].kind.as_deref(), Some("kicks"));
+        assert_eq!(rows[0].embeds[0].author_color.as_deref(), Some("#FF2C56"));
+        assert_eq!((rows[1].kind.as_str(), rows[1].body.as_str()), ("sub", "kufallen gifted 2 subscriptions"));
+        assert_eq!(rows[1].embeds[0].description.as_deref(), Some("a\nb"));
     }
 }
