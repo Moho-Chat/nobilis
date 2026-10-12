@@ -3435,6 +3435,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("steam:") => match backend::steam::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(_) => (None, Some("reactions aren't supported for this service".to_string())),
             }
         }
@@ -4075,6 +4079,21 @@ pub async fn dispatch(
             match backend::steam::friendship::remove(&link, steamid) {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Steam's warning about a conversation has been seen: it is not raised again.
+        "steamDismissNotice" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {
+                return (None, Some("steamDismissNotice requires a known \"bufferId\"".to_string()));
+            };
+            let friend = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok());
+            match (state.runtime.steam_link(&buffer.account_id), friend) {
+                (Some(link), Some(friend)) => match backend::steam::notices::dismiss(&link, friend, backend::steam::notices::SUSPICIOUS) {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                _ => (None, Some("this Steam conversation is not connected".to_string())),
             }
         }
 

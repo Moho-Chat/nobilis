@@ -34,6 +34,8 @@ pub struct Past {
     pub timestamp: u32,
     pub ordinal: u32,
     pub text: String,
+    /// Who has reacted with what, as held here; empty in a test that has none.
+    pub reactions: Vec<crate::model::Reaction>,
 }
 
 impl Past {
@@ -42,14 +44,14 @@ impl Past {
     }
 }
 
-fn read(message: &PastMessage) -> Option<Past> {
+fn read(message: &PastMessage, own: u32) -> Option<Past> {
     let account = message.accountid.filter(|a| *a != 0)?;
     // Asked for with its tags, and read into what moho draws.
     let text = super::bbcode::to_markup(message.message.as_deref().unwrap_or_default());
     if text.trim().is_empty() {
         return None;
     }
-    Some(Past { account, timestamp: message.timestamp.unwrap_or_default(), ordinal: message.ordinal.unwrap_or_default(), text })
+    Some(Past { account, timestamp: message.timestamp.unwrap_or_default(), ordinal: message.ordinal.unwrap_or_default(), text, reactions: super::reactions::from_history(own, &message.reactions) })
 }
 
 /// Asks for up to `count` messages of a conversation that are older than
@@ -69,7 +71,8 @@ pub async fn fetch(link: &Link, own: u64, friend: u64, older_than: Option<(u32, 
         ..Default::default()
     };
     let answer: GetRecentMessagesResponse = link.call("FriendMessages.GetRecentMessages#1", &request, true).await.map_err(|e| super::chat::refusal(&e))?;
-    let mut messages: Vec<Past> = answer.messages.iter().filter_map(read).collect();
+    let own_number = steamid::account_of(own).unwrap_or_default();
+    let mut messages: Vec<Past> = answer.messages.iter().filter_map(|m| read(m, own_number)).collect();
     // Steam answers newest first.
     messages.reverse();
     Ok((messages, answer.more_available.unwrap_or(false)))
@@ -103,9 +106,12 @@ pub fn store_quietly(state: &AppState, buffer: &Buffer, own: u32, past: &[Past])
         let is_own = p.account == own;
         let from = if is_own { own_name.as_str() } else { buffer.name.as_str() };
         let sender = (!is_own).then(|| steamid::text_of(p.account));
-        let stored = state.store.append_message(&buffer.id, &p.id(), from, &p.text, i64::from(p.timestamp), false, false, "chat", None, &[], is_own, None, &[], &[], sender.as_deref(), None, "dm", None, &[]);
+        let stored = state.store.append_message(&buffer.id, &p.id(), from, &p.text, i64::from(p.timestamp), false, false, "chat", None, &p.reactions, is_own, None, &[], &[], sender.as_deref(), None, "dm", None, &[]);
         if matches!(stored, Ok(true)) {
             added += 1;
+        } else if !p.reactions.is_empty() {
+            // Already held, but reacted to since: Steam's list is the truth.
+            let _ = state.store.set_reactions(&buffer.id, &p.id(), &p.reactions);
         }
     }
     added
@@ -324,7 +330,7 @@ mod tests {
         let blank = vec![past(FRIEND, 1, 0, "  "), past(0, 2, 0, "nobody"), PastMessage { accountid: Some(FRIEND), timestamp: Some(3), message: None, ordinal: None, reactions: vec![] }, past(FRIEND, 4, 0, "kept ")];
         let link = link_to(steam(blank, vec![], Arc::default())).await;
         let (got, _) = fetch(&link, steamid::steamid_of(ME), steamid::steamid_of(FRIEND), None, 50).await.unwrap();
-        assert_eq!(got, vec![Past { account: FRIEND, timestamp: 4, ordinal: 0, text: "kept".into() }], "and trailing space is dropped");
+        assert_eq!(got, vec![Past { account: FRIEND, timestamp: 4, ordinal: 0, text: "kept".into(), reactions: vec![] }], "and trailing space is dropped");
     }
 
     #[tokio::test]
@@ -406,7 +412,7 @@ mod tests {
         shown.publish(&state, &roster);
         let buffer = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).unwrap();
         let link = link_to(steam(five(), vec![session], Arc::default())).await;
-        store_quietly(&state, &buffer, ME, &held_before.iter().filter_map(read).collect::<Vec<_>>());
+        store_quietly(&state, &buffer, ME, &held_before.iter().filter_map(|m| read(m, ME)).collect::<Vec<_>>());
         let mut rx = state.events.subscribe();
         let _ = catch_up(&state, &link, ACCOUNT, ME, &roster, &shown).await;
         let (mut said, mut read_events) = (vec![], vec![]);

@@ -467,7 +467,7 @@ pub struct SenderStyle {
 /// account is among the reactors - Discord's REACTION_ADD/REMOVE events
 /// are per-user, so this is accumulated incrementally rather than
 /// snapshotted (see backend/discord/messages.rs's reaction handling).
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Reaction {
     pub emoji: String,
     pub count: i64,

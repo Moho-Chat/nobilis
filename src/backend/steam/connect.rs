@@ -416,6 +416,22 @@ impl Drive<'_> {
                         }
                     }
                 }
+                // Steam flagging a conversation as suspicious.
+                Some("FriendMessagesClient.SessionNotice#1") => {
+                    if let Ok(notice) = SessionNoticeNotification::decode(packet.body.as_slice()) {
+                        if let Some(name) = notice.steamid_friend.and_then(steamid::account_of).and_then(|f| self.shown.name_of(f)) {
+                            super::notices::heard(self.state, self.account_id, name, &notice);
+                        }
+                    }
+                }
+                // Somebody reacted to a message, or took it back.
+                Some("FriendMessagesClient.MessageReaction#1") => {
+                    if let Ok(notice) = MessageReactionNotice::decode(packet.body.as_slice()) {
+                        if let Some(name) = notice.steamid_friend.and_then(steamid::account_of).and_then(|f| self.shown.name_of(f)) {
+                            super::reactions::heard(self.state, &crate::model::buffer_id(self.account_id, name), self.own, &notice);
+                        }
+                    }
+                }
                 // Read on another of this account's clients.
                 Some("FriendMessagesClient.NotifyAckMessageEcho#1") => {
                     if let Ok(ack) = AckMessage::decode(packet.body.as_slice()) {
@@ -773,7 +789,7 @@ mod tests {
         let task = start(&state, url);
         eventually("the conversation to exist", || state.runtime.get_buffer(&gabe).is_some()).await;
         let buffer = state.runtime.get_buffer(&gabe).unwrap();
-        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into() }]);
+        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into(), reactions: vec![] }]);
 
         eventually("what was missed", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 3).await;
         let texts: Vec<String> = state.store.get_backlog(&gabe, 0, 10).unwrap().into_iter().map(|m| m.body).collect();

@@ -339,3 +339,56 @@ async fn which_tags_a_friend_message_keeps() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// A reaction between two real accounts: put on, heard by the other, found
+/// again in history, and taken off.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; sends one real message and reacts to it"]
+async fn a_reaction_is_heard_remembered_and_taken_back() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-reactions");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let (sender_id, receiver_id) = (sender.account_id(), receiver.account_id());
+    for config in [&sender, &receiver] {
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+    }
+    within(60, "both accounts to be signed in", || [&sender_id, &receiver_id].iter().all(|id| state.runtime.conn_state(id) == Some(ConnState::Connected))).await;
+    let conversation = |account: &str, with: u64| {
+        state.runtime.list_buffers().into_iter().find(|b| b.account_id == account && b.kind == "dm" && b.remote_id.as_deref() == Some(&with.to_string()))
+    };
+    within(60, "the friends to know each other", || conversation(&sender_id, receiver.steamid).is_some() && conversation(&receiver_id, sender.steamid).is_some()).await;
+    // Let the friends be named, so the conversations are where they will stay.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let said = format!("moho probe reaction {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    let ours = conversation(&sender_id, receiver.steamid).unwrap();
+    crate::backend::steam::send_message(&state, &ours, &said).await.expect("Steam takes the message");
+    let id_of = |buffer: &str| state.store.get_backlog(buffer, 0, 50).unwrap().into_iter().find(|m| m.body == said).map(|m| m.id);
+    let msg_id = id_of(&ours.id).expect("the sender logged it");
+    within(30, "the receiver to hear it", || id_of(&conversation(&receiver_id, sender.steamid).unwrap().id).is_some()).await;
+
+    let token = "[steam:emote:steamhappy]";
+    let reactions = |buffer: &str| state.store.get_message(buffer, &msg_id).unwrap().map(|m| m.reactions.iter().map(|r| (r.emoji.clone(), r.count, r.me)).collect::<Vec<_>>()).unwrap_or_default();
+    super::reactions::toggle(&state, &ours, &msg_id, token, true).await.expect("Steam takes the reaction");
+    assert_eq!(reactions(&ours.id), [(token.to_string(), 1, true)], "held by the sender");
+    within(15, "the receiver to hear the reaction", || reactions(&conversation(&receiver_id, sender.steamid).unwrap().id) == [(token.to_string(), 1, false)]).await;
+
+    // Found again in history, which is what a conversation opened later reads.
+    let theirs = conversation(&receiver_id, sender.steamid).unwrap();
+    state.store.set_reactions(&theirs.id, &msg_id, &[]).unwrap();
+    super::history::open(&state, &theirs).await.expect("history");
+    assert_eq!(reactions(&theirs.id), [(token.to_string(), 1, false)], "history carries it");
+
+    super::reactions::toggle(&state, &ours, &msg_id, token, false).await.expect("Steam takes it back");
+    assert!(reactions(&ours.id).is_empty());
+    within(15, "the receiver to hear it taken back", || reactions(&conversation(&receiver_id, sender.steamid).unwrap().id).is_empty()).await;
+
+    for id in [&sender_id, &receiver_id] {
+        if let Some(link) = state.runtime.take_steam_link(id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

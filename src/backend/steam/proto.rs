@@ -497,6 +497,76 @@ pub struct AckMessage {
     pub timestamp: Option<u32>,
 }
 
+// --- reactions -------------------------------------------------------------
+
+/// Puts a reaction on a message, or takes ours off. The message is named by when
+/// Steam stamped it and where it fell in that second.
+#[derive(Clone, PartialEq, Message)]
+pub struct UpdateMessageReactionRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub ordinal: Option<u32>,
+    /// 1 an emoticon, 2 a sticker.
+    #[prost(int32, optional, tag = "4")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "5")]
+    pub reaction: Option<String>,
+    #[prost(bool, optional, tag = "6")]
+    pub is_add: Option<bool>,
+}
+
+/// Who now holds that reaction on the message, by account number.
+#[derive(Clone, PartialEq, Message)]
+pub struct UpdateMessageReactionResponse {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub reactors: Vec<u32>,
+}
+
+/// Somebody reacted to a message in a conversation with us, or took it back.
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageReactionNotice {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_friend: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub ordinal: Option<u32>,
+    #[prost(fixed64, optional, tag = "4")]
+    pub reactor: Option<u64>,
+    #[prost(int32, optional, tag = "5")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "6")]
+    pub reaction: Option<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub is_add: Option<bool>,
+}
+
+// --- session notices -------------------------------------------------------
+
+/// Steam flagging a conversation: `notice_type` 1 is "suspicious", a person who
+/// may not be who they appear to be.
+#[derive(Clone, PartialEq, Message)]
+pub struct SessionNoticeNotification {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_friend: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub notice_type: Option<i32>,
+    #[prost(bool, optional, tag = "3")]
+    pub active: Option<bool>,
+}
+
+/// Says a notice has been seen, so Steam stops raising it.
+#[derive(Clone, PartialEq, Message)]
+pub struct DismissSessionNotice {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_friend: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub notice_type: Option<i32>,
+}
+
 // --- emoticons -------------------------------------------------------------
 
 #[derive(Clone, PartialEq, Message)]
@@ -761,10 +831,12 @@ mod tests {
                 GetRecentMessagesRequest, PastReaction, PastMessage, GetRecentMessagesResponse,
                 GetActiveSessionsRequest, MessageSession, GetActiveSessionsResponse, AckMessage,
                 GetEmoticonListRequest, EmoticonInfo, GetEmoticonListResponse,
+                UpdateMessageReactionRequest, UpdateMessageReactionResponse, MessageReactionNotice,
+                SessionNoticeNotification, DismissSessionNotice,
             );
             seen += 1;
         }
-        assert_eq!(seen, 50, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 55, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

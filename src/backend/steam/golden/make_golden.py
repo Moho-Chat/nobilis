@@ -130,6 +130,13 @@ CASES = {
         name="steamhappy", count=3, time_last_used=1790000010, use_count=9, time_received=1700000000, appid=730)),
     "GetEmoticonListResponse": (player.CPlayer_GetEmoticonList_Response, dict(
         emoticons=[dict(name="steamhappy", count=1), dict(name="steamsad", count=2, use_count=4)])),
+    "UpdateMessageReactionRequest": (fmsg.CFriendMessages_UpdateMessageReaction_Request, dict(
+        steamid=ID, server_timestamp=1790000011, ordinal=2, reaction_type=1, reaction="steamhappy", is_add=True)),
+    "UpdateMessageReactionResponse": (fmsg.CFriendMessages_UpdateMessageReaction_Response, dict(reactors=[22202, 100])),
+    "MessageReactionNotice": (fmsg.CFriendMessages_MessageReaction_Notification, dict(
+        steamid_friend=ID, server_timestamp=1790000012, ordinal=1, reactor=ID2, reaction_type=2, reaction="CatSurprise", is_add=True)),
+    "SessionNoticeNotification": (fmsg.CFriendMessages_SessionNotice_Notification, dict(steamid_friend=ID, notice_type=1, active=True)),
+    "DismissSessionNotice": (fmsg.CFriendMessages_DismissSessionNotice_Notification, dict(steamid_friend=ID2, notice_type=1)),
     "GetPasswordRsaPublicKeyRequest": (auth.CAuthentication_GetPasswordRSAPublicKey_Request, dict(account_name="someone")),
     "GetPasswordRsaPublicKeyResponse": (auth.CAuthentication_GetPasswordRSAPublicKey_Response, dict(
         publickey_mod="C0FFEE" * 8, publickey_exp="010001", timestamp=1790000005000)),

@@ -36,11 +36,13 @@ pub mod friendship;
 pub mod history;
 pub mod link;
 pub mod login;
+pub mod notices;
 pub mod presence;
 #[cfg(test)]
 mod probe;
 pub mod proto;
 pub mod publish;
+pub mod reactions;
 pub mod steamid;
 pub mod wire;
 
