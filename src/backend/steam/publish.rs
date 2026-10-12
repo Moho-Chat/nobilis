@@ -23,6 +23,8 @@ use std::collections::HashMap;
 struct Shown {
     name: String,
     status: &'static str,
+    /// What is said beside the dot: the game, or a state the colour cannot give.
+    text: Option<String>,
     avatar: Option<String>,
 }
 
@@ -46,7 +48,7 @@ impl Conversations {
                 continue;
             }
             let Some(account) = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok()).and_then(steamid::account_of) else { continue };
-            self.shown.entry(account).or_insert(Shown { name: buffer.name, status: "offline", avatar: None });
+            self.shown.entry(account).or_insert(Shown { name: buffer.name, status: "offline", text: None, avatar: None });
         }
     }
 
@@ -64,7 +66,8 @@ impl Conversations {
             let persona = roster.persona(account);
             let status = persona.map_or("offline", |p| presence::status_of(p.state));
             let avatar = persona.and_then(|p| p.avatar.clone());
-            let next = Shown { name: name.clone(), status, avatar: avatar.clone() };
+            let text = persona.and_then(|p| presence::status_text(p.state, p.game.as_deref()));
+            let next = Shown { name: name.clone(), status, text: text.clone(), avatar: avatar.clone() };
             let before = self.shown.get(&account);
             if before == Some(&next) {
                 continue;
@@ -86,6 +89,7 @@ impl Conversations {
                 "nick": persona.and_then(|p| p.name.clone()).unwrap_or_else(|| name.clone()),
                 "userId": steamid::text_of(account),
                 "status": status,
+                "statusText": text,
                 "away": status == "idle",
                 "avatarUrl": avatar,
             }]);
@@ -176,6 +180,34 @@ mod tests {
         assert_eq!(said.len(), 1);
         assert_eq!(said[0]["members"][0]["nick"], "Two");
         assert_eq!(said[0]["members"][0]["status"], "online");
+    }
+
+    #[test]
+    fn a_game_and_the_states_the_colours_share_are_said_beside_the_dot_and_change_when_they_do() {
+        let state = simulated_daemon("steam-publish-text");
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&friends(&[1, 2, 3]));
+        roster.apply_persona(&update(vec![who(1, "Plain", 1), who(2, "Snoozer", 4), who(3, "Gamer", 1)]));
+        let game = |name: &str| PersonaFriend { friendid: Some(steamid::steamid_of(3)), gameid: Some(730), game_name: Some(name.into()), ..Default::default() };
+        roster.apply_persona(&update(vec![game("Counter-Strike 2")]));
+        let mut shown = Conversations::new(ACCOUNT);
+        let mut rx = state.events.subscribe();
+        shown.publish(&state, &roster);
+        let text = |said: &[serde_json::Value], nick: &str| said.iter().find(|e| e["members"][0]["nick"] == nick).map(|e| e["members"][0]["statusText"].clone());
+        let said = events(&mut rx, "presenceChange");
+        assert_eq!(text(&said, "Plain"), Some(serde_json::Value::Null), "online says nothing beside the dot");
+        assert_eq!(text(&said, "Snoozer"), Some(serde_json::json!("Snoozing")));
+        assert_eq!(text(&said, "Gamer"), Some(serde_json::json!("Playing Counter-Strike 2")));
+        // The dot is still what it was for each: a game does not change it.
+        assert_eq!(said.iter().find(|e| e["members"][0]["nick"] == "Gamer").unwrap()["members"][0]["status"], "online");
+
+        // They stop playing: said once, for that person alone.
+        roster.apply_persona(&update(vec![PersonaFriend { friendid: Some(steamid::steamid_of(3)), gameid: Some(0), ..Default::default() }]));
+        shown.publish(&state, &roster);
+        let said = events(&mut rx, "presenceChange");
+        assert_eq!(said.len(), 1);
+        assert_eq!(said[0]["members"][0]["nick"], "Gamer");
+        assert!(said[0]["members"][0]["statusText"].is_null());
     }
 
     #[test]

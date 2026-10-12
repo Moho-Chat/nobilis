@@ -34,6 +34,8 @@ pub mod friendship;
 pub mod link;
 pub mod login;
 pub mod presence;
+#[cfg(test)]
+mod probe;
 pub mod proto;
 pub mod publish;
 pub mod steamid;

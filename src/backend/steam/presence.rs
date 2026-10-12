@@ -43,6 +43,28 @@ pub fn status_of(persona_state: u32) -> &'static str {
     }
 }
 
+/// What to say beside a friend's dot, beyond the colour: the game they are in,
+/// or the state the four colours cannot tell apart (Busy and Do not disturb
+/// are one red, Away and Snooze one amber, and "looking to trade" is just
+/// online). Nothing for plainly online or offline, which the dot says; and
+/// nothing for a game when they are offline, since that is stale.
+pub fn status_text(persona_state: u32, game: Option<&str>) -> Option<String> {
+    if status_of(persona_state) == "offline" {
+        return None;
+    }
+    if let Some(game) = game.filter(|g| !g.is_empty()) {
+        return Some(format!("Playing {game}"));
+    }
+    match persona_state {
+        BUSY => Some("Busy".to_string()),
+        AWAY => Some("Away".to_string()),
+        SNOOZE => Some("Snoozing".to_string()),
+        LOOKING_TO_TRADE => Some("Looking to trade".to_string()),
+        LOOKING_TO_PLAY => Some("Looking to play".to_string()),
+        _ => None,
+    }
+}
+
 /// Tells Steam how this account is showing.
 ///
 /// `by_user` says it was a choice, as against something done on their behalf
@@ -73,6 +95,25 @@ pub fn apply_status(state: &crate::state::AppState, account_id: &str, status: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_dot_cannot_say_is_said_beside_it() {
+        assert_eq!(status_text(ONLINE, None), None, "online is the dot");
+        assert_eq!(status_text(0, None), None, "offline is the dot");
+        assert_eq!(status_text(BUSY, None).as_deref(), Some("Busy"));
+        assert_eq!(status_text(AWAY, None).as_deref(), Some("Away"));
+        assert_eq!(status_text(SNOOZE, None).as_deref(), Some("Snoozing"));
+        assert_eq!(status_text(LOOKING_TO_TRADE, None).as_deref(), Some("Looking to trade"));
+        assert_eq!(status_text(LOOKING_TO_PLAY, None).as_deref(), Some("Looking to play"));
+        // A game outranks the state, and an empty name is no game.
+        assert_eq!(status_text(ONLINE, Some("Counter-Strike 2")).as_deref(), Some("Playing Counter-Strike 2"));
+        assert_eq!(status_text(BUSY, Some("Dota 2")).as_deref(), Some("Playing Dota 2"));
+        assert_eq!(status_text(ONLINE, Some("")), None);
+        // Somebody offline is not playing anything, whatever was last said.
+        assert_eq!(status_text(0, Some("Counter-Strike 2")), None);
+        // Invisible is never seen on somebody else, and reads as offline.
+        assert_eq!(status_text(INVISIBLE, Some("x")), None);
+    }
 
     #[test]
     fn what_moho_offers_is_what_steam_is_told() {
