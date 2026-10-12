@@ -366,6 +366,51 @@ impl KickAccountConfig {
     }
 }
 
+/// A Steam account.
+///
+/// What is kept is a **refresh token**, never the password: the password is
+/// held for the length of the sign-in (see backend/steam/auth.rs) and then
+/// forgotten, and the token is what signs this account in from then on. It is
+/// revoked from Steam's own list of signed-in devices, and signing in again
+/// replaces it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SteamAccountConfig {
+    /// The name the account signs in with. Lower-case: Steam does not tell
+    /// "Someone" and "someone" apart, and neither can the id built from it.
+    pub username: String,
+    /// The 64-bit id Steam gave the account on sign-in.
+    #[serde(default)]
+    pub steamid: u64,
+    /// What to call this account here. Local: Steam is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub refresh_token: String,
+    /// Steam's note that this machine was approved, sent with the next
+    /// sign-in so Steam Guard does not ask for a code every time.
+    #[serde(default)]
+    pub guard_data: Option<String>,
+    /// Which kind of session this account signed in as: `chat`, which lives
+    /// beside the Steam desktop client, or `client`, which replaces it. See
+    /// backend/steam/auth.rs `Kind`.
+    #[serde(default)]
+    pub session: String,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy
+    /// set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's
+    /// conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl SteamAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("steam:{}", self.username)
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -382,6 +427,8 @@ struct AccountsFile {
     matrix: Vec<MatrixAccountConfig>,
     #[serde(default, rename = "kick_account")]
     kick: Vec<KickAccountConfig>,
+    #[serde(default, rename = "steam_account")]
+    steam: Vec<SteamAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -395,11 +442,15 @@ pub struct AccountStore {
     sneedchat: Mutex<HashMap<String, SneedChatAccountConfig>>,
     matrix: Mutex<HashMap<String, MatrixAccountConfig>>,
     kick: Mutex<HashMap<String, KickAccountConfig>>,
+    /// Read by `persist` itself rather than handed to it, so the methods that
+    /// predate Steam did not each need a sixth argument. Anything that
+    /// changes this map must let go of its lock before it calls `persist`.
+    steam: Mutex<HashMap<String, SteamAccountConfig>>,
 }
 
 impl AccountStore {
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -409,11 +460,12 @@ impl AccountStore {
             let sneedchat = file.sneedchat.into_iter().map(|a| (a.account_id(), a)).collect();
             let matrix = file.matrix.into_iter().map(|a| (a.account_id(), a)).collect();
             let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick)
+            let steam = file.steam.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
-        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sneedchat: Mutex::new(sneedchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick) })
+        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sneedchat: Mutex::new(sneedchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick), steam: Mutex::new(steam) })
     }
 
     /// Callers already hold whichever map they just mutated - the others
@@ -433,6 +485,7 @@ impl AccountStore {
             sneedchat: sneedchat.values().cloned().collect(),
             matrix: matrix.values().cloned().collect(),
             kick: kick.values().cloned().collect(),
+            steam: self.steam.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -576,6 +629,71 @@ impl AccountStore {
         self.kick.lock().unwrap().values().cloned().collect()
     }
 
+    pub fn get_steam(&self, account_id: &str) -> Option<SteamAccountConfig> {
+        self.steam.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_steam(&self) -> Vec<SteamAccountConfig> {
+        self.steam.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again with the same name is how a token Steam has
+    /// stopped accepting gets replaced. A route that was on stays on, as with
+    /// the others - a sign-in from the account's own card does not ask.
+    pub fn add_steam(&self, mut config: SteamAccountConfig) -> Result<SteamAccountConfig> {
+        config.username = config.username.trim().to_lowercase();
+        let id = config.account_id();
+        {
+            let mut steam = self.steam.lock().unwrap();
+            if let Some(old) = steam.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            steam.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Steam account, and writes the file. `false` when there is
+    /// no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_steam(&self, account_id: &str, change: impl FnOnce(&mut SteamAccountConfig)) -> Result<bool> {
+        {
+            let mut steam = self.steam.lock().unwrap();
+            match steam.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
+    /// Keeps what a sign-in produced, or the fresher token a reconnect was
+    /// handed. Nothing is written when nothing changed.
+    pub fn set_steam_session(&self, account_id: &str, refresh_token: &str, guard_data: Option<&str>) -> Result<bool> {
+        let unchanged = self
+            .steam
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|a| a.refresh_token == refresh_token && guard_data.is_none_or(|g| a.guard_data.as_deref() == Some(g)));
+        if unchanged {
+            return Ok(true);
+        }
+        self.mutate_steam(account_id, |a| {
+            a.refresh_token = refresh_token.to_string();
+            if let Some(g) = guard_data {
+                a.guard_data = Some(g.to_string());
+            }
+        })
+    }
+
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
     pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
@@ -710,6 +828,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.steam.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -732,6 +854,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_matrix(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_steam(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -804,6 +929,13 @@ impl AccountStore {
             let mut matrix = self.matrix.lock().unwrap();
             if matrix.remove(account_id).is_some() {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.steam.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
@@ -965,6 +1097,9 @@ impl AccountStore {
                 return Ok(true);
             }
         }
+        if self.mutate_steam(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -993,6 +1128,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.matrix.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.steam.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -1241,6 +1379,52 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
     }
 }
 
+/// Steam has none of IRC's concepts either. What it has that the others
+/// have too is a name to show, and whether it is signed in: `has_password`
+/// says there is a token, which is what "signed in" means for an account that
+/// never keeps a password.
+///
+/// `persona_name` is what Steam calls the account, learned on connecting; the
+/// sign-in name is shown until then.
+pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: Option<&str>) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "steam".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| persona_name.filter(|n| !n.is_empty()).map(str::to_string))
+            .unwrap_or_else(|| a.username.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: !a.refresh_token.is_empty(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+    }
+}
+
 /// Matrix has none of IRC's autojoin/SASL/NickServ concepts either - same
 /// zero-value convention as discord_account_to_json/sneedchat_account_to_json.
 /// `has_key_backup` comes from the caller (Runtime::list_accounts) rather
@@ -1333,5 +1517,117 @@ mod display_name_tests {
     fn renaming_something_that_is_not_there_says_so() {
         let store = store("missing");
         assert!(!store.set_display_name("kick:nobody", "You").expect("set"));
+    }
+}
+
+#[cfg(test)]
+mod steam_account_tests {
+    use super::*;
+
+    fn store(name: &str) -> (AccountStore, PathBuf) {
+        let path = std::env::temp_dir().join(format!("nobilis-steam-accounts-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        (AccountStore::open(path.clone()).expect("accounts"), path)
+    }
+
+    fn account(name: &str, token: &str) -> SteamAccountConfig {
+        SteamAccountConfig { username: name.into(), steamid: 76561197960287930, refresh_token: token.into(), session: "chat".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_steam_account_survives_a_restart_with_its_token_and_not_a_password() {
+        let (s, path) = store("restart");
+        s.add_steam(account("Someone", "eyJ.token")).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[steam_account]]"), "{text}");
+        assert!(text.contains("eyJ.token"));
+        assert!(!text.to_lowercase().contains("password"), "no password is ever written: {text}");
+
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        let got = reopened.get_steam("steam:someone").expect("found under its lower-case id");
+        assert_eq!((got.username.as_str(), got.steamid, got.refresh_token.as_str()), ("someone", 76561197960287930, "eyJ.token"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_name_is_how_steam_reads_it_so_two_spellings_are_one_account() {
+        let (s, path) = store("case");
+        s.add_steam(account("Someone", "a")).unwrap();
+        s.add_steam(account("  SOMEONE ", "b")).unwrap();
+        assert_eq!(s.all_steam().len(), 1);
+        assert_eq!(s.get_steam("steam:someone").unwrap().refresh_token, "b");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn signing_in_again_keeps_the_route_and_the_local_name() {
+        let (s, path) = store("relogin");
+        s.add_steam(account("someone", "old")).unwrap();
+        s.set_route_level("steam:someone", "strict").unwrap();
+        s.set_display_name("steam:someone", "Me on Steam").unwrap();
+        s.add_steam(account("someone", "new")).unwrap();
+        let got = s.get_steam("steam:someone").unwrap();
+        assert_eq!(got.refresh_token, "new");
+        assert!(got.use_tor && got.strict_route, "a re-login must not send a routed account out directly");
+        assert_eq!(s.route_level_of("steam:someone").as_deref(), Some("strict"));
+        assert_eq!(s.display_name_override("steam:someone").as_deref(), Some("Me on Steam"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_fresher_token_replaces_the_old_and_an_unchanged_one_writes_nothing() {
+        let (s, path) = store("token");
+        s.add_steam(account("someone", "one")).unwrap();
+        assert!(s.set_steam_session("steam:someone", "two", Some("guard")).unwrap());
+        let got = s.get_steam("steam:someone").unwrap();
+        assert_eq!((got.refresh_token.as_str(), got.guard_data.as_deref()), ("two", Some("guard")));
+
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(s.set_steam_session("steam:someone", "two", Some("guard")).unwrap());
+        assert!(s.set_steam_session("steam:someone", "two", None).unwrap(), "no new guard data leaves the old");
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before, "the file was rewritten to say what it already said");
+        assert_eq!(s.get_steam("steam:someone").unwrap().guard_data.as_deref(), Some("guard"));
+        assert!(!s.set_steam_session("steam:nobody", "x", None).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn removing_a_steam_account_takes_it_and_only_it() {
+        let (s, path) = store("remove");
+        s.add_steam(account("one", "a")).unwrap();
+        s.add_steam(account("two", "b")).unwrap();
+        assert!(s.remove("steam:one").unwrap());
+        assert!(!s.remove("steam:one").unwrap());
+        assert!(s.get_steam("steam:one").is_none());
+        assert!(s.get_steam("steam:two").is_some());
+        assert!(AccountStore::open(path.clone()).unwrap().get_steam("steam:one").is_none(), "the file forgot too");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_account_is_listed_with_a_name_and_whether_it_is_signed_in() {
+        let mut a = account("someone", "tok");
+        let listed = steam_account_to_json(&a, "connected", None);
+        assert_eq!((listed.service.as_str(), listed.id.as_str(), listed.display_name.as_str()), ("steam", "steam:someone", "someone"));
+        assert!(listed.has_password, "a token is what being signed in means");
+        // Steam's name for the account stands in until the person picks one.
+        assert_eq!(steam_account_to_json(&a, "connected", Some("Some One")).display_name, "Some One");
+        a.display_name = Some("Mine".into());
+        assert_eq!(steam_account_to_json(&a, "connected", Some("Some One")).display_name, "Mine");
+        a.refresh_token.clear();
+        assert!(!steam_account_to_json(&a, "disconnected", None).has_password);
+    }
+
+    #[test]
+    fn a_steam_account_does_not_disturb_the_others_in_the_file() {
+        let (s, path) = store("others");
+        s.add_kick(KickAccountConfig { username: "streamer".into(), ..Default::default() }).unwrap();
+        s.add_steam(account("someone", "tok")).unwrap();
+        s.add_kick(KickAccountConfig { username: "streamer".into(), channels: vec!["x".into()], ..Default::default() }).unwrap();
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        assert_eq!(reopened.get_kick("kick:streamer").unwrap().channels, vec!["x".to_string()]);
+        assert!(reopened.get_steam("steam:someone").is_some(), "writing another service's account kept this one");
+        let _ = std::fs::remove_file(path);
     }
 }

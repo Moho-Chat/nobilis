@@ -1,0 +1,527 @@
+//! Signing in: turning a name and a password into a token that can be used
+//! to sign in again without them.
+//!
+//! This is Steam's modern authentication service, and it happens on the same
+//! connection that will carry the chat, before the account has signed in:
+//!
+//! 1. Ask for a public key for the account name, and encrypt the password with
+//!    it. The key changes, which is why it is asked for each time; the
+//!    password never goes over the connection in any other form.
+//! 2. Begin a session with the name and the encrypted password. Steam answers
+//!    with what it wants before it will let the session through: nothing, a
+//!    code from the Steam Guard authenticator, a code it emailed, or an
+//!    approval tapped on a phone.
+//! 3. Send the code if one is wanted, and poll the session. A phone approval
+//!    needs nothing sent - polling is how the answer is found.
+//! 4. The poll eventually returns a **refresh token**. That, and not the
+//!    password, is what is kept: a long-lived credential that signs the
+//!    account in, and that can be revoked from Steam without changing the
+//!    password.
+//!
+//! The password is held for the length of this exchange and no longer.
+
+use super::link::{CallError, Link};
+use super::proto::*;
+use anyhow::{Context, Result};
+use base64::Engine;
+use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
+use std::time::Duration;
+
+/// What kind of session to ask Steam for.
+///
+/// The kind is part of the token Steam issues, and decides how Steam treats
+/// the connection that uses it. Signing in as the desktop client makes this
+/// the account's client session, and Steam allows one: the desktop client on
+/// the same account is signed out when this one arrives, and the reverse. The
+/// chat session is what the Steam mobile app's chat uses - chat and friends
+/// only, and it lives beside the desktop client.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Kind {
+    Chat,
+    Client,
+}
+
+impl Kind {
+    pub fn parse(text: &str) -> Kind {
+        if text.trim().eq_ignore_ascii_case("client") {
+            Kind::Client
+        } else {
+            Kind::Chat
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Kind::Chat => "chat",
+            Kind::Client => "client",
+        }
+    }
+
+    /// `EAuthTokenPlatformType`: 1 the desktop client, 3 the mobile app.
+    fn platform_type(self) -> i32 {
+        match self {
+            Kind::Chat => 3,
+            Kind::Client => 1,
+        }
+    }
+
+    /// `EAuthTokenAppType`: 2 is the mobile chat app. Unset for the client.
+    fn app_type(self) -> Option<i32> {
+        match self {
+            Kind::Chat => Some(2),
+            Kind::Client => None,
+        }
+    }
+
+    fn website_id(self) -> &'static str {
+        match self {
+            Kind::Chat => "Mobile",
+            Kind::Client => "Client",
+        }
+    }
+}
+
+/// `EOSType` as the connection reports it: Linux 6.x is -184 and Windows 10
+/// is 16, sent as the unsigned number the field is.
+pub fn os_type() -> u32 {
+    if cfg!(windows) {
+        16
+    } else {
+        (-203i32) as u32
+    }
+}
+
+/// What the account's Steam Guard settings are asking for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Guard {
+    /// Nothing: the session goes through.
+    None,
+    /// A code Steam emailed to the account.
+    EmailCode,
+    /// A code from the Steam Guard authenticator on the person's phone.
+    DeviceCode,
+    /// An approval tapped in the Steam app on the person's phone.
+    DeviceConfirmation,
+    /// An approval by following a link in an email.
+    EmailConfirmation,
+    /// Something this client does not know how to answer.
+    Other(i32),
+}
+
+impl Guard {
+    fn from_wire(kind: i32) -> Guard {
+        match kind {
+            1 => Guard::None,
+            2 => Guard::EmailCode,
+            3 => Guard::DeviceCode,
+            4 => Guard::DeviceConfirmation,
+            5 => Guard::EmailConfirmation,
+            other => Guard::Other(other),
+        }
+    }
+
+    fn code_type(&self) -> Option<i32> {
+        match self {
+            Guard::EmailCode => Some(2),
+            Guard::DeviceCode => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Whether a person has to type something for it.
+    pub fn wants_a_code(&self) -> bool {
+        self.code_type().is_some()
+    }
+
+    /// Whether it is settled by the person acting somewhere else.
+    pub fn is_approval(&self) -> bool {
+        matches!(self, Guard::DeviceConfirmation | Guard::EmailConfirmation)
+    }
+}
+
+/// One way Steam will accept for getting the session through, with the hint it
+/// gives (an email address with most of it hidden, for the emailed code).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Confirmation {
+    pub guard: Guard,
+    pub hint: Option<String>,
+}
+
+/// A sign-in that has begun and is waiting on Steam Guard, or on the poll.
+#[derive(Clone, Debug)]
+pub struct Begun {
+    pub client_id: u64,
+    pub request_id: Vec<u8>,
+    /// How often Steam asks to be polled.
+    pub interval: Duration,
+    pub steamid: u64,
+    pub confirmations: Vec<Confirmation>,
+}
+
+impl Begun {
+    /// Whether the session goes through with nothing more from the person.
+    pub fn needs_nothing(&self) -> bool {
+        self.confirmations.is_empty() || self.confirmations.iter().any(|c| c.guard == Guard::None)
+    }
+}
+
+/// What a finished sign-in leaves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tokens {
+    pub refresh_token: String,
+    pub access_token: String,
+    pub account_name: Option<String>,
+    /// Steam's note of this machine having been approved, to send next time so
+    /// it is not asked again.
+    pub guard_data: Option<String>,
+}
+
+/// The password, encrypted with the public key Steam gave for the account.
+pub fn encrypt_password(modulus_hex: &str, exponent_hex: &str, password: &str) -> Result<String> {
+    let n = BigUint::parse_bytes(modulus_hex.trim().as_bytes(), 16).context("Steam's password key has no modulus")?;
+    let e = BigUint::parse_bytes(exponent_hex.trim().as_bytes(), 16).context("Steam's password key has no exponent")?;
+    let key = RsaPublicKey::new(n, e).context("Steam's password key is not a usable key")?;
+    let encrypted = key.encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, password.as_bytes()).context("encrypting the password")?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+}
+
+/// What Steam shows next to this session in the account's list of signed-in
+/// devices, and on the phone when it asks for an approval.
+pub fn device_name() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty());
+    match host {
+        Some(host) => format!("moho on {host}"),
+        None => "moho".to_string(),
+    }
+}
+
+fn device_details(kind: Kind) -> DeviceDetails {
+    DeviceDetails {
+        device_friendly_name: Some(device_name()),
+        platform_type: Some(kind.platform_type()),
+        os_type: Some(os_type() as i32),
+        app_type: kind.app_type(),
+        ..DeviceDetails::default()
+    }
+}
+
+/// How often to poll, from what Steam asked for: never faster than twice a
+/// second, so a server that says zero is not hammered, and never slower than
+/// every thirty, so one that says an hour is not left alone. Five seconds when
+/// it said nothing.
+fn poll_interval(asked: Option<f32>) -> Duration {
+    Duration::from_secs_f32(asked.filter(|s| s.is_finite()).unwrap_or(5.0).clamp(0.5, 30.0))
+}
+
+/// Starts a sign-in with a name and a password.
+///
+/// `guard_data` is what a previous sign-in on this machine was given to
+/// remember it by, if there was one.
+pub async fn begin(link: &Link, account_name: &str, password: &str, guard_data: Option<&str>, kind: Kind) -> Result<Begun, CallError> {
+    let key: GetPasswordRsaPublicKeyResponse = link
+        .call("Authentication.GetPasswordRSAPublicKey#1", &GetPasswordRsaPublicKeyRequest { account_name: Some(account_name.to_string()) }, false)
+        .await?;
+    let encrypted = encrypt_password(key.publickey_mod.as_deref().unwrap_or_default(), key.publickey_exp.as_deref().unwrap_or_default(), password)
+        .map_err(|e| CallError::Unreadable(format!("{e:#}")))?;
+
+    let request = BeginAuthViaCredentialsRequest {
+        device_friendly_name: Some(device_name()),
+        account_name: Some(account_name.to_string()),
+        encrypted_password: Some(encrypted),
+        encryption_timestamp: key.timestamp,
+        remember_login: Some(true),
+        platform_type: Some(kind.platform_type()),
+        // Persistent: a token that outlives this run, which is the point.
+        persistence: Some(1),
+        website_id: Some(kind.website_id().to_string()),
+        device_details: Some(device_details(kind)),
+        guard_data: guard_data.filter(|g| !g.is_empty()).map(str::to_string),
+        ..BeginAuthViaCredentialsRequest::default()
+    };
+    let begun: BeginAuthViaCredentialsResponse = link.call("Authentication.BeginAuthSessionViaCredentials#1", &request, false).await?;
+
+    Ok(Begun {
+        client_id: begun.client_id.unwrap_or_default(),
+        request_id: begun.request_id.unwrap_or_default(),
+        interval: poll_interval(begun.interval),
+        steamid: begun.steamid.unwrap_or_default(),
+        confirmations: begun
+            .allowed_confirmations
+            .into_iter()
+            .map(|c| Confirmation { guard: Guard::from_wire(c.confirmation_type.unwrap_or_default()), hint: c.associated_message.filter(|m| !m.is_empty()) })
+            .collect(),
+    })
+}
+
+/// Gives Steam the code that was asked for.
+pub async fn send_code(link: &Link, begun: &Begun, guard: &Guard, code: &str) -> Result<(), CallError> {
+    let Some(code_type) = guard.code_type() else {
+        return Err(CallError::Unreadable("that kind of confirmation takes no code".to_string()));
+    };
+    let _: UpdateAuthWithGuardCodeResponse = link
+        .call(
+            "Authentication.UpdateAuthSessionWithSteamGuardCode#1",
+            &UpdateAuthWithGuardCodeRequest { client_id: Some(begun.client_id), steamid: Some(begun.steamid), code: Some(code.trim().to_string()), code_type: Some(code_type) },
+            false,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Asks once whether the session has gone through. `None` means not yet.
+pub async fn poll(link: &Link, begun: &mut Begun) -> Result<Option<Tokens>, CallError> {
+    let answer: PollAuthSessionResponse = link
+        .call(
+            "Authentication.PollAuthSessionStatus#1",
+            &PollAuthSessionRequest { client_id: Some(begun.client_id), request_id: Some(begun.request_id.clone()), token_to_revoke: None },
+            false,
+        )
+        .await?;
+    // A session that was handed a new id carries on under it.
+    if let Some(id) = answer.new_client_id.filter(|id| *id != 0) {
+        begun.client_id = id;
+    }
+    match answer.refresh_token.filter(|t| !t.is_empty()) {
+        None => Ok(None),
+        Some(refresh_token) => Ok(Some(Tokens {
+            refresh_token,
+            access_token: answer.access_token.unwrap_or_default(),
+            account_name: answer.account_name.filter(|n| !n.is_empty()),
+            guard_data: answer.new_guard_data.filter(|g| !g.is_empty()),
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::steam::link::{self, fake::*};
+    use crate::backend::steam::wire::Packet;
+    use prost::Message;
+    use rsa::traits::PublicKeyParts;
+    use rsa::RsaPrivateKey;
+    use std::sync::{Arc, Mutex};
+
+    fn keypair() -> (RsaPrivateKey, String, String) {
+        let private = RsaPrivateKey::new(&mut rand::thread_rng(), 1024).unwrap();
+        let public = private.to_public_key();
+        let (n, e) = (public.n().to_str_radix(16), public.e().to_str_radix(16));
+        (private, n, e)
+    }
+
+    #[test]
+    fn the_password_is_encrypted_so_only_steams_key_can_read_it() {
+        let (private, n, e) = keypair();
+        let encrypted = encrypt_password(&n, &e, "hunter2").unwrap();
+        assert!(!encrypted.contains("hunter2"));
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&encrypted).unwrap();
+        assert_eq!(private.decrypt(Pkcs1v15Encrypt, &bytes).unwrap(), b"hunter2");
+        // Encrypted afresh each time, so two sign-ins do not look the same.
+        assert_ne!(encrypted, encrypt_password(&n, &e, "hunter2").unwrap());
+    }
+
+    #[test]
+    fn a_key_steam_did_not_really_send_is_refused_not_used() {
+        assert!(encrypt_password("", "010001", "x").is_err());
+        assert!(encrypt_password("zz", "010001", "x").is_err());
+        assert!(encrypt_password("0A", "010001", "x").is_err(), "too small to hold a password");
+    }
+
+    #[test]
+    fn what_steam_asks_for_is_told_apart() {
+        assert_eq!(Guard::from_wire(3), Guard::DeviceCode);
+        assert!(Guard::from_wire(3).wants_a_code());
+        assert!(Guard::from_wire(2).wants_a_code());
+        assert!(Guard::from_wire(4).is_approval());
+        assert!(Guard::from_wire(5).is_approval());
+        assert!(!Guard::from_wire(4).wants_a_code());
+        assert_eq!(Guard::from_wire(99), Guard::Other(99));
+        assert_eq!(Kind::parse("client"), Kind::Client);
+        assert_eq!(Kind::parse("Client "), Kind::Client);
+        assert_eq!(Kind::parse(""), Kind::Chat);
+        assert_eq!(Kind::parse("anything else"), Kind::Chat, "unknown means the safe one");
+    }
+
+    /// A Steam that wants a code from the authenticator, then issues tokens.
+    fn steam_with_guard(private: &RsaPrivateKey, n: String, e: String, seen: Arc<Mutex<Vec<Packet>>>) -> Script {
+        let _ = private;
+        let mut polls = 0;
+        Box::new(move |req| {
+            seen.lock().unwrap().push(req.clone());
+            let method = req.header.target_job_name.clone().unwrap_or_default();
+            let reply = match method.as_str() {
+                "Authentication.GetPasswordRSAPublicKey#1" => {
+                    GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1790000005000) }.encode_to_vec()
+                }
+                "Authentication.BeginAuthSessionViaCredentials#1" => BeginAuthViaCredentialsResponse {
+                    client_id: Some(1234),
+                    request_id: Some(vec![9, 8, 7]),
+                    interval: Some(0.5),
+                    steamid: Some(76561197960287930),
+                    allowed_confirmations: vec![
+                        AllowedConfirmation { confirmation_type: Some(3), associated_message: None },
+                        AllowedConfirmation { confirmation_type: Some(4), associated_message: Some("Steam app".into()) },
+                    ],
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                "Authentication.UpdateAuthSessionWithSteamGuardCode#1" => UpdateAuthWithGuardCodeResponse::default().encode_to_vec(),
+                "Authentication.PollAuthSessionStatus#1" => {
+                    polls += 1;
+                    if polls < 2 {
+                        PollAuthSessionResponse::default().encode_to_vec()
+                    } else {
+                        PollAuthSessionResponse {
+                            refresh_token: Some("the-refresh-token".into()),
+                            access_token: Some("the-access-token".into()),
+                            account_name: Some("someone".into()),
+                            new_guard_data: Some("remember-me".into()),
+                            ..Default::default()
+                        }
+                        .encode_to_vec()
+                    }
+                }
+                other => panic!("unexpected call {other}"),
+            };
+            Some(vec![answer(&req, 1, reply)])
+        })
+    }
+
+    #[tokio::test]
+    async fn signing_in_with_a_code_goes_through_every_step_in_order() {
+        let (private, n, e) = keypair();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let url = serve(steam_with_guard(&private, n, e, seen.clone())).await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+
+        let mut begun = begin(&link, "someone", "hunter2", Some("old-guard"), Kind::Chat).await.unwrap();
+        assert_eq!(begun.steamid, 76561197960287930);
+        assert_eq!(begun.interval, Duration::from_millis(500));
+        assert_eq!(begun.confirmations[0].guard, Guard::DeviceCode);
+        assert_eq!(begun.confirmations[1], Confirmation { guard: Guard::DeviceConfirmation, hint: Some("Steam app".into()) });
+        assert!(!begun.needs_nothing());
+
+        send_code(&link, &begun, &Guard::DeviceCode, " AB12C ").await.unwrap();
+        assert_eq!(poll(&link, &mut begun).await.unwrap(), None, "not yet");
+        let tokens = poll(&link, &mut begun).await.unwrap().expect("tokens now");
+        assert_eq!(tokens.refresh_token, "the-refresh-token");
+        assert_eq!(tokens.account_name.as_deref(), Some("someone"));
+        assert_eq!(tokens.guard_data.as_deref(), Some("remember-me"));
+
+        let seen = seen.lock().unwrap();
+        let methods: Vec<_> = seen.iter().map(|p| p.header.target_job_name.clone().unwrap()).collect();
+        assert_eq!(
+            methods,
+            [
+                "Authentication.GetPasswordRSAPublicKey#1",
+                "Authentication.BeginAuthSessionViaCredentials#1",
+                "Authentication.UpdateAuthSessionWithSteamGuardCode#1",
+                "Authentication.PollAuthSessionStatus#1",
+                "Authentication.PollAuthSessionStatus#1",
+            ]
+        );
+        // None of it as the account: there is no account signed in yet.
+        assert!(seen.iter().all(|p| p.header.steamid.is_none()));
+
+        let begin_req = BeginAuthViaCredentialsRequest::decode(seen[1].body.as_slice()).unwrap();
+        assert_eq!(begin_req.account_name.as_deref(), Some("someone"));
+        assert_eq!(begin_req.encryption_timestamp, Some(1790000005000));
+        assert_eq!(begin_req.persistence, Some(1));
+        assert_eq!(begin_req.guard_data.as_deref(), Some("old-guard"));
+        assert_eq!(begin_req.platform_type, Some(3), "a chat session asks for the mobile kind");
+        assert_eq!(begin_req.device_details.unwrap().app_type, Some(2));
+        assert!(!begin_req.encrypted_password.unwrap().contains("hunter2"));
+
+        let code_req = UpdateAuthWithGuardCodeRequest::decode(seen[2].body.as_slice()).unwrap();
+        assert_eq!((code_req.client_id, code_req.steamid), (Some(1234), Some(76561197960287930)));
+        assert_eq!(code_req.code.as_deref(), Some("AB12C"), "spaces around a pasted code are dropped");
+        assert_eq!(code_req.code_type, Some(3));
+
+        let poll_req = PollAuthSessionRequest::decode(seen[3].body.as_slice()).unwrap();
+        assert_eq!((poll_req.client_id, poll_req.request_id), (Some(1234), Some(vec![9, 8, 7])));
+    }
+
+    #[tokio::test]
+    async fn a_client_session_asks_for_the_desktop_kind() {
+        let (private, n, e) = keypair();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let url = serve(steam_with_guard(&private, n, e, seen.clone())).await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+        begin(&link, "someone", "x", None, Kind::Client).await.unwrap();
+        let req = BeginAuthViaCredentialsRequest::decode(seen.lock().unwrap()[1].body.as_slice()).unwrap();
+        assert_eq!(req.platform_type, Some(1));
+        assert_eq!(req.website_id.as_deref(), Some("Client"));
+        assert_eq!(req.device_details.unwrap().app_type, None);
+        assert_eq!(req.guard_data, None);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_password_says_so_and_a_code_where_none_is_wanted_is_refused() {
+        let (_private, n, e) = keypair();
+        let url = serve(Box::new(move |req| {
+            let method = req.header.target_job_name.clone().unwrap_or_default();
+            Some(vec![if method.contains("GetPasswordRSAPublicKey") {
+                answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1) }.encode_to_vec())
+            } else {
+                answer(&req, 5, Vec::new())
+            }])
+        }))
+        .await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+        let err = begin(&link, "someone", "wrong", None, Kind::Chat).await.unwrap_err();
+        assert_eq!(err.code(), Some(5));
+        assert!(err.to_string().contains("password"));
+
+        let begun = Begun { client_id: 1, request_id: vec![], interval: Duration::from_secs(1), steamid: 1, confirmations: vec![] };
+        assert!(send_code(&link, &begun, &Guard::DeviceConfirmation, "123").await.is_err(), "an approval takes no code");
+    }
+
+    #[tokio::test]
+    async fn an_account_without_steam_guard_needs_nothing_more() {
+        let (_private, n, e) = keypair();
+        let url = serve(Box::new(move |req| {
+            let method = req.header.target_job_name.clone().unwrap_or_default();
+            Some(vec![if method.contains("GetPasswordRSAPublicKey") {
+                answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1) }.encode_to_vec())
+            } else {
+                answer(
+                    &req,
+                    1,
+                    BeginAuthViaCredentialsResponse {
+                        client_id: Some(1),
+                        request_id: Some(vec![1]),
+                        interval: Some(1.0),
+                        steamid: Some(2),
+                        allowed_confirmations: vec![AllowedConfirmation { confirmation_type: Some(1), associated_message: None }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+            }])
+        }))
+        .await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+        assert!(begin(&link, "someone", "x", None, Kind::Chat).await.unwrap().needs_nothing());
+    }
+
+    #[test]
+    fn the_polling_interval_is_kept_to_something_sensible() {
+        assert_eq!(poll_interval(Some(0.0)), Duration::from_millis(500));
+        assert_eq!(poll_interval(Some(3600.0)), Duration::from_secs(30));
+        assert_eq!(poll_interval(Some(2.0)), Duration::from_secs(2));
+        assert_eq!(poll_interval(None), Duration::from_secs(5));
+        assert_eq!(poll_interval(Some(f32::NAN)), Duration::from_secs(5), "not a number is not an answer");
+        assert_eq!(poll_interval(Some(-3.0)), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn the_session_is_named_for_the_machine_it_is_on() {
+        assert!(device_name().starts_with("moho"));
+        assert_eq!(os_type(), if cfg!(windows) { 16 } else { 4294967093 });
+    }
+}
