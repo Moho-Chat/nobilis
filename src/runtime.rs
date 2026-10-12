@@ -840,7 +840,8 @@ pub struct Runtime {
     ///
     /// Per account rather than per channel: away is a property of the person,
     /// and the same nick in three channels is away in all of them.
-    irc_away: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Who is away, by lowercased nick, and what they said when they went.
+    irc_away: Mutex<HashMap<String, HashMap<String, Option<String>>>>,
     /// (account, guild id or "@me" for direct messages) -> what that account
     /// has silenced on Discord itself.
     ///
@@ -3456,13 +3457,37 @@ impl Runtime {
     /// Records that somebody is away, or is back. Returns whether this
     /// changed anything, so a caller only redraws rosters that moved.
     pub fn set_irc_away(&self, account_id: &str, nick: &str, away: bool) -> bool {
+        self.set_irc_away_because(account_id, nick, away.then_some(None))
+    }
+
+    /// As `set_irc_away`, with what they said when they went: `None` is back,
+    /// `Some(None)` is away without a word, `Some(Some(words))` away with some.
+    /// A change of words alone counts as a change, since it is drawn.
+    pub fn set_irc_away_because(&self, account_id: &str, nick: &str, away: Option<Option<String>>) -> bool {
         let mut all = self.irc_away.lock().unwrap();
-        let set = all.entry(account_id.to_string()).or_default();
-        if away { set.insert(nick.to_lowercase()) } else { set.remove(&nick.to_lowercase()) }
+        let held = all.entry(account_id.to_string()).or_default();
+        let key = nick.to_lowercase();
+        match away {
+            Some(reason) => {
+                let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+                // A reason is only known from an AWAY; learning somebody is away
+                // some other way (a WHOIS) must not forget what they said.
+                if reason.is_none() && held.contains_key(&key) {
+                    return false;
+                }
+                held.insert(key, reason.clone()) != Some(reason)
+            }
+            None => held.remove(&key).is_some(),
+        }
     }
 
     pub fn is_irc_away(&self, account_id: &str, nick: &str) -> bool {
-        self.irc_away.lock().unwrap().get(account_id).is_some_and(|set| set.contains(&nick.to_lowercase()))
+        self.irc_away.lock().unwrap().get(account_id).is_some_and(|held| held.contains_key(&nick.to_lowercase()))
+    }
+
+    /// What somebody who is away said when they went.
+    pub fn irc_away_reason(&self, account_id: &str, nick: &str) -> Option<String> {
+        self.irc_away.lock().unwrap().get(account_id).and_then(|held| held.get(&nick.to_lowercase()).cloned().flatten())
     }
 
     pub fn sneedchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SneedChatRoom>> {
@@ -5555,6 +5580,24 @@ mod forget_tests {
     /// The sweep itself, run: the other test reads the list, this one checks
     /// that what it names is actually emptied - for this account and its
     /// buffers, and for nobody else's.
+    #[test]
+    fn away_remembers_what_was_said_and_a_change_of_words_is_a_change() {
+        let rt = super::Runtime::new();
+        assert!(rt.set_irc_away_because("irc:a", "Bob", Some(Some("gone fishing".into()))));
+        assert_eq!(rt.irc_away_reason("irc:a", "bob").as_deref(), Some("gone fishing"));
+        assert!(!rt.set_irc_away_because("irc:a", "bob", Some(Some("gone fishing".into()))), "the same again is nothing");
+        assert!(rt.set_irc_away_because("irc:a", "bob", Some(Some("lunch".into()))), "new words are drawn");
+        // Learning they are away some other way must not forget the words.
+        assert!(!rt.set_irc_away("irc:a", "bob", true));
+        assert_eq!(rt.irc_away_reason("irc:a", "bob").as_deref(), Some("lunch"));
+        // Away with nothing said, and back.
+        assert!(rt.set_irc_away_because("irc:a", "amy", Some(None)));
+        assert!(rt.is_irc_away("irc:a", "amy") && rt.irc_away_reason("irc:a", "amy").is_none());
+        assert!(rt.set_irc_away("irc:a", "bob", false));
+        assert!(!rt.is_irc_away("irc:a", "bob"));
+        assert!(!rt.set_irc_away("irc:a", "bob", false), "back when already back is nothing");
+    }
+
     #[test]
     fn forgetting_an_account_empties_it_and_only_it() {
         let rt = super::Runtime::new();

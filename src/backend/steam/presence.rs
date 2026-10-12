@@ -43,26 +43,30 @@ pub fn status_of(persona_state: u32) -> &'static str {
     }
 }
 
-/// What to say beside a friend's dot, beyond the colour: the game they are in,
-/// or the state the four colours cannot tell apart (Busy and Do not disturb
+/// What a friend is doing, for the line under their name: the game they are
+/// in, or a state the four colours cannot tell apart (Busy and Do not disturb
 /// are one red, Away and Snooze one amber, and "looking to trade" is just
 /// online). Nothing for plainly online or offline, which the dot says; and
 /// nothing for a game when they are offline, since that is stale.
-pub fn status_text(persona_state: u32, game: Option<&str>) -> Option<String> {
+///
+/// The kind decides the picture in front of it: a game has a gamepad, and a
+/// state has none, being words.
+pub fn activity(persona_state: u32, game: Option<&str>) -> Option<(&'static str, String)> {
     if status_of(persona_state) == "offline" {
         return None;
     }
     if let Some(game) = game.filter(|g| !g.is_empty()) {
-        return Some(format!("Playing {game}"));
+        return Some(("game", game.to_string()));
     }
-    match persona_state {
-        BUSY => Some("Busy".to_string()),
-        AWAY => Some("Away".to_string()),
-        SNOOZE => Some("Snoozing".to_string()),
-        LOOKING_TO_TRADE => Some("Looking to trade".to_string()),
-        LOOKING_TO_PLAY => Some("Looking to play".to_string()),
-        _ => None,
-    }
+    let words = match persona_state {
+        BUSY => "Busy",
+        AWAY => "Away",
+        SNOOZE => "Snoozing",
+        LOOKING_TO_TRADE => "Looking to trade",
+        LOOKING_TO_PLAY => "Looking to play",
+        _ => return None,
+    };
+    Some(("custom", words.to_string()))
 }
 
 /// Tells Steam how this account is showing.
@@ -97,22 +101,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn what_the_dot_cannot_say_is_said_beside_it() {
-        assert_eq!(status_text(ONLINE, None), None, "online is the dot");
-        assert_eq!(status_text(0, None), None, "offline is the dot");
-        assert_eq!(status_text(BUSY, None).as_deref(), Some("Busy"));
-        assert_eq!(status_text(AWAY, None).as_deref(), Some("Away"));
-        assert_eq!(status_text(SNOOZE, None).as_deref(), Some("Snoozing"));
-        assert_eq!(status_text(LOOKING_TO_TRADE, None).as_deref(), Some("Looking to trade"));
-        assert_eq!(status_text(LOOKING_TO_PLAY, None).as_deref(), Some("Looking to play"));
-        // A game outranks the state, and an empty name is no game.
-        assert_eq!(status_text(ONLINE, Some("Counter-Strike 2")).as_deref(), Some("Playing Counter-Strike 2"));
-        assert_eq!(status_text(BUSY, Some("Dota 2")).as_deref(), Some("Playing Dota 2"));
-        assert_eq!(status_text(ONLINE, Some("")), None);
+    fn what_the_dot_cannot_say_is_said_under_the_name() {
+        let words = |state, game| activity(state, game).map(|(k, t)| format!("{k}:{t}"));
+        assert_eq!(words(ONLINE, None), None, "online is the dot");
+        assert_eq!(words(0, None), None, "offline is the dot");
+        assert_eq!(words(BUSY, None).as_deref(), Some("custom:Busy"));
+        assert_eq!(words(AWAY, None).as_deref(), Some("custom:Away"));
+        assert_eq!(words(SNOOZE, None).as_deref(), Some("custom:Snoozing"));
+        assert_eq!(words(LOOKING_TO_TRADE, None).as_deref(), Some("custom:Looking to trade"));
+        assert_eq!(words(LOOKING_TO_PLAY, None).as_deref(), Some("custom:Looking to play"));
+        // A game outranks the state, is named bare - the gamepad says what it is
+        // - and an empty name is no game.
+        assert_eq!(words(ONLINE, Some("Counter-Strike 2")).as_deref(), Some("game:Counter-Strike 2"));
+        assert_eq!(words(BUSY, Some("Dota 2")).as_deref(), Some("game:Dota 2"));
+        assert_eq!(words(ONLINE, Some("")), None);
         // Somebody offline is not playing anything, whatever was last said.
-        assert_eq!(status_text(0, Some("Counter-Strike 2")), None);
+        assert_eq!(words(0, Some("Counter-Strike 2")), None);
         // Invisible is never seen on somebody else, and reads as offline.
-        assert_eq!(status_text(INVISIBLE, Some("x")), None);
+        assert_eq!(words(INVISIBLE, Some("x")), None);
     }
 
     #[test]

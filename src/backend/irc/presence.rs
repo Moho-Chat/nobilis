@@ -420,6 +420,9 @@ pub(super) fn emit_presence(state: &AppState, account_id: &str, channel: &str, m
             // from away-notify where the network has it, and from a WHOIS or
             // a bounced message where it does not.
             "away": state.runtime.is_irc_away(account_id, nick),
+            // What they said when they went, under their name: words they
+            // wrote, so no picture.
+            "activity": state.runtime.irc_away_reason(account_id, nick).map(|text| json!({ "kind": "custom", "text": text })),
         }))
         .collect();
     let member_list = json!(member_list);

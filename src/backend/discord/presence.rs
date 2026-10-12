@@ -157,6 +157,28 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// offline buckets - or a member.
 /// One entry of Discord's member window, or nothing if the item is a role
 /// header rather than a person.
+/// The one line Discord's member list shows for somebody: what they are doing.
+///
+/// A custom status first, when they have one - it is words they wrote for
+/// exactly this place - and otherwise the first thing they are doing. A game is
+/// named bare, the gamepad saying what kind of thing it is; a track by its
+/// artist where there is one, which is what the member list shows (the full
+/// "Listening to Spotify" is in the profile card); anything else (watching,
+/// competing) as a sentence of words, since there is no picture for it.
+pub(super) fn activity_of(activities: &Value) -> Option<Value> {
+    let list = activities.as_array()?;
+    let chosen = list.iter().find(|a| a["type"].as_i64() == Some(4)).or_else(|| list.first())?;
+    let said = |key: &str| chosen[key].as_str().map(str::trim).filter(|t| !t.is_empty());
+    match chosen["type"].as_i64().unwrap_or(0) {
+        4 => said("state").map(|t| json!({ "kind": "custom", "text": t })),
+        // Streaming and competing are playing as far as a line can say.
+        0 | 1 | 5 => said("name").map(|t| json!({ "kind": "game", "text": t })),
+        2 => said("state").or_else(|| said("details")).or_else(|| said("name")).map(|t| json!({ "kind": "music", "text": t })),
+        3 => said("name").map(|t| json!({ "kind": "custom", "text": format!("Watching {t}") })),
+        _ => None,
+    }
+}
+
 pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
     let member = item.get("member")?;
     let user = &member["user"];
@@ -200,6 +222,7 @@ pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, 
         // present, and their own status word says the rest.
         "away": status == "offline",
         "status": status,
+        "activity": activity_of(&member["presence"]["activities"]),
         "avatarUrl": super::author_avatar_url(user),
         "roles": roles
     }))
@@ -368,7 +391,7 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
 /// PRESENCE_UPDATE arrives for anyone the account can see, which is far more
 /// people than are in any open roster - so this only touches buffers that
 /// already list them, and says nothing otherwise.
-pub(super) fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str) {
+pub(super) fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str, activity: Option<Value>) {
     for buffer in state.runtime.list_buffers() {
         let Some(existing) = state.runtime.get_presence(&buffer.id) else { continue };
         let Some(members) = existing.as_array() else { continue };
@@ -386,12 +409,55 @@ pub(super) fn update_presence_in_rosters(state: &AppState, user_id: &str, status
                 // Same rule the initial sync uses; the two disagreeing would
                 // move someone between groups on their next presence change.
                 m["away"] = json!(status == "offline");
+                m["activity"] = activity.clone().unwrap_or(Value::Null);
                 m
             })
             .collect();
         let member_list = json!(updated);
         state.runtime.set_presence(&buffer.id, member_list.clone());
         state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    fn said(activities: Value) -> Option<String> {
+        activity_of(&activities).map(|a| format!("{}:{}", a["kind"].as_str().unwrap(), a["text"].as_str().unwrap()))
+    }
+
+    #[test]
+    fn a_game_is_named_bare_and_a_track_by_its_artist() {
+        assert_eq!(said(json!([{ "type": 0, "name": "Resident Evil 4" }])).as_deref(), Some("game:Resident Evil 4"));
+        assert_eq!(said(json!([{ "type": 2, "name": "Spotify", "details": "Judy Is a Punk", "state": "Ramones" }])).as_deref(), Some("music:Ramones"));
+        assert_eq!(said(json!([{ "type": 2, "name": "Spotify", "details": "Judy Is a Punk" }])).as_deref(), Some("music:Judy Is a Punk"));
+        assert_eq!(said(json!([{ "type": 2, "name": "Spotify" }])).as_deref(), Some("music:Spotify"));
+    }
+
+    #[test]
+    fn words_somebody_wrote_come_first_and_have_no_picture() {
+        assert_eq!(said(json!([{ "type": 0, "name": "Dota 2" }, { "type": 4, "name": "Custom Status", "state": "ask questions", "emoji": { "name": "x" } }])).as_deref(), Some("custom:ask questions"));
+        assert_eq!(said(json!([{ "type": 3, "name": "a stream" }])).as_deref(), Some("custom:Watching a stream"));
+    }
+
+    #[test]
+    fn nothing_is_nothing_and_an_empty_line_is_not_a_line() {
+        assert_eq!(said(json!([])), None);
+        assert_eq!(said(json!(null)), None);
+        assert_eq!(said(json!([{ "type": 4, "state": "  " }])), None, "a custom status with only an emoji says nothing");
+        assert_eq!(said(json!([{ "type": 0, "name": "" }])), None);
+        assert_eq!(said(json!([{ "type": 99, "name": "x" }])), None);
+    }
+
+    #[test]
+    fn a_member_list_entry_carries_it() {
+        let runtime = crate::runtime::Runtime::new();
+        let item = json!({ "member": { "nick": "Gremlin", "user": { "id": "1", "username": "g" }, "presence": { "status": "online", "activities": [{ "type": 4, "state": "ask questions" }] } } });
+        let entry = member_entry(&runtime, "discord:me", "", &item).unwrap();
+        assert_eq!(entry["activity"], json!({ "kind": "custom", "text": "ask questions" }));
+        let quiet = json!({ "member": { "nick": "Q", "user": { "id": "2", "username": "q" }, "presence": { "status": "online" } } });
+        assert!(member_entry(&runtime, "discord:me", "", &quiet).unwrap()["activity"].is_null());
     }
 }
 

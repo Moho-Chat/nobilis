@@ -489,7 +489,7 @@ pub(super) async fn handle_message(
         // capability. Without it away state is only ever known about people
         // who have just been WHOISed or messaged.
         Command::AWAY(reason) => {
-            if state.runtime.set_irc_away(account_id, &from, reason.is_some()) {
+            if state.runtime.set_irc_away_because(account_id, &from, reason.clone().map(Some)) {
                 refresh_rosters_containing(state, account_id, &from, channels);
             }
         }

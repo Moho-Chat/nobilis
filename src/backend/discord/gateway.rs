@@ -482,6 +482,16 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 }
                             }
                         }
+                        // What they are doing, now that their conversations exist
+                        // to say it in: READY's presences carry it with the
+                        // status, and the rosters above were made with the
+                        // status alone.
+                        for p in d["presences"].as_array().into_iter().flatten() {
+                            let Some(user_id) = p["user"]["id"].as_str() else { continue };
+                            if let Some(activity) = super::presence::activity_of(&p["activities"]) {
+                                update_presence_in_rosters(state, user_id, p["status"].as_str().unwrap_or("offline"), Some(activity));
+                            }
+                        }
                         // Conversations are the ones people notice a gap in,
                         // and there are few enough of them to ask about
                         // directly. Channels wait until opened - a few hundred
@@ -1320,7 +1330,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // Also refresh any roster this person appears in, so
                         // an open channel's list follows them going online or
                         // away without waiting for a fresh subscription.
-                        update_presence_in_rosters(state, user_id, status);
+                        update_presence_in_rosters(state, user_id, status, super::presence::activity_of(&d["activities"]));
                     }
                     // Everything this client does not act on.
                     //
