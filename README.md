@@ -7,23 +7,11 @@ into Kiwi Farms), and translates all of them into one unified JSON model — acc
 Frontends talk to that model and never to a protocol. Two exist today: [moho](https://github.com/Moho-Chat/moho),
 an Electron desktop client, and dms-chat, a Quickshell/QML shell plugin.
 
-
-```
-src/backend/      one module per protocol (irc, discord, sneedchat, matrix, kick)
-src/rpc/          the Unix-socket JSON-RPC server
-src/runtime.rs    protocol-agnostic connection/buffer/message state
-src/store.rs      SQLite-backed scrollback persistence
-src/accounts.rs   account and credential persistence
-resources/        assets the protocols need (Sneedchat's smiley table)
-```
-
 ## Building
 
 ```bash
 cargo build --release
 ```
-
-Takes no required arguments. `--data-dir` and `--socket-path` override the defaults below.
 
 ## Wire protocol
 
