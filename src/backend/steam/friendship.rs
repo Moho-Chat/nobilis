@@ -75,10 +75,29 @@ pub async fn add(link: &Link, target: &Target) -> Result<Added, String> {
     };
     let answer: ClientAddFriendResponse = link.ask(emsg::CLIENT_ADD_FRIEND, &request).await.map_err(|e| e.to_string())?;
     let code = answer.eresult.unwrap_or(eresult::FAIL);
+    tracing::info!("steam: asking to add {target:?}: result {code}, id {:?}", answer.steam_id_added);
     if code != eresult::OK {
-        return Err(eresult::describe(code));
+        return Err(refusal_of(code, target));
     }
     Ok(Added { steamid: answer.steam_id_added.unwrap_or_default(), name: answer.persona_name_added.filter(|n| !n.is_empty()) })
+}
+
+/// What a refusal of an add means to the person who asked.
+///
+/// Steam answers a plain failure to a good many things and says nothing more.
+/// What is known to cause it is said alongside, as what to try rather than as
+/// the cause, because Steam does not say which it was.
+fn refusal_of(code: i32, target: &Target) -> String {
+    let words = eresult::describe(code);
+    if code != eresult::FAIL {
+        return words;
+    }
+    let mut out = format!("{words} (error {code}).");
+    out.push_str(" A new account that has not spent anything on Steam is \"limited\", and Steam does not let a limited account send friend requests - though it can accept one sent to it.");
+    if matches!(target, Target::Name(_)) {
+        out.push_str(" An account name here is the sign-in name, not the name shown to friends; the Steam id or friend code is more reliable.");
+    }
+    out
 }
 
 /// Ends a friendship, takes back a request, or turns one down. Steam sends
@@ -200,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_is_said_in_words_and_a_missing_result_is_a_failure() {
-        for (code, words) in [(Some(42), "nobody"), (Some(29), "already"), (Some(40), "blocked"), (None, "without saying why")] {
+        for (code, words) in [(Some(42), "nobody"), (Some(29), "already"), (Some(40), "blocked"), (None, "limited")] {
             let url = serve(Box::new(move |packet| {
                 let body = ClientAddFriendResponse { eresult: code, ..Default::default() };
                 Some(vec![reply(&packet, body.encode_to_vec())])
@@ -209,6 +228,9 @@ mod tests {
             let (link, _told) = crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
             let err = add(&link, &Target::Name("x".into())).await.unwrap_err();
             assert!(err.contains(words), "{code:?} -> {err}");
+            if code.is_none() {
+                assert!(err.contains("sign-in name"), "a name is not the same as an id: {err}");
+            }
         }
     }
 
