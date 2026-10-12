@@ -530,6 +530,9 @@ pub struct Runtime {
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
+    /// Each connected Steam account's connection, by account id: how a message
+    /// or a status change reaches Steam from outside the connection's own task.
+    steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
     /// What is known about each watched Kick channel, by buffer id.
     kick_channels: Mutex<HashMap<String, KickChannel>>,
     /// buffer id -> what that Kick channel is broadcasting, as last asked.
@@ -1077,6 +1080,7 @@ impl Runtime {
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
+            steam_links: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
             kick_stream_fetched: Mutex::new(HashMap::new()),
@@ -1215,6 +1219,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::kick_account_to_json(cfg, conn)
+        }));
+        out.extend(state.accounts.all_steam().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::steam_account_to_json(cfg, conn, self.own_identity(&id).as_deref())
         }));
         out
     }
@@ -4215,6 +4224,41 @@ impl Runtime {
         self.kick_senders.lock().unwrap().remove(account_id);
     }
 
+    /// Registers a signed-in Steam connection.
+    pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
+        self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
+    }
+
+    /// The account's connection, if it is signed in right now.
+    pub fn steam_link(&self, account_id: &str) -> Option<crate::backend::steam::link::Link> {
+        self.steam_links.lock().unwrap().get(account_id).filter(|l| l.is_open()).cloned()
+    }
+
+    /// Takes the connection out, leaving none: ending a session means
+    /// nothing else can reach it.
+    pub fn take_steam_link(&self, account_id: &str) -> Option<crate::backend::steam::link::Link> {
+        self.steam_links.lock().unwrap().remove(account_id)
+    }
+
+    /// Records which person a conversation is with, as the service names them,
+    /// and says so when it changed. The conversation's own name can change
+    /// under it - a person renames themselves - and this does not.
+    pub fn set_buffer_remote_id(&self, state: &AppState, buffer_id: &str, remote_id: &str) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.remote_id.as_deref() != Some(remote_id) => {
+                    b.remote_id = Some(remote_id.to_string());
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn clear_sneedchat_senders(&self, account_id: &str) {
         self.sneedchat_senders.lock().unwrap().remove(account_id);
     }
@@ -4250,6 +4294,11 @@ impl Runtime {
         for (sender, message) in farewells {
             let _ = sender.send_quit(if message.is_empty() { fallback } else { &message });
         }
+        // Steam is told it is being left rather than dropped. The links stay
+        // held, so the goodbye has the rest of the shutdown to be written.
+        for link in self.steam_links.lock().unwrap().values() {
+            crate::backend::steam::say_goodbye(link);
+        }
     }
 
     /// Stops a connection: gracefully QUITs if it already reached the
@@ -4265,6 +4314,12 @@ impl Runtime {
         if let Some((sender, quit_message)) = self.irc_farewell(account_id) {
             let _ = sender.send_quit(&quit_message);
             return true;
+        }
+        // A signed-in Steam session says goodbye first: the abort below stops
+        // the task without letting it, and a session that is dropped instead
+        // of left stays listed as online for a while.
+        if let Some(link) = self.take_steam_link(account_id) {
+            crate::backend::steam::sign_off(link);
         }
         let handle = self.task_handles.lock().unwrap().remove(account_id);
         match handle {
@@ -5389,7 +5444,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, kick_channels,
+            sneedchat_senders, kick_senders, steam_links, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

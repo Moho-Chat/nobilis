@@ -127,16 +127,6 @@ impl Guard {
             _ => None,
         }
     }
-
-    /// Whether a person has to type something for it.
-    pub fn wants_a_code(&self) -> bool {
-        self.code_type().is_some()
-    }
-
-    /// Whether it is settled by the person acting somewhere else.
-    pub fn is_approval(&self) -> bool {
-        matches!(self, Guard::DeviceConfirmation | Guard::EmailConfirmation)
-    }
 }
 
 /// One way Steam will accept for getting the session through, with the hint it
@@ -335,11 +325,13 @@ mod tests {
     #[test]
     fn what_steam_asks_for_is_told_apart() {
         assert_eq!(Guard::from_wire(3), Guard::DeviceCode);
-        assert!(Guard::from_wire(3).wants_a_code());
-        assert!(Guard::from_wire(2).wants_a_code());
-        assert!(Guard::from_wire(4).is_approval());
-        assert!(Guard::from_wire(5).is_approval());
-        assert!(!Guard::from_wire(4).wants_a_code());
+        assert_eq!(Guard::from_wire(2), Guard::EmailCode);
+        assert_eq!(Guard::from_wire(4), Guard::DeviceConfirmation);
+        assert_eq!(Guard::from_wire(5), Guard::EmailConfirmation);
+        assert_eq!(Guard::from_wire(1), Guard::None);
+        assert_eq!(Guard::DeviceCode.code_type(), Some(3));
+        assert_eq!(Guard::EmailCode.code_type(), Some(2));
+        assert_eq!(Guard::DeviceConfirmation.code_type(), None, "an approval takes no code");
         assert_eq!(Guard::from_wire(99), Guard::Other(99));
         assert_eq!(Kind::parse("client"), Kind::Client);
         assert_eq!(Kind::parse("Client "), Kind::Client);
@@ -474,7 +466,7 @@ mod tests {
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
         let err = begin(&link, "someone", "wrong", None, Kind::Chat).await.unwrap_err();
-        assert_eq!(err.code(), Some(5));
+        assert!(matches!(err, CallError::Refused(5, _)), "{err:?}");
         assert!(err.to_string().contains("password"));
 
         let begun = Begun { client_id: 1, request_id: vec![], interval: Duration::from_secs(1), steamid: 1, confirmations: vec![] };

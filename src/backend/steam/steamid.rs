@@ -31,16 +31,6 @@ pub fn text_of(account: u32) -> String {
     steamid_of(account).to_string()
 }
 
-/// A person's id typed or pasted as a SteamID64, or as the account number on
-/// its own.
-pub fn parse(text: &str) -> Option<u64> {
-    let n: u64 = text.trim().parse().ok()?;
-    if account_of(n).is_some() {
-        return Some(n);
-    }
-    u32::try_from(n).ok().map(steamid_of)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,16 +55,5 @@ mod tests {
         assert_eq!(account_of(INDIVIDUAL_BASE - 1), None);
         // Too large to be an account number added to the base.
         assert_eq!(account_of(INDIVIDUAL_BASE + u64::from(u32::MAX) + 1), None);
-    }
-
-    #[test]
-    fn what_somebody_types_is_understood_either_way() {
-        assert_eq!(parse("76561197960287930"), Some(76561197960287930));
-        assert_eq!(parse("  22202 "), Some(76561197960287930));
-        assert_eq!(parse("not an id"), None);
-        assert_eq!(parse(""), None);
-        // Big, but not a person's.
-        assert_eq!(parse("99999999999999999"), None);
-        assert_eq!(text_of(22202), "76561197960287930");
     }
 }

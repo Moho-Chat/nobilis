@@ -17,18 +17,74 @@
 //! - `auth` - signing in with a name and password, through Steam Guard, to a token
 //! - `presence` - Steam's states and moho's
 //! - `friends` - who the friends are, how they are doing, what each conversation is called
+//! - `chat` - direct messages, in and out
+//! - `login` - adding an account: the sign-in a person takes part in
+//! - `connect` - an account's connection: sign in with the token, listen, reconnect
+//! - `publish` - the roster as the window sees it: a conversation each, named, with a dot
 //! - `cm` - finding a connection manager to connect to
 //! - `link` - one connection: asking it things, and hearing what it says
-//!
-//! Not yet wired into the daemon: the layers below are built and tested first.
-#![allow(dead_code)]
 
 pub mod auth;
+pub mod chat;
 pub mod cm;
+pub mod connect;
 pub mod eresult;
 pub mod friends;
 pub mod link;
+pub mod login;
 pub mod presence;
 pub mod proto;
+pub mod publish;
 pub mod steamid;
 pub mod wire;
+
+pub use connect::spawn;
+pub use presence::apply_status;
+
+use crate::state::AppState;
+
+/// Tells Steam this session is being left, so it is not shown as signed in
+/// for a while afterwards as one that was merely dropped. Written to the
+/// connection; the caller keeps it open long enough for that to be sent.
+pub fn say_goodbye(link: &link::Link) {
+    let _ = link.send(wire::emsg::CLIENT_LOG_OFF, &proto::ClientLogOff {});
+}
+
+/// Ends a session politely: says goodbye, and lets go of the connection a
+/// moment later, which is how long the goodbye takes to be written.
+pub fn sign_off(link: link::Link) {
+    say_goodbye(&link);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        drop(link);
+    });
+}
+
+/// Sends a direct message in the conversation `buffer` is, and stores it.
+pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
+    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
+    let (id, sent_at) = chat::send(&link, &recipient, body).await?;
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
+    state.runtime.record_message_at(
+        state,
+        &buffer.account_id,
+        &buffer.name,
+        "dm",
+        &own,
+        body.trim_end(),
+        false,
+        "chat",
+        None,
+        Some(id),
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(i64::from(sent_at)).filter(|t| *t > 0),
+        None,
+        None,
+    );
+    Ok(())
+}

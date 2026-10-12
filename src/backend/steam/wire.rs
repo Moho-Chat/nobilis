@@ -34,21 +34,19 @@ pub const NO_JOB: u64 = u64::MAX;
 /// official client's own table (`enums_clientserver.proto`).
 pub mod emsg {
     pub const MULTI: u32 = 1;
-    pub const SERVICE_METHOD: u32 = 146;
+    #[cfg(test)]
     pub const SERVICE_METHOD_RESPONSE: u32 = 147;
     pub const SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
     pub const SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
     pub const CLIENT_HEART_BEAT: u32 = 703;
     pub const CLIENT_LOG_OFF: u32 = 706;
     pub const CLIENT_CHANGE_STATUS: u32 = 716;
-    pub const CLIENT_FRIEND_MSG: u32 = 718;
     pub const CLIENT_LOG_ON_RESPONSE: u32 = 751;
     pub const CLIENT_LOGGED_OFF: u32 = 757;
     pub const CLIENT_PERSONA_STATE: u32 = 766;
     pub const CLIENT_FRIENDS_LIST: u32 = 767;
     pub const CLIENT_ACCOUNT_INFO: u32 = 768;
     pub const CLIENT_REQUEST_FRIEND_DATA: u32 = 815;
-    pub const CLIENT_FRIEND_MSG_INCOMING: u32 = 5427;
     pub const CLIENT_LOGON: u32 = 5514;
     pub const SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED: u32 = 9804;
     pub const CLIENT_HELLO: u32 = 9805;
@@ -72,11 +70,6 @@ pub struct Packet {
 impl Packet {
     pub fn new(emsg: u32, header: Header, body: Vec<u8>) -> Self {
         Self { emsg, protobuf: true, header, body }
-    }
-
-    /// The request this starts, or `NO_JOB`.
-    pub fn job_source(&self) -> u64 {
-        self.header.jobid_source.unwrap_or(NO_JOB)
     }
 
     /// The request this answers, or `NO_JOB`.
@@ -237,7 +230,6 @@ mod tests {
     fn an_answer_names_the_request_it_answers() {
         let mut p = packet(emsg::SERVICE_METHOD_RESPONSE, b"");
         assert_eq!(p.job_target(), NO_JOB);
-        assert_eq!(p.job_source(), 42);
         p.header.jobid_target = Some(9);
         assert_eq!(Packet::decode(&p.encode()).unwrap().job_target(), 9);
     }
@@ -284,7 +276,8 @@ mod tests {
         let p = Packet::decode(&bytes).unwrap();
         assert!(!p.protobuf);
         assert_eq!(p.emsg, 5500);
-        assert_eq!((p.job_target(), p.job_source()), (11, 22));
+        assert_eq!(p.job_target(), 11);
+        assert_eq!(p.header.jobid_source, Some(22));
         assert_eq!(p.header.steamid, Some(76561197960287930));
         assert_eq!(p.header.client_sessionid, Some(5));
         assert_eq!(p.body, b"body");

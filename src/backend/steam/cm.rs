@@ -115,7 +115,7 @@ mod tests {
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].endpoint, "cmp1-iad1.steamserver.net:443");
         assert_eq!(servers[0].dc, "iad1");
-        assert_eq!(servers[1].wtd_load, 3.76304769515991211);
+        assert_eq!(servers[1].wtd_load, 3.763_047_695_159_912);
         assert_eq!(servers[0].url(), "wss://cmp1-iad1.steamserver.net:443/cmsocket/");
     }
 

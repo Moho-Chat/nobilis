@@ -449,6 +449,12 @@ pub struct AccountStore {
 }
 
 impl AccountStore {
+    /// Where the file is, for a test that reads it back.
+    #[cfg(test)]
+    pub fn path_for_tests(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn open(path: PathBuf) -> Result<Self> {
         let (irc, discord, sneedchat, matrix, kick, steam) = if path.exists() {
             let text = std::fs::read_to_string(&path)
@@ -672,26 +678,6 @@ impl AccountStore {
         }
         self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(true)
-    }
-
-    /// Keeps what a sign-in produced, or the fresher token a reconnect was
-    /// handed. Nothing is written when nothing changed.
-    pub fn set_steam_session(&self, account_id: &str, refresh_token: &str, guard_data: Option<&str>) -> Result<bool> {
-        let unchanged = self
-            .steam
-            .lock()
-            .unwrap()
-            .get(account_id)
-            .is_some_and(|a| a.refresh_token == refresh_token && guard_data.is_none_or(|g| a.guard_data.as_deref() == Some(g)));
-        if unchanged {
-            return Ok(true);
-        }
-        self.mutate_steam(account_id, |a| {
-            a.refresh_token = refresh_token.to_string();
-            if let Some(g) = guard_data {
-                a.guard_data = Some(g.to_string());
-            }
-        })
     }
 
     /// Upserts, like the others: signing in to Kick again with the same
@@ -1571,24 +1557,6 @@ mod steam_account_tests {
         assert!(got.use_tor && got.strict_route, "a re-login must not send a routed account out directly");
         assert_eq!(s.route_level_of("steam:someone").as_deref(), Some("strict"));
         assert_eq!(s.display_name_override("steam:someone").as_deref(), Some("Me on Steam"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn a_fresher_token_replaces_the_old_and_an_unchanged_one_writes_nothing() {
-        let (s, path) = store("token");
-        s.add_steam(account("someone", "one")).unwrap();
-        assert!(s.set_steam_session("steam:someone", "two", Some("guard")).unwrap());
-        let got = s.get_steam("steam:someone").unwrap();
-        assert_eq!((got.refresh_token.as_str(), got.guard_data.as_deref()), ("two", Some("guard")));
-
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        assert!(s.set_steam_session("steam:someone", "two", Some("guard")).unwrap());
-        assert!(s.set_steam_session("steam:someone", "two", None).unwrap(), "no new guard data leaves the old");
-        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), before, "the file was rewritten to say what it already said");
-        assert_eq!(s.get_steam("steam:someone").unwrap().guard_data.as_deref(), Some("guard"));
-        assert!(!s.set_steam_session("steam:nobody", "x", None).unwrap());
         let _ = std::fs::remove_file(path);
     }
 

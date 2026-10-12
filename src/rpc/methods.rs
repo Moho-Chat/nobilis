@@ -78,6 +78,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_kick(id) {
             backend::kick::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("steam:") {
+        if let Some(cfg) = state.accounts.get_steam(id) {
+            backend::steam::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -102,6 +106,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
         | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
+        "addSteamAccount" => Some("steam"),
         _ => None,
     }
 }
@@ -325,6 +330,7 @@ pub async fn dispatch(
                 { "id": "discord", "name": "Discord", "available": true },
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
+                { "id": "steam", "name": "Steam", "available": true },
             ])),
             None,
         ),
@@ -691,6 +697,14 @@ pub async fn dispatch(
                         match state.accounts.get_kick(id) {
                             Some(cfg) => {
                                 backend::kick::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("steam:") {
+                        match state.accounts.get_steam(id) {
+                            Some(cfg) => {
+                                backend::steam::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -1530,6 +1544,9 @@ pub async fn dispatch(
                     Ok(()) => true,
                     Err(e) => return (None, Some(format!("{e:#}"))),
                 }
+            } else if state.accounts.get_steam(account_id).is_some() {
+                // A choice, as against stepping away: Steam keeps the two apart.
+                backend::steam::apply_status(state, account_id, status, true)
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
@@ -1577,6 +1594,8 @@ pub async fn dispatch(
                 let shown = state.runtime.effective_status(state, id);
                 let applied = if state.accounts.get_discord(id).is_some() {
                     backend::discord::apply_session_presence(state, id, &shown)
+                } else if state.accounts.get_steam(id).is_some() {
+                    backend::steam::apply_status(state, id, &shown, false)
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
                     let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
                     sender.send(irc::proto::Command::AWAY(away)).is_ok()
@@ -3203,6 +3222,15 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("steam:") => {
+                    // Steam has no attachments, replies or edits for a direct
+                    // message in this client yet: what arrives that it cannot
+                    // use is ignored rather than refused, as elsewhere.
+                    match backend::steam::send_message(state, &buffer, body).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("kick:") => {
                     let Some(cfg) = state.accounts.get_kick(&buffer.account_id) else {
                         return (None, Some("account not connected".to_string()));
@@ -3927,6 +3955,38 @@ pub async fn dispatch(
         // to wait for. The browser window already did the signing in (see
         // moho's browser-login), so all this does is check who the token
         // belongs to and start the connection.
+        // Adding a Steam account takes place over time, because Steam may ask
+        // for something from the person's phone: this answers with an id and
+        // the rest is events - see backend/steam/login.rs.
+        "addSteamAccount" => {
+            let (Some(username), Some(password)) = (p_str_opt(params, "username"), p_str_opt(params, "password")) else {
+                return (None, Some("addSteamAccount requires \"username\" and \"password\"".to_string()));
+            };
+            let kind = backend::steam::auth::Kind::parse(p_str(params, "session", "chat"));
+            let login_id = format!("steam-{}", crate::model::next_message_id());
+            backend::steam::login::start(state.clone(), login_id.clone(), username.to_string(), password.to_string(), kind);
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The code Steam asked for, for a sign-in that is waiting on one.
+        "submitSteamGuardCode" => {
+            let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), p_str_opt(params, "code")) else {
+                return (None, Some("submitSteamGuardCode requires \"loginId\" and \"code\"".to_string()));
+            };
+            match backend::steam::login::submit_code(login_id, code) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The form was closed with a sign-in still waiting.
+        "cancelSteamLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::steam::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
         "addKickAccount" => {
             let token = p_str_opt(params, "token")
                 .map(backend::kick::api::bare_token)

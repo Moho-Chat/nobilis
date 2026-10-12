@@ -50,20 +50,17 @@ pub enum CallError {
     Unreadable(String),
 }
 
-impl CallError {
-    /// The result code, where Steam gave one.
-    pub fn code(&self) -> Option<i32> {
-        match self {
-            CallError::Refused(code, _) => Some(*code),
-            _ => None,
-        }
-    }
-}
-
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CallError::Refused(code, _) => write!(f, "{}", eresult::describe(*code)),
+            CallError::Refused(code, said) => {
+                let words = eresult::describe(*code);
+                // Steam's own words go after ours when they add anything.
+                match said.as_deref().filter(|m| !m.eq_ignore_ascii_case(&words)) {
+                    Some(said) => write!(f, "{words} ({said})"),
+                    None => write!(f, "{words}"),
+                }
+            }
             CallError::Closed => write!(f, "the connection to Steam ended"),
             CallError::TimedOut => write!(f, "Steam did not answer in time"),
             CallError::Unreadable(why) => write!(f, "an answer from Steam could not be read: {why}"),
@@ -267,15 +264,6 @@ impl Link {
         }
         A::decode(answer.body.as_slice()).map_err(|e| CallError::Unreadable(e.to_string()))
     }
-
-    /// A call to a service that sends no answer back (a notification).
-    pub fn notify<Q: Message>(&self, method: &str, request: &Q) -> Result<(), CallError> {
-        let mut header = self.header(true);
-        header.target_job_name = Some(method.to_string());
-        header.realm = Some(1);
-        let packet = Packet::new(emsg::SERVICE_METHOD_CALL_FROM_CLIENT, header, request.encode_to_vec());
-        self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
-    }
 }
 
 /// A connection manager that is not one: speaks the framing, over a plain
@@ -401,9 +389,9 @@ mod tests {
         .await;
         let (link, _told) = open(KEY, &url).await.unwrap();
         let err = link.call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
-        assert_eq!(err.code(), Some(84));
         assert!(matches!(&err, CallError::Refused(84, Some(m)) if m == "slow down"));
         assert!(err.to_string().contains("limiting"));
+        assert!(err.to_string().contains("(slow down)"), "Steam's own words are kept: {err}");
     }
 
     #[tokio::test]
@@ -473,31 +461,5 @@ mod tests {
         drop(other);
         drop(told);
         tokio::time::timeout(Duration::from_secs(5), closed.notified()).await.expect("the server saw the connection close");
-    }
-
-    #[tokio::test]
-    async fn a_notification_names_its_method_and_expects_nothing_back() {
-        let seen = Arc::new(Mutex::new(None));
-        let url = serve({
-            let seen = seen.clone();
-            Box::new(move |req| {
-                *seen.lock().unwrap() = Some(req);
-                Some(Vec::new())
-            })
-        })
-        .await;
-        let (link, _told) = open(KEY, &url).await.unwrap();
-        link.set_identity(Identity { steamid: 5, session: 6 });
-        link.notify("FriendMessages.AckMessage#1", &ClientLogOff {}).unwrap();
-        for _ in 0..100 {
-            if seen.lock().unwrap().is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let req = seen.lock().unwrap().clone().expect("the server heard it");
-        assert_eq!(req.header.target_job_name.as_deref(), Some("FriendMessages.AckMessage#1"));
-        assert_eq!(req.header.jobid_source, None, "no job: nobody is waiting for an answer");
-        assert_eq!(req.header.steamid, Some(5));
     }
 }

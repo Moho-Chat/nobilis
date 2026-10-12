@@ -18,11 +18,7 @@ use std::collections::HashMap;
 
 /// `EFriendRelationship`.
 pub const REL_NONE: u32 = 0;
-pub const REL_BLOCKED: u32 = 1;
-pub const REL_REQUEST_RECIPIENT: u32 = 2;
 pub const REL_FRIEND: u32 = 3;
-pub const REL_REQUEST_INITIATOR: u32 = 4;
-pub const REL_IGNORED: u32 = 5;
 
 /// What is known about a person from their persona updates.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -57,6 +53,10 @@ pub fn clean_name(name: &str) -> String {
 pub struct Roster {
     relationships: HashMap<u32, u32>,
     personas: HashMap<u32, Persona>,
+    /// People with a conversation who are not friends: somebody who wrote to
+    /// us first. They need a conversation of their own and a name that does
+    /// not clash with anyone else's, but they are not on the friends list.
+    talking: std::collections::HashSet<u32>,
 }
 
 impl Roster {
@@ -106,6 +106,21 @@ impl Roster {
         changed
     }
 
+    /// Notes that there is a conversation with this person, friend or not.
+    /// Returns whether that is new.
+    pub fn note_conversation(&mut self, account: u32) -> bool {
+        !self.is_friend(account) && self.talking.insert(account)
+    }
+
+    /// Everybody a conversation exists with: the friends, and whoever else
+    /// has written. In a steady order.
+    pub fn participants(&self) -> Vec<u32> {
+        let mut out = self.friends();
+        out.extend(self.talking.iter().copied().filter(|a| !self.is_friend(*a)));
+        out.sort_unstable();
+        out
+    }
+
     /// The people who are friends, in a steady order.
     pub fn friends(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| **r == REL_FRIEND).map(|(a, _)| *a).collect();
@@ -119,11 +134,6 @@ impl Roster {
 
     pub fn persona(&self, account: u32) -> Option<&Persona> {
         self.personas.get(&account)
-    }
-
-    /// Everybody whose details are not known yet, to ask for.
-    pub fn unknown(&self) -> Vec<u32> {
-        self.friends().into_iter().filter(|a| self.personas.get(a).and_then(|p| p.name.as_ref()).is_none()).collect()
     }
 
     /// What each friend's conversation is called.
@@ -150,8 +160,8 @@ impl Roster {
                 .filter(|n| !n.is_empty())
                 .unwrap_or_else(|| steamid::text_of(account))
         };
-        let friends = self.friends();
-        let mut names: HashMap<u32, String> = friends.iter().map(|a| (*a, base(*a))).collect();
+        let people = self.participants();
+        let mut names: HashMap<u32, String> = people.iter().map(|a| (*a, base(*a))).collect();
         // Plain, then with the number in round brackets, in square, in curly;
         // and for the last resort a character no cleaned name can contain.
         let marks: [fn(&str, u32) -> String; 4] = [
@@ -200,6 +210,11 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
 mod tests {
     use super::*;
     use crate::backend::steam::proto::FriendsListEntry;
+
+    // The other standings a list carries, which matter here only as not being a friend.
+    const REL_BLOCKED: u32 = 1;
+    const REL_REQUEST_RECIPIENT: u32 = 2;
+    const REL_REQUEST_INITIATOR: u32 = 4;
 
     fn entry(account: u32, relationship: u32) -> FriendsListEntry {
         FriendsListEntry { ulfriendid: Some(steamid::steamid_of(account)), efriendrelationship: Some(relationship) }
@@ -297,7 +312,6 @@ mod tests {
         let names = r.conversation_names();
         assert_eq!(names[&10], "Alex");
         assert_eq!(names[&20], steamid::text_of(20));
-        assert_eq!(r.unknown(), vec![20]);
     }
 
     #[test]
@@ -355,6 +369,23 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, 7 * 7 * 7 * 7);
+    }
+
+    #[test]
+    fn somebody_who_writes_first_gets_a_conversation_without_becoming_a_friend() {
+        let mut r = Roster::default();
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND)]));
+        assert!(r.note_conversation(77), "new");
+        assert!(!r.note_conversation(77), "not new twice");
+        assert!(!r.note_conversation(10), "a friend already has one");
+        assert_eq!(r.friends(), vec![10]);
+        assert_eq!(r.participants(), vec![10, 77]);
+        r.apply_persona(&persona(vec![named(10, "Alex", 1), named(77, "Alex", 1)]));
+        let names = r.conversation_names();
+        assert_ne!(names[&10].to_lowercase(), names[&77].to_lowercase(), "a stranger sharing a friend's name does not share their conversation");
+        // Once they are a friend they are only counted once.
+        r.apply_friends_list(&list(true, &[(77, REL_FRIEND)]));
+        assert_eq!(r.participants(), vec![10, 77]);
     }
 
     #[test]

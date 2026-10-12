@@ -855,6 +855,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("discord") => "discord",
         Some("kick") => "kick",
         Some("sneedchat") => "sneedchat",
+        Some("steam") => "steam",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
@@ -871,6 +872,7 @@ mod service_tests {
         assert_eq!(service_of("discord:167790743988076545"), "discord");
         assert_eq!(service_of("kick:someone"), "kick");
         assert_eq!(service_of("sneedchat:Ancient Pioneer"), "sneedchat");
+        assert_eq!(service_of("steam:someone"), "steam");
         // IRC is the one without a prefix, and a host with a port in it must
         // not be read as one.
         assert_eq!(service_of("Salastil@irc.libera.chat"), "irc");
@@ -1003,7 +1005,8 @@ mod tests {
 /// Whether a service has anything to make of a status.
 ///
 /// Offered by what each can actually express, and not by what could be faked
-/// out of something nearby: Discord has all four; IRC has away and back, which
+/// out of something nearby: Discord has all four; Steam has online, away
+/// (idle) and invisible; IRC has away and back, which
 /// are idle and online; Matrix has
 /// online and offline presence, so invisible is real and idle is not; Kick and
 /// Sneedchat have no presence at all.
@@ -1016,7 +1019,7 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:"),
         _ => false,
     }
 }
@@ -1043,6 +1046,14 @@ mod status_tests {
     fn matrix_has_offline_presence_and_no_idle() {
         assert!(status_supported("matrix:@me:poa.st", "invisible"));
         assert!(!status_supported("matrix:@me:poa.st", "idle"));
+    }
+
+    #[test]
+    fn steam_has_online_idle_and_invisible() {
+        for s in ["online", "idle", "invisible", "dnd"] {
+            assert!(status_supported("steam:someone", s), "{s}");
+        }
+        assert!(!status_supported("steam:someone", "nonsense"));
     }
 
     #[test]
