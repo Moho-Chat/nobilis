@@ -445,3 +445,52 @@ async fn nicknames_notifications_and_a_friends_card_work_against_steam() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// The account's own emoticons and stickers, asked for in one question; and a
+/// sticker sent with the command Steam's own client sends.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; sends one real sticker if the sender has any"]
+async fn the_accounts_emoticons_and_stickers_are_listed_and_a_sticker_is_sent() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=info,nobilis::backend::steam::emoticons=debug,nobilis::backend::steam::connect=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-stickers");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let (sender_id, receiver_id) = (sender.account_id(), receiver.account_id());
+    for config in [&sender, &receiver] {
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+    }
+    within(60, "both accounts to be signed in", || [&sender_id, &receiver_id].iter().all(|id| state.runtime.conn_state(id) == Some(ConnState::Connected))).await;
+    let conversation = |account: &str, with: u64| {
+        state.runtime.list_buffers().into_iter().find(|b| b.account_id == account && b.kind == "dm" && b.remote_id.as_deref() == Some(&with.to_string()))
+    };
+    within(60, "the friends", || conversation(&sender_id, receiver.steamid).is_some() && conversation(&receiver_id, sender.steamid).is_some()).await;
+    within(30, "the lists", || state.runtime.emoji_catalogue(&sender_id).len() == 2).await;
+    let sources = state.runtime.emoji_catalogue(&sender_id);
+    let by = |id: &str| sources.iter().find(|s| s.id == id).map(|s| s.emoji.iter().map(|e| e.name.clone()).collect::<Vec<_>>()).unwrap_or_default();
+    let (emoticons, stickers) = (by("steam"), by(super::emoticons::STICKERS));
+    println!("{} emoticon(s) {:?}; {} sticker(s) {:?}", emoticons.len(), emoticons.iter().take(4).collect::<Vec<_>>(), stickers.len(), stickers.iter().take(4).collect::<Vec<_>>());
+    assert!(!emoticons.is_empty(), "an account has the free emoticons at least");
+    for (who, id) in [("sender", &sender_id), ("receiver", &receiver_id)] {
+        let all = state.runtime.emoji_catalogue(id);
+        println!("{who}: {:?}", all.iter().map(|s| (s.id.clone(), s.emoji.len())).collect::<Vec<_>>());
+    }
+
+    if let Some(name) = stickers.first() {
+        let ours = conversation(&sender_id, receiver.steamid).unwrap();
+        let before = state.store.get_backlog(&ours.id, 0, 5).unwrap().len();
+        crate::backend::steam::send_message(&state, &ours, &format!("/sticker {name}")).await.expect("Steam takes a sticker");
+        let log = state.store.get_backlog(&ours.id, 0, 50).unwrap();
+        println!("logged after the sticker: {:?}", log.last().map(|m| m.body.clone()));
+        assert!(log.len() > before);
+        within(30, "the other side to hear it", || state.store.get_backlog(&conversation(&receiver_id, sender.steamid).unwrap().id, 0, 5).unwrap().iter().any(|m| m.body.contains("sticker"))).await;
+    } else {
+        println!("the sender has no stickers to send");
+    }
+    for id in [&sender_id, &receiver_id] {
+        if let Some(link) = state.runtime.take_steam_link(id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

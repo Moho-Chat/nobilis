@@ -53,6 +53,8 @@ pub mod emsg {
     pub const CLIENT_ACCOUNT_INFO: u32 = 768;
     pub const CLIENT_FRIEND_PROFILE_INFO: u32 = 5535;
     pub const CLIENT_FS_GET_FRIENDS_STEAM_LEVELS: u32 = 7528;
+    pub const CLIENT_GET_EMOTICON_LIST: u32 = 9330;
+    pub const CLIENT_EMOTICON_LIST: u32 = 9331;
     pub const CLIENT_ADD_FRIEND: u32 = 791;
     /// Only the tests build one: the connection matches it to its question by job id, not by kind.
     #[cfg(test)]

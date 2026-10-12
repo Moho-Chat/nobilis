@@ -155,6 +155,12 @@ CASES = {
     "SetPerFriendPreferencesResponse": (player.CPlayer_SetPerFriendPreferences_Response, dict()),
     "PerFriendPreferencesChanged": (player.CPlayer_PerFriendPreferencesChanged_Notification, dict(accountid=22202, preferences=dict(accountid=22202, nickname="Pal", notifications_showmessages=1))),
     "FriendNicknameChanged": (player.CPlayer_FriendNicknameChanged_Notification, dict(accountid=22202, nickname="Pal", is_echo_to_self=True)),
+    "ClientGetEmoticonList": (friends.CMsgClientGetEmoticonList, dict()),
+    "EmoticonOwned": (friends.CMsgClientEmoticonList.Emoticon, dict(name="steamhappy", count=3, time_last_used=1790000010, use_count=9, time_received=1700000000, appid=730)),
+    "StickerOwned": (friends.CMsgClientEmoticonList.Sticker, dict(name="CatSurprise", count=2, time_received=1700000001, appid=440, time_last_used=1790000011, use_count=5)),
+    "EffectOwned": (friends.CMsgClientEmoticonList.Effect, dict(name="Fireworks", count=1, time_received=1700000002, infinite_use=True, appid=570)),
+    "ClientEmoticonList": (friends.CMsgClientEmoticonList, dict(
+        emoticons=[dict(name="steamhappy", count=1)], stickers=[dict(name="CatSurprise", count=2)], effects=[dict(name="Fireworks", infinite_use=True)])),
     "IgnoreFriendRequest": (player.CPlayer_IgnoreFriend_Request, dict(steamid=ID, unignore=True)),
     "IgnoreFriendResponse": (player.CPlayer_IgnoreFriend_Response, dict(friend_relationship=5)),
     "GetPasswordRsaPublicKeyRequest": (auth.CAuthentication_GetPasswordRSAPublicKey_Request, dict(account_name="someone")),

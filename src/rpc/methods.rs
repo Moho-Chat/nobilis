@@ -176,6 +176,9 @@ pub async fn dispatch(
             };
             let account_id = channel_account(state, buffer_id);
             let mut sources = state.runtime.emoji_catalogue(&account_id);
+            // Steam's stickers are sent, not typed: they have their own tab, asked for
+            // by `listSteamStickers`, and are not a section of emoji.
+            sources.retain(|s| s.id != backend::steam::emoticons::STICKERS);
 
             // Sneedchat's table is the same everywhere and belongs to no
             // room, so it is added here rather than recorded per channel.
@@ -214,6 +217,38 @@ pub async fn dispatch(
                 })
                 .collect();
             (Some(serde_json::json!(answer)), None)
+        }
+
+        // The stickers a Steam account has - all it can send, and the only ones the
+        // picker offers.
+        "listSteamStickers" => match p_str_opt(params, "bufferId") {
+            None => (None, Some("listSteamStickers requires \"bufferId\"".to_string())),
+            Some(buffer_id) => {
+                let account_id = channel_account(state, buffer_id);
+                let stickers: Vec<serde_json::Value> = state
+                    .runtime
+                    .emoji_catalogue(&account_id)
+                    .into_iter()
+                    .filter(|s| s.id == backend::steam::emoticons::STICKERS)
+                    .flat_map(|s| s.emoji)
+                    .map(|e| serde_json::json!({ "name": e.name, "pack": "Steam", "body": e.name, "id": e.id, "url": e.url }))
+                    .collect();
+                (Some(serde_json::json!(stickers)), None)
+            }
+        },
+
+        // A sticker is a message: Steam's client sends the command and Steam turns it into the picture.
+        "sendSteamSticker" => {
+            let (Some(buffer), Some(name)) = (p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)), p_str_opt(params, "name")) else {
+                return (None, Some("sendSteamSticker requires a known \"bufferId\" and a \"name\"".to_string()));
+            };
+            if !backend::steam::emoticons::is_owned_sticker(state, &buffer.account_id, name) {
+                return (None, Some("this account does not have that sticker".to_string()));
+            }
+            match backend::steam::send_message(state, &buffer, &format!("/sticker {name}")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
         }
 
         "listBufferEmoji" => match p_str_opt(params, "bufferId") {

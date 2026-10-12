@@ -425,6 +425,12 @@ impl Drive<'_> {
                     self.shown.publish(self.state, &self.roster);
                 }
             }
+            // Everything the account may put in a message, as one list.
+            emsg::CLIENT_EMOTICON_LIST => {
+                if let Ok(list) = ClientEmoticonList::decode(packet.body.as_slice()) {
+                    super::emoticons::keep(self.state, self.account_id, &list);
+                }
+            }
             emsg::CLIENT_ACCOUNT_INFO => {
                 if let Some(name) = ClientAccountInfo::decode(packet.body.as_slice()).ok().and_then(|i| i.persona_name).filter(|n| !n.is_empty()) {
                     self.state.runtime.set_own_identity(self.account_id, &name);
@@ -665,10 +671,15 @@ mod tests {
         let presence = state.runtime.list_accounts(&state);
         assert!(presence.iter().any(|a| a.id == ACCOUNT && a.state == "connected" && a.display_name == "Me Myself"), "{presence:?}");
 
-        // What was said to Steam, in order.
+        // What was said to Steam, in order - once it has asked about the friends,
+        // which follows the list and is not the same moment as their message.
+        eventually("the account to ask who its friends are", || seen.lock().unwrap().iter().any(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA)).await;
         let seen = seen.lock().unwrap().clone();
         let kinds: Vec<u32> = seen.iter().map(|p| p.emsg).collect();
-        assert_eq!(kinds[..3], [emsg::CLIENT_HELLO, emsg::CLIENT_LOGON, emsg::CLIENT_CHANGE_STATUS]);
+        // Hello, then the sign-in; what follows includes the status, but the account's
+        // emoticons and preferences are asked for in the background and may be in between.
+        assert_eq!(kinds[..2], [emsg::CLIENT_HELLO, emsg::CLIENT_LOGON]);
+        assert!(kinds.contains(&emsg::CLIENT_CHANGE_STATUS), "{kinds:?}");
         assert!(kinds.contains(&emsg::CLIENT_REQUEST_FRIEND_DATA), "asked who the friends are: {kinds:?}");
         assert_eq!(ClientHello::decode(seen[0].body.as_slice()).unwrap().protocol_version, Some(65581));
         let logon = ClientLogon::decode(seen[1].body.as_slice()).unwrap();
@@ -676,7 +687,7 @@ mod tests {
         assert_eq!(logon.access_token.as_deref(), Some("the-refresh-token"), "the token, and never a password");
         assert_eq!((logon.protocol_version, logon.chat_mode), (Some(65581), Some(2)));
         assert_eq!(seen[1].header.steamid, Some(ME), "as the account being signed in");
-        let status = ClientChangeStatus::decode(seen[2].body.as_slice()).unwrap();
+        let status = ClientChangeStatus::decode(seen.iter().find(|p| p.emsg == emsg::CLIENT_CHANGE_STATUS).unwrap().body.as_slice()).unwrap();
         assert_eq!((status.persona_state, status.persona_set_by_user), (Some(1), Some(true)), "online, since nothing else was chosen");
         let ask = seen.iter().find(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA).unwrap();
         assert_eq!(ask.header.client_sessionid, Some(4242), "with the session Steam gave");

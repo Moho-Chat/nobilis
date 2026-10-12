@@ -696,6 +696,67 @@ pub struct IgnoreFriendResponse {
 }
 
 // --- emoticons -------------------------------------------------------------
+/// Asks for the emoticons, stickers and effects an account has, in one answer.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientGetEmoticonList {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EmoticonOwned {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(int32, optional, tag = "2")]
+    pub count: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_last_used: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub use_count: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub time_received: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub appid: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StickerOwned {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(int32, optional, tag = "2")]
+    pub count: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_received: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub appid: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub time_last_used: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub use_count: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EffectOwned {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(int32, optional, tag = "2")]
+    pub count: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_received: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub infinite_use: Option<bool>,
+    #[prost(uint32, optional, tag = "5")]
+    pub appid: Option<u32>,
+}
+
+/// Everything an account may put in a message beyond words.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientEmoticonList {
+    #[prost(message, repeated, tag = "1")]
+    pub emoticons: Vec<EmoticonOwned>,
+    #[prost(message, repeated, tag = "2")]
+    pub stickers: Vec<StickerOwned>,
+    #[prost(message, repeated, tag = "3")]
+    pub effects: Vec<EffectOwned>,
+}
+
 
 #[derive(Clone, PartialEq, Message)]
 pub struct GetEmoticonListRequest {}
@@ -965,10 +1026,11 @@ mod tests {
                 FriendsSteamLevelsResponse, GetPerFriendPreferencesRequest, PerFriendPreferences,
                 GetPerFriendPreferencesResponse, SetPerFriendPreferencesRequest, SetPerFriendPreferencesResponse,
                 PerFriendPreferencesChanged, FriendNicknameChanged, IgnoreFriendRequest, IgnoreFriendResponse,
+                ClientGetEmoticonList, EmoticonOwned, StickerOwned, EffectOwned, ClientEmoticonList,
             );
             seen += 1;
         }
-        assert_eq!(seen, 69, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 74, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare
