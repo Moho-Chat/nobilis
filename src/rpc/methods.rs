@@ -3301,10 +3301,29 @@ pub async fn dispatch(
                     }
                 },
                 Some(buffer) if buffer.account_id.starts_with("steam:") => {
-                    // Steam has no attachments, replies or edits for a direct
-                    // message in this client yet: what arrives that it cannot
-                    // use is ignored rather than refused, as elsewhere.
-                    match backend::steam::send_message(state, &buffer, body).await {
+                    // Steam has no replies or edits for a direct message in
+                    // this client yet: what arrives that it cannot use is
+                    // ignored rather than refused, as elsewhere. Files it has.
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let result = if paths.is_empty() {
+                        backend::steam::send_message(state, &buffer, body).await
+                    } else {
+                        let spoilers: Vec<&str> = params
+                            .get("spoilerPaths")
+                            .and_then(|v| v.as_array())
+                            .map(|list| list.iter().filter_map(|v| v.as_str()).collect())
+                            .unwrap_or_default();
+                        let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                        let sent = backend::steam::send_files(state, &buffer, body, &files, progress).await;
+                        if let Some(p) = progress {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                        sent
+                    };
+                    match result {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }

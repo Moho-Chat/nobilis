@@ -56,11 +56,42 @@ fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
     "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*",
+    "video", "looping_media", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.
 const RAW: &[&str] = &["code", "noparse"];
+
+/// An attribute written as `name="value"`, `name=value`, or among others
+/// (`src="..." width="..."`): the value, unquoted.
+fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+    let lower = attrs.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(at) = lower[from..].find(&format!("{name}=")) {
+        let start = from + at;
+        let boundary = start == 0 || lower.as_bytes()[start - 1].is_ascii_whitespace();
+        let value = &attrs[start + name.len() + 1..];
+        if boundary {
+            return Some(match value.strip_prefix('"') {
+                Some(quoted) => quoted.split('"').next().unwrap_or_default(),
+                None => value.split(|c: char| c.is_whitespace() || c == '/' || c == ']').next().unwrap_or_default(),
+            });
+        }
+        from = start + 1;
+    }
+    None
+}
+
+/// A picture or video written with its address as an attribute - what Steam
+/// makes of a file sent through its website - read as that address on a line
+/// of its own, which is what the link previews read.
+fn media_address(tag: &Tag<'_>) -> Option<String> {
+    matches!(tag.name.as_str(), "img" | "video" | "looping_media")
+        .then(|| tag.attr.and_then(|a| attribute(a, "src")))
+        .flatten()
+        .filter(|u| is_web(u))
+        .map(str::to_string)
+}
 
 fn is_web(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
@@ -164,6 +195,15 @@ pub fn to_markup(bbcode: &str) -> String {
                 } else if !tag.closing && tag.name == "*" {
                     out!().push_str("\n• ");
                     i += tag.len;
+                    continue;
+                } else if let (false, Some(address)) = (tag.closing, media_address(&tag)) {
+                    out!().push_str(&format!("\n{address}\n"));
+                    i += tag.len;
+                    // Its own close, if it was written with one, says nothing more.
+                    let close = format!("[/{}]", tag.name);
+                    if bytes[i..].to_ascii_lowercase().starts_with(&close) {
+                        i += close.len();
+                    }
                     continue;
                 } else if !tag.closing && !RAW.contains(&tag.name.as_str()) {
                     stack.push(Open { tag: tag.name, attr: tag.attr.map(str::to_string), literal: rest[..tag.len].to_string(), out: String::new() });
@@ -303,6 +343,10 @@ mod tests {
         assert_eq!(to_markup("[roomeffect]fireworks[/roomeffect]hello"), "hello");
         assert_eq!(to_markup("a[hr]b"), "a\nb");
         assert_eq!(to_markup("[img]https://example.com/a.png[/img]"), "https://example.com/a.png");
+        assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" height=\"64\"][/img]"), "https://x.test/ugc/1/");
+        assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" /]"), "https://x.test/ugc/1/", "with no close at all");
+        assert_eq!(to_markup("[spoiler][img src=\"https://x.test/ugc/1/\"][/img][/spoiler]"), "||\nhttps://x.test/ugc/1/\n||");
+        assert_eq!(to_markup("[video src=\"https://x.test/v.webm\" controls=\"1\"][/video]"), "https://x.test/v.webm");
     }
 
     #[test]

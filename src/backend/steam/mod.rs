@@ -46,6 +46,7 @@ pub mod proto;
 pub mod publish;
 pub mod reactions;
 pub mod steamid;
+pub mod web;
 pub mod wire;
 
 pub use connect::spawn;
@@ -97,5 +98,43 @@ pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body:
         None,
         None,
     );
+    Ok(())
+}
+
+/// Sends files to a friend, and the words that came with them.
+///
+/// Steam has no caption: the words go first as a message of their own and each
+/// file is a message after it, which is how its own client sends the two. The
+/// messages are written into the conversation by Steam and come back to this
+/// session as the echo of what another session sent, so nothing is recorded
+/// here. Stops at the first file Steam refuses and says why.
+pub async fn send_files(
+    state: &AppState,
+    buffer: &crate::model::Buffer,
+    caption: &str,
+    files: &[(String, bool)],
+    progress: Option<&crate::upload::Progress>,
+) -> Result<(), String> {
+    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let friend = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
+    let config = state.accounts.get_steam(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    // Refused before anything is sent, so a bad file does not leave the words
+    // sent and the pictures not.
+    for (path, _) in files {
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
+        let size = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("reading {name}: {e}"))?;
+        if let Some(why) = web::refusal(name, size) {
+            return Err(why);
+        }
+    }
+    if !caption.trim().is_empty() {
+        send_message(state, buffer, caption).await?;
+    }
+    for (path, spoiler) in files {
+        let url = web::send_file(&link, &buffer.account_id, config.steamid, &config.refresh_token, &friend, path, *spoiler, progress)
+            .await
+            .inspect_err(|why| tracing::info!("steam[{}]: a file to {friend} was not sent: {why}", buffer.account_id))?;
+        tracing::info!("steam[{}]: sent a file to {friend}: {url}", buffer.account_id);
+    }
     Ok(())
 }

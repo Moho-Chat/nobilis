@@ -494,3 +494,93 @@ async fn the_accounts_emoticons_and_stickers_are_listed_and_a_sticker_is_sent() 
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Files between two real accounts: a picture, a spoilered picture and a short
+/// video go through Steam's website, and the other account hears each as a
+/// message. Prints what Steam wrote into the conversation, which is the one
+/// thing nothing else can say. Needs `ffmpeg` to make the video.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; sends real files"]
+async fn pictures_and_videos_are_sent_and_heard() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam::connect=debug,nobilis::backend::steam::web=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-files");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let (sender_id, receiver_id) = (sender.account_id(), receiver.account_id());
+    for config in [&sender, &receiver] {
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+    }
+    within(60, "both accounts to be signed in", || [&sender_id, &receiver_id].iter().all(|id| state.runtime.conn_state(id) == Some(ConnState::Connected))).await;
+    let conversation = |account: &str, with: u64| {
+        state.runtime.list_buffers().into_iter().find(|b| b.account_id == account && b.kind == "dm" && b.remote_id.as_deref() == Some(&with.to_string()))
+    };
+    within(60, "the friend", || conversation(&sender_id, receiver.steamid).is_some() && conversation(&receiver_id, sender.steamid).is_some()).await;
+
+    let dir = std::env::temp_dir().join(format!("moho-steam-files-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("probe.png");
+    image::RgbaImage::from_pixel(96, 64, image::Rgba([200, 60, 60, 255])).save(&png).unwrap();
+    let video = dir.join("probe.webm");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=128x96:rate=10", "-t", "1", video.to_str().unwrap()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let pdf = dir.join("paper.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4").unwrap();
+
+    let outgoing = conversation(&sender_id, receiver.steamid).unwrap();
+    let path = |p: &std::path::Path| p.to_str().unwrap().to_string();
+    let refused = crate::backend::steam::send_files(&state, &outgoing, "", &[(path(&pdf), false)], None).await;
+    println!("a pdf: {refused:?}");
+    assert!(refused.is_err());
+
+    let mut files = vec![(path(&png), false), (path(&png), true)];
+    if made {
+        files.push((path(&video), false));
+    }
+    let sent = crate::backend::steam::send_files(&state, &outgoing, "moho files probe", &files, None).await;
+    println!("sent: {sent:?}");
+    sent.expect("Steam takes the files");
+
+    let incoming = conversation(&receiver_id, sender.steamid).unwrap();
+    let wanted = files.len() + 1;
+    within(60, "the receiver to hear them all", || state.store.get_backlog(&incoming.id, 0, 50).map(|m| m.iter().filter(|m| !m.is_own).count() >= wanted).unwrap_or(false)).await;
+    for m in state.store.get_backlog(&incoming.id, 0, 50).unwrap().iter().filter(|m| !m.is_own) {
+        println!("RECEIVED {:?}", m.body);
+    }
+    for m in state.store.get_backlog(&outgoing.id, 0, 50).unwrap().iter().filter(|m| m.is_own) {
+        println!("SENDER HAS {:?}", m.body);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+    for id in [&sender_id, &receiver_id] {
+        if let Some(link) = state.runtime.take_steam_link(id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// Whether Steam would take a file from an account, asked and not sent: the
+/// first step of an upload is a question and leaves nothing behind.
+#[tokio::test]
+#[ignore = "needs a real Steam account; sends no message"]
+async fn steam_says_whether_an_account_may_upload() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam::web=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-may-upload");
+    for role in ["SENDER", "RECEIVER"] {
+        let config = account(role);
+        let id = config.account_id();
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+        within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+        let link = state.runtime.steam_link(&id).unwrap();
+        println!("{role}: {:?}", super::web::may_upload(&link, &id, config.steamid, &config.refresh_token).await);
+        if let Some(link) = state.runtime.take_steam_link(&id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
