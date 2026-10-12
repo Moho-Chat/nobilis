@@ -13,8 +13,17 @@ use super::*;
 /// migrate_caches_to_xdg_cache_dir moves any pre-existing directory here
 /// once at startup.
 pub(super) fn avatar_cache_dir() -> std::path::PathBuf {
+    // A test that fetches a picture must not leave it in somebody's real cache.
+    #[cfg(test)]
+    if let Some(dir) = TEST_CACHE.lock().unwrap().clone() {
+        return dir;
+    }
     dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sneedchat-avatars")
 }
+
+/// Where tests keep avatars instead, when one has said so.
+#[cfg(test)]
+pub(super) static TEST_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
 
 /// Evicts the oldest-written files in `dir` until it's back under
 /// `max_bytes`. Oldest-by-mtime rather than true LRU (a cache hit doesn't

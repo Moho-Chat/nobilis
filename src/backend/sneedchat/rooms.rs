@@ -279,52 +279,100 @@ pub(super) const SITE_OWNER_ID: &str = "1";
 
 pub(super) fn update_roster(
     state: &AppState,
+    http: &super::http::HttpClient,
+    host: &str,
     account_id: &str,
     buffer_name: &str,
     joined: &[protocol::WireUser],
     left: &[String],
 ) {
     let buffer_id = crate::model::buffer_id(account_id, buffer_name);
-    let mut by_id: std::collections::BTreeMap<String, String> = state
+    let mut by_id = published_roster(state, &buffer_id);
+
+    for user in joined {
+        // Whatever picture they already had stays until a new one is fetched.
+        let known = by_id.get(&user.id).and_then(|(_, a)| a.clone());
+        by_id.insert(user.id.clone(), (user.username.clone(), known));
+    }
+    for id in left {
+        by_id.remove(id);
+    }
+    publish_roster(state, &buffer_id, &by_id);
+
+    // The pictures, after the list is already on screen: fetching one goes over
+    // the site's own route and is slow the first time, and neither the list nor
+    // the room's messages should wait for a face. Fetched together, then laid
+    // over the roster as it is by then and said again.
+    let wanted: Vec<(String, String)> = joined
+        .iter()
+        .filter_map(|u| Some((u.id.clone(), u.avatar_url.clone().filter(|a| !a.is_empty())?)))
+        .collect();
+    if !wanted.is_empty() {
+        tokio::spawn({
+            let (state, http, host) = (state.clone(), http.clone(), host.to_string());
+            async move { add_pictures(&state, &http, &host, &buffer_id, wanted).await }
+        });
+    }
+}
+
+/// The roster as last published: who is there, and the picture each has.
+fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+    state
         .runtime
-        .get_presence(&buffer_id)
+        .get_presence(buffer_id)
         .and_then(|v| serde_json::from_value::<Vec<serde_json::Value>>(v).ok())
         .unwrap_or_default()
         .into_iter()
         .filter_map(|m| {
             let id = m.get("userId")?.as_str()?.to_string();
             let nick = m.get("nick")?.as_str()?.to_string();
-            Some((id, nick))
+            let avatar = m.get("avatarUrl").and_then(|a| a.as_str()).map(str::to_string);
+            Some((id, (nick, avatar)))
         })
-        .collect();
+        .collect()
+}
 
-    for user in joined {
-        by_id.insert(user.id.clone(), user.username.clone());
+/// Fetches pictures and puts them on whoever is still in the room.
+async fn add_pictures(state: &AppState, http: &super::http::HttpClient, host: &str, buffer_id: &str, wanted: Vec<(String, String)>) {
+    let found = futures::future::join_all(wanted.iter().map(|(id, raw)| async move { (id.clone(), super::media::cached_avatar_path(http, host, id, raw).await) })).await;
+    // Read afresh: people came and went while these were being fetched, and a
+    // roster built from before would bring back whoever has left.
+    let mut now = published_roster(state, buffer_id);
+    let mut changed = false;
+    for (id, path) in found {
+        if let (Some(path), Some(entry)) = (path, now.get_mut(&id)) {
+            if entry.1.as_deref() != Some(path.as_str()) {
+                entry.1 = Some(path);
+                changed = true;
+            }
+        }
     }
-    for id in left {
-        by_id.remove(id);
+    if changed {
+        publish_roster(state, buffer_id, &now);
     }
+}
 
-    let mut members: Vec<(String, String)> = by_id.into_iter().collect();
-    members.sort_by(|(_, a), (_, b)| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
+/// Orders and publishes a roster: sorted here rather than left to the client,
+/// since every other backend hands over a sorted one and a five-hundred-name
+/// list in map order would be unreadable.
+fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, (String, Option<String>)>) {
+    let mut members: Vec<(&String, &(String, Option<String>))> = by_id.iter().collect();
+    members.sort_by(|(_, (a, _)), (_, (b, _))| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members
         .into_iter()
-        .map(|(id, nick)| {
+        .map(|(id, (nick, avatar))| {
             // "~" is the owner prefix the frontend already ranks by, shared
             // with IRC rather than inventing a Sneedchat-only convention.
             let prefix = if id == SITE_OWNER_ID { "~" } else { "" };
-            serde_json::json!({ "nick": nick, "userId": id, "prefix": prefix, "away": false })
+            serde_json::json!({ "nick": nick, "userId": id, "prefix": prefix, "away": false, "avatarUrl": avatar })
         })
         .collect::<Vec<_>>());
 
     // Persisted as well as broadcast, so a client that subscribes later gets
     // the roster from subscribe's replay rather than waiting for the next
     // arrival or departure - which in a quiet room could be a long wait.
-    state.runtime.set_presence(&buffer_id, member_list.clone());
-    state.events.emit(
-        "presenceChange",
-        serde_json::json!({ "bufferId": buffer_id, "members": member_list }),
-    );
+    state.runtime.set_presence(buffer_id, member_list.clone());
+    state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 #[cfg(test)]
@@ -361,5 +409,92 @@ pub(super) mod buffer_name_tests {
         // Tolerant read-back: a caller that already stripped it gets the same
         // answer rather than a different one.
         assert_eq!(room_name_of("fishtank"), "fishtank");
+    }
+}
+
+#[cfg(test)]
+mod roster_tests {
+    use super::*;
+    use crate::backend::kick::testkit::simulated_daemon;
+    use crate::backend::sneedchat::http::{CookieJar, HttpClient};
+    use crate::net::tor::Transport;
+
+    const ACCOUNT: &str = "sneedchat:test";
+
+    fn client() -> HttpClient {
+        HttpClient::new(Transport::Direct, CookieJar::new(), "test".to_string())
+    }
+
+    fn user(id: &str, name: &str, avatar: Option<&str>) -> protocol::WireUser {
+        serde_json::from_value(serde_json::json!({ "id": id, "username": name, "avatar_url": avatar })).unwrap()
+    }
+
+    fn members(state: &AppState) -> Vec<(String, Option<String>)> {
+        let list = state.runtime.get_presence(&crate::model::buffer_id(ACCOUNT, "general")).unwrap();
+        list.as_array().unwrap().iter().map(|m| (m["nick"].as_str().unwrap().to_string(), m["avatarUrl"].as_str().map(str::to_string))).collect()
+    }
+
+    #[tokio::test]
+    async fn the_list_is_published_at_once_with_nobody_waiting_on_a_picture() {
+        let state = simulated_daemon("sneedchat-roster-plain");
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("2", "bob", None), user("1", "Amy", None)], &[]);
+        assert_eq!(members(&state), [("Amy".to_string(), None), ("bob".to_string(), None)], "sorted, and no picture is no picture");
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[], &["2".to_string()]);
+        assert_eq!(members(&state).len(), 1);
+    }
+
+    /// A tiny picture on a local server, fetched into a scratch cache.
+    async fn picture_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // A PNG's signature and a few more bytes: enough to be sniffed as one.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let png = png.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", png.len());
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(&png).await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn pictures_follow_the_list_and_stay_through_later_arrivals() {
+        let dir = std::env::temp_dir().join(format!("nobilis-roster-avatars-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = Some(dir.clone());
+        let base = picture_server().await;
+        let state = simulated_daemon("sneedchat-roster-pictures");
+
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("7", "Amy", Some(&format!("{base}/a.png")))], &[]);
+        // On screen first, without the picture.
+        assert_eq!(members(&state), [("Amy".to_string(), None)]);
+        let mut with = None;
+        for _ in 0..100 {
+            with = members(&state)[0].1.clone();
+            if with.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let path = with.expect("the picture arrives after the list");
+        assert!(path.contains("7."), "a file named for the user: {path}");
+
+        // Somebody arrives, and Amy keeps hers.
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("8", "Bob", None)], &[]);
+        let list = members(&state);
+        assert_eq!(list.iter().find(|m| m.0 == "Amy").unwrap().1.as_deref().map(|p| p.contains("7.")), Some(true));
+        assert_eq!(list.iter().find(|m| m.0 == "Bob").unwrap().1, None);
+
+        *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = None;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

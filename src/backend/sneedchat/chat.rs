@@ -237,7 +237,7 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
     let resp = protocol::ServerResponse::parse(frame);
 
     if !resp.users_joined.is_empty() || !resp.users_left.is_empty() {
-        update_roster(state, account_id, buffer_name, &resp.users_joined, &resp.users_left);
+        update_roster(state, http, host, account_id, buffer_name, &resp.users_joined, &resp.users_left);
     }
 
     if let Some(text) = &resp.plaintext {
