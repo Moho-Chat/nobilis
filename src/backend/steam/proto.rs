@@ -567,6 +567,134 @@ pub struct DismissSessionNotice {
     pub notice_type: Option<i32>,
 }
 
+// --- profiles, levels, nicknames and preferences ---------------------------
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendProfileInfoRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_friend: Option<u64>,
+}
+
+/// What somebody wrote on their profile: where they are, a headline, a summary.
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendProfileInfoResponse {
+    #[prost(int32, optional, tag = "1")]
+    pub eresult: Option<i32>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid_friend: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_created: Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub real_name: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    pub city_name: Option<String>,
+    #[prost(string, optional, tag = "6")]
+    pub state_name: Option<String>,
+    #[prost(string, optional, tag = "7")]
+    pub country_name: Option<String>,
+    #[prost(string, optional, tag = "8")]
+    pub headline: Option<String>,
+    #[prost(string, optional, tag = "9")]
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendsSteamLevelsRequest {
+    #[prost(uint32, repeated, packed = "false", tag = "1")]
+    pub accountids: Vec<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendLevel {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub level: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendsSteamLevelsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub friends: Vec<FriendLevel>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetPerFriendPreferencesRequest {}
+
+/// What an account keeps about one friend: the name it calls them, and how
+/// they may notify it. `ENotificationSetting`: 0 the default, 1 always, 2 never.
+#[derive(Clone, PartialEq, Message)]
+pub struct PerFriendPreferences {
+    #[prost(fixed32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(string, optional, tag = "2")]
+    pub nickname: Option<String>,
+    #[prost(int32, optional, tag = "3")]
+    pub notifications_showingame: Option<i32>,
+    #[prost(int32, optional, tag = "4")]
+    pub notifications_showonline: Option<i32>,
+    #[prost(int32, optional, tag = "5")]
+    pub notifications_showmessages: Option<i32>,
+    #[prost(int32, optional, tag = "6")]
+    pub sounds_showingame: Option<i32>,
+    #[prost(int32, optional, tag = "7")]
+    pub sounds_showonline: Option<i32>,
+    #[prost(int32, optional, tag = "8")]
+    pub sounds_showmessages: Option<i32>,
+    #[prost(int32, optional, tag = "9")]
+    pub notifications_sendmobile: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetPerFriendPreferencesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub preferences: Vec<PerFriendPreferences>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetPerFriendPreferencesRequest {
+    #[prost(message, optional, tag = "1")]
+    pub preferences: Option<PerFriendPreferences>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetPerFriendPreferencesResponse {}
+
+/// Said by Steam when preferences about one friend change, here or elsewhere.
+#[derive(Clone, PartialEq, Message)]
+pub struct PerFriendPreferencesChanged {
+    #[prost(fixed32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(message, optional, tag = "2")]
+    pub preferences: Option<PerFriendPreferences>,
+}
+
+/// Somebody's nickname changed on one of the account's clients.
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendNicknameChanged {
+    #[prost(fixed32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(string, optional, tag = "2")]
+    pub nickname: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub is_echo_to_self: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct IgnoreFriendRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid: Option<u64>,
+    #[prost(bool, optional, tag = "2")]
+    pub unignore: Option<bool>,
+}
+
+/// What the relationship is now, `EFriendRelationship`.
+#[derive(Clone, PartialEq, Message)]
+pub struct IgnoreFriendResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub friend_relationship: Option<u32>,
+}
+
 // --- emoticons -------------------------------------------------------------
 
 #[derive(Clone, PartialEq, Message)]
@@ -833,10 +961,14 @@ mod tests {
                 GetEmoticonListRequest, EmoticonInfo, GetEmoticonListResponse,
                 UpdateMessageReactionRequest, UpdateMessageReactionResponse, MessageReactionNotice,
                 SessionNoticeNotification, DismissSessionNotice,
+                FriendProfileInfoRequest, FriendProfileInfoResponse, FriendsSteamLevelsRequest, FriendLevel,
+                FriendsSteamLevelsResponse, GetPerFriendPreferencesRequest, PerFriendPreferences,
+                GetPerFriendPreferencesResponse, SetPerFriendPreferencesRequest, SetPerFriendPreferencesResponse,
+                PerFriendPreferencesChanged, FriendNicknameChanged, IgnoreFriendRequest, IgnoreFriendResponse,
             );
             seen += 1;
         }
-        assert_eq!(seen, 55, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 69, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

@@ -53,6 +53,13 @@ const PERSONA_FIELDS: u32 = 1 | 2 | 16 | 64 | 256 | 4096;
 
 /// How many people to ask about in one message.
 const ASK_ABOUT_AT_A_TIME: usize = 200;
+/// A friend's new nickname, from the notification that says it: who, and what.
+fn decode_nickname_changed(body: &[u8]) -> Option<(u32, Option<String>)> {
+    use super::proto::FriendNicknameChanged;
+    let n = FriendNicknameChanged::decode(body).ok()?;
+    Some((n.accountid?, n.nickname.filter(|n| !n.trim().is_empty())))
+}
+
 /// How long after the friends list to read what was missed.
 pub(super) static CATCH_UP_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4000);
 /// How many times a catch-up that found conversations not yet named is tried again.
@@ -285,6 +292,7 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         asked: Default::default(),
         catch_up_at: None,
         catch_up_tries: 0,
+        prefs_wanted: None,
         shown: Conversations::new(account_id),
     }
     .run(&mut told, heartbeat)
@@ -307,6 +315,8 @@ struct Drive<'a> {
     /// conversations exist to put it in.
     catch_up_at: Option<tokio::time::Instant>,
     catch_up_tries: u32,
+    /// What the account keeps about its friends, on its way.
+    prefs_wanted: Option<tokio::sync::oneshot::Receiver<Vec<PerFriendPreferences>>>,
 }
 
 impl Drive<'_> {
@@ -314,6 +324,19 @@ impl Drive<'_> {
         self.shown.adopt(self.state, self.account_id);
         // What can be put in a message, for the picker; it arrives when it arrives.
         tokio::spawn(super::emoticons::load(self.state.clone(), self.link.clone(), self.account_id.to_string()));
+        // What the account keeps about its friends - nicknames and the like -
+        // is asked for in the background and taken in when it arrives, so that
+        // a Steam slow to answer holds nothing up.
+        let (prefs_tx, prefs_rx) = tokio::sync::oneshot::channel();
+        self.prefs_wanted = Some(prefs_rx);
+        tokio::spawn({
+            let link = self.link.clone();
+            async move {
+                if let Ok(all) = super::prefs::load(&link).await {
+                    let _ = prefs_tx.send(all);
+                }
+            }
+        });
         let mut beat = tokio::time::interval(heartbeat);
         beat.tick().await; // the first tick is immediate
         loop {
@@ -330,6 +353,18 @@ impl Drive<'_> {
                     if unnamed > 0 && self.catch_up_tries < CATCH_UP_RETRIES {
                         self.catch_up_tries += 1;
                         self.catch_up_at = Some(tokio::time::Instant::now() + catch_up_after());
+                    }
+                }
+                loaded = async { match self.prefs_wanted.as_mut() { Some(rx) => rx.await, None => std::future::pending().await } } => {
+                    self.prefs_wanted = None;
+                    if let Ok(all) = loaded {
+                        let mut renamed = false;
+                        for prefs in &all {
+                            renamed |= self.roster.set_preferences(prefs);
+                        }
+                        if renamed {
+                            self.shown.publish(self.state, &self.roster);
+                        }
                     }
                 }
                 packet = told.recv() => match packet {
@@ -413,6 +448,24 @@ impl Drive<'_> {
                         let (_, stranger) = chat::record_incoming(self.state, self.account_id, &mut self.roster, &mut self.shown, &own_name, &incoming);
                         if stranger {
                             self.ask_about(&[incoming.account]);
+                        }
+                    }
+                }
+                // What the account keeps about a friend changed, here or elsewhere.
+                Some("PlayerClient.NotifyPerFriendPreferencesChanged#1") => {
+                    if let Ok(changed) = PerFriendPreferencesChanged::decode(packet.body.as_slice()) {
+                        if let Some(prefs) = changed.preferences.filter(|p| p.accountid.is_some() || changed.accountid.is_some()) {
+                            let prefs = PerFriendPreferences { accountid: prefs.accountid.or(changed.accountid), ..prefs };
+                            if self.roster.set_preferences(&prefs) {
+                                self.shown.publish(self.state, &self.roster);
+                            }
+                        }
+                    }
+                }
+                Some("PlayerClient.NotifyFriendNicknameChanged#1") => {
+                    if let Some(account) = packet.body.as_slice().first().and(Some(&packet.body)).and_then(|b| decode_nickname_changed(b)) {
+                        if self.roster.set_nickname(account.0, account.1.as_deref()) {
+                            self.shown.publish(self.state, &self.roster);
                         }
                     }
                 }
@@ -804,6 +857,43 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn a_friend_is_called_what_the_account_calls_them_and_follows_a_change_made_elsewhere() {
+        let state = simulated_daemon("steam-connect-nickname");
+        let renamed = Packet::new(
+            emsg::SERVICE_METHOD,
+            Header { target_job_name: Some("PlayerClient.NotifyFriendNicknameChanged#1".into()), ..Header::default() },
+            FriendNicknameChanged { accountid: Some(FRIEND), nickname: Some("Pal".into()), is_echo_to_self: Some(false) }.encode_to_vec(),
+        );
+        let mut told = false;
+        let url = serve(Box::new(move |p| match p.emsg {
+            emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
+            emsg::CLIENT_CHANGE_STATUS if !told => {
+                told = true;
+                Some(vec![
+                    tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
+                    tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                ])
+            }
+            emsg::SERVICE_METHOD_CALL_FROM_CLIENT if p.header.target_job_name.as_deref() == Some("Player.GetPerFriendPreferences#1") => Some(vec![answer(
+                &p,
+                1,
+                GetPerFriendPreferencesResponse { preferences: vec![PerFriendPreferences { accountid: Some(FRIEND), nickname: Some("Buddy".into()), ..Default::default() }] }.encode_to_vec(),
+            )]),
+            // Somebody changes it on the phone, once the account has asked about its friends.
+            emsg::CLIENT_REQUEST_FRIEND_DATA => Some(vec![renamed.clone()]),
+            _ => Some(Vec::new()),
+        }))
+        .await;
+        state.accounts.add_steam(config()).unwrap();
+        let task = start(&state, url);
+        eventually("the friend, called what the account calls them", || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Buddy")).is_some() || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal")).is_some()).await;
+        // Then what it is changed to.
+        eventually("the change made elsewhere", || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal")).is_some()).await;
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).is_none(), "never by their own name once the account has one for them");
+        task.abort();
+    }
+
     #[test]
     fn steams_heartbeat_interval_is_kept_to_something_sensible() {
         let welcomed = read_logon(&reply_logon(1, 1)).unwrap();
@@ -830,7 +920,7 @@ mod tests {
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
         link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0 };
+        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {

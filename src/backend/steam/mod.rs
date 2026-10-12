@@ -37,7 +37,9 @@ pub mod history;
 pub mod link;
 pub mod login;
 pub mod notices;
+pub mod prefs;
 pub mod presence;
+pub mod profile;
 #[cfg(test)]
 mod probe;
 pub mod proto;

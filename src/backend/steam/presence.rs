@@ -69,6 +69,29 @@ pub fn activity(persona_state: u32, game: Option<&str>) -> Option<(&'static str,
     Some(("custom", words.to_string()))
 }
 
+/// Which kind of client somebody is on, for their card: from the flags on their
+/// state, and whether it is a Deck. Nothing for somebody who is not here.
+///
+/// `EPersonaStateFlag`: 256 web, 512 mobile, 1024 Big Picture, 2048 VR.
+pub fn client_of(persona_state: u32, flags: u32, on_deck: bool) -> Option<&'static str> {
+    if status_of(persona_state) == "offline" {
+        return None;
+    }
+    Some(if on_deck {
+        "Steam Deck"
+    } else if flags & 2048 != 0 {
+        "VR"
+    } else if flags & 1024 != 0 {
+        "Big Picture"
+    } else if flags & 512 != 0 {
+        "Mobile"
+    } else if flags & 256 != 0 {
+        "Web"
+    } else {
+        "Desktop"
+    })
+}
+
 /// Tells Steam how this account is showing.
 ///
 /// `by_user` says it was a choice, as against something done on their behalf
@@ -119,6 +142,18 @@ mod tests {
         assert_eq!(words(0, Some("Counter-Strike 2")), None);
         // Invisible is never seen on somebody else, and reads as offline.
         assert_eq!(words(INVISIBLE, Some("x")), None);
+    }
+
+    #[test]
+    fn the_kind_of_client_is_read_from_the_flags_and_is_nothing_for_somebody_away() {
+        assert_eq!(client_of(ONLINE, 0, false), Some("Desktop"));
+        assert_eq!(client_of(ONLINE, 512, false), Some("Mobile"));
+        assert_eq!(client_of(ONLINE, 256 | 1, false), Some("Web"));
+        assert_eq!(client_of(AWAY, 1024, false), Some("Big Picture"));
+        assert_eq!(client_of(ONLINE, 2048 | 512, false), Some("VR"));
+        assert_eq!(client_of(ONLINE, 512, true), Some("Steam Deck"), "a Deck is a Deck whatever else is set");
+        assert_eq!(client_of(0, 512, false), None);
+        assert_eq!(client_of(INVISIBLE, 0, false), None);
     }
 
     #[test]

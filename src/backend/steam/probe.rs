@@ -392,3 +392,56 @@ async fn a_reaction_is_heard_remembered_and_taken_back() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// What an account keeps about a friend, and a friend's card, against the real
+/// thing: a nickname set is what the friend is then called, hears itself back as
+/// a change, and goes when taken off; and the card has Steam's answers.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; changes the sender's nickname for the receiver and back"]
+async fn nicknames_notifications_and_a_friends_card_work_against_steam() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=info").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-prefs");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the sender to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let conversation = || state.runtime.list_buffers().into_iter().find(|b| b.account_id == id && b.kind == "dm" && b.remote_id.as_deref() == Some(&receiver.steamid.to_string()));
+    within(60, "the friend", || conversation().is_some()).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let original = conversation().unwrap().name;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let number = super::steamid::account_of(receiver.steamid).unwrap();
+
+    // Their card: Steam's answers, in the shape the window draws.
+    let card = super::profile::build(&state, &id, &conversation().unwrap().id, &original).await;
+    let labels: Vec<&str> = card["extra"].as_array().map(|a| a.iter().filter_map(|e| e["label"].as_str()).collect()).unwrap_or_default();
+    println!("card: id {} status {} labels {labels:?} created {}", card["id"], card["status"], card.get("createdTs").is_some());
+    assert_eq!(card["id"], receiver.steamid.to_string());
+    assert!(card.get("createdTs").is_some() || labels.contains(&"Steam level"), "Steam answered something about them");
+
+    // A nickname: set, held by Steam, and the conversation is called it.
+    super::prefs::set_nickname(&link, number, "probe-nick").await.expect("Steam takes a nickname");
+    let held = super::prefs::load(&link).await.expect("preferences");
+    assert_eq!(held.iter().find(|p| p.accountid == Some(number)).and_then(|p| p.nickname.as_deref()), Some("probe-nick"));
+    within(15, "the conversation to take the new name", || conversation().is_some_and(|b| b.name == "probe-nick")).await;
+
+    // Muted and back, without losing the nickname.
+    super::prefs::set_muted(&link, number, true).await.expect("mute");
+    let held = super::prefs::load(&link).await.unwrap();
+    let mine = held.iter().find(|p| p.accountid == Some(number)).unwrap();
+    assert_eq!((mine.nickname.as_deref(), mine.notifications_showmessages), (Some("probe-nick"), Some(super::friends::NOTIFY_NEVER)));
+    super::prefs::set_muted(&link, number, false).await.expect("unmute");
+
+    // And taken off, so it is as it was.
+    super::prefs::set_nickname(&link, number, "").await.expect("clear");
+    within(15, "the conversation to go back to their name", || conversation().is_some_and(|b| b.name == original)).await;
+    let held = super::prefs::load(&link).await.unwrap();
+    assert!(held.iter().find(|p| p.accountid == Some(number)).map(|p| p.nickname.as_deref().unwrap_or("").is_empty() && p.notifications_showmessages.unwrap_or(0) == 0).unwrap_or(true), "left as it was");
+
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

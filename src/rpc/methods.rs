@@ -1092,6 +1092,7 @@ pub async fn dispatch(
                         "discord" => backend::discord::profile(&state, &account_id, &buffer_id, &user_id, &who).await,
                         "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
                         "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
+                        "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -4094,6 +4095,30 @@ pub async fn dispatch(
                     Err(e) => (None, Some(e)),
                 },
                 _ => (None, Some("this Steam conversation is not connected".to_string())),
+            }
+        }
+
+        // What this account keeps about a friend - what it calls them, whether
+        // their messages notify it - and blocking them. By the conversation.
+        "steamSetNickname" | "steamSetFriendMuted" | "steamBlockFriend" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {
+                return (None, Some(format!("{method} requires a known \"bufferId\"")));
+            };
+            let Some(friend) = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok()).filter(|id| backend::steam::steamid::account_of(*id).is_some()) else {
+                return (None, Some("this conversation is not with a Steam account".to_string()));
+            };
+            let Some(link) = state.runtime.steam_link(&buffer.account_id) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            let number = backend::steam::steamid::account_of(friend).unwrap_or_default();
+            let done = match method {
+                "steamSetNickname" => backend::steam::prefs::set_nickname(&link, number, p_str(params, "nickname", "")).await,
+                "steamSetFriendMuted" => backend::steam::prefs::set_muted(&link, number, p_bool(params, "muted", true)).await,
+                _ => backend::steam::prefs::block(&link, friend, p_bool(params, "block", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
             }
         }
 

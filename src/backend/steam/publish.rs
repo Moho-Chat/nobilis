@@ -26,6 +26,8 @@ struct Shown {
     /// What is said under the name: the game, or a state the colour cannot give.
     activity: Option<(&'static str, String)>,
     avatar: Option<String>,
+    /// Which kind of client, when they were last seen, and what their game says: for their card.
+    detail: (Option<&'static str>, Option<u32>, Option<String>),
 }
 
 pub struct Conversations {
@@ -48,7 +50,7 @@ impl Conversations {
                 continue;
             }
             let Some(account) = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok()).and_then(steamid::account_of) else { continue };
-            self.shown.entry(account).or_insert(Shown { name: buffer.name, status: "offline", activity: None, avatar: None });
+            self.shown.entry(account).or_insert(Shown { name: buffer.name, status: "offline", activity: None, avatar: None, detail: (None, None, None) });
         }
     }
 
@@ -67,7 +69,8 @@ impl Conversations {
             let status = persona.map_or("offline", |p| presence::status_of(p.state));
             let avatar = persona.and_then(|p| p.avatar.clone());
             let activity = persona.and_then(|p| presence::activity(p.state, p.game.as_deref()));
-            let next = Shown { name: name.clone(), status, activity: activity.clone(), avatar: avatar.clone() };
+            let detail = persona.map_or((None, None, None), |p| (presence::client_of(p.state, p.flags, p.on_deck), p.last_seen, p.rich.clone()));
+            let next = Shown { name: name.clone(), status, activity: activity.clone(), avatar: avatar.clone(), detail: detail.clone() };
             let before = self.shown.get(&account);
             if before == Some(&next) {
                 continue;
@@ -90,6 +93,9 @@ impl Conversations {
                 "userId": steamid::text_of(account),
                 "status": status,
                 "activity": activity.map(|(kind, text)| json!({ "kind": kind, "text": text })),
+                "client": detail.0,
+                "lastSeen": detail.1,
+                "rich": detail.2,
                 "away": status == "idle",
                 "avatarUrl": avatar,
             }]);

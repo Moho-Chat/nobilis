@@ -12,7 +12,7 @@
 //! in and out, so the rules (who counts as a friend, what a conversation is
 //! called when two friends share a name) can be tested without a connection.
 
-use super::proto::{ClientFriendsList, ClientPersonaState, PersonaFriend};
+use super::proto::{ClientFriendsList, ClientPersonaState, PerFriendPreferences, PersonaFriend};
 use super::steamid;
 use std::collections::HashMap;
 
@@ -24,6 +24,9 @@ pub const REL_FRIEND: u32 = 3;
 /// We have asked somebody to be ours.
 pub const REL_REQUEST_INITIATOR: u32 = 4;
 
+/// `ENotificationSetting` never: this friend's messages do not notify.
+pub const NOTIFY_NEVER: i32 = 2;
+
 /// What is known about a person from their persona updates.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Persona {
@@ -34,6 +37,14 @@ pub struct Persona {
     pub game: Option<String>,
     /// The avatar's hash as hex.
     pub avatar: Option<String>,
+    /// `EPersonaStateFlag`: which kind of client they are on, among other things.
+    pub flags: u32,
+    /// Whether they are on a Steam Deck.
+    pub on_deck: bool,
+    /// The last time they were seen, unix seconds.
+    pub last_seen: Option<u32>,
+    /// What the game they are in says about what they are doing, where it says.
+    pub rich: Option<String>,
 }
 
 /// The picture Steam shows for somebody who has not set one.
@@ -57,6 +68,8 @@ pub fn clean_name(name: &str) -> String {
 pub struct Roster {
     relationships: HashMap<u32, u32>,
     personas: HashMap<u32, Persona>,
+    /// What the account keeps about each friend: the name it calls them, and how they may notify it.
+    preferences: HashMap<u32, PerFriendPreferences>,
     /// People with a conversation who are not friends: somebody who wrote to
     /// us first. They need a conversation of their own and a name that does
     /// not clash with anyone else's, but they are not on the friends list.
@@ -152,6 +165,33 @@ impl Roster {
         self.relationships.get(&account) == Some(&REL_FRIEND)
     }
 
+    /// Takes in what the account keeps about a friend. Returns whether the name
+    /// it calls them changed, which is what moves a conversation.
+    pub fn set_preferences(&mut self, prefs: &PerFriendPreferences) -> bool {
+        let Some(account) = prefs.accountid else { return false };
+        let before = self.nickname(account).map(str::to_string);
+        let bare = PerFriendPreferences { accountid: Some(account), ..Default::default() };
+        if *prefs == bare {
+            self.preferences.remove(&account);
+        } else {
+            self.preferences.insert(account, prefs.clone());
+        }
+        before.as_deref() != self.nickname(account)
+    }
+
+    /// Sets only what the account calls a friend, keeping the rest it holds.
+    /// Returns whether that name changed.
+    pub fn set_nickname(&mut self, account: u32, nickname: Option<&str>) -> bool {
+        let mut prefs = self.preferences.get(&account).cloned().unwrap_or(PerFriendPreferences { accountid: Some(account), ..Default::default() });
+        prefs.nickname = nickname.map(str::to_string);
+        self.set_preferences(&prefs)
+    }
+
+    /// What the account calls this friend, if it has said.
+    pub fn nickname(&self, account: u32) -> Option<&str> {
+        self.preferences.get(&account).and_then(|p| p.nickname.as_deref()).map(str::trim).filter(|n| !n.is_empty())
+    }
+
     pub fn persona(&self, account: u32) -> Option<&Persona> {
         self.personas.get(&account)
     }
@@ -172,12 +212,13 @@ impl Roster {
     /// the result is checked and anyone still sharing a name is marked again,
     /// differently, until nobody is.
     pub fn conversation_names(&self) -> HashMap<u32, String> {
+        // What the account calls them, if it has said; otherwise what they
+        // call themselves.
         let base = |account: u32| -> String {
-            self.personas
-                .get(&account)
-                .and_then(|p| p.name.as_deref())
+            self.nickname(account)
                 .map(clean_name)
                 .filter(|n| !n.is_empty())
+                .or_else(|| self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).filter(|n| !n.is_empty()))
                 .unwrap_or_else(|| steamid::text_of(account))
         };
         let people = self.participants();
@@ -224,15 +265,70 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
     if let Some(hash) = update.avatar_hash.as_deref().filter(|h| !h.is_empty()) {
         held.avatar = Some(avatar_url(hash));
     }
+    if let Some(flags) = update.persona_state_flags {
+        held.flags = flags;
+    }
+    if let Some(deck) = update.on_steam_deck {
+        held.on_deck = deck;
+    }
+    if let Some(seen) = [update.last_seen_online, update.last_logoff, update.last_logon].into_iter().flatten().filter(|t| *t > 0).max() {
+        held.last_seen = Some(held.last_seen.map_or(seen, |old| old.max(seen)));
+    }
+    // A game's own words for what is going on: its "status" line, which is
+    // plain text where the game sets one. Cleared with the game.
+    if !update.rich_presence.is_empty() {
+        held.rich = update.rich_presence.iter().find(|kv| kv.key.as_deref() == Some("status")).and_then(|kv| kv.value.clone()).filter(|v| !v.trim().is_empty());
+    }
+    if update.gameid == Some(0) || update.game_played_app_id == Some(0) {
+        held.rich = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::steam::proto::FriendsListEntry;
+    use crate::backend::steam::proto::{FriendsListEntry, KeyValue};
 
     // The other standings a list carries, which matter here only as not being a friend.
     const REL_BLOCKED: u32 = 1;
+
+    #[test]
+    fn a_nickname_is_what_a_friend_is_called_and_goes_back_to_their_name_when_taken() {
+        let mut r = Roster::default();
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_FRIEND)]));
+        r.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), player_name: Some("Gabe".into()), ..Default::default() }], ..Default::default() });
+        assert_eq!(r.conversation_names()[&10], "Gabe");
+        assert!(r.set_nickname(10, Some("Buddy")), "a new name is a change");
+        assert_eq!(r.conversation_names()[&10], "Buddy");
+        assert!(!r.set_nickname(10, Some("Buddy")), "the same again is not");
+        // Muting keeps the nickname, and the other way about.
+        r.set_preferences(&PerFriendPreferences { accountid: Some(10), nickname: Some("Buddy".into()), notifications_showmessages: Some(NOTIFY_NEVER), ..Default::default() });
+        assert_eq!(r.preferences.get(&10).and_then(|p| p.notifications_showmessages), Some(NOTIFY_NEVER));
+        assert!(r.set_nickname(10, None));
+        assert_eq!(r.conversation_names()[&10], "Gabe");
+        assert_eq!(r.preferences.get(&10).and_then(|p| p.notifications_showmessages), Some(NOTIFY_NEVER), "taking the name back does not unmute");
+        // Two friends given the same nickname are still told apart.
+        r.set_nickname(10, Some("Pal"));
+        r.set_nickname(20, Some("pal"));
+        let names = r.conversation_names();
+        assert_ne!(names[&10].to_lowercase(), names[&20].to_lowercase());
+    }
+
+    #[test]
+    fn the_kind_of_client_and_last_seen_are_kept_from_their_updates() {
+        let mut r = Roster::default();
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND)]));
+        r.apply_persona(&ClientPersonaState {
+            friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), persona_state_flags: Some(512), last_logoff: Some(100), last_seen_online: Some(300), on_steam_deck: Some(false), rich_presence: vec![KeyValue { key: Some("status".into()), value: Some("In a match".into()) }], ..Default::default() }],
+            ..Default::default()
+        });
+        let p = r.persona(10).unwrap();
+        assert_eq!((p.flags, p.last_seen, p.rich.as_deref()), (512, Some(300), Some("In a match")));
+        // A later update only says what changed: the newest time wins, and the game ending ends its words.
+        r.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), last_logoff: Some(200), gameid: Some(0), ..Default::default() }], ..Default::default() });
+        let p = r.persona(10).unwrap();
+        assert_eq!((p.last_seen, p.rich.as_deref(), p.flags), (Some(300), None, 512));
+    }
 
     #[test]
     fn requests_are_told_apart_by_who_made_them() {

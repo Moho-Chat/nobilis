@@ -33,6 +33,7 @@ FILES = [
     "steammessages_friendmessages.steamclient.proto",
     "steammessages_auth.steamclient.proto",
     "steammessages_player.steamclient.proto",
+    "steammessages_clientserver_2.proto",
     # What those import.
     "steammessages_unified_base.steamclient.proto",
     "enums.proto",
@@ -48,6 +49,7 @@ friends = importlib.import_module("steammessages_clientserver_friends_pb2")
 fmsg = importlib.import_module("steammessages_friendmessages.steamclient_pb2")
 auth = importlib.import_module("steammessages_auth.steamclient_pb2")
 player = importlib.import_module("steammessages_player.steamclient_pb2")
+cs2 = importlib.import_module("steammessages_clientserver_2_pb2")
 
 ID = 76561197960287930  # an account's 64-bit id
 ID2 = 76561197960265729
@@ -137,6 +139,24 @@ CASES = {
         steamid_friend=ID, server_timestamp=1790000012, ordinal=1, reactor=ID2, reaction_type=2, reaction="CatSurprise", is_add=True)),
     "SessionNoticeNotification": (fmsg.CFriendMessages_SessionNotice_Notification, dict(steamid_friend=ID, notice_type=1, active=True)),
     "DismissSessionNotice": (fmsg.CFriendMessages_DismissSessionNotice_Notification, dict(steamid_friend=ID2, notice_type=1)),
+    "FriendProfileInfoRequest": (friends.CMsgClientFriendProfileInfo, dict(steamid_friend=ID)),
+    "FriendProfileInfoResponse": (friends.CMsgClientFriendProfileInfoResponse, dict(
+        eresult=1, steamid_friend=ID2, time_created=1300000000, real_name="Some One", city_name="Bellevue",
+        state_name="WA", country_name="United States", headline="Hello", summary="About me")),
+    "FriendsSteamLevelsRequest": (cs2.CMsgClientFSGetFriendsSteamLevels, dict(accountids=[22202, 100])),
+    "FriendLevel": (cs2.CMsgClientFSGetFriendsSteamLevelsResponse.Friend, dict(accountid=22202, level=42)),
+    "FriendsSteamLevelsResponse": (cs2.CMsgClientFSGetFriendsSteamLevelsResponse, dict(friends=[dict(accountid=22202, level=42), dict(accountid=100, level=7)])),
+    "GetPerFriendPreferencesRequest": (player.CPlayer_GetPerFriendPreferences_Request, dict()),
+    "PerFriendPreferences": (player.PerFriendPreferences, dict(
+        accountid=22202, nickname="Buddy", notifications_showingame=1, notifications_showonline=2, notifications_showmessages=2,
+        sounds_showingame=1, sounds_showonline=2, sounds_showmessages=1, notifications_sendmobile=2)),
+    "GetPerFriendPreferencesResponse": (player.CPlayer_GetPerFriendPreferences_Response, dict(preferences=[dict(accountid=22202, nickname="Buddy", notifications_showmessages=2)])),
+    "SetPerFriendPreferencesRequest": (player.CPlayer_SetPerFriendPreferences_Request, dict(preferences=dict(accountid=22202, nickname="Pal"))),
+    "SetPerFriendPreferencesResponse": (player.CPlayer_SetPerFriendPreferences_Response, dict()),
+    "PerFriendPreferencesChanged": (player.CPlayer_PerFriendPreferencesChanged_Notification, dict(accountid=22202, preferences=dict(accountid=22202, nickname="Pal", notifications_showmessages=1))),
+    "FriendNicknameChanged": (player.CPlayer_FriendNicknameChanged_Notification, dict(accountid=22202, nickname="Pal", is_echo_to_self=True)),
+    "IgnoreFriendRequest": (player.CPlayer_IgnoreFriend_Request, dict(steamid=ID, unignore=True)),
+    "IgnoreFriendResponse": (player.CPlayer_IgnoreFriend_Response, dict(friend_relationship=5)),
     "GetPasswordRsaPublicKeyRequest": (auth.CAuthentication_GetPasswordRSAPublicKey_Request, dict(account_name="someone")),
     "GetPasswordRsaPublicKeyResponse": (auth.CAuthentication_GetPasswordRSAPublicKey_Response, dict(
         publickey_mod="C0FFEE" * 8, publickey_exp="010001", timestamp=1790000005000)),
