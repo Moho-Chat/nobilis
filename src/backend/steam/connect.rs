@@ -18,6 +18,7 @@ use super::chat;
 use super::cm;
 use super::eresult;
 use super::friends::Roster;
+use super::friendship;
 use super::link::{self, Identity, Link};
 use super::presence;
 use super::proto::*;
@@ -268,6 +269,7 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         link: &link,
         own: steamid::account_of(steamid).unwrap_or_default(),
         roster: Roster::default(),
+        asked: Default::default(),
         shown: Conversations::new(account_id),
     }
     .run(&mut told, heartbeat)
@@ -284,6 +286,8 @@ struct Drive<'a> {
     own: u32,
     roster: Roster,
     shown: Conversations,
+    /// Who has been announced as asking to be our friend.
+    asked: std::collections::HashSet<u32>,
 }
 
 impl Drive<'_> {
@@ -318,14 +322,27 @@ impl Drive<'_> {
                     let changed = self.roster.apply_friends_list(&list);
                     // Everybody on a full list, and whoever is new on a
                     // change to one: their names and states are not in it.
-                    let ask: Vec<u32> = if list.bincremental.unwrap_or(false) { changed.into_iter().filter(|a| self.roster.is_friend(*a)).collect() } else { self.roster.friends() };
+                    // Whoever has asked to be a friend is asked about too, so the
+                    // request can say who it is from.
+                    let known = |a: &u32| self.roster.is_friend(*a) || self.roster.asked_us().contains(a);
+                    let ask: Vec<u32> = if list.bincremental.unwrap_or(false) {
+                        changed.into_iter().filter(known).collect()
+                    } else {
+                        let mut all = self.roster.friends();
+                        all.extend(self.roster.asked_us());
+                        all
+                    };
                     self.ask_about(&ask);
                     self.shown.publish(self.state, &self.roster);
+                    friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
                 }
             }
             emsg::CLIENT_PERSONA_STATE => {
                 if let Ok(update) = ClientPersonaState::decode(packet.body.as_slice()) {
-                    self.roster.apply_persona(&update);
+                    let changed = self.roster.apply_persona(&update);
+                    if changed.iter().any(|a| self.roster.asked_us().contains(a) || self.roster.asked_by_us().contains(a)) {
+                        friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
+                    }
                     if let Some(name) = self.roster.persona(self.own).and_then(|p| p.name.clone()) {
                         self.state.runtime.set_own_identity(self.account_id, &name);
                     }
@@ -512,7 +529,8 @@ mod tests {
         let ask = seen.iter().find(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA).unwrap();
         assert_eq!(ask.header.client_sessionid, Some(4242), "with the session Steam gave");
         let ask = ClientRequestFriendData::decode(ask.body.as_slice()).unwrap();
-        assert_eq!(ask.friends, vec![steamid::steamid_of(FRIEND)], "friends only, not the person who has asked to be one");
+        assert_eq!(ask.friends, vec![steamid::steamid_of(FRIEND), steamid::steamid_of(900)], "the friends, and the person who has asked to be one, so the request can say who it is from");
+        assert_eq!(state.runtime.steam_requests(ACCOUNT)["incoming"][0]["steamid"], steamid::text_of(900), "and the request is there for the window to show");
         assert_eq!(ask.persona_state_requested, Some(PERSONA_FIELDS));
 
         task.abort();
@@ -602,7 +620,7 @@ mod tests {
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
         link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT) };
+        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default() };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {

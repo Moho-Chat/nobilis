@@ -3987,6 +3987,61 @@ pub async fn dispatch(
             (Some(ok_node()), None)
         }
 
+        // Friendships. Asking and accepting are one message to Steam; so are
+        // declining, withdrawing and ending.
+        "steamAddFriend" => {
+            let (Some(account_id), Some(target)) = (p_str_opt(params, "accountId"), p_str_opt(params, "target")) else {
+                return (None, Some("steamAddFriend requires \"accountId\" and \"target\"".to_string()));
+            };
+            let Some(link) = state.runtime.steam_link(account_id) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            let target = match backend::steam::friendship::parse_target(target) {
+                Ok(t) => t,
+                Err(e) => return (None, Some(e)),
+            };
+            match backend::steam::friendship::add(&link, &target).await {
+                Ok(added) => (Some(serde_json::json!({ "steamid": added.steamid.to_string(), "name": added.name })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "steamAnswerFriendRequest" => {
+            let (Some(account_id), Some(steamid)) = (p_str_opt(params, "accountId"), p_str_opt(params, "steamid").and_then(|t| t.parse::<u64>().ok())) else {
+                return (None, Some("steamAnswerFriendRequest requires \"accountId\" and \"steamid\"".to_string()));
+            };
+            let Some(link) = state.runtime.steam_link(account_id) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            let result = if p_bool(params, "accept", false) {
+                backend::steam::friendship::add(&link, &backend::steam::friendship::Target::Id(steamid)).await.map(|_| ())
+            } else {
+                backend::steam::friendship::remove(&link, steamid)
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "steamRemoveFriend" => {
+            let (Some(account_id), Some(steamid)) = (p_str_opt(params, "accountId"), p_str_opt(params, "steamid").and_then(|t| t.parse::<u64>().ok())) else {
+                return (None, Some("steamRemoveFriend requires \"accountId\" and \"steamid\"".to_string()));
+            };
+            let Some(link) = state.runtime.steam_link(account_id) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            match backend::steam::friendship::remove(&link, steamid) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "steamFriendRequests" => match p_str_opt(params, "accountId") {
+            Some(account_id) => (Some(state.runtime.steam_requests(account_id)), None),
+            None => (None, Some("steamFriendRequests requires \"accountId\"".to_string())),
+        },
+
         "addKickAccount" => {
             let token = p_str_opt(params, "token")
                 .map(backend::kick::api::bare_token)

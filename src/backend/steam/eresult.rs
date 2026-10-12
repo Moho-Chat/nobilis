@@ -12,18 +12,22 @@ pub const NO_CONNECTION: i32 = 3;
 pub const INVALID_PASSWORD: i32 = 5;
 pub const LOGGED_IN_ELSEWHERE: i32 = 6;
 pub const INVALID_PROTOCOL_VER: i32 = 7;
+pub const INVALID_PARAM: i32 = 8;
 pub const BUSY: i32 = 10;
 pub const ACCESS_DENIED: i32 = 15;
 pub const TIMEOUT: i32 = 16;
 pub const BANNED: i32 = 17;
 pub const ACCOUNT_NOT_FOUND: i32 = 18;
+pub const INVALID_STEAM_ID: i32 = 19;
 pub const SERVICE_UNAVAILABLE: i32 = 20;
 pub const NOT_LOGGED_ON: i32 = 21;
 pub const LIMIT_EXCEEDED: i32 = 25;
 pub const REVOKED: i32 = 26;
+pub const DUPLICATE_REQUEST: i32 = 29;
 pub const EXPIRED: i32 = 27;
 pub const BLOCKED: i32 = 40;
 pub const IGNORED: i32 = 41;
+pub const NO_MATCH: i32 = 42;
 pub const ACCOUNT_DISABLED: i32 = 43;
 pub const TRY_ANOTHER_CM: i32 = 48;
 pub const SUSPENDED: i32 = 51;
@@ -71,6 +75,9 @@ pub fn describe(code: i32) -> String {
         ACCOUNT_LOCKED_DOWN => "this account is locked until its owner secures it".to_string(),
         ACCOUNT_NOT_FRIENDS => "you can only message people who are your friends".to_string(),
         LIMITED_USER_ACCOUNT => "a limited account cannot do that; Steam asks for a purchase first".to_string(),
+        INVALID_PARAM | INVALID_STEAM_ID => "Steam does not recognise that as an account".to_string(),
+        NO_MATCH => "Steam found nobody by that name".to_string(),
+        DUPLICATE_REQUEST => "a request to this person is already waiting".to_string(),
         FAIL => "Steam reported a failure without saying why".to_string(),
         other => format!("Steam answered with error {other}"),
     }
@@ -96,6 +103,8 @@ mod tests {
         assert!(describe(INVALID_PASSWORD).contains("password"));
         assert!(describe(RATE_LIMIT_EXCEEDED).contains("limiting"));
         assert!(describe(ACCOUNT_NOT_FRIENDS).contains("friends"));
+        assert!(describe(NO_MATCH).contains("nobody"));
+        assert!(describe(DUPLICATE_REQUEST).contains("already"));
         assert!(describe(LIMITED_USER_ACCOUNT).contains("limited account"));
         assert!(describe(TWO_FACTOR_CODE_MISMATCH).contains("Steam Guard"));
     }

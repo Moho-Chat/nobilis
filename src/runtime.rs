@@ -533,6 +533,10 @@ pub struct Runtime {
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
+    /// Who has asked to be a Steam account's friend, and who it has asked:
+    /// what the window is shown on the account's page, kept so a window opened
+    /// after the request arrived can still be told.
+    steam_requests: Mutex<HashMap<String, serde_json::Value>>,
     /// What is known about each watched Kick channel, by buffer id.
     kick_channels: Mutex<HashMap<String, KickChannel>>,
     /// buffer id -> what that Kick channel is broadcasting, as last asked.
@@ -1081,6 +1085,7 @@ impl Runtime {
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
+            steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
             kick_stream_fetched: Mutex::new(HashMap::new()),
@@ -4234,6 +4239,21 @@ impl Runtime {
         self.steam_links.lock().unwrap().get(account_id).filter(|l| l.is_open()).cloned()
     }
 
+    /// Remembers the friend requests an account has, as the window shows them.
+    pub fn set_steam_requests(&self, account_id: &str, requests: serde_json::Value) {
+        self.steam_requests.lock().unwrap().insert(account_id.to_string(), requests);
+    }
+
+    /// The friend requests last remembered for the account.
+    pub fn steam_requests(&self, account_id: &str) -> serde_json::Value {
+        self.steam_requests
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "incoming": [], "outgoing": [] }))
+    }
+
     /// Takes the connection out, leaving none: ending a session means
     /// nothing else can reach it.
     pub fn take_steam_link(&self, account_id: &str) -> Option<crate::backend::steam::link::Link> {
@@ -5444,7 +5464,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, steam_links, kick_channels,
+            sneedchat_senders, kick_senders, steam_links, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
@@ -5547,8 +5567,13 @@ mod forget_tests {
         rt.silenced.lock().unwrap().insert("irc:a|#one".into());
         rt.silenced.lock().unwrap().insert("irc:ab|#one".into());
         rt.discord_members.lock().unwrap().insert(("irc:a|#one".into(), "u".into()), serde_json::json!({}));
+        rt.set_steam_requests("irc:a", serde_json::json!({ "incoming": [1], "outgoing": [] }));
+        rt.set_steam_requests("irc:ab", serde_json::json!({ "incoming": [2], "outgoing": [] }));
 
         rt.forget_account("irc:a");
+
+        assert_eq!(rt.steam_requests("irc:a")["incoming"], serde_json::json!([]), "a forgotten account has no requests");
+        assert_eq!(rt.steam_requests("irc:ab")["incoming"], serde_json::json!([2]));
 
         assert!(rt.own_identity.lock().unwrap().get("irc:a").is_none());
         assert!(rt.own_identity.lock().unwrap().get("irc:ab").is_some(), "a longer id that starts the same is another account");

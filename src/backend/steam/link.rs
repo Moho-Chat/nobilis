@@ -223,6 +223,40 @@ impl Link {
         self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
     }
 
+    /// A question to Steam in one of its older messages, and the answer.
+    ///
+    /// These are not service methods: there is no method name, and the
+    /// result code is inside the answer rather than in its header, so it is
+    /// the caller's to read. What matches the answer to the question is the
+    /// same job id.
+    pub async fn ask<Q: Message, A: Message + Default>(&self, emsg: u32, request: &Q) -> Result<A, CallError> {
+        let job = self.0.next_job.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut waiting = self.0.jobs.lock().unwrap();
+            if waiting.ended {
+                return Err(CallError::Closed);
+            }
+            waiting.by_job.insert(job, tx);
+        }
+        let mut header = self.header(true);
+        header.jobid_source = Some(job);
+        let packet = Packet::new(emsg, header, request.encode_to_vec());
+        if self.0.out.send(packet.encode()).is_err() {
+            self.0.jobs.lock().unwrap().by_job.remove(&job);
+            return Err(CallError::Closed);
+        }
+        let answer = match tokio::time::timeout(self.0.timeout, rx).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => return Err(CallError::Closed),
+            Err(_) => {
+                self.0.jobs.lock().unwrap().by_job.remove(&job);
+                return Err(CallError::TimedOut);
+            }
+        };
+        A::decode(answer.body.as_slice()).map_err(|e| CallError::Unreadable(e.to_string()))
+    }
+
     /// A question to one of Steam's services, and its answer.
     ///
     /// `method` is the service and method as Steam names them, `Service.Method#1`.

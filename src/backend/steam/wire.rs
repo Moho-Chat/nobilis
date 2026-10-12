@@ -40,12 +40,17 @@ pub mod emsg {
     pub const SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
     pub const CLIENT_HEART_BEAT: u32 = 703;
     pub const CLIENT_LOG_OFF: u32 = 706;
+    pub const CLIENT_REMOVE_FRIEND: u32 = 714;
     pub const CLIENT_CHANGE_STATUS: u32 = 716;
     pub const CLIENT_LOG_ON_RESPONSE: u32 = 751;
     pub const CLIENT_LOGGED_OFF: u32 = 757;
     pub const CLIENT_PERSONA_STATE: u32 = 766;
     pub const CLIENT_FRIENDS_LIST: u32 = 767;
     pub const CLIENT_ACCOUNT_INFO: u32 = 768;
+    pub const CLIENT_ADD_FRIEND: u32 = 791;
+    /// Only the tests build one: the connection matches it to its question by job id, not by kind.
+    #[cfg(test)]
+    pub const CLIENT_ADD_FRIEND_RESPONSE: u32 = 792;
     pub const CLIENT_REQUEST_FRIEND_DATA: u32 = 815;
     pub const CLIENT_LOGON: u32 = 5514;
     pub const SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED: u32 = 9804;

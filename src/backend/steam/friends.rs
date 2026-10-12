@@ -18,7 +18,11 @@ use std::collections::HashMap;
 
 /// `EFriendRelationship`.
 pub const REL_NONE: u32 = 0;
+/// Somebody has asked to be our friend.
+pub const REL_REQUEST_RECIPIENT: u32 = 2;
 pub const REL_FRIEND: u32 = 3;
+/// We have asked somebody to be ours.
+pub const REL_REQUEST_INITIATOR: u32 = 4;
 
 /// What is known about a person from their persona updates.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -128,6 +132,22 @@ impl Roster {
         out
     }
 
+    /// The people who have asked to be our friend, in a steady order.
+    pub fn asked_us(&self) -> Vec<u32> {
+        self.with_relationship(REL_REQUEST_RECIPIENT)
+    }
+
+    /// The people we have asked, who have not yet said yes.
+    pub fn asked_by_us(&self) -> Vec<u32> {
+        self.with_relationship(REL_REQUEST_INITIATOR)
+    }
+
+    fn with_relationship(&self, wanted: u32) -> Vec<u32> {
+        let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| **r == wanted).map(|(a, _)| *a).collect();
+        out.sort_unstable();
+        out
+    }
+
     pub fn is_friend(&self, account: u32) -> bool {
         self.relationships.get(&account) == Some(&REL_FRIEND)
     }
@@ -213,8 +233,19 @@ mod tests {
 
     // The other standings a list carries, which matter here only as not being a friend.
     const REL_BLOCKED: u32 = 1;
-    const REL_REQUEST_RECIPIENT: u32 = 2;
-    const REL_REQUEST_INITIATOR: u32 = 4;
+
+    #[test]
+    fn requests_are_told_apart_by_who_made_them() {
+        let mut r = Roster::default();
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (30, REL_REQUEST_RECIPIENT), (20, REL_REQUEST_RECIPIENT), (50, REL_REQUEST_INITIATOR), (60, REL_BLOCKED)]));
+        assert_eq!(r.asked_us(), [20, 30]);
+        assert_eq!(r.asked_by_us(), [50]);
+        assert_eq!(r.friends(), [10]);
+        // Saying yes turns a request into a friend.
+        r.apply_friends_list(&list(true, &[(20, REL_FRIEND)]));
+        assert_eq!(r.asked_us(), [30]);
+        assert!(r.is_friend(20));
+    }
 
     fn entry(account: u32, relationship: u32) -> FriendsListEntry {
         FriendsListEntry { ulfriendid: Some(steamid::steamid_of(account)), efriendrelationship: Some(relationship) }

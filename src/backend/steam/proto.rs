@@ -282,6 +282,35 @@ pub struct ClientChangeStatus {
     pub is_client_idle: Option<bool>,
 }
 
+/// Asks to become friends with somebody, or accepts their request: Steam
+/// treats the two as one thing, and which it is depends on whether they have
+/// already asked. Exactly one of the fields is given.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientAddFriend {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_to_add: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub accountname_or_email_to_add: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientAddFriendResponse {
+    /// Absent means 2 (fail), as everywhere in Steam's definitions.
+    #[prost(int32, optional, tag = "1")]
+    pub eresult: Option<i32>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steam_id_added: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub persona_name_added: Option<String>,
+}
+
+/// Ends a friendship, withdraws a request we made, or declines one made to us.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientRemoveFriend {
+    #[prost(fixed64, optional, tag = "1")]
+    pub friendid: Option<u64>,
+}
+
 // --- messages --------------------------------------------------------------
 
 /// A friend typing, or the older route for a message; messages themselves
@@ -592,6 +621,7 @@ mod tests {
                 Header, Multi, IpAddress, ClientHello, ClientHeartBeat, ClientLogon, ClientLogonResponse,
                 ClientLogOff, ClientLoggedOff, ClientAccountInfo, FriendsListEntry, ClientFriendsList,
                 KeyValue, PersonaFriend, ClientPersonaState, ClientRequestFriendData, ClientChangeStatus,
+                ClientAddFriend, ClientAddFriendResponse, ClientRemoveFriend,
                 ClientFriendMsg, ClientFriendMsgIncoming, FriendMessagesSendRequest,
                 FriendMessagesSendResponse, FriendMessagesIncoming, GetPasswordRsaPublicKeyRequest,
                 GetPasswordRsaPublicKeyResponse, DeviceDetails, AllowedConfirmation,
@@ -602,7 +632,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 36, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 39, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

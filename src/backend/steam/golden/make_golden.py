@@ -91,6 +91,9 @@ CASES = {
     "ClientChangeStatus": (friends.CMsgClientChangeStatus, dict(
         persona_state=7, player_name="Some One", is_auto_generated_name=True, high_priority=True,
         persona_set_by_user=True, persona_state_flags=1, need_persona_response=True, is_client_idle=True)),
+    "ClientAddFriend": (friends.CMsgClientAddFriend, dict(steamid_to_add=ID, accountname_or_email_to_add="someone")),
+    "ClientAddFriendResponse": (friends.CMsgClientAddFriendResponse, dict(eresult=29, steam_id_added=ID2, persona_name_added="Some One")),
+    "ClientRemoveFriend": (friends.CMsgClientRemoveFriend, dict(friendid=ID)),
     "ClientFriendMsg": (friends.CMsgClientFriendMsg, dict(
         steamid=ID, chat_entry_type=2, message=b"typing", rtime32_server_timestamp=1790000001, echo_to_sender=True)),
     "ClientFriendMsgIncoming": (friends.CMsgClientFriendMsgIncoming, dict(
