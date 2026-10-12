@@ -16,7 +16,7 @@
 //!
 //! and the window answers a code with `submitSteamGuardCode`.
 
-use super::auth::{self, Begun, Guard, Kind};
+use super::auth::{self, Begun, Guard};
 use super::connect;
 use super::link::{self, Identity};
 use super::proto::ClientHello;
@@ -81,7 +81,7 @@ pub fn guard_for_code(begun: &Begun) -> Option<Guard> {
 }
 
 /// Starts a sign-in. Answers at once; the rest is events.
-pub fn start(state: AppState, login_id: String, username: String, password: String, kind: Kind) {
+pub fn start(state: AppState, login_id: String, username: String, password: String) {
     let (code_tx, code_rx) = mpsc::unbounded_channel();
     waiting().lock().unwrap().insert(login_id.clone(), code_tx);
     tokio::spawn(async move {
@@ -89,7 +89,7 @@ pub fn start(state: AppState, login_id: String, username: String, password: Stri
             let key = crate::net::route::pending_key("steam");
             let servers = cm::discover(&key, 0).await?;
             let urls: Vec<String> = servers.iter().take(4).map(|s| s.url()).collect();
-            flow(&state, &login_id, &username, &password, kind, &urls, code_rx).await
+            flow(&state, &login_id, &username, &password, &urls, code_rx).await
         }
         .await;
         waiting().lock().unwrap().remove(&login_id);
@@ -123,7 +123,6 @@ pub async fn flow(
     login_id: &str,
     username: &str,
     password: &str,
-    kind: Kind,
     urls: &[String],
     mut codes: mpsc::UnboundedReceiver<String>,
 ) -> Result<Option<SteamAccountConfig>> {
@@ -150,7 +149,7 @@ pub async fn flow(
     link.send(emsg::CLIENT_HELLO, &ClientHello { protocol_version: Some(connect::PROTOCOL_VERSION) })?;
 
     status("signing in");
-    let mut begun = auth::begin(&link, &username, password, None, kind).await.map_err(|e| anyhow!("{e}"))?;
+    let mut begun = auth::begin(&link, &username, password, None).await.map_err(|e| anyhow!("{e}"))?;
     let steamid = begun.steamid;
 
     let options = options_of(&begun);
@@ -192,7 +191,8 @@ pub async fn flow(
         display_name: None,
         refresh_token: tokens.refresh_token,
         guard_data: tokens.guard_data,
-        session: kind.name().to_string(),
+        // Always the mobile chat session; kept so older files still read.
+        session: "chat".to_string(),
         use_tor: crate::net::route::router().wanted(&key),
         strict_route: false,
     };
@@ -331,7 +331,7 @@ mod tests {
 
         let task = tokio::spawn({
             let state = state.clone();
-            async move { flow(&state, "login-1", " Someone ", "hunter2", Kind::Chat, &[url], code_rx).await }
+            async move { flow(&state, "login-1", " Someone ", "hunter2", &[url], code_rx).await }
         });
 
         // Steam asks, offering the authenticator and a phone approval.
@@ -379,7 +379,7 @@ mod tests {
         }))
         .await;
         let (_tx, rx) = mpsc::unbounded_channel();
-        let err = flow(&state, "login-2", "someone", "wrong", Kind::Chat, &[url], rx).await.unwrap_err();
+        let err = flow(&state, "login-2", "someone", "wrong", &[url], rx).await.unwrap_err();
         assert!(err.to_string().contains("password"), "{err:#}");
         assert!(state.accounts.get_steam("steam:someone").is_none(), "nothing is saved for a sign-in that failed");
     }
@@ -388,11 +388,11 @@ mod tests {
     async fn an_empty_form_and_an_unreachable_steam_are_said_plainly() {
         let state = simulated_daemon("steam-login-bad");
         let (_tx, rx) = mpsc::unbounded_channel();
-        assert!(flow(&state, "l", "", "x", Kind::Chat, &[], rx).await.unwrap_err().to_string().contains("account name"));
+        assert!(flow(&state, "l", "", "x", &[], rx).await.unwrap_err().to_string().contains("account name"));
         let (_tx, rx) = mpsc::unbounded_channel();
-        assert!(flow(&state, "l", "x", "", Kind::Chat, &[], rx).await.unwrap_err().to_string().contains("password"));
+        assert!(flow(&state, "l", "x", "", &[], rx).await.unwrap_err().to_string().contains("password"));
         let (_tx, rx) = mpsc::unbounded_channel();
-        let err = flow(&state, "l", "someone", "x", Kind::Chat, &["ws://127.0.0.1:1".to_string()], rx).await.unwrap_err();
+        let err = flow(&state, "l", "someone", "x", &["ws://127.0.0.1:1".to_string()], rx).await.unwrap_err();
         assert!(format!("{err:#}").contains("reaching Steam"), "{err:#}");
     }
 
@@ -404,7 +404,7 @@ mod tests {
         let (code_tx, code_rx) = mpsc::unbounded_channel();
         let task = tokio::spawn({
             let state = state.clone();
-            async move { flow(&state, "login-3", "someone", "x", Kind::Chat, &[url], code_rx).await }
+            async move { flow(&state, "login-3", "someone", "x", &[url], code_rx).await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         drop(code_tx);

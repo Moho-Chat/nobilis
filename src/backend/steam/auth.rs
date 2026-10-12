@@ -27,59 +27,19 @@ use base64::Engine;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
 use std::time::Duration;
 
-/// What kind of session to ask Steam for.
+/// What moho signs in as: the Steam mobile app's chat session.
 ///
-/// The kind is part of the token Steam issues, and decides how Steam treats
-/// the connection that uses it. Signing in as the desktop client makes this
-/// the account's client session, and Steam allows one: the desktop client on
-/// the same account is signed out when this one arrives, and the reverse. The
-/// chat session is what the Steam mobile app's chat uses - chat and friends
-/// only, and it lives beside the desktop client.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Kind {
-    Chat,
-    Client,
-}
-
-impl Kind {
-    pub fn parse(text: &str) -> Kind {
-        if text.trim().eq_ignore_ascii_case("client") {
-            Kind::Client
-        } else {
-            Kind::Chat
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Kind::Chat => "chat",
-            Kind::Client => "client",
-        }
-    }
-
-    /// `EAuthTokenPlatformType`: 1 the desktop client, 3 the mobile app.
-    fn platform_type(self) -> i32 {
-        match self {
-            Kind::Chat => 3,
-            Kind::Client => 1,
-        }
-    }
-
-    /// `EAuthTokenAppType`: 2 is the mobile chat app. Unset for the client.
-    fn app_type(self) -> Option<i32> {
-        match self {
-            Kind::Chat => Some(2),
-            Kind::Client => None,
-        }
-    }
-
-    fn website_id(self) -> &'static str {
-        match self {
-            Kind::Chat => "Mobile",
-            Kind::Client => "Client",
-        }
-    }
-}
+/// This is part of the token Steam issues and decides how Steam treats the
+/// connection that uses it. The desktop client's session is one per account,
+/// so signing in as it would sign the Steam launcher out (and the reverse).
+/// The mobile chat session is chat and friends only, and lives beside the
+/// launcher. It is the only kind moho offers.
+///
+/// `EAuthTokenPlatformType` 3 is the mobile app.
+const PLATFORM_TYPE: i32 = 3;
+/// `EAuthTokenAppType` 2 is the mobile chat app.
+const APP_TYPE: i32 = 2;
+const WEBSITE_ID: &str = "Mobile";
 
 /// `EOSType` as the connection reports it: Linux 6.x is -184 and Windows 10
 /// is 16, sent as the unsigned number the field is.
@@ -190,12 +150,12 @@ pub fn device_name() -> String {
     }
 }
 
-fn device_details(kind: Kind) -> DeviceDetails {
+fn device_details() -> DeviceDetails {
     DeviceDetails {
         device_friendly_name: Some(device_name()),
-        platform_type: Some(kind.platform_type()),
+        platform_type: Some(PLATFORM_TYPE),
         os_type: Some(os_type() as i32),
-        app_type: kind.app_type(),
+        app_type: Some(APP_TYPE),
         ..DeviceDetails::default()
     }
 }
@@ -212,7 +172,7 @@ fn poll_interval(asked: Option<f32>) -> Duration {
 ///
 /// `guard_data` is what a previous sign-in on this machine was given to
 /// remember it by, if there was one.
-pub async fn begin(link: &Link, account_name: &str, password: &str, guard_data: Option<&str>, kind: Kind) -> Result<Begun, CallError> {
+pub async fn begin(link: &Link, account_name: &str, password: &str, guard_data: Option<&str>) -> Result<Begun, CallError> {
     let key: GetPasswordRsaPublicKeyResponse = link
         .call("Authentication.GetPasswordRSAPublicKey#1", &GetPasswordRsaPublicKeyRequest { account_name: Some(account_name.to_string()) }, false)
         .await?;
@@ -225,11 +185,11 @@ pub async fn begin(link: &Link, account_name: &str, password: &str, guard_data: 
         encrypted_password: Some(encrypted),
         encryption_timestamp: key.timestamp,
         remember_login: Some(true),
-        platform_type: Some(kind.platform_type()),
+        platform_type: Some(PLATFORM_TYPE),
         // Persistent: a token that outlives this run, which is the point.
         persistence: Some(1),
-        website_id: Some(kind.website_id().to_string()),
-        device_details: Some(device_details(kind)),
+        website_id: Some(WEBSITE_ID.to_string()),
+        device_details: Some(device_details()),
         guard_data: guard_data.filter(|g| !g.is_empty()).map(str::to_string),
         ..BeginAuthViaCredentialsRequest::default()
     };
@@ -333,10 +293,6 @@ mod tests {
         assert_eq!(Guard::EmailCode.code_type(), Some(2));
         assert_eq!(Guard::DeviceConfirmation.code_type(), None, "an approval takes no code");
         assert_eq!(Guard::from_wire(99), Guard::Other(99));
-        assert_eq!(Kind::parse("client"), Kind::Client);
-        assert_eq!(Kind::parse("Client "), Kind::Client);
-        assert_eq!(Kind::parse(""), Kind::Chat);
-        assert_eq!(Kind::parse("anything else"), Kind::Chat, "unknown means the safe one");
     }
 
     /// A Steam that wants a code from the authenticator, then issues tokens.
@@ -391,7 +347,7 @@ mod tests {
         let url = serve(steam_with_guard(&private, n, e, seen.clone())).await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
 
-        let mut begun = begin(&link, "someone", "hunter2", Some("old-guard"), Kind::Chat).await.unwrap();
+        let mut begun = begin(&link, "someone", "hunter2", Some("old-guard")).await.unwrap();
         assert_eq!(begun.steamid, 76561197960287930);
         assert_eq!(begun.interval, Duration::from_millis(500));
         assert_eq!(begun.confirmations[0].guard, Guard::DeviceCode);
@@ -425,7 +381,7 @@ mod tests {
         assert_eq!(begin_req.encryption_timestamp, Some(1790000005000));
         assert_eq!(begin_req.persistence, Some(1));
         assert_eq!(begin_req.guard_data.as_deref(), Some("old-guard"));
-        assert_eq!(begin_req.platform_type, Some(3), "a chat session asks for the mobile kind");
+        assert_eq!(begin_req.platform_type, Some(3), "it signs in as the mobile app, never as the desktop client");
         assert_eq!(begin_req.device_details.unwrap().app_type, Some(2));
         assert!(!begin_req.encrypted_password.unwrap().contains("hunter2"));
 
@@ -436,20 +392,6 @@ mod tests {
 
         let poll_req = PollAuthSessionRequest::decode(seen[3].body.as_slice()).unwrap();
         assert_eq!((poll_req.client_id, poll_req.request_id), (Some(1234), Some(vec![9, 8, 7])));
-    }
-
-    #[tokio::test]
-    async fn a_client_session_asks_for_the_desktop_kind() {
-        let (private, n, e) = keypair();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let url = serve(steam_with_guard(&private, n, e, seen.clone())).await;
-        let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        begin(&link, "someone", "x", None, Kind::Client).await.unwrap();
-        let req = BeginAuthViaCredentialsRequest::decode(seen.lock().unwrap()[1].body.as_slice()).unwrap();
-        assert_eq!(req.platform_type, Some(1));
-        assert_eq!(req.website_id.as_deref(), Some("Client"));
-        assert_eq!(req.device_details.unwrap().app_type, None);
-        assert_eq!(req.guard_data, None);
     }
 
     #[tokio::test]
@@ -465,7 +407,7 @@ mod tests {
         }))
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        let err = begin(&link, "someone", "wrong", None, Kind::Chat).await.unwrap_err();
+        let err = begin(&link, "someone", "wrong", None).await.unwrap_err();
         assert!(matches!(err, CallError::Refused(5, _)), "{err:?}");
         assert!(err.to_string().contains("password"));
 
@@ -498,7 +440,7 @@ mod tests {
         }))
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        assert!(begin(&link, "someone", "x", None, Kind::Chat).await.unwrap().needs_nothing());
+        assert!(begin(&link, "someone", "x", None).await.unwrap().needs_nothing());
     }
 
     #[test]

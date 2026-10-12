@@ -390,9 +390,9 @@ pub struct SteamAccountConfig {
     /// sign-in so Steam Guard does not ask for a code every time.
     #[serde(default)]
     pub guard_data: Option<String>,
-    /// Which kind of session this account signed in as: `chat`, which lives
-    /// beside the Steam desktop client, or `client`, which replaces it. See
-    /// backend/steam/auth.rs `Kind`.
+    /// Which kind of session this account signed in as. Always `chat`, the
+    /// mobile app's, which lives beside the Steam launcher; kept so files
+    /// written when the desktop kind could still be chosen read the same.
     #[serde(default)]
     pub session: String,
     /// Whether this account's connections go through Tor or the SOCKS5 proxy

@@ -3962,9 +3962,8 @@ pub async fn dispatch(
             let (Some(username), Some(password)) = (p_str_opt(params, "username"), p_str_opt(params, "password")) else {
                 return (None, Some("addSteamAccount requires \"username\" and \"password\"".to_string()));
             };
-            let kind = backend::steam::auth::Kind::parse(p_str(params, "session", "chat"));
             let login_id = format!("steam-{}", crate::model::next_message_id());
-            backend::steam::login::start(state.clone(), login_id.clone(), username.to_string(), password.to_string(), kind);
+            backend::steam::login::start(state.clone(), login_id.clone(), username.to_string(), password.to_string());
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
