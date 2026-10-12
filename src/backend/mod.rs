@@ -15,3 +15,4 @@ pub mod irc;
 pub mod kick;
 pub mod matrix;
 pub mod sneedchat;
+pub mod steam;
