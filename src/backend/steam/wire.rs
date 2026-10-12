@@ -36,6 +36,10 @@ pub mod emsg {
     pub const MULTI: u32 = 1;
     #[cfg(test)]
     pub const SERVICE_METHOD_RESPONSE: u32 = 147;
+    /// What the server sends the client unprompted: a notification such as
+    /// `FriendMessagesClient.IncomingMessage#1`. 152 is the same shape and is
+    /// accepted wherever this is, since both are seen.
+    pub const SERVICE_METHOD: u32 = 146;
     pub const SERVICE_METHOD_CALL_FROM_CLIENT: u32 = 151;
     pub const SERVICE_METHOD_SEND_TO_CLIENT: u32 = 152;
     pub const CLIENT_HEART_BEAT: u32 = 703;

@@ -65,7 +65,8 @@ pub fn sign_off(link: link::Link) {
 pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
     let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
-    let (id, sent_at) = chat::send(&link, &recipient, body).await?;
+    let (id, sent_at) = chat::send(&link, &recipient, body).await.inspect_err(|why| tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id))?;
+    tracing::info!("steam[{}]: sent a message to {recipient} as {id}", buffer.account_id);
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
     state.runtime.record_message_at(
         state,

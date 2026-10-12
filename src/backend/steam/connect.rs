@@ -362,7 +362,7 @@ impl Drive<'_> {
                     _ => Ending::Closed,
                 });
             }
-            emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet.header.target_job_name.as_deref() {
+            emsg::SERVICE_METHOD | emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet.header.target_job_name.as_deref() {
                 Some("FriendMessagesClient.IncomingMessage#1") => {
                     if let Some(incoming) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| chat::read_incoming(&n)) {
                         let own_name = self.state.runtime.own_identity(self.account_id).unwrap_or_default();
@@ -372,9 +372,9 @@ impl Drive<'_> {
                         }
                     }
                 }
-                other => tracing::debug!("steam[{}]: a notification this client does not use: {other:?}", self.account_id),
+                other => tracing::info!("steam[{}]: a notification this client does not use: {other:?}", self.account_id),
             },
-            other => tracing::trace!("steam[{}]: message {other}", self.account_id),
+            other => tracing::debug!("steam[{}]: message {other}", self.account_id),
         }
         None
     }
@@ -419,8 +419,12 @@ mod tests {
     }
 
     fn incoming(from: u32, text: &str, ts: u32, ordinal: u32, echo: bool) -> Packet {
+        incoming_as(emsg::SERVICE_METHOD, from, text, ts, ordinal, echo)
+    }
+
+    fn incoming_as(kind: u32, from: u32, text: &str, ts: u32, ordinal: u32, echo: bool) -> Packet {
         Packet::new(
-            emsg::SERVICE_METHOD_SEND_TO_CLIENT,
+            kind,
             Header { target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()), ..Header::default() },
             FriendMessagesIncoming {
                 steamid_friend: Some(steamid::steamid_of(from)),
@@ -567,7 +571,7 @@ mod tests {
                             tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
                             tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
                             incoming(STRANGER, "do I know you", 1790000001, 0, false),
-                            incoming(FRIEND, "sent from my phone", 1790000002, 0, true),
+                            incoming_as(emsg::SERVICE_METHOD_SEND_TO_CLIENT, FRIEND, "sent from my phone", 1790000002, 0, true),
                             // The same message again, as a replay would send it.
                             incoming(FRIEND, "sent from my phone", 1790000002, 0, true),
                         ])
