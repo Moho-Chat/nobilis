@@ -130,7 +130,13 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u
         low_priority: Some(false),
         client_message_id: Some(client_message_id()),
     };
-    let response: FriendMessagesSendResponse = link.call("FriendMessages.SendMessage#1", &request, true).await.map_err(|e| refusal(&e))?;
+    let response: FriendMessagesSendResponse = link
+        .call("FriendMessages.SendMessage#1", &request, true)
+        .await
+        .map_err(|e| {
+            tracing::info!("steam: SendMessage was answered with {e:?}");
+            refusal(&e)
+        })?;
     let timestamp = response.server_timestamp.unwrap_or_default();
     Ok((message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp))
 }
@@ -138,13 +144,27 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u
 /// A fresh name for one send, so that sending it twice cannot say it twice.
 fn client_message_id() -> String {
     use rand::Rng;
-    let n: u128 = rand::thread_rng().gen();
-    format!("{n:032x}")
+    // Sixteen hex digits, as Steam's own client makes them.
+    let n: u64 = rand::thread_rng().gen();
+    format!("{n:016x}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Steam refuses a message whose id is the wrong shape - as "not an
+    /// account", which says nothing of the id - and the shape that is accepted
+    /// is what its own client makes: sixteen hex digits. Found against a live
+    /// account, where thirty-two were refused and sixteen sent.
+    #[test]
+    fn a_message_id_is_sixteen_hex_digits_and_not_the_same_twice() {
+        let a = client_message_id();
+        let b = client_message_id();
+        assert_eq!(a.len(), 16);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
     use crate::backend::kick::testkit::simulated_daemon;
     use crate::backend::steam::friends::REL_FRIEND;
     use crate::backend::steam::link::{self, fake::*};
@@ -289,7 +309,7 @@ mod tests {
         assert_eq!(body.steamid, Some(76561197960265729));
         assert_eq!(body.message.as_deref(), Some("hi [b]there[/b]"), "trailing space is dropped, brackets are left alone");
         assert_eq!((body.chat_entry_type, body.contains_bbcode), (Some(1), Some(false)));
-        assert_eq!(body.client_message_id.as_deref().map(str::len), Some(32));
+        assert_eq!(body.client_message_id.as_deref().map(str::len), Some(16));
     }
 
     #[tokio::test]
