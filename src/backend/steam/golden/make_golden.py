@@ -106,6 +106,23 @@ CASES = {
     "FriendMessagesIncoming": (fmsg.CFriendMessages_IncomingMessage_Notification, dict(
         steamid_friend=ID, chat_entry_type=1, from_limited_account=True, message="yo", rtime32_server_timestamp=1790000004,
         ordinal=3, local_echo=True, message_no_bbcode="yo", low_priority=True)),
+    "GetRecentMessagesRequest": (fmsg.CFriendMessages_GetRecentMessages_Request, dict(
+        steamid1=ID, steamid2=ID2, count=50, most_recent_conversation=True, rtime32_start_time=1700000000,
+        bbcode_format=True, start_ordinal=3, time_last=1790000000, ordinal_last=4)),
+    "PastReaction": (fmsg.CFriendMessages_GetRecentMessages_Response.FriendMessage.MessageReaction, dict(reaction_type=1, reaction=":steamhappy:", reactors=[22202, 100])),
+    "PastMessage": (fmsg.CFriendMessages_GetRecentMessages_Response.FriendMessage, dict(
+        accountid=22202, timestamp=1790000005, message="from the past", ordinal=2,
+        reactions=[dict(reaction_type=1, reaction=":steamhappy:", reactors=[100])])),
+    "GetRecentMessagesResponse": (fmsg.CFriendMessages_GetRecentMessages_Response, dict(
+        messages=[dict(accountid=22202, timestamp=1790000005, message="a", ordinal=1), dict(accountid=100, timestamp=1790000006, message="b", ordinal=0)],
+        more_available=True)),
+    "GetActiveSessionsRequest": (fmsg.CFriendsMessages_GetActiveMessageSessions_Request, dict(lastmessage_since=1790000000, only_sessions_with_messages=True)),
+    "MessageSession": (fmsg.CFriendsMessages_GetActiveMessageSessions_Response.FriendMessageSession, dict(
+        accountid_friend=100, last_message=1790000007, last_view=1790000003, unread_message_count=4, notices=[1])),
+    "GetActiveSessionsResponse": (fmsg.CFriendsMessages_GetActiveMessageSessions_Response, dict(
+        message_sessions=[dict(accountid_friend=100, last_message=1790000007, last_view=1790000003, unread_message_count=4)],
+        timestamp=1790000008)),
+    "AckMessage": (fmsg.CFriendMessages_AckMessage_Notification, dict(steamid_partner=ID, timestamp=1790000009)),
     "GetPasswordRsaPublicKeyRequest": (auth.CAuthentication_GetPasswordRSAPublicKey_Request, dict(account_name="someone")),
     "GetPasswordRsaPublicKeyResponse": (auth.CAuthentication_GetPasswordRSAPublicKey_Response, dict(
         publickey_mod="C0FFEE" * 8, publickey_exp="010001", timestamp=1790000005000)),

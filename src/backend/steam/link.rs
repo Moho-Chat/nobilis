@@ -223,6 +223,16 @@ impl Link {
         self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
     }
 
+    /// A service method that is said and not answered: Steam's `SendNotification`,
+    /// as against a call. Nothing waits for anything.
+    pub fn notify<Q: Message>(&self, method: &str, request: &Q) -> Result<(), CallError> {
+        let mut header = self.header(true);
+        header.target_job_name = Some(method.to_string());
+        header.realm = Some(1);
+        let packet = Packet::new(emsg::SERVICE_METHOD_CALL_FROM_CLIENT, header, request.encode_to_vec());
+        self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
+    }
+
     /// A question to Steam in one of its older messages, and the answer.
     ///
     /// These are not service methods: there is no method name, and the

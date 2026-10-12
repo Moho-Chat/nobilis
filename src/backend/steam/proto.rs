@@ -396,6 +396,107 @@ pub struct FriendMessagesIncoming {
     pub low_priority: Option<bool>,
 }
 
+// --- history and what has been read ---------------------------------------
+
+/// Asks for a stretch of a conversation, newest first. `time_last` and
+/// `ordinal_last` bound it from above: what is asked for is older than that.
+#[derive(Clone, PartialEq, Message)]
+pub struct GetRecentMessagesRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid1: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid2: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub count: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub most_recent_conversation: Option<bool>,
+    #[prost(fixed32, optional, tag = "5")]
+    pub rtime32_start_time: Option<u32>,
+    #[prost(bool, optional, tag = "6")]
+    pub bbcode_format: Option<bool>,
+    #[prost(uint32, optional, tag = "7")]
+    pub start_ordinal: Option<u32>,
+    #[prost(uint32, optional, tag = "8")]
+    pub time_last: Option<u32>,
+    #[prost(uint32, optional, tag = "9")]
+    pub ordinal_last: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PastReaction {
+    #[prost(int32, optional, tag = "1")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub reaction: Option<String>,
+    #[prost(uint32, repeated, packed = "false", tag = "3")]
+    pub reactors: Vec<u32>,
+}
+
+/// One message out of the history, by account number rather than 64-bit id.
+#[derive(Clone, PartialEq, Message)]
+pub struct PastMessage {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub timestamp: Option<u32>,
+    #[prost(string, optional, tag = "3")]
+    pub message: Option<String>,
+    #[prost(uint32, optional, tag = "4")]
+    pub ordinal: Option<u32>,
+    #[prost(message, repeated, tag = "5")]
+    pub reactions: Vec<PastReaction>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetRecentMessagesResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub messages: Vec<PastMessage>,
+    #[prost(bool, optional, tag = "4")]
+    pub more_available: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetActiveSessionsRequest {
+    #[prost(uint32, optional, tag = "1")]
+    pub lastmessage_since: Option<u32>,
+    #[prost(bool, optional, tag = "2")]
+    pub only_sessions_with_messages: Option<bool>,
+}
+
+/// What Steam keeps of one conversation: when it last had a message, when it
+/// was last looked at, and how many have come since.
+#[derive(Clone, PartialEq, Message)]
+pub struct MessageSession {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid_friend: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub last_message: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub last_view: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub unread_message_count: Option<u32>,
+    #[prost(int32, repeated, packed = "false", tag = "5")]
+    pub notices: Vec<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetActiveSessionsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub message_sessions: Vec<MessageSession>,
+    #[prost(uint32, optional, tag = "2")]
+    pub timestamp: Option<u32>,
+}
+
+/// Says a conversation has been read up to a moment. Sent to Steam when it is
+/// read here, and sent by Steam (as an echo) when it is read anywhere else.
+#[derive(Clone, PartialEq, Message)]
+pub struct AckMessage {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_partner: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub timestamp: Option<u32>,
+}
+
 // --- signing in ------------------------------------------------------------
 
 #[derive(Clone, PartialEq, Message)]
@@ -629,10 +730,12 @@ mod tests {
                 BeginAuthViaQrResponse, PollAuthSessionRequest, PollAuthSessionResponse,
                 UpdateAuthWithGuardCodeRequest, UpdateAuthWithGuardCodeResponse,
                 GenerateAccessTokenRequest, GenerateAccessTokenResponse,
+                GetRecentMessagesRequest, PastReaction, PastMessage, GetRecentMessagesResponse,
+                GetActiveSessionsRequest, MessageSession, GetActiveSessionsResponse, AckMessage,
             );
             seen += 1;
         }
-        assert_eq!(seen, 39, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 47, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

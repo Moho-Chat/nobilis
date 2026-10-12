@@ -60,6 +60,11 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
     Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false) })
 }
 
+/// Who is typing to us, from a notification that says so.
+pub fn read_typing(n: &FriendMessagesIncoming) -> Option<u32> {
+    (n.chat_entry_type == Some(TYPING) && n.local_echo != Some(true)).then_some(n.steamid_friend).flatten().and_then(steamid::account_of)
+}
+
 /// Puts a message in the conversation it belongs to, starting the
 /// conversation if this is the first word from somebody.
 ///
@@ -141,6 +146,21 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u
     Ok((message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp))
 }
 
+/// What a typing notice is, in `chat_entry_type`.
+pub const TYPING: i32 = 2;
+
+/// Tells somebody we are writing to them. A message of the other kind with no
+/// text, which is how Steam's own client says it; sent without waiting, since
+/// nothing depends on it arriving.
+pub fn send_typing(link: &Link, recipient: &str) {
+    let Some(steamid) = recipient.parse::<u64>().ok().filter(|id| steamid::account_of(*id).is_some()) else { return };
+    let link = link.clone();
+    tokio::spawn(async move {
+        let request = FriendMessagesSendRequest { steamid: Some(steamid), chat_entry_type: Some(TYPING), ..Default::default() };
+        let _: Result<FriendMessagesSendResponse, _> = link.call("FriendMessages.SendMessage#1", &request, true).await;
+    });
+}
+
 /// A fresh name for one send, so that sending it twice cannot say it twice.
 fn client_message_id() -> String {
     use rand::Rng;
@@ -152,6 +172,44 @@ fn client_message_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn typing_is_a_message_of_the_other_kind_with_no_words_and_not_a_message() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = serve({
+            let seen = seen.clone();
+            Box::new(move |p| {
+                seen.lock().unwrap().push(p.clone());
+                Some(vec![answer(&p, 1, FriendMessagesSendResponse::default().encode_to_vec())])
+            })
+        })
+        .await;
+        let (link, _told) = link::open_with("test", &url, Duration::from_secs(5)).await.unwrap();
+        send_typing(&link, "76561197960265729");
+        // Nothing to send to when it is not somebody's id.
+        send_typing(&link, "not an id");
+        for _ in 0..100 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].header.target_job_name.as_deref(), Some("FriendMessages.SendMessage#1"));
+        let body = FriendMessagesSendRequest::decode(seen[0].body.as_slice()).unwrap();
+        assert_eq!((body.steamid, body.chat_entry_type, body.message), (Some(76561197960265729), Some(2), None));
+    }
+
+    #[test]
+    fn somebody_typing_is_told_from_a_message_and_from_ourselves_elsewhere() {
+        let from = |kind, echo| FriendMessagesIncoming { steamid_friend: Some(steamid::steamid_of(7)), chat_entry_type: Some(kind), local_echo: Some(echo), ..Default::default() };
+        assert_eq!(read_typing(&from(2, false)), Some(7));
+        assert_eq!(read_typing(&from(1, false)), None, "a message is not typing");
+        assert_eq!(read_typing(&from(2, true)), None, "our own typing, from another client, is not somebody else's");
+        assert_eq!(read_typing(&FriendMessagesIncoming { chat_entry_type: Some(2), ..Default::default() }), None, "from nobody");
+    }
 
     /// Steam refuses a message whose id is the wrong shape - as "not an
     /// account", which says nothing of the id - and the shape that is accepted
@@ -169,6 +227,7 @@ mod tests {
     use crate::backend::steam::friends::REL_FRIEND;
     use crate::backend::steam::link::{self, fake::*};
     use crate::backend::steam::wire::emsg;
+    use std::time::Duration;
     use prost::Message;
 
     const ACCOUNT: &str = "steam:tester";

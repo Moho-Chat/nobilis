@@ -31,6 +31,7 @@ pub mod connect;
 pub mod eresult;
 pub mod friends;
 pub mod friendship;
+pub mod history;
 pub mod link;
 pub mod login;
 pub mod presence;

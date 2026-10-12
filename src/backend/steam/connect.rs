@@ -53,6 +53,14 @@ const PERSONA_FIELDS: u32 = 1 | 2 | 16 | 64 | 256 | 4096;
 
 /// How many people to ask about in one message.
 const ASK_ABOUT_AT_A_TIME: usize = 200;
+/// How long after the friends list to read what was missed.
+pub(super) static CATCH_UP_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4000);
+/// How many times a catch-up that found conversations not yet named is tried again.
+const CATCH_UP_RETRIES: u32 = 4;
+/// The most that reading what was missed may hold up the connection for.
+const CATCH_UP_FOR: Duration = Duration::from_secs(20);
+/// How long a notice that somebody is typing holds.
+const TYPING_FOR: Duration = Duration::from_secs(10);
 
 /// How a connection ended, and what follows.
 #[derive(Debug, PartialEq)]
@@ -120,6 +128,11 @@ pub fn logon_message(config: &SteamAccountConfig, language: &str) -> ClientLogon
         access_token: Some(config.refresh_token.clone()),
         ..ClientLogon::default()
     }
+}
+
+/// How long after the friends list to read what was missed.
+fn catch_up_after() -> Duration {
+    Duration::from_millis(CATCH_UP_AFTER_MS.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Starts (or restarts) an account's connection.
@@ -270,6 +283,8 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         own: steamid::account_of(steamid).unwrap_or_default(),
         roster: Roster::default(),
         asked: Default::default(),
+        catch_up_at: None,
+        catch_up_tries: 0,
         shown: Conversations::new(account_id),
     }
     .run(&mut told, heartbeat)
@@ -288,6 +303,10 @@ struct Drive<'a> {
     shown: Conversations,
     /// Who has been announced as asking to be our friend.
     asked: std::collections::HashSet<u32>,
+    /// When to ask what was missed: a moment after the friends list, so their
+    /// conversations exist to put it in.
+    catch_up_at: Option<tokio::time::Instant>,
+    catch_up_tries: u32,
 }
 
 impl Drive<'_> {
@@ -296,7 +315,21 @@ impl Drive<'_> {
         let mut beat = tokio::time::interval(heartbeat);
         beat.tick().await; // the first tick is immediate
         loop {
+            let due = self.catch_up_at;
             tokio::select! {
+                _ = async { match due { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {
+                    self.catch_up_at = None;
+                    // Bounded: the connection is not heard from while this runs, and
+                    // a Steam that stops answering must not stop that for long.
+                    let unnamed = tokio::time::timeout(CATCH_UP_FOR, super::history::catch_up(self.state, self.link, self.account_id, self.own, &self.roster, &self.shown)).await.unwrap_or(0);
+                    // Conversations whose friends had not been named yet have
+                    // nowhere to be read into: a few more tries, as the names
+                    // arrive, and then they are left for opening.
+                    if unnamed > 0 && self.catch_up_tries < CATCH_UP_RETRIES {
+                        self.catch_up_tries += 1;
+                        self.catch_up_at = Some(tokio::time::Instant::now() + catch_up_after());
+                    }
+                }
                 packet = told.recv() => match packet {
                     None => return Ending::Closed,
                     Some(packet) => {
@@ -335,6 +368,12 @@ impl Drive<'_> {
                     self.ask_about(&ask);
                     self.shown.publish(self.state, &self.roster);
                     friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
+                    // Their names arrive in the next moments; what was missed is
+                    // read into conversations that have them.
+                    if !list.bincremental.unwrap_or(false) {
+                        self.catch_up_tries = 0;
+                        self.catch_up_at = Some(tokio::time::Instant::now() + catch_up_after());
+                    }
                 }
             }
             emsg::CLIENT_PERSONA_STATE => {
@@ -364,7 +403,10 @@ impl Drive<'_> {
             }
             emsg::SERVICE_METHOD | emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet.header.target_job_name.as_deref() {
                 Some("FriendMessagesClient.IncomingMessage#1") => {
-                    if let Some(incoming) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| chat::read_incoming(&n)) {
+                    tracing::debug!("steam[{}]: an incoming message notification (kind {:?})", self.account_id, FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| n.chat_entry_type));
+                    if let Some(typing) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().as_ref().and_then(chat::read_typing) {
+                        self.friend_is_typing(typing);
+                    } else if let Some(incoming) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| chat::read_incoming(&n)) {
                         let own_name = self.state.runtime.own_identity(self.account_id).unwrap_or_default();
                         let (_, stranger) = chat::record_incoming(self.state, self.account_id, &mut self.roster, &mut self.shown, &own_name, &incoming);
                         if stranger {
@@ -372,11 +414,45 @@ impl Drive<'_> {
                         }
                     }
                 }
+                // Read on another of this account's clients.
+                Some("FriendMessagesClient.NotifyAckMessageEcho#1") => {
+                    if let Ok(ack) = AckMessage::decode(packet.body.as_slice()) {
+                        self.read_elsewhere(&ack);
+                    }
+                }
                 other => tracing::info!("steam[{}]: a notification this client does not use: {other:?}", self.account_id),
             },
             other => tracing::debug!("steam[{}]: message {other}", self.account_id),
         }
         None
+    }
+
+    /// Somebody is writing to us. Said only for a conversation that exists:
+    /// anybody can send one of these, and a stranger typing should not put a
+    /// conversation on screen before they have said anything.
+    fn friend_is_typing(&self, friend: u32) {
+        let Some(name) = self.shown.name_of(friend) else { return };
+        self.state.events.emit(
+            "typing",
+            serde_json::json!({
+                "accountId": self.account_id,
+                "bufferId": crate::model::buffer_id(self.account_id, name),
+                "nicks": [name],
+                "expiresInMs": TYPING_FOR.as_millis() as u64,
+            }),
+        );
+    }
+
+    /// A conversation was read on another client: it is read here too, if what
+    /// was read is everything this log holds.
+    fn read_elsewhere(&self, ack: &AckMessage) {
+        let Some(friend) = ack.steamid_partner.and_then(steamid::account_of) else { return };
+        let Some(name) = self.shown.name_of(friend) else { return };
+        let buffer_id = crate::model::buffer_id(self.account_id, name);
+        let newest = self.state.store.get_backlog(&buffer_id, 0, 1).ok().and_then(|m| m.last().map(|m| m.ts)).unwrap_or(0);
+        if i64::from(ack.timestamp.unwrap_or(0)) >= newest {
+            self.state.events.emit("bufferRead", serde_json::json!({ "accountId": self.account_id, "bufferId": buffer_id }));
+        }
     }
 
     fn ask_about(&self, accounts: &[u32]) {
@@ -490,6 +566,7 @@ mod tests {
     }
 
     fn start(state: &AppState, url: String) -> tokio::task::JoinHandle<Result<Outcome>> {
+        CATCH_UP_AFTER_MS.store(60, std::sync::atomic::Ordering::Relaxed);
         let state = state.clone();
         tokio::spawn(async move { session(&state, &config(), ACCOUNT, &url).await })
     }
@@ -598,6 +675,117 @@ mod tests {
         task.abort();
     }
 
+    fn typing(from: u32) -> Packet {
+        Packet::new(
+            emsg::SERVICE_METHOD,
+            Header { target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()), ..Header::default() },
+            FriendMessagesIncoming { steamid_friend: Some(steamid::steamid_of(from)), chat_entry_type: Some(2), ..Default::default() }.encode_to_vec(),
+        )
+    }
+
+    fn read_echo(friend: u32, at: u32) -> Packet {
+        Packet::new(
+            emsg::SERVICE_METHOD,
+            Header { target_job_name: Some("FriendMessagesClient.NotifyAckMessageEcho#1".into()), ..Header::default() },
+            AckMessage { steamid_partner: Some(steamid::steamid_of(friend)), timestamp: Some(at) }.encode_to_vec(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_friend_typing_and_a_conversation_read_elsewhere_are_heard_and_only_when_they_mean_something() {
+        let state = simulated_daemon("steam-connect-typing");
+        let url = serve(Box::new(move |p| match p.emsg {
+            emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
+            emsg::CLIENT_CHANGE_STATUS => Some(vec![
+                tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
+                tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                typing(FRIEND),
+                // A stranger typing is not a reason to open a conversation.
+                typing(STRANGER),
+                incoming(FRIEND, "hello", 200, 0, false),
+                // Read up to before the newest: not everything, so still unread here.
+                read_echo(FRIEND, 150),
+                // Read up to the newest: read.
+                read_echo(FRIEND, 200),
+            ]),
+            _ => Some(Vec::new()),
+        }))
+        .await;
+        state.accounts.add_steam(config()).unwrap();
+        let mut rx = state.events.subscribe();
+        let task = start(&state, url);
+        let gabe = crate::model::buffer_id(ACCOUNT, "Gabe");
+        eventually("the friend's message", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let (mut typed, mut read) = (vec![], vec![]);
+        while let Ok(e) = rx.try_recv() {
+            match e.name {
+                "typing" => typed.push(e.data),
+                "bufferRead" => read.push(e.data),
+                _ => {}
+            }
+        }
+        assert_eq!(typed.len(), 1, "the friend, and not the stranger: {typed:?}");
+        assert_eq!((typed[0]["bufferId"].as_str(), typed[0]["nicks"][0].as_str()), (Some(gabe.as_str()), Some("Gabe")));
+        assert_eq!(read.len(), 1, "only the echo that reached the newest message");
+        assert_eq!(read[0]["bufferId"].as_str(), Some(gabe.as_str()));
+        assert_eq!(state.store.get_backlog(&gabe, 0, 10).unwrap().len(), 1, "typing is not a message");
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, &steamid::text_of(STRANGER))).is_none());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn what_was_missed_while_away_is_read_in_once_the_friends_are_known() {
+        let state = simulated_daemon("steam-connect-catchup");
+        let url = serve(Box::new(move |p| match p.emsg {
+            emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
+            emsg::CLIENT_CHANGE_STATUS => Some(vec![
+                tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
+                tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+            ]),
+            emsg::SERVICE_METHOD_CALL_FROM_CLIENT => {
+                let method = p.header.target_job_name.clone().unwrap_or_default();
+                let body = if method.contains("GetActiveMessageSessions") {
+                    GetActiveSessionsResponse { message_sessions: vec![MessageSession { accountid_friend: Some(FRIEND), last_message: Some(300), last_view: Some(100), unread_message_count: Some(2), notices: vec![] }], timestamp: Some(1) }.encode_to_vec()
+                } else {
+                    GetRecentMessagesResponse {
+                        messages: vec![
+                            PastMessage { accountid: Some(FRIEND), timestamp: Some(300), message: Some("second".into()), ordinal: Some(0), reactions: vec![] },
+                            PastMessage { accountid: Some(FRIEND), timestamp: Some(250), message: Some("first".into()), ordinal: Some(0), reactions: vec![] },
+                        ],
+                        more_available: Some(false),
+                    }
+                    .encode_to_vec()
+                };
+                Some(vec![answer(&p, 1, body)])
+            }
+            _ => Some(Vec::new()),
+        }))
+        .await;
+        state.accounts.add_steam(config()).unwrap();
+        // The log already holds an older message, so this conversation is one
+        // that is behind rather than one never opened.
+        let gabe = crate::model::buffer_id(ACCOUNT, "Gabe");
+        let mut rx = state.events.subscribe();
+        let task = start(&state, url);
+        eventually("the conversation to exist", || state.runtime.get_buffer(&gabe).is_some()).await;
+        let buffer = state.runtime.get_buffer(&gabe).unwrap();
+        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into() }]);
+
+        eventually("what was missed", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 3).await;
+        let texts: Vec<String> = state.store.get_backlog(&gabe, 0, 10).unwrap().into_iter().map(|m| m.body).collect();
+        assert_eq!(texts, ["before", "first", "second"]);
+        let mut news = vec![];
+        while let Ok(e) = rx.try_recv() {
+            if e.name == "message" {
+                news.push(e.data["body"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        assert!(news.contains(&"first".to_string()) && news.contains(&"second".to_string()), "unread, so announced: {news:?}");
+        task.abort();
+    }
+
     #[test]
     fn steams_heartbeat_interval_is_kept_to_something_sensible() {
         let welcomed = read_logon(&reply_logon(1, 1)).unwrap();
@@ -624,7 +812,7 @@ mod tests {
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
         link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default() };
+        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0 };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {

@@ -379,6 +379,20 @@ pub async fn dispatch(
                             backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
                         }
                     }
+                    // Steam keeps every conversation: opening one asks for its
+                    // recent end, and scrolling to the top for the part before.
+                    // Best-effort - failing to reach Steam leaves what is
+                    // stored, which is what is returned below either way.
+                    if buffer.account_id.starts_with("steam:") {
+                        let fetched = if before > 0 {
+                            backend::steam::history::older(state, &buffer, before).await
+                        } else {
+                            backend::steam::history::open(state, &buffer).await
+                        };
+                        if let Err(e) = fetched {
+                            tracing::debug!("steam history: {e}");
+                        }
+                    }
                     // Kick pages back through its own history endpoint,
                     // continuing from where the last page stopped rather than
                     // by timestamp - the endpoint is cursor-based, and asking
@@ -907,6 +921,15 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("steam:") => {
+                    // Steam has no "stopped"; it lapses by itself.
+                    if typing {
+                        if let (Some(link), Some(friend)) = (state.runtime.steam_link(&buffer.account_id), buffer.remote_id.as_deref()) {
+                            backend::steam::chat::send_typing(&link, friend);
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 // IRC says it with a client-only tag on an empty TAGMSG,
                 // and says nothing at all where the server has no
                 // message-tags to carry one - see send_typing.
@@ -1130,6 +1153,14 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // Steam keeps a read position for each conversation, and tells
+                // every other client of the account when it moves.
+                Some(buffer) if buffer.account_id.starts_with("steam:") => {
+                    if let Err(e) = backend::steam::history::mark_read(state, &buffer) {
+                        tracing::debug!("steam read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }

@@ -23,6 +23,7 @@
 //! signed out of any moho that is open, or it takes their place.
 
 use super::connect;
+use super::history::Past;
 use crate::accounts::SteamAccountConfig;
 use crate::backend::kick::testkit::simulated_daemon;
 use crate::runtime::ConnState;
@@ -89,6 +90,146 @@ async fn a_message_sent_by_one_account_is_heard_by_the_other() {
     .await;
     let sent = state.store.get_backlog(&outgoing.id, 0, 50).unwrap();
     assert!(sent.iter().any(|m| m.body == text && m.is_own), "and the sender kept its own copy");
+
+    for id in [&sender_id, &receiver_id] {
+        if let Some(link) = state.runtime.take_steam_link(id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// Paging back through a real conversation: the boundary Steam is given means
+/// "older than this", and what comes back is in order and does not repeat what
+/// was already had. Needs a conversation with at least seven messages in it.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends, with at least seven messages between them"]
+async fn history_pages_back_without_gaps_or_repeats() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-history");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).expect("a connection");
+
+    let (newest, more) = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 3).await.unwrap();
+    assert_eq!(newest.len(), 3, "the newest three");
+    assert!(more, "and Steam says there are more");
+    assert!(newest.windows(2).all(|w| (w[0].timestamp, w[0].ordinal) <= (w[1].timestamp, w[1].ordinal)), "oldest first");
+
+    let edge = (newest[0].timestamp, newest[0].ordinal);
+    let (before, _) = super::history::fetch(&link, sender.steamid, receiver.steamid, Some(edge), 3).await.unwrap();
+    println!("newest {:?}\nolder than {:?}: {:?}", newest.iter().map(Past::id).collect::<Vec<_>>(), edge, before.iter().map(Past::id).collect::<Vec<_>>());
+    assert_eq!(before.len(), 3, "the three before those");
+    assert!(before.iter().all(|p| (p.timestamp, p.ordinal) < edge), "strictly older than the boundary");
+    let ids: std::collections::HashSet<String> = newest.iter().chain(&before).map(Past::id).collect();
+    assert_eq!(ids.len(), 6, "no message twice");
+
+    // And with the ordinal left open, as scrolling up asks, the boundary's own
+    // second is included rather than skipped: what is already stored is
+    // recognised by id, so over-asking is harmless and under-asking is not.
+    let (loose, _) = super::history::fetch(&link, sender.steamid, receiver.steamid, Some((edge.0, u32::MAX)), 3).await.unwrap();
+    println!("older than ({}, MAX): {:?}", edge.0, loose.iter().map(Past::id).collect::<Vec<_>>());
+    assert!(loose.iter().all(|p| p.timestamp <= edge.0));
+
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// What reading, typing and being away do between two real accounts: a message
+/// sent while the other is signed out is there when it signs in, a notice that
+/// somebody is writing is heard, and reading tells Steam so.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; sends one real message"]
+async fn missed_messages_typing_and_reading_work_between_two_real_accounts() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-reading");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let (sender_id, receiver_id) = (sender.account_id(), receiver.account_id());
+    let conversation = |account: &str, with: u64| {
+        state.runtime.list_buffers().into_iter().find(|b| b.account_id == account && b.kind == "dm" && b.remote_id.as_deref() == Some(&with.to_string()))
+    };
+
+    // The receiver is not there when this is said.
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the sender to be signed in", || state.runtime.conn_state(&sender_id) == Some(ConnState::Connected)).await;
+    within(60, "the sender to know the receiver", || conversation(&sender_id, receiver.steamid).is_some()).await;
+    let said = format!("moho probe missed {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    crate::backend::steam::send_message(&state, &conversation(&sender_id, receiver.steamid).unwrap(), &said).await.expect("Steam takes the message");
+
+    // Now it arrives, and finds what it missed.
+    state.accounts.add_steam(receiver.clone()).unwrap();
+    let mut events = state.events.subscribe();
+    connect::spawn(state.clone(), receiver.clone());
+    within(60, "the receiver to be signed in", || state.runtime.conn_state(&receiver_id) == Some(ConnState::Connected)).await;
+    within(60, "the receiver to know the sender", || conversation(&receiver_id, sender.steamid).is_some()).await;
+    // Looked for afresh each time: a friend is called by their number until
+    // Steam says their name, and the conversation moves when it does.
+    let theirs_now = || conversation(&receiver_id, sender.steamid).expect("the conversation");
+    let has = |text: &str| state.store.get_backlog(&theirs_now().id, 0, 100).map(|m| m.iter().any(|m| m.body == text && !m.is_own)).unwrap_or(false);
+    for _ in 0..200 {
+        if has(&said) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if has(&said) {
+        println!("the missed message was caught up on at sign-in");
+    } else {
+        // Read already somewhere else (an open official client marks it so),
+        // which leaves it for the conversation to be opened.
+        let held = super::history::sessions(&state.runtime.steam_link(&receiver_id).unwrap(), 0).await.expect("the sessions");
+        let mine = held.message_sessions.iter().find(|s| s.accountid_friend == super::steamid::account_of(sender.steamid));
+        println!("not caught up at sign-in; Steam's session for it: {mine:?}; asking for it as opening the conversation does");
+        super::history::open(&state, &theirs_now()).await.expect("opening the conversation");
+        assert!(has(&said), "the message the receiver missed is in its history");
+    }
+
+    // A notice that somebody is writing.
+    while events.try_recv().is_ok() {}
+    let link = state.runtime.steam_link(&sender_id).expect("the sender's connection");
+    super::chat::send_typing(&link, &receiver.steamid.to_string());
+    let mut heard = false;
+    let mut seen = std::collections::BTreeMap::<String, usize>::new();
+    for _ in 0..100 {
+        loop {
+            match events.try_recv() {
+                Ok(e) => {
+                    *seen.entry(e.name.to_string()).or_default() += 1;
+                    if e.name == "typing" {
+                        heard |= e.data["bufferId"] == theirs_now().id.as_str();
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        if heard {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(heard, "the receiver hears that the sender is typing; events seen: {seen:?}");
+
+    // Reading is told to Steam, which then holds nothing unread for it.
+    super::history::mark_read(&state, &theirs_now()).expect("telling Steam it was read");
+    let receiving = state.runtime.steam_link(&receiver_id).expect("the receiver's connection");
+    let mut unread = u32::MAX;
+    for _ in 0..50 {
+        let answer = super::history::sessions(&receiving, 0).await.expect("the sessions");
+        unread = answer.message_sessions.iter().find(|s| s.accountid_friend == super::steamid::account_of(sender.steamid)).and_then(|s| s.unread_message_count).unwrap_or(0);
+        if unread == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(unread, 0, "Steam counts nothing unread once it has been told");
 
     for id in [&sender_id, &receiver_id] {
         if let Some(link) = state.runtime.take_steam_link(id) {
