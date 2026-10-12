@@ -52,7 +52,12 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
         return None;
     }
     let account = n.steamid_friend.and_then(steamid::account_of)?;
-    let text = n.message_no_bbcode.as_deref().filter(|t| !t.trim().is_empty()).or(n.message.as_deref()).unwrap_or_default().trim_end().to_string();
+    // The message as Steam formatted it, read into what moho draws; the plain
+    // copy only if that leaves nothing, which is a message made of tags alone.
+    let text = Some(super::bbcode::to_markup(n.message.as_deref().unwrap_or_default()))
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| n.message_no_bbcode.as_deref().map(|t| t.trim_end().to_string()))
+        .unwrap_or_default();
     if text.trim().is_empty() {
         return None;
     }
@@ -115,7 +120,7 @@ pub fn refusal(error: &CallError) -> String {
 /// `recipient` is their 64-bit id as the conversation holds it. Returns the
 /// id Steam gave the message and the second it stamped it, which the caller
 /// stores under so that an echo of it is recognised.
-pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u32), String> {
+pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<Sent, String> {
     let steamid: u64 = recipient.parse().ok().filter(|id| steamid::account_of(*id).is_some()).ok_or("this conversation is not with a Steam account")?;
     let text = text.trim_end();
     if text.trim().is_empty() {
@@ -128,9 +133,10 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u
         steamid: Some(steamid),
         chat_entry_type: Some(CHAT_MESSAGE),
         message: Some(text.to_string()),
-        // What was typed is what is said: a "[b]" somebody typed is theirs,
-        // not a request for bold. Formatting comes with its own controls.
-        contains_bbcode: Some(false),
+        // The text is BBCode, as Steam's own client sends it: the composer
+        // writes the formatting as tags and escapes any bracket somebody typed
+        // as `\[`, so a "[b]" they meant literally stays what they meant.
+        contains_bbcode: Some(true),
         echo_to_sender: Some(false),
         low_priority: Some(false),
         client_message_id: Some(client_message_id()),
@@ -142,8 +148,23 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<(String, u
             tracing::info!("steam: SendMessage was answered with {e:?}");
             refusal(&e)
         })?;
+    tracing::debug!("steam: sent {text:?}; Steam stored {:?} ({:?} without tags)", response.modified_message, response.message_without_bb_code);
     let timestamp = response.server_timestamp.unwrap_or_default();
-    Ok((message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp))
+    // What Steam stored, which is the text with its emoticons found: ":steamhappy:"
+    // comes back as a tag, and the log should hold what the other side will see.
+    let said = response.modified_message.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(text);
+    Ok(Sent { id: message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp, shown: super::bbcode::to_markup(said) })
+}
+
+/// A message that Steam took.
+#[derive(Debug)]
+pub struct Sent {
+    /// The id Steam gave it, which an echo of it is recognised by.
+    pub id: String,
+    /// The second Steam stamped it.
+    pub timestamp: u32,
+    /// What to put in the log: the message as moho draws it.
+    pub shown: String,
 }
 
 /// What a typing notice is, in `chat_entry_type`.
@@ -203,6 +224,22 @@ mod tests {
     }
 
     #[test]
+    fn an_incoming_message_is_read_from_its_tags() {
+        let said = |message: &str, plain: &str| FriendMessagesIncoming {
+            steamid_friend: Some(steamid::steamid_of(7)),
+            chat_entry_type: Some(1),
+            message: Some(message.into()),
+            message_no_bbcode: Some(plain.into()),
+            rtime32_server_timestamp: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(read_incoming(&said("look [b]here[/b] [emoticon]steamhappy[/emoticon]", "look here :steamhappy:")).unwrap().text, "look **here** [steam:emote:steamhappy]");
+        // Nothing but tags: the plain copy is what there is to show.
+        assert_eq!(read_incoming(&said("[roomeffect]x[/roomeffect]", "sends an effect")).unwrap().text, "sends an effect");
+        assert_eq!(read_incoming(&said("   ", "  ")), None, "and nothing at all is not a message");
+    }
+
+    #[test]
     fn somebody_typing_is_told_from_a_message_and_from_ourselves_elsewhere() {
         let from = |kind, echo| FriendMessagesIncoming { steamid_friend: Some(steamid::steamid_of(7)), chat_entry_type: Some(kind), local_echo: Some(echo), ..Default::default() };
         assert_eq!(read_typing(&from(2, false)), Some(7));
@@ -236,7 +273,7 @@ mod tests {
         FriendMessagesIncoming {
             steamid_friend: Some(steamid::steamid_of(friend)),
             chat_entry_type: Some(1),
-            message: Some(format!("[b]{text}[/b]")),
+            message: Some(text.to_string()),
             message_no_bbcode: Some(text.to_string()),
             rtime32_server_timestamp: Some(ts),
             ordinal: Some(ordinal),
@@ -272,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn the_text_has_its_formatting_codes_off_and_falls_back_to_the_raw_text() {
+    fn the_text_is_the_message_and_trailing_space_is_dropped() {
         assert_eq!(read_incoming(&notice(1, "plain words", 1, 0)).unwrap().text, "plain words");
         let mut raw_only = notice(1, "", 1, 0);
         raw_only.message_no_bbcode = None;
@@ -346,28 +383,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sending_names_the_recipient_says_what_was_typed_and_keeps_stamps() {
+    async fn sending_names_the_recipient_sends_the_tags_and_logs_what_steam_stored() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
         let url = serve({
             let seen = seen.clone();
             Box::new(move |req| {
                 *seen.lock().unwrap() = Some(req.clone());
-                Some(vec![answer(&req, 1, FriendMessagesSendResponse { modified_message: Some("hi".into()), server_timestamp: Some(1790000003), ordinal: Some(2), message_without_bb_code: Some("hi".into()) }.encode_to_vec())])
+                Some(vec![answer(&req, 1, FriendMessagesSendResponse { modified_message: Some("hi [b]there[/b] [emoticon]steamhappy[/emoticon]".into()), server_timestamp: Some(1790000003), ordinal: Some(2), message_without_bb_code: Some("hi there".into()) }.encode_to_vec())])
             })
         })
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
         link.set_identity(link::Identity { steamid: 76561197960287930, session: 4 });
 
-        let (id, ts) = send(&link, "76561197960265729", "hi [b]there[/b]  \n").await.unwrap();
-        assert_eq!((id.as_str(), ts), ("1790000003:2", 1790000003));
+        let sent = send(&link, "76561197960265729", "hi [b]there[/b] :steamhappy:  \n").await.unwrap();
+        assert_eq!((sent.id.as_str(), sent.timestamp), ("1790000003:2", 1790000003));
+        assert_eq!(sent.shown, "hi **there** [steam:emote:steamhappy]", "what is logged is what Steam stored, drawn as moho draws it");
         let req = seen.lock().unwrap().clone().unwrap();
         assert_eq!(req.emsg, emsg::SERVICE_METHOD_CALL_FROM_CLIENT, "as the signed-in account");
         assert_eq!(req.header.target_job_name.as_deref(), Some("FriendMessages.SendMessage#1"));
         let body = FriendMessagesSendRequest::decode(req.body.as_slice()).unwrap();
         assert_eq!(body.steamid, Some(76561197960265729));
-        assert_eq!(body.message.as_deref(), Some("hi [b]there[/b]"), "trailing space is dropped, brackets are left alone");
-        assert_eq!((body.chat_entry_type, body.contains_bbcode), (Some(1), Some(false)));
+        assert_eq!(body.message.as_deref(), Some("hi [b]there[/b] :steamhappy:"), "trailing space is dropped; the tags are sent as they came");
+        assert_eq!((body.chat_entry_type, body.contains_bbcode), (Some(1), Some(true)));
         assert_eq!(body.client_message_id.as_deref().map(str::len), Some(16));
     }
 

@@ -312,6 +312,8 @@ struct Drive<'a> {
 impl Drive<'_> {
     async fn run(mut self, told: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>, heartbeat: Duration) -> Ending {
         self.shown.adopt(self.state, self.account_id);
+        // What can be put in a message, for the picker; it arrives when it arrives.
+        tokio::spawn(super::emoticons::load(self.state.clone(), self.link.clone(), self.account_id.to_string()));
         let mut beat = tokio::time::interval(heartbeat);
         beat.tick().await; // the first tick is immediate
         loop {
@@ -403,7 +405,7 @@ impl Drive<'_> {
             }
             emsg::SERVICE_METHOD | emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet.header.target_job_name.as_deref() {
                 Some("FriendMessagesClient.IncomingMessage#1") => {
-                    tracing::debug!("steam[{}]: an incoming message notification (kind {:?})", self.account_id, FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| n.chat_entry_type));
+                    tracing::debug!("steam[{}]: an incoming message notification: {:?}", self.account_id, FriendMessagesIncoming::decode(packet.body.as_slice()).ok());
                     if let Some(typing) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().as_ref().and_then(chat::read_typing) {
                         self.friend_is_typing(typing);
                     } else if let Some(incoming) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| chat::read_incoming(&n)) {

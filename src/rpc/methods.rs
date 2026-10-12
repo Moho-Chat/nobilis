@@ -225,6 +225,17 @@ pub async fn dispatch(
                     None,
                 ),
             },
+            // Steam's emoticons are the account's, the same in every conversation.
+            Some(buffer_id) if buffer_id.starts_with("steam:") => {
+                let emoji: Vec<serde_json::Value> = state
+                    .runtime
+                    .emoji_catalogue(&channel_account(state, buffer_id))
+                    .into_iter()
+                    .flat_map(|s| s.emoji)
+                    .map(|e| serde_json::json!({ "id": e.id, "name": e.name, "animated": false, "url": e.url }))
+                    .collect();
+                (Some(serde_json::json!(emoji)), None)
+            }
             Some(buffer_id) => (Some(serde_json::json!(state.runtime.get_discord_buffer_emojis(buffer_id))), None),
         },
 

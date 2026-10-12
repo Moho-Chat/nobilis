@@ -25,9 +25,11 @@
 //! - `link` - one connection: asking it things, and hearing what it says
 
 pub mod auth;
+pub mod bbcode;
 pub mod chat;
 pub mod cm;
 pub mod connect;
+pub mod emoticons;
 pub mod eresult;
 pub mod friends;
 pub mod friendship;
@@ -68,8 +70,8 @@ pub fn sign_off(link: link::Link) {
 pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
     let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
-    let (id, sent_at) = chat::send(&link, &recipient, body).await.inspect_err(|why| tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id))?;
-    tracing::info!("steam[{}]: sent a message to {recipient} as {id}", buffer.account_id);
+    let sent = chat::send(&link, &recipient, body).await.inspect_err(|why| tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id))?;
+    tracing::info!("steam[{}]: sent a message to {recipient} as {}", buffer.account_id, sent.id);
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
     state.runtime.record_message_at(
         state,
@@ -77,17 +79,17 @@ pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body:
         &buffer.name,
         "dm",
         &own,
-        body.trim_end(),
+        &sent.shown,
         false,
         "chat",
         None,
-        Some(id),
+        Some(sent.id),
         false,
         None,
         Vec::new(),
         Vec::new(),
         None,
-        Some(i64::from(sent_at)).filter(|t| *t > 0),
+        Some(i64::from(sent.timestamp)).filter(|t| *t > 0),
         None,
         None,
     );

@@ -44,7 +44,8 @@ impl Past {
 
 fn read(message: &PastMessage) -> Option<Past> {
     let account = message.accountid.filter(|a| *a != 0)?;
-    let text = message.message.as_deref().unwrap_or_default().trim_end().to_string();
+    // Asked for with its tags, and read into what moho draws.
+    let text = super::bbcode::to_markup(message.message.as_deref().unwrap_or_default());
     if text.trim().is_empty() {
         return None;
     }
@@ -64,8 +65,7 @@ pub async fn fetch(link: &Link, own: u64, friend: u64, older_than: Option<(u32, 
         start_ordinal: Some(0),
         time_last: Some(time_last),
         ordinal_last: Some(ordinal_last),
-        // Plain text: formatting comes with its own round (BBCode).
-        bbcode_format: Some(false),
+        bbcode_format: Some(true),
         ..Default::default()
     };
     let answer: GetRecentMessagesResponse = link.call("FriendMessages.GetRecentMessages#1", &request, true).await.map_err(|e| super::chat::refusal(&e))?;

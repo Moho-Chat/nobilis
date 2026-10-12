@@ -32,6 +32,7 @@ FILES = [
     "steammessages_clientserver_friends.proto",
     "steammessages_friendmessages.steamclient.proto",
     "steammessages_auth.steamclient.proto",
+    "steammessages_player.steamclient.proto",
     # What those import.
     "steammessages_unified_base.steamclient.proto",
     "enums.proto",
@@ -46,6 +47,7 @@ login = importlib.import_module("steammessages_clientserver_login_pb2")
 friends = importlib.import_module("steammessages_clientserver_friends_pb2")
 fmsg = importlib.import_module("steammessages_friendmessages.steamclient_pb2")
 auth = importlib.import_module("steammessages_auth.steamclient_pb2")
+player = importlib.import_module("steammessages_player.steamclient_pb2")
 
 ID = 76561197960287930  # an account's 64-bit id
 ID2 = 76561197960265729
@@ -123,6 +125,11 @@ CASES = {
         message_sessions=[dict(accountid_friend=100, last_message=1790000007, last_view=1790000003, unread_message_count=4)],
         timestamp=1790000008)),
     "AckMessage": (fmsg.CFriendMessages_AckMessage_Notification, dict(steamid_partner=ID, timestamp=1790000009)),
+    "GetEmoticonListRequest": (player.CPlayer_GetEmoticonList_Request, dict()),
+    "EmoticonInfo": (player.CPlayer_GetEmoticonList_Response.Emoticon, dict(
+        name="steamhappy", count=3, time_last_used=1790000010, use_count=9, time_received=1700000000, appid=730)),
+    "GetEmoticonListResponse": (player.CPlayer_GetEmoticonList_Response, dict(
+        emoticons=[dict(name="steamhappy", count=1), dict(name="steamsad", count=2, use_count=4)])),
     "GetPasswordRsaPublicKeyRequest": (auth.CAuthentication_GetPasswordRSAPublicKey_Request, dict(account_name="someone")),
     "GetPasswordRsaPublicKeyResponse": (auth.CAuthentication_GetPasswordRSAPublicKey_Response, dict(
         publickey_mod="C0FFEE" * 8, publickey_exp="010001", timestamp=1790000005000)),

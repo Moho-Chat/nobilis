@@ -238,3 +238,104 @@ async fn missed_messages_typing_and_reading_work_between_two_real_accounts() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Formatting and emoticons through the real thing: what is written as tags
+/// comes out the other side as what moho draws, and the account's emoticons
+/// are known.
+#[tokio::test]
+#[ignore = "needs two real Steam accounts that are friends; sends one real message"]
+async fn formatting_and_emoticons_arrive_as_what_was_written() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-formatting");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let (sender_id, receiver_id) = (sender.account_id(), receiver.account_id());
+    for config in [&sender, &receiver] {
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+    }
+    within(60, "both accounts to be signed in", || [&sender_id, &receiver_id].iter().all(|id| state.runtime.conn_state(id) == Some(ConnState::Connected))).await;
+    let conversation = |account: &str, with: u64| {
+        state.runtime.list_buffers().into_iter().find(|b| b.account_id == account && b.kind == "dm" && b.remote_id.as_deref() == Some(&with.to_string()))
+    };
+    within(60, "the friends to know each other", || conversation(&sender_id, receiver.steamid).is_some() && conversation(&receiver_id, sender.steamid).is_some()).await;
+    within(30, "the sender's emoticons", || !state.runtime.emoji_catalogue(&sender_id).is_empty()).await;
+    let have = &state.runtime.emoji_catalogue(&sender_id)[0].emoji;
+    println!("{} emoticon(s); first {:?}", have.len(), have.iter().take(3).map(|e| e.name.as_str()).collect::<Vec<_>>());
+    assert!(!have.is_empty());
+
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    // Steam takes no formatting - it shows [b] as the characters - but it does take
+    // emoticons and makes a link of an address.
+    let typed = format!("probe {stamp} [b]not bold[/b] see https://example.com/x :steamhappy: and \\[emoticon]plain[/emoticon]");
+    let outgoing = conversation(&sender_id, receiver.steamid).unwrap();
+    crate::backend::steam::send_message(&state, &outgoing, &typed).await.expect("Steam takes the message");
+
+    let body = |id: &str| state.store.get_backlog(id, 0, 50).unwrap().into_iter().find(|m| m.body.contains(&format!("probe {stamp}"))).map(|m| m.body);
+    let mut theirs = None;
+    for _ in 0..100 {
+        theirs = body(&conversation(&receiver_id, sender.steamid).unwrap().id);
+        if theirs.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ours = body(&outgoing.id);
+    println!("sender logged:   {ours:?}\nreceiver logged: {theirs:?}");
+    let wanted = [
+        "[steam:emote:steamhappy]",
+        "https://example.com/x",
+        // The literal brackets stay literal, and are not tags to the window.
+        "[\u{200b}b]not bold[\u{200b}/b]",
+        "[\u{200b}emoticon]plain[\u{200b}/emoticon]",
+    ];
+    for body in [&theirs, &ours] {
+        let body = body.as_deref().expect("the message is logged on both sides");
+        for piece in wanted {
+            assert!(body.contains(piece), "{piece:?} is in {body:?}");
+        }
+    }
+    assert_eq!(ours, theirs, "both sides hold the same thing");
+
+    for id in [&sender_id, &receiver_id] {
+        if let Some(link) = state.runtime.take_steam_link(id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// Which tags Steam's friend chat keeps. Prints, for each tag sent alone, what
+/// Steam stored; asserts nothing, since it is a survey of the service.
+#[tokio::test]
+#[ignore = "survey; needs two real Steam accounts that are friends; sends several real messages"]
+async fn which_tags_a_friend_message_keeps() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam::chat=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-tags");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    within(60, "the friend", || state.runtime.list_buffers().iter().any(|b| b.account_id == id && b.remote_id.as_deref() == Some(&receiver.steamid.to_string()))).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    for text in [
+        "t1 [code]code[/code]",
+        "t2 [quote]quote[/quote]",
+        "t3 [noparse][b]x[/b][/noparse]",
+        "t4 [h1]head[/h1]",
+        "t5 [spoiler]hidden[/spoiler]",
+        "t6 [sticker type=\"Cats\" limit=\"1\"]CatSurprise[/sticker]",
+        "t7 [img]https://example.com/a.png[/img]",
+        "t8 *star* _under_ ~~tilde~~ ||bars||",
+        "t9 [list][*]a[*]b[/list]",
+        "t10 [url]https://example.com[/url]",
+    ] {
+        let _ = super::chat::send(&link, &receiver.steamid.to_string(), text).await;
+    }
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

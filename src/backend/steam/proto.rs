@@ -497,6 +497,34 @@ pub struct AckMessage {
     pub timestamp: Option<u32>,
 }
 
+// --- emoticons -------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetEmoticonListRequest {}
+
+/// One emoticon an account has, by name, with how it has been used.
+#[derive(Clone, PartialEq, Message)]
+pub struct EmoticonInfo {
+    #[prost(string, optional, tag = "1")]
+    pub name: Option<String>,
+    #[prost(int32, optional, tag = "2")]
+    pub count: Option<i32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_last_used: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub use_count: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub time_received: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub appid: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetEmoticonListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub emoticons: Vec<EmoticonInfo>,
+}
+
 // --- signing in ------------------------------------------------------------
 
 #[derive(Clone, PartialEq, Message)]
@@ -732,10 +760,11 @@ mod tests {
                 GenerateAccessTokenRequest, GenerateAccessTokenResponse,
                 GetRecentMessagesRequest, PastReaction, PastMessage, GetRecentMessagesResponse,
                 GetActiveSessionsRequest, MessageSession, GetActiveSessionsResponse, AckMessage,
+                GetEmoticonListRequest, EmoticonInfo, GetEmoticonListResponse,
             );
             seen += 1;
         }
-        assert_eq!(seen, 47, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 50, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare
