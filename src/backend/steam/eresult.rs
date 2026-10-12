@@ -21,6 +21,7 @@ pub const ACCOUNT_NOT_FOUND: i32 = 18;
 pub const INVALID_STEAM_ID: i32 = 19;
 pub const SERVICE_UNAVAILABLE: i32 = 20;
 pub const NOT_LOGGED_ON: i32 = 21;
+pub const INSUFFICIENT_PRIVILEGE: i32 = 24;
 pub const LIMIT_EXCEEDED: i32 = 25;
 pub const REVOKED: i32 = 26;
 pub const DUPLICATE_REQUEST: i32 = 29;
@@ -74,6 +75,7 @@ pub fn describe(code: i32) -> String {
         IP_LOGIN_RESTRICTION_FAILED => "Steam will not let this account sign in from this address".to_string(),
         ACCOUNT_LOCKED_DOWN => "this account is locked until its owner secures it".to_string(),
         ACCOUNT_NOT_FRIENDS => "you can only message people who are your friends".to_string(),
+        INSUFFICIENT_PRIVILEGE => "this account is not allowed to do that; on Steam that usually means it is a limited account, which has to spend $5 before it can send friend requests".to_string(),
         LIMITED_USER_ACCOUNT => "a limited account cannot do that; Steam asks for a purchase first".to_string(),
         INVALID_PARAM | INVALID_STEAM_ID => "Steam does not recognise that as an account".to_string(),
         NO_MATCH => "Steam found nobody by that name".to_string(),
@@ -103,6 +105,7 @@ mod tests {
         assert!(describe(INVALID_PASSWORD).contains("password"));
         assert!(describe(RATE_LIMIT_EXCEEDED).contains("limiting"));
         assert!(describe(ACCOUNT_NOT_FRIENDS).contains("friends"));
+        assert!(describe(INSUFFICIENT_PRIVILEGE).contains("limited account"));
         assert!(describe(NO_MATCH).contains("nobody"));
         assert!(describe(DUPLICATE_REQUEST).contains("already"));
         assert!(describe(LIMITED_USER_ACCOUNT).contains("limited account"));

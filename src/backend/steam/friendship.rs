@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusal_is_said_in_words_and_a_missing_result_is_a_failure() {
-        for (code, words) in [(Some(42), "nobody"), (Some(29), "already"), (Some(40), "blocked"), (None, "limited")] {
+        for (code, words) in [(Some(42), "nobody"), (Some(29), "already"), (Some(40), "blocked"), (Some(24), "limited account"), (None, "limited")] {
             let url = serve(Box::new(move |packet| {
                 let body = ClientAddFriendResponse { eresult: code, ..Default::default() };
                 Some(vec![reply(&packet, body.encode_to_vec())])
