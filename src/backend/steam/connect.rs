@@ -235,6 +235,7 @@ struct Registered<'a> {
 
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
+        super::groups::clear(self.account_id);
         self.state.runtime.take_steam_link(self.account_id);
     }
 }
@@ -483,6 +484,12 @@ impl Drive<'_> {
                     }
                     self.ask_game_names();
                     self.shown.publish(self.state, &self.roster);
+                }
+            }
+            // The groups the account sorts its friends into, and changes to them.
+            emsg::CLIENT_FRIENDS_GROUPS_LIST => {
+                if let Ok(list) = ClientFriendsGroupsList::decode(packet.body.as_slice()) {
+                    super::groups::heard(self.state, self.account_id, &list);
                 }
             }
             // Everything the account may put in a message, as one list.

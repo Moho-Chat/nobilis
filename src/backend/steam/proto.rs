@@ -17,6 +17,10 @@
 //! Enums are carried as the plain integers they are on the wire, and given
 //! names where they are used.
 
+// A few friend-group messages keep Valve's own field names (`nGroupID`), which the
+// golden check requires of every struct.
+#![allow(non_snake_case)]
+
 use prost::Message;
 
 /// The header every protobuf packet carries ahead of its body.
@@ -746,6 +750,117 @@ pub struct EffectOwned {
     pub appid: Option<u32>,
 }
 
+/// One of the groups the account has sorted its friends into.
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendGroup {
+    #[prost(int32, optional, tag = "1")]
+    pub nGroupID: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub strGroupName: Option<String>,
+}
+
+/// One friend's place in a group.
+#[derive(Clone, PartialEq, Message)]
+pub struct FriendGroupMembership {
+    #[prost(fixed64, optional, tag = "1")]
+    pub ulSteamID: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub nGroupID: Option<i32>,
+}
+
+/// The groups and who is in them: all of it at sign-in, then what changed.
+/// A list that says `removal` is of things taken away.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientFriendsGroupsList {
+    #[prost(bool, optional, tag = "1")]
+    pub bremoval: Option<bool>,
+    #[prost(bool, optional, tag = "2")]
+    pub bincremental: Option<bool>,
+    #[prost(message, repeated, tag = "3")]
+    pub friendGroups: Vec<FriendGroup>,
+    #[prost(message, repeated, tag = "4")]
+    pub memberships: Vec<FriendGroupMembership>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientCreateFriendsGroup {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub groupname: Option<String>,
+    #[prost(fixed64, repeated, packed = "false", tag = "3")]
+    pub steamid_friends: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientCreateFriendsGroupResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+    #[prost(int32, optional, tag = "2")]
+    pub groupid: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientDeleteFriendsGroup {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid: Option<u64>,
+    #[prost(int32, optional, tag = "2")]
+    pub groupid: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientDeleteFriendsGroupResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+}
+
+/// Renames a group, or adds and takes away friends, in one.
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientManageFriendsGroup {
+    #[prost(int32, optional, tag = "1")]
+    pub groupid: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub groupname: Option<String>,
+    #[prost(fixed64, repeated, packed = "false", tag = "3")]
+    pub steamid_friends_added: Vec<u64>,
+    #[prost(fixed64, repeated, packed = "false", tag = "4")]
+    pub steamid_friends_removed: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientManageFriendsGroupResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientAddFriendToGroup {
+    #[prost(int32, optional, tag = "1")]
+    pub groupid: Option<i32>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamiduser: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientAddFriendToGroupResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientRemoveFriendFromGroup {
+    #[prost(int32, optional, tag = "1")]
+    pub groupid: Option<i32>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamiduser: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ClientRemoveFriendFromGroupResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub eresult: Option<u32>,
+}
+
 /// Everything an account may put in a message beyond words.
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientEmoticonList {
@@ -1027,10 +1142,14 @@ mod tests {
                 GetPerFriendPreferencesResponse, SetPerFriendPreferencesRequest, SetPerFriendPreferencesResponse,
                 PerFriendPreferencesChanged, FriendNicknameChanged, IgnoreFriendRequest, IgnoreFriendResponse,
                 ClientGetEmoticonList, EmoticonOwned, StickerOwned, EffectOwned, ClientEmoticonList,
+                FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
+                ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
+                ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
+                ClientAddFriendToGroupResponse, ClientRemoveFriendFromGroup, ClientRemoveFriendFromGroupResponse,
             );
             seen += 1;
         }
-        assert_eq!(seen, 74, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 87, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

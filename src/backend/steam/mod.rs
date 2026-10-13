@@ -33,6 +33,7 @@ pub mod emoticons;
 pub mod eresult;
 pub mod friends;
 pub mod friendship;
+pub mod groups;
 pub mod history;
 pub mod link;
 pub mod login;

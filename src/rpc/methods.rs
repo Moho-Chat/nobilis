@@ -4142,6 +4142,39 @@ pub async fn dispatch(
             }
         }
 
+        // The groups the account has sorted its friends into, as Steam holds them.
+        "steamFriendGroups" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamFriendGroups requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(backend::steam::groups::held(account_id).to_json()), None),
+        },
+
+        // Changes one: a friend into or out of a group, or the group itself - made,
+        // renamed or deleted. Answers with the number of a group that was made.
+        "steamGroupChange" => {
+            use backend::steam::groups::{self, Change};
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("steamGroupChange requires \"accountId\"".to_string()));
+            };
+            let friend = p_str_opt(params, "steamid").and_then(groups::friend_of);
+            let group = params.get("groupId").and_then(|v| v.as_i64()).map(|g| g as i32);
+            let name = p_str_opt(params, "name").map(|n| n.trim().chars().take(64).collect::<String>()).filter(|n| !n.is_empty());
+            let what = match (p_str_opt(params, "action"), group, friend, name) {
+                (Some("add"), Some(group), Some(friend), _) => Change::Add { group, friend },
+                (Some("remove"), Some(group), Some(friend), _) => Change::Remove { group, friend },
+                (Some("create"), _, friend, Some(name)) => Change::Create { name, friends: friend.into_iter().collect() },
+                (Some("rename"), Some(group), _, Some(name)) => Change::Rename { group, name },
+                (Some("delete"), Some(group), _, _) => Change::Delete { group },
+                _ => return (None, Some("steamGroupChange needs an action and what it is about".to_string())),
+            };
+            let (Some(link), Some(config)) = (state.runtime.steam_link(account_id), state.accounts.get_steam(account_id)) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            match groups::change(state, &link, account_id, config.steamid, what).await {
+                Ok(made) => (Some(serde_json::json!({ "ok": true, "groupId": made })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Steam's warning about a conversation has been seen: it is not raised again.
         "steamDismissNotice" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {

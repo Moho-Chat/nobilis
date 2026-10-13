@@ -739,3 +739,62 @@ async fn a_friends_name_history_is_read() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// The account's friend groups against real Steam: what it says at sign-in, and
+/// a group made, filled, renamed, emptied and deleted - one of the sender's own,
+/// made for this and gone at the end.
+#[tokio::test]
+#[ignore = "needs a real Steam account and its friend; changes only that account's friend groups"]
+async fn friend_groups_are_read_and_changed() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=info").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-groups");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    println!("AT SIGN-IN {}", super::groups::held(&id).to_json());
+    let link = state.runtime.steam_link(&id).unwrap();
+    let friend = receiver.steamid;
+    use super::groups::{change, Change};
+    // Between two sign-ins: leave a group behind, or take the ones this left.
+    if std::env::var("MOHO_GROUP_CLEAN").is_ok() {
+        for (group, name) in super::groups::held(&id).names_for_probe() {
+            if name.starts_with("moho probe") {
+                println!("CLEAN {name} {:?}", change(&state, &link, &id, sender.steamid, Change::Delete { group }).await);
+            }
+        }
+        if let Some(link) = state.runtime.take_steam_link(&id) {
+            crate::backend::steam::sign_off(link);
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        return;
+    }
+    if std::env::var("MOHO_GROUP_KEEP").is_ok() {
+        let group = change(&state, &link, &id, sender.steamid, Change::Create { name: "moho probe kept".into(), friends: vec![friend] }).await.unwrap().unwrap();
+        println!("KEPT {group}");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if let Some(link) = state.runtime.take_steam_link(&id) {
+            crate::backend::steam::sign_off(link);
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        return;
+    }
+    let made = change(&state, &link, &id, sender.steamid, Change::Create { name: "moho probe".into(), friends: vec![] }).await;
+    println!("CREATE {made:?}");
+    let group = made.unwrap().expect("a group number");
+    println!("ADD {:?}", change(&state, &link, &id, sender.steamid, Change::Add { group, friend }).await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("HELD {}", super::groups::held(&id).to_json());
+    println!("RENAME {:?}", change(&state, &link, &id, sender.steamid, Change::Rename { group, name: "moho probe 2".into() }).await);
+    println!("REMOVE {:?}", change(&state, &link, &id, sender.steamid, Change::Remove { group, friend }).await);
+    println!("DELETE {:?}", change(&state, &link, &id, sender.steamid, Change::Delete { group }).await);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    println!("AT END {}", super::groups::held(&id).to_json());
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
