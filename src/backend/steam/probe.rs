@@ -3445,3 +3445,49 @@ async fn the_friend_groups_an_account_has_at_sign_in() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// A picture sent into a room of a group by the real account, plain and then as a spoiler: what the
+/// file upload commits for a room, and whether the message comes back. Sends two real messages in
+/// the group `MOHO_TEST_GROUP` (78995476 by default), and nothing else.
+#[tokio::test]
+#[ignore = "needs a real Steam account that is not limited and a group it is in; sends two real messages"]
+async fn a_picture_is_sent_into_a_group_plain_and_as_a_spoiler() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-group-picture");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || {
+        state.runtime.conn_state(&id) == Some(ConnState::Connected)
+    })
+    .await;
+    let group = std::env::var("MOHO_TEST_GROUP").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(78995476);
+    let mut room = None;
+    for _ in 0..60 {
+        room = state
+            .runtime
+            .list_buffers()
+            .into_iter()
+            .filter(|b| b.account_id == id && b.name.ends_with("/#General"))
+            .find(|b| super::chatgroups::ids_of(b).map(|(g, _)| g) == Some(group));
+        if room.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let room = room.expect("the group's General room");
+    println!("PICTURE room {}", room.name);
+    let path = format!("{}/.local/share/moho-dev/avatar.png", std::env::var("HOME").unwrap());
+    println!("PICTURE plain -> {:?}", super::send_files(&state, &room, "", &[(path.clone(), false)], None).await);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    println!("PICTURE spoiler -> {:?}", super::send_files(&state, &room, "", &[(path, true)], None).await);
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    for m in state.store.get_backlog(&room.id, 0, 100).unwrap_or_default().iter().rev().take(4) {
+        println!("PICTURE in the log: {:?} from {:?}: {:?}", m.id, m.from, m.body);
+    }
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
