@@ -1,27 +1,12 @@
-//! The Pusher socket Kick's chat rides on.
+//! The realtime socket Kick's chat rides on.
 //!
 //! Kick does not run a chat server of its own so much as a channel on a
 //! commercial pub/sub service, which means connecting is subscribing: this
 //! module owns the websocket, the subscription list, and the frame envelope
-//! everything else arrives inside.
+//! everything else arrives inside. The service's own protocol is in
+//! `realtime`; what is said on it is the same events as ever.
 
 use super::*;
-
-/// Kick's own Pusher application, as served to every visitor of kick.com.
-///
-/// Public by construction: a Pusher *key* is the identifier a browser needs to
-/// subscribe to public channels, which is why it appears in their page source
-/// and why reading a public chat needs no credential. It is not a secret and
-/// grants nothing beyond what a browser on the channel page already has.
-pub(super) const PUSHER_KEY: &str = "32cbd69e4b950bf97679";
-
-pub(super) const PUSHER_CLUSTER: &str = "us2";
-
-pub(super) fn pusher_url() -> String {
-    format!(
-        "wss://ws-{PUSHER_CLUSTER}.pusher.com/app/{PUSHER_KEY}?protocol=7&client=moho&version=8.4.0&flash=false"
-    )
-}
 
 /// Asked of the connection from elsewhere in the daemon, over a channel,
 /// because the socket is owned by its own task and these arrive from RPC.
@@ -249,9 +234,10 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
         });
     }
 
-    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, pusher_url())
-        .await
-        .context("connecting to Kick's chat")?;
+    // A guest of the realtime service: public chat needs nothing more, and
+    // what the account signed in as is for sending, which goes by HTTP.
+    let realtime_client = realtime::client_id();
+    let (mut socket, token_ttl) = open_realtime(&http, &realtime_client).await?;
 
     // Two maps because Kick uses two numbers. A chat message names the
     // chatroom; the events on `channel.<id>` name the channel, which is a
@@ -366,12 +352,11 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
 
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
-    // Pusher closes a socket it has not heard from. Its own timeout arrives in
-    // the handshake, but a fixed interval well inside the shortest it ever
-    // sends is simpler than tracking it and cannot be wrong in the direction
-    // that matters.
-    let mut ping = tokio::time::interval(Duration::from_secs(60));
-    ping.tick().await;
+    // The connection's token runs out, and a connection past it is closed. A
+    // fresh one is handed over before then. The keepalive is answered as it
+    // arrives, in `handle_frame`.
+    let mut renew = tokio::time::interval(token_ttl);
+    renew.tick().await;
 
     // Who is live, and how many people are watching. Kick pushes the start and
     // the stop of a stream but never the count, so the only way to keep the
@@ -447,10 +432,7 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                 }
                 Some(Command::Part(slug)) => {
                     for name in watched.remove(&slug) {
-                        let _ = socket.send(WsMessage::Text(serde_json::json!({
-                            "event": "pusher:unsubscribe",
-                            "data": { "channel": name }
-                        }).to_string())).await;
+                        let _ = socket.send(WsMessage::Text(realtime::unsubscribe(&name).to_string())).await;
                     }
                     state.runtime.forget_kick_channel(&format!("{account_id}|{slug}"));
                 }
@@ -463,8 +445,9 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
                 let (account_id, token) = (account_id.to_string(), live_token.clone().unwrap_or_default());
                 tokio::spawn(async move { refresh_followed_live(&state, &http, &account_id, &token).await });
             }
-            _ = ping.tick() => {
-                socket.send(WsMessage::Text(r#"{"event":"pusher:ping","data":{}}"#.to_string())).await
+            _ = renew.tick() => {
+                let token = realtime::token(&http, &realtime_client, None).await.context("renewing the chat connection's token")?;
+                socket.send(WsMessage::Text(realtime::refresh(&token).to_string())).await
                     .context("Kick's chat connection went away")?;
             }
             frame = socket.next() => match frame {
@@ -476,6 +459,41 @@ pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id
             },
         }
     }
+}
+
+/// Opens the realtime connection as a guest: where it is, a token for it, and
+/// the wait for the service to accept it. Returns how long the token is good
+/// for, which is how long until it has to be renewed.
+async fn open_realtime(http: &reqwest::Client, client: &str) -> Result<(Socket, Duration)> {
+    let url = realtime::address(http, client).await?;
+    let token = realtime::token(http, client, None).await?;
+    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str()).await.context("connecting to Kick's chat")?;
+    socket.send(WsMessage::Text(realtime::connect(&token).to_string())).await.context("opening the connection to Kick's chat")?;
+    let waited = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match socket.next().await {
+                None => anyhow::bail!("Kick closed the chat connection before it answered"),
+                Some(Err(e)) => return Err(e).context("reading from Kick's chat"),
+                Some(Ok(WsMessage::Text(text))) => {
+                    for said in realtime::read(&text) {
+                        match said {
+                            realtime::Said::Connected { ttl } => return Ok(ttl),
+                            realtime::Said::Refused(why) | realtime::Said::Disconnect(why) => anyhow::bail!("Kick's chat refused the connection: {why}"),
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) => anyhow::bail!("Kick closed the chat connection before it answered"),
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await
+    .context("Kick's chat did not answer")??;
+    // Renewed well before it runs out. Not at the last moment: a renewal that
+    // is slow or retried must still land inside the token's life.
+    let ttl = waited.unwrap_or(2700);
+    Ok((socket, Duration::from_secs((ttl * 2 / 3).max(30))))
 }
 
 pub(super) type Socket = tokio_tungstenite::WebSocketStream<
@@ -680,27 +698,18 @@ pub(super) async fn subscribe(socket: &mut Socket, chatroom_id: u64, channel_id:
         format!("predictions-channel-{channel_id}"),
     ] {
         socket
-            .send(WsMessage::Text(
-                serde_json::json!({ "event": "pusher:subscribe", "data": { "auth": "", "channel": channel } })
-                    .to_string(),
-            ))
+            .send(WsMessage::Text(realtime::subscribe(&channel).to_string()))
             .await
             .context("subscribing to the channel's chat")?;
     }
     Ok(())
 }
 
-#[derive(Deserialize)]
-pub(super) struct PusherFrame {
-    pub(super) event: String,
-    #[serde(default)]
-    pub(super) data: serde_json::Value,
-    /// Which subscription this arrived on. The most reliable way to know
-    /// whose channel an event belongs to: a chat message names its room in the
-    /// payload, but the doing-things events name variously the channel, the
-    /// chatroom, or nothing at all - while Pusher always says which
-    /// subscription delivered it.
-    #[serde(default)]
+/// Where an event arrived. The most reliable way to know whose channel it
+/// belongs to: a chat message names its room in the payload, but the
+/// doing-things events name variously the channel, the chatroom, or nothing at
+/// all - while the service always says which subscription delivered it.
+pub(super) struct Delivery {
     pub(super) channel: Option<String>,
 }
 
@@ -711,23 +720,18 @@ pub(super) async fn handle_frame(
     text: &str,
     socket: &mut Socket,
 ) -> Result<()> {
-    let frame: PusherFrame = match serde_json::from_str(text) {
-        Ok(f) => f,
-        Err(_) => return Ok(()),
-    };
-
-    // Pusher nests the real payload as a JSON *string* inside the frame, so
-    // every event needs unwrapping twice.
-    let payload = match &frame.data {
-        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).unwrap_or(serde_json::Value::Null),
-        other => other.clone(),
-    };
-
-    if frame.event == "pusher:ping" {
-        socket.send(WsMessage::Text(r#"{"event":"pusher:pong","data":{}}"#.to_string())).await?;
-        return Ok(());
+    for said in realtime::read(text) {
+        match said {
+            realtime::Said::Ping => socket.send(WsMessage::Text(realtime::pong().to_string())).await?,
+            realtime::Said::Published { channel, event, data } => handle_event(state, account_id, watched, &event, Some(&channel), data)?,
+            // A refused subscription is a channel that will not arrive, and
+            // looks like nothing: said in the log, once for each.
+            realtime::Said::Refused(why) => tracing::warn!("kick[{account_id}]: the chat service refused a request: {why}"),
+            realtime::Said::Disconnect(why) => anyhow::bail!("Kick's chat ended the connection: {why}"),
+            realtime::Said::Connected { .. } | realtime::Said::Other => {}
+        }
     }
-    handle_event(state, account_id, watched, &frame.event, frame.channel.as_deref(), payload)
+    Ok(())
 }
 
 /// The channel behind a conversation, waiting a little for it to arrive.
@@ -900,5 +904,57 @@ mod tests {
         assert_eq!(id_in_subscription("channel_123"), Some(Subscribed::Channel(123)));
         assert_eq!(id_in_subscription("chatrooms.abc"), None);
         assert_eq!(id_in_subscription("something-else"), None);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+    use crate::backend::kick::testkit::simulated_daemon;
+    use crate::runtime::ConnState;
+
+    /// Against the real service: a signed-out account opens a live channel and
+    /// has to hear somebody talk in it. Nothing is sent. Ignored because it
+    /// needs the network and a channel that is live and busy.
+    ///
+    /// ```text
+    /// MOHO_KICK_CHANNEL=xqc cargo test --release kick::socket::live -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs the network and a live Kick channel"]
+    async fn a_signed_out_reader_hears_a_live_channel() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::kick=info").with_test_writer().try_init();
+        let channel = std::env::var("MOHO_KICK_CHANNEL").unwrap_or_else(|_| "xqc".to_string());
+        let state = simulated_daemon("kick-live-probe");
+        let config = KickAccountConfig { username: "reader".into(), channels: vec![channel.clone()], ..Default::default() };
+        let id = config.account_id();
+        state.accounts.add_kick(config.clone()).unwrap();
+        spawn(state.clone(), config);
+        let buffer = crate::model::buffer_id(&id, &channel);
+        let mut heard = 0;
+        for _ in 0..240 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            heard = state.store.get_backlog(&buffer, 0, 200).map(|m| m.iter().filter(|m| m.kind == "chat" || m.kind == "message").count()).unwrap_or(0);
+            if heard >= 5 && state.runtime.conn_state(&id) == Some(ConnState::Connected) {
+                break;
+            }
+        }
+        // And for as long as asked, to see that the keepalive is answered and
+        // that chat keeps arriving after the first minute.
+        let secs: u64 = std::env::var("MOHO_KICK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let before = heard;
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let after = state.store.get_backlog(&buffer, 0, 1000).map(|m| m.len()).unwrap_or(0);
+        println!("after {secs}s more: {} -> {after} message(s); state {:?}", before, state.runtime.conn_state(&id));
+        if secs > 0 {
+            assert!(after > before, "chat kept arriving");
+            assert_eq!(state.runtime.conn_state(&id), Some(ConnState::Connected));
+        }
+        println!("state {:?}; heard {heard} message(s) in {channel}", state.runtime.conn_state(&id));
+        for m in state.store.get_backlog(&buffer, 0, 5).unwrap_or_default() {
+            println!("  {}: {}", m.from, m.body.chars().take(80).collect::<String>());
+        }
+        assert!(heard >= 5, "a live channel's chat should be arriving");
     }
 }

@@ -1,4 +1,4 @@
-//! Kick - livestream chat, read over the same Pusher websocket kick.com's own
+//! Kick - livestream chat, read over the same realtime websocket kick.com's own
 //! player page uses.
 //!
 //! Two things make this backend shaped differently from the others here.
@@ -11,7 +11,7 @@
 //! are subscribed to. That is why the token is optional throughout rather than
 //! a precondition for connecting.
 //!
-//! **One websocket carries every channel.** Pusher multiplexes: each channel
+//! **One websocket carries every channel.** The service multiplexes: each channel
 //! is a `chatrooms.<id>.v2` subscription on the one connection, so watching
 //! twenty streamers costs one socket rather than twenty. Sneedchat next door
 //! opens one per room because its protocol has no such verb; this one does,
@@ -21,7 +21,8 @@
 //!
 //! # How this folder is arranged
 //!
-//! - `socket` - the Pusher connection, its subscriptions, the frame envelope
+//! - `socket` - the realtime connection,
+//! - `realtime` - its two HTTP calls and its frames, its subscriptions, the frame envelope
 //! - `chat` - what is said in a channel, and who said it
 //! - `cards` - polls and predictions, which are the same shape twice
 //! - `live` - whether a channel is streaming, and who just started
@@ -34,6 +35,7 @@ pub mod cards;
 pub mod chat;
 pub mod live;
 pub mod pins;
+pub mod realtime;
 pub mod socket;
 pub mod watch;
 #[cfg(test)]

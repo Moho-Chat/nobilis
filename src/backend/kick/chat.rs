@@ -163,11 +163,7 @@ pub(super) fn handle_event(
     // Rebuilt so the arms below can keep reading `frame.channel`, which is
     // how a channel is identified for every event that does not carry an id
     // of its own.
-    let frame = PusherFrame {
-        event: event.to_string(),
-        channel: channel.map(str::to_string),
-        data: serde_json::Value::Null,
-    };
+    let frame = Delivery { channel: channel.map(str::to_string) };
     match event {
         "pusher:error" => {
             let msg = payload.get("message").and_then(|m| m.as_str()).unwrap_or("Kick refused the connection");

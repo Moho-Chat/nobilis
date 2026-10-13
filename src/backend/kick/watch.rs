@@ -112,16 +112,17 @@ async fn post(http: &reqwest::Client, token: &str, url: &str, body: serde_json::
 ///
 /// Deliberately the smallest possible client. This subscribes and then listens
 /// to nothing: the point is to be present, not to read what the channel
-/// publishes - chat already arrives on the Pusher socket, and duplicating it
+/// publishes - chat already arrives on the chat socket, and duplicating it
 /// here would mean two sources for one conversation.
 pub mod frames {
     use serde_json::{json, Value};
 
-    /// Opens the connection. No token: the negotiation answers with a URL and
-    /// nothing else, so the connection is anonymous and the per-channel token
-    /// below is what identifies anybody.
-    pub fn connect(id: u64) -> Value {
-        json!({ "id": id, "connect": {} })
+    /// Opens the connection, with the token the service gives this account for
+    /// it. The service closes one that has none, and one whose token has run
+    /// out - which is why a session here is ended and begun again well before
+    /// that.
+    pub fn connect(id: u64, token: &str) -> Value {
+        json!({ "id": id, "connect": { "token": token, "name": "js" } })
     }
 
     pub fn subscribe(id: u64, channel: &str, token: &str) -> Value {
@@ -200,7 +201,11 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
         next_id += 1;
         next_id
     };
-    socket.send(Message::Text(frames::connect(id()).to_string())).await.context("opening the connection")?;
+    let connection_token = super::realtime::token(&http, user_id, Some(token)).await?;
+    socket.send(Message::Text(frames::connect(id(), &connection_token).to_string())).await.context("opening the connection")?;
+    // The token is good for forty-five minutes. A session that has been up for
+    // thirty is ended, and the next one opens with a new one.
+    let begun = std::time::Instant::now();
 
     // What is subscribed now, so the set on screen can be followed as it
     // changes without tearing the connection down.
@@ -208,7 +213,7 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
 
     loop {
         let wanted = state.runtime.kick_watching(account_id);
-        if wanted.is_empty() {
+        if wanted.is_empty() || begun.elapsed() > std::time::Duration::from_secs(30 * 60) {
             return Ok(());
         }
 
@@ -299,11 +304,10 @@ mod tests {
         assert_eq!(f["id"], json!(2));
     }
 
-    /// The connection itself is anonymous - the negotiation answers with a URL
-    /// and no token, so nothing is sent here.
+    /// The service closes a connection that is opened with no token.
     #[test]
-    fn the_connection_carries_no_token() {
-        assert_eq!(frames::connect(1), json!({ "id": 1, "connect": {} }));
+    fn the_connection_carries_its_token() {
+        assert_eq!(frames::connect(1, "jwt"), json!({ "id": 1, "connect": { "token": "jwt", "name": "js" } }));
     }
 
     #[test]
