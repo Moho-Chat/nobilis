@@ -40,7 +40,7 @@ pub fn say(state: &AppState, account_id: &str, conversation: &str, friend: u32, 
         // A kind of its own, which the window draws in red so it is not scrolled past.
         "warning",
         None,
-        Some(format!("notice:{friend}:{notice_type}")),
+        Some(notice_id(friend, notice_type)),
         false,
         None,
         Vec::new(),
@@ -52,6 +52,40 @@ pub fn say(state: &AppState, account_id: &str, conversation: &str, friend: u32, 
     );
 }
 
+/// The id a notice is kept under: the same in the log and in what says whether
+/// it has been dismissed.
+pub fn notice_id(friend: u32, notice_type: i32) -> String {
+    format!("notice:{friend}:{notice_type}")
+}
+
+/// Puts back the banners that were up when moho last ran and have not been
+/// dismissed. Steam does not say a notice again at every sign-in, so what was
+/// not seen would otherwise be gone with the restart. A warning that was said in
+/// the log before anything recorded it is one nobody dismissed, and is shown.
+pub fn restore(state: &AppState, account_id: &str) {
+    let Ok(held) = state.store.account_notices(account_id) else { return };
+    for (buffer, id, recorded) in held {
+        let kind = id.rsplit(':').next().and_then(|t| t.parse::<i32>().ok()).unwrap_or(SUSPICIOUS);
+        let Some(text) = words(kind) else { continue };
+        match recorded.as_deref() {
+            Some("dismissed") => {}
+            other => {
+                if other.is_none() {
+                    let _ = state.store.set_notice_state(&buffer, &id, "pending");
+                }
+                state.runtime.set_buffer_notice(state, &buffer, Some(BufferNotice { kind: "suspicious".to_string(), text: text.to_string() }));
+            }
+        }
+    }
+}
+
+/// Dismissed: the banner is taken off, and it stays off across a restart until
+/// Steam raises a notice again.
+pub fn dismissed(state: &AppState, buffer_id: &str, friend: u32, notice_type: i32) {
+    let _ = state.store.set_notice_state(buffer_id, &notice_id(friend, notice_type), "dismissed");
+    state.runtime.set_buffer_notice(state, buffer_id, None);
+}
+
 /// A notice that arrived live, for a conversation that exists.
 pub fn heard(state: &AppState, account_id: &str, conversation: &str, notice: &SessionNoticeNotification) {
     let (Some(friend), Some(kind)) = (notice.steamid_friend.and_then(steamid::account_of), notice.notice_type) else { return };
@@ -61,10 +95,12 @@ pub fn heard(state: &AppState, account_id: &str, conversation: &str, notice: &Se
     if notice.active.unwrap_or(true) {
         say(state, account_id, conversation, friend, kind);
         if let Some(text) = words(kind) {
+            // Raised afresh, so not dismissed any more, whatever came before.
+            let _ = state.store.set_notice_state(&buffer, &notice_id(friend, kind), "pending");
             state.runtime.set_buffer_notice(state, &buffer, Some(BufferNotice { kind: "suspicious".to_string(), text: text.to_string() }));
         }
     } else if words(kind).is_some() {
-        state.runtime.set_buffer_notice(state, &buffer, None);
+        dismissed(state, &buffer, friend, kind);
     }
 }
 
@@ -106,7 +142,7 @@ mod tests {
         let id = crate::model::buffer_id(ACCOUNT, "Gabe");
         assert!(state.runtime.get_buffer(&id).unwrap().notice.is_some());
         // Dismissed: the banner goes, and the line in the log stays.
-        state.runtime.set_buffer_notice(&state, &id, None);
+        dismissed(&state, &id, 100, SUSPICIOUS);
         assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
         assert_eq!(said(&state).len(), 1);
         // Steam raising it again is a new notice.
@@ -115,6 +151,34 @@ mod tests {
         assert_eq!(said(&state).len(), 1, "though the log is not told twice");
         // Steam lifting it takes the banner off.
         heard(&state, ACCOUNT, "Gabe", &SessionNoticeNotification { active: Some(false), ..raised });
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
+    }
+
+    #[test]
+    fn a_banner_not_dismissed_is_there_after_a_restart_and_one_dismissed_is_not() {
+        let state = simulated_daemon("steam-notice-restart");
+        let id = crate::model::buffer_id(ACCOUNT, "Gabe");
+        heard(&state, ACCOUNT, "Gabe", &SessionNoticeNotification { steamid_friend: Some(steamid::steamid_of(100)), notice_type: Some(SUSPICIOUS), active: Some(true) });
+        // The window and the daemon are restarted: nothing is held but what was kept.
+        state.runtime.set_buffer_notice(&state, &id, None);
+        restore(&state, ACCOUNT);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_some(), "not dismissed, so still there");
+        dismissed(&state, &id, 100, SUSPICIOUS);
+        restore(&state, ACCOUNT);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none(), "dismissed, so not brought back");
+    }
+
+    #[test]
+    fn a_warning_said_in_the_log_before_anything_recorded_it_is_shown_once() {
+        let state = simulated_daemon("steam-notice-legacy");
+        let id = crate::model::buffer_id(ACCOUNT, "Gabe");
+        // As it was stored before there was a banner: a system line, nothing more.
+        state.runtime.record_message_at(&state, ACCOUNT, "Gabe", "dm", "Steam", "Steam warns that this person may not be who they appear to be.", false, "system", None, Some(notice_id(100, SUSPICIOUS)), false, None, vec![], vec![], None, None, None, None);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
+        restore(&state, ACCOUNT);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_some(), "nobody dismissed it, so it is up");
+        dismissed(&state, &id, 100, SUSPICIOUS);
+        restore(&state, ACCOUNT);
         assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
     }
 

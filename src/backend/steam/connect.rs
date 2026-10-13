@@ -325,6 +325,8 @@ struct Drive<'a> {
 impl Drive<'_> {
     async fn run(mut self, told: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>, heartbeat: Duration) -> Ending {
         self.shown.adopt(self.state, self.account_id);
+        // The warnings still waiting to be seen from before this was started.
+        super::notices::restore(self.state, self.account_id);
         // What can be put in a message, for the picker; it arrives when it arrives.
         tokio::spawn(super::emoticons::load(self.state.clone(), self.link.clone(), self.account_id.to_string()));
         // What the account keeps about its friends - nicknames and the like -
@@ -421,6 +423,8 @@ impl Drive<'_> {
                     };
                     self.ask_about(&ask);
                     self.shown.publish(self.state, &self.roster);
+                    // Conversations that were not there at the start are now.
+                    super::notices::restore(self.state, self.account_id);
                     friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
                     // Their names arrive in the next moments; what was missed is
                     // read into conversations that have them.

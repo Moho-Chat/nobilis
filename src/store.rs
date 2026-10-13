@@ -279,6 +279,18 @@ impl Store {
              CREATE TABLE IF NOT EXISTS known_groups (id TEXT PRIMARY KEY, data TEXT NOT NULL);",
         );
 
+        // A warning the service put on a conversation, and whether it has been
+        // dismissed: what keeps a banner over the conversation until it is, across
+        // a restart - see backend/steam/notices.rs.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS buffer_notices (
+                 buffer_id TEXT NOT NULL,
+                 notice_id TEXT NOT NULL,
+                 state TEXT NOT NULL,
+                 PRIMARY KEY (buffer_id, notice_id)
+             );",
+        );
+
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS media_sources (
                  path TEXT PRIMARY KEY,
@@ -1026,6 +1038,31 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_notice_state(&self, buffer_id: &str, notice_id: &str, state: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO buffer_notices (buffer_id, notice_id, state) VALUES (?1, ?2, ?3)
+             ON CONFLICT(buffer_id, notice_id) DO UPDATE SET state = ?3",
+            params![buffer_id, notice_id, state],
+        )?;
+        Ok(())
+    }
+
+    /// The warnings of one account's conversations: each with its state, or
+    /// none for a warning that was said in the log before anything recorded it.
+    /// Found by the log line a warning leaves, which has an id of its own.
+    pub fn account_notices(&self, account_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let like = format!("{account_id}|%");
+        let mut stmt = conn.prepare(
+            "SELECT m.buffer_id, m.msg_id, n.state FROM messages m
+             LEFT JOIN buffer_notices n ON n.buffer_id = m.buffer_id AND n.notice_id = m.msg_id
+             WHERE m.buffer_id LIKE ?1 AND m.msg_id LIKE 'notice:%'",
+        )?;
+        let rows = stmt.query_map(params![like], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
+    }
+
     /// The polls or predictions this conversation has seen, newest first.
     pub fn live_cards(&self, buffer_id: &str, kind: &str, limit: i64) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().unwrap();
@@ -1288,7 +1325,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let like = format!("{account_id}|%");
         let mut gone = 0;
-        for table in ["messages", "live_cards", "matrix_reactions"] {
+        for table in ["messages", "live_cards", "matrix_reactions", "buffer_notices"] {
             gone += conn.execute(
                 &format!("DELETE FROM {table} WHERE buffer_id = ?1 OR buffer_id LIKE ?2"),
                 params![account_id, like],

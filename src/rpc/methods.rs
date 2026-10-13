@@ -4150,7 +4150,11 @@ pub async fn dispatch(
             let friend = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok());
             // The banner goes whether or not Steam can be told just now: it was
             // seen. Steam is told so that it is not raised again.
-            state.runtime.set_buffer_notice(state, &buffer.id, None);
+            if let Some(number) = friend.and_then(backend::steam::steamid::account_of) {
+                backend::steam::notices::dismissed(state, &buffer.id, number, backend::steam::notices::SUSPICIOUS);
+            } else {
+                state.runtime.set_buffer_notice(state, &buffer.id, None);
+            }
             match (state.runtime.steam_link(&buffer.account_id), friend) {
                 (Some(link), Some(friend)) => match backend::steam::notices::dismiss(&link, friend, backend::steam::notices::SUSPICIOUS) {
                     Ok(()) => (Some(ok_node()), None),
