@@ -99,10 +99,11 @@ pub async fn list(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> 
         .send()
         .await
         .map_err(|e| format!("could not reach Steam's website: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Steam's website refused it ({})", response.status()));
-    }
+    let status = response.status();
     let answer = plain_json(&response.bytes().await.map_err(|e| e.to_string())?);
+    if !status.is_success() {
+        return Err(web::explain(status, &answer));
+    }
     Ok(read_links(super::steamid::account_of(steamid).unwrap_or_default(), &answer))
 }
 
@@ -111,10 +112,11 @@ pub async fn create(link: &Link, key: &str, steamid: u64, refresh_token: &str) -
     let (http, cookie, session) = website(link, key, steamid, refresh_token).await?;
     let form = reqwest::multipart::Form::new().text("sessionid", session).text("steamid_user", steamid.to_string()).text("duration", "2592000");
     let response = http.post("https://steamcommunity.com/invites/ajaxcreate").header("Cookie", cookie).multipart(form).send().await.map_err(|e| format!("could not reach Steam's website: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Steam's website refused it ({})", response.status()));
-    }
+    let status = response.status();
     let answer = plain_json(&response.bytes().await.map_err(|e| e.to_string())?);
+    if !status.is_success() {
+        return Err(web::explain(status, &answer));
+    }
     read_link(&code_of(super::steamid::account_of(steamid).unwrap_or_default()), &answer["invite"]).ok_or_else(|| "Steam did not make a link".to_string())
 }
 
@@ -126,9 +128,12 @@ pub async fn revoke(link: &Link, key: &str, steamid: u64, refresh_token: &str, t
     let (http, cookie, session) = website(link, key, steamid, refresh_token).await?;
     let form = reqwest::multipart::Form::new().text("sessionid", session).text("invite_token", token.to_string()).text("steamid_user", steamid.to_string());
     let response = http.post("https://steamcommunity.com/invites/ajaxrevoke").header("Cookie", cookie).multipart(form).send().await.map_err(|e| format!("could not reach Steam's website: {e}"))?;
+    let status = response.status();
     let answer = plain_json(&response.bytes().await.map_err(|e| e.to_string())?);
-    if answer["success"].as_i64() == Some(1) {
+    if status.is_success() && answer["success"].as_i64() == Some(1) {
         Ok(())
+    } else if answer["success"].as_i64().is_some_and(|c| c > 1) || !status.is_success() {
+        Err(web::explain(status, &answer))
     } else {
         Err("Steam would not revoke that link".to_string())
     }

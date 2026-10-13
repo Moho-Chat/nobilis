@@ -223,6 +223,17 @@ pub async fn send_code(link: &Link, begun: &Begun, guard: &Guard, code: &str) ->
     Ok(())
 }
 
+/// What a failure while waiting for a sign-in to be approved means: for this, Steam's "not found"
+/// and "expired" are the same - the sign-in ran out before anybody approved it - which the Steam
+/// client treats as one thing; the agreement page and the rate limit are said as the general table
+/// says them.
+pub fn waiting_failure(error: CallError) -> String {
+    match error {
+        CallError::Refused(super::eresult::FILE_NOT_FOUND | super::eresult::EXPIRED, _) => "that sign-in ran out before it was approved; start again".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Starts a sign-in that a phone will approve by scanning a code. Answers with
 /// the address the code carries; the session is then polled as any other.
 pub async fn begin_qr(link: &Link) -> Result<(Begun, String), CallError> {
@@ -283,6 +294,15 @@ pub async fn poll_session(link: &Link, begun: &mut Begun) -> Result<Polled, Call
 mod tests {
     use super::*;
     use crate::backend::steam::link::{self, fake::*};
+
+    #[test]
+    fn a_sign_in_that_ran_out_is_said_so_and_the_rest_by_the_general_table() {
+        assert!(waiting_failure(CallError::Refused(9, None)).contains("ran out"));
+        assert!(waiting_failure(CallError::Refused(27, None)).contains("ran out"));
+        assert!(waiting_failure(CallError::Refused(84, None)).contains("limiting"));
+        let page = waiting_failure(CallError::Refused(118, Some("https://login.steampowered.com/agree".into())));
+        assert!(page.contains("agreement") && page.contains("https://login.steampowered.com/agree"), "{page}");
+    }
     use crate::backend::steam::wire::Packet;
     use prost::Message;
     use rsa::traits::PublicKeyParts;

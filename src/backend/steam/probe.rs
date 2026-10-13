@@ -1161,3 +1161,35 @@ async fn a_group_picture_is_changed() {
     }
     tokio::time::sleep(Duration::from_millis(800)).await;
 }
+
+/// How long a message Steam takes in a group, found by trying lengths. Throwaway account, own group, left at the end.
+#[tokio::test]
+#[ignore = "needs a real Steam account; makes, writes in and leaves a chat group"]
+async fn how_long_a_message_steam_takes() {
+    use super::chatgroups::{self as groups, Action};
+    use super::proto::*;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-length");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let made = groups::act(&state, &id, Action::Create { name: "moho length probe".into() }).await.unwrap();
+    let group = groups::group_of_rail_id(made["groupId"].as_str().unwrap()).map(|(_, g)| g).unwrap();
+    let room = groups::held(&id, group).unwrap().default_room;
+    let link = state.runtime.steam_link(&id).unwrap();
+    for n in [1000usize, 2000, 2001, 3000, 4000, 5000, 5001, 8000, 20000] {
+        let sent: Result<ChatSendResponse, _> = link
+            .call("ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: Some(room), message: Some("x".repeat(n)), echo_to_sender: Some(false) }, true)
+            .await;
+        println!("LENGTH {n}: {:?}", sent.map(|r| r.server_timestamp.is_some()).map_err(|e| e.to_string()));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+    }
+    println!("LENGTH left {:?}", groups::act(&state, &id, Action::Leave { group }).await);
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

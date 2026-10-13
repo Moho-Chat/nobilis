@@ -120,6 +120,45 @@ pub fn refusal(error: &CallError) -> String {
     }
 }
 
+/// How long the Steam client keeps trying to send one message before it gives up on it.
+const SEND_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a failure to send may be gone a moment later: a server that did not answer, was busy or
+/// had a problem of its own - and not one that is about the account, the person or the room.
+fn passing(error: &CallError) -> bool {
+    match error {
+        CallError::TimedOut => true,
+        CallError::Refused(code, _) => matches!(*code, eresult::FAIL | eresult::BUSY | eresult::TIMEOUT | eresult::SERVICE_UNAVAILABLE | 32 | 33 | 35 | 36 | 37 | 55),
+        CallError::Closed | CallError::Unreadable(_) => false,
+    }
+}
+
+/// Sends a message with the Steam client's own patience: a passing failure is tried again after one
+/// second, then two, then four, for up to a minute; being refused for good is said at once, in the
+/// words the client uses - not a friend (or not allowed here) and sending too fast.
+///
+/// `unsafe_to_repeat` is for a send that has no id of its own to stop Steam taking it twice: it is
+/// repeated only when Steam said it failed, never when it merely did not answer.
+pub async fn send_with_patience<Q: prost::Message, A: prost::Message + Default>(link: &Link, method: &str, request: &Q, in_group: bool, unsafe_to_repeat: bool) -> Result<A, String> {
+    let began = std::time::Instant::now();
+    let mut wait = 1;
+    loop {
+        match link.call::<Q, A>(method, request, true).await {
+            Ok(answer) => return Ok(answer),
+            Err(CallError::Refused(eresult::ACCESS_DENIED, _)) => {
+                return Err(if in_group { "you may not write in this group right now; you may be muted there, or not allowed".to_string() } else { eresult::describe(eresult::ACCOUNT_NOT_FRIENDS) })
+            }
+            Err(CallError::Refused(eresult::RATE_LIMIT_EXCEEDED, _)) => return Err("you are sending too fast; wait a moment".to_string()),
+            Err(error) if passing(&error) && !(unsafe_to_repeat && matches!(error, CallError::TimedOut)) && began.elapsed() < SEND_FOR => {
+                tracing::info!("steam: {method} did not go ({error}); trying again in {wait}s");
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                wait *= 2;
+            }
+            Err(error) => return Err(refusal(&error)),
+        }
+    }
+}
+
 /// Sends a message to the person a conversation is with.
 ///
 /// `recipient` is their 64-bit id as the conversation holds it. Returns the
@@ -146,13 +185,7 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<Sent, Stri
         low_priority: Some(false),
         client_message_id: Some(client_message_id()),
     };
-    let response: FriendMessagesSendResponse = link
-        .call("FriendMessages.SendMessage#1", &request, true)
-        .await
-        .map_err(|e| {
-            tracing::info!("steam: SendMessage was answered with {e:?}");
-            refusal(&e)
-        })?;
+    let response: FriendMessagesSendResponse = send_with_patience(link, "FriendMessages.SendMessage#1", &request, false, false).await.inspect_err(|why| tracing::info!("steam: SendMessage was refused: {why}"))?;
     tracing::debug!("steam: sent {text:?}; Steam stored {:?} ({:?} without tags)", response.modified_message, response.message_without_bb_code);
     let timestamp = response.server_timestamp.unwrap_or_default();
     // What Steam stored, which is the text with its emoticons found: ":steamhappy:"
@@ -480,6 +513,47 @@ mod tests {
         // Exactly the limit is fine.
         send(&link, "76561197960265729", &"x".repeat(2000)).await.unwrap();
         assert_eq!(heard.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_send_that_fails_in_passing_is_tried_again_with_the_same_id_and_one_that_is_refused_is_not() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let url = serve({
+            let seen = seen.clone();
+            Box::new(move |req| {
+                let mut seen = seen.lock().unwrap();
+                seen.push(FriendMessagesSendRequest::decode(req.body.as_slice()).unwrap().client_message_id);
+                // Fails the first time, as a busy server does, then goes through.
+                let code = if seen.len() == 1 { eresult::SERVICE_UNAVAILABLE } else { 1 };
+                Some(vec![answer(&req, code, FriendMessagesSendResponse { server_timestamp: Some(5), ordinal: Some(0), ..Default::default() }.encode_to_vec())])
+            })
+        })
+        .await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+        let sent = send(&link, "76561197960265729", "hi").await.unwrap();
+        assert_eq!(sent.timestamp, 5);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "tried again after the first failure");
+        assert_eq!(seen[0], seen[1], "under the same id, so Steam cannot take it twice");
+    }
+
+    #[tokio::test]
+    async fn being_refused_for_good_is_said_at_once_in_the_clients_words() {
+        for (code, words, in_group) in [(eresult::ACCESS_DENIED, "friends", false), (eresult::ACCESS_DENIED, "may not write in this group", true), (eresult::RATE_LIMIT_EXCEEDED, "too fast", false), (eresult::LIMITED_USER_ACCOUNT, "limited account", false)] {
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let url = serve({
+                let count = count.clone();
+                Box::new(move |req| {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Some(vec![answer(&req, code, Vec::new())])
+                })
+            })
+            .await;
+            let (link, _told) = link::open("steam:test", &url).await.unwrap();
+            let err = send_with_patience::<FriendMessagesSendRequest, FriendMessagesSendResponse>(&link, "FriendMessages.SendMessage#1", &FriendMessagesSendRequest::default(), in_group, false).await.unwrap_err();
+            assert!(err.contains(words), "{code}: {err}");
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "{code} is not tried again");
+        }
     }
 
     #[tokio::test]

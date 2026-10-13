@@ -69,8 +69,9 @@ pub const PAGE: u32 = 50;
 /// What a room with no name of its own is called: the first room of a group has none.
 const UNNAMED_ROOM: &str = "General";
 
-/// How long a message may be.
-pub const MAX_LENGTH: usize = 2000;
+/// How long a message may be: the Steam client's own text box stops at five thousand characters, and
+/// Steam took messages of eight thousand in a group when tried.
+pub const MAX_LENGTH: usize = 5000;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Member {
@@ -453,7 +454,7 @@ fn titles(groups: &BTreeMap<u64, Group>, people: &HashMap<u32, Person>, own: u32
 
 /// What the account is told about its groups and what it has read.
 pub async fn load(link: &Link, account_id: &str, own: u32) -> Result<Vec<u32>, String> {
-    let mine: GetMyChatRoomGroupsResponse = link.call("ChatRoom.GetMyChatRoomGroups#1", &GetMyChatRoomGroupsRequest {}, true).await.map_err(|e| chat::refusal(&e))?;
+    let mine: GetMyChatRoomGroupsResponse = link.call("ChatRoom.GetMyChatRoomGroups#1", &GetMyChatRoomGroupsRequest {}, true).await.map_err(|e| group_refusal(&e))?;
     let ids: Vec<u64> = mine.chat_room_groups.iter().filter_map(|p| p.group_summary.as_ref()?.chat_group_id.or(p.user_chat_group_state.as_ref()?.chat_group_id)).collect();
     // The groups' members come with being active in them.
     let active: SetSessionActiveGroupsResponse = if ids.is_empty() {
@@ -461,7 +462,7 @@ pub async fn load(link: &Link, account_id: &str, own: u32) -> Result<Vec<u32>, S
     } else {
         link.call("ChatRoom.SetSessionActiveChatRoomGroups#1", &SetSessionActiveGroupsRequest { chat_group_ids: ids.clone(), chat_groups_data_requested: ids.clone(), virtualize_members_threshold: None }, true)
             .await
-            .map_err(|e| chat::refusal(&e))?
+            .map_err(|e| group_refusal(&e))?
     };
     let mut groups = BTreeMap::new();
     for pair in &mine.chat_room_groups {
@@ -998,7 +999,7 @@ async fn fetch(link: &Link, own: u32, group: u64, room: u64, older_than: Option<
     let answer: ChatHistoryResponse = link
         .call("ChatRoom.GetMessageHistory#1", &ChatHistoryRequest { chat_group_id: Some(group), chat_id: Some(room), last_time: Some(last_time), last_ordinal: Some(last_ordinal), start_time: Some(0), start_ordinal: Some(0), max_count: Some(PAGE) }, true)
         .await
-        .map_err(|e| chat::refusal(&e))?;
+        .map_err(|e| group_refusal(&e))?;
     let mut past: Vec<Past> = answer.messages.iter().filter_map(|m| read_past(m, own)).collect();
     // Steam answers newest first.
     past.reverse();
@@ -1117,10 +1118,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, text: &str) -> Result<(), S
     let people: Vec<(u32, String)> = held(&buffer.account_id, group).map(|g| g.members.iter().map(|m| (m.account, person(&buffer.account_id, m.account).name)).collect()).unwrap_or_default();
     let can_all = held(&buffer.account_id, group).is_some_and(|g| g.may_mention_all());
     let text = mentionize(text, &people, can_all);
-    let answer: ChatSendResponse = link
-        .call("ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: Some(room), message: Some(text.clone()), echo_to_sender: Some(false) }, true)
+    let answer: ChatSendResponse = chat::send_with_patience(&link, "ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: Some(room), message: Some(text.clone()), echo_to_sender: Some(false) }, true, true)
         .await
-        .map_err(|e| super::explained(&buffer.account_id, chat::refusal(&e)))?;
+        .map_err(|why| super::explained(&buffer.account_id, why))?;
     let said = answer.modified_message.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&text);
     let rendered = super::bbcode::render_message(said);
     let at = answer.server_timestamp.unwrap_or(0);
@@ -1165,7 +1165,7 @@ pub async fn delete_message(state: &AppState, buffer: &Buffer, msg_id: &str) -> 
     let _: DeleteChatMessagesResponse = link
         .call("ChatRoom.DeleteChatMessages#1", &DeleteChatMessagesRequest { chat_group_id: Some(group), chat_id: Some(room), messages: vec![DeleteChatMessage { server_timestamp: Some(at), ordinal: Some(ordinal) }] }, true)
         .await
-        .map_err(|e| chat::refusal(&e))?;
+        .map_err(|e| group_refusal(&e))?;
     state.runtime.delete_message(state, &buffer.id, msg_id);
     Ok(())
 }
@@ -1180,7 +1180,7 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
     let _: ChatReactionResponse = link
         .call("ChatRoom.UpdateMessageReaction#1", &ChatReactionRequest { chat_group_id: Some(group), chat_id: Some(room), server_timestamp: Some(at), ordinal: Some(ordinal), reaction_type: Some(kind), reaction: Some(reaction), is_add: Some(add) }, true)
         .await
-        .map_err(|e| chat::refusal(&e))?;
+        .map_err(|e| group_refusal(&e))?;
     state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
     Ok(())
 }
@@ -1238,7 +1238,22 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, roster: &
 
 /// `ChatRoom.<method>#1` for a request that has no answer worth reading.
 async fn command<Q: prost::Message, A: prost::Message + Default>(link: &Link, method: &str, request: &Q) -> Result<A, String> {
-    link.call(&format!("ChatRoom.{method}#1"), request, true).await.map_err(|e| chat::refusal(&e))
+    link.call(&format!("ChatRoom.{method}#1"), request, true).await.map_err(|e| group_refusal(&e))
+}
+
+/// Why a call about a group was refused, in the words that fit a group: the Steam client has no
+/// words for most of these and says that it failed, so these are the codes it does tell apart
+/// (a name it will not accept, being refused, a limit) said plainly, and the rest by the general table.
+pub fn group_refusal(error: &super::link::CallError) -> String {
+    use super::link::CallError;
+    match error {
+        CallError::Refused(super::eresult::ACCESS_DENIED, _) => "you do not have the permission for that in this group".to_string(),
+        CallError::Refused(12, _) => "Steam does not accept that name".to_string(),
+        CallError::Refused(super::eresult::LIMIT_EXCEEDED, _) => "the group is at a limit Steam keeps (rooms, roles, invite links or members)".to_string(),
+        CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND | super::eresult::INVALID_STATE, _) => "that group, room or person is not there any more".to_string(),
+        CallError::Refused(super::eresult::LIMITED_USER_ACCOUNT | super::eresult::INSUFFICIENT_PRIVILEGE, _) => "a limited account cannot do that; Steam asks for a purchase first".to_string(),
+        other => chat::refusal(other),
+    }
 }
 
 /// What the window can ask of a group.
@@ -1354,8 +1369,8 @@ fn join_refusal(e: super::link::CallError) -> String {
     match e {
         CallError::Refused(super::eresult::ACCESS_DENIED, _) => "you were removed from that group for now and cannot come back yet".to_string(),
         CallError::Refused(super::eresult::BANNED, _) => "you have been banned from that group".to_string(),
-        CallError::Refused(9, _) => "that invite link is no longer good".to_string(),
-        other => chat::refusal(&other),
+        CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND, _) => "that invite link is no longer good".to_string(),
+        other => group_refusal(&other),
     }
 }
 
@@ -1465,8 +1480,13 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             Ok(json!({}))
         }
         Action::Ban { group, who, banned } => {
-            let _: BanChatUserResponse = command(&link, "SetUserBanState", &BanChatUserRequest { chat_group_id: Some(group), steamid: Some(who), ban_state: Some(banned) }).await?;
-            Ok(json!({}))
+            // Banning somebody already banned, or lifting what is not there, is answered "duplicate
+            // request", which the Steam client takes as having worked.
+            let done: Result<BanChatUserResponse, _> = link.call("ChatRoom.SetUserBanState#1", &BanChatUserRequest { chat_group_id: Some(group), steamid: Some(who), ban_state: Some(banned) }, true).await;
+            match done {
+                Ok(_) | Err(super::link::CallError::Refused(super::eresult::DUPLICATE_REQUEST, _)) => Ok(json!({})),
+                Err(e) => Err(group_refusal(&e)),
+            }
         }
         Action::Mute { group, who, seconds } => {
             let _: MuteChatUserResponse = command(&link, "MuteUserInGroup", &MuteChatUserRequest { chat_group_id: Some(group), steamid: Some(who), expiration: Some(ends_at(seconds)) }).await?;

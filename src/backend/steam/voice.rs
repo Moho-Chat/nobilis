@@ -51,7 +51,35 @@ fn say<Q: Message>(link: &Link, method: &str, request: &Q) -> Result<(), String>
 }
 
 async fn ask<Q: Message, A: Message + Default>(link: &Link, method: &str, request: &Q) -> Result<A, String> {
-    link.call(method, request, true).await.map_err(|e| refusal(&e))
+    link.call(method, request, true).await.map_err(|e| voice_refusal(&e, method))
+}
+
+/// What the window reads at the front of a failure that may be gone in a moment, as the Steam client
+/// reads them: it tries a call again, after a little longer each time, for up to a minute.
+pub const AGAIN: &str = "[again] ";
+
+/// Why a voice call was refused, in the words that fit it. A failure that is the server's and
+/// passing is marked [`AGAIN`] for the window to try again; being refused for good is said.
+fn voice_refusal(error: &super::link::CallError, method: &str) -> String {
+    use super::link::CallError;
+    use super::eresult as e;
+    let transient = match error {
+        CallError::TimedOut => true,
+        CallError::Refused(code, _) => matches!(*code, e::FAIL | e::BUSY | e::TIMEOUT | e::SERVICE_UNAVAILABLE | 32 | 33 | 37 | 55),
+        _ => false,
+    };
+    if transient {
+        return format!("{AGAIN}{}", refusal(error));
+    }
+    match error {
+        CallError::Refused(e::ACCESS_DENIED, _) if method.starts_with("ChatRoom.JoinVoiceChat") => "you may not join voice in this room".to_string(),
+        CallError::Refused(e::ACCESS_DENIED, _) if method.starts_with("VoiceChat.RequestOneOnOneChat") => "this person is not taking calls from you".to_string(),
+        CallError::Refused(e::BLOCKED, _) | CallError::Refused(e::IGNORED, _) => "this person cannot be called".to_string(),
+        CallError::Refused(e::LIMIT_EXCEEDED, _) => "the voice chat is full".to_string(),
+        CallError::Refused(e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_PARAM | e::INVALID_STATE, _) if method.starts_with("ChatRoom.JoinVoiceChat") => "this room has no voice".to_string(),
+        CallError::Refused(e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_STATE, _) => "that call is over".to_string(),
+        other => refusal(other),
+    }
 }
 
 /// One thing the window asks of the voice, and what Steam answers.
@@ -280,6 +308,19 @@ mod tests {
 
         let (known, event) = told(&state, "VoiceChatClient.NotifyNothingInParticular#1", Vec::new());
         assert!(!known && event.is_none(), "a method this does not know is not told");
+    }
+
+    #[test]
+    fn a_passing_failure_is_marked_for_trying_again_and_being_refused_for_good_is_said() {
+        use crate::backend::steam::link::CallError;
+        assert!(voice_refusal(&CallError::Refused(2, None), "ChatRoom.JoinVoiceChat#1").starts_with(AGAIN));
+        assert!(voice_refusal(&CallError::TimedOut, "WebRTCClient.InitiateWebRTCConnection#1").starts_with(AGAIN));
+        assert_eq!(voice_refusal(&CallError::Refused(15, None), "ChatRoom.JoinVoiceChat#1"), "you may not join voice in this room");
+        assert_eq!(voice_refusal(&CallError::Refused(15, None), "VoiceChat.RequestOneOnOneChat#1"), "this person is not taking calls from you");
+        assert_eq!(voice_refusal(&CallError::Refused(40, None), "VoiceChat.RequestOneOnOneChat#1"), "this person cannot be called");
+        assert_eq!(voice_refusal(&CallError::Refused(25, None), "ChatRoom.JoinVoiceChat#1"), "the voice chat is full");
+        assert_eq!(voice_refusal(&CallError::Refused(42, None), "ChatRoom.JoinVoiceChat#1"), "this room has no voice");
+        assert!(!voice_refusal(&CallError::Closed, "VoiceChat.EndOneOnOneChat#1").starts_with(AGAIN));
     }
 
     #[test]

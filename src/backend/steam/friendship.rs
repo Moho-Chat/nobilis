@@ -93,7 +93,13 @@ pub async fn add(link: &Link, target: &Target) -> Result<Added, String> {
 /// What is known to cause it is said alongside, as what to try rather than as
 /// the cause, because Steam does not say which it was.
 fn refusal_of(code: i32, target: &Target) -> String {
-    let words = eresult::describe(code);
+    // What an add means by some answers is not what they mean elsewhere.
+    let words = match code {
+        eresult::NO_MATCH | eresult::ACCOUNT_NOT_FOUND => "Steam found nobody by that name or number".to_string(),
+        eresult::LIMIT_EXCEEDED => "a friends list can only hold so many people, and one of the two is full".to_string(),
+        eresult::ACCESS_DENIED => "this person's settings do not allow a friend request from you".to_string(),
+        other => eresult::describe(other),
+    };
     if code != eresult::FAIL {
         return words;
     }

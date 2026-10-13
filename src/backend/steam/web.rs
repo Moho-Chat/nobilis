@@ -288,7 +288,7 @@ pub async fn upload_avatar(link: &Link, key: &str, steamid: u64, refresh_token: 
     let (http, cookie, session_id) = login(link, key, steamid, refresh_token).await?;
     let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(mime).map_err(|e| e.to_string())?;
     let form = reqwest::multipart::Form::new().text("sessionid", session_id).part("avatar", part);
-    let answer = site(&http, &cookie, &format!("{SITE}/chat/avatarfileupload/"), form).await?;
+    let answer = site_coded(&http, &cookie, &format!("{SITE}/chat/avatarfileupload/"), form).await.map_err(|(code, said)| avatar_refusal(code, said))?;
     let sha = answer.sha.filter(|s| s.len() == 40).ok_or("Steam took the picture and did not say what it is called")?;
     (0..sha.len()).step_by(2).map(|i| u8::from_str_radix(&sha[i..i + 2], 16).map_err(|_| "Steam named the picture in a way that is not understood".to_string())).collect()
 }
@@ -318,10 +318,11 @@ pub async fn aliases(link: &Link, key: &str, steamid: u64, refresh_token: &str, 
         .send()
         .await
         .map_err(|e| format!("could not reach Steam's website: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Steam's website refused it ({})", response.status()));
-    }
+    let status = response.status();
     let raw = response.bytes().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(explain(status, &serde_json::from_str(&plain(&raw)).unwrap_or_default()));
+    }
     Ok(read_aliases(&plain(&raw)))
 }
 
@@ -340,6 +341,11 @@ pub fn read_aliases(text: &str) -> Vec<(String, String)> {
 /// One call to the site, read as the client reads it: the body is JSON even
 /// when the status is an error, and its `message` is what to show.
 async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::multipart::Form) -> Result<Answer, String> {
+    site_coded(http, cookie, url, form).await.map_err(|(_, why)| why)
+}
+
+/// The same, with the result code the site gave, for a caller that has words of its own for some.
+async fn site_coded(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::multipart::Form) -> Result<Answer, (Option<i64>, String)> {
     let response = http
         .post(url)
         .header("Cookie", cookie)
@@ -347,7 +353,7 @@ async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::mu
         .multipart(form)
         .send()
         .await
-        .map_err(|e| format!("could not reach Steam's website: {e}"))?;
+        .map_err(|e| (None, format!("could not reach Steam's website: {e}")))?;
     let status = response.status();
     let raw = response.bytes().await.unwrap_or_default();
     let text = plain(&raw);
@@ -355,19 +361,70 @@ async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::mu
     // Never the body: it carries the signed address the file is sent to.
     tracing::debug!("steam web: {} -> {status}, success {:?}", url.split('?').next().unwrap_or(url), answer.success);
     if !status.is_success() || answer.success.is_some_and(|s| s != 1) {
-        return Err(answer.message.filter(|m| !m.is_empty()).unwrap_or_else(|| match (status.as_u16(), answer.success) {
+        let why = answer.message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| match (status.as_u16(), answer.success) {
             // The site answers in Steam's own result codes, which say why far better than the status.
             (_, Some(code)) if code > 1 => format!("Steam refused it: {}", super::eresult::describe(code as i32)),
             (401 | 403, _) => "Steam's website did not accept this sign-in".to_string(),
             _ => format!("Steam's website refused it ({status})"),
-        }));
+        });
+        return Err((answer.success, why));
     }
     Ok(answer)
+}
+
+/// Why the site refused something, from its status and what it said: its own result code in the
+/// words of the general table when it gave one, and otherwise what the status means.
+pub(super) fn explain(status: reqwest::StatusCode, answer: &serde_json::Value) -> String {
+    if let Some(message) = answer["message"].as_str().filter(|m| !m.is_empty()) {
+        return message.to_string();
+    }
+    match (status.as_u16(), answer["success"].as_i64()) {
+        (_, Some(code)) if code > 1 => format!("Steam refused it: {}", super::eresult::describe(code as i32)),
+        (401 | 403, _) => "Steam's website did not accept this sign-in; try again in a moment".to_string(),
+        (429, _) => "Steam's website is limiting how often this can be done; wait a while".to_string(),
+        (500..=599, _) => "Steam's website is having trouble just now; try again in a moment".to_string(),
+        _ => format!("Steam's website refused it ({status})"),
+    }
+}
+
+/// Why the site refused a group's picture, in the words the client has for each: not signed in, a
+/// limited account, not allowed, failed to upload, too large, not a usable picture, a server error.
+fn avatar_refusal(code: Option<i64>, said: String) -> String {
+    match code {
+        Some(21) => "Steam's website says this account is not signed in; try again in a moment".to_string(),
+        Some(112) => "a limited account cannot change a group's picture; Steam asks for a purchase first".to_string(),
+        Some(15) => "you may not change this group's picture".to_string(),
+        Some(2) => "Steam could not take the picture; try again".to_string(),
+        Some(25) => "that picture is too large for Steam".to_string(),
+        Some(8) => "Steam cannot use that as a picture".to_string(),
+        Some(37) => "Steam had a problem on its side taking the picture; try again in a moment".to_string(),
+        _ => said,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_the_site_refuses_is_said_by_its_own_code_and_then_by_its_status() {
+        let said = |status: u16, body: serde_json::Value| explain(reqwest::StatusCode::from_u16(status).unwrap(), &body);
+        assert_eq!(said(400, serde_json::json!({ "message": "No." })), "No.");
+        assert!(said(401, serde_json::json!({ "success": 112 })).contains("limited account"));
+        assert!(said(401, serde_json::json!({})).contains("sign-in"));
+        assert!(said(429, serde_json::json!({})).contains("limiting"));
+        assert!(said(503, serde_json::json!({})).contains("trouble"));
+        assert!(said(418, serde_json::json!({})).contains("418"));
+    }
+
+    #[test]
+    fn a_refused_picture_is_told_in_the_words_the_client_has_for_each_reason() {
+        assert!(avatar_refusal(Some(112), String::new()).contains("limited account"));
+        assert!(avatar_refusal(Some(25), String::new()).contains("too large"));
+        assert!(avatar_refusal(Some(8), String::new()).contains("cannot use"));
+        assert!(avatar_refusal(Some(15), String::new()).contains("may not"));
+        assert_eq!(avatar_refusal(Some(99), "Steam said this".into()), "Steam said this", "what Steam says of the rest is kept");
+    }
 
     #[test]
     fn the_types_are_the_ones_the_client_takes() {

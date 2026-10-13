@@ -318,9 +318,49 @@ impl Link {
         };
         let code = answer.eresult();
         if code != eresult::OK {
-            return Err(CallError::Refused(code, answer.header.error_message.filter(|m| !m.is_empty())));
+            // Steam asking for its agreement to be accepted puts the page for it in the answer, and
+            // that page is the whole of what can be done about it.
+            let said = answer.header.error_message.filter(|m| !m.is_empty()).or_else(|| (code == eresult::MUST_AGREE_TO_SSA).then(|| agreement_page(&answer.body)).flatten());
+            return Err(CallError::Refused(code, said));
         }
         A::decode(answer.body.as_slice()).map_err(|e| CallError::Unreadable(e.to_string()))
+    }
+}
+
+/// The address Steam gives for the agreement it wants accepted: the sign-in answers carry it as
+/// field 7 and the polling answer as field 8.
+fn agreement_page(body: &[u8]) -> Option<String> {
+    #[derive(Message)]
+    struct Page {
+        #[prost(string, optional, tag = "7")]
+        sign_in: Option<String>,
+        #[prost(string, optional, tag = "8")]
+        poll: Option<String>,
+    }
+    let page = Page::decode(body).ok()?;
+    page.sign_in.or(page.poll).filter(|u| u.starts_with("https://"))
+}
+
+#[cfg(test)]
+mod agreement_tests {
+    use super::*;
+
+    #[test]
+    fn the_page_for_the_agreement_steam_wants_is_found_in_either_kind_of_answer() {
+        #[derive(Message)]
+        struct Begin {
+            #[prost(string, optional, tag = "7")]
+            url: Option<String>,
+        }
+        #[derive(Message)]
+        struct Poll {
+            #[prost(string, optional, tag = "8")]
+            url: Option<String>,
+        }
+        assert_eq!(agreement_page(&Begin { url: Some("https://login.steampowered.com/a".into()) }.encode_to_vec()).as_deref(), Some("https://login.steampowered.com/a"));
+        assert_eq!(agreement_page(&Poll { url: Some("https://login.steampowered.com/b".into()) }.encode_to_vec()).as_deref(), Some("https://login.steampowered.com/b"));
+        assert_eq!(agreement_page(&Poll { url: Some("javascript:alert(1)".into()) }.encode_to_vec()), None, "only an https address is passed on");
+        assert_eq!(agreement_page(&[0xff, 0xff]), None);
     }
 }
 

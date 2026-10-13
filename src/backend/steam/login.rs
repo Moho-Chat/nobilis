@@ -191,7 +191,7 @@ pub async fn flow_qr(state: &AppState, login_id: &str, urls: &[String], mut canc
                 if tokio::time::Instant::now() >= deadline {
                     bail!("the code was not scanned in time; start again");
                 }
-                let polled = auth::poll_session(&link, &mut begun).await.map_err(|e| anyhow!("{e}"))?;
+                let polled = auth::poll_session(&link, &mut begun).await.map_err(|e| anyhow!("{}", auth::waiting_failure(e)))?;
                 // A code runs out and is replaced: the picture follows it.
                 if let Some(next) = polled.new_challenge {
                     write_qr(&next, &path)?;
@@ -292,7 +292,7 @@ pub async fn flow(
                 if tokio::time::Instant::now() >= deadline {
                     bail!("Steam was left waiting too long; start again");
                 }
-                if let Some(tokens) = auth::poll(&link, &mut begun).await.map_err(|e| anyhow!("{e}"))? {
+                if let Some(tokens) = auth::poll(&link, &mut begun).await.map_err(|e| anyhow!("{}", auth::waiting_failure(e)))? {
                     break tokens;
                 }
             }

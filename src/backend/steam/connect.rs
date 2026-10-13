@@ -105,13 +105,10 @@ pub fn read_logon(packet: &Packet) -> Result<Logon> {
         });
     }
     Ok(match code {
-        eresult::RATE_LIMIT_EXCEEDED | eresult::ACCOUNT_LOGIN_DENIED_THROTTLE => Logon::Refused(Ending::Later(RATE_LIMIT_WAIT, eresult::describe(code))),
-        eresult::LOGGED_IN_ELSEWHERE => Logon::Refused(Ending::Stop(eresult::describe(code))),
+        c if eresult::is_rate_limit(c) => Logon::Refused(Ending::Later(RATE_LIMIT_WAIT, eresult::describe(c))),
         c if eresult::means_sign_in_again(c) => Logon::Refused(Ending::Stop(format!("{}. Sign in to Steam again from Accounts.", eresult::describe(c)))),
-        eresult::BANNED | eresult::SUSPENDED | eresult::ACCOUNT_DISABLED | eresult::ACCOUNT_HAS_BEEN_DELETED | eresult::ACCOUNT_LOCKED_DOWN | eresult::IP_LOGIN_RESTRICTION_FAILED => {
-            Logon::Refused(Ending::Stop(eresult::describe(code)))
-        }
-        c if eresult::worth_another_server(c) => Logon::TryAnother(eresult::describe(c)),
+        c if eresult::is_final(c) => Logon::Refused(Ending::Stop(eresult::describe(c))),
+        // Whatever else is something a server did, or did not, and another may do better.
         c => Logon::TryAnother(eresult::describe(c)),
     })
 }
@@ -554,8 +551,8 @@ impl Drive<'_> {
                 let code = ClientLoggedOff::decode(packet.body.as_slice()).ok().and_then(|m| m.eresult).unwrap_or(eresult::FAIL);
                 tracing::info!("steam[{}]: Steam signed this session out: {} ({code})", self.account_id, eresult::describe(code));
                 return Some(match code {
-                    eresult::LOGGED_IN_ELSEWHERE => Ending::Stop(eresult::describe(code)),
                     c if eresult::means_sign_in_again(c) => Ending::Stop(format!("{}. Sign in to Steam again from Accounts.", eresult::describe(c))),
+                    c if eresult::is_final(c) => Ending::Stop(eresult::describe(c)),
                     _ => Ending::Closed,
                 });
             }
