@@ -52,6 +52,8 @@ const SERVER_INVITED_MANY: i32 = 14;
 
 /// `EChatRoomMemberStateChange`.
 const CHANGE_JOINED: i32 = 1;
+const CHANGE_INVITED: i32 = 4;
+const CHANGE_INVITE_DISMISSED: i32 = 8;
 const CHANGE_PARTED: i32 = 2;
 const CHANGE_KICKED: i32 = 3;
 const CHANGE_RANK: i32 = 7;
@@ -969,7 +971,22 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             let n = ChatUserStateChange::decode(body).ok()?;
             let group = n.chat_group_id?;
             match n.user_action {
-                Some(CHANGE_JOINED) => out.reload = true,
+                Some(CHANGE_JOINED) => {
+                    // Taken up here or on another client: it is not waiting any more.
+                    with(account_id, |a| a.invites.retain(|i| i.group != group));
+                    tell_invites(state, account_id);
+                    out.reload = true;
+                }
+                // Invited as the group was made or by its members, which is not a message in a
+                // conversation: Steam says so here, with what the group is called.
+                Some(CHANGE_INVITED) => {
+                    let name = n.group_summary.as_ref().and_then(|s| s.chat_group_name.clone()).unwrap_or_default();
+                    note_invite(state, account_id, "", (group, None, name));
+                }
+                Some(CHANGE_INVITE_DISMISSED) => {
+                    with(account_id, |a| a.invites.retain(|i| i.group != group));
+                    tell_invites(state, account_id);
+                }
                 Some(action @ (CHANGE_PARTED | CHANGE_KICKED | CHANGE_BANNED)) => {
                     removed(state, account_id, group, action);
                     publish(state, account_id, roster);
@@ -1772,6 +1789,26 @@ pub fn to_json(account_id: &str, group: Option<u64>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn being_invited_as_a_group_is_made_waits_to_be_answered_and_taking_it_up_clears_it() {
+        use prost::Message;
+        let state = crate::backend::kick::testkit::simulated_daemon("steam-groups-invited");
+        let acc = "steam:groups-invited";
+        let roster = set_up(&state, acc);
+        let mut rx = state.events.subscribe();
+        let invited = ChatUserStateChange { chat_group_id: Some(99), user_action: Some(CHANGE_INVITED), group_summary: Some(ChatGroupSummary { chat_group_id: Some(99), chat_group_name: Some("Newcomers".into()), ..Default::default() }), ..Default::default() };
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", invited.encode_to_vec());
+        let waiting = invites_json(acc);
+        assert_eq!((waiting.len(), waiting[0]["roomId"].as_str(), waiting[0]["name"].as_str()), (1, Some("99"), Some("Newcomers")));
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|e| e.name == "steamGroupInvites"), "the window is told");
+        // The same again is one; joined, anywhere, it is gone.
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", invited.encode_to_vec());
+        assert_eq!(invites_json(acc).len(), 1);
+        let joined = ChatUserStateChange { chat_group_id: Some(99), user_action: Some(CHANGE_JOINED), ..Default::default() };
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", joined.encode_to_vec());
+        assert!(invites_json(acc).is_empty());
+    }
 
     #[test]
     fn a_direct_invitation_is_read_from_the_message_that_carries_it() {

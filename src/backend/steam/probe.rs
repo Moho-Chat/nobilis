@@ -3067,6 +3067,16 @@ async fn a_group_watched_from_the_official_client() {
     })
     .await;
     tokio::time::sleep(Duration::from_secs(4)).await;
+    println!(
+        "OFFICIAL groups at sign-in: {:?}",
+        state
+            .runtime
+            .list_buffer_groups()
+            .into_iter()
+            .filter(|g| g.account_id == id)
+            .map(|g| g.name)
+            .collect::<Vec<_>>()
+    );
     // A group from an earlier run is used again, so the person in the official client keeps it.
     let existing = state
         .runtime
@@ -3267,6 +3277,8 @@ async fn a_group_watched_from_the_official_client() {
                                 );
                             }
                         }
+                    } else if line.starts_with("!accept ") || line.starts_with("!dismiss ") {
+                        // Answered above.
                     } else if of_room != Some(group) {
                         // Said, shown and reacted to only in the group the person is in.
                     } else if let Some(path) = line.strip_prefix("!image ") {
