@@ -49,11 +49,7 @@ const BUDGET: Duration = Duration::from_secs(105);
 pub enum Work {
     Sha256,
     /// Costs are the service's own: memory in KiB, then passes and lanes.
-    Argon2id {
-        m_cost: u32,
-        t_cost: u32,
-        p_cost: u32,
-    },
+    Argon2id { m_cost: u32, t_cost: u32, p_cost: u32 },
 }
 
 impl Work {
@@ -83,17 +79,9 @@ impl Work {
                 hasher.update(password);
                 out.copy_from_slice(&hasher.finalize());
             }
-            Work::Argon2id {
-                m_cost,
-                t_cost,
-                p_cost,
-            } => {
+            Work::Argon2id { m_cost, t_cost, p_cost } => {
                 let params = argon2::Params::new(*m_cost, *t_cost, *p_cost, Some(HASH_LEN))
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "the captcha asked for argon2 settings that are not usable: {e}"
-                        )
-                    })?;
+                    .map_err(|e| anyhow::anyhow!("the captcha asked for argon2 settings that are not usable: {e}"))?;
                 argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
                     .hash_password_into(password, ARGON_SALT, &mut out)
                     .map_err(|e| anyhow::anyhow!("hashing the captcha's challenge: {e}"))?;
@@ -121,9 +109,7 @@ fn clears(hash: &[u8; HASH_LEN], difficulty: u32) -> bool {
 /// widget's JavaScript.
 pub fn find_nonce(salt: &str, difficulty: u32, work: &Work, deadline: Instant) -> Result<u64> {
     if difficulty > MAX_DIFFICULTY {
-        bail!(
-            "the captcha asked for {difficulty} zero bits, which is more work than it can be owed"
-        );
+        bail!("the captcha asked for {difficulty} zero bits, which is more work than it can be owed");
     }
     let mut nonce: u64 = 0;
     loop {
@@ -161,12 +147,8 @@ pub async fn solve(http: &HttpClient, base: &str, site_key: &str) -> Result<Stri
         .get(&format!("{base}{API_BASE}/start?key={site_key}"))
         .await
         .context("asking the captcha for a challenge")?;
-    let answer: Value = serde_json::from_str(&start.body).with_context(|| {
-        format!(
-            "the captcha answered with something that is not JSON (HTTP {})",
-            start.status
-        )
-    })?;
+    let answer: Value = serde_json::from_str(&start.body)
+        .with_context(|| format!("the captcha answered with something that is not JSON (HTTP {})", start.status))?;
     if answer["status"].as_str() != Some("challenge") {
         bail!("the captcha would not start: {}", message(&answer));
     }
@@ -195,12 +177,8 @@ pub async fn solve(http: &HttpClient, base: &str, site_key: &str) -> Result<Stri
             )
             .await
             .context("handing the captcha a solved round")?;
-        let answer: Value = serde_json::from_str(&resp.body).with_context(|| {
-            format!(
-                "the captcha answered a round with something that is not JSON (HTTP {})",
-                resp.status
-            )
-        })?;
+        let answer: Value = serde_json::from_str(&resp.body)
+            .with_context(|| format!("the captcha answered a round with something that is not JSON (HTTP {})", resp.status))?;
 
         match answer["status"].as_str() {
             Some("complete") | Some("verified") => {
@@ -264,15 +242,9 @@ mod tests {
         // SHA-256 at a difficulty the test can afford, checked by hashing the
         // answer again the way the site would.
         let deadline = Instant::now() + Duration::from_secs(30);
-        let nonce =
-            find_nonce("some-salt_abcd", 12, &Work::Sha256, deadline).expect("should find a nonce");
-        let hash = Work::Sha256
-            .hash(format!("some-salt_abcd{nonce}").as_bytes())
-            .unwrap();
-        assert!(
-            clears(&hash, 12),
-            "the nonce it found does not actually clear the bar"
-        );
+        let nonce = find_nonce("some-salt_abcd", 12, &Work::Sha256, deadline).expect("should find a nonce");
+        let hash = Work::Sha256.hash(format!("some-salt_abcd{nonce}").as_bytes()).unwrap();
+        assert!(clears(&hash, 12), "the nonce it found does not actually clear the bar");
     }
 
     #[test]
@@ -280,52 +252,21 @@ mod tests {
         // The live settings, at a difficulty low enough to stay quick: this
         // is here to catch the parameters being rejected outright, which is
         // what a wrong m_cost/p_cost pairing does.
-        let work = Work::Argon2id {
-            m_cost: 256,
-            t_cost: 1,
-            p_cost: 1,
-        };
+        let work = Work::Argon2id { m_cost: 256, t_cost: 1, p_cost: 1 };
         let deadline = Instant::now() + Duration::from_secs(60);
-        let nonce = find_nonce("5ef58a71decaea9a_6aa099c3", 8, &work, deadline)
-            .expect("should find a nonce");
-        let hash = work
-            .hash(format!("5ef58a71decaea9a_6aa099c3{nonce}").as_bytes())
-            .unwrap();
+        let nonce = find_nonce("5ef58a71decaea9a_6aa099c3", 8, &work, deadline).expect("should find a nonce");
+        let hash = work.hash(format!("5ef58a71decaea9a_6aa099c3{nonce}").as_bytes()).unwrap();
         assert!(clears(&hash, 8));
     }
 
     #[test]
     fn the_algorithm_comes_off_the_wire_and_defaults_to_what_came_before() {
         let start = serde_json::json!({ "algorithm": "argon2id", "argon2_m_cost": 512, "argon2_t_cost": 2, "argon2_p_cost": 1 });
-        assert_eq!(
-            Work::read(&start, &Work::Sha256),
-            Work::Argon2id {
-                m_cost: 512,
-                t_cost: 2,
-                p_cost: 1
-            }
-        );
+        assert_eq!(Work::read(&start, &Work::Sha256), Work::Argon2id { m_cost: 512, t_cost: 2, p_cost: 1 });
         // A round that says nothing keeps whatever the last one asked for.
         let quiet = serde_json::json!({ "status": "next_round" });
-        assert_eq!(
-            Work::read(
-                &quiet,
-                &Work::Argon2id {
-                    m_cost: 256,
-                    t_cost: 1,
-                    p_cost: 1
-                }
-            ),
-            Work::Argon2id {
-                m_cost: 256,
-                t_cost: 1,
-                p_cost: 1
-            }
-        );
-        assert_eq!(
-            Work::read(&serde_json::json!({ "algorithm": "sha256" }), &Work::Sha256),
-            Work::Sha256
-        );
+        assert_eq!(Work::read(&quiet, &Work::Argon2id { m_cost: 256, t_cost: 1, p_cost: 1 }), Work::Argon2id { m_cost: 256, t_cost: 1, p_cost: 1 });
+        assert_eq!(Work::read(&serde_json::json!({ "algorithm": "sha256" }), &Work::Sha256), Work::Sha256);
     }
 
     #[test]

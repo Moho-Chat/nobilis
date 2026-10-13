@@ -15,21 +15,11 @@ use serde_json::Value;
 /// Which account a conversation belongs to, or an empty string - which every
 /// lookup that takes one already treats as "no such account".
 fn channel_account(state: &AppState, buffer_id: &str) -> String {
-    state
-        .runtime
-        .get_buffer(buffer_id)
-        .map(|b| b.account_id)
-        .unwrap_or_default()
+    state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default()
 }
 
-fn kick_credential(
-    state: &AppState,
-    account_id: &str,
-) -> std::result::Result<(reqwest::Client, String), String> {
-    let cfg = state
-        .accounts
-        .get_kick(account_id)
-        .ok_or_else(|| "no such account".to_string())?;
+fn kick_credential(state: &AppState, account_id: &str) -> std::result::Result<(reqwest::Client, String), String> {
+    let cfg = state.accounts.get_kick(account_id).ok_or_else(|| "no such account".to_string())?;
     let token = cfg
         .token
         .filter(|t| !t.is_empty())
@@ -45,12 +35,7 @@ fn kick_credential(
 /// the service itself was told and it follows the account everywhere, "window"
 /// when there was nobody to tell and this is moho declining to show what still
 /// arrives.
-async fn apply_ignore(
-    state: &AppState,
-    account_id: &str,
-    target: &str,
-    ignored: bool,
-) -> anyhow::Result<&'static str> {
+async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored: bool) -> anyhow::Result<&'static str> {
     match crate::model::service_of(account_id) {
         // The homeserver keeps the list and stops sending the messages, so
         // there is nothing to keep here.
@@ -118,14 +103,8 @@ fn reconnect_routed(state: &AppState) {
 fn adding_service(method: &str) -> Option<&'static str> {
     match method {
         "addDiscordAccount" | "addDiscordAccountToken" => Some("discord"),
-        "addMatrixAccount"
-        | "addMatrixAccountDeviceCode"
-        | "matrixAuthMetadata"
-        | "registerMatrixAccount"
-        | "matrixRegistrationFlows"
-        | "matrixLoginFlows"
-        | "addMatrixAccountSso"
-        | "addMatrixAccountQr" => Some("matrix"),
+        "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
+        | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
         _ => None,
@@ -143,19 +122,13 @@ pub async fn dispatch(
     // Recorded for the service so those requests are routed, and so the
     // account they create starts with the same choice. Only when the request
     // says - a continuation such as a second factor leaves it as it was.
-    if let (Some(service), Some(use_tor)) = (
-        adding_service(method),
-        params.get("useTor").and_then(|v| v.as_bool()),
-    ) {
+    if let (Some(service), Some(use_tor)) = (adding_service(method), params.get("useTor").and_then(|v| v.as_bool())) {
         let router = crate::net::route::router();
         let key = crate::net::route::pending_key(service);
         router.mark(&key, use_tor);
         if router.routed(&key) {
             if let Err(e) = router.ready(|_| {}).await {
-                return (
-                    None,
-                    Some(format!("couldn't start Tor or reach the proxy: {e:#}")),
-                );
+                return (None, Some(format!("couldn't start Tor or reach the proxy: {e:#}")));
             }
         }
     }

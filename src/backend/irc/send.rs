@@ -13,13 +13,7 @@ use super::*;
 /// PRIVMSG. Mirrors daemon/nobilis/actions.c's nobilis_send_message, minus
 /// libpurple's purple_cmd_do_command registry (hand-rolled here instead -
 /// see project plan). Returns Err with a user-facing message on failure.
-pub fn send_message(
-    state: &AppState,
-    account_id: &str,
-    sender: &Sender,
-    target_buffer: &str,
-    body: &str,
-) -> Result<()> {
+pub fn send_message(state: &AppState, account_id: &str, sender: &Sender, target_buffer: &str, body: &str) -> Result<()> {
     if let Some(rest) = body.strip_prefix('/') {
         // A command takes its argument from the rest of the line; a second line
         // would be sent as part of it, into a nick change or a topic.
@@ -27,13 +21,7 @@ pub fn send_message(
             bail!("a command is one line");
         }
         if let Some(literal) = rest.strip_prefix('/') {
-            return send_plain(
-                state,
-                account_id,
-                sender,
-                target_buffer,
-                &format!("/{literal}"),
-            );
+            return send_plain(state, account_id, sender, target_buffer, &format!("/{literal}"));
         }
         let mut parts = rest.splitn(2, ' ');
         let cmd = parts.next().unwrap_or("").to_lowercase();
@@ -43,32 +31,11 @@ pub fn send_message(
             "part" => sender.send_part(target_buffer).map_err(|e| anyhow!(e)),
             "me" => {
                 sender.send_action(target_buffer, arg)?;
-                let own_nick = state
-                    .runtime
-                    .irc_current_nick(account_id)
-                    .unwrap_or_default();
-                state.runtime.record_message(
-                    state,
-                    account_id,
-                    target_buffer,
-                    buffer_kind_hint(target_buffer),
-                    &own_nick,
-                    arg,
-                    true,
-                    "chat",
-                    None,
-                    None,
-                    false,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                );
+                let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
+                state.runtime.record_message(state, account_id, target_buffer, buffer_kind_hint(target_buffer), &own_nick, arg, true, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
                 Ok(())
             }
-            "nick" => sender
-                .send(Command::NICK(arg.to_string()))
-                .map_err(|e| anyhow!(e)),
+            "nick" => sender.send(Command::NICK(arg.to_string())).map_err(|e| anyhow!(e)),
             // The other name you have here. `nick` is what people call you;
             // this is the sentence about yourself that USER fixed at
             // registration and that, without `setname`, could only be changed
@@ -90,9 +57,7 @@ pub fn send_message(
                 }
                 Ok(())
             }
-            "topic" => sender
-                .send_topic(target_buffer, arg)
-                .map_err(|e| anyhow!(e)),
+            "topic" => sender.send_topic(target_buffer, arg).map_err(|e| anyhow!(e)),
             // Moderator actions - the frontend only offers these in the
             // userlist context menu when the presence data it already has
             // shows the local user holding founder/op/halfop in this
@@ -107,23 +72,14 @@ pub fn send_message(
                 if nick.is_empty() {
                     bail!("/kick requires a nick");
                 }
-                sender
-                    .send(Command::KICK(
-                        target_buffer.to_string(),
-                        nick.to_string(),
-                        reason.map(String::from),
-                    ))
-                    .map_err(|e| anyhow!(e))
+                sender.send(Command::KICK(target_buffer.to_string(), nick.to_string(), reason.map(String::from))).map_err(|e| anyhow!(e))
             }
             "ban" => {
                 if arg.is_empty() {
                     bail!("/ban requires a nick");
                 }
                 sender
-                    .send(Command::ChannelMODE(
-                        target_buffer.to_string(),
-                        vec![Mode::Plus(ChannelMode::Ban, Some(ban_mask(arg)))],
-                    ))
+                    .send(Command::ChannelMODE(target_buffer.to_string(), vec![Mode::Plus(ChannelMode::Ban, Some(ban_mask(arg)))]))
                     .map_err(|e| anyhow!(e))
             }
             // Raw, deliberately. Channel modes are a small language of their
@@ -140,24 +96,15 @@ pub fn send_message(
                 if target.is_empty() {
                     bail!("/mode needs a channel or nick");
                 }
-                let raw = if rest.is_empty() {
-                    format!("MODE {target}")
-                } else {
-                    format!("MODE {target} {rest}")
-                };
-                sender
-                    .send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?)
-                    .map_err(|e| anyhow!(e))
+                let raw = if rest.is_empty() { format!("MODE {target}") } else { format!("MODE {target} {rest}") };
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
             }
             "unban" => {
                 if arg.is_empty() {
                     bail!("/unban requires a nick or mask");
                 }
                 sender
-                    .send(Command::ChannelMODE(
-                        target_buffer.to_string(),
-                        vec![Mode::Minus(ChannelMode::Ban, Some(ban_mask(arg)))],
-                    ))
+                    .send(Command::ChannelMODE(target_buffer.to_string(), vec![Mode::Minus(ChannelMode::Ban, Some(ban_mask(arg)))]))
                     .map_err(|e| anyhow!(e))
             }
             "invite" => {
@@ -169,23 +116,15 @@ pub fn send_message(
                 // The channel may be named, or taken from where the command
                 // was typed - which is what somebody means nine times in ten.
                 let channel = invite_parts.next().unwrap_or(target_buffer);
-                sender
-                    .send(Command::INVITE(nick.to_string(), channel.to_string()))
-                    .map_err(|e| anyhow!(e))
+                sender.send(Command::INVITE(nick.to_string(), channel.to_string())).map_err(|e| anyhow!(e))
             }
             // Asks the server for its channel list. The answer arrives as
             // numerics and is gathered up rather than printed line by line -
             // a network's list runs to tens of thousands of channels, which
             // is a directory to search rather than a wall of chat.
             "list" => {
-                let raw = if arg.is_empty() {
-                    "LIST".to_string()
-                } else {
-                    format!("LIST {arg}")
-                };
-                sender
-                    .send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?)
-                    .map_err(|e| anyhow!(e))
+                let raw = if arg.is_empty() { "LIST".to_string() } else { format!("LIST {arg}") };
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
             }
             "op" => set_channel_mode(sender, target_buffer, ChannelMode::Oper, true, arg),
             "deop" => set_channel_mode(sender, target_buffer, ChannelMode::Oper, false, arg),
@@ -205,10 +144,7 @@ pub fn send_message(
             // and writes the stored one and puts the answer where the other
             // answers about the network go.
             "notify" | "unnotify" => {
-                let host = account_id
-                    .split_once('@')
-                    .map(|(_, h)| h)
-                    .unwrap_or(account_id);
+                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
                 let Some(config) = state.accounts.get_irc(account_id) else {
                     bail!("no such account");
                 };
@@ -222,23 +158,7 @@ pub fn send_message(
                     } else {
                         format!("watching: {}", list.join(", "))
                     };
-                    state.runtime.record_message(
-                        state,
-                        account_id,
-                        host,
-                        "server",
-                        "*",
-                        &body,
-                        false,
-                        "system",
-                        None,
-                        None,
-                        false,
-                        None,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    );
+                    state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                     return Ok(());
                 }
                 if nick.is_empty() || is_channel(nick) {
@@ -264,60 +184,31 @@ pub fn send_message(
                     if let Ok(msg) = raw.parse::<Message>() {
                         let _ = sender.send(msg);
                     }
-                    notify_seen()
-                        .lock()
-                        .unwrap()
-                        .entry(account_id.to_string())
-                        .or_default()
-                        .remove(&nick.to_lowercase());
+                    notify_seen().lock().unwrap().entry(account_id.to_string()).or_default().remove(&nick.to_lowercase());
                     format!("no longer watching {nick}")
                 } else {
                     format!("not watching {nick}")
                 };
                 state.accounts.set_irc_notify(account_id, &list.join(","))?;
-                state.runtime.record_message(
-                    state,
-                    account_id,
-                    host,
-                    "server",
-                    "*",
-                    &body,
-                    false,
-                    "system",
-                    None,
-                    None,
-                    false,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                );
+                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                 Ok(())
             }
             // Who somebody is. The reply arrives as numerics and is
             // gathered into one answer rather than printed line by line -
             // see take_whois.
             "whois" | "whowas" => {
-                let nick = if arg.is_empty() {
-                    target_buffer
-                } else {
-                    arg.split_whitespace().next().unwrap_or("")
-                };
+                let nick = if arg.is_empty() { target_buffer } else { arg.split_whitespace().next().unwrap_or("") };
                 if nick.is_empty() || is_channel(nick) {
                     bail!("/{cmd} requires a nick");
                 }
                 state.runtime.begin_irc_whois(account_id, nick);
                 let raw = format!("{} {nick}", cmd.to_uppercase());
-                sender
-                    .send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?)
-                    .map_err(|e| anyhow!(e))
+                sender.send(raw.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
             }
             // Away with a reason, back without one. The server confirms
             // either way (305/306) and that confirmation is what gets shown,
             // rather than this claiming success on its own.
-            "away" => sender
-                .send(Command::AWAY((!arg.is_empty()).then(|| arg.to_string())))
-                .map_err(|e| anyhow!(e)),
+            "away" => sender.send(Command::AWAY((!arg.is_empty()).then(|| arg.to_string()))).map_err(|e| anyhow!(e)),
             "back" => sender.send(Command::AWAY(None)).map_err(|e| anyhow!(e)),
             // A notice, which is what a client sends when it does not want an
             // answer - and what services and bots are expected to reply with,
@@ -329,31 +220,10 @@ pub fn send_message(
                 if to.is_empty() || text.is_empty() {
                     bail!("/notice requires a target and a message");
                 }
-                sender
-                    .send(Command::NOTICE(to.to_string(), text.to_string()))
-                    .map_err(|e| anyhow!(e))?;
-                let own_nick = state
-                    .runtime
-                    .irc_current_nick(account_id)
-                    .unwrap_or_default();
+                sender.send(Command::NOTICE(to.to_string(), text.to_string())).map_err(|e| anyhow!(e))?;
+                let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
                 let line = format!("-> -{to}- {text}");
-                state.runtime.record_message(
-                    state,
-                    account_id,
-                    target_buffer,
-                    buffer_kind_hint(target_buffer),
-                    &own_nick,
-                    &line,
-                    false,
-                    "notice",
-                    None,
-                    None,
-                    false,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                );
+                state.runtime.record_message(state, account_id, target_buffer, buffer_kind_hint(target_buffer), &own_nick, &line, false, "notice", None, None, false, None, Vec::new(), Vec::new(), None);
                 Ok(())
             }
             // CTCP: a PRIVMSG wrapped in \x01, which is all CTCP has ever
@@ -367,12 +237,7 @@ pub fn send_message(
                 if to.is_empty() || rest.is_empty() {
                     bail!("/ctcp requires a target and a command, e.g. /ctcp nick VERSION");
                 }
-                sender
-                    .send(Command::PRIVMSG(
-                        to.to_string(),
-                        format!("\u{1}{rest}\u{1}"),
-                    ))
-                    .map_err(|e| anyhow!(e))
+                sender.send(Command::PRIVMSG(to.to_string(), format!("\u{1}{rest}\u{1}"))).map_err(|e| anyhow!(e))
             }
             // The escape hatch. Sixteen commands cannot cover a protocol with
             // per-network extensions, services with their own vocabularies and
@@ -384,9 +249,7 @@ pub fn send_message(
                 if arg.is_empty() {
                     bail!("/{cmd} needs something to send");
                 }
-                sender
-                    .send(arg.parse::<Message>().map_err(|e| anyhow!("{e}"))?)
-                    .map_err(|e| anyhow!(e))
+                sender.send(arg.parse::<Message>().map_err(|e| anyhow!("{e}"))?).map_err(|e| anyhow!(e))
             }
             other => bail!("unknown command \"/{other}\""),
         };
@@ -465,33 +328,15 @@ pub(super) fn mode_word(mode: &ChannelMode) -> &'static str {
     }
 }
 
-pub(super) fn set_channel_mode(
-    sender: &Sender,
-    channel: &str,
-    mode: ChannelMode,
-    add: bool,
-    nick: &str,
-) -> Result<()> {
+pub(super) fn set_channel_mode(sender: &Sender, channel: &str, mode: ChannelMode, add: bool, nick: &str) -> Result<()> {
     if nick.is_empty() {
         bail!("this command requires a nick");
     }
-    let m = if add {
-        Mode::Plus(mode, Some(nick.to_string()))
-    } else {
-        Mode::Minus(mode, Some(nick.to_string()))
-    };
-    sender
-        .send(Command::ChannelMODE(channel.to_string(), vec![m]))
-        .map_err(|e| anyhow!(e))
+    let m = if add { Mode::Plus(mode, Some(nick.to_string())) } else { Mode::Minus(mode, Some(nick.to_string())) };
+    sender.send(Command::ChannelMODE(channel.to_string(), vec![m])).map_err(|e| anyhow!(e))
 }
 
-pub(super) fn send_plain(
-    state: &AppState,
-    account_id: &str,
-    sender: &Sender,
-    target: &str,
-    body: &str,
-) -> Result<()> {
+pub(super) fn send_plain(state: &AppState, account_id: &str, sender: &Sender, target: &str, body: &str) -> Result<()> {
     // Noted on the way past, so a transfer that stops short can be asked for
     // again without anybody having to remember the pack number. Ignores
     // everything that is not an XDCC request, which is almost everything.
@@ -511,33 +356,14 @@ pub(super) fn send_plain(
         return Ok(());
     }
     if pieces.len() > 1 {
-        let own_nick = state
-            .runtime
-            .irc_current_nick(account_id)
-            .unwrap_or_default();
+        let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
         if state.runtime.irc_has_cap(account_id, "draft/multiline") {
             drafts::send_multiline(sender, target, &pieces)?;
             // Recorded whole, because whole is what was sent - the pieces are
             // a transport detail and putting them in the log as separate
             // lines would be showing the reader the envelope.
             if !state.runtime.irc_has_cap(account_id, "echo-message") {
-                state.runtime.record_message(
-                    state,
-                    account_id,
-                    target,
-                    buffer_kind_hint(target),
-                    &own_nick,
-                    body,
-                    false,
-                    "chat",
-                    None,
-                    None,
-                    false,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                );
+                state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
             }
             return Ok(());
         }
@@ -559,37 +385,15 @@ pub(super) fn send_plain(
     let echoes = state.runtime.irc_has_cap(account_id, "echo-message");
     if !echoes {
         sender.send_privmsg(target, body)?;
-        let own_nick = state
-            .runtime
-            .irc_current_nick(account_id)
-            .unwrap_or_default();
-        state.runtime.record_message(
-            state,
-            account_id,
-            target,
-            buffer_kind_hint(target),
-            &own_nick,
-            body,
-            false,
-            "chat",
-            None,
-            None,
-            false,
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
+        let own_nick = state.runtime.irc_current_nick(account_id).unwrap_or_default();
+        state.runtime.record_message(state, account_id, target, buffer_kind_hint(target), &own_nick, body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
         return Ok(());
     }
 
     let label = next_label();
     let mut msg = Message::from(Command::PRIVMSG(target.to_string(), body.to_string()));
     if state.runtime.irc_has_cap(account_id, "labeled-response") {
-        msg.tags = Some(vec![irc::proto::message::Tag(
-            "label".to_string(),
-            Some(label.clone()),
-        )]);
+        msg.tags = Some(vec![irc::proto::message::Tag("label".to_string(), Some(label.clone()))]);
     }
     sender.send(msg)?;
     pending_sends().lock().unwrap().insert(
@@ -621,8 +425,7 @@ pub(super) struct PendingSend {
 pub(super) const ECHO_GRACE: Duration = Duration::from_secs(6);
 
 pub(super) fn pending_sends() -> &'static std::sync::Mutex<HashMap<String, PendingSend>> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PendingSend>>> =
-        std::sync::OnceLock::new();
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<String, PendingSend>>> = std::sync::OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
@@ -630,10 +433,7 @@ pub(super) fn pending_sends() -> &'static std::sync::Mutex<HashMap<String, Pendi
 /// has to be unique in.
 pub(super) fn next_label() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    format!(
-        "moho-{}",
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    )
+    format!("moho-{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Writes anything the server never answered about.
@@ -654,16 +454,10 @@ pub(super) fn sweep_pending_sends(state: &AppState) {
             .filter(|(_, p)| now.duration_since(p.sent) > ECHO_GRACE)
             .map(|(label, _)| label.clone())
             .collect();
-        stale
-            .into_iter()
-            .filter_map(|label| all.remove(&label))
-            .collect()
+        stale.into_iter().filter_map(|label| all.remove(&label)).collect()
     };
     for send in overdue {
-        let own_nick = state
-            .runtime
-            .irc_current_nick(&send.account_id)
-            .unwrap_or_default();
+        let own_nick = state.runtime.irc_current_nick(&send.account_id).unwrap_or_default();
         state.runtime.record_message(
             state,
             &send.account_id,

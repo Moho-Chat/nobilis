@@ -163,10 +163,7 @@ fn outline(v: &serde_json::Value) -> String {
             // are user ids.
             let sample = match map.values().next() {
                 Some(serde_json::Value::Object(inner)) => {
-                    format!(
-                        "{{{}}}",
-                        inner.keys().cloned().collect::<Vec<_>>().join(",")
-                    )
+                    format!("{{{}}}", inner.keys().cloned().collect::<Vec<_>>().join(","))
                 }
                 Some(v) => outline(v),
                 None => "?".into(),
@@ -208,10 +205,7 @@ impl ServerResponse {
         let trimmed = frame.trim_start();
         if !trimmed.starts_with('{') {
             let text = frame.trim();
-            return ServerResponse {
-                plaintext: (!text.is_empty()).then(|| text.to_string()),
-                ..Default::default()
-            };
+            return ServerResponse { plaintext: (!text.is_empty()).then(|| text.to_string()), ..Default::default() };
         }
 
         let raw: RawResponse = match serde_json::from_str(trimmed) {
@@ -256,27 +250,15 @@ impl ServerResponse {
         // key was in here, spelled `whisper`, while the field asking for it
         // said `Whisper`. Worth keeping for the next such question.
         if !raw.extra.is_empty() {
-            let shape: Vec<String> = raw
-                .extra
-                .iter()
-                .map(|(k, v)| format!("{k}: {}", outline(v)))
-                .collect();
-            tracing::debug!(
-                "sneedchat: frame carried undecoded keys - {}",
-                shape.join(", ")
-            );
+            let shape: Vec<String> = raw.extra.iter().map(|(k, v)| format!("{k}: {}", outline(v))).collect();
+            tracing::debug!("sneedchat: frame carried undecoded keys - {}", shape.join(", "));
         }
 
         let users_joined: Vec<WireUser> = raw.users.into_values().collect();
         // Only the false entries are departures; a true one carries no user
         // object to add anyone with, and the matching `users` frame is what
         // announces an arrival.
-        let users_left: Vec<String> = raw
-            .user
-            .into_iter()
-            .filter(|(_, present)| !present)
-            .map(|(id, _)| id)
-            .collect();
+        let users_left: Vec<String> = raw.user.into_iter().filter(|(_, present)| !present).map(|(id, _)| id).collect();
 
         ServerResponse {
             messages,
@@ -290,10 +272,7 @@ impl ServerResponse {
             // An empty motd is the site having none rather than the site
             // saying nothing, and drawing a blank line for it would be worse
             // than drawing nothing.
-            motd: raw
-                .motd
-                .map(|m| m.trim().to_string())
-                .filter(|m| !m.is_empty()),
+            motd: raw.motd.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()),
         }
     }
 }
@@ -314,16 +293,9 @@ pub fn unescape_html(s: &str) -> String {
         out.push_str(&rest[..i]);
         let tail = &rest[i..];
 
-        let named = [
-            ("&quot;", "\""),
-            ("&apos;", "'"),
-            ("&amp;", "&"),
-            ("&lt;", "<"),
-            ("&gt;", ">"),
-            ("&nbsp;", " "),
-        ]
-        .iter()
-        .find_map(|(ent, rep)| tail.strip_prefix(ent).map(|r| ((*rep).to_string(), r)));
+        let named = [("&quot;", "\""), ("&apos;", "'"), ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"), ("&nbsp;", " ")]
+            .iter()
+            .find_map(|(ent, rep)| tail.strip_prefix(ent).map(|r| ((*rep).to_string(), r)));
 
         match named.or_else(|| numeric_entity(tail)) {
             Some((rep, r)) => {
@@ -495,6 +467,7 @@ pub fn parse_whisper_command_among(text: &str, known: &[String]) -> Option<(Stri
     Some((target.to_string(), body.to_string()))
 }
 
+
 /// `/delete <uuid>` - unlike `/edit`, just the bare uuid, no JSON.
 pub fn prepare_delete(uuid: &str) -> String {
     format!("/delete {uuid}")
@@ -524,15 +497,9 @@ mod tests {
 
     #[test]
     fn a_line_break_is_sent_as_the_site_writes_one() {
-        assert_eq!(
-            prepare_outgoing("one\ntwo\r\nthree").as_deref(),
-            Some("one[br]two[br]three")
-        );
+        assert_eq!(prepare_outgoing("one\ntwo\r\nthree").as_deref(), Some("one[br]two[br]three"));
         assert_eq!(prepare_outgoing("  hi\n  ").as_deref(), Some("hi"));
-        assert_eq!(
-            prepare_outgoing(">green\ntext").as_deref(),
-            Some("[color=#72ff72]>green[br]text")
-        );
+        assert_eq!(prepare_outgoing(">green\ntext").as_deref(), Some("[color=#72ff72]>green[br]text"));
     }
 
     #[test]
@@ -549,21 +516,15 @@ mod tests {
 
     #[test]
     fn messages_carry_their_room() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1","room_id":20}]}"#,
-        );
+        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1","room_id":20}]}"#);
         assert_eq!(r.messages[0].room_id, Some(20));
     }
 
     #[test]
     fn accepts_string_or_numeric_author_ids() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":"160024","username":"y a t s"},"message_raw":"hi","message_uuid":"u1"}]}"#,
-        );
+        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":"160024","username":"y a t s"},"message_raw":"hi","message_uuid":"u1"}]}"#);
         assert_eq!(r.messages[0].author.id, "160024");
-        let r2 = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":7,"username":"x"},"message_raw":"hi","message_uuid":"u2"}]}"#,
-        );
+        let r2 = ServerResponse::parse(r#"{"messages":[{"author":{"id":7,"username":"x"},"message_raw":"hi","message_uuid":"u2"}]}"#);
         assert_eq!(r2.messages[0].author.id, "7");
     }
 
@@ -607,9 +568,7 @@ mod tests {
     fn parses_whispers_and_perms() {
         // Lowercase, which is what the site actually sends - the capitalised
         // spelling this used to require is why none were ever received.
-        let r = ServerResponse::parse(
-            r#"{"whisper":{"author":{"id":9,"username":"w"},"message_raw":"psst","message_uuid":"u9"}}"#,
-        );
+        let r = ServerResponse::parse(r#"{"whisper":{"author":{"id":9,"username":"w"},"message_raw":"psst","message_uuid":"u9"}}"#);
         let w = r.whisper.unwrap();
         assert_eq!(w.author.id, "9");
         assert_eq!(w.message_raw, "psst");
@@ -638,10 +597,7 @@ mod tests {
         assert_eq!(unescape_html("a &amp; b"), "a & b");
         assert_eq!(unescape_html("&lt;tag&gt;"), "<tag>");
         assert_eq!(unescape_html("it&#039;s"), "it's");
-        assert_eq!(
-            unescape_html("There&#x27;s so much evil"),
-            "There's so much evil"
-        );
+        assert_eq!(unescape_html("There&#x27;s so much evil"), "There's so much evil");
         assert_eq!(unescape_html("&#8212;"), "—");
     }
 
@@ -653,10 +609,7 @@ mod tests {
 
     #[test]
     fn greentext_gets_colored() {
-        assert_eq!(
-            prepare_outgoing(">implying").unwrap(),
-            "[color=#72ff72]>implying"
-        );
+        assert_eq!(prepare_outgoing(">implying").unwrap(), "[color=#72ff72]>implying");
         assert_eq!(prepare_outgoing(">>123").unwrap(), ">>123");
         assert_eq!(prepare_outgoing("normal").unwrap(), "normal");
     }
@@ -674,32 +627,23 @@ mod tests {
             r#"{"messages":[{"author":{"id":1,"username":"a","avatar_url":"/data/avatars/l/0/1.jpg"},"message_raw":"hi","message_uuid":"u1","message_edit_date":12345}]}"#,
         );
         assert_eq!(r.messages[0].message_edit_date, 12345);
-        assert_eq!(
-            r.messages[0].author.avatar_url.as_deref(),
-            Some("/data/avatars/l/0/1.jpg")
-        );
+        assert_eq!(r.messages[0].author.avatar_url.as_deref(), Some("/data/avatars/l/0/1.jpg"));
         assert!(!r.messages[0].is_deleted());
     }
 
     #[test]
     fn a_message_with_no_edit_date_or_avatar_defaults_sanely() {
-        let r = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1"}]}"#,
-        );
+        let r = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_raw":"hi","message_uuid":"u1"}]}"#);
         assert_eq!(r.messages[0].message_edit_date, 0);
         assert!(r.messages[0].author.avatar_url.is_none());
     }
 
     #[test]
     fn parses_per_message_delete_flags() {
-        let deleted = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","deleted":true}]}"#,
-        );
+        let deleted = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","deleted":true}]}"#);
         assert!(deleted.messages[0].is_deleted());
 
-        let is_deleted = ServerResponse::parse(
-            r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","is_deleted":true}]}"#,
-        );
+        let is_deleted = ServerResponse::parse(r#"{"messages":[{"author":{"id":1,"username":"a"},"message_uuid":"u1","is_deleted":true}]}"#);
         assert!(is_deleted.messages[0].is_deleted());
     }
 
@@ -714,17 +658,11 @@ mod tests {
 
     #[test]
     fn builds_the_edit_and_delete_commands() {
-        assert_eq!(
-            prepare_edit("abc-123", "new text"),
-            r#"/edit {"message":"new text","uuid":"abc-123"}"#
-        );
+        assert_eq!(prepare_edit("abc-123", "new text"), r#"/edit {"message":"new text","uuid":"abc-123"}"#);
         assert_eq!(prepare_delete("abc-123"), "/delete abc-123");
         // The site reads the target as a mention, so the @ is part of
         // addressing it rather than something a caller has to remember.
-        assert_eq!(
-            prepare_whisper("Someone", "hello there"),
-            "/w @Someone, hello there"
-        );
+        assert_eq!(prepare_whisper("Someone", "hello there"), "/w @Someone, hello there");
         // A name that already carries one does not get a second.
         assert_eq!(prepare_whisper("@Someone", "hi"), "/w @Someone, hi");
         assert_eq!(prepare_whisper("  Spaced  ", "hi"), "/w @Spaced, hi");
@@ -735,10 +673,7 @@ mod tests {
             "/w @Fishtank Observer, aaa"
         );
         // And a caller that supplied the comma does not get two.
-        assert_eq!(
-            prepare_whisper("Fishtank Observer,", "aaa"),
-            "/w @Fishtank Observer, aaa"
-        );
+        assert_eq!(prepare_whisper("Fishtank Observer,", "aaa"), "/w @Fishtank Observer, aaa");
         // The command itself, spelled out rather than built from the constant:
         // a test that reads the constant back cannot notice it changing, and
         // the wrong word here is not a failed send - it is the message posted
@@ -753,15 +688,9 @@ mod tests {
             Some(("Someone".into(), "hello there".into()))
         );
         // Without the @, which the site accepts and people leave off.
-        assert_eq!(
-            parse_whisper_command("/w Someone, hi"),
-            Some(("Someone".into(), "hi".into()))
-        );
+        assert_eq!(parse_whisper_command("/w Someone, hi"), Some(("Someone".into(), "hi".into())));
         // The word somebody will type having read about this anywhere else.
-        assert_eq!(
-            parse_whisper_command("/whisper @Someone, hi"),
-            Some(("Someone".into(), "hi".into()))
-        );
+        assert_eq!(parse_whisper_command("/whisper @Someone, hi"), Some(("Someone".into(), "hi".into())));
         // The case the comma exists for: splitting on whitespace would read
         // this as a whisper to "Fishtank" beginning "Observer, aaa".
         assert_eq!(
@@ -770,10 +699,7 @@ mod tests {
         );
         // A single-word name with no comma still works, because there is
         // nowhere else the name could end.
-        assert_eq!(
-            parse_whisper_command("/w @Someone hi"),
-            Some(("Someone".into(), "hi".into()))
-        );
+        assert_eq!(parse_whisper_command("/w @Someone hi"), Some(("Someone".into(), "hi".into())));
         // A comma inside the message is not a second delimiter.
         assert_eq!(
             parse_whisper_command("/w @Someone, hi, how are you"),
@@ -796,11 +722,7 @@ mod tests {
     /// "Pioneer ..." and came back in the room instead.
     #[test]
     fn a_name_with_a_space_is_found_among_the_people_in_the_room() {
-        let here = vec![
-            "Ancient Pioneer".to_string(),
-            "Ann".to_string(),
-            "Annabel Lee".to_string(),
-        ];
+        let here = vec!["Ancient Pioneer".to_string(), "Ann".to_string(), "Annabel Lee".to_string()];
         assert_eq!(
             parse_whisper_command_among("/w @Ancient Pioneer a", &here),
             Some(("Ancient Pioneer".into(), "a".into()))
@@ -821,10 +743,7 @@ mod tests {
             Some(("Annabel Lee".into(), "hi".into()))
         );
         // And a name that merely starts the same is not it.
-        assert_eq!(
-            parse_whisper_command_among("/w @Ann hi", &here),
-            Some(("Ann".into(), "hi".into()))
-        );
+        assert_eq!(parse_whisper_command_among("/w @Ann hi", &here), Some(("Ann".into(), "hi".into())));
     }
 
     /// A numeric id is the site's other form, and belongs to nobody in the
@@ -832,23 +751,14 @@ mod tests {
     #[test]
     fn an_id_still_works_when_nobody_here_is_called_that() {
         let here = vec!["Ancient Pioneer".to_string()];
-        assert_eq!(
-            parse_whisper_command_among("/w 38746 hello", &here),
-            Some(("38746".into(), "hello".into()))
-        );
+        assert_eq!(parse_whisper_command_among("/w 38746 hello", &here), Some(("38746".into(), "hello".into())));
     }
 
     #[test]
     fn a_name_with_nothing_after_it_is_not_a_whisper() {
         let here = vec!["Ancient Pioneer".to_string()];
-        assert_eq!(
-            parse_whisper_command_among("/w @Ancient Pioneer", &here),
-            None
-        );
-        assert_eq!(
-            parse_whisper_command_among("/w @Ancient Pioneer   ", &here),
-            None
-        );
+        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer", &here), None);
+        assert_eq!(parse_whisper_command_among("/w @Ancient Pioneer   ", &here), None);
         assert_eq!(parse_whisper_command("/w @Someone,"), None);
         assert_eq!(parse_whisper_command("/w , body"), None);
         assert_eq!(parse_whisper_command("/w "), None);

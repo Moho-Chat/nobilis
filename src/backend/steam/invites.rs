@@ -20,10 +20,7 @@ const LETTERS: &[u8; 16] = b"bcdfghjkmnpqrtvw";
 
 /// The code an account is known by in a link.
 pub fn code_of(account: u32) -> String {
-    let code: String = format!("{account:x}")
-        .bytes()
-        .map(|d| LETTERS[(d as char).to_digit(16).unwrap_or(0) as usize] as char)
-        .collect();
+    let code: String = format!("{account:x}").bytes().map(|d| LETTERS[(d as char).to_digit(16).unwrap_or(0) as usize] as char).collect();
     if code.len() > 3 {
         let (a, b) = code.split_at(code.len() / 2);
         format!("{a}-{b}")
@@ -34,11 +31,7 @@ pub fn code_of(account: u32) -> String {
 
 /// The account a code is for, or nothing for text that is not one.
 pub fn account_in(code: &str) -> Option<u32> {
-    let letters: String = code
-        .chars()
-        .filter(|c| *c != '-')
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let letters: String = code.chars().filter(|c| *c != '-').collect::<String>().to_ascii_lowercase();
     if letters.is_empty() || letters.len() > 8 {
         return None;
     }
@@ -54,11 +47,7 @@ pub fn account_in(code: &str) -> Option<u32> {
 /// profile address in the code's form, or the code on its own.
 pub fn account_of_link(text: &str) -> Option<u32> {
     let text = text.trim().trim_end_matches('/');
-    let rest = text
-        .split_once("/p/")
-        .map(|(_, r)| r)
-        .or_else(|| text.split_once("/user/").map(|(_, r)| r))
-        .unwrap_or(text);
+    let rest = text.split_once("/p/").map(|(_, r)| r).or_else(|| text.split_once("/user/").map(|(_, r)| r)).unwrap_or(text);
     let code = rest.split(['/', '?', '#']).next()?;
     account_in(code)
 }
@@ -74,19 +63,12 @@ pub struct InviteLink {
 }
 
 fn read_link(own_code: &str, entry: &Value) -> Option<InviteLink> {
-    let token = entry["invite_token"]
-        .as_str()
-        .filter(|t| !t.is_empty())?
-        .to_string();
+    let token = entry["invite_token"].as_str().filter(|t| !t.is_empty())?.to_string();
     Some(InviteLink {
         link: format!("https://s.team/p/{own_code}/{token}"),
         valid: entry["valid"].as_i64().unwrap_or(0) != 0,
         created: entry["time_created"].as_u64().unwrap_or(0),
-        lasts_seconds: entry["invite_duration"]
-            .as_str()
-            .and_then(|d| d.parse().ok())
-            .or_else(|| entry["invite_duration"].as_u64())
-            .unwrap_or(0),
+        lasts_seconds: entry["invite_duration"].as_str().and_then(|d| d.parse().ok()).or_else(|| entry["invite_duration"].as_u64()).unwrap_or(0),
         token,
     })
 }
@@ -94,23 +76,12 @@ fn read_link(own_code: &str, entry: &Value) -> Option<InviteLink> {
 /// Reads the list the website gives: the ones still good, newest first.
 pub fn read_links(own_account: u32, answer: &Value) -> Vec<InviteLink> {
     let code = code_of(own_account);
-    let mut links: Vec<InviteLink> = answer["tokens"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| read_link(&code, t))
-        .filter(|l| l.valid)
-        .collect();
+    let mut links: Vec<InviteLink> = answer["tokens"].as_array().into_iter().flatten().filter_map(|t| read_link(&code, t)).filter(|l| l.valid).collect();
     links.sort_by_key(|l| std::cmp::Reverse(l.created));
     links
 }
 
-async fn website(
-    link: &Link,
-    key: &str,
-    steamid: u64,
-    refresh_token: &str,
-) -> Result<(reqwest::Client, String, String), String> {
+async fn website(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<(reqwest::Client, String, String), String> {
     web::login(link, key, steamid, refresh_token).await
 }
 
@@ -119,12 +90,7 @@ fn plain_json(raw: &[u8]) -> Value {
 }
 
 /// The account's own links that are still good.
-pub async fn list(
-    link: &Link,
-    key: &str,
-    steamid: u64,
-    refresh_token: &str,
-) -> Result<Vec<InviteLink>, String> {
+pub async fn list(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<Vec<InviteLink>, String> {
     let (http, cookie, session) = website(link, key, steamid, refresh_token).await?;
     let response = http
         .get("https://steamcommunity.com/invites/ajaxgetall")
@@ -138,66 +104,30 @@ pub async fn list(
     if !status.is_success() {
         return Err(web::explain(status, &answer));
     }
-    Ok(read_links(
-        super::steamid::account_of(steamid).unwrap_or_default(),
-        &answer,
-    ))
+    Ok(read_links(super::steamid::account_of(steamid).unwrap_or_default(), &answer))
 }
 
 /// Makes a new link, good for a month.
-pub async fn create(
-    link: &Link,
-    key: &str,
-    steamid: u64,
-    refresh_token: &str,
-) -> Result<InviteLink, String> {
+pub async fn create(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<InviteLink, String> {
     let (http, cookie, session) = website(link, key, steamid, refresh_token).await?;
-    let form = reqwest::multipart::Form::new()
-        .text("sessionid", session)
-        .text("steamid_user", steamid.to_string())
-        .text("duration", "2592000");
-    let response = http
-        .post("https://steamcommunity.com/invites/ajaxcreate")
-        .header("Cookie", cookie)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach Steam's website: {e}"))?;
+    let form = reqwest::multipart::Form::new().text("sessionid", session).text("steamid_user", steamid.to_string()).text("duration", "2592000");
+    let response = http.post("https://steamcommunity.com/invites/ajaxcreate").header("Cookie", cookie).multipart(form).send().await.map_err(|e| format!("could not reach Steam's website: {e}"))?;
     let status = response.status();
     let answer = plain_json(&response.bytes().await.map_err(|e| e.to_string())?);
     if !status.is_success() {
         return Err(web::explain(status, &answer));
     }
-    read_link(
-        &code_of(super::steamid::account_of(steamid).unwrap_or_default()),
-        &answer["invite"],
-    )
-    .ok_or_else(|| "Steam did not make a link".to_string())
+    read_link(&code_of(super::steamid::account_of(steamid).unwrap_or_default()), &answer["invite"]).ok_or_else(|| "Steam did not make a link".to_string())
 }
 
 /// Takes a link back, so that it is no use to whoever has it.
-pub async fn revoke(
-    link: &Link,
-    key: &str,
-    steamid: u64,
-    refresh_token: &str,
-    token: &str,
-) -> Result<(), String> {
+pub async fn revoke(link: &Link, key: &str, steamid: u64, refresh_token: &str, token: &str) -> Result<(), String> {
     if token.is_empty() || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err("that is not an invite link".to_string());
     }
     let (http, cookie, session) = website(link, key, steamid, refresh_token).await?;
-    let form = reqwest::multipart::Form::new()
-        .text("sessionid", session)
-        .text("invite_token", token.to_string())
-        .text("steamid_user", steamid.to_string());
-    let response = http
-        .post("https://steamcommunity.com/invites/ajaxrevoke")
-        .header("Cookie", cookie)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("could not reach Steam's website: {e}"))?;
+    let form = reqwest::multipart::Form::new().text("sessionid", session).text("invite_token", token.to_string()).text("steamid_user", steamid.to_string());
+    let response = http.post("https://steamcommunity.com/invites/ajaxrevoke").header("Cookie", cookie).multipart(form).send().await.map_err(|e| format!("could not reach Steam's website: {e}"))?;
     let status = response.status();
     let answer = plain_json(&response.bytes().await.map_err(|e| e.to_string())?);
     if status.is_success() && answer["success"].as_i64() == Some(1) {
@@ -221,45 +151,21 @@ mod tests {
         assert_eq!(code_of(17167656), "cbh-whdm");
         assert_eq!(account_in("dknq-cpfb"), Some(664476208));
         assert_eq!(account_in("CBH-WHDM"), Some(17167656));
-        assert_eq!(
-            account_in("dknqcpfb"),
-            Some(664476208),
-            "the hyphen is for reading"
-        );
+        assert_eq!(account_in("dknqcpfb"), Some(664476208), "the hyphen is for reading");
         for account in [1u32, 255, 4095, 22202, 664476208, u32::MAX] {
             assert_eq!(account_in(&code_of(account)), Some(account), "{account}");
         }
         assert_eq!(account_in(""), None);
-        assert_eq!(
-            account_in("abcdefgh"),
-            None,
-            "a, e and i are not among the letters"
-        );
-        assert_eq!(
-            account_in("bcdfghjkmnpq-rtvw1"),
-            None,
-            "too long to be a number of this kind"
-        );
+        assert_eq!(account_in("abcdefgh"), None, "a, e and i are not among the letters");
+        assert_eq!(account_in("bcdfghjkmnpq-rtvw1"), None, "too long to be a number of this kind");
     }
 
     #[test]
     fn a_link_is_read_for_the_account_it_is_from() {
-        assert_eq!(
-            account_of_link("https://s.team/p/dknq-cpfb/QWERTYUI"),
-            Some(664476208)
-        );
-        assert_eq!(
-            account_of_link("https://s.team/p/dknq-cpfb"),
-            Some(664476208)
-        );
-        assert_eq!(
-            account_of_link("http://s.team/p/dknq-cpfb/QWERTYUI/"),
-            Some(664476208)
-        );
-        assert_eq!(
-            account_of_link("https://steamcommunity.com/user/cbh-whdm/"),
-            Some(17167656)
-        );
+        assert_eq!(account_of_link("https://s.team/p/dknq-cpfb/QWERTYUI"), Some(664476208));
+        assert_eq!(account_of_link("https://s.team/p/dknq-cpfb"), Some(664476208));
+        assert_eq!(account_of_link("http://s.team/p/dknq-cpfb/QWERTYUI/"), Some(664476208));
+        assert_eq!(account_of_link("https://steamcommunity.com/user/cbh-whdm/"), Some(17167656));
         assert_eq!(account_of_link("dknq-cpfb"), Some(664476208));
         assert_eq!(account_of_link("https://example.com/not/this"), None);
     }
@@ -273,10 +179,7 @@ mod tests {
             { "valid": 1 }
         ] });
         let links = read_links(664476208, &answer);
-        assert_eq!(
-            links.iter().map(|l| l.token.as_str()).collect::<Vec<_>>(),
-            ["CCCCCCCC", "AAAAAAAA"]
-        );
+        assert_eq!(links.iter().map(|l| l.token.as_str()).collect::<Vec<_>>(), ["CCCCCCCC", "AAAAAAAA"]);
         assert_eq!(links[0].link, "https://s.team/p/dknq-cpfb/CCCCCCCC");
         assert_eq!(links[0].lasts_seconds, 2592000);
     }

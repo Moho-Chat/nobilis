@@ -37,14 +37,8 @@ impl Sticker {
     pub fn url(&self) -> Option<String> {
         match self.format_type {
             3 => None,
-            4 => Some(format!(
-                "https://media.discordapp.net/stickers/{}.gif",
-                self.id
-            )),
-            _ => Some(format!(
-                "https://media.discordapp.net/stickers/{}.png?size=160",
-                self.id
-            )),
+            4 => Some(format!("https://media.discordapp.net/stickers/{}.gif", self.id)),
+            _ => Some(format!("https://media.discordapp.net/stickers/{}.png?size=160", self.id)),
         }
     }
 }
@@ -84,29 +78,21 @@ pub async fn lottie_file(token: &str, id: &str) -> Result<String> {
             .await
             .context("fetching the sticker")?;
         if !resp.status().is_success() {
-            bail!(
-                "Discord has no animation for that sticker ({})",
-                resp.status()
-            );
+            bail!("Discord has no animation for that sticker ({})", resp.status());
         }
         let bytes = resp.bytes().await.context("reading the sticker")?;
         tokio::fs::create_dir_all(&dir).await.ok();
         // Written beside and renamed, so a reader never finds half a file.
         let partial = dir.join(format!("{id}.json.part"));
-        tokio::fs::write(&partial, &bytes)
-            .await
-            .context("saving the sticker")?;
-        tokio::fs::rename(&partial, &path)
-            .await
-            .context("saving the sticker")?;
+        tokio::fs::write(&partial, &bytes).await.context("saving the sticker")?;
+        tokio::fs::rename(&partial, &path).await.context("saving the sticker")?;
     }
     Ok(format!("file://{}", path.display()))
 }
 
 /// Account to guild to its stickers.
 fn known() -> &'static Mutex<HashMap<String, HashMap<String, GuildStickers>>> {
-    static KNOWN: OnceLock<Mutex<HashMap<String, HashMap<String, GuildStickers>>>> =
-        OnceLock::new();
+    static KNOWN: OnceLock<Mutex<HashMap<String, HashMap<String, GuildStickers>>>> = OnceLock::new();
     KNOWN.get_or_init(Default::default)
 }
 
@@ -228,19 +214,12 @@ fn guild_list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value>
     // no guild's sticker can go.
     let here = state.runtime.get_discord_guild(buffer_id);
     let all = known().lock().unwrap();
-    let Some(guilds) = all.get(account_id) else {
-        return Vec::new();
-    };
+    let Some(guilds) = all.get(account_id) else { return Vec::new() };
     let mut out = Vec::new();
     // This conversation's own guild first: what is most likely wanted, and
     // the only ones usable without Nitro.
     let mut ordered: Vec<(&String, &GuildStickers)> = guilds.iter().collect();
-    ordered.sort_by_key(|(id, g)| {
-        (
-            here.as_deref() != Some(id.as_str()),
-            g.guild_name.to_lowercase(),
-        )
-    });
+    ordered.sort_by_key(|(id, g)| (here.as_deref() != Some(id.as_str()), g.guild_name.to_lowercase()));
     for (guild_id, guild) in ordered {
         let usable = anywhere || here.as_deref() == Some(guild_id.as_str());
         for sticker in &guild.stickers {
@@ -261,10 +240,7 @@ fn guild_list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value>
 
 /// Sends a sticker as a message of its own.
 pub async fn send(state: &AppState, buffer_id: &str, token: &str, sticker_id: &str) -> Result<()> {
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
         http_client_for(token)
             .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -294,10 +270,7 @@ mod tests {
             { "id": "4", "name": "vector", "format_type": 3 },
         ]});
         let stickers = read_stickers(&guild);
-        assert_eq!(
-            stickers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            ["wave", "dance", "vector"]
-        );
+        assert_eq!(stickers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["wave", "dance", "vector"]);
         assert!(stickers[1].url().unwrap().ends_with("3.gif"));
         // Offered by name: it can be sent, just not drawn here.
         assert_eq!(stickers[2].url(), None);

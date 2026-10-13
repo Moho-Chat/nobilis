@@ -33,9 +33,7 @@ pub fn spawn(state: AppState, config: MatrixAccountConfig) {
             state.runtime.remove_task_handle(&account_id);
         }
     });
-    state
-        .runtime
-        .insert_task_handle(&account_id, join_handle.abort_handle());
+    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 /// Keeps re-establishing the sync loop for as long as this task lives -
@@ -43,43 +41,27 @@ pub fn spawn(state: AppState, config: MatrixAccountConfig) {
 /// (3s -> 60s, no permanent give-up, including for a bad/revoked
 /// password - it just keeps failing visibly). Only stops when this task
 /// itself is aborted from outside.
-pub(super) async fn run_with_retry(
-    state: &AppState,
-    config: &MatrixAccountConfig,
-    account_id: &str,
-) {
+pub(super) async fn run_with_retry(state: &AppState, config: &MatrixAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
-    state
-        .runtime
-        .set_conn_state(state, account_id, ConnState::Connecting, None);
+    state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         // Re-fetch the stored config each attempt, in case a re-login
         // inside a previous attempt updated access_token/device_id/
         // next_batch (state.accounts.set_matrix_session/next_batch) after
         // this loop's own `config` snapshot was taken.
-        let current = state
-            .accounts
-            .get_matrix(account_id)
-            .unwrap_or_else(|| config.clone());
+        let current = state.accounts.get_matrix(account_id).unwrap_or_else(|| config.clone());
         // A re-login changes the token, and the token is what the requests
         // are routed by. Tor or the proxy is made ready before the first
         // request - and only for an account that is routed.
         let router = crate::net::route::router();
         router.mark(&current.access_token, current.use_tor);
         let prepared = if router.routed(account_id) {
-            router
-                .ready(|msg| state.runtime.report_progress(state, account_id, msg))
-                .await
-                .map(|_| ())
+            router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.map(|_| ())
         } else {
             Ok(())
         };
         let result = match prepared {
-            Ok(()) => {
-                std::panic::AssertUnwindSafe(run_sync(state, &current, account_id))
-                    .catch_unwind()
-                    .await
-            }
+            Ok(()) => std::panic::AssertUnwindSafe(run_sync(state, &current, account_id)).catch_unwind().await,
             Err(e) => Ok(Err(e.context("starting Tor or reaching the proxy"))),
         };
         let detail = match result {
@@ -98,15 +80,8 @@ pub(super) async fn run_with_retry(
                 "internal error (see nobilis logs)".to_string()
             }
         };
-        state
-            .runtime
-            .set_conn_state(state, account_id, ConnState::Connecting, None);
-        let wait = state.runtime.next_retry_delay(
-            account_id,
-            &mut delay,
-            RECONNECT_INITIAL_DELAY,
-            RECONNECT_MAX_DELAY,
-        );
+        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
@@ -137,11 +112,7 @@ pub(super) fn is_unknown_position(e: &anyhow::Error) -> bool {
 /// Logs in (or re-logs-in) and persists the fresh session - `device_id` is
 /// threaded through so a re-login reuses the *same* device rather than
 /// minting a fresh one (see auth.rs's module doc for why that matters).
-pub(super) async fn ensure_login(
-    state: &AppState,
-    config: &MatrixAccountConfig,
-    account_id: &str,
-) -> Result<(String, String)> {
+pub(super) async fn ensure_login(state: &AppState, config: &MatrixAccountConfig, account_id: &str) -> Result<(String, String)> {
     // An account signed in through an OAuth provider has no password to try
     // again with, and its access token is short-lived by design - minutes,
     // on matrix.org. Refreshing is the only way back, and the way every
@@ -165,48 +136,25 @@ pub(super) async fn ensure_login(
             }
         }
     }
-    let device_id = if config.device_id.is_empty() {
-        None
-    } else {
-        Some(config.device_id.as_str())
-    };
-    let login = auth::login(
-        &config.homeserver_url,
-        &config.user_id,
-        &config.password,
-        device_id,
-    )
-    .await
-    .context("logging in")?;
-    let _ = state
-        .accounts
-        .set_matrix_session(account_id, &login.access_token, &login.device_id);
+    let device_id = if config.device_id.is_empty() { None } else { Some(config.device_id.as_str()) };
+    let login = auth::login(&config.homeserver_url, &config.user_id, &config.password, device_id)
+        .await
+        .context("logging in")?;
+    let _ = state.accounts.set_matrix_session(account_id, &login.access_token, &login.device_id);
     Ok((login.access_token, login.device_id))
 }
 
 /// Trades the stored refresh token for a fresh access token, and keeps both.
-async fn refresh_oauth_session(
-    state: &AppState,
-    config: &MatrixAccountConfig,
-    account_id: &str,
-) -> Result<String> {
+async fn refresh_oauth_session(state: &AppState, config: &MatrixAccountConfig, account_id: &str) -> Result<String> {
     let metadata = oidc::auth_metadata(&config.homeserver_url)
         .await?
         .context("this homeserver no longer says where its accounts live")?;
-    let (access, rotated) = oidc::refresh(
-        &metadata,
-        &config.oauth_client_id,
-        &config.oauth_refresh_token,
-    )
-    .await?;
+    let (access, rotated) =
+        oidc::refresh(&metadata, &config.oauth_client_id, &config.oauth_refresh_token).await?;
     // The device id does not change on a refresh - the token is bound to the
     // same one - so only the session is rewritten.
-    let _ = state
-        .accounts
-        .set_matrix_session(account_id, &access, &config.device_id);
-    let _ = state
-        .accounts
-        .set_matrix_oauth_refresh(account_id, &rotated);
+    let _ = state.accounts.set_matrix_session(account_id, &access, &config.device_id);
+    let _ = state.accounts.set_matrix_oauth_refresh(account_id, &rotated);
     tracing::info!("matrix[{account_id}]: renewed the session from its refresh token");
     Ok(access)
 }
@@ -218,11 +166,7 @@ async fn refresh_oauth_session(
 /// inline via a re-login, not treated as session-ending, since that's a
 /// routine occurrence (expired session) rather than a real connectivity
 /// problem.
-pub(super) async fn run_sync(
-    state: &AppState,
-    config: &MatrixAccountConfig,
-    account_id: &str,
-) -> Result<()> {
+pub(super) async fn run_sync(state: &AppState, config: &MatrixAccountConfig, account_id: &str) -> Result<()> {
     let mut access_token = config.access_token.clone();
     let mut device_id = config.device_id.clone();
     let mut next_batch = config.next_batch.clone();
@@ -245,39 +189,25 @@ pub(super) async fn run_sync(
     // never-resolved local optimistic echo, once as the real incoming
     // event, because the frontend never recognizes the real one as "ours"
     // to reconcile against.
-    state
-        .runtime
-        .set_own_identity(account_id, &protocol::mxid_localpart(&config.user_id));
+    state.runtime.set_own_identity(account_id, &protocol::mxid_localpart(&config.user_id));
 
     let user_id = ruma_common::UserId::parse(&config.user_id).context("invalid own user_id")?;
     let device_id_ruma = <&ruma_common::DeviceId>::from(device_id.as_str());
     let session = std::sync::Arc::new(
-        crypto::CryptoSession::open(&config_dir(), account_id, &user_id, device_id_ruma)
-            .await
-            .context("opening crypto store")?,
+        crypto::CryptoSession::open(&config_dir(), account_id, &user_id, device_id_ruma).await.context("opening crypto store")?,
     );
-    state
-        .runtime
-        .set_matrix_machine(account_id, session.clone());
+    state.runtime.set_matrix_machine(account_id, session.clone());
     // Asked for outright, because a resumed sync will never mention it: see
     // load_user_emotes. Before the first sync, so the picker has the pack
     // from the moment the account is up rather than one round trip later.
-    load_user_emotes(
-        state,
-        account_id,
-        config.homeserver_url.trim_end_matches('/'),
-        &access_token,
-        &config.user_id,
-    )
-    .await;
+    load_user_emotes(state, account_id, config.homeserver_url.trim_end_matches('/'), &access_token, &config.user_id).await;
     // What this homeserver says it can do, before anything asks it to. Read
     // once because both answers are properties of the server rather than of
     // the moment - a homeserver that changes either has been restarted, which
     // reconnects this account anyway.
-    state.runtime.set_matrix_server_facts(
-        account_id,
-        server::read_facts(&config.homeserver_url, &access_token).await,
-    );
+    state
+        .runtime
+        .set_matrix_server_facts(account_id, server::read_facts(&config.homeserver_url, &access_token).await);
     backup::reactivate_on_connect(state, account_id, &session).await;
     // Collect whatever the dehydrated device was sent while this login did not
     // exist, and leave a fresh one behind. After the backup reactivation
@@ -304,60 +234,22 @@ pub(super) async fn run_sync(
     // named. A room named without it is named once and cached, so reading
     // this late would leave a conversation filed as an ordinary room for the
     // rest of the session.
-    directs::fetch(
-        state,
-        account_id,
-        &config.homeserver_url,
-        &access_token,
-        &config.user_id,
-    )
-    .await;
-    previews::fetch_account_setting(
-        state,
-        account_id,
-        &config.homeserver_url,
-        &access_token,
-        &config.user_id,
-    )
-    .await;
+    directs::fetch(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
+    previews::fetch_account_setting(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
 
     if next_batch.is_some() {
-        if let Err(e) = bootstrap_joined_rooms(
-            state,
-            account_id,
-            &config.user_id,
-            &config.homeserver_url,
-            &access_token,
-        )
-        .await
-        {
+        if let Err(e) = bootstrap_joined_rooms(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
             tracing::warn!("matrix[{account_id}]: bootstrapping joined rooms failed: {e:#}");
         }
     }
 
     // Read markers, once, for every room at once - see fetch_read_receipts.
-    if let Err(e) = fetch_read_receipts(
-        state,
-        account_id,
-        &config.user_id,
-        &config.homeserver_url,
-        &access_token,
-    )
-    .await
-    {
+    if let Err(e) = fetch_read_receipts(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
         tracing::debug!("matrix[{account_id}]: read receipts: {e:#}");
     }
 
     // And the invitations already waiting - see fetch_pending_invites.
-    if let Err(e) = fetch_pending_invites(
-        state,
-        account_id,
-        &config.user_id,
-        &config.homeserver_url,
-        &access_token,
-    )
-    .await
-    {
+    if let Err(e) = fetch_pending_invites(state, account_id, &config.user_id, &config.homeserver_url, &access_token).await {
         tracing::debug!("matrix[{account_id}]: pending invites: {e:#}");
     }
 
@@ -369,14 +261,7 @@ pub(super) async fn run_sync(
     // And what this account has asked to be told about - see fetch_push_rules.
     fetch_push_rules(state, account_id, &config.homeserver_url, &access_token).await;
     // And who it has asked never to hear from.
-    fetch_ignored_users(
-        state,
-        account_id,
-        &config.homeserver_url,
-        &access_token,
-        &config.user_id,
-    )
-    .await;
+    fetch_ignored_users(state, account_id, &config.homeserver_url, &access_token, &config.user_id).await;
 
     // No RAII drop-guard here (deliberately) - run_with_retry's own
     // catch_unwind wraps this whole function, so a plain `?` return
@@ -408,34 +293,29 @@ pub(super) async fn run_sync(
     // order - an account that has not asked never has its server questioned.
     let use_sliding = config.prefer_sliding_sync
         && match http::get_json_anonymous(&format!(
-            "{}/_matrix/client/versions",
-            config.homeserver_url.trim_end_matches('/')
-        ))
-        .await
-        {
-            Ok(v) => sliding::supported_in_versions(&v),
-            // A server that will not say is a server to treat as not having it.
-            // Classic sync works everywhere; guessing the other way would break
-            // the connection outright.
-            Err(e) => {
-                tracing::debug!("matrix[{account_id}]: asking which sync: {e}");
-                false
-            }
-        };
+        "{}/_matrix/client/versions",
+        config.homeserver_url.trim_end_matches('/')
+    ))
+    .await
+    {
+        Ok(v) => sliding::supported_in_versions(&v),
+        // A server that will not say is a server to treat as not having it.
+        // Classic sync works everywhere; guessing the other way would break
+        // the connection outright.
+        Err(e) => {
+            tracing::debug!("matrix[{account_id}]: asking which sync: {e}");
+            false
+        }
+    };
     if use_sliding != config.used_sliding_sync {
         tracing::info!(
             "matrix[{account_id}]: sync kind changed to {}, starting a fresh stream",
             if use_sliding { "sliding" } else { "classic" }
         );
         next_batch = None;
-        let _ = state
-            .accounts
-            .set_matrix_used_sliding_sync(account_id, use_sliding);
+        let _ = state.accounts.set_matrix_used_sliding_sync(account_id, use_sliding);
     }
-    tracing::info!(
-        "matrix[{account_id}]: using {} sync",
-        if use_sliding { "sliding" } else { "classic" }
-    );
+    tracing::info!("matrix[{account_id}]: using {} sync", if use_sliding { "sliding" } else { "classic" });
 
     let mut announced_connected = false;
 
@@ -443,9 +323,7 @@ pub(super) async fn run_sync(
         // Advertise E2EE capability / send anything the machine already
         // wants sent (e.g. a fresh device's initial key upload) before
         // syncing, same order the crate's own tutorial documents.
-        session
-            .process_outgoing_requests(&config.homeserver_url, &access_token)
-            .await;
+        session.process_outgoing_requests(&config.homeserver_url, &access_token).await;
 
         // Re-read each poll rather than captured once: a status set
         // mid-session has to take effect on the next sync, not the next
@@ -476,20 +354,11 @@ pub(super) async fn run_sync(
             let url = sync_url(&config.homeserver_url, next_batch.as_deref(), presence);
             http::get_json(&url, &access_token).await
         };
-        let resp = match raw.map(|v| {
-            if use_sliding {
-                sliding::to_classic(&v)
-            } else {
-                v
-            }
-        }) {
+        let resp = match raw.map(|v| if use_sliding { sliding::to_classic(&v) } else { v }) {
             Ok(v) => v,
             Err(e) if is_auth_error(&e) => {
                 tracing::info!("matrix[{account_id}]: session rejected, re-logging in");
-                let (token, _device_id) = match ensure_login(state, config, account_id)
-                    .await
-                    .context("re-login after 401")
-                {
+                let (token, _device_id) = match ensure_login(state, config, account_id).await.context("re-login after 401") {
                     Ok(v) => v,
                     Err(e) => {
                         state.runtime.remove_matrix_machine(account_id);
@@ -515,9 +384,7 @@ pub(super) async fn run_sync(
         };
 
         if !announced_connected {
-            state
-                .runtime
-                .set_conn_state(state, account_id, ConnState::Connected, None);
+            state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
             announced_connected = true;
         }
 
@@ -536,9 +403,7 @@ pub(super) async fn run_sync(
         // requests (e.g. claiming one-time keys to establish a session
         // with a device that just sent us a room key) - send those too
         // before moving on, same as the tutorial's sync() sketch.
-        session
-            .process_outgoing_requests(&config.homeserver_url, &access_token)
-            .await;
+        session.process_outgoing_requests(&config.homeserver_url, &access_token).await;
 
         // A key that has just arrived may open messages already on screen as
         // "unable to decrypt". Here rather than inside the to-device handler
@@ -547,29 +412,10 @@ pub(super) async fn run_sync(
         // share - and this is the one place all three have already landed.
         relock::retry_locked(state, &session, account_id).await;
 
-        verification::tick(
-            state,
-            account_id,
-            &session,
-            &user_id,
-            &config.homeserver_url,
-            &access_token,
-        )
-        .await;
-        session
-            .run_pending_backup(&config.homeserver_url, &access_token)
-            .await;
+        verification::tick(state, account_id, &session, &user_id, &config.homeserver_url, &access_token).await;
+        session.run_pending_backup(&config.homeserver_url, &access_token).await;
 
-        process_sync_response(
-            state,
-            account_id,
-            &config.user_id,
-            &config.homeserver_url,
-            &access_token,
-            &resp,
-            &session,
-        )
-        .await;
+        process_sync_response(state, account_id, &config.user_id, &config.homeserver_url, &access_token, &resp, &session).await;
 
         if let Some(nb) = resp["next_batch"].as_str() {
             next_batch = Some(nb.to_string());
@@ -597,11 +443,7 @@ pub(super) fn sync_url(homeserver_url: &str, since: Option<&str>, presence: &str
         // quietly undo an idle or DND setting on the next poll.
         "{}/_matrix/client/v3/sync?timeout={}&set_presence={}",
         homeserver_url.trim_end_matches('/'),
-        if since.is_none() {
-            0
-        } else {
-            SYNC_LONG_POLL_MS
-        },
+        if since.is_none() { 0 } else { SYNC_LONG_POLL_MS },
         presence
     );
     if let Some(since) = since {
@@ -619,48 +461,19 @@ pub(super) fn sync_url(homeserver_url: &str, since: Option<&str>, presence: &str
 /// array `process_sync_response` already knows how to derive a name and
 /// encryption flag from for a room it's seeing for the first time - reused
 /// directly rather than duplicating that logic.
-pub(super) async fn bootstrap_joined_rooms(
-    state: &AppState,
-    account_id: &str,
-    own_user_id: &str,
-    homeserver_url: &str,
-    access_token: &str,
-) -> Result<()> {
+pub(super) async fn bootstrap_joined_rooms(state: &AppState, account_id: &str, own_user_id: &str, homeserver_url: &str, access_token: &str) -> Result<()> {
     let base = homeserver_url.trim_end_matches('/');
-    let resp = http::get_json(
-        &format!("{base}/_matrix/client/v3/joined_rooms"),
-        access_token,
-    )
-    .await
-    .context("joined_rooms")?;
-    let room_ids: Vec<String> = resp["joined_rooms"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(String::from))
-        .collect();
+    let resp = http::get_json(&format!("{base}/_matrix/client/v3/joined_rooms"), access_token).await.context("joined_rooms")?;
+    let room_ids: Vec<String> = resp["joined_rooms"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
 
     for room_id in room_ids {
         // Already known (e.g. this account never actually restarted, or a
         // prior bootstrap/first-sync already covered it this run) - skip
         // the extra request rather than re-deriving needlessly.
-        if state
-            .runtime
-            .get_matrix_room_name(account_id, &room_id)
-            .is_some()
-        {
+        if state.runtime.get_matrix_room_name(account_id, &room_id).is_some() {
             continue;
         }
-        register_room(
-            state,
-            account_id,
-            own_user_id,
-            homeserver_url,
-            access_token,
-            &room_id,
-            false,
-        )
-        .await;
+        register_room(state, account_id, own_user_id, homeserver_url, access_token, &room_id, false).await;
     }
     Ok(())
 }
@@ -687,61 +500,30 @@ pub(super) async fn register_room(
     syncing: bool,
 ) {
     let base = homeserver_url.trim_end_matches('/');
-    let already_known = state
-        .runtime
-        .get_matrix_room_name(account_id, room_id)
-        .is_some();
-    let encoded_room_id =
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let state_resp = match http::get_json(
-        &format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/state"),
-        access_token,
-    )
-    .await
-    {
+    let already_known = state.runtime.get_matrix_room_name(account_id, room_id).is_some();
+    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let state_resp = match http::get_json(&format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/state"), access_token).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!("matrix[{account_id}]: fetching state for room {room_id} failed: {e:#}");
             return;
         }
     };
-    let Some(events) = state_resp.as_array() else {
-        return;
-    };
+    let Some(events) = state_resp.as_array() else { return };
     let event_refs: Vec<&Value> = events.iter().collect();
 
     // A Space is a room too, so it arrives in joined_rooms alongside real
     // ones. It gets a rail entry rather than a buffer - there is nothing
     // to say in it.
     if rooms::is_space(&event_refs) {
-        register_space(
-            state,
-            account_id,
-            room_id,
-            homeserver_url,
-            access_token,
-            &event_refs,
-        )
-        .await;
+        register_space(state, account_id, room_id, homeserver_url, access_token, &event_refs).await;
         return;
     }
 
-    let info = rooms::derive_room_info(
-        room_id,
-        own_user_id,
-        &event_refs,
-        state
-            .runtime
-            .matrix_direct_peer(account_id, room_id)
-            .as_deref(),
-    );
-    state
-        .runtime
-        .set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
+    let info = rooms::derive_room_info(room_id, own_user_id, &event_refs, state.runtime.matrix_direct_peer(account_id, room_id).as_deref());
+    state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
 
-    let buffer = state
-        .runtime
-        .ensure_buffer(state, account_id, &info.name, &info.kind);
+    let buffer = state.runtime.ensure_buffer(state, account_id, &info.name, &info.kind);
     state.runtime.set_matrix_room(state, &buffer.id, room_id);
     // Only for a room this is the first sight of. A sync that has already
     // carried the room has already said what is in it, and marking it as
@@ -757,17 +539,12 @@ pub(super) async fn register_room(
         state.runtime.set_buffer_group(state, &buffer.id, &group_id);
     }
 
-    state
-        .runtime
-        .set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
+    state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&event_refs));
 
     // The packs this room shares with everybody in it. Keyed by state key
     // because a room may carry several, and named after the room where the
     // pack itself gives no name.
-    for event in event_refs
-        .iter()
-        .filter(|e| e["type"].as_str() == Some("im.ponies.room_emotes"))
-    {
+    for event in event_refs.iter().filter(|e| e["type"].as_str() == Some("im.ponies.room_emotes")) {
         state.runtime.set_matrix_sticker_pack(
             account_id,
             &format!("{room_id}|{}", event["state_key"].as_str().unwrap_or("")),
@@ -776,15 +553,7 @@ pub(super) async fn register_room(
         );
     }
 
-    roomstate::process_state_events(
-        state,
-        account_id,
-        room_id,
-        homeserver_url,
-        access_token,
-        &event_refs,
-    )
-    .await;
+    roomstate::process_state_events(state, account_id, room_id, homeserver_url, access_token, &event_refs).await;
     // No presence data available at bootstrap time (that's /sync-only
     // - there's no bulk "current presence for all these users"
     // endpoint) - the roster/power-level part of the userlist is
@@ -815,15 +584,7 @@ pub(super) fn stop_waiting_eventually(state: AppState, buffer_id: String) {
     });
 }
 
-pub(super) async fn process_sync_response(
-    state: &AppState,
-    account_id: &str,
-    own_user_id: &str,
-    homeserver_url: &str,
-    access_token: &str,
-    resp: &Value,
-    session: &crypto::CryptoSession,
-) {
+pub(super) async fn process_sync_response(state: &AppState, account_id: &str, own_user_id: &str, homeserver_url: &str, access_token: &str, resp: &Value, session: &crypto::CryptoSession) {
     // Global presence updates, handled before the per-room loop below since
     // presence.events is a top-level sibling of rooms, not scoped to any
     // one of them - a user going online/offline with no other room
@@ -848,11 +609,7 @@ pub(super) async fn process_sync_response(
             // the homeserver and somebody who turned it off in Element meant
             // to stop telling it which links they read.
             if event["type"].as_str() == Some(previews::ACCOUNT_SETTING) {
-                state.runtime.set_matrix_previews_off(
-                    account_id,
-                    "",
-                    previews::disabled_by(&event["content"]),
-                );
+                state.runtime.set_matrix_previews_off(account_id, "", previews::disabled_by(&event["content"]));
             }
             // The account's own sticker pack, which travels with it between
             // clients - see backend/matrix/stickers.rs for the two places a
@@ -865,17 +622,10 @@ pub(super) async fn process_sync_response(
 
     if let Some(events) = resp["presence"]["events"].as_array() {
         for event in events {
-            let Some(sender) = event["sender"].as_str() else {
-                continue;
-            };
+            let Some(sender) = event["sender"].as_str() else { continue };
             let online = event["content"]["presence"].as_str() == Some("online");
-            state
-                .runtime
-                .set_matrix_presence(account_id, sender, online);
-            for room_id in state
-                .runtime
-                .matrix_rooms_containing_member(account_id, sender)
-            {
+            state.runtime.set_matrix_presence(account_id, sender, online);
+            for room_id in state.runtime.matrix_rooms_containing_member(account_id, sender) {
                 roomstate::emit_matrix_presence(state, account_id, &room_id, own_user_id);
             }
         }
@@ -895,11 +645,7 @@ pub(super) async fn process_sync_response(
             rooms
                 .iter()
                 .map(|(room_id, room)| {
-                    let events: Vec<&Value> = room["invite_state"]["events"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .collect();
+                    let events: Vec<&Value> = room["invite_state"]["events"].as_array().into_iter().flatten().collect();
                     rooms::invite_summary(room_id, own_user_id, &events)
                 })
                 .collect()
@@ -910,48 +656,31 @@ pub(super) async fn process_sync_response(
     // ones that have been, here or in another client.
     let resolved: std::collections::HashSet<String> = ["join", "leave"]
         .iter()
-        .flat_map(|kind| {
-            resp["rooms"][kind]
-                .as_object()
-                .into_iter()
-                .flatten()
-                .map(|(room_id, _)| room_id.clone())
-        })
+        .flat_map(|kind| resp["rooms"][kind].as_object().into_iter().flatten().map(|(room_id, _)| room_id.clone()))
         .collect();
-    if state
-        .runtime
-        .merge_matrix_invites(account_id, invites, &resolved)
-    {
+    if state.runtime.merge_matrix_invites(account_id, invites, &resolved) {
         let invites = state.runtime.matrix_invites(account_id);
-        state.events.emit(
-            "matrixInvites",
-            serde_json::json!({ "accountId": account_id, "invites": invites }),
-        );
+        state.events.emit("matrixInvites", serde_json::json!({ "accountId": account_id, "invites": invites }));
     }
 
     // Rooms this account is no longer in - left from another client, or
     // kicked. Their buffers would otherwise sit there looking joined.
     if let Some(left) = resp["rooms"]["leave"].as_object() {
         for room_id in left.keys() {
-            if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id)
-            {
+            if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
                 let buffer_id = crate::model::buffer_id(account_id, &buffer_name);
                 state.runtime.remove_buffer(state, &buffer_id);
             }
         }
     }
 
-    let Some(joined) = resp["rooms"]["join"].as_object() else {
-        return;
-    };
+    let Some(joined) = resp["rooms"]["join"].as_object() else { return };
     for (room_id, room) in joined {
         // The anchor for reading older history. Only the first one seen is
         // kept: every later sync's prev_batch points at newer history, and
         // taking one would skip everything between.
         if let Some(token) = room["timeline"]["prev_batch"].as_str() {
-            state
-                .runtime
-                .set_matrix_back_token(account_id, room_id, token, true);
+            state.runtime.set_matrix_back_token(account_id, room_id, token, true);
         }
 
         // Who is composing in this room, if anybody. Matrix sends the whole
@@ -960,16 +689,10 @@ pub(super) async fn process_sync_response(
         // empty case has to be emitted rather than skipped or the last
         // indicator would never clear.
         if let Some(events) = room["ephemeral"]["events"].as_array() {
-            for event in events
-                .iter()
-                .filter(|e| e["type"].as_str() == Some("m.receipt"))
-            {
+            for event in events.iter().filter(|e| e["type"].as_str() == Some("m.receipt")) {
                 take_read_receipts(state, account_id, room_id, own_user_id, &event["content"]);
             }
-            for event in events
-                .iter()
-                .filter(|e| e["type"].as_str() == Some("m.typing"))
-            {
+            for event in events.iter().filter(|e| e["type"].as_str() == Some("m.typing")) {
                 let members = state.runtime.get_matrix_room_members(account_id, room_id);
                 let nicks: Vec<String> = event["content"]["user_ids"]
                     .as_array()
@@ -979,9 +702,7 @@ pub(super) async fn process_sync_response(
                     .filter(|u| *u != own_user_id)
                     .map(|u| members.get(u).cloned().unwrap_or_else(|| u.to_string()))
                     .collect();
-                if let Some((buffer_name, _)) =
-                    state.runtime.get_matrix_room_name(account_id, room_id)
-                {
+                if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
                     state.events.emit(
                         "typing",
                         serde_json::json!({
@@ -1005,9 +726,7 @@ pub(super) async fn process_sync_response(
         // already knows about.
         if let Some(events) = room["account_data"]["events"].as_array() {
             if let Some(unread) = receipts::marked_unread_in(events) {
-                if let Some((buffer_name, _)) =
-                    state.runtime.get_matrix_room_name(account_id, room_id)
-                {
+                if let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) {
                     state.events.emit(
                         "markedUnread",
                         serde_json::json!({
@@ -1027,125 +746,79 @@ pub(super) async fn process_sync_response(
             state.runtime.set_buffer_syncing(state, &buffer_id, false);
         }
 
-        let timeline_events: Vec<&Value> = room["timeline"]["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .collect();
+        let timeline_events: Vec<&Value> = room["timeline"]["events"].as_array().into_iter().flatten().collect();
 
-        let (buffer_name, buffer_kind) =
-            match state.runtime.get_matrix_room_name(account_id, room_id) {
-                // Known already - but a room can be renamed by anybody with the
-                // power to do it, from any client, at any time, and the cached
-                // name would then be wrong for the rest of the session and every
-                // session after it: the name is what the buffer is keyed by, so
-                // nothing re-derives it and a restart finds the old one again.
-                //
-                // Re-derived only when this sync actually carries a naming event,
-                // which is the narrow case the blanket rule below was protecting
-                // against. A later sync is a delta, and deriving a name from a
-                // delta that says nothing about naming would take a direct
-                // message with no member events in it and call it by its room id.
-                // An `m.room.name` in hand is not a guess.
-                Some(cached) => match renamed_to(room, &cached.0) {
-                    Some(new_name) => {
-                        state
-                            .runtime
-                            .set_matrix_room_name(account_id, room_id, &new_name, &cached.1);
-                        state
-                            .runtime
-                            .rename_buffer(state, account_id, &cached.0, &new_name, &cached.1);
-                        (new_name, cached.1)
-                    }
-                    None => cached,
-                },
-                None => {
-                    // First time seeing this room - either the account's true
-                    // first /sync (a full state snapshot) or a room newly
-                    // joined mid-session (Matrix sends that room's full state
-                    // the first time it appears too) - either way this
-                    // response's state section for THIS room is a real
-                    // snapshot, not a partial delta, so deriving from it once
-                    // here is reliable. See rooms.rs's doc comment for why
-                    // this is deliberately *not* re-derived on later syncs.
-                    let mut naming_events: Vec<&Value> = room["state"]["events"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .collect();
-                    naming_events.extend(
-                        timeline_events
-                            .iter()
-                            .filter(|e| e["state_key"].is_string()),
-                    );
-
-                    // A space joined mid-session arrives here exactly like a room
-                    // would. It becomes a rail entry, not a buffer - without this
-                    // it would appear in the room list as somewhere to talk.
-                    // Bootstrap and this loop run concurrently, and a first
-                    // sync does not always carry m.room.create - so a space can
-                    // reach here looking like an ordinary room. Whichever side
-                    // identified it first is the answer.
-                    if rooms::is_space(&naming_events)
-                        || state
-                            .runtime
-                            .has_buffer_group(&space_group_id(account_id, room_id))
-                    {
-                        register_space(
-                            state,
-                            account_id,
-                            room_id,
-                            homeserver_url,
-                            access_token,
-                            &naming_events,
-                        )
-                        .await;
-                        continue;
-                    }
-
-                    let info = rooms::derive_room_info(
-                        room_id,
-                        own_user_id,
-                        &naming_events,
-                        state
-                            .runtime
-                            .matrix_direct_peer(account_id, room_id)
-                            .as_deref(),
-                    );
-                    state
-                        .runtime
-                        .set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
-                    // Same full-state snapshot naming just derived from - also
-                    // seeds member avatars/room avatar/power levels the first
-                    // time this room is seen, same reasoning as naming above
-                    // (see roomstate.rs's own doc comment).
-                    roomstate::process_state_events(
-                        state,
-                        account_id,
-                        room_id,
-                        homeserver_url,
-                        access_token,
-                        &naming_events,
-                    )
-                    .await;
-                    roomstate::emit_matrix_presence(state, account_id, room_id, own_user_id);
-                    (info.name, info.kind)
+        let (buffer_name, buffer_kind) = match state.runtime.get_matrix_room_name(account_id, room_id) {
+            // Known already - but a room can be renamed by anybody with the
+            // power to do it, from any client, at any time, and the cached
+            // name would then be wrong for the rest of the session and every
+            // session after it: the name is what the buffer is keyed by, so
+            // nothing re-derives it and a restart finds the old one again.
+            //
+            // Re-derived only when this sync actually carries a naming event,
+            // which is the narrow case the blanket rule below was protecting
+            // against. A later sync is a delta, and deriving a name from a
+            // delta that says nothing about naming would take a direct
+            // message with no member events in it and call it by its room id.
+            // An `m.room.name` in hand is not a guess.
+            Some(cached) => match renamed_to(room, &cached.0) {
+                Some(new_name) => {
+                    state.runtime.set_matrix_room_name(account_id, room_id, &new_name, &cached.1);
+                    state.runtime.rename_buffer(state, account_id, &cached.0, &new_name, &cached.1);
+                    (new_name, cached.1)
                 }
-            };
+                None => cached,
+            },
+            None => {
+                // First time seeing this room - either the account's true
+                // first /sync (a full state snapshot) or a room newly
+                // joined mid-session (Matrix sends that room's full state
+                // the first time it appears too) - either way this
+                // response's state section for THIS room is a real
+                // snapshot, not a partial delta, so deriving from it once
+                // here is reliable. See rooms.rs's doc comment for why
+                // this is deliberately *not* re-derived on later syncs.
+                let mut naming_events: Vec<&Value> = room["state"]["events"].as_array().into_iter().flatten().collect();
+                naming_events.extend(timeline_events.iter().filter(|e| e["state_key"].is_string()));
 
-        let buffer = state
-            .runtime
-            .ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
+                // A space joined mid-session arrives here exactly like a room
+                // would. It becomes a rail entry, not a buffer - without this
+                // it would appear in the room list as somewhere to talk.
+                // Bootstrap and this loop run concurrently, and a first
+                // sync does not always carry m.room.create - so a space can
+                // reach here looking like an ordinary room. Whichever side
+                // identified it first is the answer.
+                if rooms::is_space(&naming_events)
+                    || state.runtime.has_buffer_group(&space_group_id(account_id, room_id))
+                {
+                    register_space(state, account_id, room_id, homeserver_url, access_token, &naming_events).await;
+                    continue;
+                }
+
+                let info = rooms::derive_room_info(
+                    room_id,
+                    own_user_id,
+                    &naming_events,
+                    state.runtime.matrix_direct_peer(account_id, room_id).as_deref(),
+                );
+                state.runtime.set_matrix_room_name(account_id, room_id, &info.name, &info.kind);
+                // Same full-state snapshot naming just derived from - also
+                // seeds member avatars/room avatar/power levels the first
+                // time this room is seen, same reasoning as naming above
+                // (see roomstate.rs's own doc comment).
+                roomstate::process_state_events(state, account_id, room_id, homeserver_url, access_token, &naming_events).await;
+                roomstate::emit_matrix_presence(state, account_id, room_id, own_user_id);
+                (info.name, info.kind)
+            }
+        };
+
+        let buffer = state.runtime.ensure_buffer(state, account_id, &buffer_name, &buffer_kind);
         state.runtime.set_matrix_room(state, &buffer.id, room_id);
 
         // How the account has filed this room. Read every sync because it is
         // set from any client, and after the buffer exists because it is the
         // buffer this moves in the rail.
-        for event in room["account_data"]["events"]
-            .as_array()
-            .into_iter()
-            .flatten()
-        {
+        for event in room["account_data"]["events"].as_array().into_iter().flatten() {
             if event["type"].as_str() == Some("m.tag") {
                 tags::apply(state, account_id, room_id, &event["content"]);
             }
@@ -1165,15 +838,11 @@ pub(super) async fn process_sync_response(
         // (a no-op if it was already applied, e.g. via bootstrap_joined_
         // rooms, which resolves the avatar *after* the buffer exists).
         if let Some(avatar) = state.runtime.get_matrix_room_avatar(account_id, room_id) {
-            state
-                .runtime
-                .set_matrix_room_avatar(state, account_id, room_id, &avatar);
+            state.runtime.set_matrix_room_avatar(state, account_id, room_id, &avatar);
         }
         // And the topic, for the same reason.
         if let Some(topic) = state.runtime.get_matrix_room_topic(account_id, room_id) {
-            state
-                .runtime
-                .set_matrix_room_topic(state, account_id, room_id, &topic);
+            state.runtime.set_matrix_room_topic(state, account_id, room_id, &topic);
         }
 
         // Checked every sync (not just first-seen, unlike naming above) -
@@ -1181,17 +850,9 @@ pub(super) async fn process_sync_response(
         // set (the spec forbids un-encrypting), so this only ever needs
         // to move from unset to set, never back.
         if !state.runtime.is_matrix_room_encrypted(&buffer.id) {
-            let mut state_events: Vec<&Value> = room["state"]["events"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .collect();
+            let mut state_events: Vec<&Value> = room["state"]["events"].as_array().into_iter().flatten().collect();
             state_events.extend(timeline_events.iter().copied());
-            state.runtime.set_matrix_room_encrypted(
-                state,
-                &buffer.id,
-                rooms::is_encrypted(&state_events),
-            );
+            state.runtime.set_matrix_room_encrypted(state, &buffer.id, rooms::is_encrypted(&state_events));
         }
 
         // Unlike the full-state seeding above, this runs every sync
@@ -1200,21 +861,9 @@ pub(super) async fn process_sync_response(
         // change mid-session, each showing up as an ordinary
         // state-carrying timeline event rather than a fresh full state
         // snapshot.
-        let mid_session_state_events: Vec<&Value> = timeline_events
-            .iter()
-            .filter(|e| e["state_key"].is_string())
-            .copied()
-            .collect();
+        let mid_session_state_events: Vec<&Value> = timeline_events.iter().filter(|e| e["state_key"].is_string()).copied().collect();
         if !mid_session_state_events.is_empty() {
-            roomstate::process_state_events(
-                state,
-                account_id,
-                room_id,
-                homeserver_url,
-                access_token,
-                &mid_session_state_events,
-            )
-            .await;
+            roomstate::process_state_events(state, account_id, room_id, homeserver_url, access_token, &mid_session_state_events).await;
             // A membership join/leave or power-level change mid-session
             // both change this room's userlist - re-broadcast unconditionally
             // here rather than trying to detect which specific event types
@@ -1224,30 +873,11 @@ pub(super) async fn process_sync_response(
             // Only ever called against this genuinely-live batch, never
             // the full-state dumps first-seen-room/bootstrap use above -
             // see announce_membership_changes's own doc comment for why.
-            roomstate::announce_membership_changes(
-                state,
-                account_id,
-                &buffer_name,
-                &buffer_kind,
-                &mid_session_state_events,
-            );
+            roomstate::announce_membership_changes(state, account_id, &buffer_name, &buffer_kind, &mid_session_state_events);
         }
 
         for event in &timeline_events {
-            handle_timeline_event(
-                state,
-                account_id,
-                &buffer.id,
-                &buffer_name,
-                &buffer_kind,
-                event,
-                own_user_id,
-                room_id,
-                session,
-                homeserver_url,
-                access_token,
-            )
-            .await;
+            handle_timeline_event(state, account_id, &buffer.id, &buffer_name, &buffer_kind, event, own_user_id, room_id, session, homeserver_url, access_token).await;
         }
     }
 
@@ -1257,9 +887,7 @@ pub(super) async fn process_sync_response(
     // noticed - see Runtime::note_matrix_upgrade.
     for successor in state.runtime.take_matrix_upgrades(account_id) {
         if let Err(e) = join_room(state, account_id, &successor, &[]).await {
-            tracing::warn!(
-                "matrix[{account_id}]: following a room upgrade into {successor}: {e:#}"
-            );
+            tracing::warn!("matrix[{account_id}]: following a room upgrade into {successor}: {e:#}");
         }
     }
 }
@@ -1300,34 +928,22 @@ pub(super) async fn fetch_pending_invites(
         homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(filter.as_bytes()).collect::<String>()
     );
-    let resp = http::get_json(&url, access_token)
-        .await
-        .context("invite sync")?;
+    let resp = http::get_json(&url, access_token).await.context("invite sync")?;
     let invites: Vec<Value> = resp["rooms"]["invite"]
         .as_object()
         .map(|rooms| {
             rooms
                 .iter()
                 .map(|(room_id, room)| {
-                    let events: Vec<&Value> = room["invite_state"]["events"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .collect();
+                    let events: Vec<&Value> = room["invite_state"]["events"].as_array().into_iter().flatten().collect();
                     rooms::invite_summary(room_id, own_user_id, &events)
                 })
                 .collect()
         })
         .unwrap_or_default();
-    if state
-        .runtime
-        .merge_matrix_invites(account_id, invites, &Default::default())
-    {
+    if state.runtime.merge_matrix_invites(account_id, invites, &Default::default()) {
         let invites = state.runtime.matrix_invites(account_id);
-        state.events.emit(
-            "matrixInvites",
-            serde_json::json!({ "accountId": account_id, "invites": invites }),
-        );
+        state.events.emit("matrixInvites", serde_json::json!({ "accountId": account_id, "invites": invites }));
     }
     Ok(())
 }
@@ -1342,9 +958,7 @@ pub(super) fn space_group_id(account_id: &str, room_id: &str) -> String {
 /// The client names a space by the group id it was given, which is the only
 /// handle it has; the room id inside it is what the protocol wants.
 pub fn space_room_id(group_id: &str) -> Option<String> {
-    group_id
-        .split_once("|space:")
-        .map(|(_, room)| room.to_string())
+    group_id.split_once("|space:").map(|(_, room)| room.to_string())
 }
 
 /// Turns a joined Space into a rail entry and files its rooms under it.
@@ -1396,16 +1010,12 @@ pub(super) async fn register_space(
     // discard it: a space is not somewhere you talk, and leaving it in the
     // room list is how spaces end up looking like empty chats.
     if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
-        tracing::debug!(
-            "matrix[{account_id}]: {room_id} is a space, dropping the buffer made for it"
-        );
+        tracing::debug!("matrix[{account_id}]: {room_id} is a space, dropping the buffer made for it");
         state.runtime.remove_buffer(state, &buffer_id);
     }
 
     for child in rooms::space_children(events) {
-        state
-            .runtime
-            .set_matrix_space_parent(account_id, &child, &group_id);
+        state.runtime.set_matrix_space_parent(account_id, &child, &group_id);
         if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, &child) {
             state.runtime.set_buffer_group(state, &buffer_id, &group_id);
         }
@@ -1440,11 +1050,8 @@ fn renamed_to(room: &Value, current: &str) -> Option<String> {
     let in_timeline = room["timeline"]["events"].as_array().into_iter().flatten();
     in_state
         .chain(in_timeline)
-        .filter(|e| {
-            e["type"].as_str() == Some("m.room.name") && e["state_key"].as_str() == Some("")
-        })
-        .filter_map(|e| e["content"]["name"].as_str())
-        .rfind(|n| !n.is_empty())
+        .filter(|e| e["type"].as_str() == Some("m.room.name") && e["state_key"].as_str() == Some(""))
+        .filter_map(|e| e["content"]["name"].as_str()).rfind(|n| !n.is_empty())
         .filter(|n| *n != current)
         .map(str::to_string)
 }
@@ -1466,28 +1073,20 @@ mod rename_tests {
         let raw = anyhow::anyhow!("M_UNKNOWN_POS: Unknown position");
         assert!(super::is_unknown_position(&raw));
         let wrapped = raw.context("sync request failed");
-        assert!(
-            super::is_unknown_position(&wrapped),
-            "the cause has to be found through the context"
-        );
+        assert!(super::is_unknown_position(&wrapped), "the cause has to be found through the context");
     }
 
     /// And nothing else is: ending the loop is right for a real failure, so
     /// this must not swallow one.
     #[test]
     fn an_ordinary_failure_is_not_mistaken_for_one() {
-        assert!(!super::is_unknown_position(&anyhow::anyhow!(
-            "HTTP 502: bad gateway"
-        )));
-        assert!(!super::is_unknown_position(&anyhow::anyhow!(
-            "M_UNKNOWN_TOKEN"
-        )));
+        assert!(!super::is_unknown_position(&anyhow::anyhow!("HTTP 502: bad gateway")));
+        assert!(!super::is_unknown_position(&anyhow::anyhow!("M_UNKNOWN_TOKEN")));
     }
 
     #[test]
     fn a_rename_in_the_state_section_is_picked_up() {
-        let room =
-            json!({ "state": { "events": [name_event("after")] }, "timeline": { "events": [] } });
+        let room = json!({ "state": { "events": [name_event("after")] }, "timeline": { "events": [] } });
         assert_eq!(renamed_to(&room, "before").as_deref(), Some("after"));
     }
 
@@ -1496,8 +1095,7 @@ mod rename_tests {
     /// somebody sitting in the room when it is renamed.
     #[test]
     fn a_rename_in_the_timeline_is_picked_up_too() {
-        let room =
-            json!({ "state": { "events": [] }, "timeline": { "events": [name_event("after")] } });
+        let room = json!({ "state": { "events": [] }, "timeline": { "events": [name_event("after")] } });
         assert_eq!(renamed_to(&room, "before").as_deref(), Some("after"));
     }
 
@@ -1507,17 +1105,12 @@ mod rename_tests {
             "state": { "events": [json!({ "type": "m.room.topic", "state_key": "", "content": { "topic": "x" } })] },
             "timeline": { "events": [json!({ "type": "m.room.message", "content": { "body": "hello" } })] }
         });
-        assert_eq!(
-            renamed_to(&room, "before"),
-            None,
-            "a delta with no name in it is not a rename"
-        );
+        assert_eq!(renamed_to(&room, "before"), None, "a delta with no name in it is not a rename");
     }
 
     #[test]
     fn the_name_it_already_has_is_not_a_rename() {
-        let room =
-            json!({ "state": { "events": [name_event("same")] }, "timeline": { "events": [] } });
+        let room = json!({ "state": { "events": [name_event("same")] }, "timeline": { "events": [] } });
         assert_eq!(renamed_to(&room, "same"), None);
     }
 
@@ -1566,9 +1159,7 @@ mod rename_tests {
 /// stored batch token - so a pack that was set yesterday was never mentioned
 /// again, and the stickers stayed missing until somebody edited the pack.
 fn apply_user_emotes(state: &AppState, account_id: &str, content: &Value) {
-    state
-        .runtime
-        .set_matrix_sticker_pack(account_id, "", "your stickers", content);
+    state.runtime.set_matrix_sticker_pack(account_id, "", "your stickers", content);
     // The other half of the same pack. Stickers are events of
     // their own and have their own picker; emoticons are images
     // inside a line of text, which is what the emoji picker is
@@ -1578,10 +1169,7 @@ fn apply_user_emotes(state: &AppState, account_id: &str, content: &Value) {
     // turn `:name:` into the image on the way out.
     state.runtime.set_matrix_emoticons(
         account_id,
-        emoticons
-            .iter()
-            .map(|e| (e.name.clone(), e.mxc.clone()))
-            .collect(),
+        emoticons.iter().map(|e| (e.name.clone(), e.mxc.clone())).collect(),
     );
     if !emoticons.is_empty() {
         state.runtime.set_emoji_source(
@@ -1616,16 +1204,8 @@ fn apply_user_emotes(state: &AppState, account_id: &str, content: &Value) {
 
 /// Asks for the account's pack outright, for the connect that would otherwise
 /// never be told about it.
-pub(super) async fn load_user_emotes(
-    state: &AppState,
-    account_id: &str,
-    base: &str,
-    token: &str,
-    user_id: &str,
-) {
-    if let Some(content) =
-        super::ssss::read_account_data(base, token, user_id, "im.ponies.user_emotes").await
-    {
+pub(super) async fn load_user_emotes(state: &AppState, account_id: &str, base: &str, token: &str, user_id: &str) {
+    if let Some(content) = super::ssss::read_account_data(base, token, user_id, "im.ponies.user_emotes").await {
         apply_user_emotes(state, account_id, &content);
     }
 }

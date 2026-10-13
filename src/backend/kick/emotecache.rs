@@ -75,10 +75,7 @@ fn shrink_gif(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
     use image::AnimationDecoder;
 
     let decoder = GifDecoder::new(Cursor::new(bytes)).context("reading the emote")?;
-    let frames = decoder
-        .into_frames()
-        .collect_frames()
-        .context("decoding the emote's frames")?;
+    let frames = decoder.into_frames().collect_frames().context("decoding the emote's frames")?;
     if frames.is_empty() {
         bail!("emote had no frames");
     }
@@ -89,15 +86,12 @@ fn shrink_gif(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
         // enough to notice, and the difference at this size is not visible on a
         // 64-pixel square.
         let mut encoder = GifEncoder::new_with_speed(&mut out, 10);
-        encoder
-            .set_repeat(Repeat::Infinite)
-            .context("setting the emote to loop")?;
+        encoder.set_repeat(Repeat::Infinite).context("setting the emote to loop")?;
         for frame in frames {
             let delay = frame.delay();
             let buffer = frame.into_buffer();
             let (w, h) = fit(buffer.width(), buffer.height(), px);
-            let small =
-                image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Lanczos3);
+            let small = image::imageops::resize(&buffer, w, h, image::imageops::FilterType::Lanczos3);
             encoder
                 .encode_frame(image::Frame::from_parts(small, 0, 0, delay))
                 .context("writing a shrunk frame")?;
@@ -112,9 +106,7 @@ fn shrink_still(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
     let (w, h) = fit(image.width(), image.height(), px);
     let small = image.resize(w, h, image::imageops::FilterType::Lanczos3);
     let mut out = Vec::new();
-    small
-        .write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png)
-        .context("writing the shrunk emote")?;
+    small.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png).context("writing the shrunk emote")?;
     Ok(out)
 }
 
@@ -125,9 +117,7 @@ pub fn shrink(bytes: &[u8], px: u32) -> Result<(Vec<u8>, &'static str)> {
         // fall through rather than give up on it.
         match shrink_gif(bytes, px) {
             Ok(out) => return Ok((out, "gif")),
-            Err(e) => tracing::debug!(
-                "kick: emote would not shrink as an animation ({e}), trying it as a still"
-            ),
+            Err(e) => tracing::debug!("kick: emote would not shrink as an animation ({e}), trying it as a still"),
         }
     }
     Ok((shrink_still(bytes, px)?, "png"))
@@ -238,21 +228,15 @@ const FETCH_AT_ONCE: usize = 6;
 pub async fn cached_map() -> std::collections::BTreeMap<String, String> {
     let dir = emote_cache_dir();
     let mut out = std::collections::BTreeMap::new();
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return out;
-    };
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { return out };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
         // A half-written file is not a cached emote yet.
         if name.ends_with(".part") {
             continue;
         }
-        let Some((id, _ext)) = name.rsplit_once('.') else {
-            continue;
-        };
+        let Some((id, _ext)) = name.rsplit_once('.') else { continue };
         out.insert(id.to_string(), format!("file://{}", path.display()));
     }
     out
@@ -301,20 +285,13 @@ pub async fn resolve(ids: &[String]) -> std::collections::BTreeMap<String, Strin
 /// named by the emote's id, which is all Kick needs.
 pub async fn restore_cached(path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
-    let id = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .context("not a cached emote")?;
+    let id = path.file_stem().and_then(|n| n.to_str()).context("not a cached emote")?;
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         anyhow::bail!("not a cached emote");
     }
     let client = http().context("no client to fetch it with")?;
-    let url = local_copy(&client, id)
-        .await
-        .context("Kick did not send the emote")?;
-    Ok(std::path::PathBuf::from(
-        url.strip_prefix("file://").unwrap_or(&url),
-    ))
+    let url = local_copy(&client, id).await.context("Kick did not send the emote")?;
+    Ok(std::path::PathBuf::from(url.strip_prefix("file://").unwrap_or(&url)))
 }
 
 #[cfg(test)]
@@ -332,13 +309,8 @@ mod tests {
             for i in 0..frames {
                 let shade = (i * 60) as u8;
                 let buf = image::RgbaImage::from_pixel(w, h, image::Rgba([shade, 40, 200, 255]));
-                enc.encode_frame(image::Frame::from_parts(
-                    buf,
-                    0,
-                    0,
-                    image::Delay::from_numer_denom_ms(100, 1),
-                ))
-                .unwrap();
+                enc.encode_frame(image::Frame::from_parts(buf, 0, 0, image::Delay::from_numer_denom_ms(100, 1)))
+                    .unwrap();
             }
         }
         out
@@ -368,11 +340,7 @@ mod tests {
         let (small, ext) = shrink(&png, 64).expect("should shrink");
         assert_eq!(ext, "png");
         let out = image::load_from_memory(&small).unwrap();
-        assert_eq!(
-            (out.width(), out.height()),
-            (64, 32),
-            "aspect ratio is kept"
-        );
+        assert_eq!((out.width(), out.height()), (64, 32), "aspect ratio is kept");
     }
 
     #[test]
@@ -434,10 +402,7 @@ mod tests {
         );
         assert_eq!(after.len(), before.len(), "every frame survives");
         assert!(aw <= EMOTE_PX && ah <= EMOTE_PX);
-        assert!(
-            small.len() < big.len() / 4,
-            "should be much smaller, not slightly"
-        );
+        assert!(small.len() < big.len() / 4, "should be much smaller, not slightly");
     }
 
     #[test]

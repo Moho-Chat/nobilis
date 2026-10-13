@@ -30,9 +30,7 @@ fn threshold(pl: &Value, key: &str, default: i64) -> i64 {
 ///
 /// Not the whole answer since room version 12 - see `effective_power`.
 pub fn user_power_level(pl: &Value, user_id: &str) -> i64 {
-    pl["users"][user_id]
-        .as_i64()
-        .unwrap_or_else(|| threshold(pl, "users_default", 0))
+    pl["users"][user_id].as_i64().unwrap_or_else(|| threshold(pl, "users_default", 0))
 }
 
 /// Whether this room's version gives its creators power of their own.
@@ -42,11 +40,7 @@ pub fn user_power_level(pl: &Value, user_id: &str) -> i64 {
 /// be demoted - so `users` is empty in a room whose owner has full control,
 /// which reads as "nobody has any power" to anything that only looks there.
 pub fn creators_outrank_everybody(room_version: &str) -> bool {
-    room_version
-        .trim()
-        .parse::<u32>()
-        .map(|v| v >= 12)
-        .unwrap_or(false)
+    room_version.trim().parse::<u32>().map(|v| v >= 12).unwrap_or(false)
 }
 
 /// The rank a creator holds: above every number a room can name.
@@ -106,9 +100,7 @@ pub fn creators_of(create_event: &Value) -> Vec<String> {
 }
 
 fn message_send_threshold(pl: &Value) -> i64 {
-    pl["events"]["m.room.message"]
-        .as_i64()
-        .unwrap_or_else(|| threshold(pl, "events_default", 0))
+    pl["events"]["m.room.message"].as_i64().unwrap_or_else(|| threshold(pl, "events_default", 0))
 }
 
 /// Whether this account may set one particular piece of room state.
@@ -122,49 +114,24 @@ fn message_send_threshold(pl: &Value) -> i64 {
 /// Room-level, like `permissions_json` beside it - the server enforces the
 /// real rule either way, and this only decides what to put in front of
 /// somebody.
-pub fn can_send_state(
-    pl: &Value,
-    own_user_id: &str,
-    creators: &[String],
-    room_version: &str,
-    event_type: &str,
-) -> bool {
+pub fn can_send_state(pl: &Value, own_user_id: &str, creators: &[String], room_version: &str, event_type: &str) -> bool {
     let own_level = effective_power(pl, own_user_id, creators, room_version);
-    let needed = pl["events"][event_type]
-        .as_i64()
-        .unwrap_or_else(|| threshold(pl, "state_default", 50));
+    let needed = pl["events"][event_type].as_i64().unwrap_or_else(|| threshold(pl, "state_default", 50));
     own_level >= needed
 }
 
 /// The same question asked about a buffer, with the room's cached levels.
-pub fn can_send_state_in_buffer(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_type: &str,
-) -> bool {
-    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
-        return false;
-    };
-    let Some(account) = state.accounts.get_matrix(account_id) else {
-        return false;
-    };
-    let pl = state
-        .runtime
-        .get_matrix_power_levels(account_id, &room_id)
-        .unwrap_or_else(|| serde_json::json!({}));
+pub fn can_send_state_in_buffer(state: &AppState, account_id: &str, buffer_id: &str, event_type: &str) -> bool {
+    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else { return false };
+    let Some(account) = state.accounts.get_matrix(account_id) else { return false };
+    let pl = state.runtime.get_matrix_power_levels(account_id, &room_id).unwrap_or_else(|| serde_json::json!({}));
     let creators = state.runtime.matrix_room_creators(account_id, &room_id);
-    let version = state
-        .runtime
-        .matrix_room_version(account_id, &room_id)
-        .unwrap_or_default();
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
     can_send_state(&pl, &account.user_id, &creators, &version, event_type)
 }
 
 fn power_levels_change_threshold(pl: &Value) -> i64 {
-    pl["events"]["m.room.power_levels"]
-        .as_i64()
-        .unwrap_or_else(|| threshold(pl, "state_default", 50))
+    pl["events"]["m.room.power_levels"].as_i64().unwrap_or_else(|| threshold(pl, "state_default", 50))
 }
 
 /// `{canRedactOthers, canKick, canBan, canMute}` for `own_user_id` in a
@@ -176,12 +143,7 @@ fn power_levels_change_threshold(pl: &Value) -> i64 {
 /// *target's*, which this can't check without knowing who - the mutation
 /// itself still enforces that server-side regardless, this is only ever
 /// used to decide whether to show the option at all.
-pub fn permissions_json(
-    pl: &Value,
-    own_user_id: &str,
-    creators: &[String],
-    room_version: &str,
-) -> Value {
+pub fn permissions_json(pl: &Value, own_user_id: &str, creators: &[String], room_version: &str) -> Value {
     let own_level = effective_power(pl, own_user_id, creators, room_version);
     serde_json::json!({
         "canRedactOthers": own_level >= threshold(pl, "redact", 50),
@@ -194,68 +156,30 @@ pub fn permissions_json(
 /// This account's own cached permissions in a buffer's room - `{}` (every
 /// default) if nothing's been cached yet, same reasoning as
 /// permissions_json's own doc comment.
-pub fn permissions_for_buffer(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-) -> Result<Value> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("no such Matrix account")?;
-    let pl = state
-        .runtime
-        .get_matrix_power_levels(account_id, &room_id)
-        .unwrap_or_else(|| serde_json::json!({}));
+pub fn permissions_for_buffer(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
+    let pl = state.runtime.get_matrix_power_levels(account_id, &room_id).unwrap_or_else(|| serde_json::json!({}));
     let creators = state.runtime.matrix_room_creators(account_id, &room_id);
-    let version = state
-        .runtime
-        .matrix_room_version(account_id, &room_id)
-        .unwrap_or_default();
+    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
     Ok(permissions_json(&pl, &account.user_id, &creators, &version))
 }
 
-async fn homeserver_token_room(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-) -> Result<(String, String, String)> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("no such Matrix account")?;
+async fn homeserver_token_room(state: &AppState, account_id: &str, buffer_id: &str) -> Result<(String, String, String)> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
     Ok((account.homeserver_url, account.access_token, room_id))
 }
 
-pub async fn kick_member(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    target_user_id: &str,
-    reason: Option<&str>,
-) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+pub async fn kick_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str, reason: Option<&str>) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/kick",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/kick", url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>());
     let mut body = serde_json::json!({ "user_id": target_user_id });
     if let Some(reason) = reason {
         body["reason"] = Value::String(reason.to_string());
     }
-    http::post_json(&url, Some(&access_token), body)
-        .await
-        .context("kicking member")?;
+    http::post_json(&url, Some(&access_token), body).await.context("kicking member")?;
     Ok(())
 }
 
@@ -266,73 +190,33 @@ pub async fn kick_member(
 /// exactly as they say who may remove. It is the opposite action, which is
 /// why its absence was odd: a room made here could gain no second member
 /// from here.
-pub async fn invite_member(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    target_user_id: &str,
-) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+pub async fn invite_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/invite",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
-    );
-    http::post_json(
-        &url,
-        Some(&access_token),
-        serde_json::json!({ "user_id": target_user_id }),
-    )
-    .await
-    .context("inviting member")?;
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/invite", url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>());
+    http::post_json(&url, Some(&access_token), serde_json::json!({ "user_id": target_user_id }))
+        .await
+        .context("inviting member")?;
     Ok(())
 }
 
-pub async fn ban_member(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    target_user_id: &str,
-    reason: Option<&str>,
-) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+pub async fn ban_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str, reason: Option<&str>) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/ban",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/ban", url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>());
     let mut body = serde_json::json!({ "user_id": target_user_id });
     if let Some(reason) = reason {
         body["reason"] = Value::String(reason.to_string());
     }
-    http::post_json(&url, Some(&access_token), body)
-        .await
-        .context("banning member")?;
+    http::post_json(&url, Some(&access_token), body).await.context("banning member")?;
     Ok(())
 }
 
-pub async fn unban_member(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    target_user_id: &str,
-) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+pub async fn unban_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/unban",
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
-    );
-    http::post_json(
-        &url,
-        Some(&access_token),
-        serde_json::json!({ "user_id": target_user_id }),
-    )
-    .await
-    .context("unbanning member")?;
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/unban", url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>());
+    http::post_json(&url, Some(&access_token), serde_json::json!({ "user_id": target_user_id })).await.context("unbanning member")?;
     Ok(())
 }
 
@@ -354,16 +238,12 @@ pub async fn set_power_level(
     target_user_id: &str,
     level: i64,
 ) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
     let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let state_url =
-        format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
+    let state_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
 
-    let mut pl = http::get_json(&state_url, &access_token)
-        .await
-        .context("fetching current power levels")?;
+    let mut pl = http::get_json(&state_url, &access_token).await.context("fetching current power levels")?;
     // The account id is "matrix:@user:server"; the power levels are keyed by
     // the Matrix id itself.
     let own_mxid = account_id.strip_prefix("matrix:").unwrap_or(account_id);
@@ -381,11 +261,8 @@ pub async fn set_power_level(
     let (creators, version) = match (cached_creators.is_empty(), cached_version) {
         (false, Some(version)) => (cached_creators, version),
         _ => {
-            let create_url =
-                format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.create/");
-            let create = http::get_json(&create_url, &access_token)
-                .await
-                .unwrap_or(Value::Null);
+            let create_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.create/");
+            let create = http::get_json(&create_url, &access_token).await.unwrap_or(Value::Null);
             let version = create["room_version"]
                 .as_str()
                 .or_else(|| create["content"]["room_version"].as_str())
@@ -412,9 +289,7 @@ pub async fn set_power_level(
         );
     }
     pl["users"][target_user_id] = Value::from(level);
-    http::put_json(&state_url, &access_token, pl)
-        .await
-        .context("setting power level")?;
+    http::put_json(&state_url, &access_token, pl).await.context("setting power level")?;
     Ok(())
 }
 
@@ -425,28 +300,17 @@ pub async fn set_power_level(
 /// state events are always a full replace, never a partial patch - a
 /// naive "just PUT {users: {target: level}}" would silently wipe every
 /// other customization the room's power levels already had.
-pub async fn mute_member(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    target_user_id: &str,
-) -> Result<()> {
-    let (homeserver_url, access_token, room_id) =
-        homeserver_token_room(state, account_id, buffer_id).await?;
+pub async fn mute_member(state: &AppState, account_id: &str, buffer_id: &str, target_user_id: &str) -> Result<()> {
+    let (homeserver_url, access_token, room_id) = homeserver_token_room(state, account_id, buffer_id).await?;
     let base = homeserver_url.trim_end_matches('/');
     let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let state_url =
-        format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
+    let state_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.power_levels/");
 
-    let mut pl = http::get_json(&state_url, &access_token)
-        .await
-        .context("fetching current power levels")?;
+    let mut pl = http::get_json(&state_url, &access_token).await.context("fetching current power levels")?;
     // Same rule as set_power_level: muting is a power-level floor, and a
     // creator's floor cannot be written from room version 12 on.
     let create_url = format!("{base}/_matrix/client/v3/rooms/{encoded_room}/state/m.room.create/");
-    let create = http::get_json(&create_url, &access_token)
-        .await
-        .unwrap_or(Value::Null);
+    let create = http::get_json(&create_url, &access_token).await.unwrap_or(Value::Null);
     let version = create["room_version"]
         .as_str()
         .or_else(|| create["content"]["room_version"].as_str())
@@ -457,16 +321,12 @@ pub async fn mute_member(
         creators = creators_of(&create);
     }
     if creators_outrank_everybody(&version) && creators.iter().any(|c| c == target_user_id) {
-        anyhow::bail!(
-            "{target_user_id} made this room, and from room version 12 a creator cannot be muted"
-        );
+        anyhow::bail!("{target_user_id} made this room, and from room version 12 a creator cannot be muted");
     }
     let muted_level = message_send_threshold(&pl) - 1;
     pl["users"][target_user_id] = serde_json::json!(muted_level);
 
-    http::put_json(&state_url, &access_token, pl)
-        .await
-        .context("updating power levels")?;
+    http::put_json(&state_url, &access_token, pl).await.context("updating power levels")?;
     Ok(())
 }
 
@@ -489,10 +349,7 @@ mod creator_tests {
         let create = create("12", "@owner:example.org", vec!["@second:example.org"]);
         let creators = creators_of(&create);
         assert!(creators.iter().any(|c| c == "@owner:example.org"));
-        assert!(
-            creators.iter().any(|c| c == "@second:example.org"),
-            "additional_creators count too"
-        );
+        assert!(creators.iter().any(|c| c == "@second:example.org"), "additional_creators count too");
         // And an ordinary member is not one, so ranking them stays possible.
         assert!(!creators.iter().any(|c| c == "@somebody:example.org"));
     }
@@ -514,17 +371,11 @@ mod creator_tests {
         let creators = creators_of(&create);
         // Exactly what a freshly made v12 room looks like: nobody in `users`.
         let levels = json!({ "users": {}, "users_default": 0, "state_default": 50 });
-        assert_eq!(
-            effective_power(&levels, "@me:example.org", &creators, "12"),
-            CREATOR_POWER
-        );
+        assert_eq!(effective_power(&levels, "@me:example.org", &creators, "12"), CREATOR_POWER);
         // And it is above anything a room could name.
         assert!(effective_power(&levels, "@me:example.org", &creators, "12") > 100);
         // Somebody else in that same room is still nobody.
-        assert_eq!(
-            effective_power(&levels, "@them:example.org", &creators, "12"),
-            0
-        );
+        assert_eq!(effective_power(&levels, "@them:example.org", &creators, "12"), 0);
     }
 
     #[test]
@@ -535,15 +386,9 @@ mod creator_tests {
         // demoted like anybody - so an empty users map really does mean the
         // room has no admin left, and inventing one would be wrong.
         let levels = json!({ "users": {}, "users_default": 0 });
-        assert_eq!(
-            effective_power(&levels, "@me:example.org", &creators, "10"),
-            0
-        );
+        assert_eq!(effective_power(&levels, "@me:example.org", &creators, "10"), 0);
         let with_admin = json!({ "users": { "@me:example.org": 100 } });
-        assert_eq!(
-            effective_power(&with_admin, "@me:example.org", &creators, "10"),
-            100
-        );
+        assert_eq!(effective_power(&with_admin, "@me:example.org", &creators, "10"), 100);
     }
 
     #[test]
@@ -552,18 +397,14 @@ mod creator_tests {
         let creators = creators_of(&create);
         assert_eq!(creators.len(), 2);
         let levels = json!({ "users": {} });
-        assert_eq!(
-            effective_power(&levels, "@partner:example.org", &creators, "12"),
-            CREATOR_POWER
-        );
+        assert_eq!(effective_power(&levels, "@partner:example.org", &creators, "12"), CREATOR_POWER);
     }
 
     #[test]
     fn the_permission_gates_follow() {
         let create = create("12", "@me:example.org", vec![]);
         let creators = creators_of(&create);
-        let levels =
-            json!({ "users": {}, "state_default": 50, "kick": 50, "ban": 50, "redact": 50 });
+        let levels = json!({ "users": {}, "state_default": 50, "kick": 50, "ban": 50, "redact": 50 });
         let perms = permissions_json(&levels, "@me:example.org", &creators, "12");
         // The bug this fixes: the owner of a room being offered nothing.
         assert_eq!(perms["canKick"], true);

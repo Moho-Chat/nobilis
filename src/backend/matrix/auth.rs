@@ -11,9 +11,9 @@
 //! to re-establish sessions (and often re-prompt for verification) with
 //! what looks like a stranger.
 
-use super::http::post_json;
 use super::*;
 use anyhow::bail;
+use super::http::post_json;
 use anyhow::{Context, Result};
 use serde_json::json;
 
@@ -40,16 +40,8 @@ pub struct LoginResult {
 /// list of logins is the one that gets revoked - possibly the wrong one.
 pub const DEVICE_DISPLAY_NAME: &str = "moho";
 
-pub async fn login(
-    homeserver_url: &str,
-    username: &str,
-    password: &str,
-    device_id: Option<&str>,
-) -> Result<LoginResult> {
-    let url = format!(
-        "{}/_matrix/client/v3/login",
-        homeserver_url.trim_end_matches('/')
-    );
+pub async fn login(homeserver_url: &str, username: &str, password: &str, device_id: Option<&str>) -> Result<LoginResult> {
+    let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
     let mut body = json!({
         "type": "m.login.password",
         "identifier": { "type": "m.id.user", "user": username },
@@ -60,27 +52,12 @@ pub async fn login(
         body["device_id"] = json!(device_id);
     }
 
-    let resp = post_json(&url, None, body)
-        .await
-        .context("login request failed")?;
-    let user_id = resp["user_id"]
-        .as_str()
-        .context("login response missing user_id")?
-        .to_string();
-    let access_token = resp["access_token"]
-        .as_str()
-        .context("login response missing access_token")?
-        .to_string();
-    let device_id = resp["device_id"]
-        .as_str()
-        .context("login response missing device_id")?
-        .to_string();
+    let resp = post_json(&url, None, body).await.context("login request failed")?;
+    let user_id = resp["user_id"].as_str().context("login response missing user_id")?.to_string();
+    let access_token = resp["access_token"].as_str().context("login response missing access_token")?.to_string();
+    let device_id = resp["device_id"].as_str().context("login response missing device_id")?.to_string();
 
-    Ok(LoginResult {
-        user_id,
-        access_token,
-        device_id,
-    })
+    Ok(LoginResult { user_id, access_token, device_id })
 }
 
 /// Which ways a homeserver will let somebody sign in.
@@ -89,13 +66,8 @@ pub async fn login(
 /// for: a server with only `m.login.sso` has no password to take, and a form
 /// that demands one there is a form nobody can complete.
 pub(super) async fn flows_at(homeserver_url: &str) -> Result<Vec<String>> {
-    let url = format!(
-        "{}/_matrix/client/v3/login",
-        homeserver_url.trim_end_matches('/')
-    );
-    let resp = super::http::get_json_anonymous(&url)
-        .await
-        .context("asking how to sign in")?;
+    let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
+    let resp = super::http::get_json_anonymous(&url).await.context("asking how to sign in")?;
     Ok(resp["flows"]
         .as_array()
         .into_iter()
@@ -110,15 +82,8 @@ pub(super) async fn flows_at(homeserver_url: &str) -> Result<Vec<String>> {
 /// The same endpoint as a password login, with the type that says a third
 /// party already did the identifying. `device_id` is reused for exactly the
 /// reason the module doc gives - the identity has to survive.
-pub async fn login_with_token(
-    homeserver_url: &str,
-    token: &str,
-    device_id: Option<&str>,
-) -> Result<LoginResult> {
-    let url = format!(
-        "{}/_matrix/client/v3/login",
-        homeserver_url.trim_end_matches('/')
-    );
+pub async fn login_with_token(homeserver_url: &str, token: &str, device_id: Option<&str>) -> Result<LoginResult> {
+    let url = format!("{}/_matrix/client/v3/login", homeserver_url.trim_end_matches('/'));
     let mut body = json!({
         "type": "m.login.token",
         "token": token,
@@ -127,22 +92,11 @@ pub async fn login_with_token(
     if let Some(device_id) = device_id {
         body["device_id"] = json!(device_id);
     }
-    let resp = post_json(&url, None, body)
-        .await
-        .context("finishing the sign-in")?;
+    let resp = post_json(&url, None, body).await.context("finishing the sign-in")?;
     Ok(LoginResult {
-        user_id: resp["user_id"]
-            .as_str()
-            .context("login response missing user_id")?
-            .to_string(),
-        access_token: resp["access_token"]
-            .as_str()
-            .context("login response missing access_token")?
-            .to_string(),
-        device_id: resp["device_id"]
-            .as_str()
-            .context("login response missing device_id")?
-            .to_string(),
+        user_id: resp["user_id"].as_str().context("login response missing user_id")?.to_string(),
+        access_token: resp["access_token"].as_str().context("login response missing access_token")?.to_string(),
+        device_id: resp["device_id"].as_str().context("login response missing device_id")?.to_string(),
     })
 }
 
@@ -173,29 +127,18 @@ mod tests {
             println!("MATRIX_PASSWORD not set, skipping");
             return;
         };
-        let homeserver =
-            std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
+        let homeserver = std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
 
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         println!("logging in to {homeserver} as {username}...");
-        let result = login(&homeserver, &username, &password, None)
-            .await
-            .expect("login failed");
-        println!(
-            "logged in. user_id={} device_id={}",
-            result.user_id, result.device_id
-        );
+        let result = login(&homeserver, &username, &password, None).await.expect("login failed");
+        println!("logged in. user_id={} device_id={}", result.user_id, result.device_id);
         assert!(!result.access_token.is_empty(), "access_token was empty");
 
         println!("logging in again with the same device_id to confirm reuse...");
-        let second = login(&homeserver, &username, &password, Some(&result.device_id))
-            .await
-            .expect("second login failed");
-        assert_eq!(
-            second.device_id, result.device_id,
-            "homeserver did not reuse the supplied device_id"
-        );
+        let second = login(&homeserver, &username, &password, Some(&result.device_id)).await.expect("second login failed");
+        assert_eq!(second.device_id, result.device_id, "homeserver did not reuse the supplied device_id");
         println!("device_id reuse confirmed.");
     }
 }
@@ -265,9 +208,7 @@ pub async fn register(
             http::Attempt::Done(answer) => return registered(&answer),
             http::Attempt::NeedsAuth(challenge) => challenge,
         };
-        let session = challenge["session"]
-            .as_str()
-            .context("registration was refused with no session to continue")?;
+        let session = challenge["session"].as_str().context("registration was refused with no session to continue")?;
         let stage = next_stage(&challenge, token.is_some())?;
         // The same stage twice means the answer was wrong, not that another
         // turn is needed: a refused stage comes back as the same 401 with
@@ -277,10 +218,7 @@ pub async fn register(
         if stage == last_stage {
             let said = challenge["error"].as_str().unwrap_or_default();
             if stage == REGISTRATION_TOKEN {
-                bail!(
-                    "this homeserver refused that invitation token{}",
-                    suffix(said)
-                );
+                bail!("this homeserver refused that invitation token{}", suffix(said));
             }
             bail!("this homeserver refused the registration{}", suffix(said));
         }
@@ -300,25 +238,15 @@ pub async fn register(
 
 /// Whatever the homeserver said about it, where it said anything.
 fn suffix(said: &str) -> String {
-    if said.is_empty() {
-        String::new()
-    } else {
-        format!(" ({said})")
-    }
+    if said.is_empty() { String::new() } else { format!(" ({said})") }
 }
 
 const REGISTRATION_TOKEN: &str = "m.login.registration_token";
 const MAX_REGISTRATION_STAGES: usize = 4;
 
 fn registered(answer: &Value) -> Result<(String, String, String)> {
-    let user_id = answer["user_id"]
-        .as_str()
-        .context("the homeserver registered no user id")?
-        .to_string();
-    let access_token = answer["access_token"]
-        .as_str()
-        .context("the homeserver returned no access token")?
-        .to_string();
+    let user_id = answer["user_id"].as_str().context("the homeserver registered no user id")?.to_string();
+    let access_token = answer["access_token"].as_str().context("the homeserver returned no access token")?.to_string();
     let device_id = answer["device_id"].as_str().unwrap_or_default().to_string();
     Ok((user_id, access_token, device_id))
 }
@@ -331,19 +259,9 @@ fn registered(answer: &Value) -> Result<(String, String, String)> {
 /// a flow that cannot be finished would leave a half-registered session on
 /// the server and an error here either way.
 fn next_stage(challenge: &Value, have_token: bool) -> Result<&'static str> {
-    let completed: Vec<&str> = challenge["completed"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|s| s.as_str())
-        .collect();
-    let flows = challenge["flows"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let doable =
-        |stage: &str| stage == "m.login.dummy" || (stage == REGISTRATION_TOKEN && have_token);
+    let completed: Vec<&str> = challenge["completed"].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter_map(|s| s.as_str()).collect();
+    let flows = challenge["flows"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let doable = |stage: &str| stage == "m.login.dummy" || (stage == REGISTRATION_TOKEN && have_token);
 
     let next = flows
         .iter()
@@ -366,17 +284,7 @@ fn next_stage(challenge: &Value, have_token: bool) -> Result<&'static str> {
     // Worth separating from the rest: an invitation token is the one missing
     // thing that can be supplied from this window, so saying "sign up on its
     // own page" here would send somebody away from the field they need.
-    if !have_token
-        && flows
-            .iter()
-            .filter_map(|flow| flow["stages"].as_array())
-            .any(|stages| {
-                stages
-                    .iter()
-                    .filter_map(|s| s.as_str())
-                    .all(|s| doable(s) || s == REGISTRATION_TOKEN)
-            })
-    {
+    if !have_token && flows.iter().filter_map(|flow| flow["stages"].as_array()).any(|stages| stages.iter().filter_map(|s| s.as_str()).all(|s| doable(s) || s == REGISTRATION_TOKEN)) {
         bail!("this homeserver needs an invitation token to register");
     }
     bail!(
@@ -412,10 +320,7 @@ fn wanted_stages(flows: &[Value]) -> Vec<String> {
 /// reason beats a form that fails on submit.
 pub async fn registration_flows(homeserver_url: &str) -> Result<(bool, bool, Vec<String>)> {
     let resolved = http::resolve_homeserver(homeserver_url).await?;
-    let url = format!(
-        "{}/_matrix/client/v3/register",
-        resolved.trim_end_matches('/')
-    );
+    let url = format!("{}/_matrix/client/v3/register", resolved.trim_end_matches('/'));
     let challenge = match http::post_json_uia(&url, json!({})).await {
         Ok(http::Attempt::NeedsAuth(challenge)) => challenge,
         // Answering an empty registration outright would be a homeserver
@@ -428,18 +333,8 @@ pub async fn registration_flows(homeserver_url: &str) -> Result<(bool, bool, Vec
         Err(e) if is_closed(&e) => return Ok((false, false, Vec::new())),
         Err(e) => return Err(e),
     };
-    let flows = challenge["flows"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let needs_token = flows
-        .iter()
-        .filter_map(|flow| flow["stages"].as_array())
-        .any(|stages| {
-            stages
-                .iter()
-                .any(|s| s.as_str() == Some(REGISTRATION_TOKEN))
-        });
+    let flows = challenge["flows"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let needs_token = flows.iter().filter_map(|flow| flow["stages"].as_array()).any(|stages| stages.iter().any(|s| s.as_str() == Some(REGISTRATION_TOKEN)));
     Ok((!flows.is_empty(), needs_token, wanted_stages(flows)))
 }
 
@@ -474,31 +369,16 @@ fn readable_stage(stage: &str) -> String {
 /// the desktop, works the same on every platform, and cannot be claimed by
 /// another application: the port is chosen by the kernel a moment before it
 /// is used, and nothing else knows it.
-pub fn start_sso_login(
-    state: AppState,
-    login_id: String,
-    homeserver_url: String,
-    provider: Option<String>,
-) {
+pub fn start_sso_login(state: AppState, login_id: String, homeserver_url: String, provider: Option<String>) {
     tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_sso_login(
-            &state,
-            &login_id,
-            &homeserver_url,
-            provider.as_deref(),
-        ))
-        .catch_unwind()
-        .await;
+        let result = std::panic::AssertUnwindSafe(try_sso_login(&state, &login_id, &homeserver_url, provider.as_deref())).catch_unwind().await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("matrix sso login[{login_id}]: {error}");
-        state.events.emit(
-            "matrixLoginResult",
-            serde_json::json!({ "loginId": login_id, "success": false, "error": error }),
-        );
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
     });
 }
 
@@ -511,19 +391,14 @@ pub fn start_sso_login(
 pub fn start_device_login(state: AppState, login_id: String, homeserver_url: String) {
     tokio::spawn(async move {
         let result =
-            std::panic::AssertUnwindSafe(try_device_login(&state, &login_id, &homeserver_url))
-                .catch_unwind()
-                .await;
+            std::panic::AssertUnwindSafe(try_device_login(&state, &login_id, &homeserver_url)).catch_unwind().await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("matrix device login[{login_id}]: {error}");
-        state.events.emit(
-            "matrixLoginResult",
-            serde_json::json!({ "loginId": login_id, "success": false, "error": error }),
-        );
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
     });
 }
 
@@ -535,20 +410,11 @@ pub fn start_device_login(state: AppState, login_id: String, homeserver_url: Str
 /// it reads like one in a device list beside the ones a server generated.
 fn fresh_device_id() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    (0..10)
-        .map(|_| ALPHABET[rand::random::<usize>() % ALPHABET.len()] as char)
-        .collect()
+    (0..10).map(|_| ALPHABET[rand::random::<usize>() % ALPHABET.len()] as char).collect()
 }
 
-pub(super) async fn try_device_login(
-    state: &AppState,
-    login_id: &str,
-    homeserver_url: &str,
-) -> Result<()> {
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }),
-    );
+pub(super) async fn try_device_login(state: &AppState, login_id: &str, homeserver_url: &str) -> Result<()> {
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
     let homeserver_url = http::resolve_homeserver(homeserver_url).await?;
 
     let metadata = oidc::auth_metadata(&homeserver_url)
@@ -558,10 +424,7 @@ pub(super) async fn try_device_login(
         // for those the password form is the right door.
         .context("this homeserver holds its own accounts, so there is no code to sign in with - use a password")?;
 
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "asking for a code..." }),
-    );
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "asking for a code..." }));
     let client_id = oidc::register_client(&metadata).await?;
     let device_id = fresh_device_id();
     let grant = oidc::request_device_code(&metadata, &client_id, &device_id).await?;
@@ -602,11 +465,7 @@ pub(super) async fn try_device_login(
             // said this once will say it again at the old rate.
             oidc::Poll::SlowDown => interval += Duration::from_secs(5),
             oidc::Poll::Stopped(why) => anyhow::bail!("{why}"),
-            oidc::Poll::Approved {
-                access_token,
-                refresh_token: refresh,
-                expires_in,
-            } => {
+            oidc::Poll::Approved { access_token, refresh_token: refresh, expires_in } => {
                 // Kept, because the access token does not last: matrix.org
                 // measures these in minutes, and there is no password here
                 // to sign in again with when one runs out.
@@ -621,31 +480,19 @@ pub(super) async fn try_device_login(
         }
     };
 
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "signing in..." }),
-    );
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "signing in..." }));
     // Who this turned out to be. The grant knows nothing about Matrix ids -
     // it hands back a token, and the homeserver is what says whose it is.
     let whoami = http::get_json(
-        &format!(
-            "{}/_matrix/client/v3/account/whoami",
-            homeserver_url.trim_end_matches('/')
-        ),
+        &format!("{}/_matrix/client/v3/account/whoami", homeserver_url.trim_end_matches('/')),
         &access_token,
     )
     .await
     .context("asking the homeserver who this token belongs to")?;
-    let user_id = whoami["user_id"]
-        .as_str()
-        .context("the homeserver did not say who this is")?
-        .to_string();
+    let user_id = whoami["user_id"].as_str().context("the homeserver did not say who this is")?.to_string();
     // The server's own answer wins where it has one: it is what the device
     // list will show, and a mismatch here would be a device nobody can find.
-    let device_id = whoami["device_id"]
-        .as_str()
-        .unwrap_or(&device_id)
-        .to_string();
+    let device_id = whoami["device_id"].as_str().unwrap_or(&device_id).to_string();
 
     // Said outright, because this flow has nowhere to say it in passing. The
     // password and token paths carry `initial_device_display_name` on the
@@ -699,10 +546,7 @@ pub(super) async fn try_device_login(
     let saved = state.accounts.add_matrix(config)?;
     let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
-    state.events.emit(
-        "matrixLoginResult",
-        serde_json::json!({ "loginId": login_id, "success": true, "account": account }),
-    );
+    state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
     Ok(())
 }
 
@@ -716,16 +560,8 @@ fn offers_sso(flow: &str) -> bool {
 /// How long to hold the loopback listener open waiting for the browser.
 pub(super) const SSO_TIMEOUT: Duration = Duration::from_secs(300);
 
-pub(super) async fn try_sso_login(
-    state: &AppState,
-    login_id: &str,
-    homeserver_url: &str,
-    provider: Option<&str>,
-) -> Result<()> {
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }),
-    );
+pub(super) async fn try_sso_login(state: &AppState, login_id: &str, homeserver_url: &str, provider: Option<&str>) -> Result<()> {
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
     let homeserver_url = http::resolve_homeserver(homeserver_url).await?;
     let base = homeserver_url.trim_end_matches('/');
 
@@ -741,9 +577,7 @@ pub(super) async fn try_sso_login(
     }
 
     // Bound before the URL is built, because the URL has to contain the port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .context("opening a port for the sign-in to come back to")?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("opening a port for the sign-in to come back to")?;
     let port = listener.local_addr().context("reading the port")?.port();
     let redirect = format!("http://127.0.0.1:{port}/");
     let url = match provider.filter(|p| !p.is_empty()) {
@@ -772,13 +606,8 @@ pub(super) async fn try_sso_login(
         .map_err(|_| anyhow::anyhow!("the sign-in was not finished in time"))?
         .context("waiting for the browser to come back")?;
 
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "logging in..." }),
-    );
-    let login = auth::login_with_token(&homeserver_url, &token, None)
-        .await
-        .context("finishing the sign-in")?;
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "logging in..." }));
+    let login = auth::login_with_token(&homeserver_url, &token, None).await.context("finishing the sign-in")?;
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
@@ -801,15 +630,12 @@ pub(super) async fn try_sso_login(
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
-        rtc_focus_url: None,
-    };
+            rtc_focus_url: None,
+        };
     let saved = state.accounts.add_matrix(config)?;
     let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
-    state.events.emit(
-        "matrixLoginResult",
-        serde_json::json!({ "loginId": login_id, "success": true, "account": account }),
-    );
+    state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
     Ok(())
 }
 
@@ -818,10 +644,7 @@ pub(super) async fn try_sso_login(
 pub(super) async fn wait_for_sso_token(listener: tokio::net::TcpListener) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
-        let (mut socket, _) = listener
-            .accept()
-            .await
-            .context("accepting the browser's request")?;
+        let (mut socket, _) = listener.accept().await.context("accepting the browser's request")?;
         let mut buffer = [0u8; 2048];
         let read = socket.read(&mut buffer).await.unwrap_or(0);
         let request = String::from_utf8_lossy(&buffer[..read]).to_string();
@@ -861,63 +684,31 @@ pub(super) async fn wait_for_sso_token(listener: tokio::net::TcpListener) -> Res
 /// The same shape as `start_login` on purpose: a client that can already
 /// follow a sign-in follows this with no new machinery, and what somebody sees
 /// is a form that either works or explains itself.
-pub fn start_registration(
-    state: AppState,
-    login_id: String,
-    homeserver_url: String,
-    username: String,
-    password: String,
-    token: Option<String>,
-) {
+pub fn start_registration(state: AppState, login_id: String, homeserver_url: String, username: String, password: String, token: Option<String>) {
     tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_registration(
-            &state,
-            &login_id,
-            &homeserver_url,
-            &username,
-            &password,
-            token.as_deref(),
-        ))
-        .catch_unwind()
-        .await;
+        let result =
+            std::panic::AssertUnwindSafe(try_registration(&state, &login_id, &homeserver_url, &username, &password, token.as_deref())).catch_unwind().await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("matrix registration[{login_id}]: {error}");
-        state.events.emit(
-            "matrixLoginResult",
-            serde_json::json!({ "loginId": login_id, "success": false, "error": error }),
-        );
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
     });
 }
 
-async fn try_registration(
-    state: &AppState,
-    login_id: &str,
-    homeserver_url: &str,
-    username: &str,
-    password: &str,
-    token: Option<&str>,
-) -> Result<()> {
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }),
-    );
+async fn try_registration(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str, token: Option<&str>) -> Result<()> {
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
     let homeserver_url = &http::resolve_homeserver(homeserver_url).await?;
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "making the account..." }),
-    );
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "making the account..." }));
 
     // Nothing is stored before it works, unlike the login path. A login saves
     // a placeholder so a wrong password leaves something to correct; there is
     // no equivalent here, because a registration that failed left no account
     // to retry against - the name may now be taken, by us, or not exist at
     // all, and guessing which would be storing a guess.
-    let (user_id, access_token, device_id) =
-        register(homeserver_url, username, password, token).await?;
+    let (user_id, access_token, device_id) = register(homeserver_url, username, password, token).await?;
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
@@ -947,58 +738,29 @@ async fn try_registration(
     Ok(())
 }
 
-pub fn start_login(
-    state: AppState,
-    login_id: String,
-    homeserver_url: String,
-    username: String,
-    password: String,
-) {
+pub fn start_login(state: AppState, login_id: String, homeserver_url: String, username: String, password: String) {
     tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_login(
-            &state,
-            &login_id,
-            &homeserver_url,
-            &username,
-            &password,
-        ))
-        .catch_unwind()
-        .await;
+        let result = std::panic::AssertUnwindSafe(try_login(&state, &login_id, &homeserver_url, &username, &password)).catch_unwind().await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("matrix login[{login_id}]: {error}");
-        state.events.emit(
-            "matrixLoginResult",
-            serde_json::json!({ "loginId": login_id, "success": false, "error": error }),
-        );
+        state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
     });
 }
 
-pub(super) async fn try_login(
-    state: &AppState,
-    login_id: &str,
-    homeserver_url: &str,
-    username: &str,
-    password: &str,
-) -> Result<()> {
+pub(super) async fn try_login(state: &AppState, login_id: &str, homeserver_url: &str, username: &str, password: &str) -> Result<()> {
     // Where the client API actually is, before anything is stored or tried.
     //
     // Resolved here rather than at every call site, and the *resolved* address
     // is what gets saved - so a delegated server is asked once at sign-in
     // rather than on every request forever, and an account that works keeps
     // working if the well-known later goes away.
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }),
-    );
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "finding the server..." }));
     let homeserver_url = &http::resolve_homeserver(homeserver_url).await?;
-    state.events.emit(
-        "matrixLoginStatus",
-        serde_json::json!({ "loginId": login_id, "detail": "logging in..." }),
-    );
+    state.events.emit("matrixLoginStatus", serde_json::json!({ "loginId": login_id, "detail": "logging in..." }));
 
     // Saved before the login is attempted, so a failure leaves an account to
     // correct and retry rather than an empty form. Same reasoning as the
@@ -1027,13 +789,11 @@ pub(super) async fn try_login(
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
-        rtc_focus_url: None,
-    };
+            rtc_focus_url: None,
+        };
     state.accounts.add_matrix(pending.clone())?;
 
-    let login = auth::login(homeserver_url, username, password, None)
-        .await
-        .context("logging in")?;
+    let login = auth::login(homeserver_url, username, password, None).await.context("logging in")?;
 
     let config = MatrixAccountConfig {
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("matrix")),
@@ -1052,8 +812,8 @@ pub(super) async fn try_login(
         prefer_sliding_sync: false,
         dehydration_enabled: false,
         display_name: None,
-        rtc_focus_url: None,
-    };
+            rtc_focus_url: None,
+        };
     let saved = state.accounts.add_matrix(config)?;
     // The placeholder above was keyed on whatever was typed, and the server
     // answers with the canonical user id - "salastil" against "@salastil:
@@ -1070,10 +830,7 @@ pub(super) async fn try_login(
     let account = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
 
-    state.events.emit(
-        "matrixLoginResult",
-        serde_json::json!({ "loginId": login_id, "success": true, "account": account }),
-    );
+    state.events.emit("matrixLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
     Ok(())
 }
 
@@ -1087,27 +844,18 @@ mod sso_tests {
     async fn reads_the_token_the_browser_brings_back() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let waiting = tokio::spawn(super::wait_for_sso_token(listener));
 
         // A browser asking for the icon first, which must not be mistaken for
         // the answer - this is why the handler loops rather than taking the
         // first request it sees.
-        let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect");
-        noise
-            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
-            .await
-            .expect("write");
+        let mut noise = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
+        noise.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n").await.expect("write");
         drop(noise);
 
-        let mut browser = tokio::net::TcpStream::connect(("127.0.0.1", port))
-            .await
-            .expect("connect");
+        let mut browser = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.expect("connect");
         browser
             .write_all(b"GET /?loginToken=syt_abc123 HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .await
@@ -1173,10 +921,7 @@ mod registration_stage_tests {
         // A captcha sits behind the token here. Answering the token stage
         // would succeed and then strand the registration at the captcha, so
         // the whole flow is refused before the first request.
-        let c = challenge(
-            json!([{ "stages": [REGISTRATION_TOKEN, "m.login.recaptcha"] }]),
-            json!([]),
-        );
+        let c = challenge(json!([{ "stages": [REGISTRATION_TOKEN, "m.login.recaptcha"] }]), json!([]));
         let said = next_stage(&c, true).unwrap_err().to_string();
         assert!(said.contains("a captcha"), "{said}");
     }
@@ -1193,10 +938,7 @@ mod registration_stage_tests {
     #[test]
     fn no_flows_at_all_means_no_new_accounts() {
         let c = challenge(json!([]), json!([]));
-        assert!(next_stage(&c, true)
-            .unwrap_err()
-            .to_string()
-            .contains("not accepting"));
+        assert!(next_stage(&c, true).unwrap_err().to_string().contains("not accepting"));
     }
 
     #[test]

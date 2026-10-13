@@ -74,14 +74,7 @@ pub struct Reassembler {
 
 impl Reassembler {
     pub fn new(window: usize) -> Self {
-        Self {
-            packets: BTreeMap::new(),
-            highest: None,
-            floor: 0,
-            window: window.max(2),
-            waiting_since: None,
-            emitted: false,
-        }
+        Self { packets: BTreeMap::new(), highest: None, floor: 0, window: window.max(2), waiting_since: None, emitted: false }
     }
 
     /// Where a 16-bit sequence number sits on a line that does not wrap.
@@ -92,9 +85,7 @@ impl Reassembler {
     /// between them, which is right whenever the true gap is under half the
     /// space - 32767 packets, or minutes of video.
     fn extend(&self, sequence: u16) -> u64 {
-        let Some(highest) = self.highest else {
-            return sequence as u64;
-        };
+        let Some(highest) = self.highest else { return sequence as u64 };
         let base = (highest & 0xffff) as u16;
         let delta = sequence.wrapping_sub(base) as i16;
         (highest as i64 + delta as i64).max(0) as u64
@@ -130,9 +121,7 @@ impl Reassembler {
     /// the newest packet - the ones worth asking the sender for again. At most
     /// `limit` of them, oldest first.
     pub fn missing(&self, limit: usize) -> Vec<u16> {
-        let Some(highest) = self.highest else {
-            return Vec::new();
-        };
+        let Some(highest) = self.highest else { return Vec::new() };
         if !self.emitted {
             return Vec::new();
         }
@@ -152,9 +141,7 @@ impl Reassembler {
     /// decoder will refuse, and it will be shown the next keyframe instead.
     fn evict(&mut self) {
         while self.packets.len() > self.window {
-            let Some((&oldest, _)) = self.packets.iter().next() else {
-                break;
-            };
+            let Some((&oldest, _)) = self.packets.iter().next() else { break };
             self.packets.remove(&oldest);
             self.floor = oldest + 1;
         }
@@ -178,13 +165,9 @@ impl Reassembler {
             let mut keyframe = false;
             let mut timestamp = 0;
             for sequence in start..=end {
-                let Some(packet) = self.packets.remove(&sequence) else {
-                    break;
-                };
+                let Some(packet) = self.packets.remove(&sequence) else { break };
                 timestamp = packet.timestamp;
-                let Some(offset) = vp8_payload_start(&packet.payload) else {
-                    continue;
-                };
+                let Some(offset) = vp8_payload_start(&packet.payload) else { continue };
                 if sequence == start {
                     keyframe = is_keyframe(&packet.payload[offset..]);
                 }
@@ -196,12 +179,7 @@ impl Reassembler {
             self.packets.retain(|&sequence, _| sequence > end);
             if !data.is_empty() {
                 self.emitted = true;
-                out.push(Frame {
-                    timestamp,
-                    keyframe,
-                    data,
-                    after_gap,
-                });
+                out.push(Frame { timestamp, keyframe, data, after_gap });
             }
         }
         out
@@ -272,9 +250,7 @@ pub fn vp8_payload_start(payload: &[u8]) -> Option<usize> {
 /// frames can be split into several. Only the one with partition index zero
 /// starts the frame itself.
 pub fn starts_frame(payload: &[u8]) -> bool {
-    payload
-        .first()
-        .is_some_and(|b| b & 0x10 != 0 && b & 0x07 == 0)
+    payload.first().is_some_and(|b| b & 0x10 != 0 && b & 0x07 == 0)
 }
 
 /// Whether a frame is a keyframe, from VP8's own header.
@@ -291,14 +267,7 @@ mod tests {
     use super::*;
 
     fn packet(sequence: u16, marker: bool, payload: Vec<u8>) -> Packet {
-        Packet {
-            payload_type: super::super::rtp::PAYLOAD_TYPE_VP8,
-            sequence,
-            timestamp: 900,
-            ssrc: 1,
-            marker,
-            payload,
-        }
+        Packet { payload_type: super::super::rtp::PAYLOAD_TYPE_VP8, sequence, timestamp: 900, ssrc: 1, marker, payload }
     }
 
     /// A descriptor with S set and partition zero, then a VP8 header whose
@@ -340,11 +309,7 @@ mod tests {
         assert!(r.push(packet(12, true, later_packet(&[3]))).is_empty());
         assert!(r.push(packet(11, false, later_packet(&[2]))).is_empty());
         let frames = r.push(packet(10, false, first_packet(&[1])));
-        assert_eq!(
-            frames.len(),
-            1,
-            "the frame completes when its first packet finally lands"
-        );
+        assert_eq!(frames.len(), 1, "the frame completes when its first packet finally lands");
         assert_eq!(&frames[0].data[3..], &[1, 2, 3]);
     }
 
@@ -364,10 +329,7 @@ mod tests {
         r.push(packet(10, false, first_packet(&[1])));
         // 11 never arrives.
         let frames = r.push(packet(12, true, later_packet(&[3])));
-        assert!(
-            frames.is_empty(),
-            "a decoder must not be given a frame missing its middle"
-        );
+        assert!(frames.is_empty(), "a decoder must not be given a frame missing its middle");
     }
 
     #[test]
@@ -376,15 +338,10 @@ mod tests {
         let t = Instant::now();
         r.push_at(packet(10, true, first_packet(&[1])), t);
         // 11 is lost; 12 is a whole frame, held rather than handed out.
-        assert!(r
-            .push_at(packet(12, true, first_packet(&[3])), t)
-            .is_empty());
+        assert!(r.push_at(packet(12, true, first_packet(&[3])), t).is_empty());
         assert_eq!(r.missing(8), vec![11]);
         // The resend arrives in time: both come out, in order, whole.
-        let frames = r.push_at(
-            packet(11, true, first_packet(&[2])),
-            t + Duration::from_millis(40),
-        );
+        let frames = r.push_at(packet(11, true, first_packet(&[2])), t + Duration::from_millis(40));
         assert_eq!(frames.len(), 2);
         assert!(frames.iter().all(|f| !f.after_gap));
     }
@@ -394,17 +351,12 @@ mod tests {
         let mut r = Reassembler::new(DEFAULT_WINDOW);
         let t = Instant::now();
         r.push_at(packet(10, true, first_packet(&[1])), t);
-        assert!(r
-            .push_at(packet(12, true, first_packet(&[3])), t)
-            .is_empty());
+        assert!(r.push_at(packet(12, true, first_packet(&[3])), t).is_empty());
         let frames = r.push_at(packet(13, true, first_packet(&[4])), t + RETRANSMIT_WAIT);
         assert_eq!(frames.len(), 2);
         assert!(frames[0].after_gap, "the first frame past the hole says so");
         assert!(!frames[1].after_gap);
-        assert!(
-            r.missing(8).is_empty(),
-            "nothing is still asked for once given up"
-        );
+        assert!(r.missing(8).is_empty(), "nothing is still asked for once given up");
     }
 
     #[test]
@@ -414,18 +366,11 @@ mod tests {
         r.push_at(packet(9, true, first_packet(&[0])), t);
         r.push_at(packet(10, false, first_packet(&[1])), t);
         r.push_at(packet(12, true, later_packet(&[3])), t);
-        assert!(
-            r.push_at(packet(13, true, first_packet(&[9])), t)
-                .is_empty(),
-            "held for a resend first"
-        );
+        assert!(r.push_at(packet(13, true, first_packet(&[9])), t).is_empty(), "held for a resend first");
         let frames = r.push_at(packet(14, true, first_packet(&[10])), t + RETRANSMIT_WAIT);
         assert_eq!(frames.len(), 2, "losing one frame must not stop the stream");
         assert_eq!(&frames[0].data[3..], &[9]);
-        assert!(
-            frames[0].after_gap,
-            "and it says a frame was lost before it"
-        );
+        assert!(frames[0].after_gap, "and it says a frame was lost before it");
         assert!(!frames[1].after_gap);
     }
 
@@ -435,11 +380,7 @@ mod tests {
         assert!(r.push(packet(65_534, false, first_packet(&[1]))).is_empty());
         assert!(r.push(packet(65_535, false, later_packet(&[2]))).is_empty());
         let frames = r.push(packet(0, true, later_packet(&[3])));
-        assert_eq!(
-            frames.len(),
-            1,
-            "65535 is followed by 0, not by a gap of 65535"
-        );
+        assert_eq!(frames.len(), 1, "65535 is followed by 0, not by a gap of 65535");
         assert_eq!(&frames[0].data[3..], &[1, 2, 3]);
     }
 
@@ -450,14 +391,9 @@ mod tests {
         let mut seen = 0;
         // Far more than the window, so the hole at 11 ages out.
         for sequence in 12..40 {
-            seen += r
-                .push(packet(sequence, true, first_packet(&[sequence as u8])))
-                .len();
+            seen += r.push(packet(sequence, true, first_packet(&[sequence as u8]))).len();
         }
-        assert!(
-            seen > 0,
-            "the window has to give up on a hole or the picture stops forever"
-        );
+        assert!(seen > 0, "the window has to give up on a hole or the picture stops forever");
     }
 
     #[test]
@@ -467,10 +403,7 @@ mod tests {
         payload.extend_from_slice(&[7]);
         let frames = r.push(packet(1, true, payload));
         assert_eq!(frames.len(), 1);
-        assert!(
-            !frames[0].keyframe,
-            "the low bit of VP8's first byte set means an inter frame"
-        );
+        assert!(!frames[0].keyframe, "the low bit of VP8's first byte set means an inter frame");
     }
 
     #[test]
@@ -489,11 +422,7 @@ mod tests {
 
     #[test]
     fn a_descriptor_that_runs_off_the_end_is_refused() {
-        assert_eq!(
-            vp8_payload_start(&[0x80]),
-            None,
-            "X set with nothing after it"
-        );
+        assert_eq!(vp8_payload_start(&[0x80]), None, "X set with nothing after it");
         assert_eq!(vp8_payload_start(&[]), None);
     }
 
@@ -513,10 +442,7 @@ mod tests {
         frame.extend((0..rtp::MAX_PAYLOAD * 2 + 7).map(|i| (i % 251) as u8));
 
         let packets = rtp::packetise_vp8(&frame, 77, 1_000, 90_000);
-        assert!(
-            packets.len() > 2,
-            "the point of this test is a frame that had to be split"
-        );
+        assert!(packets.len() > 2, "the point of this test is a frame that had to be split");
 
         let mut r = Reassembler::new(DEFAULT_WINDOW);
         let mut out = Vec::new();
@@ -535,10 +461,7 @@ mod tests {
             }));
         }
         assert_eq!(out.len(), 1, "one frame in, one frame out");
-        assert_eq!(
-            out[0].data, frame,
-            "the bytes have to survive the round trip exactly"
-        );
+        assert_eq!(out[0].data, frame, "the bytes have to survive the round trip exactly");
         assert_eq!(out[0].timestamp, 90_000);
         assert!(out[0].keyframe);
     }
@@ -546,10 +469,7 @@ mod tests {
     #[test]
     fn only_partition_zero_starts_a_frame() {
         assert!(starts_frame(&[0x10]));
-        assert!(
-            !starts_frame(&[0x11]),
-            "S set on partition 1 is a partition, not a frame"
-        );
+        assert!(!starts_frame(&[0x11]), "S set on partition 1 is a partition, not a frame");
         assert!(!starts_frame(&[0x00]));
     }
 }

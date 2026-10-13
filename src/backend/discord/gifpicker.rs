@@ -16,8 +16,7 @@ use super::*;
 use std::sync::LazyLock;
 use std::time::Instant;
 
-static CACHE: LazyLock<std::sync::Mutex<HashMap<String, (Instant, Value)>>> =
-    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static CACHE: LazyLock<std::sync::Mutex<HashMap<String, (Instant, Value)>>> = LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 const TRENDING_FOR: Duration = Duration::from_secs(10 * 60);
 const SEARCH_FOR: Duration = Duration::from_secs(5 * 60);
 const CACHE_LIMIT: usize = 64;
@@ -46,10 +45,7 @@ fn one(item: &Value) -> Option<Value> {
 /// Discord's two shapes of answer: a search is a list of GIFs, and trending is
 /// an object holding them with the categories beside.
 pub(super) fn parse_gifs(answer: &Value) -> Value {
-    let list = answer
-        .as_array()
-        .or_else(|| answer["gifs"].as_array())
-        .or_else(|| answer["results"].as_array());
+    let list = answer.as_array().or_else(|| answer["gifs"].as_array()).or_else(|| answer["results"].as_array());
     let gifs: Vec<Value> = list.into_iter().flatten().filter_map(one).collect();
     let categories: Vec<Value> = answer["categories"]
         .as_array()
@@ -67,11 +63,7 @@ pub(super) fn parse_gifs(answer: &Value) -> Value {
 pub async fn list_gifs(state: &AppState, query: &str) -> Result<Value> {
     let query = query.trim();
     let key = query.to_lowercase();
-    let ttl = if key.is_empty() {
-        TRENDING_FOR
-    } else {
-        SEARCH_FOR
-    };
+    let ttl = if key.is_empty() { TRENDING_FOR } else { SEARCH_FOR };
     if let Some((at, answer)) = CACHE.lock().unwrap().get(&key) {
         if at.elapsed() < ttl {
             return Ok(answer.clone());
@@ -84,23 +76,13 @@ pub async fn list_gifs(state: &AppState, query: &str) -> Result<Value> {
         .into_iter()
         .next()
         .context("GIFs are found through a Discord account, and none is set up")?;
-    let mut url = url::Url::parse(&format!(
-        "{API_BASE}/gifs/{}",
-        if query.is_empty() {
-            "trending"
-        } else {
-            "search"
-        }
-    ))
-    .context("building the GIF request")?;
+    let mut url = url::Url::parse(&format!("{API_BASE}/gifs/{}", if query.is_empty() { "trending" } else { "search" })).context("building the GIF request")?;
     {
         let mut pairs = url.query_pairs_mut();
         if !query.is_empty() {
             pairs.append_pair("q", &query.chars().take(100).collect::<String>());
         }
-        pairs
-            .append_pair("media_format", "mp4")
-            .append_pair("locale", "en-US");
+        pairs.append_pair("media_format", "mp4").append_pair("locale", "en-US");
     }
     let resp = http_client_for(&config.token)
         .get(url)
@@ -111,10 +93,7 @@ pub async fn list_gifs(state: &AppState, query: &str) -> Result<Value> {
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "asking Discord for GIFs")
-        );
+        bail!("{}", discord_error_text(status, &text, "asking Discord for GIFs"));
     }
     let answer: Value = resp.json().await.context("reading Discord's GIFs")?;
     let parsed = parse_gifs(&answer);
@@ -146,13 +125,7 @@ mod tests {
         assert_eq!(out["gifs"][0]["url"], "https://tenor.com/view/cat-gif-1");
         assert_eq!(out["gifs"][0]["src"], "https://media.tenor.com/1.mp4");
         assert_eq!(out["gifs"][0]["gifSrc"], "https://media.tenor.com/1.gif");
-        assert_eq!(
-            (
-                out["gifs"][0]["width"].as_u64(),
-                out["gifs"][0]["height"].as_u64()
-            ),
-            (Some(480), Some(270))
-        );
+        assert_eq!((out["gifs"][0]["width"].as_u64(), out["gifs"][0]["height"].as_u64()), (Some(480), Some(270)));
     }
 
     #[test]
@@ -162,11 +135,7 @@ mod tests {
             "gifs": [gif("1")]
         }));
         assert_eq!(out["gifs"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            out["categories"].as_array().unwrap().len(),
-            1,
-            "a category with no name is not one"
-        );
+        assert_eq!(out["categories"].as_array().unwrap().len(), 1, "a category with no name is not one");
         assert_eq!(out["categories"][0]["name"], "reaction");
     }
 
@@ -182,9 +151,7 @@ mod tests {
 
     #[test]
     fn without_a_file_the_video_is_what_there_is() {
-        let out = parse_gifs(
-            &json!([{ "url": "https://tenor.com/view/x", "src": "https://media.tenor.com/x.mp4" }]),
-        );
+        let out = parse_gifs(&json!([{ "url": "https://tenor.com/view/x", "src": "https://media.tenor.com/x.mp4" }]));
         assert_eq!(out["gifs"][0]["gifSrc"], "https://media.tenor.com/x.mp4");
     }
 

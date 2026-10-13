@@ -23,16 +23,8 @@ use super::*;
 /// module landed in v1.15 and the rooms worth looking into are on servers
 /// that have had the unstable spelling for years, so a client that asks only
 /// one of them asks the wrong one about half the time.
-pub async fn summary(
-    state: &AppState,
-    account_id: &str,
-    room: &str,
-    via: &[String],
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn summary(state: &AppState, account_id: &str, room: &str, via: &[String]) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let escaped = url::form_urlencoded::byte_serialize(room.as_bytes()).collect::<String>();
     let mut query = String::new();
@@ -42,14 +34,11 @@ pub async fn summary(
     for server in via.iter().filter(|s| !s.trim().is_empty()) {
         query.push(if query.is_empty() { '?' } else { '&' });
         query.push_str("via=");
-        query.push_str(
-            &url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>(),
-        );
+        query.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
     }
 
     let stable = format!("{base}/_matrix/client/v1/room_summary/{escaped}{query}");
-    let unstable =
-        format!("{base}/_matrix/client/unstable/im.nheko.summary/summary/{escaped}{query}");
+    let unstable = format!("{base}/_matrix/client/unstable/im.nheko.summary/summary/{escaped}{query}");
     let answer = match http::get_json(&stable, &account.access_token).await {
         Ok(answer) => answer,
         Err(stable_err) => http::get_json(&unstable, &account.access_token)
@@ -81,16 +70,8 @@ pub async fn summary(
 ///
 /// Read backwards from the end, which is what "look inside" means - the last
 /// page of a conversation, not its first.
-pub async fn recent(
-    state: &AppState,
-    account_id: &str,
-    room_id: &str,
-    limit: u32,
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn recent(state: &AppState, account_id: &str, room_id: &str, limit: u32) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={limit}",
         account.homeserver_url.trim_end_matches('/'),

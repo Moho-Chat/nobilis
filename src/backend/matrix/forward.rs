@@ -39,23 +39,15 @@ pub async fn forward_message(
     if !event_id.starts_with('$') {
         bail!("that message has not reached the server yet");
     }
-    let room_id = state
-        .runtime
-        .get_matrix_room(from_buffer)
-        .context("no known Matrix room for that message")?;
-    let account = state
-        .accounts
-        .get_matrix(from_account)
-        .context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(from_buffer).context("no known Matrix room for that message")?;
+    let account = state.accounts.get_matrix(from_account).context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/event/{}",
         account.homeserver_url.trim_end_matches('/'),
         escape(&room_id),
         escape(event_id)
     );
-    let event = http::get_json(&url, &account.access_token)
-        .await
-        .context("reading the message")?;
+    let event = http::get_json(&url, &account.access_token).await.context("reading the message")?;
     let event = readable(state, from_account, &room_id, event).await?;
 
     // An edited message is forwarded as it reads now. The server bundles the
@@ -73,19 +65,11 @@ pub async fn forward_message(
 }
 
 /// The event in plaintext, or a reason it cannot be forwarded.
-async fn readable(
-    state: &AppState,
-    account_id: &str,
-    room_id: &str,
-    event: Value,
-) -> Result<Value> {
+async fn readable(state: &AppState, account_id: &str, room_id: &str, event: Value) -> Result<Value> {
     if event["type"].as_str() != Some(protocol::EVENT_ROOM_ENCRYPTED) {
         return Ok(event);
     }
-    let session = state
-        .runtime
-        .get_matrix_machine(account_id)
-        .context("crypto session not ready yet")?;
+    let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
     let room = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
     crypto::decrypt_room_event(&session, &event, &room)
         .await
@@ -121,16 +105,10 @@ fn forwardable(event: &Value, edit: Option<&Value>) -> Result<(String, Value)> {
     // stranger's words with nothing to say whose.
     if original.contains_key("m.relates_to") {
         if let Some(body) = content.get("body").and_then(Value::as_str) {
-            content.insert(
-                "body".into(),
-                Value::String(strip_plain_fallback(body).to_string()),
-            );
+            content.insert("body".into(), Value::String(strip_plain_fallback(body).to_string()));
         }
         if let Some(html) = content.get("formatted_body").and_then(Value::as_str) {
-            content.insert(
-                "formatted_body".into(),
-                Value::String(strip_html_fallback(html)),
-            );
+            content.insert("formatted_body".into(), Value::String(strip_html_fallback(html)));
         }
     }
     Ok((event_type.to_string(), Value::Object(content)))
@@ -150,9 +128,7 @@ fn strip_plain_fallback(body: &str) -> &str {
 /// The HTML one is a single `<mx-reply>` element at the front.
 fn strip_html_fallback(html: &str) -> String {
     match (html.find("<mx-reply>"), html.find("</mx-reply>")) {
-        (Some(start), Some(end)) if start < end => {
-            format!("{}{}", &html[..start], &html[end + "</mx-reply>".len()..])
-        }
+        (Some(start), Some(end)) if start < end => format!("{}{}", &html[..start], &html[end + "</mx-reply>".len()..]),
         _ => html.to_string(),
     }
 }
@@ -226,21 +202,15 @@ mod tests {
     /// Forwarded as it reads now, not as it was first sent.
     #[test]
     fn an_edited_message_goes_as_edited() {
-        let event =
-            json!({ "type": "m.room.message", "content": { "msgtype": "m.text", "body": "teh" } });
-        let edit =
-            json!({ "content": { "m.new_content": { "msgtype": "m.text", "body": "the" } } });
+        let event = json!({ "type": "m.room.message", "content": { "msgtype": "m.text", "body": "teh" } });
+        let edit = json!({ "content": { "m.new_content": { "msgtype": "m.text", "body": "the" } } });
         let (_, content) = forwardable(&event, Some(&edit)).unwrap();
         assert_eq!(content["body"], "the");
     }
 
     #[test]
     fn polls_and_deleted_messages_are_refused() {
-        assert!(forwardable(
-            &json!({ "type": "m.poll.start", "content": { "body": "?" } }),
-            None
-        )
-        .is_err());
+        assert!(forwardable(&json!({ "type": "m.poll.start", "content": { "body": "?" } }), None).is_err());
         assert!(forwardable(&json!({ "type": "m.room.message", "content": {} }), None).is_err());
     }
 

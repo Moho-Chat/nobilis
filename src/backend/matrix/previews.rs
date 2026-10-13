@@ -47,19 +47,11 @@ pub fn allowed(state: &AppState, account_id: &str, buffer_id: &str, room_id: &st
 /// Asked for directly rather than waited for, like every other piece of
 /// account data here: a resumed session is told only what changed since its
 /// cursor, and a preference set a year ago has not changed.
-pub(super) async fn fetch_account_setting(
-    state: &AppState,
-    account_id: &str,
-    homeserver_url: &str,
-    access_token: &str,
-    user_id: &str,
-) {
+pub(super) async fn fetch_account_setting(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str, user_id: &str) {
     let content = ssss::read_account_data(homeserver_url, access_token, user_id, ACCOUNT_SETTING)
         .await
         .unwrap_or_else(|| serde_json::json!({}));
-    state
-        .runtime
-        .set_matrix_previews_off(account_id, "", disabled_by(&content));
+    state.runtime.set_matrix_previews_off(account_id, "", disabled_by(&content));
 }
 
 /// The first link in a message body, if it has one.
@@ -88,12 +80,7 @@ pub fn first_link(body: &str) -> Option<&str> {
 /// are worth telling a reader about, because the link itself is still there
 /// and still works. A missing card says "no preview"; an error message where
 /// a card should be says "this client is broken".
-pub async fn fetch(
-    state: &AppState,
-    account_id: &str,
-    url: &str,
-    ts_ms: i64,
-) -> Option<crate::model::Embed> {
+pub async fn fetch(state: &AppState, account_id: &str, url: &str, ts_ms: i64) -> Option<crate::model::Embed> {
     let account = state.accounts.get_matrix(account_id)?;
     let asked = format!(
         "{}/_matrix/client/v1/media/preview_url?url={}&ts={ts_ms}",
@@ -102,21 +89,13 @@ pub async fn fetch(
     );
     let answer = http::get_json(&asked, &account.access_token).await.ok()?;
 
-    let text = |key: &str| {
-        answer[key]
-            .as_str()
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-    };
+    let text = |key: &str| answer[key].as_str().filter(|v| !v.is_empty()).map(str::to_string);
     let title = text("og:title");
     let description = text("og:description");
     // The picture comes back as an mxc URI - the homeserver fetched it and
     // kept a copy, so it needs the same token-bearing download everything
     // else here does and cannot be handed to a frontend as it stands.
-    let image = match answer["og:image"]
-        .as_str()
-        .filter(|v| v.starts_with("mxc://"))
-    {
+    let image = match answer["og:image"].as_str().filter(|v| v.starts_with("mxc://")) {
         Some(mxc) => {
             let ext = extension_for_mimetype(answer["og:image:type"].as_str().unwrap_or(""));
             cached_media_path(&account.homeserver_url, &account.access_token, mxc, ext).await
@@ -174,15 +153,11 @@ pub(super) fn unfurl_later(
         link.to_string(),
     );
     tokio::spawn(async move {
-        let Some(embed) = fetch(&state, &account_id, &link, ts_ms).await else {
-            return;
-        };
+        let Some(embed) = fetch(&state, &account_id, &link, ts_ms).await else { return };
         // Not an edit: nobody changed the message, and its attachments are
         // its own business.
         let _ = body;
-        state
-            .runtime
-            .set_message_embeds(&state, &buffer_id, &event_id, &[embed]);
+        state.runtime.set_message_embeds(&state, &buffer_id, &event_id, &[embed]);
     });
 }
 
@@ -193,30 +168,15 @@ mod tests {
     /// One link, and the sentence's punctuation left out of it.
     #[test]
     fn the_first_link_is_the_one_that_gets_a_card() {
-        assert_eq!(
-            first_link("look at https://example.org/page"),
-            Some("https://example.org/page")
-        );
+        assert_eq!(first_link("look at https://example.org/page"), Some("https://example.org/page"));
         // The full stop ends the sentence, not the address.
-        assert_eq!(
-            first_link("see https://example.org."),
-            Some("https://example.org")
-        );
+        assert_eq!(first_link("see https://example.org."), Some("https://example.org"));
         // And the bracket around it belongs to the sentence at both ends.
-        assert_eq!(
-            first_link("(https://example.org/a)"),
-            Some("https://example.org/a")
-        );
-        assert_eq!(
-            first_link("<https://example.org>"),
-            Some("https://example.org")
-        );
+        assert_eq!(first_link("(https://example.org/a)"), Some("https://example.org/a"));
+        assert_eq!(first_link("<https://example.org>"), Some("https://example.org"));
         // First of several: a card is a glance at what somebody posted, not
         // an index of it.
-        assert_eq!(
-            first_link("https://one.example https://two.example"),
-            Some("https://one.example")
-        );
+        assert_eq!(first_link("https://one.example https://two.example"), Some("https://one.example"));
 
         assert_eq!(first_link("nothing here"), None);
         assert_eq!(first_link("mailto:someone@example.org"), None);

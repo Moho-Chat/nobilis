@@ -128,18 +128,10 @@ pub struct Tokens {
 
 /// The password, encrypted with the public key Steam gave for the account.
 pub fn encrypt_password(modulus_hex: &str, exponent_hex: &str, password: &str) -> Result<String> {
-    let n = BigUint::parse_bytes(modulus_hex.trim().as_bytes(), 16)
-        .context("Steam's password key has no modulus")?;
-    let e = BigUint::parse_bytes(exponent_hex.trim().as_bytes(), 16)
-        .context("Steam's password key has no exponent")?;
+    let n = BigUint::parse_bytes(modulus_hex.trim().as_bytes(), 16).context("Steam's password key has no modulus")?;
+    let e = BigUint::parse_bytes(exponent_hex.trim().as_bytes(), 16).context("Steam's password key has no exponent")?;
     let key = RsaPublicKey::new(n, e).context("Steam's password key is not a usable key")?;
-    let encrypted = key
-        .encrypt(
-            &mut rand::thread_rng(),
-            Pkcs1v15Encrypt,
-            password.as_bytes(),
-        )
-        .context("encrypting the password")?;
+    let encrypted = key.encrypt(&mut rand::thread_rng(), Pkcs1v15Encrypt, password.as_bytes()).context("encrypting the password")?;
     Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
 }
 
@@ -173,39 +165,19 @@ fn device_details() -> DeviceDetails {
 /// every thirty, so one that says an hour is not left alone. Five seconds when
 /// it said nothing.
 fn poll_interval(asked: Option<f32>) -> Duration {
-    Duration::from_secs_f32(
-        asked
-            .filter(|s| s.is_finite())
-            .unwrap_or(5.0)
-            .clamp(0.5, 30.0),
-    )
+    Duration::from_secs_f32(asked.filter(|s| s.is_finite()).unwrap_or(5.0).clamp(0.5, 30.0))
 }
 
 /// Starts a sign-in with a name and a password.
 ///
 /// `guard_data` is what a previous sign-in on this machine was given to
 /// remember it by, if there was one.
-pub async fn begin(
-    link: &Link,
-    account_name: &str,
-    password: &str,
-    guard_data: Option<&str>,
-) -> Result<Begun, CallError> {
+pub async fn begin(link: &Link, account_name: &str, password: &str, guard_data: Option<&str>) -> Result<Begun, CallError> {
     let key: GetPasswordRsaPublicKeyResponse = link
-        .call(
-            "Authentication.GetPasswordRSAPublicKey#1",
-            &GetPasswordRsaPublicKeyRequest {
-                account_name: Some(account_name.to_string()),
-            },
-            false,
-        )
+        .call("Authentication.GetPasswordRSAPublicKey#1", &GetPasswordRsaPublicKeyRequest { account_name: Some(account_name.to_string()) }, false)
         .await?;
-    let encrypted = encrypt_password(
-        key.publickey_mod.as_deref().unwrap_or_default(),
-        key.publickey_exp.as_deref().unwrap_or_default(),
-        password,
-    )
-    .map_err(|e| CallError::Unreadable(format!("{e:#}")))?;
+    let encrypted = encrypt_password(key.publickey_mod.as_deref().unwrap_or_default(), key.publickey_exp.as_deref().unwrap_or_default(), password)
+        .map_err(|e| CallError::Unreadable(format!("{e:#}")))?;
 
     let request = BeginAuthViaCredentialsRequest {
         device_friendly_name: Some(device_name()),
@@ -221,13 +193,7 @@ pub async fn begin(
         guard_data: guard_data.filter(|g| !g.is_empty()).map(str::to_string),
         ..BeginAuthViaCredentialsRequest::default()
     };
-    let begun: BeginAuthViaCredentialsResponse = link
-        .call(
-            "Authentication.BeginAuthSessionViaCredentials#1",
-            &request,
-            false,
-        )
-        .await?;
+    let begun: BeginAuthViaCredentialsResponse = link.call("Authentication.BeginAuthSessionViaCredentials#1", &request, false).await?;
 
     Ok(Begun {
         client_id: begun.client_id.unwrap_or_default(),
@@ -237,35 +203,20 @@ pub async fn begin(
         confirmations: begun
             .allowed_confirmations
             .into_iter()
-            .map(|c| Confirmation {
-                guard: Guard::from_wire(c.confirmation_type.unwrap_or_default()),
-                hint: c.associated_message.filter(|m| !m.is_empty()),
-            })
+            .map(|c| Confirmation { guard: Guard::from_wire(c.confirmation_type.unwrap_or_default()), hint: c.associated_message.filter(|m| !m.is_empty()) })
             .collect(),
     })
 }
 
 /// Gives Steam the code that was asked for.
-pub async fn send_code(
-    link: &Link,
-    begun: &Begun,
-    guard: &Guard,
-    code: &str,
-) -> Result<(), CallError> {
+pub async fn send_code(link: &Link, begun: &Begun, guard: &Guard, code: &str) -> Result<(), CallError> {
     let Some(code_type) = guard.code_type() else {
-        return Err(CallError::Unreadable(
-            "that kind of confirmation takes no code".to_string(),
-        ));
+        return Err(CallError::Unreadable("that kind of confirmation takes no code".to_string()));
     };
     let _: UpdateAuthWithGuardCodeResponse = link
         .call(
             "Authentication.UpdateAuthSessionWithSteamGuardCode#1",
-            &UpdateAuthWithGuardCodeRequest {
-                client_id: Some(begun.client_id),
-                steamid: Some(begun.steamid),
-                code: Some(code.trim().to_string()),
-                code_type: Some(code_type),
-            },
+            &UpdateAuthWithGuardCodeRequest { client_id: Some(begun.client_id), steamid: Some(begun.steamid), code: Some(code.trim().to_string()), code_type: Some(code_type) },
             false,
         )
         .await?;
@@ -278,9 +229,7 @@ pub async fn send_code(
 /// says them.
 pub fn waiting_failure(error: CallError) -> String {
     match error {
-        CallError::Refused(super::eresult::FILE_NOT_FOUND | super::eresult::EXPIRED, _) => {
-            "that sign-in ran out before it was approved; start again".to_string()
-        }
+        CallError::Refused(super::eresult::FILE_NOT_FOUND | super::eresult::EXPIRED, _) => "that sign-in ran out before it was approved; start again".to_string(),
         other => other.to_string(),
     }
 }
@@ -288,27 +237,11 @@ pub fn waiting_failure(error: CallError) -> String {
 /// Starts a sign-in that a phone will approve by scanning a code. Answers with
 /// the address the code carries; the session is then polled as any other.
 pub async fn begin_qr(link: &Link) -> Result<(Begun, String), CallError> {
-    let request = BeginAuthViaQrRequest {
-        device_friendly_name: Some(device_name()),
-        platform_type: Some(PLATFORM_TYPE),
-        device_details: Some(device_details()),
-        website_id: Some(WEBSITE_ID.to_string()),
-    };
-    let begun: BeginAuthViaQrResponse = link
-        .call("Authentication.BeginAuthSessionViaQR#1", &request, false)
-        .await?;
-    let url = begun
-        .challenge_url
-        .filter(|u| !u.is_empty())
-        .ok_or_else(|| CallError::Unreadable("Steam gave no code to scan".to_string()))?;
+    let request = BeginAuthViaQrRequest { device_friendly_name: Some(device_name()), platform_type: Some(PLATFORM_TYPE), device_details: Some(device_details()), website_id: Some(WEBSITE_ID.to_string()) };
+    let begun: BeginAuthViaQrResponse = link.call("Authentication.BeginAuthSessionViaQR#1", &request, false).await?;
+    let url = begun.challenge_url.filter(|u| !u.is_empty()).ok_or_else(|| CallError::Unreadable("Steam gave no code to scan".to_string()))?;
     Ok((
-        Begun {
-            client_id: begun.client_id.unwrap_or_default(),
-            request_id: begun.request_id.unwrap_or_default(),
-            interval: poll_interval(begun.interval),
-            steamid: 0,
-            confirmations: Vec::new(),
-        },
+        Begun { client_id: begun.client_id.unwrap_or_default(), request_id: begun.request_id.unwrap_or_default(), interval: poll_interval(begun.interval), steamid: 0, confirmations: Vec::new() },
         url,
     ))
 }
@@ -317,9 +250,7 @@ pub async fn begin_qr(link: &Link) -> Result<(Begun, String), CallError> {
 /// does not say, and an account is kept by its number.
 pub fn steamid_of_token(token: &str) -> Option<u64> {
     let payload = token.split('.').nth(1)?;
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload.trim_end_matches('='))
-        .ok()?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&raw).ok()?;
     claims["sub"].as_str()?.parse().ok()
 }
@@ -341,11 +272,7 @@ pub async fn poll_session(link: &Link, begun: &mut Begun) -> Result<Polled, Call
     let answer: PollAuthSessionResponse = link
         .call(
             "Authentication.PollAuthSessionStatus#1",
-            &PollAuthSessionRequest {
-                client_id: Some(begun.client_id),
-                request_id: Some(begun.request_id.clone()),
-                token_to_revoke: None,
-            },
+            &PollAuthSessionRequest { client_id: Some(begun.client_id), request_id: Some(begun.request_id.clone()), token_to_revoke: None },
             false,
         )
         .await?;
@@ -354,19 +281,13 @@ pub async fn poll_session(link: &Link, begun: &mut Begun) -> Result<Polled, Call
         begun.client_id = id;
     }
     let new_challenge = answer.new_challenge_url.filter(|u| !u.is_empty());
-    let tokens = answer
-        .refresh_token
-        .filter(|t| !t.is_empty())
-        .map(|refresh_token| Tokens {
-            refresh_token,
-            access_token: answer.access_token.unwrap_or_default(),
-            account_name: answer.account_name.filter(|n| !n.is_empty()),
-            guard_data: answer.new_guard_data.filter(|g| !g.is_empty()),
-        });
-    Ok(Polled {
-        tokens,
-        new_challenge,
-    })
+    let tokens = answer.refresh_token.filter(|t| !t.is_empty()).map(|refresh_token| Tokens {
+        refresh_token,
+        access_token: answer.access_token.unwrap_or_default(),
+        account_name: answer.account_name.filter(|n| !n.is_empty()),
+        guard_data: answer.new_guard_data.filter(|g| !g.is_empty()),
+    });
+    Ok(Polled { tokens, new_challenge })
 }
 
 #[cfg(test)]
@@ -379,14 +300,8 @@ mod tests {
         assert!(waiting_failure(CallError::Refused(9, None)).contains("ran out"));
         assert!(waiting_failure(CallError::Refused(27, None)).contains("ran out"));
         assert!(waiting_failure(CallError::Refused(84, None)).contains("limiting"));
-        let page = waiting_failure(CallError::Refused(
-            118,
-            Some("https://login.steampowered.com/agree".into()),
-        ));
-        assert!(
-            page.contains("agreement") && page.contains("https://login.steampowered.com/agree"),
-            "{page}"
-        );
+        let page = waiting_failure(CallError::Refused(118, Some("https://login.steampowered.com/agree".into())));
+        assert!(page.contains("agreement") && page.contains("https://login.steampowered.com/agree"), "{page}");
     }
     use crate::backend::steam::wire::Packet;
     use prost::Message;
@@ -406,13 +321,8 @@ mod tests {
         let (private, n, e) = keypair();
         let encrypted = encrypt_password(&n, &e, "hunter2").unwrap();
         assert!(!encrypted.contains("hunter2"));
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&encrypted)
-            .unwrap();
-        assert_eq!(
-            private.decrypt(Pkcs1v15Encrypt, &bytes).unwrap(),
-            b"hunter2"
-        );
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&encrypted).unwrap();
+        assert_eq!(private.decrypt(Pkcs1v15Encrypt, &bytes).unwrap(), b"hunter2");
         // Encrypted afresh each time, so two sign-ins do not look the same.
         assert_ne!(encrypted, encrypt_password(&n, &e, "hunter2").unwrap());
     }
@@ -421,10 +331,7 @@ mod tests {
     fn a_key_steam_did_not_really_send_is_refused_not_used() {
         assert!(encrypt_password("", "010001", "x").is_err());
         assert!(encrypt_password("zz", "010001", "x").is_err());
-        assert!(
-            encrypt_password("0A", "010001", "x").is_err(),
-            "too small to hold a password"
-        );
+        assert!(encrypt_password("0A", "010001", "x").is_err(), "too small to hold a password");
     }
 
     #[test]
@@ -436,56 +343,34 @@ mod tests {
         assert_eq!(Guard::from_wire(1), Guard::None);
         assert_eq!(Guard::DeviceCode.code_type(), Some(3));
         assert_eq!(Guard::EmailCode.code_type(), Some(2));
-        assert_eq!(
-            Guard::DeviceConfirmation.code_type(),
-            None,
-            "an approval takes no code"
-        );
+        assert_eq!(Guard::DeviceConfirmation.code_type(), None, "an approval takes no code");
         assert_eq!(Guard::from_wire(99), Guard::Other(99));
     }
 
     /// A Steam that wants a code from the authenticator, then issues tokens.
-    fn steam_with_guard(
-        private: &RsaPrivateKey,
-        n: String,
-        e: String,
-        seen: Arc<Mutex<Vec<Packet>>>,
-    ) -> Script {
+    fn steam_with_guard(private: &RsaPrivateKey, n: String, e: String, seen: Arc<Mutex<Vec<Packet>>>) -> Script {
         let _ = private;
         let mut polls = 0;
         Box::new(move |req| {
             seen.lock().unwrap().push(req.clone());
             let method = req.header.target_job_name.clone().unwrap_or_default();
             let reply = match method.as_str() {
-                "Authentication.GetPasswordRSAPublicKey#1" => GetPasswordRsaPublicKeyResponse {
-                    publickey_mod: Some(n.clone()),
-                    publickey_exp: Some(e.clone()),
-                    timestamp: Some(1790000005000),
+                "Authentication.GetPasswordRSAPublicKey#1" => {
+                    GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1790000005000) }.encode_to_vec()
+                }
+                "Authentication.BeginAuthSessionViaCredentials#1" => BeginAuthViaCredentialsResponse {
+                    client_id: Some(1234),
+                    request_id: Some(vec![9, 8, 7]),
+                    interval: Some(0.5),
+                    steamid: Some(76561197960287930),
+                    allowed_confirmations: vec![
+                        AllowedConfirmation { confirmation_type: Some(3), associated_message: None },
+                        AllowedConfirmation { confirmation_type: Some(4), associated_message: Some("Steam app".into()) },
+                    ],
+                    ..Default::default()
                 }
                 .encode_to_vec(),
-                "Authentication.BeginAuthSessionViaCredentials#1" => {
-                    BeginAuthViaCredentialsResponse {
-                        client_id: Some(1234),
-                        request_id: Some(vec![9, 8, 7]),
-                        interval: Some(0.5),
-                        steamid: Some(76561197960287930),
-                        allowed_confirmations: vec![
-                            AllowedConfirmation {
-                                confirmation_type: Some(3),
-                                associated_message: None,
-                            },
-                            AllowedConfirmation {
-                                confirmation_type: Some(4),
-                                associated_message: Some("Steam app".into()),
-                            },
-                        ],
-                        ..Default::default()
-                    }
-                    .encode_to_vec()
-                }
-                "Authentication.UpdateAuthSessionWithSteamGuardCode#1" => {
-                    UpdateAuthWithGuardCodeResponse::default().encode_to_vec()
-                }
+                "Authentication.UpdateAuthSessionWithSteamGuardCode#1" => UpdateAuthWithGuardCodeResponse::default().encode_to_vec(),
                 "Authentication.PollAuthSessionStatus#1" => {
                     polls += 1;
                     if polls < 2 {
@@ -514,24 +399,14 @@ mod tests {
         let url = serve(steam_with_guard(&private, n, e, seen.clone())).await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
 
-        let mut begun = begin(&link, "someone", "hunter2", Some("old-guard"))
-            .await
-            .unwrap();
+        let mut begun = begin(&link, "someone", "hunter2", Some("old-guard")).await.unwrap();
         assert_eq!(begun.steamid, 76561197960287930);
         assert_eq!(begun.interval, Duration::from_millis(500));
         assert_eq!(begun.confirmations[0].guard, Guard::DeviceCode);
-        assert_eq!(
-            begun.confirmations[1],
-            Confirmation {
-                guard: Guard::DeviceConfirmation,
-                hint: Some("Steam app".into())
-            }
-        );
+        assert_eq!(begun.confirmations[1], Confirmation { guard: Guard::DeviceConfirmation, hint: Some("Steam app".into()) });
         assert!(!begun.needs_nothing());
 
-        send_code(&link, &begun, &Guard::DeviceCode, " AB12C ")
-            .await
-            .unwrap();
+        send_code(&link, &begun, &Guard::DeviceCode, " AB12C ").await.unwrap();
         assert_eq!(poll(&link, &mut begun).await.unwrap(), None, "not yet");
         let tokens = poll(&link, &mut begun).await.unwrap().expect("tokens now");
         assert_eq!(tokens.refresh_token, "the-refresh-token");
@@ -539,10 +414,7 @@ mod tests {
         assert_eq!(tokens.guard_data.as_deref(), Some("remember-me"));
 
         let seen = seen.lock().unwrap();
-        let methods: Vec<_> = seen
-            .iter()
-            .map(|p| p.header.target_job_name.clone().unwrap())
-            .collect();
+        let methods: Vec<_> = seen.iter().map(|p| p.header.target_job_name.clone().unwrap()).collect();
         assert_eq!(
             methods,
             [
@@ -561,31 +433,17 @@ mod tests {
         assert_eq!(begin_req.encryption_timestamp, Some(1790000005000));
         assert_eq!(begin_req.persistence, Some(1));
         assert_eq!(begin_req.guard_data.as_deref(), Some("old-guard"));
-        assert_eq!(
-            begin_req.platform_type,
-            Some(3),
-            "it signs in as the mobile app, never as the desktop client"
-        );
+        assert_eq!(begin_req.platform_type, Some(3), "it signs in as the mobile app, never as the desktop client");
         assert_eq!(begin_req.device_details.unwrap().app_type, Some(2));
         assert!(!begin_req.encrypted_password.unwrap().contains("hunter2"));
 
         let code_req = UpdateAuthWithGuardCodeRequest::decode(seen[2].body.as_slice()).unwrap();
-        assert_eq!(
-            (code_req.client_id, code_req.steamid),
-            (Some(1234), Some(76561197960287930))
-        );
-        assert_eq!(
-            code_req.code.as_deref(),
-            Some("AB12C"),
-            "spaces around a pasted code are dropped"
-        );
+        assert_eq!((code_req.client_id, code_req.steamid), (Some(1234), Some(76561197960287930)));
+        assert_eq!(code_req.code.as_deref(), Some("AB12C"), "spaces around a pasted code are dropped");
         assert_eq!(code_req.code_type, Some(3));
 
         let poll_req = PollAuthSessionRequest::decode(seen[3].body.as_slice()).unwrap();
-        assert_eq!(
-            (poll_req.client_id, poll_req.request_id),
-            (Some(1234), Some(vec![9, 8, 7]))
-        );
+        assert_eq!((poll_req.client_id, poll_req.request_id), (Some(1234), Some(vec![9, 8, 7])));
     }
 
     #[tokio::test]
@@ -594,16 +452,7 @@ mod tests {
         let url = serve(Box::new(move |req| {
             let method = req.header.target_job_name.clone().unwrap_or_default();
             Some(vec![if method.contains("GetPasswordRSAPublicKey") {
-                answer(
-                    &req,
-                    1,
-                    GetPasswordRsaPublicKeyResponse {
-                        publickey_mod: Some(n.clone()),
-                        publickey_exp: Some(e.clone()),
-                        timestamp: Some(1),
-                    }
-                    .encode_to_vec(),
-                )
+                answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1) }.encode_to_vec())
             } else {
                 answer(&req, 5, Vec::new())
             }])
@@ -614,19 +463,8 @@ mod tests {
         assert!(matches!(err, CallError::Refused(5, _)), "{err:?}");
         assert!(err.to_string().contains("password"));
 
-        let begun = Begun {
-            client_id: 1,
-            request_id: vec![],
-            interval: Duration::from_secs(1),
-            steamid: 1,
-            confirmations: vec![],
-        };
-        assert!(
-            send_code(&link, &begun, &Guard::DeviceConfirmation, "123")
-                .await
-                .is_err(),
-            "an approval takes no code"
-        );
+        let begun = Begun { client_id: 1, request_id: vec![], interval: Duration::from_secs(1), steamid: 1, confirmations: vec![] };
+        assert!(send_code(&link, &begun, &Guard::DeviceConfirmation, "123").await.is_err(), "an approval takes no code");
     }
 
     #[tokio::test]
@@ -635,16 +473,7 @@ mod tests {
         let url = serve(Box::new(move |req| {
             let method = req.header.target_job_name.clone().unwrap_or_default();
             Some(vec![if method.contains("GetPasswordRSAPublicKey") {
-                answer(
-                    &req,
-                    1,
-                    GetPasswordRsaPublicKeyResponse {
-                        publickey_mod: Some(n.clone()),
-                        publickey_exp: Some(e.clone()),
-                        timestamp: Some(1),
-                    }
-                    .encode_to_vec(),
-                )
+                answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1) }.encode_to_vec())
             } else {
                 answer(
                     &req,
@@ -654,10 +483,7 @@ mod tests {
                         request_id: Some(vec![1]),
                         interval: Some(1.0),
                         steamid: Some(2),
-                        allowed_confirmations: vec![AllowedConfirmation {
-                            confirmation_type: Some(1),
-                            associated_message: None,
-                        }],
+                        allowed_confirmations: vec![AllowedConfirmation { confirmation_type: Some(1), associated_message: None }],
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -666,10 +492,7 @@ mod tests {
         }))
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        assert!(begin(&link, "someone", "x", None)
-            .await
-            .unwrap()
-            .needs_nothing());
+        assert!(begin(&link, "someone", "x", None).await.unwrap().needs_nothing());
     }
 
     #[test]
@@ -678,11 +501,7 @@ mod tests {
         assert_eq!(poll_interval(Some(3600.0)), Duration::from_secs(30));
         assert_eq!(poll_interval(Some(2.0)), Duration::from_secs(2));
         assert_eq!(poll_interval(None), Duration::from_secs(5));
-        assert_eq!(
-            poll_interval(Some(f32::NAN)),
-            Duration::from_secs(5),
-            "not a number is not an answer"
-        );
+        assert_eq!(poll_interval(Some(f32::NAN)), Duration::from_secs(5), "not a number is not an answer");
         assert_eq!(poll_interval(Some(-3.0)), Duration::from_millis(500));
     }
 
@@ -695,12 +514,8 @@ mod tests {
     #[test]
     fn a_token_says_whose_it_is_in_its_subject() {
         use base64::Engine;
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"iss":"steam","sub":"76561197960287930","aud":["mobile"]}"#);
-        assert_eq!(
-            steamid_of_token(&format!("eyJhbGciOiJFZERTQSJ9.{payload}.signature")),
-            Some(76561197960287930)
-        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"iss":"steam","sub":"76561197960287930","aud":["mobile"]}"#);
+        assert_eq!(steamid_of_token(&format!("eyJhbGciOiJFZERTQSJ9.{payload}.signature")), Some(76561197960287930));
         assert_eq!(steamid_of_token("not a token"), None);
         assert_eq!(steamid_of_token("a.b.c"), None);
     }

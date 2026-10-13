@@ -60,13 +60,8 @@ impl ServerFacts {
             let (major, minor) = v.trim_start_matches('v').split_once('.')?;
             Some((major.parse().ok()?, minor.parse().ok()?))
         };
-        let Some(wanted) = parse(wanted) else {
-            return false;
-        };
-        self.versions
-            .iter()
-            .filter_map(|v| parse(v))
-            .any(|have| have >= wanted)
+        let Some(wanted) = parse(wanted) else { return false };
+        self.versions.iter().filter_map(|v| parse(v)).any(|have| have >= wanted)
     }
 
     /// Whether a file of this size can be uploaded at all.
@@ -108,20 +103,11 @@ pub async fn read_facts(homeserver_url: &str, access_token: &str) -> ServerFacts
     if let Ok(answer) = http::get_json_anonymous(&format!("{base}/_matrix/client/versions")).await {
         facts.versions = string_list(&answer["versions"]);
         if let Some(flags) = answer["unstable_features"].as_object() {
-            facts.unstable = flags
-                .iter()
-                .filter(|(_, on)| on.as_bool() == Some(true))
-                .map(|(name, _)| name.clone())
-                .collect();
+            facts.unstable = flags.iter().filter(|(_, on)| on.as_bool() == Some(true)).map(|(name, _)| name.clone()).collect();
         }
     }
 
-    if let Ok(answer) = http::get_json(
-        &format!("{base}/_matrix/client/v3/capabilities"),
-        access_token,
-    )
-    .await
-    {
+    if let Ok(answer) = http::get_json(&format!("{base}/_matrix/client/v3/capabilities"), access_token).await {
         let caps = &answer["capabilities"];
         // `enabled` absent means enabled, per the specification - the field
         // exists to say no, not to say yes.
@@ -141,12 +127,7 @@ pub async fn read_facts(homeserver_url: &str, access_token: &str) -> ServerFacts
     // with the rest. v1 is the authenticated-media spelling; every server new
     // enough to require a token for downloads has it, and one that answers
     // nothing here is simply a server that does not say.
-    if let Ok(answer) = http::get_json(
-        &format!("{base}/_matrix/client/v1/media/config"),
-        access_token,
-    )
-    .await
-    {
+    if let Ok(answer) = http::get_json(&format!("{base}/_matrix/client/v1/media/config"), access_token).await {
         facts.max_upload_size = answer["m.upload.size"].as_u64();
     }
 
@@ -154,12 +135,7 @@ pub async fn read_facts(homeserver_url: &str, access_token: &str) -> ServerFacts
 }
 
 fn string_list(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect()
+    value.as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
 }
 
 #[cfg(test)]
@@ -167,10 +143,7 @@ mod tests {
     use super::*;
 
     fn facts(versions: &[&str]) -> ServerFacts {
-        ServerFacts {
-            versions: versions.iter().map(|v| v.to_string()).collect(),
-            ..ServerFacts::default()
-        }
+        ServerFacts { versions: versions.iter().map(|v| v.to_string()).collect(), ..ServerFacts::default() }
     }
 
     /// Spec versions are compared as numbers, not as text. Sorted as strings,
@@ -208,10 +181,7 @@ mod tests {
         let silent = ServerFacts::default();
         assert!(silent.accepts_upload(4 * 1024 * 1024 * 1024));
 
-        let capped = ServerFacts {
-            max_upload_size: Some(50 * 1024 * 1024),
-            ..ServerFacts::default()
-        };
+        let capped = ServerFacts { max_upload_size: Some(50 * 1024 * 1024), ..ServerFacts::default() };
         assert!(capped.accepts_upload(50 * 1024 * 1024));
         assert!(!capped.accepts_upload(50 * 1024 * 1024 + 1));
     }

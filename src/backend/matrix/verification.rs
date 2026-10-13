@@ -23,10 +23,8 @@ use super::crypto::CryptoSession;
 use super::http;
 use crate::accounts::MatrixAccountConfig;
 use crate::state::AppState;
-use anyhow::{bail, Context, Result};
-use matrix_sdk_crypto::{
-    QrVerification, Sas, SasState, VerificationRequest, VerificationRequestState,
-};
+use anyhow::{Context, Result, bail};
+use matrix_sdk_crypto::{QrVerification, Sas, SasState, VerificationRequest, VerificationRequestState};
 use ruma_common::{DeviceId, UserId};
 use std::sync::Arc;
 
@@ -70,36 +68,20 @@ pub struct ActiveVerification {
     done: bool,
 }
 
-async fn account_session(
-    state: &AppState,
-    account_id: &str,
-) -> Result<(MatrixAccountConfig, Arc<CryptoSession>)> {
-    let config = state
-        .accounts
-        .get_matrix(account_id)
-        .context("no such Matrix account")?;
-    let session = state
-        .runtime
-        .get_matrix_machine(account_id)
-        .context("account is not connected")?;
+async fn account_session(state: &AppState, account_id: &str) -> Result<(MatrixAccountConfig, Arc<CryptoSession>)> {
+    let config = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
+    let session = state.runtime.get_matrix_machine(account_id).context("account is not connected")?;
     Ok((config, session))
 }
 
 /// This account's other known devices (from the last `/keys/query`) -
 /// candidates to start a verification with. Excludes our own current
 /// device - verifying "yourself" isn't a meaningful flow.
-pub async fn list_own_devices(
-    state: &AppState,
-    account_id: &str,
-) -> Result<Vec<serde_json::Value>> {
+pub async fn list_own_devices(state: &AppState, account_id: &str) -> Result<Vec<serde_json::Value>> {
     let (config, session) = account_session(state, account_id).await?;
     let own_user_id = UserId::parse(&config.user_id).context("invalid own user_id")?;
     let own_device_id = session.machine.device_id();
-    let devices = session
-        .machine
-        .get_user_devices(&own_user_id, None)
-        .await
-        .context("get_user_devices")?;
+    let devices = session.machine.get_user_devices(&own_user_id, None).await.context("get_user_devices")?;
     Ok(devices
         .devices()
         .filter(|d| d.device_id() != own_device_id)
@@ -117,21 +99,11 @@ pub async fn list_own_devices(
 /// Requires the account password - deleting a device is UIA-gated by the
 /// Matrix spec (see http.rs's delete_with_password_uia), unlike most
 /// authenticated C-S API calls which only need a valid access token.
-pub async fn delete_device(
-    state: &AppState,
-    account_id: &str,
-    device_id: &str,
-    password: &str,
-) -> Result<()> {
+pub async fn delete_device(state: &AppState, account_id: &str, device_id: &str, password: &str) -> Result<()> {
     let (config, _session) = account_session(state, account_id).await?;
     let base = config.homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/devices/{}",
-        url::form_urlencoded::byte_serialize(device_id.as_bytes()).collect::<String>()
-    );
-    http::delete_with_password_uia(&url, &config.access_token, &config.user_id, password)
-        .await
-        .context("deleting device")?;
+    let url = format!("{base}/_matrix/client/v3/devices/{}", url::form_urlencoded::byte_serialize(device_id.as_bytes()).collect::<String>());
+    http::delete_with_password_uia(&url, &config.access_token, &config.user_id, password).await.context("deleting device")?;
     Ok(())
 }
 
@@ -146,12 +118,7 @@ pub async fn cross_signing_status(state: &AppState, account_id: &str) -> Result<
     let (config, session) = account_session(state, account_id).await?;
     let own_user_id = UserId::parse(&config.user_id).context("invalid own user_id")?;
     let status = session.cross_signing_status().await;
-    let identity = session
-        .machine
-        .get_identity(&own_user_id, None)
-        .await
-        .ok()
-        .flatten();
+    let identity = session.machine.get_identity(&own_user_id, None).await.ok().flatten();
     let own_device = session
         .machine
         .get_device(&own_user_id, session.machine.device_id(), None)
@@ -177,33 +144,18 @@ pub async fn cross_signing_status(state: &AppState, account_id: &str) -> Result<
 }
 
 /// Creates this account's cross-signing identity, where it has none.
-pub async fn bootstrap_cross_signing(
-    state: &AppState,
-    account_id: &str,
-    password: &str,
-) -> Result<()> {
+pub async fn bootstrap_cross_signing(state: &AppState, account_id: &str, password: &str) -> Result<()> {
     let (config, session) = account_session(state, account_id).await?;
-    let password = if password.is_empty() {
-        config.password.clone()
-    } else {
-        password.to_string()
-    };
+    let password = if password.is_empty() { config.password.clone() } else { password.to_string() };
     if password.is_empty() {
         bail!("your homeserver asks for your password before it will publish signing keys");
     }
     session
-        .bootstrap_cross_signing(
-            &config.homeserver_url,
-            &config.access_token,
-            &config.user_id,
-            &password,
-        )
+        .bootstrap_cross_signing(&config.homeserver_url, &config.access_token, &config.user_id, &password)
         .await?;
     state.events.emit(
         "matrixCrossSigning",
-        cross_signing_status(state, account_id)
-            .await
-            .unwrap_or_else(|_| serde_json::json!({ "accountId": account_id })),
+        cross_signing_status(state, account_id).await.unwrap_or_else(|_| serde_json::json!({ "accountId": account_id })),
     );
     Ok(())
 }
@@ -235,10 +187,7 @@ pub async fn start_verification(
 ) -> Result<String> {
     let (config, session) = account_session(state, account_id).await?;
 
-    for old_id in state
-        .runtime
-        .matrix_verification_ids_for_account(account_id)
-    {
+    for old_id in state.runtime.matrix_verification_ids_for_account(account_id) {
         let _ = cancel(state, account_id, &old_id).await;
     }
 
@@ -246,9 +195,7 @@ pub async fn start_verification(
     // the same either way - emoji over to-device events - and what differs is
     // which key ends up signing the result: your self-signing key for your
     // own devices, your user-signing key for anybody else's.
-    let whose = user_id
-        .filter(|id| !id.is_empty())
-        .unwrap_or(&config.user_id);
+    let whose = user_id.filter(|id| !id.is_empty()).unwrap_or(&config.user_id);
     let whose_user_id = UserId::parse(whose).context("invalid user id")?;
     let device_id_ruma = <&DeviceId>::from(device_id);
     let device = session
@@ -266,23 +213,9 @@ pub async fn start_verification(
         .context("sending verification request")?;
 
     let verification_id = flow_id.clone();
-    let v = ActiveVerification {
-        account_id: account_id.to_string(),
-        flow_id,
-        request,
-        sas: None,
-        qr: None,
-        qr_svg: None,
-        qr_state: None,
-        emoji_emitted: false,
-        done: false,
-    };
-    state
-        .events
-        .emit("matrixVerificationStatus", status_event(&v, "requested"));
-    state
-        .runtime
-        .insert_matrix_verification(&verification_id, v);
+    let v = ActiveVerification { account_id: account_id.to_string(), flow_id, request, sas: None, qr: None, qr_svg: None, qr_state: None, emoji_emitted: false, done: false };
+    state.events.emit("matrixVerificationStatus", status_event(&v, "requested"));
+    state.runtime.insert_matrix_verification(&verification_id, v);
     Ok(verification_id)
 }
 
@@ -298,17 +231,10 @@ pub async fn start_verification(
 /// The direct message is made if there is not one already - asking somebody
 /// to verify is asking them something, and a client that could only do it in
 /// rooms that happened to exist would refuse most of the time.
-pub async fn start_user_verification(
-    state: &AppState,
-    account_id: &str,
-    user_id: &str,
-) -> Result<String> {
+pub async fn start_user_verification(state: &AppState, account_id: &str, user_id: &str) -> Result<String> {
     let (config, session) = account_session(state, account_id).await?;
 
-    for old_id in state
-        .runtime
-        .matrix_verification_ids_for_account(account_id)
-    {
+    for old_id in state.runtime.matrix_verification_ids_for_account(account_id) {
         let _ = cancel(state, account_id, &old_id).await;
     }
 
@@ -325,9 +251,7 @@ pub async fn start_user_verification(
         .context("they have no cross-signing identity to verify against")?;
 
     // The room to carry it, made if there is not one.
-    let buffer_id = super::open_dm(state, account_id, user_id, user_id)
-        .await
-        .context("opening a direct message")?;
+    let buffer_id = super::open_dm(state, account_id, user_id, user_id).await.context("opening a direct message")?;
     let room_id = state
         .runtime
         .get_matrix_room(&buffer_id)
@@ -339,8 +263,7 @@ pub async fn start_user_verification(
     let content = serde_json::to_value(identity.verification_request_content(None))
         .context("building the verification request")?;
     let event_id = super::send_room_event(state, account_id, &buffer_id, &room_id, content).await?;
-    let event = ruma_common::EventId::parse(&event_id)
-        .context("the server returned an event id this client cannot read")?;
+    let event = ruma_common::EventId::parse(&event_id).context("the server returned an event id this client cannot read")?;
 
     let request = identity.request_verification(&room, &event, None);
     let flow_id = request.flow_id().as_str().to_string();
@@ -355,13 +278,9 @@ pub async fn start_user_verification(
         emoji_emitted: false,
         done: false,
     };
-    state
-        .events
-        .emit("matrixVerificationStatus", status_event(&v, "requested"));
+    state.events.emit("matrixVerificationStatus", status_event(&v, "requested"));
     state.runtime.insert_matrix_verification(&flow_id, v);
-    state
-        .runtime
-        .note_matrix_verification_peer(account_id, user_id);
+    state.runtime.note_matrix_verification_peer(account_id, user_id);
     Ok(flow_id)
 }
 
@@ -384,9 +303,7 @@ async fn confirm_scan(
 ) -> Result<()> {
     if !scanned {
         if let Some(outgoing) = qr.cancel() {
-            let _ = session
-                .send_verification_request(&config.homeserver_url, &config.access_token, outgoing)
-                .await;
+            let _ = session.send_verification_request(&config.homeserver_url, &config.access_token, outgoing).await;
         }
         state.events.emit(
             "matrixVerificationResult",
@@ -402,9 +319,7 @@ async fn confirm_scan(
     // other side is what we are waiting on.
     let before = qr.state();
     let Some(outgoing) = qr.confirm_scanning() else {
-        tracing::info!(
-            "matrix[{account_id}]: a scan was confirmed while the code was in state {before:?}"
-        );
+        tracing::info!("matrix[{account_id}]: a scan was confirmed while the code was in state {before:?}");
         match before {
             // Already finished. Both of these mean the flow got where it was
             // going without this press, which is a success arriving out of
@@ -435,15 +350,9 @@ async fn confirm_scan(
     // still read as unverified everywhere else without it. A QR flow queues
     // those on the machine rather than handing them back, so they go out the
     // way every other queued request does.
-    session
-        .process_outgoing_requests(&config.homeserver_url, &config.access_token)
-        .await;
+    session.process_outgoing_requests(&config.homeserver_url, &config.access_token).await;
     if qr.is_done() {
-        if let Err(e) = session
-            .machine
-            .query_missing_secrets_from_other_sessions()
-            .await
-        {
+        if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
             tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
         }
         state.events.emit(
@@ -470,11 +379,7 @@ async fn confirm_scan(
 /// ordinary case for a reason worth knowing: a QR code proves an identity the
 /// other side can already check, so it needs cross-signing set up. Without it
 /// there is nothing to encode, and emoji remain the way through.
-pub async fn qr_code(
-    state: &AppState,
-    account_id: &str,
-    verification_id: &str,
-) -> Result<Option<String>> {
+pub async fn qr_code(state: &AppState, account_id: &str, verification_id: &str) -> Result<Option<String>> {
     let Some(mut v) = state.runtime.get_matrix_verification(verification_id) else {
         bail!("no such verification");
     };
@@ -485,12 +390,7 @@ pub async fn qr_code(
     if let Some(svg) = &v.qr_svg {
         return Ok(Some(svg.clone()));
     }
-    let Some(qr) = v
-        .request
-        .generate_qr_code()
-        .await
-        .context("making the QR code")?
-    else {
+    let Some(qr) = v.request.generate_qr_code().await.context("making the QR code")? else {
         // Why there is none, which is otherwise unanswerable from outside.
         // A code needs three things and the absence of any one of them looks
         // identical from the window: this session holding the master key, the
@@ -499,20 +399,12 @@ pub async fn qr_code(
         let theirs = v
             .request
             .their_supported_methods()
-            .map(|m| {
-                m.iter()
-                    .map(|m| m.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            })
+            .map(|m| m.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", "))
             .unwrap_or_else(|| "not yet known".to_string());
         let held = match state.runtime.get_matrix_machine(account_id) {
             Some(session) => {
                 let status = session.machine.cross_signing_status().await;
-                format!(
-                    "master {}, self-signing {}",
-                    status.has_master, status.has_self_signing
-                )
+                format!("master {}, self-signing {}", status.has_master, status.has_self_signing)
             }
             None => "no crypto session".to_string(),
         };
@@ -553,37 +445,20 @@ pub async fn qr_code(
     Ok(Some(svg))
 }
 
-pub async fn respond_to_request(
-    state: &AppState,
-    account_id: &str,
-    verification_id: &str,
-    accept: bool,
-) -> Result<()> {
+pub async fn respond_to_request(state: &AppState, account_id: &str, verification_id: &str, accept: bool) -> Result<()> {
     let (config, session) = account_session(state, account_id).await?;
-    let v = state
-        .runtime
-        .get_matrix_verification(verification_id)
-        .context("no such verification")?;
+    let v = state.runtime.get_matrix_verification(verification_id).context("no such verification")?;
     if v.account_id != account_id {
         bail!("verification does not belong to this account");
     }
 
-    let outgoing = if accept {
-        v.request.accept()
-    } else {
-        v.request.cancel()
-    };
+    let outgoing = if accept { v.request.accept() } else { v.request.cancel() };
     if let Some(outgoing) = outgoing {
-        session
-            .send_verification_request(&config.homeserver_url, &config.access_token, outgoing)
-            .await
-            .context("sending verification response")?;
+        session.send_verification_request(&config.homeserver_url, &config.access_token, outgoing).await.context("sending verification response")?;
     }
 
     if accept {
-        state
-            .events
-            .emit("matrixVerificationStatus", status_event(&v, "ready"));
+        state.events.emit("matrixVerificationStatus", status_event(&v, "ready"));
     } else {
         state.events.emit(
             "matrixVerificationResult",
@@ -595,17 +470,9 @@ pub async fn respond_to_request(
 }
 
 /// Confirms ("they match") or rejects ("they don't") the emoji comparison.
-pub async fn confirm_sas(
-    state: &AppState,
-    account_id: &str,
-    verification_id: &str,
-    matches: bool,
-) -> Result<()> {
+pub async fn confirm_sas(state: &AppState, account_id: &str, verification_id: &str, matches: bool) -> Result<()> {
     let (config, session) = account_session(state, account_id).await?;
-    let v = state
-        .runtime
-        .get_matrix_verification(verification_id)
-        .context("no such verification")?;
+    let v = state.runtime.get_matrix_verification(verification_id).context("no such verification")?;
     if v.account_id != account_id {
         bail!("verification does not belong to this account");
     }
@@ -613,29 +480,14 @@ pub async fn confirm_sas(
     // other device agree?" - and the same button answers it, so they share a
     // method rather than making a window decide which one it is in.
     if let Some(qr) = v.qr.clone() {
-        return confirm_scan(
-            state,
-            &config,
-            &session,
-            account_id,
-            verification_id,
-            &qr,
-            matches,
-        )
-        .await;
+        return confirm_scan(state, &config, &session, account_id, verification_id, &qr, matches).await;
     }
-    let sas = v
-        .sas
-        .clone()
-        .context("verification has not reached the emoji stage yet")?;
+    let sas = v.sas.clone().context("verification has not reached the emoji stage yet")?;
 
     if matches {
         let (requests, signature_upload) = sas.confirm().await.context("confirm")?;
         for req in requests {
-            session
-                .send_verification_request(&config.homeserver_url, &config.access_token, req)
-                .await
-                .context("sending confirmation")?;
+            session.send_verification_request(&config.homeserver_url, &config.access_token, req).await.context("sending confirmation")?;
         }
         // The half that makes it mean something anywhere else. Both sides
         // agreeing is a private fact until this is published: without it a
@@ -652,11 +504,7 @@ pub async fn confirm_sas(
             // cross-signing keys this client does not hold. Nothing to send
             // and nothing to wait for: the answer arrives as a to-device
             // secret through the sync loop already running.
-            if let Err(e) = session
-                .machine
-                .query_missing_secrets_from_other_sessions()
-                .await
-            {
+            if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
                 tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
             }
             state.events.emit(
@@ -674,10 +522,7 @@ pub async fn confirm_sas(
 /// Cancels an in-progress verification (any stage) from our side.
 pub async fn cancel(state: &AppState, account_id: &str, verification_id: &str) -> Result<()> {
     let (config, session) = account_session(state, account_id).await?;
-    let v = state
-        .runtime
-        .get_matrix_verification(verification_id)
-        .context("no such verification")?;
+    let v = state.runtime.get_matrix_verification(verification_id).context("no such verification")?;
     if v.account_id != account_id {
         bail!("verification does not belong to this account");
     }
@@ -687,10 +532,7 @@ pub async fn cancel(state: &AppState, account_id: &str, verification_id: &str) -
         None => v.request.cancel(),
     };
     if let Some(outgoing) = outgoing {
-        session
-            .send_verification_request(&config.homeserver_url, &config.access_token, outgoing)
-            .await
-            .context("sending cancellation")?;
+        session.send_verification_request(&config.homeserver_url, &config.access_token, outgoing).await.context("sending cancellation")?;
     }
 
     state.events.emit(
@@ -707,14 +549,7 @@ pub async fn cancel(state: &AppState, account_id: &str, verification_id: &str) -
 /// side becoming ready (upgrading our own request to SAS, if we're the one
 /// who started it), the SAS keys being exchanged (time to show emoji), or
 /// the flow finishing/being cancelled from the other end.
-pub async fn tick(
-    state: &AppState,
-    account_id: &str,
-    session: &CryptoSession,
-    own_user_id: &UserId,
-    homeserver_url: &str,
-    access_token: &str,
-) {
+pub async fn tick(state: &AppState, account_id: &str, session: &CryptoSession, own_user_id: &UserId, homeserver_url: &str, access_token: &str) {
     let known = state.runtime.matrix_known_flow_ids(account_id);
     // Our own other sessions, and anybody who has sent verification traffic
     // into a room we share. The machine is asked one user at a time, so
@@ -726,10 +561,7 @@ pub async fn tick(
             whose.push(user_id);
         }
     }
-    for request in whose
-        .iter()
-        .flat_map(|user| session.machine.get_verification_requests(user))
-    {
+    for request in whose.iter().flat_map(|user| session.machine.get_verification_requests(user)) {
         if request.we_started() {
             continue;
         }
@@ -737,10 +569,7 @@ pub async fn tick(
         if known.contains(&flow_id) {
             continue;
         }
-        let other_device = request
-            .other_device_id()
-            .map(|d| d.to_string())
-            .unwrap_or_default();
+        let other_device = request.other_device_id().map(|d| d.to_string()).unwrap_or_default();
         let v = ActiveVerification {
             account_id: account_id.to_string(),
             flow_id: flow_id.clone(),
@@ -765,13 +594,8 @@ pub async fn tick(
         state.runtime.insert_matrix_verification(&flow_id, v);
     }
 
-    for id in state
-        .runtime
-        .matrix_verification_ids_for_account(account_id)
-    {
-        let Some(mut v) = state.runtime.get_matrix_verification(&id) else {
-            continue;
-        };
+    for id in state.runtime.matrix_verification_ids_for_account(account_id) {
+        let Some(mut v) = state.runtime.get_matrix_verification(&id) else { continue };
         if v.done {
             continue;
         }
@@ -782,18 +606,11 @@ pub async fn tick(
             // resulting `m.key.verification.start` to-device event.
             match v.request.start_sas().await {
                 Ok(Some((sas, outgoing))) => {
-                    if let Err(e) = session
-                        .send_verification_request(homeserver_url, access_token, outgoing)
-                        .await
-                    {
-                        tracing::warn!(
-                            "matrix verification[{id}]: sending SAS start failed: {e:#}"
-                        );
+                    if let Err(e) = session.send_verification_request(homeserver_url, access_token, outgoing).await {
+                        tracing::warn!("matrix verification[{id}]: sending SAS start failed: {e:#}");
                     }
                     v.sas = Some(sas);
-                    state
-                        .events
-                        .emit("matrixVerificationStatus", status_event(&v, "started"));
+                    state.events.emit("matrixVerificationStatus", status_event(&v, "started"));
                     state.runtime.update_matrix_verification(&id, v.clone());
                 }
                 Ok(None) => {}
@@ -860,14 +677,8 @@ pub async fn tick(
                         }
                         match named {
                             "done" => {
-                                if let Err(e) = session
-                                    .machine
-                                    .query_missing_secrets_from_other_sessions()
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        "matrix: could not ask for the cross-signing keys: {e}"
-                                    );
+                                if let Err(e) = session.machine.query_missing_secrets_from_other_sessions().await {
+                                    tracing::warn!("matrix: could not ask for the cross-signing keys: {e}");
                                 }
                                 state.events.emit(
                                     "matrixVerificationResult",
@@ -884,9 +695,7 @@ pub async fn tick(
                                 state.runtime.remove_matrix_verification(&id);
                                 continue;
                             }
-                            _ => state
-                                .events
-                                .emit("matrixVerificationStatus", status_event(&v, named)),
+                            _ => state.events.emit("matrixVerificationStatus", status_event(&v, named)),
                         }
                         state.runtime.update_matrix_verification(&id, v.clone());
                     }
@@ -895,30 +704,19 @@ pub async fn tick(
                 if let Some(sas) = verification.sas_v1() {
                     let sas = *sas;
                     if let Some(outgoing) = sas.accept() {
-                        if let Err(e) = session
-                            .send_verification_request(homeserver_url, access_token, outgoing)
-                            .await
-                        {
-                            tracing::warn!(
-                                "matrix verification[{id}]: sending SAS accept failed: {e:#}"
-                            );
+                        if let Err(e) = session.send_verification_request(homeserver_url, access_token, outgoing).await {
+                            tracing::warn!("matrix verification[{id}]: sending SAS accept failed: {e:#}");
                         }
                     }
                     v.sas = Some(sas);
-                    state
-                        .events
-                        .emit("matrixVerificationStatus", status_event(&v, "started"));
+                    state.events.emit("matrixVerificationStatus", status_event(&v, "started"));
                     state.runtime.update_matrix_verification(&id, v.clone());
                 }
             }
         }
 
         if v.request.is_cancelled() && v.sas.is_none() {
-            let reason = v
-                .request
-                .cancel_info()
-                .map(|c| c.reason().to_string())
-                .unwrap_or_default();
+            let reason = v.request.cancel_info().map(|c| c.reason().to_string()).unwrap_or_default();
             state.events.emit(
                 "matrixVerificationResult",
                 serde_json::json!({ "accountId": account_id, "verificationId": id, "success": false, "error": reason }),
@@ -991,48 +789,23 @@ mod tests {
     /// defeats the entire point of this test (two genuinely independent
     /// devices, each with their own Olm identity) - so each test device
     /// gets its own store under its own temp dir instead.
-    async fn spawn_test_device(
-        homeserver: &str,
-        username: &str,
-        password: &str,
-        tag: &str,
-    ) -> TestDevice {
-        let login = super::super::auth::login(homeserver, username, password, None)
-            .await
-            .expect("login failed");
-        let data_dir = std::env::temp_dir().join(format!(
-            "nobilis-matrix-verify-probe-{tag}-{}",
-            std::process::id()
-        ));
+    async fn spawn_test_device(homeserver: &str, username: &str, password: &str, tag: &str) -> TestDevice {
+        let login = super::super::auth::login(homeserver, username, password, None).await.expect("login failed");
+        let data_dir = std::env::temp_dir().join(format!("nobilis-matrix-verify-probe-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
         let state = AppState {
-            store: Arc::new(
-                crate::store::Store::open(&data_dir.join("scrollback.db")).expect("opening store"),
-            ),
-            accounts: Arc::new(
-                crate::accounts::AccountStore::open(data_dir.join("accounts.toml"))
-                    .expect("opening accounts"),
-            ),
+            store: Arc::new(crate::store::Store::open(&data_dir.join("scrollback.db")).expect("opening store")),
+            accounts: Arc::new(crate::accounts::AccountStore::open(data_dir.join("accounts.toml")).expect("opening accounts")),
             events: crate::events::EventBus::new(),
             runtime: Arc::new(crate::runtime::Runtime::new()),
             tor: Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: Arc::new(tokio::sync::Notify::new()),
             voice: Arc::new(crate::backend::discord::voice::VoiceState::new()),
-            voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(
-                data_dir.join("voice.toml"),
-            )),
-            dcc_prefs: Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(
-                data_dir.join("dcc.toml"),
-            )),
-            irc_sts: Arc::new(crate::backend::irc::sts::StsStore::open(
-                data_dir.join("irc-sts.toml"),
-            )),
-            highlights: Arc::new(crate::highlights::HighlightStore::open(
-                data_dir.join("highlights.toml"),
-            )),
-            ignores: Arc::new(crate::ignores::IgnoreStore::open(
-                data_dir.join("ignores.toml"),
-            )),
+            voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
+            dcc_prefs: Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
+            irc_sts: Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
+            highlights: Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
+            ignores: Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
         };
         let config = MatrixAccountConfig {
             use_tor: false,
@@ -1045,28 +818,19 @@ mod tests {
             next_batch: None,
             used_sliding_sync: false,
             oauth_refresh_token: String::new(),
-            oauth_client_id: String::new(),
-            prefer_sliding_sync: false,
+        oauth_client_id: String::new(),
+        prefer_sliding_sync: false,
             dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
-        let saved = state
-            .accounts
-            .add_matrix(config)
-            .expect("add_matrix failed");
+        let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
         let account_id = saved.account_id();
 
         let user_id = UserId::parse(&login.user_id).expect("invalid user_id");
         let device_id_ruma = <&DeviceId>::from(login.device_id.as_str());
-        let session = Arc::new(
-            CryptoSession::open(&data_dir, &account_id, &user_id, device_id_ruma)
-                .await
-                .expect("opening crypto store"),
-        );
-        state
-            .runtime
-            .set_matrix_machine(&account_id, session.clone());
+        let session = Arc::new(CryptoSession::open(&data_dir, &account_id, &user_id, device_id_ruma).await.expect("opening crypto store"));
+        state.runtime.set_matrix_machine(&account_id, session.clone());
 
         let sync_state = state.clone();
         let sync_account_id = account_id.clone();
@@ -1077,18 +841,11 @@ mod tests {
         let sync_task = tokio::spawn(async move {
             let mut since: Option<String> = None;
             loop {
-                session
-                    .process_outgoing_requests(&sync_homeserver, &sync_token)
-                    .await;
-                let mut url = format!(
-                    "{}/_matrix/client/v3/sync?timeout=3000&set_presence=online",
-                    sync_homeserver.trim_end_matches('/')
-                );
+                session.process_outgoing_requests(&sync_homeserver, &sync_token).await;
+                let mut url = format!("{}/_matrix/client/v3/sync?timeout=3000&set_presence=online", sync_homeserver.trim_end_matches('/'));
                 if let Some(s) = &since {
                     url.push_str("&since=");
-                    url.push_str(
-                        &url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>(),
-                    );
+                    url.push_str(&url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>());
                 }
                 let resp = match super::super::http::get_json(&url, &sync_token).await {
                     Ok(r) => r,
@@ -1098,30 +855,15 @@ mod tests {
                     }
                 };
                 super::super::crypto::receive_sync_changes(&session, &resp).await;
-                session
-                    .process_outgoing_requests(&sync_homeserver, &sync_token)
-                    .await;
-                tick(
-                    &sync_state,
-                    &sync_account_id,
-                    &session,
-                    &sync_user_id,
-                    &sync_homeserver,
-                    &sync_token,
-                )
-                .await;
+                session.process_outgoing_requests(&sync_homeserver, &sync_token).await;
+                tick(&sync_state, &sync_account_id, &session, &sync_user_id, &sync_homeserver, &sync_token).await;
                 if let Some(nb) = resp["next_batch"].as_str() {
                     since = Some(nb.to_string());
                 }
             }
         });
 
-        TestDevice {
-            state,
-            account_id,
-            device_id: login.device_id,
-            sync_task,
-        }
+        TestDevice { state, account_id, device_id: login.device_id, sync_task }
     }
 
     /// Waits until `target_device_id` specifically shows up in
@@ -1135,10 +877,7 @@ mod tests {
     async fn wait_for_device(state: &AppState, account_id: &str, target_device_id: &str) -> String {
         for _ in 0..60 {
             if let Ok(devices) = list_own_devices(state, account_id).await {
-                if devices
-                    .iter()
-                    .any(|d| d["deviceId"].as_str() == Some(target_device_id))
-                {
+                if devices.iter().any(|d| d["deviceId"].as_str() == Some(target_device_id)) {
                     return target_device_id.to_string();
                 }
             }
@@ -1182,16 +921,14 @@ mod tests {
             println!("MATRIX_PASSWORD not set, skipping");
             return;
         };
-        let homeserver =
-            std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
+        let homeserver = std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let a = spawn_test_device(&homeserver, &username, &password, "a").await;
         let b = spawn_test_device(&homeserver, &username, &password, "b").await;
         println!("account A: {}\naccount B: {}", a.account_id, b.account_id);
 
-        let own_user_id =
-            UserId::parse(&a.state.accounts.get_matrix(&a.account_id).unwrap().user_id).unwrap();
+        let own_user_id = UserId::parse(&a.state.accounts.get_matrix(&a.account_id).unwrap().user_id).unwrap();
         let session_a = a.state.runtime.get_matrix_machine(&a.account_id).unwrap();
         let session_b = b.state.runtime.get_matrix_machine(&b.account_id).unwrap();
 
@@ -1199,115 +936,60 @@ mod tests {
         // own user id as a side effect of sending into a room it's a
         // member of (see crypto.rs's ensure_keys_shared) - this test never
         // sends a message, so it's done explicitly here instead.
-        session_a
-            .machine
-            .update_tracked_users(std::iter::once(own_user_id.as_ref()))
-            .await
-            .expect("update_tracked_users A");
-        session_b
-            .machine
-            .update_tracked_users(std::iter::once(own_user_id.as_ref()))
-            .await
-            .expect("update_tracked_users B");
+        session_a.machine.update_tracked_users(std::iter::once(own_user_id.as_ref())).await.expect("update_tracked_users A");
+        session_b.machine.update_tracked_users(std::iter::once(own_user_id.as_ref())).await.expect("update_tracked_users B");
 
         let device_b_id = wait_for_device(&a.state, &a.account_id, &b.device_id).await;
         let device_a_id = wait_for_device(&b.state, &b.account_id, &a.device_id).await;
         println!("A sees B's device: {device_b_id}\nB sees A's device: {device_a_id}");
 
-        let verification_id = start_verification(&a.state, &a.account_id, None, &device_b_id)
-            .await
-            .expect("start_verification");
+        let verification_id = start_verification(&a.state, &a.account_id, None, &device_b_id).await.expect("start_verification");
         println!("A started verification {verification_id}");
 
         let mut b_saw_request = false;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            if b.state
-                .runtime
-                .get_matrix_verification(&verification_id)
-                .is_some()
-            {
+            if b.state.runtime.get_matrix_verification(&verification_id).is_some() {
                 b_saw_request = true;
                 break;
             }
         }
-        assert!(
-            b_saw_request,
-            "B never saw the incoming verification request within 30s"
-        );
+        assert!(b_saw_request, "B never saw the incoming verification request within 30s");
 
-        respond_to_request(&b.state, &b.account_id, &verification_id, true)
-            .await
-            .expect("respond_to_request");
+        respond_to_request(&b.state, &b.account_id, &verification_id, true).await.expect("respond_to_request");
         println!("B accepted");
 
-        let sas_a = wait_for_emoji(&a.state, &verification_id)
-            .await
-            .expect("A never reached the emoji stage within 30s");
-        let sas_b = wait_for_emoji(&b.state, &verification_id)
-            .await
-            .expect("B never reached the emoji stage within 30s");
+        let sas_a = wait_for_emoji(&a.state, &verification_id).await.expect("A never reached the emoji stage within 30s");
+        let sas_b = wait_for_emoji(&b.state, &verification_id).await.expect("B never reached the emoji stage within 30s");
 
         let emoji_a: Vec<&str> = sas_a.emoji().unwrap().iter().map(|e| e.symbol).collect();
         let emoji_b: Vec<&str> = sas_b.emoji().unwrap().iter().map(|e| e.symbol).collect();
-        assert_eq!(
-            emoji_a, emoji_b,
-            "independently-computed emoji sequences did not match"
-        );
+        assert_eq!(emoji_a, emoji_b, "independently-computed emoji sequences did not match");
         println!("emoji match confirmed: {emoji_a:?}");
 
-        confirm_sas(&a.state, &a.account_id, &verification_id, true)
-            .await
-            .expect("confirm A");
-        confirm_sas(&b.state, &b.account_id, &verification_id, true)
-            .await
-            .expect("confirm B");
+        confirm_sas(&a.state, &a.account_id, &verification_id, true).await.expect("confirm A");
+        confirm_sas(&b.state, &b.account_id, &verification_id, true).await.expect("confirm B");
 
         let mut a_done = false;
         let mut b_done = false;
         for _ in 0..60 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            a_done = a_done
-                || a.state
-                    .runtime
-                    .get_matrix_verification(&verification_id)
-                    .is_none();
-            b_done = b_done
-                || b.state
-                    .runtime
-                    .get_matrix_verification(&verification_id)
-                    .is_none();
+            a_done = a_done || a.state.runtime.get_matrix_verification(&verification_id).is_none();
+            b_done = b_done || b.state.runtime.get_matrix_verification(&verification_id).is_none();
             if a_done && b_done {
                 break;
             }
         }
-        assert!(
-            a_done && b_done,
-            "verification never completed on both sides within 30s"
-        );
+        assert!(a_done && b_done, "verification never completed on both sides within 30s");
 
         let device_id_b_ruma = <&DeviceId>::from(device_b_id.as_str());
         let device_id_a_ruma = <&DeviceId>::from(device_a_id.as_str());
-        let device_b_from_a = session_a
-            .machine
-            .get_device(&own_user_id, device_id_b_ruma, None)
-            .await
-            .expect("get_device")
-            .expect("device B not found from A");
-        let device_a_from_b = session_b
-            .machine
-            .get_device(&own_user_id, device_id_a_ruma, None)
-            .await
-            .expect("get_device")
-            .expect("device A not found from B");
-        assert!(
-            device_b_from_a.is_verified(),
-            "A does not consider B's device verified after SAS confirm"
-        );
-        assert!(
-            device_a_from_b.is_verified(),
-            "B does not consider A's device verified after SAS confirm"
-        );
+        let device_b_from_a =
+            session_a.machine.get_device(&own_user_id, device_id_b_ruma, None).await.expect("get_device").expect("device B not found from A");
+        let device_a_from_b =
+            session_b.machine.get_device(&own_user_id, device_id_a_ruma, None).await.expect("get_device").expect("device A not found from B");
+        assert!(device_b_from_a.is_verified(), "A does not consider B's device verified after SAS confirm");
+        assert!(device_a_from_b.is_verified(), "B does not consider A's device verified after SAS confirm");
         println!("mutual device verification confirmed.");
 
         a.sync_task.abort();
@@ -1322,17 +1004,9 @@ mod tests {
     }
 
     async fn logout(state: &AppState, account_id: &str) {
-        let Some(config) = state.accounts.get_matrix(account_id) else {
-            return;
-        };
-        let url = format!(
-            "{}/_matrix/client/v3/logout",
-            config.homeserver_url.trim_end_matches('/')
-        );
-        if let Err(e) =
-            super::super::http::post_json(&url, Some(&config.access_token), serde_json::json!({}))
-                .await
-        {
+        let Some(config) = state.accounts.get_matrix(account_id) else { return };
+        let url = format!("{}/_matrix/client/v3/logout", config.homeserver_url.trim_end_matches('/'));
+        if let Err(e) = super::super::http::post_json(&url, Some(&config.access_token), serde_json::json!({})).await {
             eprintln!("warning: failed to log out test session for {account_id}: {e:#}");
         }
     }

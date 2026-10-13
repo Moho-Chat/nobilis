@@ -1013,6 +1013,7 @@ pub struct RevokeRefreshTokenRequest {
 #[derive(Clone, PartialEq, Message)]
 pub struct RevokeRefreshTokenResponse {}
 
+
 // ---- Steam chat groups: the messages this backend speaks, by Valve's own field names ----
 
 #[derive(Clone, PartialEq, Message)]
@@ -1906,7 +1907,8 @@ pub struct SetAvatarRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct SetAvatarResponse {}
+pub struct SetAvatarResponse {
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct ChatRoomNoticeNotification {
@@ -1956,6 +1958,7 @@ pub struct ClientEmoticonList {
     #[prost(message, repeated, tag = "3")]
     pub effects: Vec<EffectOwned>,
 }
+
 
 #[derive(Clone, PartialEq, Message)]
 pub struct GetEmoticonListRequest {}
@@ -2179,10 +2182,7 @@ mod tests {
     const GOLDEN: &str = include_str!("golden/golden.txt");
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
-            .collect()
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
     }
 
     /// Decodes into the type, and requires the same bytes back. A field with
@@ -2190,11 +2190,7 @@ mod tests {
     /// out; one with the wrong type fails to decode or comes out differently.
     fn round_trips<M: Message + Default>(name: &str, bytes: &[u8]) {
         let decoded = M::decode(bytes).unwrap_or_else(|e| panic!("{name} did not decode: {e}"));
-        assert_eq!(
-            decoded.encode_to_vec(),
-            bytes,
-            "{name} changed on the way through, so a field is wrong or missing"
-        );
+        assert_eq!(decoded.encode_to_vec(), bytes, "{name} changed on the way through, so a field is wrong or missing");
     }
 
     #[test]
@@ -2212,277 +2208,95 @@ mod tests {
                 };
             }
             cases!(
-                Header,
-                Multi,
-                IpAddress,
-                ClientHello,
-                ClientHeartBeat,
-                ClientLogon,
-                ClientLogonResponse,
-                ClientLogOff,
-                ClientLoggedOff,
-                ClientAccountInfo,
-                FriendsListEntry,
-                ClientFriendsList,
-                KeyValue,
-                PersonaFriend,
-                ClientPersonaState,
-                ClientRequestFriendData,
-                ClientChangeStatus,
-                ClientAddFriend,
-                ClientAddFriendResponse,
-                ClientRemoveFriend,
-                ClientFriendMsg,
-                ClientFriendMsgIncoming,
-                FriendMessagesSendRequest,
-                FriendMessagesSendResponse,
-                FriendMessagesIncoming,
-                GetPasswordRsaPublicKeyRequest,
-                GetPasswordRsaPublicKeyResponse,
-                DeviceDetails,
-                AllowedConfirmation,
-                BeginAuthViaCredentialsRequest,
-                BeginAuthViaCredentialsResponse,
-                BeginAuthViaQrRequest,
-                BeginAuthViaQrResponse,
-                PollAuthSessionRequest,
-                PollAuthSessionResponse,
-                UpdateAuthWithGuardCodeRequest,
-                UpdateAuthWithGuardCodeResponse,
-                GenerateAccessTokenRequest,
-                GenerateAccessTokenResponse,
-                GetRecentMessagesRequest,
-                PastReaction,
-                PastMessage,
-                GetRecentMessagesResponse,
-                GetActiveSessionsRequest,
-                MessageSession,
-                GetActiveSessionsResponse,
-                AckMessage,
-                GetEmoticonListRequest,
-                EmoticonInfo,
-                GetEmoticonListResponse,
-                UpdateMessageReactionRequest,
-                UpdateMessageReactionResponse,
-                MessageReactionNotice,
-                SessionNoticeNotification,
-                DismissSessionNotice,
-                FriendProfileInfoRequest,
-                FriendProfileInfoResponse,
-                FriendsSteamLevelsRequest,
-                FriendLevel,
-                FriendsSteamLevelsResponse,
-                GetPerFriendPreferencesRequest,
-                PerFriendPreferences,
-                GetPerFriendPreferencesResponse,
-                SetPerFriendPreferencesRequest,
-                SetPerFriendPreferencesResponse,
-                PerFriendPreferencesChanged,
-                FriendNicknameChanged,
-                IgnoreFriendRequest,
-                IgnoreFriendResponse,
-                ClientGetEmoticonList,
-                EmoticonOwned,
-                StickerOwned,
-                EffectOwned,
-                ClientEmoticonList,
-                GetCommunityPreferencesRequest,
-                CommunityPreferences,
-                GetCommunityPreferencesResponse,
-                GetTextFilterWordsRequest,
-                TextFilterWords,
-                GetTextFilterWordsResponse,
-                GetPrivacySettingsRequest,
-                PrivacySettings,
-                GetPrivacySettingsResponse,
-                GetParentalSettingsRequest,
-                ParentalSettings,
-                GetParentalSettingsResponse,
-                EnumerateTokensRequest,
-                TokenUsageEvent,
-                RefreshTokenDescription,
-                EnumerateTokensResponse,
-                RevokeRefreshTokenRequest,
-                RevokeRefreshTokenResponse,
-                ChatRoomState,
-                ChatRoomMember,
-                ChatRole,
-                ChatRoomGroupHeaderState,
-                ChatRoomGroupState,
-                UserChatRoomState,
-                UserChatRoomGroupState,
-                ChatGroupSummary,
-                ChatRoomSummaryPair,
-                GetMyChatRoomGroupsRequest,
-                GetMyChatRoomGroupsResponse,
-                GetChatRoomGroupStateRequest,
-                GetChatRoomGroupStateResponse,
-                SetSessionActiveGroupsRequest,
-                SetSessionActiveGroupsResponse,
-                ChatSendRequest,
-                ChatSendResponse,
-                ChatHistoryRequest,
-                ServerMessage,
-                ChatMessageReaction,
-                ChatHistoryMessage,
-                ChatHistoryResponse,
-                ChatMentions,
-                ChatIncoming,
-                ChatAck,
-                ChatModifiedMessage,
-                ChatModified,
-                ChatMemberChange,
-                ChatHeaderChange,
-                ChatRoomsChange,
-                ChatUserStateChange,
-                CreateChatGroupRequest,
-                CreateChatGroupResponse,
-                JoinChatGroupRequest,
-                JoinChatGroupResponse,
-                LeaveChatGroupRequest,
-                LeaveChatGroupResponse,
-                CreateChatRoomRequest,
-                CreateChatRoomResponse,
-                DeleteChatRoomRequest,
-                DeleteChatRoomResponse,
-                RenameChatRoomRequest,
-                RenameChatRoomResponse,
-                RenameChatGroupRequest,
-                RenameChatGroupResponse,
-                CreateInviteLinkRequest,
-                CreateInviteLinkResponse,
-                GetInviteLinksRequest,
-                InviteLinkInfo,
-                GetInviteLinksResponse,
-                GetInviteLinkInfoRequest,
-                GetInviteLinkInfoResponse,
-                DeleteInviteLinkRequest,
-                DeleteInviteLinkResponse,
-                KickChatUserRequest,
-                KickChatUserResponse,
-                BanChatUserRequest,
-                BanChatUserResponse,
-                MuteChatUserRequest,
-                MuteChatUserResponse,
-                DeleteChatMessage,
-                DeleteChatMessagesRequest,
-                DeleteChatMessagesResponse,
-                ChatReactionRequest,
-                ChatReactionResponse,
-                ChatReactionNotice,
-                InviteFriendToChatGroupRequest,
-                InviteFriendToChatGroupResponse,
-                ChatRoleActions,
-                SetTaglineRequest,
-                SetTaglineResponse,
-                UserChatGroupPreferences,
-                SetUserPreferencesRequest,
-                SetUserPreferencesResponse,
-                CreateRoleRequest,
-                CreateRoleResponse,
-                RenameRoleRequest,
-                RenameRoleResponse,
-                DeleteRoleRequest,
-                DeleteRoleResponse,
-                GetRoleActionsRequest,
-                GetRoleActionsResponse,
-                ReplaceRoleActionsRequest,
-                ReplaceRoleActionsResponse,
-                AddRoleToUserRequest,
-                AddRoleToUserResponse,
-                DeleteRoleFromUserRequest,
-                DeleteRoleFromUserResponse,
-                GetBanListRequest,
-                BanInfo,
-                GetBanListResponse,
-                SetAvatarRequest,
-                SetAvatarResponse,
-                ChatRoomNoticeNotification,
-                DismissChatRoomNotice,
-                ChatRoomMemberNotice,
-                ChatRoomGroupMemberNotices,
-                FriendGroup,
-                FriendGroupMembership,
-                ClientFriendsGroupsList,
-                ClientCreateFriendsGroup,
-                ClientCreateFriendsGroupResponse,
-                ClientDeleteFriendsGroup,
-                ClientDeleteFriendsGroupResponse,
-                ClientManageFriendsGroup,
-                ClientManageFriendsGroupResponse,
-                ClientAddFriendToGroup,
-                ClientAddFriendToGroupResponse,
-                ClientRemoveFriendFromGroup,
-                ClientRemoveFriendFromGroupResponse,
+                Header, Multi, IpAddress, ClientHello, ClientHeartBeat, ClientLogon, ClientLogonResponse,
+                ClientLogOff, ClientLoggedOff, ClientAccountInfo, FriendsListEntry, ClientFriendsList,
+                KeyValue, PersonaFriend, ClientPersonaState, ClientRequestFriendData, ClientChangeStatus,
+                ClientAddFriend, ClientAddFriendResponse, ClientRemoveFriend,
+                ClientFriendMsg, ClientFriendMsgIncoming, FriendMessagesSendRequest,
+                FriendMessagesSendResponse, FriendMessagesIncoming, GetPasswordRsaPublicKeyRequest,
+                GetPasswordRsaPublicKeyResponse, DeviceDetails, AllowedConfirmation,
+                BeginAuthViaCredentialsRequest, BeginAuthViaCredentialsResponse, BeginAuthViaQrRequest,
+                BeginAuthViaQrResponse, PollAuthSessionRequest, PollAuthSessionResponse,
+                UpdateAuthWithGuardCodeRequest, UpdateAuthWithGuardCodeResponse,
+                GenerateAccessTokenRequest, GenerateAccessTokenResponse,
+                GetRecentMessagesRequest, PastReaction, PastMessage, GetRecentMessagesResponse,
+                GetActiveSessionsRequest, MessageSession, GetActiveSessionsResponse, AckMessage,
+                GetEmoticonListRequest, EmoticonInfo, GetEmoticonListResponse,
+                UpdateMessageReactionRequest, UpdateMessageReactionResponse, MessageReactionNotice,
+                SessionNoticeNotification, DismissSessionNotice,
+                FriendProfileInfoRequest, FriendProfileInfoResponse, FriendsSteamLevelsRequest, FriendLevel,
+                FriendsSteamLevelsResponse, GetPerFriendPreferencesRequest, PerFriendPreferences,
+                GetPerFriendPreferencesResponse, SetPerFriendPreferencesRequest, SetPerFriendPreferencesResponse,
+                PerFriendPreferencesChanged, FriendNicknameChanged, IgnoreFriendRequest, IgnoreFriendResponse,
+                ClientGetEmoticonList, EmoticonOwned, StickerOwned, EffectOwned, ClientEmoticonList,
+                GetCommunityPreferencesRequest, CommunityPreferences, GetCommunityPreferencesResponse, GetTextFilterWordsRequest,
+                TextFilterWords, GetTextFilterWordsResponse, GetPrivacySettingsRequest, PrivacySettings, GetPrivacySettingsResponse,
+                GetParentalSettingsRequest, ParentalSettings, GetParentalSettingsResponse, EnumerateTokensRequest, TokenUsageEvent,
+                RefreshTokenDescription, EnumerateTokensResponse, RevokeRefreshTokenRequest, RevokeRefreshTokenResponse,
+                ChatRoomState, ChatRoomMember, ChatRole, ChatRoomGroupHeaderState,
+                ChatRoomGroupState, UserChatRoomState, UserChatRoomGroupState, ChatGroupSummary,
+                ChatRoomSummaryPair, GetMyChatRoomGroupsRequest, GetMyChatRoomGroupsResponse,
+                GetChatRoomGroupStateRequest, GetChatRoomGroupStateResponse,
+                SetSessionActiveGroupsRequest, SetSessionActiveGroupsResponse, ChatSendRequest,
+                ChatSendResponse, ChatHistoryRequest, ServerMessage, ChatMessageReaction,
+                ChatHistoryMessage, ChatHistoryResponse, ChatMentions, ChatIncoming, ChatAck,
+                ChatModifiedMessage, ChatModified, ChatMemberChange, ChatHeaderChange,
+                ChatRoomsChange, ChatUserStateChange, CreateChatGroupRequest,
+                CreateChatGroupResponse, JoinChatGroupRequest, JoinChatGroupResponse,
+                LeaveChatGroupRequest, LeaveChatGroupResponse, CreateChatRoomRequest,
+                CreateChatRoomResponse, DeleteChatRoomRequest, DeleteChatRoomResponse,
+                RenameChatRoomRequest, RenameChatRoomResponse, RenameChatGroupRequest,
+                RenameChatGroupResponse, CreateInviteLinkRequest, CreateInviteLinkResponse,
+                GetInviteLinksRequest, InviteLinkInfo, GetInviteLinksResponse,
+                GetInviteLinkInfoRequest, GetInviteLinkInfoResponse, DeleteInviteLinkRequest,
+                DeleteInviteLinkResponse, KickChatUserRequest, KickChatUserResponse,
+                BanChatUserRequest, BanChatUserResponse, MuteChatUserRequest, MuteChatUserResponse,
+                DeleteChatMessage, DeleteChatMessagesRequest, DeleteChatMessagesResponse,
+                ChatReactionRequest, ChatReactionResponse, ChatReactionNotice,
+                InviteFriendToChatGroupRequest, InviteFriendToChatGroupResponse,
+                ChatRoleActions, SetTaglineRequest, SetTaglineResponse, UserChatGroupPreferences, SetUserPreferencesRequest, SetUserPreferencesResponse, CreateRoleRequest, CreateRoleResponse, RenameRoleRequest, RenameRoleResponse, DeleteRoleRequest, DeleteRoleResponse, GetRoleActionsRequest, GetRoleActionsResponse, ReplaceRoleActionsRequest, ReplaceRoleActionsResponse, AddRoleToUserRequest, AddRoleToUserResponse, DeleteRoleFromUserRequest, DeleteRoleFromUserResponse, GetBanListRequest, BanInfo, GetBanListResponse,
+        SetAvatarRequest, SetAvatarResponse, ChatRoomNoticeNotification, DismissChatRoomNotice, ChatRoomMemberNotice, ChatRoomGroupMemberNotices,
+        FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
+                ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
+                ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
+                ClientAddFriendToGroupResponse, ClientRemoveFriendFromGroup, ClientRemoveFriendFromGroupResponse,
             );
             seen += 1;
         }
-        assert_eq!(
-            seen, 202,
-            "a message was added without a vector, or one was lost"
-        );
+        assert_eq!(seen, 202, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare
     /// against: the fields a connection cannot work without.
     #[test]
     fn the_fields_a_connection_depends_on_are_where_steam_puts_them() {
-        let line = GOLDEN
-            .lines()
-            .find(|l| l.starts_with("ClientChangeStatus "))
-            .unwrap();
-        let status =
-            ClientChangeStatus::decode(unhex(line.split_once(' ').unwrap().1).as_slice()).unwrap();
-        assert_eq!(
-            status.persona_state,
-            Some(7),
-            "invisible is persona state 7"
-        );
+        let line = GOLDEN.lines().find(|l| l.starts_with("ClientChangeStatus ")).unwrap();
+        let status = ClientChangeStatus::decode(unhex(line.split_once(' ').unwrap().1).as_slice()).unwrap();
+        assert_eq!(status.persona_state, Some(7), "invisible is persona state 7");
         assert_eq!(status.is_client_idle, Some(true));
 
         let line = GOLDEN.lines().find(|l| l.starts_with("Header ")).unwrap();
         let header = Header::decode(unhex(line.split_once(' ').unwrap().1).as_slice()).unwrap();
         assert_eq!(header.steamid, Some(76561197960287930));
         assert_eq!(header.client_sessionid, Some(-1234));
-        assert_eq!(
-            (header.jobid_source, header.jobid_target),
-            (Some(17), Some(18))
-        );
-        assert_eq!(
-            header.target_job_name.as_deref(),
-            Some("FriendMessagesClient.IncomingMessage#1")
-        );
+        assert_eq!((header.jobid_source, header.jobid_target), (Some(17), Some(18)));
+        assert_eq!(header.target_job_name.as_deref(), Some("FriendMessagesClient.IncomingMessage#1"));
 
-        let line = GOLDEN
-            .lines()
-            .find(|l| l.starts_with("ClientLogon "))
-            .unwrap();
+        let line = GOLDEN.lines().find(|l| l.starts_with("ClientLogon ")).unwrap();
         let logon = ClientLogon::decode(unhex(line.split_once(' ').unwrap().1).as_slice()).unwrap();
         assert_eq!(logon.access_token.as_deref(), Some("eyJ.refresh.token"));
         assert_eq!(logon.account_name.as_deref(), Some("someone"));
-        assert_eq!(
-            logon.obfuscated_private_ip.and_then(|ip| ip.ip),
-            Some(ip_address::Ip::V4(0xdeadbeef))
-        );
+        assert_eq!(logon.obfuscated_private_ip.and_then(|ip| ip.ip), Some(ip_address::Ip::V4(0xdeadbeef)));
     }
 
     /// A message from a newer Steam, with fields this client does not know,
     /// still decodes: the ones it knows are read and the rest are skipped.
     #[test]
     fn fields_added_later_are_skipped_not_fatal() {
-        let mut bytes = ClientChangeStatus {
-            persona_state: Some(1),
-            ..Default::default()
-        }
-        .encode_to_vec();
+        let mut bytes = ClientChangeStatus { persona_state: Some(1), ..Default::default() }.encode_to_vec();
         // An unknown varint field 99, an unknown length-delimited field 100.
         bytes.extend_from_slice(&[0x98, 0x06, 0x05]);
         bytes.extend_from_slice(&[0xa2, 0x06, 0x03, b'a', b'b', b'c']);
-        assert_eq!(
-            ClientChangeStatus::decode(bytes.as_slice())
-                .unwrap()
-                .persona_state,
-            Some(1)
-        );
+        assert_eq!(ClientChangeStatus::decode(bytes.as_slice()).unwrap().persona_state, Some(1));
     }
 }

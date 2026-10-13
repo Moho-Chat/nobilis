@@ -49,10 +49,7 @@ impl HighlightStore {
             // No keywords is a working configuration - it is what everybody
             // has until they add one.
             .unwrap_or_default();
-        Self {
-            path,
-            inner: Mutex::new(inner),
-        }
+        Self { path, inner: Mutex::new(inner) }
     }
 
     /// The words that count on every account.
@@ -62,13 +59,7 @@ impl HighlightStore {
 
     /// The words this one account has of its own.
     pub fn account(&self, account_id: &str) -> Vec<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .accounts
-            .get(account_id)
-            .cloned()
-            .unwrap_or_default()
+        self.inner.lock().unwrap().accounts.get(account_id).cloned().unwrap_or_default()
     }
 
     /// Everything that counts in a conversation on this account: the global
@@ -112,9 +103,7 @@ impl HighlightStore {
     fn update(&self, edit: impl FnOnce(&mut HighlightPrefs)) {
         let mut prefs = self.inner.lock().unwrap();
         edit(&mut prefs);
-        let Ok(text) = toml::to_string_pretty(&*prefs) else {
-            return;
-        };
+        let Ok(text) = toml::to_string_pretty(&*prefs) else { return };
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -145,13 +134,7 @@ mod tests {
 
     #[test]
     fn a_typed_list_loses_its_blanks_and_its_repeats() {
-        let words = tidy(vec![
-            "  moho ".into(),
-            "".into(),
-            "MOHO".into(),
-            "nobilis".into(),
-            "   ".into(),
-        ]);
+        let words = tidy(vec!["  moho ".into(), "".into(), "MOHO".into(), "nobilis".into(), "   ".into()]);
         assert_eq!(words, vec!["moho".to_string(), "nobilis".to_string()]);
     }
 
@@ -173,8 +156,7 @@ mod tests {
 
     #[test]
     fn emptying_a_list_removes_it_rather_than_storing_nothing() {
-        let dir =
-            std::env::temp_dir().join(format!("moho-highlights-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("moho-highlights-empty-{}", std::process::id()));
         let store = HighlightStore::open(dir.join("highlights.toml"));
         store.set_account("irc:coreirc", vec!["moho".into()]);
         store.set_account("irc:coreirc", vec![]);
@@ -195,17 +177,13 @@ mod tests {
         }
         let reopened = HighlightStore::open(path);
         assert_eq!(reopened.global(), vec!["salastil".to_string()]);
-        assert_eq!(
-            reopened.account("kick:me"),
-            vec!["raid".to_string(), "gifted".to_string()]
-        );
+        assert_eq!(reopened.account("kick:me"), vec!["raid".to_string(), "gifted".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_removed_accounts_words_go_with_it_and_nobody_elses_do() {
-        let dir =
-            std::env::temp_dir().join(format!("moho-highlights-forget-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("moho-highlights-forget-{}", std::process::id()));
         let path = dir.join("highlights.toml");
         let store = HighlightStore::open(path.clone());
         store.set_global(vec!["everyone".into()]);

@@ -55,9 +55,7 @@ fn matrix_client(routed: bool) -> reqwest::Client {
 /// "nobody's" would send a routed account's room search out directly.
 pub fn anonymous_client() -> reqwest::Client {
     let router = crate::net::route::router();
-    matrix_client(
-        router.routed(&crate::net::route::pending_key("matrix")) || router.wanted(SHARED_KEY),
-    )
+    matrix_client(router.routed(&crate::net::route::pending_key("matrix")) || router.wanted(SHARED_KEY))
 }
 
 /// Marked while any Matrix account is routed.
@@ -104,14 +102,9 @@ fn normalise_homeserver(typed: &str) -> Result<String> {
     if typed.is_empty() {
         bail!("no homeserver address given");
     }
-    let with_scheme = if typed.contains("://") {
-        typed.to_string()
-    } else {
-        format!("https://{typed}")
-    };
+    let with_scheme = if typed.contains("://") { typed.to_string() } else { format!("https://{typed}") };
 
-    let parsed =
-        url::Url::parse(&with_scheme).with_context(|| format!("{typed} is not an address"))?;
+    let parsed = url::Url::parse(&with_scheme).with_context(|| format!("{typed} is not an address"))?;
     if parsed.port() == Some(8448) {
         bail!(
             "{typed} is the federation port, which does not serve the client API - use the address without :8448, or whatever your server's own /.well-known/matrix/client points at"
@@ -164,17 +157,9 @@ pub enum Attempt {
 
 /// A POST whose 401 is an answer rather than a failure.
 pub async fn post_json_uia(url: &str, body: Value) -> Result<Attempt> {
-    let resp = anonymous_client()
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = anonymous_client().post(url).json(&body).send().await.context("request failed")?;
     if resp.status().as_u16() == 401 {
-        let challenge: Value = resp
-            .json()
-            .await
-            .context("invalid JSON in the authentication challenge")?;
+        let challenge: Value = resp.json().await.context("invalid JSON in the authentication challenge")?;
         return Ok(Attempt::NeedsAuth(challenge));
     }
     handle_response(resp).await.map(Attempt::Done)
@@ -197,11 +182,7 @@ pub async fn post_json(url: &str, token: Option<&str>, body: Value) -> Result<Va
 /// asking a homeserver how it lets people sign in is the first thing that
 /// happens, before there is anybody to be.
 pub async fn get_json_anonymous(url: &str) -> Result<Value> {
-    let resp = anonymous_client()
-        .get(url)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = anonymous_client().get(url).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -209,23 +190,13 @@ pub async fn get_json_anonymous(url: &str) -> Result<Value> {
 /// account provider is asked to register this client before there is any
 /// account to act as.
 pub async fn post_json_anonymous(url: &str, body: Value) -> Result<Value> {
-    let resp = anonymous_client()
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = anonymous_client().post(url).json(&body).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
 /// A form POST, which is what OAuth 2.0 endpoints take rather than JSON.
 pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<Value> {
-    let resp = anonymous_client()
-        .post(url)
-        .form(fields)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = anonymous_client().post(url).form(fields).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -236,12 +207,7 @@ pub async fn post_form_anonymous(url: &str, fields: &[(&str, &str)]) -> Result<V
 /// `handle_response` correctly turns a 403 into an error. Polling needs to
 /// read the body either way, so it asks for both and decides for itself.
 pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Result<(u16, Value)> {
-    let resp = anonymous_client()
-        .post(url)
-        .form(fields)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = anonymous_client().post(url).form(fields).send().await.context("request failed")?;
     let status = resp.status().as_u16();
     let text = resp.text().await.context("reading the reply")?;
     let body = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
@@ -249,22 +215,12 @@ pub async fn post_form_anonymous_raw(url: &str, fields: &[(&str, &str)]) -> Resu
 }
 
 pub async fn get_json(url: &str, token: &str) -> Result<Value> {
-    let resp = http_client_for(token)
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).get(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
 pub async fn delete_json(url: &str, token: &str) -> Result<Value> {
-    let resp = http_client_for(token)
-        .delete(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).delete(url).bearer_auth(token).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -274,11 +230,7 @@ pub struct RateLimited(pub std::time::Duration);
 
 impl std::fmt::Display for RateLimited {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "M_LIMIT_EXCEEDED: the server asks for {} seconds before this is done again",
-            self.0.as_secs().max(1)
-        )
+        write!(f, "M_LIMIT_EXCEEDED: the server asks for {} seconds before this is done again", self.0.as_secs().max(1))
     }
 }
 
@@ -301,13 +253,7 @@ fn limit_wait(body: &Value) -> std::time::Duration {
 /// caller to decide about.
 pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
     for attempt in 1..=LIMIT_TRIES {
-        let resp = http_client_for(token)
-            .put(url)
-            .bearer_auth(token)
-            .json(&body)
-            .send()
-            .await
-            .context("request failed")?;
+        let resp = http_client_for(token).put(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
             return handle_response(resp).await;
         }
@@ -325,12 +271,7 @@ pub async fn put_json(url: &str, token: &str, body: Value) -> Result<Value> {
 /// backend/sneedchat/http.rs's own get_bytes, so callers can distinguish
 /// "fetch itself failed" from "server returned a non-2xx".
 pub async fn get_bytes(url: &str, token: &str) -> Result<(u16, Vec<u8>)> {
-    let resp = http_client_for(token)
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).get(url).bearer_auth(token).send().await.context("request failed")?;
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await.context("reading response body")?;
     Ok((status, bytes.to_vec()))
@@ -344,27 +285,13 @@ pub async fn get_bytes(url: &str, token: &str) -> Result<(u16, Vec<u8>)> {
 /// removing a login session is exactly the kind of sensitive action UIA
 /// exists to re-gate behind the account password) - see
 /// backend/matrix/verification.rs's delete_device, the only caller today.
-pub async fn delete_with_password_uia(
-    url: &str,
-    token: &str,
-    user_id: &str,
-    password: &str,
-) -> Result<Value> {
-    let resp = http_client_for(token)
-        .delete(url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .context("request failed")?;
+pub async fn delete_with_password_uia(url: &str, token: &str, user_id: &str, password: &str) -> Result<Value> {
+    let resp = http_client_for(token).delete(url).bearer_auth(token).json(&serde_json::json!({})).send().await.context("request failed")?;
     if resp.status().as_u16() != 401 {
         return handle_response(resp).await;
     }
     let body: Value = resp.json().await.context("invalid JSON response")?;
-    let session = body["session"]
-        .as_str()
-        .context("no UIA session in 401 response")?
-        .to_string();
+    let session = body["session"].as_str().context("no UIA session in 401 response")?.to_string();
     let auth_body = serde_json::json!({
         "auth": {
             "type": "m.login.password",
@@ -373,13 +300,7 @@ pub async fn delete_with_password_uia(
             "session": session,
         }
     });
-    let resp = http_client_for(token)
-        .delete(url)
-        .bearer_auth(token)
-        .json(&auth_body)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).delete(url).bearer_auth(token).json(&auth_body).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -397,21 +318,12 @@ pub async fn post_with_password_uia(
     password: &str,
     body: Value,
 ) -> Result<Value> {
-    let resp = http_client_for(token)
-        .post(url)
-        .bearer_auth(token)
-        .json(&body)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).post(url).bearer_auth(token).json(&body).send().await.context("request failed")?;
     if resp.status().as_u16() != 401 {
         return handle_response(resp).await;
     }
     let challenge: Value = resp.json().await.context("invalid JSON response")?;
-    let session = challenge["session"]
-        .as_str()
-        .context("no UIA session in 401 response")?
-        .to_string();
+    let session = challenge["session"].as_str().context("no UIA session in 401 response")?.to_string();
     let mut authed = body;
     if let Some(object) = authed.as_object_mut() {
         object.insert(
@@ -424,13 +336,7 @@ pub async fn post_with_password_uia(
             }),
         );
     }
-    let resp = http_client_for(token)
-        .post(url)
-        .bearer_auth(token)
-        .json(&authed)
-        .send()
-        .await
-        .context("request failed")?;
+    let resp = http_client_for(token).post(url).bearer_auth(token).json(&authed).send().await.context("request failed")?;
     handle_response(resp).await
 }
 
@@ -438,11 +344,7 @@ pub async fn post_with_password_uia(
 /// as well, so printing both verbatim gives "M_USER_IN_USE: M_USER_IN_USE:
 /// User ID is not available." Tuwunel does this to every error it sends.
 fn without_errcode<'a>(errcode: &str, error: &'a str) -> &'a str {
-    error
-        .strip_prefix(errcode)
-        .map(|rest| rest.trim_start_matches([':', ' ']))
-        .filter(|rest| !rest.is_empty())
-        .unwrap_or(error)
+    error.strip_prefix(errcode).map(|rest| rest.trim_start_matches([':', ' '])).filter(|rest| !rest.is_empty()).unwrap_or(error)
 }
 
 async fn handle_response(resp: reqwest::Response) -> Result<Value> {
@@ -450,11 +352,7 @@ async fn handle_response(resp: reqwest::Response) -> Result<Value> {
     let body: Value = resp.json().await.context("invalid JSON response")?;
     if !status.is_success() {
         if let Ok(err) = serde_json::from_value::<MatrixError>(body.clone()) {
-            bail!(
-                "{}: {}",
-                err.errcode,
-                without_errcode(&err.errcode, &err.error)
-            );
+            bail!("{}: {}", err.errcode, without_errcode(&err.errcode, &err.error));
         }
         bail!("HTTP {status}: {body}");
     }
@@ -467,39 +365,19 @@ mod tests {
 
     #[test]
     fn an_errcode_is_printed_once_however_the_server_words_it() {
-        assert_eq!(
-            without_errcode("M_USER_IN_USE", "M_USER_IN_USE: User ID is not available."),
-            "User ID is not available."
-        );
-        assert_eq!(
-            without_errcode("M_FORBIDDEN", "Registration has been disabled."),
-            "Registration has been disabled."
-        );
+        assert_eq!(without_errcode("M_USER_IN_USE", "M_USER_IN_USE: User ID is not available."), "User ID is not available.");
+        assert_eq!(without_errcode("M_FORBIDDEN", "Registration has been disabled."), "Registration has been disabled.");
         // Nothing left once the prefix goes: keep what there was, because an
         // errcode alone still says more than an empty string.
-        assert_eq!(
-            without_errcode("M_LIMIT_EXCEEDED", "M_LIMIT_EXCEEDED"),
-            "M_LIMIT_EXCEEDED"
-        );
+        assert_eq!(without_errcode("M_LIMIT_EXCEEDED", "M_LIMIT_EXCEEDED"), "M_LIMIT_EXCEEDED");
     }
 
     #[test]
     fn a_limit_is_waited_out_as_long_as_the_server_asks() {
-        assert_eq!(
-            limit_wait(
-                &serde_json::json!({ "errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 4500 })
-            ),
-            std::time::Duration::from_millis(4500)
-        );
+        assert_eq!(limit_wait(&serde_json::json!({ "errcode": "M_LIMIT_EXCEEDED", "retry_after_ms": 4500 })), std::time::Duration::from_millis(4500));
         // Said nothing, or said zero: a short pause, not a spin.
-        assert_eq!(
-            limit_wait(&serde_json::json!({})),
-            std::time::Duration::from_secs(2)
-        );
-        assert_eq!(
-            limit_wait(&serde_json::json!({ "retry_after_ms": 0 })),
-            std::time::Duration::from_millis(100)
-        );
+        assert_eq!(limit_wait(&serde_json::json!({})), std::time::Duration::from_secs(2));
+        assert_eq!(limit_wait(&serde_json::json!({ "retry_after_ms": 0 })), std::time::Duration::from_millis(100));
     }
 
     /// A server that answers each connection with the next canned reply.
@@ -528,22 +406,15 @@ mod tests {
         let started = std::time::Instant::now();
         let answer = put_json(&url, "token", serde_json::json!({ "presence": "online" })).await;
         assert!(answer.is_ok(), "{answer:?}");
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(100),
-            "it waited as asked"
-        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100), "it waited as asked");
     }
 
     #[tokio::test]
     async fn a_wait_too_long_to_sit_through_is_handed_back_as_the_wait() {
         const LONG: &str = "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 66\r\n\r\n{\"errcode\":\"M_LIMIT_EXCEEDED\",\"error\":\"x\",\"retry_after_ms\":60000}  ";
         let url = server_saying(vec![LONG]).await;
-        let err = put_json(&url, "token", serde_json::json!({}))
-            .await
-            .unwrap_err();
-        let limited = err
-            .downcast_ref::<RateLimited>()
-            .expect("the wait, to be decided about");
+        let err = put_json(&url, "token", serde_json::json!({})).await.unwrap_err();
+        let limited = err.downcast_ref::<RateLimited>().expect("the wait, to be decided about");
         assert_eq!(limited.0, std::time::Duration::from_secs(60));
     }
 
@@ -557,24 +428,12 @@ mod tests {
     fn assumes_https_where_no_scheme_was_typed() {
         // Without this, reqwest refuses the address with a builder error that
         // surfaces only as a reconnect banner saying nothing useful.
-        assert_eq!(
-            normalise_homeserver("matrix.org").unwrap(),
-            "https://matrix.org"
-        );
-        assert_eq!(
-            normalise_homeserver("  matrix.org/  ").unwrap(),
-            "https://matrix.org"
-        );
+        assert_eq!(normalise_homeserver("matrix.org").unwrap(), "https://matrix.org");
+        assert_eq!(normalise_homeserver("  matrix.org/  ").unwrap(), "https://matrix.org");
         // Something already carrying one is left exactly as written, including
         // a plain-http server somebody is deliberately running locally.
-        assert_eq!(
-            normalise_homeserver("https://matrix.example.com").unwrap(),
-            "https://matrix.example.com"
-        );
-        assert_eq!(
-            normalise_homeserver("http://localhost:8008").unwrap(),
-            "http://localhost:8008"
-        );
+        assert_eq!(normalise_homeserver("https://matrix.example.com").unwrap(), "https://matrix.example.com");
+        assert_eq!(normalise_homeserver("http://localhost:8008").unwrap(), "http://localhost:8008");
     }
 
     #[test]
@@ -583,9 +442,7 @@ mod tests {
         // 404 and a reconnect loop that retries it forever. Named rather than
         // rewritten: guessing at 443 would be right most of the time and wrong
         // on a server genuinely running the client API on an odd port.
-        let err = normalise_homeserver("https://example.com:8448")
-            .unwrap_err()
-            .to_string();
+        let err = normalise_homeserver("https://example.com:8448").unwrap_err().to_string();
         assert!(err.contains("federation port"), "{err}");
         assert!(err.contains("well-known"), "{err}");
         // Any other port is somebody's own arrangement and is left alone.

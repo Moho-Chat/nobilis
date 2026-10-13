@@ -15,10 +15,7 @@ pub enum Command {
     /// Watch a channel, by whatever the user typed as a handle. With a
     /// reply when somebody is waiting to hear how it went: a join that
     /// fails on a connected account has nowhere else to say so.
-    Join(
-        String,
-        Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
-    ),
+    Join(String, Option<tokio::sync::oneshot::Sender<Result<(), String>>>),
     /// Try a channel Kick refused for the rate limit again, counting the
     /// attempts so this cannot become a connection that asks forever.
     Rejoin(String, u8),
@@ -39,9 +36,7 @@ pub fn spawn(state: AppState, config: KickAccountConfig) {
             state.runtime.remove_task_handle(&account_id);
         }
     });
-    state
-        .runtime
-        .insert_task_handle(&account_id, join_handle.abort_handle());
+    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 /// Whether Kick said this handle names no channel at all.
@@ -59,27 +54,15 @@ fn forget_missing(state: &AppState, account_id: &str, slug: &str) {
     let gone = api::normalise_slug(slug);
     if let Some(cfg) = state.accounts.get_kick(account_id) {
         let before = cfg.channels.len();
-        let left: Vec<String> = cfg
-            .channels
-            .into_iter()
-            .filter(|c| api::normalise_slug(c) != gone)
-            .collect();
+        let left: Vec<String> = cfg.channels.into_iter().filter(|c| api::normalise_slug(c) != gone).collect();
         if left.len() != before {
             let _ = state.accounts.set_kick_channels(account_id, left);
         }
     }
     // Its placeholder too, put up while it was being looked up.
-    state
-        .runtime
-        .remove_buffer(state, &crate::model::buffer_id(account_id, &gone));
-    tracing::info!(
-        "kick[{account_id}]: {gone} is not a Kick channel any more; taken off the saved list"
-    );
-    state.runtime.report_progress(
-        state,
-        account_id,
-        &format!("{gone} is not on Kick any more - taken off your channels"),
-    );
+    state.runtime.remove_buffer(state, &crate::model::buffer_id(account_id, &gone));
+    tracing::info!("kick[{account_id}]: {gone} is not a Kick channel any more; taken off the saved list");
+    state.runtime.report_progress(state, account_id, &format!("{gone} is not on Kick any more - taken off your channels"));
 }
 
 /// Saves a handle, once Kick has said it is a channel.
@@ -100,9 +83,7 @@ pub(super) const REJOIN_ATTEMPTS: u8 = 3;
 /// Each attempt is its own task with its own wait, so thirty refusals do not
 /// become thirty simultaneous retries - which is the burst that caused them.
 pub(super) fn retry_later(state: &AppState, account_id: &str, slug: String, attempt: u8) {
-    let Some(sender) = state.runtime.kick_sender(account_id) else {
-        return;
-    };
+    let Some(sender) = state.runtime.kick_sender(account_id) else { return };
     tokio::spawn(async move {
         // Well outside whatever window was exhausted, and staggered by the
         // channel's own name so they do not all come back at once.
@@ -134,9 +115,7 @@ pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
 pub(super) async fn run_with_retry(state: &AppState, config: &KickAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
-    state
-        .runtime
-        .set_conn_state(state, account_id, ConnState::Connecting, None);
+    state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         // Re-read the account rather than reusing the one this task was
         // spawned with. Everything about it can have changed since - and one
@@ -148,9 +127,7 @@ pub(super) async fn run_with_retry(state: &AppState, config: &KickAccountConfig,
         // with the buffer still sitting there looking connected.
         let current = state.accounts.get_kick(account_id);
         let config = current.as_ref().unwrap_or(config);
-        let result = std::panic::AssertUnwindSafe(run(state, config, account_id))
-            .catch_unwind()
-            .await;
+        let result = std::panic::AssertUnwindSafe(run(state, config, account_id)).catch_unwind().await;
         let detail = match result {
             Ok(Ok(())) => "connection ended".to_string(),
             Ok(Err(e)) => {
@@ -163,25 +140,14 @@ pub(super) async fn run_with_retry(state: &AppState, config: &KickAccountConfig,
             }
         };
         state.runtime.clear_kick_sender(account_id);
-        state
-            .runtime
-            .set_conn_state(state, account_id, ConnState::Connecting, None);
-        let wait = state.runtime.next_retry_delay(
-            account_id,
-            &mut delay,
-            RECONNECT_INITIAL_DELAY,
-            RECONNECT_MAX_DELAY,
-        );
+        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
 }
 
-pub(super) async fn run(
-    state: &AppState,
-    config: &KickAccountConfig,
-    account_id: &str,
-) -> Result<()> {
+pub(super) async fn run(state: &AppState, config: &KickAccountConfig, account_id: &str) -> Result<()> {
     // The route first, then the client that uses it. Built the other way
     // round - the chat socket below being what used to start Tor - a routed
     // account's client was made before there was anywhere to send it, got
@@ -209,11 +175,7 @@ pub(super) async fn run(
             }
             // Not fatal. A rejected token still leaves a working reader, and
             // saying so beats a reconnect loop that never explains itself.
-            Err(e) => {
-                state
-                    .runtime
-                    .report_progress(state, account_id, &format!("signed out: {e:#}"))
-            }
+            Err(e) => state.runtime.report_progress(state, account_id, &format!("signed out: {e:#}")),
         }
     }
 
@@ -241,22 +203,14 @@ pub(super) async fn run(
                     // for good with nothing on screen to close it by.
                     let _ = state.accounts.mark_kick_follows_synced(account_id);
                     if added > 0 {
-                        state.runtime.report_progress(
-                            state,
-                            account_id,
-                            &format!("opened {added} channels you follow on Kick"),
-                        );
+                        state.runtime.report_progress(state, account_id, &format!("opened {added} channels you follow on Kick"));
                     }
                 }
                 // Not fatal, and not retried on the next connect either -
                 // marking it done anyway would be worse, since a person who
                 // has since closed those channels would get them all back.
                 // Reported, so a failure is visible rather than silent.
-                Err(e) => state.runtime.report_progress(
-                    state,
-                    account_id,
-                    &format!("could not read your Kick follows: {e:#}"),
-                ),
+                Err(e) => state.runtime.report_progress(state, account_id, &format!("could not read your Kick follows: {e:#}")),
             }
         }
     }
@@ -318,16 +272,9 @@ pub(super) async fn run(
         // slow to answer for was otherwise not there at all.
         let name = api::normalise_slug(slug);
         if !name.is_empty() {
-            let id = state
-                .runtime
-                .ensure_buffer(state, account_id, &name, "channel")
-                .id;
+            let id = state.runtime.ensure_buffer(state, account_id, &name, "channel").id;
             if state.runtime.kick_channel(&id).is_none() {
-                state.runtime.set_buffer_link(
-                    state,
-                    &id,
-                    Some(crate::model::BufferLink::connecting()),
-                );
+                state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::connecting()));
             }
         }
         let buffer_id = crate::model::buffer_id(account_id, &api::normalise_slug(slug));
@@ -339,15 +286,7 @@ pub(super) async fn run(
         watched.add_ids(&known.slug, known.chatroom_id, known.channel_id);
         let (state, http, account_id) = (state.clone(), http.clone(), account_id.to_string());
         tokio::spawn(async move {
-            backfill(
-                &state,
-                &http,
-                &account_id,
-                &known.slug,
-                known.channel_id,
-                None,
-            )
-            .await;
+            backfill(&state, &http, &account_id, &known.slug, known.channel_id, None).await;
         });
     }
 
@@ -391,15 +330,9 @@ pub(super) async fn run(
                 if words.contains("429") {
                     refused.push(slug);
                 } else {
-                    state
-                        .runtime
-                        .report_progress(state, account_id, &format!("{slug}: {words}"));
+                    state.runtime.report_progress(state, account_id, &format!("{slug}: {words}"));
                     let id = crate::model::buffer_id(account_id, &api::normalise_slug(&slug));
-                    state.runtime.set_buffer_link(
-                        state,
-                        &id,
-                        Some(crate::model::BufferLink::down("refused", words)),
-                    );
+                    state.runtime.set_buffer_link(state, &id, Some(crate::model::BufferLink::down("refused", words)));
                 }
             }
         }
@@ -410,19 +343,14 @@ pub(super) async fn run(
         state.runtime.report_progress(
             state,
             account_id,
-            &format!(
-                "Kick asked us to slow down - retrying {} channels",
-                refused.len()
-            ),
+            &format!("Kick asked us to slow down - retrying {} channels", refused.len()),
         );
         for slug in refused {
             retry_later(state, account_id, slug, 1);
         }
     }
 
-    state
-        .runtime
-        .set_conn_state(state, account_id, ConnState::Connected, None);
+    state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
 
     // The connection's token runs out, and a connection past it is closed. A
     // fresh one is handed over before then. The keepalive is answered as it
@@ -539,13 +467,8 @@ pub(super) async fn run(
 async fn open_realtime(http: &reqwest::Client, client: &str) -> Result<(Socket, Duration)> {
     let url = realtime::address(http, client).await?;
     let token = realtime::token(http, client, None).await?;
-    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str())
-        .await
-        .context("connecting to Kick's chat")?;
-    socket
-        .send(WsMessage::Text(realtime::connect(&token).to_string()))
-        .await
-        .context("opening the connection to Kick's chat")?;
+    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str()).await.context("connecting to Kick's chat")?;
+    socket.send(WsMessage::Text(realtime::connect(&token).to_string())).await.context("opening the connection to Kick's chat")?;
     let waited = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             match socket.next().await {
@@ -555,16 +478,12 @@ async fn open_realtime(http: &reqwest::Client, client: &str) -> Result<(Socket, 
                     for said in realtime::read(&text) {
                         match said {
                             realtime::Said::Connected { ttl } => return Ok(ttl),
-                            realtime::Said::Refused(why) | realtime::Said::Disconnect(why) => {
-                                anyhow::bail!("Kick's chat refused the connection: {why}")
-                            }
+                            realtime::Said::Refused(why) | realtime::Said::Disconnect(why) => anyhow::bail!("Kick's chat refused the connection: {why}"),
                             _ => {}
                         }
                     }
                 }
-                Some(Ok(WsMessage::Close(_))) => {
-                    anyhow::bail!("Kick closed the chat connection before it answered")
-                }
+                Some(Ok(WsMessage::Close(_))) => anyhow::bail!("Kick closed the chat connection before it answered"),
                 Some(Ok(_)) => {}
             }
         }
@@ -609,9 +528,7 @@ async fn prepare(
     // bare account id wrote a group that does not exist, and a buffer in a
     // group with no rail tile is a conversation with no way to reach it:
     // receiving fine, listed by the daemon, and invisible.
-    let buffer = state
-        .runtime
-        .ensure_buffer(state, account_id, &channel.slug, "channel");
+    let buffer = state.runtime.ensure_buffer(state, account_id, &channel.slug, "channel");
     state.runtime.set_buffer_link(state, &buffer.id, None);
     state.runtime.set_kick_channel(
         &buffer.id,
@@ -697,10 +614,7 @@ async fn prepare(
             // emote rather than a conversation.
             let subscribed = match token.as_deref() {
                 None => false,
-                Some(token) => api::standing(&http, token, &slug)
-                    .await
-                    .map(|s| s.subscribed)
-                    .unwrap_or(false),
+                Some(token) => api::standing(&http, token, &slug).await.map(|s| s.subscribed).unwrap_or(false),
             };
             let emotes = api::emotes(&http, &slug).await.unwrap_or_default();
 
@@ -736,9 +650,7 @@ async fn prepare(
                 );
             }
 
-            state
-                .runtime
-                .set_kick_emotes(&buffer_id, emotes, subscribed);
+            state.runtime.set_kick_emotes(&buffer_id, emotes, subscribed);
         }
     });
 
@@ -766,11 +678,7 @@ async fn prepare(
 ///
 /// Empty auth: all four are public, and this backend subscribes to nothing
 /// that is not.
-pub(super) async fn subscribe(
-    socket: &mut Socket,
-    chatroom_id: u64,
-    channel_id: u64,
-) -> Result<()> {
+pub(super) async fn subscribe(socket: &mut Socket, chatroom_id: u64, channel_id: u64) -> Result<()> {
     for channel in [
         format!("chatrooms.{chatroom_id}.v2"),
         format!("chatrooms.{chatroom_id}"),
@@ -814,24 +722,12 @@ pub(super) async fn handle_frame(
 ) -> Result<()> {
     for said in realtime::read(text) {
         match said {
-            realtime::Said::Ping => {
-                socket
-                    .send(WsMessage::Text(realtime::pong().to_string()))
-                    .await?
-            }
-            realtime::Said::Published {
-                channel,
-                event,
-                data,
-            } => handle_event(state, account_id, watched, &event, Some(&channel), data)?,
+            realtime::Said::Ping => socket.send(WsMessage::Text(realtime::pong().to_string())).await?,
+            realtime::Said::Published { channel, event, data } => handle_event(state, account_id, watched, &event, Some(&channel), data)?,
             // A refused subscription is a channel that will not arrive, and
             // looks like nothing: said in the log, once for each.
-            realtime::Said::Refused(why) => {
-                tracing::warn!("kick[{account_id}]: the chat service refused a request: {why}")
-            }
-            realtime::Said::Disconnect(why) => {
-                anyhow::bail!("Kick's chat ended the connection: {why}")
-            }
+            realtime::Said::Refused(why) => tracing::warn!("kick[{account_id}]: the chat service refused a request: {why}"),
+            realtime::Said::Disconnect(why) => anyhow::bail!("Kick's chat ended the connection: {why}"),
             realtime::Said::Connected { .. } | realtime::Said::Other => {}
         }
     }
@@ -846,10 +742,7 @@ pub(super) async fn handle_frame(
 /// already running in the background, and the alternative to waiting is a
 /// poll or a prediction that is running right now and shows up nowhere until
 /// something else changes.
-pub(super) async fn channel_when_ready(
-    state: &AppState,
-    buffer_id: &str,
-) -> Option<crate::runtime::KickChannel> {
+pub(super) async fn channel_when_ready(state: &AppState, buffer_id: &str) -> Option<crate::runtime::KickChannel> {
     for wait in [0, 3, 8, 20] {
         if wait > 0 {
             tokio::time::sleep(Duration::from_secs(wait)).await;
@@ -868,11 +761,7 @@ pub(super) async fn channel_when_ready(
 /// payload is the fallback, because these events disagree about what they name -
 /// some carry the chatroom, some the channel, some neither - and a fallback
 /// that is occasionally right beats an event dropped for lack of a field.
-pub(super) fn channel_of(
-    watched: &Watched,
-    subscription: &Option<String>,
-    payload: &serde_json::Value,
-) -> Option<String> {
+pub(super) fn channel_of(watched: &Watched, subscription: &Option<String>, payload: &serde_json::Value) -> Option<String> {
     if let Some(name) = subscription.as_deref() {
         match id_in_subscription(name) {
             Some(Subscribed::Chatroom(id)) => {
@@ -911,27 +800,11 @@ pub(super) enum Subscribed {
 }
 
 pub(super) fn id_in_subscription(name: &str) -> Option<Subscribed> {
-    if let Some(rest) = name
-        .strip_prefix("chatrooms.")
-        .or_else(|| name.strip_prefix("chatroom_"))
-    {
-        return rest
-            .split('.')
-            .next()?
-            .parse()
-            .ok()
-            .map(Subscribed::Chatroom);
+    if let Some(rest) = name.strip_prefix("chatrooms.").or_else(|| name.strip_prefix("chatroom_")) {
+        return rest.split('.').next()?.parse().ok().map(Subscribed::Chatroom);
     }
-    if let Some(rest) = name
-        .strip_prefix("channel.")
-        .or_else(|| name.strip_prefix("channel_"))
-    {
-        return rest
-            .split('.')
-            .next()?
-            .parse()
-            .ok()
-            .map(Subscribed::Channel);
+    if let Some(rest) = name.strip_prefix("channel.").or_else(|| name.strip_prefix("channel_")) {
+        return rest.split('.').next()?.parse().ok().map(Subscribed::Channel);
     }
     if let Some(rest) = name.strip_prefix("predictions-channel-") {
         return rest.parse().ok().map(Subscribed::Channel);
@@ -944,23 +817,18 @@ mod tests {
     use super::*;
     use crate::backend::kick::testkit::*;
 
+
+
+
+
     #[test]
     fn finds_the_channel_by_the_subscription_it_arrived_on() {
         let w = watching_odablock();
         let none = serde_json::json!({});
         // All four names this connection subscribes to resolve to the same
         // streamer, across both of Kick's number spaces.
-        for name in [
-            "chatrooms.2393554.v2",
-            "chatrooms.2393554",
-            "chatroom_2393554",
-            "channel.2401072",
-        ] {
-            assert_eq!(
-                channel_of(&w, &Some(name.into()), &none).as_deref(),
-                Some("odablock"),
-                "for {name}"
-            );
+        for name in ["chatrooms.2393554.v2", "chatrooms.2393554", "chatroom_2393554", "channel.2401072"] {
+            assert_eq!(channel_of(&w, &Some(name.into()), &none).as_deref(), Some("odablock"), "for {name}");
         }
     }
 
@@ -972,17 +840,10 @@ mod tests {
             serde_json::json!({ "channel_id": 2401072 }),
             serde_json::json!({ "chatroom_id": 2393554 }),
         ] {
-            assert_eq!(
-                channel_of(&w, &None, &payload).as_deref(),
-                Some("odablock"),
-                "for {payload}"
-            );
+            assert_eq!(channel_of(&w, &None, &payload).as_deref(), Some("odablock"), "for {payload}");
         }
         // A channel this account is not watching is not ours to report.
-        assert_eq!(
-            channel_of(&w, &None, &serde_json::json!({ "channel_id": 1 })),
-            None
-        );
+        assert_eq!(channel_of(&w, &None, &serde_json::json!({ "channel_id": 1 })), None);
     }
 
     #[test]
@@ -990,38 +851,11 @@ mod tests {
         // So a reader can turn off raids without losing redemptions. One kind
         // for all of them made the settings a single on-or-off switch.
         let kind = |event: &str, p: serde_json::Value| describe_action(event, &p).map(|(k, _)| k);
-        assert_eq!(
-            kind(
-                "RewardRedeemedEvent",
-                serde_json::json!({ "username": "a", "reward_title": "x" })
-            ),
-            Some("reward")
-        );
-        assert_eq!(
-            kind("SubscriptionEvent", serde_json::json!({ "username": "a" })),
-            Some("sub")
-        );
-        assert_eq!(
-            kind(
-                "GiftedSubscriptionsEvent",
-                serde_json::json!({ "gifter_username": "a" })
-            ),
-            Some("sub")
-        );
-        assert_eq!(
-            kind(
-                "StreamHostEvent",
-                serde_json::json!({ "host_username": "a" })
-            ),
-            Some("raid")
-        );
-        assert_eq!(
-            kind(
-                "UserBannedEvent",
-                serde_json::json!({ "user": { "username": "a" } })
-            ),
-            Some("moderation")
-        );
+        assert_eq!(kind("RewardRedeemedEvent", serde_json::json!({ "username": "a", "reward_title": "x" })), Some("reward"));
+        assert_eq!(kind("SubscriptionEvent", serde_json::json!({ "username": "a" })), Some("sub"));
+        assert_eq!(kind("GiftedSubscriptionsEvent", serde_json::json!({ "gifter_username": "a" })), Some("sub"));
+        assert_eq!(kind("StreamHostEvent", serde_json::json!({ "host_username": "a" })), Some("raid"));
+        assert_eq!(kind("UserBannedEvent", serde_json::json!({ "user": { "username": "a" } })), Some("moderation"));
     }
 
     #[test]
@@ -1031,39 +865,19 @@ mod tests {
         // by "some id" would deliver one's events into the other's buffer.
         let mut w = Watched::default();
         w.add(&api::Channel {
-            id: 999,
-            chatroom_id: 111,
-            slug: "first".into(),
-            username: "first".into(),
-            avatar_url: None,
-            subscribers_only: false,
-            followers_only: false,
-            live: None,
-            followers: None,
+            id: 999, chatroom_id: 111, slug: "first".into(), username: "first".into(),
+            avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
             playback_url: None,
         });
         w.add(&api::Channel {
-            id: 222,
-            chatroom_id: 999,
-            slug: "second".into(),
-            username: "second".into(),
-            avatar_url: None,
-            subscribers_only: false,
-            followers_only: false,
-            live: None,
-            followers: None,
+            id: 222, chatroom_id: 999, slug: "second".into(), username: "second".into(),
+            avatar_url: None, subscribers_only: false, followers_only: false, live: None, followers: None,
             playback_url: None,
         });
         // 999 is first's channel and second's chatroom. Which one is meant is
         // never a guess - the subscription name says which kind it is.
-        assert_eq!(
-            channel_of(&w, &Some("channel.999".into()), &serde_json::json!({})).as_deref(),
-            Some("first")
-        );
-        assert_eq!(
-            channel_of(&w, &Some("chatrooms.999.v2".into()), &serde_json::json!({})).as_deref(),
-            Some("second")
-        );
+        assert_eq!(channel_of(&w, &Some("channel.999".into()), &serde_json::json!({})).as_deref(), Some("first"));
+        assert_eq!(channel_of(&w, &Some("chatrooms.999.v2".into()), &serde_json::json!({})).as_deref(), Some("second"));
     }
 
     #[test]
@@ -1073,49 +887,21 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec![
-                "channel.2401072",
-                "channel_2401072",
-                "chatroom_2393554",
-                "chatrooms.2393554",
-                "chatrooms.2393554.v2"
-            ]
+            vec!["channel.2401072", "channel_2401072", "chatroom_2393554", "chatrooms.2393554", "chatrooms.2393554.v2"]
         );
         // And it is gone from both maps, so a straggling event has nowhere to
         // land rather than reopening the buffer that was just closed.
-        assert_eq!(
-            channel_of(
-                &w,
-                &Some("chatrooms.2393554".into()),
-                &serde_json::json!({})
-            ),
-            None
-        );
+        assert_eq!(channel_of(&w, &Some("chatrooms.2393554".into()), &serde_json::json!({})), None);
         assert!(w.remove("odablock").is_empty());
     }
 
     #[test]
     fn reads_the_id_out_of_a_subscription_name() {
-        assert_eq!(
-            id_in_subscription("chatrooms.123.v2"),
-            Some(Subscribed::Chatroom(123))
-        );
-        assert_eq!(
-            id_in_subscription("chatrooms.123"),
-            Some(Subscribed::Chatroom(123))
-        );
-        assert_eq!(
-            id_in_subscription("chatroom_123"),
-            Some(Subscribed::Chatroom(123))
-        );
-        assert_eq!(
-            id_in_subscription("channel.123"),
-            Some(Subscribed::Channel(123))
-        );
-        assert_eq!(
-            id_in_subscription("channel_123"),
-            Some(Subscribed::Channel(123))
-        );
+        assert_eq!(id_in_subscription("chatrooms.123.v2"), Some(Subscribed::Chatroom(123)));
+        assert_eq!(id_in_subscription("chatrooms.123"), Some(Subscribed::Chatroom(123)));
+        assert_eq!(id_in_subscription("chatroom_123"), Some(Subscribed::Chatroom(123)));
+        assert_eq!(id_in_subscription("channel.123"), Some(Subscribed::Channel(123)));
+        assert_eq!(id_in_subscription("channel_123"), Some(Subscribed::Channel(123)));
         assert_eq!(id_in_subscription("chatrooms.abc"), None);
         assert_eq!(id_in_subscription("something-else"), None);
     }
@@ -1138,17 +924,10 @@ mod live {
     #[ignore = "needs the network and a live Kick channel"]
     async fn a_signed_out_reader_hears_a_live_channel() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter("nobilis::backend::kick=info")
-            .with_test_writer()
-            .try_init();
+        let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::kick=info").with_test_writer().try_init();
         let channel = std::env::var("MOHO_KICK_CHANNEL").unwrap_or_else(|_| "xqc".to_string());
         let state = simulated_daemon("kick-live-probe");
-        let config = KickAccountConfig {
-            username: "reader".into(),
-            channels: vec![channel.clone()],
-            ..Default::default()
-        };
+        let config = KickAccountConfig { username: "reader".into(), channels: vec![channel.clone()], ..Default::default() };
         let id = config.account_id();
         state.accounts.add_kick(config.clone()).unwrap();
         spawn(state.clone(), config);
@@ -1156,51 +935,25 @@ mod live {
         let mut heard = 0;
         for _ in 0..240 {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            heard = state
-                .store
-                .get_backlog(&buffer, 0, 200)
-                .map(|m| {
-                    m.iter()
-                        .filter(|m| m.kind == "chat" || m.kind == "message")
-                        .count()
-                })
-                .unwrap_or(0);
+            heard = state.store.get_backlog(&buffer, 0, 200).map(|m| m.iter().filter(|m| m.kind == "chat" || m.kind == "message").count()).unwrap_or(0);
             if heard >= 5 && state.runtime.conn_state(&id) == Some(ConnState::Connected) {
                 break;
             }
         }
         // And for as long as asked, to see that the keepalive is answered and
         // that chat keeps arriving after the first minute.
-        let secs: u64 = std::env::var("MOHO_KICK_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+        let secs: u64 = std::env::var("MOHO_KICK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
         let before = heard;
         tokio::time::sleep(Duration::from_secs(secs)).await;
-        let after = state
-            .store
-            .get_backlog(&buffer, 0, 1000)
-            .map(|m| m.len())
-            .unwrap_or(0);
-        println!(
-            "after {secs}s more: {} -> {after} message(s); state {:?}",
-            before,
-            state.runtime.conn_state(&id)
-        );
+        let after = state.store.get_backlog(&buffer, 0, 1000).map(|m| m.len()).unwrap_or(0);
+        println!("after {secs}s more: {} -> {after} message(s); state {:?}", before, state.runtime.conn_state(&id));
         if secs > 0 {
             assert!(after > before, "chat kept arriving");
             assert_eq!(state.runtime.conn_state(&id), Some(ConnState::Connected));
         }
-        println!(
-            "state {:?}; heard {heard} message(s) in {channel}",
-            state.runtime.conn_state(&id)
-        );
+        println!("state {:?}; heard {heard} message(s) in {channel}", state.runtime.conn_state(&id));
         for m in state.store.get_backlog(&buffer, 0, 5).unwrap_or_default() {
-            println!(
-                "  {}: {}",
-                m.from,
-                m.body.chars().take(80).collect::<String>()
-            );
+            println!("  {}: {}", m.from, m.body.chars().take(80).collect::<String>());
         }
         assert!(heard >= 5, "a live channel's chat should be arriving");
     }

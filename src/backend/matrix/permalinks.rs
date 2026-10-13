@@ -24,34 +24,15 @@ use super::*;
 /// an id alone. The hints are servers we can name with certainty - the
 /// domains in the room id and in this account's own user id - rather than a
 /// guess at who else is in it.
-pub async fn message_link(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-) -> Result<Value> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no room for this conversation")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn message_link(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
 
     let alias = roomsettings::canonical_alias(state, account_id, &room_id).await;
     let url = match alias {
-        Some(alias) => format!(
-            "https://matrix.to/#/{}/{}",
-            escape(&alias),
-            escape(event_id)
-        ),
+        Some(alias) => format!("https://matrix.to/#/{}/{}", escape(&alias), escape(event_id)),
         None => {
-            let mut url = format!(
-                "https://matrix.to/#/{}/{}",
-                escape(&room_id),
-                escape(event_id)
-            );
+            let mut url = format!("https://matrix.to/#/{}/{}", escape(&room_id), escape(event_id));
             for (i, server) in via(&room_id, &account.user_id).iter().enumerate() {
                 url.push(if i == 0 { '?' } else { '&' });
                 url.push_str("via=");
@@ -98,37 +79,22 @@ fn escape(value: &str) -> String {
 /// Fetched rather than taken from the timeline. What is held here is what
 /// this client *made* of the event - a row with a body and a sender - and the
 /// whole point of looking at the source is that what it made may be wrong.
-pub async fn event_source(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-) -> Result<Value> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no room for this conversation")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn event_source(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/event/{}",
         account.homeserver_url.trim_end_matches('/'),
         escape(&room_id),
         escape(event_id)
     );
-    let event = http::get_json(&url, &account.access_token)
-        .await
-        .context("reading the event")?;
+    let event = http::get_json(&url, &account.access_token).await.context("reading the event")?;
 
     let decrypted = if event["type"].as_str() == Some(protocol::EVENT_ROOM_ENCRYPTED) {
         let session = state.runtime.get_matrix_machine(account_id);
         let room = ruma_common::RoomId::parse(&room_id).ok();
         match (session, room) {
-            (Some(session), Some(room)) => crypto::decrypt_room_event(&session, &event, &room)
-                .await
-                .ok(),
+            (Some(session), Some(room)) => crypto::decrypt_room_event(&session, &event, &room).await.ok(),
             _ => None,
         }
     } else {
@@ -154,10 +120,7 @@ mod tests {
     /// was made on, and a server known to be in it because we are on it.
     #[test]
     fn a_link_names_servers_it_can_be_sure_of() {
-        assert_eq!(
-            via("!abc:example.org", "@me:poa.st"),
-            vec!["example.org", "poa.st"]
-        );
+        assert_eq!(via("!abc:example.org", "@me:poa.st"), vec!["example.org", "poa.st"]);
         // Same server on both sides is one hint, not the same one twice.
         assert_eq!(via("!abc:poa.st", "@me:poa.st"), vec!["poa.st"]);
         // Nothing to split on is no hint rather than a broken one.

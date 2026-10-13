@@ -7,10 +7,7 @@
 //! needs asking is the profile text and the level.
 
 use super::link::Link;
-use super::proto::{
-    FriendProfileInfoRequest, FriendProfileInfoResponse, FriendsSteamLevelsRequest,
-    FriendsSteamLevelsResponse,
-};
+use super::proto::{FriendProfileInfoRequest, FriendProfileInfoResponse, FriendsSteamLevelsRequest, FriendsSteamLevelsResponse};
 use super::steamid;
 use super::wire::emsg;
 use crate::profile;
@@ -19,13 +16,7 @@ use serde_json::{json, Value};
 
 /// What somebody wrote about where they are, as one line.
 fn place(p: &FriendProfileInfoResponse) -> String {
-    [&p.city_name, &p.state_name, &p.country_name]
-        .iter()
-        .filter_map(|s| s.as_deref())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(", ")
+    [&p.city_name, &p.state_name, &p.country_name].iter().filter_map(|s| s.as_deref()).map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join(", ")
 }
 
 /// A profile's summary, which is written with Steam's tags, as plain words.
@@ -36,12 +27,7 @@ fn summary(text: &str) -> String {
         plain = plain.replace(mark, "");
     }
     let plain = pictures_as_words(&plain);
-    plain
-        .chars()
-        .take(600)
-        .collect::<String>()
-        .trim()
-        .to_string()
+    plain.chars().take(600).collect::<String>().trim().to_string()
 }
 
 /// `[steam:emote:name]` as `:name:`, which is how it is read in words.
@@ -51,10 +37,7 @@ fn pictures_as_words(text: &str) -> String {
     while let Some(at) = rest.find("[steam:") {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
-        match tail
-            .find(']')
-            .and_then(|end| tail[7..end].split_once(':').map(|(_, name)| (end, name)))
-        {
+        match tail.find(']').and_then(|end| tail[7..end].split_once(':').map(|(_, name)| (end, name))) {
             Some((end, name)) => {
                 out.push_str(&format!(":{name}:"));
                 rest = &tail[end + 1..];
@@ -75,34 +58,18 @@ fn fill(card: &mut Value, info: Option<&FriendProfileInfoResponse>, level: Optio
         profile::note(card, "Steam level", level.to_string());
     }
     let Some(info) = info else { return };
-    profile::set(
-        card,
-        "createdTs",
-        info.time_created.filter(|t| *t > 0).map(|t| json!(t)),
-    );
-    profile::note(
-        card,
-        "Real name",
-        info.real_name.clone().unwrap_or_default(),
-    );
+    profile::set(card, "createdTs", info.time_created.filter(|t| *t > 0).map(|t| json!(t)));
+    profile::note(card, "Real name", info.real_name.clone().unwrap_or_default());
     profile::note(card, "Location", place(info));
     profile::note(card, "Headline", info.headline.clone().unwrap_or_default());
-    profile::note(
-        card,
-        "Summary",
-        summary(info.summary.as_deref().unwrap_or_default()),
-    );
+    profile::note(card, "Summary", summary(info.summary.as_deref().unwrap_or_default()));
 }
 
 /// Adds the names they have had, newest first: the one they have now is the one
 /// the card is headed by, so it is not listed again.
 fn fill_names(card: &mut Value, names: &[(String, String)]) {
     let now = card["name"].as_str().unwrap_or_default().to_string();
-    let history: Vec<Value> = names
-        .iter()
-        .filter(|(n, _)| *n != now)
-        .map(|(name, when)| json!({ "name": name, "when": when }))
-        .collect();
+    let history: Vec<Value> = names.iter().filter(|(n, _)| *n != now).map(|(name, when)| json!({ "name": name, "when": when })).collect();
     if !history.is_empty() {
         card["nameHistory"] = json!(history);
     }
@@ -120,23 +87,12 @@ fn how_long(seconds: u64) -> String {
 /// Adds what is already known from how they are showing.
 fn fill_from_presence(card: &mut Value, member: &Value) {
     profile::set(card, "status", member["status"].as_str().map(|s| json!(s)));
-    profile::set(
-        card,
-        "avatarUrl",
-        member["avatarUrl"].as_str().map(|s| json!(s)),
-    );
-    profile::set(
-        card,
-        "activity",
-        Some(member["activity"].clone()).filter(|a| !a.is_null()),
-    );
+    profile::set(card, "avatarUrl", member["avatarUrl"].as_str().map(|s| json!(s)));
+    profile::set(card, "activity", Some(member["activity"].clone()).filter(|a| !a.is_null()));
     profile::note(card, "On", member["client"].as_str().unwrap_or_default());
     // Only as long as moho has seen it: Steam does not say how long anybody has been in a game.
     if let Some(since) = member["playingSince"].as_u64().filter(|s| *s > 0) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if now > since {
             profile::note(card, "Seen playing for", how_long(now - since));
         }
@@ -144,93 +100,39 @@ fn fill_from_presence(card: &mut Value, member: &Value) {
     profile::note(card, "Doing", member["rich"].as_str().unwrap_or_default());
     // Only for somebody who is not here: for somebody who is, it is now.
     if member["status"].as_str() == Some("offline") {
-        profile::set(
-            card,
-            "lastActiveTs",
-            member["lastSeen"]
-                .as_u64()
-                .filter(|t| *t > 0)
-                .map(|t| json!(t)),
-        );
+        profile::set(card, "lastActiveTs", member["lastSeen"].as_u64().filter(|t| *t > 0).map(|t| json!(t)));
     }
 }
 
 async fn ask_profile(link: &Link, friend: u64) -> Option<FriendProfileInfoResponse> {
-    let answer: FriendProfileInfoResponse = link
-        .ask(
-            emsg::CLIENT_FRIEND_PROFILE_INFO,
-            &FriendProfileInfoRequest {
-                steamid_friend: Some(friend),
-            },
-        )
-        .await
-        .ok()?;
+    let answer: FriendProfileInfoResponse = link.ask(emsg::CLIENT_FRIEND_PROFILE_INFO, &FriendProfileInfoRequest { steamid_friend: Some(friend) }).await.ok()?;
     (answer.eresult.unwrap_or(super::eresult::FAIL) == super::eresult::OK).then_some(answer)
 }
 
 async fn ask_level(link: &Link, friend: u32) -> Option<u32> {
-    let answer: FriendsSteamLevelsResponse = link
-        .ask(
-            emsg::CLIENT_FS_GET_FRIENDS_STEAM_LEVELS,
-            &FriendsSteamLevelsRequest {
-                accountids: vec![friend],
-            },
-        )
-        .await
-        .ok()?;
-    answer
-        .friends
-        .iter()
-        .find(|f| f.accountid == Some(friend))
-        .and_then(|f| f.level)
+    let answer: FriendsSteamLevelsResponse = link.ask(emsg::CLIENT_FS_GET_FRIENDS_STEAM_LEVELS, &FriendsSteamLevelsRequest { accountids: vec![friend] }).await.ok()?;
+    answer.friends.iter().find(|f| f.accountid == Some(friend)).and_then(|f| f.level)
 }
 
 /// The card for the person a conversation is with.
-pub async fn build(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    who: &str,
-    user_id: &str,
-) -> Value {
+pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &str, user_id: &str) -> Value {
     let mut card = profile::pending("steam", account_id, who);
     card["pending"] = json!(false);
     let buffer = state.runtime.get_buffer(buffer_id);
     // A conversation is with one person; a room of a group is with many, and the
     // member who was asked about is named.
     let in_room = buffer.as_ref().is_some_and(super::chatgroups::is_room);
-    let friend = if in_room {
-        user_id.parse::<u64>().ok()
-    } else {
-        buffer
-            .as_ref()
-            .and_then(|b| b.remote_id.as_deref())
-            .and_then(|id| id.parse::<u64>().ok())
-    }
-    .filter(|id| steamid::account_of(*id).is_some());
+    let friend = if in_room { user_id.parse::<u64>().ok() } else { buffer.as_ref().and_then(|b| b.remote_id.as_deref()).and_then(|id| id.parse::<u64>().ok()) }.filter(|id| steamid::account_of(*id).is_some());
     let Some(friend) = friend else { return card };
     card["id"] = json!(friend.to_string());
-    let listed = state
-        .runtime
-        .get_presence(buffer_id)
-        .and_then(|m| m.as_array().cloned())
-        .unwrap_or_default();
-    let member = if in_room {
-        listed
-            .into_iter()
-            .find(|m| m["userId"].as_str() == Some(&friend.to_string()))
-    } else {
-        listed.into_iter().next()
-    };
+    let listed = state.runtime.get_presence(buffer_id).and_then(|m| m.as_array().cloned()).unwrap_or_default();
+    let member = if in_room { listed.into_iter().find(|m| m["userId"].as_str() == Some(&friend.to_string())) } else { listed.into_iter().next() };
     if let Some(member) = member {
         fill_from_presence(&mut card, &member);
         if in_room {
             if let Some(roles) = member["roles"].as_array().filter(|r| !r.is_empty()) {
                 card["roles"] = json!(roles);
-                card["isModerator"] = json!(
-                    member["powerLevel"].as_i64().unwrap_or(0)
-                        >= super::chatgroups::RANK_MODERATOR as i64
-                );
+                card["isModerator"] = json!(member["powerLevel"].as_i64().unwrap_or(0) >= super::chatgroups::RANK_MODERATOR as i64);
             }
         }
     }
@@ -239,16 +141,11 @@ pub async fn build(
         let config = state.accounts.get_steam(account_id);
         let names = async {
             match &config {
-                Some(c) => {
-                    super::web::aliases(&link, account_id, c.steamid, &c.refresh_token, friend)
-                        .await
-                        .unwrap_or_default()
-                }
+                Some(c) => super::web::aliases(&link, account_id, c.steamid, &c.refresh_token, friend).await.unwrap_or_default(),
                 None => Vec::new(),
             }
         };
-        let (info, level, names) =
-            tokio::join!(ask_profile(&link, friend), ask_level(&link, number), names);
+        let (info, level, names) = tokio::join!(ask_profile(&link, friend), ask_level(&link, number), names);
         fill(&mut card, info.as_ref(), level);
         fill_names(&mut card, &names);
     }
@@ -260,19 +157,7 @@ mod tests {
     use super::*;
 
     fn labels(card: &Value) -> Vec<(String, String)> {
-        card["extra"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .map(|e| {
-                        (
-                            e["label"].as_str().unwrap().to_string(),
-                            e["value"].as_str().unwrap().to_string(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
+        card["extra"].as_array().map(|a| a.iter().map(|e| (e["label"].as_str().unwrap().to_string(), e["value"].as_str().unwrap().to_string())).collect()).unwrap_or_default()
     }
 
     #[test]
@@ -281,41 +166,19 @@ mod tests {
         assert_eq!(how_long(600), "10 min");
         assert_eq!(how_long(3600 + 5 * 60), "1h 05m");
         let mut card = profile::pending("steam", "steam:me", "Gabe");
-        let since = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            - 4000;
-        fill_from_presence(
-            &mut card,
-            &json!({ "status": "online", "activity": { "kind": "game", "text": "X" }, "playingSince": since }),
-        );
-        assert_eq!(
-            labels(&card),
-            [("Seen playing for".to_string(), "1h 06m".to_string())]
-        );
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 4000;
+        fill_from_presence(&mut card, &json!({ "status": "online", "activity": { "kind": "game", "text": "X" }, "playingSince": since }));
+        assert_eq!(labels(&card), [("Seen playing for".to_string(), "1h 06m".to_string())]);
     }
 
     #[test]
     fn the_names_they_have_had_are_listed_except_the_one_they_have() {
         let mut card = profile::pending("steam", "steam:me", "Gabe");
-        fill_names(
-            &mut card,
-            &[
-                ("Gabe".into(), "1 Jan, 2024 @ 1:00pm".into()),
-                ("Gabe Newell".into(), "3 Mar, 2019 @ 1:00am".into()),
-            ],
-        );
-        assert_eq!(
-            card["nameHistory"],
-            json!([{ "name": "Gabe Newell", "when": "3 Mar, 2019 @ 1:00am" }])
-        );
+        fill_names(&mut card, &[("Gabe".into(), "1 Jan, 2024 @ 1:00pm".into()), ("Gabe Newell".into(), "3 Mar, 2019 @ 1:00am".into())]);
+        assert_eq!(card["nameHistory"], json!([{ "name": "Gabe Newell", "when": "3 Mar, 2019 @ 1:00am" }]));
         let mut none = profile::pending("steam", "steam:me", "Gabe");
         fill_names(&mut none, &[("Gabe".into(), "x".into())]);
-        assert!(
-            none.get("nameHistory").is_none(),
-            "only the present name: nothing to list"
-        );
+        assert!(none.get("nameHistory").is_none(), "only the present name: nothing to list");
     }
 
     #[test]
@@ -336,14 +199,8 @@ mod tests {
         assert_eq!(card["createdTs"], 1300000000);
         assert_eq!(
             labels(&card),
-            [
-                ("Steam level", "42"),
-                ("Real name", "Gabe N"),
-                ("Location", "Bellevue, United States"),
-                ("Headline", "Hello"),
-                ("Summary", "About me and :steamhappy: [x]")
-            ]
-            .map(|(a, b)| (a.to_string(), b.to_string())),
+            [("Steam level", "42"), ("Real name", "Gabe N"), ("Location", "Bellevue, United States"), ("Headline", "Hello"), ("Summary", "About me and :steamhappy: [x]")]
+                .map(|(a, b)| (a.to_string(), b.to_string())),
             "an empty part of a place is left out, and the summary is words"
         );
     }
@@ -352,11 +209,7 @@ mod tests {
     fn nothing_known_is_nothing_shown() {
         let mut card = profile::pending("steam", "steam:me", "Gabe");
         fill(&mut card, None, None);
-        fill(
-            &mut card,
-            Some(&FriendProfileInfoResponse::default()),
-            Some(0),
-        );
+        fill(&mut card, Some(&FriendProfileInfoResponse::default()), Some(0));
         assert!(labels(&card).is_empty());
         assert!(card.get("createdTs").is_none());
     }
@@ -364,33 +217,15 @@ mod tests {
     #[test]
     fn how_they_are_showing_comes_from_their_presence() {
         let mut card = profile::pending("steam", "steam:me", "Gabe");
-        fill_from_presence(
-            &mut card,
-            &json!({ "status": "online", "client": "Mobile", "rich": "In a match", "avatarUrl": "https://a/b.jpg", "activity": { "kind": "game", "text": "Dota 2" }, "lastSeen": 100 }),
-        );
+        fill_from_presence(&mut card, &json!({ "status": "online", "client": "Mobile", "rich": "In a match", "avatarUrl": "https://a/b.jpg", "activity": { "kind": "game", "text": "Dota 2" }, "lastSeen": 100 }));
         assert_eq!(card["status"], "online");
         assert_eq!(card["activity"]["text"], "Dota 2");
-        assert!(
-            card.get("lastActiveTs").is_none(),
-            "last seen is for somebody who is away"
-        );
-        assert_eq!(
-            labels(&card),
-            [
-                ("On".to_string(), "Mobile".to_string()),
-                ("Doing".to_string(), "In a match".to_string())
-            ]
-        );
+        assert!(card.get("lastActiveTs").is_none(), "last seen is for somebody who is away");
+        assert_eq!(labels(&card), [("On".to_string(), "Mobile".to_string()), ("Doing".to_string(), "In a match".to_string())]);
 
         let mut gone = profile::pending("steam", "steam:me", "Gabe");
-        fill_from_presence(
-            &mut gone,
-            &json!({ "status": "offline", "lastSeen": 1790000000 }),
-        );
+        fill_from_presence(&mut gone, &json!({ "status": "offline", "lastSeen": 1790000000 }));
         assert_eq!(gone["lastActiveTs"], 1790000000u64);
-        assert!(
-            labels(&gone).is_empty(),
-            "nothing to say of a client that is not there"
-        );
+        assert!(labels(&gone).is_empty(), "nothing to say of a client that is not there");
     }
 }

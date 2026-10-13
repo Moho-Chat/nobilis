@@ -77,19 +77,10 @@ pub fn is_unpin(event: &str) -> bool {
 /// guess which, this looks in all three and takes the first that has an id and
 /// something to say.
 pub fn read(payload: &Value) -> Option<Pin> {
-    for candidate in [
-        payload.get("message"),
-        payload.get("data").and_then(|d| d.get("message")),
-        payload.get("data"),
-        Some(payload),
-    ] {
+    for candidate in [payload.get("message"), payload.get("data").and_then(|d| d.get("message")), payload.get("data"), Some(payload)] {
         let Some(message) = candidate else { continue };
         let id = message.get("id").and_then(id_text);
-        let body = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let body = message.get("content").and_then(|v| v.as_str()).unwrap_or("").trim();
         let Some(id) = id else { continue };
         if body.is_empty() {
             continue;
@@ -101,11 +92,7 @@ pub fn read(payload: &Value) -> Option<Pin> {
             .filter(|s| !s.is_empty())
             .unwrap_or("someone")
             .to_string();
-        return Some(Pin {
-            id,
-            from,
-            body: body.to_string(),
-        });
+        return Some(Pin { id, from, body: body.to_string() });
     }
     None
 }
@@ -158,9 +145,7 @@ pub fn replay(state: &AppState, buffer_id: &str) {
 /// learns about the pin when it next changes - which is worth strictly more
 /// than refusing to join.
 pub async fn refresh_pin(state: &AppState, buffer_id: &str) {
-    let Some(channel) = channel_when_ready(state, buffer_id).await else {
-        return;
-    };
+    let Some(channel) = channel_when_ready(state, buffer_id).await else { return };
     let Ok(http) = api::client() else { return };
     let token = state
         .runtime
@@ -229,29 +214,16 @@ mod tests {
     /// hardest kind of failure to notice - so the test is the shape.
     #[test]
     fn a_pin_event_is_recognised_by_shape_and_its_direction_by_name() {
-        for up in [
-            "App\\Events\\PinnedMessageCreatedEvent",
-            "PinnedMessageCreatedEvent",
-            "App\\Events\\PinnedMessageUpdatedEvent",
-        ] {
+        for up in ["App\\Events\\PinnedMessageCreatedEvent", "PinnedMessageCreatedEvent", "App\\Events\\PinnedMessageUpdatedEvent"] {
             assert!(is_pin_event(up), "{up}");
             assert!(!is_unpin(up), "{up}");
         }
-        for down in [
-            "App\\Events\\PinnedMessageDeletedEvent",
-            "PinnedMessageRemovedEvent",
-            "UnpinMessageEvent",
-        ] {
+        for down in ["App\\Events\\PinnedMessageDeletedEvent", "PinnedMessageRemovedEvent", "UnpinMessageEvent"] {
             assert!(is_pin_event(down), "{down}");
             assert!(is_unpin(down), "{down}");
         }
         // And nothing else is swept up with them.
-        for other in [
-            "App\\Events\\ChatMessageEvent",
-            "PollUpdateEvent",
-            "MessageDeletedEvent",
-            "SpinWheelEvent",
-        ] {
+        for other in ["App\\Events\\ChatMessageEvent", "PollUpdateEvent", "MessageDeletedEvent", "SpinWheelEvent"] {
             assert!(!is_pin_event(other), "{other}");
         }
     }
@@ -259,9 +231,7 @@ mod tests {
     /// Whoever pinned it may not be named; the pin is still the point.
     #[test]
     fn a_pin_with_no_named_sender_is_still_a_pin() {
-        let pin =
-            read(&serde_json::json!({ "message": { "id": "7", "content": "hi", "sender": {} } }))
-                .expect("a pin");
+        let pin = read(&serde_json::json!({ "message": { "id": "7", "content": "hi", "sender": {} } })).expect("a pin");
         assert_eq!(pin.from, "someone");
     }
 }

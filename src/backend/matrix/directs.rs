@@ -25,9 +25,7 @@ use serde_json::{json, Map};
 /// DM, and who with" - the account data is keyed the other way, by person,
 /// since one person can have several rooms with you.
 pub fn read(content: &Value) -> Vec<(String, String)> {
-    let Some(by_user) = content.as_object() else {
-        return Vec::new();
-    };
+    let Some(by_user) = content.as_object() else { return Vec::new() };
     let mut pairs = Vec::new();
     for (user_id, rooms) in by_user {
         for room in rooms.as_array().into_iter().flatten() {
@@ -47,14 +45,8 @@ pub fn read(content: &Value) -> Vec<(String, String)> {
 /// already listed changes nothing rather than listing it twice.
 pub fn with(content: &Value, user_id: &str, room_id: &str) -> Value {
     let mut by_user = content.as_object().cloned().unwrap_or_else(Map::new);
-    let rooms = by_user
-        .entry(user_id.to_string())
-        .or_insert_with(|| json!([]));
-    let already = rooms
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|r| r.as_str() == Some(room_id));
+    let rooms = by_user.entry(user_id.to_string()).or_insert_with(|| json!([]));
+    let already = rooms.as_array().into_iter().flatten().any(|r| r.as_str() == Some(room_id));
     if !already {
         if let Some(list) = rooms.as_array_mut() {
             list.push(json!(room_id));
@@ -72,13 +64,7 @@ pub fn with(content: &Value, user_id: &str, room_id: &str) -> Value {
 /// cursor never arrives again - so an account that had not reopened a DM
 /// since before this existed would sit there with every conversation filed as
 /// an ordinary room.
-pub(super) async fn fetch(
-    state: &AppState,
-    account_id: &str,
-    homeserver_url: &str,
-    access_token: &str,
-    user_id: &str,
-) {
+pub(super) async fn fetch(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str, user_id: &str) {
     let base = homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/user/{}/account_data/m.direct",
@@ -102,15 +88,11 @@ pub(super) fn apply(state: &AppState, account_id: &str, content: &Value) {
     let pairs = read(content);
     state.runtime.set_matrix_directs(account_id, pairs.clone());
     for (room_id, _) in pairs {
-        let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, &room_id) else {
-            continue;
-        };
+        let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, &room_id) else { continue };
         if kind == "dm" {
             continue;
         }
-        state
-            .runtime
-            .set_matrix_room_name(account_id, &room_id, &name, "dm");
+        state.runtime.set_matrix_room_name(account_id, &room_id, &name, "dm");
         if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, &room_id) {
             state.runtime.set_buffer_kind(state, &buffer_id, "dm");
         }
@@ -125,31 +107,14 @@ pub(super) fn apply(state: &AppState, account_id: &str, content: &Value) {
 /// have written it since. Best-effort: failing to record a DM is worth a
 /// line in the log and not worth failing the conversation over.
 pub(super) async fn record(state: &AppState, account_id: &str, peer_user_id: &str, room_id: &str) {
-    let Some(account) = state.accounts.get_matrix(account_id) else {
-        return;
-    };
-    let existing = ssss::read_account_data(
-        &account.homeserver_url,
-        &account.access_token,
-        &account.user_id,
-        "m.direct",
-    )
-    .await
-    .unwrap_or_else(|| json!({}));
+    let Some(account) = state.accounts.get_matrix(account_id) else { return };
+    let existing = ssss::read_account_data(&account.homeserver_url, &account.access_token, &account.user_id, "m.direct")
+        .await
+        .unwrap_or_else(|| json!({}));
     let updated = with(&existing, peer_user_id, room_id);
-    match ssss::write_account_data(
-        &account.homeserver_url,
-        &account.access_token,
-        &account.user_id,
-        "m.direct",
-        updated.clone(),
-    )
-    .await
-    {
+    match ssss::write_account_data(&account.homeserver_url, &account.access_token, &account.user_id, "m.direct", updated.clone()).await {
         Ok(()) => apply(state, account_id, &updated),
-        Err(e) => {
-            tracing::warn!("matrix[{account_id}]: recording {room_id} as a direct message: {e:#}")
-        }
+        Err(e) => tracing::warn!("matrix[{account_id}]: recording {room_id} as a direct message: {e:#}"),
     }
 }
 

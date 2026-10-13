@@ -65,22 +65,14 @@ const DEFAULT_AVATAR: &str = "fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb";
 /// "none set", and is not an image - the default has a hash of its own.
 pub fn avatar_url(hash: &[u8]) -> String {
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-    let hex = if hex.is_empty() || hash.iter().all(|b| *b == 0) {
-        DEFAULT_AVATAR.to_string()
-    } else {
-        hex
-    };
+    let hex = if hex.is_empty() || hash.iter().all(|b| *b == 0) { DEFAULT_AVATAR.to_string() } else { hex };
     format!("https://avatars.steamstatic.com/{hex}_full.jpg")
 }
 
 /// A name made safe to be a conversation's name: no line breaks or other
 /// control characters, no padding.
 pub fn clean_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .to_string()
+    name.chars().filter(|c| !c.is_control()).collect::<String>().trim().to_string()
 }
 
 #[derive(Default)]
@@ -112,25 +104,14 @@ impl Roster {
             return Some(game);
         }
         let app = persona.app?;
-        Some(
-            self.app_names
-                .get(&app)
-                .cloned()
-                .unwrap_or_else(|| "In game".to_string()),
-        )
+        Some(self.app_names.get(&app).cloned().unwrap_or_else(|| "In game".to_string()))
     }
 
     /// Games people are in whose names are not known: what to ask the store.
     /// Only a game on Steam, whose number fits the store's; one that is not has
     /// a name from Steam, or none to be had.
     pub fn unnamed_apps(&self) -> Vec<u64> {
-        let mut apps: Vec<u64> = self
-            .personas
-            .values()
-            .filter(|p| p.game.is_none())
-            .filter_map(|p| p.app)
-            .filter(|a| *a <= u64::from(u32::MAX) && !self.app_names.contains_key(a))
-            .collect();
+        let mut apps: Vec<u64> = self.personas.values().filter(|p| p.game.is_none()).filter_map(|p| p.app).filter(|a| *a <= u64::from(u32::MAX) && !self.app_names.contains_key(a)).collect();
         apps.sort_unstable();
         apps.dedup();
         apps
@@ -143,32 +124,17 @@ impl Roster {
         let mut changed = Vec::new();
         if !list.bincremental.unwrap_or(false) {
             // Anyone not mentioned any more is no longer on the list.
-            let now: std::collections::HashSet<u32> = list
-                .friends
-                .iter()
-                .filter_map(|f| f.ulfriendid.and_then(steamid::account_of))
-                .collect();
-            let gone: Vec<u32> = self
-                .relationships
-                .keys()
-                .copied()
-                .filter(|a| !now.contains(a))
-                .collect();
+            let now: std::collections::HashSet<u32> = list.friends.iter().filter_map(|f| f.ulfriendid.and_then(steamid::account_of)).collect();
+            let gone: Vec<u32> = self.relationships.keys().copied().filter(|a| !now.contains(a)).collect();
             for account in gone {
                 self.relationships.remove(&account);
                 changed.push(account);
             }
         }
         for entry in &list.friends {
-            let Some(account) = entry.ulfriendid.and_then(steamid::account_of) else {
-                continue;
-            };
+            let Some(account) = entry.ulfriendid.and_then(steamid::account_of) else { continue };
             let relationship = entry.efriendrelationship.unwrap_or(REL_NONE);
-            let before = self
-                .relationships
-                .get(&account)
-                .copied()
-                .unwrap_or(REL_NONE);
+            let before = self.relationships.get(&account).copied().unwrap_or(REL_NONE);
             if relationship == REL_NONE {
                 self.relationships.remove(&account);
             } else {
@@ -186,9 +152,7 @@ impl Roster {
     pub fn apply_persona(&mut self, update: &ClientPersonaState) -> Vec<u32> {
         let mut changed = Vec::new();
         for friend in &update.friends {
-            let Some(account) = friend.friendid.and_then(steamid::account_of) else {
-                continue;
-            };
+            let Some(account) = friend.friendid.and_then(steamid::account_of) else { continue };
             let held = self.personas.entry(account).or_default();
             let before = held.clone();
             merge(held, friend);
@@ -216,12 +180,7 @@ impl Roster {
 
     /// The people who are friends, in a steady order.
     pub fn friends(&self) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .relationships
-            .iter()
-            .filter(|(_, r)| **r == REL_FRIEND)
-            .map(|(a, _)| *a)
-            .collect();
+        let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| **r == REL_FRIEND).map(|(a, _)| *a).collect();
         out.sort_unstable();
         out
     }
@@ -230,12 +189,7 @@ impl Roster {
     /// Everybody the account has blocked or ignored: Steam's "blocked" and the two
     /// ways it says "ignored".
     pub fn blocked(&self) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .relationships
-            .iter()
-            .filter(|(_, r)| matches!(**r, 1 | 5 | 6))
-            .map(|(a, _)| *a)
-            .collect();
+        let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| matches!(**r, 1 | 5 | 6)).map(|(a, _)| *a).collect();
         out.sort_unstable();
         out
     }
@@ -250,12 +204,7 @@ impl Roster {
     }
 
     fn with_relationship(&self, wanted: u32) -> Vec<u32> {
-        let mut out: Vec<u32> = self
-            .relationships
-            .iter()
-            .filter(|(_, r)| **r == wanted)
-            .map(|(a, _)| *a)
-            .collect();
+        let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| **r == wanted).map(|(a, _)| *a).collect();
         out.sort_unstable();
         out
     }
@@ -267,14 +216,9 @@ impl Roster {
     /// Takes in what the account keeps about a friend. Returns whether the name
     /// it calls them changed, which is what moves a conversation.
     pub fn set_preferences(&mut self, prefs: &PerFriendPreferences) -> bool {
-        let Some(account) = prefs.accountid else {
-            return false;
-        };
+        let Some(account) = prefs.accountid else { return false };
         let before = self.nickname(account).map(str::to_string);
-        let bare = PerFriendPreferences {
-            accountid: Some(account),
-            ..Default::default()
-        };
+        let bare = PerFriendPreferences { accountid: Some(account), ..Default::default() };
         if *prefs == bare {
             self.preferences.remove(&account);
         } else {
@@ -285,33 +229,20 @@ impl Roster {
 
     /// Whether the account has muted this friend's messages, on any of its clients.
     pub fn muted(&self, account: u32) -> bool {
-        self.preferences
-            .get(&account)
-            .is_some_and(|p| p.notifications_showmessages == Some(NOTIFY_NEVER))
+        self.preferences.get(&account).is_some_and(|p| p.notifications_showmessages == Some(NOTIFY_NEVER))
     }
 
     /// Sets only what the account calls a friend, keeping the rest it holds.
     /// Returns whether that name changed.
     pub fn set_nickname(&mut self, account: u32, nickname: Option<&str>) -> bool {
-        let mut prefs = self
-            .preferences
-            .get(&account)
-            .cloned()
-            .unwrap_or(PerFriendPreferences {
-                accountid: Some(account),
-                ..Default::default()
-            });
+        let mut prefs = self.preferences.get(&account).cloned().unwrap_or(PerFriendPreferences { accountid: Some(account), ..Default::default() });
         prefs.nickname = nickname.map(str::to_string);
         self.set_preferences(&prefs)
     }
 
     /// What the account calls this friend, if it has said.
     pub fn nickname(&self, account: u32) -> Option<&str> {
-        self.preferences
-            .get(&account)
-            .and_then(|p| p.nickname.as_deref())
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
+        self.preferences.get(&account).and_then(|p| p.nickname.as_deref()).map(str::trim).filter(|n| !n.is_empty())
     }
 
     pub fn persona(&self, account: u32) -> Option<&Persona> {
@@ -337,15 +268,8 @@ impl Roster {
     /// gave them, or the name they have. Without either, `conversation_names`
     /// has only their number to offer.
     pub fn has_name(&self, account: u32) -> bool {
-        self.nickname(account)
-            .map(clean_name)
-            .is_some_and(|n| !n.is_empty())
-            || self
-                .personas
-                .get(&account)
-                .and_then(|p| p.name.as_deref())
-                .map(clean_name)
-                .is_some_and(|n| !n.is_empty())
+        self.nickname(account).map(clean_name).is_some_and(|n| !n.is_empty())
+            || self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).is_some_and(|n| !n.is_empty())
     }
 
     pub fn conversation_names(&self) -> HashMap<u32, String> {
@@ -355,13 +279,7 @@ impl Roster {
             self.nickname(account)
                 .map(clean_name)
                 .filter(|n| !n.is_empty())
-                .or_else(|| {
-                    self.personas
-                        .get(&account)
-                        .and_then(|p| p.name.as_deref())
-                        .map(clean_name)
-                        .filter(|n| !n.is_empty())
-                })
+                .or_else(|| self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).filter(|n| !n.is_empty()))
                 .unwrap_or_else(|| steamid::text_of(account))
         };
         let people = self.participants();
@@ -377,16 +295,9 @@ impl Roster {
         for mark in marks {
             let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
             for (account, name) in &names {
-                by_name
-                    .entry(name.to_lowercase())
-                    .or_default()
-                    .push(*account);
+                by_name.entry(name.to_lowercase()).or_default().push(*account);
             }
-            let clashing: Vec<u32> = by_name
-                .into_values()
-                .filter(|group| group.len() > 1)
-                .flatten()
-                .collect();
+            let clashing: Vec<u32> = by_name.into_values().filter(|group| group.len() > 1).flatten().collect();
             if clashing.is_empty() {
                 break;
             }
@@ -399,12 +310,7 @@ impl Roster {
 }
 
 fn merge(held: &mut Persona, update: &PersonaFriend) {
-    if let Some(name) = update
-        .player_name
-        .as_deref()
-        .map(clean_name)
-        .filter(|n| !n.is_empty())
-    {
+    if let Some(name) = update.player_name.as_deref().map(clean_name).filter(|n| !n.is_empty()) {
         held.name = Some(name);
     }
     if let Some(state) = update.persona_state {
@@ -416,21 +322,11 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
         held.app = None;
         held.playing_since = None;
     }
-    if let Some(app) = update
-        .game_played_app_id
-        .map(u64::from)
-        .filter(|a| *a > 0)
-        .or(update.gameid.filter(|g| *g > 0))
-    {
+    if let Some(app) = update.game_played_app_id.map(u64::from).filter(|a| *a > 0).or(update.gameid.filter(|g| *g > 0)) {
         if held.app != Some(app) {
             // A different game: what was said of the last is not said of this one.
             held.game = None;
-            held.playing_since = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as u32)
-                    .unwrap_or(0),
-            );
+            held.playing_since = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0));
         }
         held.app = Some(app);
     }
@@ -452,27 +348,13 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
         held.device = kind;
         held.on_deck = held.on_deck || kind == DEVICE_STEAM_DECK;
     }
-    if let Some(seen) = [
-        update.last_seen_online,
-        update.last_logoff,
-        update.last_logon,
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|t| *t > 0)
-    .max()
-    {
+    if let Some(seen) = [update.last_seen_online, update.last_logoff, update.last_logon].into_iter().flatten().filter(|t| *t > 0).max() {
         held.last_seen = Some(held.last_seen.map_or(seen, |old| old.max(seen)));
     }
     // A game's own words for what is going on: its "status" line, which is
     // plain text where the game sets one. Cleared with the game.
     if !update.rich_presence.is_empty() {
-        held.rich = update
-            .rich_presence
-            .iter()
-            .find(|kv| kv.key.as_deref() == Some("status"))
-            .and_then(|kv| kv.value.clone())
-            .filter(|v| !v.trim().is_empty());
+        held.rich = update.rich_presence.iter().find(|kv| kv.key.as_deref() == Some("status")).and_then(|kv| kv.value.clone()).filter(|v| !v.trim().is_empty());
     }
     if update.gameid == Some(0) || update.game_played_app_id == Some(0) {
         held.rich = None;
@@ -491,40 +373,17 @@ mod tests {
     fn a_nickname_is_what_a_friend_is_called_and_goes_back_to_their_name_when_taken() {
         let mut r = Roster::default();
         r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_FRIEND)]));
-        r.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(10)),
-                player_name: Some("Gabe".into()),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        r.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), player_name: Some("Gabe".into()), ..Default::default() }], ..Default::default() });
         assert_eq!(r.conversation_names()[&10], "Gabe");
         assert!(r.set_nickname(10, Some("Buddy")), "a new name is a change");
         assert_eq!(r.conversation_names()[&10], "Buddy");
         assert!(!r.set_nickname(10, Some("Buddy")), "the same again is not");
         // Muting keeps the nickname, and the other way about.
-        r.set_preferences(&PerFriendPreferences {
-            accountid: Some(10),
-            nickname: Some("Buddy".into()),
-            notifications_showmessages: Some(NOTIFY_NEVER),
-            ..Default::default()
-        });
-        assert_eq!(
-            r.preferences
-                .get(&10)
-                .and_then(|p| p.notifications_showmessages),
-            Some(NOTIFY_NEVER)
-        );
+        r.set_preferences(&PerFriendPreferences { accountid: Some(10), nickname: Some("Buddy".into()), notifications_showmessages: Some(NOTIFY_NEVER), ..Default::default() });
+        assert_eq!(r.preferences.get(&10).and_then(|p| p.notifications_showmessages), Some(NOTIFY_NEVER));
         assert!(r.set_nickname(10, None));
         assert_eq!(r.conversation_names()[&10], "Gabe");
-        assert_eq!(
-            r.preferences
-                .get(&10)
-                .and_then(|p| p.notifications_showmessages),
-            Some(NOTIFY_NEVER),
-            "taking the name back does not unmute"
-        );
+        assert_eq!(r.preferences.get(&10).and_then(|p| p.notifications_showmessages), Some(NOTIFY_NEVER), "taking the name back does not unmute");
         // Two friends given the same nickname are still told apart.
         r.set_nickname(10, Some("Pal"));
         r.set_nickname(20, Some("pal"));
@@ -537,55 +396,21 @@ mod tests {
         let mut r = Roster::default();
         r.apply_friends_list(&list(false, &[(10, REL_FRIEND)]));
         r.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(10)),
-                persona_state_flags: Some(512),
-                last_logoff: Some(100),
-                last_seen_online: Some(300),
-                on_steam_deck: Some(false),
-                rich_presence: vec![KeyValue {
-                    key: Some("status".into()),
-                    value: Some("In a match".into()),
-                }],
-                ..Default::default()
-            }],
+            friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), persona_state_flags: Some(512), last_logoff: Some(100), last_seen_online: Some(300), on_steam_deck: Some(false), rich_presence: vec![KeyValue { key: Some("status".into()), value: Some("In a match".into()) }], ..Default::default() }],
             ..Default::default()
         });
         let p = r.persona(10).unwrap();
-        assert_eq!(
-            (p.flags, p.last_seen, p.rich.as_deref()),
-            (512, Some(300), Some("In a match"))
-        );
+        assert_eq!((p.flags, p.last_seen, p.rich.as_deref()), (512, Some(300), Some("In a match")));
         // A later update only says what changed: the newest time wins, and the game ending ends its words.
-        r.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(10)),
-                last_logoff: Some(200),
-                gameid: Some(0),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        r.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), last_logoff: Some(200), gameid: Some(0), ..Default::default() }], ..Default::default() });
         let p = r.persona(10).unwrap();
-        assert_eq!(
-            (p.last_seen, p.rich.as_deref(), p.flags),
-            (Some(300), None, 512)
-        );
+        assert_eq!((p.last_seen, p.rich.as_deref(), p.flags), (Some(300), None, 512));
     }
 
     #[test]
     fn requests_are_told_apart_by_who_made_them() {
         let mut r = Roster::default();
-        r.apply_friends_list(&list(
-            false,
-            &[
-                (10, REL_FRIEND),
-                (30, REL_REQUEST_RECIPIENT),
-                (20, REL_REQUEST_RECIPIENT),
-                (50, REL_REQUEST_INITIATOR),
-                (60, REL_BLOCKED),
-            ],
-        ));
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (30, REL_REQUEST_RECIPIENT), (20, REL_REQUEST_RECIPIENT), (50, REL_REQUEST_INITIATOR), (60, REL_BLOCKED)]));
         assert_eq!(r.asked_us(), [20, 30]);
         assert_eq!(r.asked_by_us(), [50]);
         assert_eq!(r.friends(), [10]);
@@ -596,49 +421,25 @@ mod tests {
     }
 
     fn entry(account: u32, relationship: u32) -> FriendsListEntry {
-        FriendsListEntry {
-            ulfriendid: Some(steamid::steamid_of(account)),
-            efriendrelationship: Some(relationship),
-        }
+        FriendsListEntry { ulfriendid: Some(steamid::steamid_of(account)), efriendrelationship: Some(relationship) }
     }
 
     fn list(incremental: bool, entries: &[(u32, u32)]) -> ClientFriendsList {
-        ClientFriendsList {
-            bincremental: Some(incremental),
-            friends: entries.iter().map(|(a, r)| entry(*a, *r)).collect(),
-            ..Default::default()
-        }
+        ClientFriendsList { bincremental: Some(incremental), friends: entries.iter().map(|(a, r)| entry(*a, *r)).collect(), ..Default::default() }
     }
 
     fn named(account: u32, name: &str, state: u32) -> PersonaFriend {
-        PersonaFriend {
-            friendid: Some(steamid::steamid_of(account)),
-            player_name: Some(name.into()),
-            persona_state: Some(state),
-            ..Default::default()
-        }
+        PersonaFriend { friendid: Some(steamid::steamid_of(account)), player_name: Some(name.into()), persona_state: Some(state), ..Default::default() }
     }
 
     fn persona(friends: Vec<PersonaFriend>) -> ClientPersonaState {
-        ClientPersonaState {
-            friends,
-            ..Default::default()
-        }
+        ClientPersonaState { friends, ..Default::default() }
     }
 
     #[test]
     fn only_friends_are_friends_not_requests_or_the_blocked() {
         let mut r = Roster::default();
-        r.apply_friends_list(&list(
-            false,
-            &[
-                (10, REL_FRIEND),
-                (20, REL_REQUEST_RECIPIENT),
-                (30, REL_BLOCKED),
-                (40, REL_FRIEND),
-                (50, REL_REQUEST_INITIATOR),
-            ],
-        ));
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_REQUEST_RECIPIENT), (30, REL_BLOCKED), (40, REL_FRIEND), (50, REL_REQUEST_INITIATOR)]));
         assert_eq!(r.friends(), vec![10, 40]);
         assert!(r.is_friend(10) && !r.is_friend(20) && !r.is_friend(99));
     }
@@ -647,17 +448,9 @@ mod tests {
     fn an_incremental_list_changes_the_people_it_names_and_leaves_the_rest() {
         let mut r = Roster::default();
         r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_FRIEND)]));
-        let changed = r.apply_friends_list(&list(
-            true,
-            &[(20, REL_NONE), (30, REL_FRIEND), (10, REL_FRIEND)],
-        ));
+        let changed = r.apply_friends_list(&list(true, &[(20, REL_NONE), (30, REL_FRIEND), (10, REL_FRIEND)]));
         assert_eq!(r.friends(), vec![10, 30]);
-        changed.iter().for_each(|a| {
-            assert!(
-                [20, 30].contains(a),
-                "10 did not change, so it is not reported: {changed:?}"
-            )
-        });
+        changed.iter().for_each(|a| assert!([20, 30].contains(a), "10 did not change, so it is not reported: {changed:?}"));
         assert_eq!(changed.len(), 2);
     }
 
@@ -674,19 +467,7 @@ mod tests {
     fn an_id_that_is_not_a_person_is_skipped_not_a_panic() {
         let mut r = Roster::default();
         let group = (1u64 << 56) | (7 << 52) | (1 << 32) | 5;
-        let bad = ClientFriendsList {
-            friends: vec![
-                FriendsListEntry {
-                    ulfriendid: Some(group),
-                    efriendrelationship: Some(3),
-                },
-                FriendsListEntry {
-                    ulfriendid: None,
-                    efriendrelationship: Some(3),
-                },
-            ],
-            ..Default::default()
-        };
+        let bad = ClientFriendsList { friends: vec![FriendsListEntry { ulfriendid: Some(group), efriendrelationship: Some(3) }, FriendsListEntry { ulfriendid: None, efriendrelationship: Some(3) }], ..Default::default() };
         assert!(r.apply_friends_list(&bad).is_empty());
         assert!(r.friends().is_empty());
     }
@@ -696,50 +477,23 @@ mod tests {
         let mut r = Roster::default();
         r.apply_persona(&persona(vec![named(10, "Alex", 1)]));
         // A later update with only a state, and one with only a game.
-        r.apply_persona(&persona(vec![PersonaFriend {
-            friendid: Some(steamid::steamid_of(10)),
-            persona_state: Some(3),
-            ..Default::default()
-        }]));
-        r.apply_persona(&persona(vec![PersonaFriend {
-            friendid: Some(steamid::steamid_of(10)),
-            game_name: Some("Portal 2".into()),
-            gameid: Some(620),
-            ..Default::default()
-        }]));
+        r.apply_persona(&persona(vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), persona_state: Some(3), ..Default::default() }]));
+        r.apply_persona(&persona(vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), game_name: Some("Portal 2".into()), gameid: Some(620), ..Default::default() }]));
         let p = r.persona(10).unwrap();
-        assert_eq!(
-            p.name.as_deref(),
-            Some("Alex"),
-            "a name left out is not a name taken away"
-        );
+        assert_eq!(p.name.as_deref(), Some("Alex"), "a name left out is not a name taken away");
         assert_eq!(p.state, 3);
         assert_eq!(p.game.as_deref(), Some("Portal 2"));
         // Quitting the game is said by saying there is none.
-        r.apply_persona(&persona(vec![PersonaFriend {
-            friendid: Some(steamid::steamid_of(10)),
-            gameid: Some(0),
-            ..Default::default()
-        }]));
+        r.apply_persona(&persona(vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), gameid: Some(0), ..Default::default() }]));
         assert_eq!(r.persona(10).unwrap().game, None);
     }
 
     #[test]
     fn only_a_real_change_is_reported_as_one() {
         let mut r = Roster::default();
-        assert_eq!(
-            r.apply_persona(&persona(vec![named(10, "Alex", 1)])),
-            vec![10]
-        );
-        assert!(
-            r.apply_persona(&persona(vec![named(10, "Alex", 1)]))
-                .is_empty(),
-            "the same again is not news"
-        );
-        assert_eq!(
-            r.apply_persona(&persona(vec![named(10, "Alex", 3)])),
-            vec![10]
-        );
+        assert_eq!(r.apply_persona(&persona(vec![named(10, "Alex", 1)])), vec![10]);
+        assert!(r.apply_persona(&persona(vec![named(10, "Alex", 1)])).is_empty(), "the same again is not news");
+        assert_eq!(r.apply_persona(&persona(vec![named(10, "Alex", 3)])), vec![10]);
     }
 
     #[test]
@@ -751,11 +505,7 @@ mod tests {
         let mut r = Roster::default();
         r.apply_friends_list(&list(false, &[(10, REL_FRIEND)]));
         r.apply_persona(&persona(vec![named(10, "   ", 1)]));
-        assert_eq!(
-            r.persona(10).unwrap().name,
-            None,
-            "a blank name is not a name"
-        );
+        assert_eq!(r.persona(10).unwrap().name, None, "a blank name is not a name");
     }
 
     #[test]
@@ -771,34 +521,19 @@ mod tests {
     #[test]
     fn two_friends_with_the_same_name_do_not_share_a_conversation() {
         let mut r = Roster::default();
-        r.apply_friends_list(&list(
-            false,
-            &[(10, REL_FRIEND), (20, REL_FRIEND), (30, REL_FRIEND)],
-        ));
-        r.apply_persona(&persona(vec![
-            named(10, "Alex", 1),
-            named(20, "alex", 1),
-            named(30, "Sam", 1),
-        ]));
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_FRIEND), (30, REL_FRIEND)]));
+        r.apply_persona(&persona(vec![named(10, "Alex", 1), named(20, "alex", 1), named(30, "Sam", 1)]));
         let names = r.conversation_names();
         // Case is not what tells people apart, so these two collide...
         assert_eq!(names[&10], "Alex (10)");
         assert_eq!(names[&20], "alex (20)");
         assert_eq!(names[&30], "Sam");
-        let distinct: std::collections::HashSet<_> =
-            names.values().map(|n| n.to_lowercase()).collect();
-        assert_eq!(
-            distinct.len(),
-            3,
-            "every conversation has a name of its own"
-        );
+        let distinct: std::collections::HashSet<_> = names.values().map(|n| n.to_lowercase()).collect();
+        assert_eq!(distinct.len(), 3, "every conversation has a name of its own");
         // ...and when one of them is renamed the other goes back to plain.
         r.apply_persona(&persona(vec![named(20, "Robin", 1)]));
         let names = r.conversation_names();
-        assert_eq!(
-            (names[&10].as_str(), names[&20].as_str()),
-            ("Alex", "Robin")
-        );
+        assert_eq!((names[&10].as_str(), names[&20].as_str()), ("Alex", "Robin"));
     }
 
     #[test]
@@ -806,18 +541,10 @@ mod tests {
         // Somebody calling themselves "Alex (20)" must not collide with the
         // friend who is made "Alex (20)" by sharing a name.
         let mut r = Roster::default();
-        r.apply_friends_list(&list(
-            false,
-            &[(10, REL_FRIEND), (20, REL_FRIEND), (30, REL_FRIEND)],
-        ));
-        r.apply_persona(&persona(vec![
-            named(10, "Alex", 1),
-            named(20, "Alex", 1),
-            named(30, "Alex (20)", 1),
-        ]));
+        r.apply_friends_list(&list(false, &[(10, REL_FRIEND), (20, REL_FRIEND), (30, REL_FRIEND)]));
+        r.apply_persona(&persona(vec![named(10, "Alex", 1), named(20, "Alex", 1), named(30, "Alex (20)", 1)]));
         let names = r.conversation_names();
-        let distinct: std::collections::HashSet<_> =
-            names.values().map(|n| n.to_lowercase()).collect();
+        let distinct: std::collections::HashSet<_> = names.values().map(|n| n.to_lowercase()).collect();
         assert_eq!(distinct.len(), 3, "{names:?}");
     }
 
@@ -830,15 +557,7 @@ mod tests {
         let mut checked = 0;
         for combo in 0..pool.len().pow(4) {
             let mut r = Roster::default();
-            r.apply_friends_list(&list(
-                false,
-                &[
-                    (1, REL_FRIEND),
-                    (2, REL_FRIEND),
-                    (3, REL_FRIEND),
-                    (4, REL_FRIEND),
-                ],
-            ));
+            r.apply_friends_list(&list(false, &[(1, REL_FRIEND), (2, REL_FRIEND), (3, REL_FRIEND), (4, REL_FRIEND)]));
             let mut at = combo;
             let updates: Vec<PersonaFriend> = (1..=4u32)
                 .map(|account| {
@@ -849,8 +568,7 @@ mod tests {
                 .collect();
             r.apply_persona(&persona(updates));
             let names = r.conversation_names();
-            let distinct: std::collections::HashSet<String> =
-                names.values().map(|n| n.to_lowercase()).collect();
+            let distinct: std::collections::HashSet<String> = names.values().map(|n| n.to_lowercase()).collect();
             assert_eq!(distinct.len(), 4, "combination {combo} gave {names:?}");
             checked += 1;
         }
@@ -868,11 +586,7 @@ mod tests {
         assert_eq!(r.participants(), vec![10, 77]);
         r.apply_persona(&persona(vec![named(10, "Alex", 1), named(77, "Alex", 1)]));
         let names = r.conversation_names();
-        assert_ne!(
-            names[&10].to_lowercase(),
-            names[&77].to_lowercase(),
-            "a stranger sharing a friend's name does not share their conversation"
-        );
+        assert_ne!(names[&10].to_lowercase(), names[&77].to_lowercase(), "a stranger sharing a friend's name does not share their conversation");
         // Once they are a friend they are only counted once.
         r.apply_friends_list(&list(true, &[(77, REL_FRIEND)]));
         assert_eq!(r.participants(), vec![10, 77]);
@@ -881,15 +595,7 @@ mod tests {
     #[test]
     fn a_steam_deck_is_known_by_the_kind_of_device_as_the_steam_client_knows_it() {
         let mut roster = Roster::default();
-        let said = |kind: u32| ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(10)),
-                gaming_device_type: Some(kind),
-                persona_state: Some(1),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
+        let said = |kind: u32| ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), gaming_device_type: Some(kind), persona_state: Some(1), ..Default::default() }], ..Default::default() };
         roster.apply_persona(&said(544));
         assert!(roster.persona(10).unwrap().on_deck, "544 is a Steam Deck");
         roster.apply_persona(&said(545));
@@ -899,14 +605,8 @@ mod tests {
     #[test]
     fn the_avatar_is_where_steam_serves_it_and_none_set_is_the_default_picture() {
         let hash: Vec<u8> = (0..20).collect();
-        assert_eq!(
-            avatar_url(&hash),
-            "https://avatars.steamstatic.com/000102030405060708090a0b0c0d0e0f10111213_full.jpg"
-        );
-        assert_eq!(
-            avatar_url(&[0; 20]),
-            "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg"
-        );
+        assert_eq!(avatar_url(&hash), "https://avatars.steamstatic.com/000102030405060708090a0b0c0d0e0f10111213_full.jpg");
+        assert_eq!(avatar_url(&[0; 20]), "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg");
         assert_eq!(avatar_url(&[]), avatar_url(&[0; 20]));
     }
 }

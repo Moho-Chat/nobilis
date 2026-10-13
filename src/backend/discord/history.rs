@@ -18,18 +18,13 @@ struct HistoryFetch<'a> {
 
 impl<'a> HistoryFetch<'a> {
     fn begin(state: &'a AppState, buffer_id: &'a str) -> Option<Self> {
-        state
-            .runtime
-            .try_start_discord_history_fetch(buffer_id)
-            .then_some(Self { state, buffer_id })
+        state.runtime.try_start_discord_history_fetch(buffer_id).then_some(Self { state, buffer_id })
     }
 }
 
 impl Drop for HistoryFetch<'_> {
     fn drop(&mut self) {
-        self.state
-            .runtime
-            .finish_discord_history_fetch(self.buffer_id);
+        self.state.runtime.finish_discord_history_fetch(self.buffer_id);
     }
 }
 
@@ -39,27 +34,13 @@ impl Drop for HistoryFetch<'_> {
 /// many REST requests at once risks Discord's rate limiter; a one-time
 /// startup cost taking a few extra seconds in the background is a fine
 /// trade for not tripping it.
-pub(super) fn spawn_backfill(
-    state: AppState,
-    token: String,
-    user_id: String,
-    display_name: Option<String>,
-    targets: Vec<(String, String)>,
-) {
+pub(super) fn spawn_backfill(state: AppState, token: String, user_id: String, display_name: Option<String>, targets: Vec<(String, String)>) {
     if targets.is_empty() {
         return;
     }
     tokio::spawn(async move {
         for (buffer_id, channel_id) in targets {
-            backfill_channel_history(
-                &state,
-                &token,
-                &user_id,
-                display_name.as_deref(),
-                &buffer_id,
-                &channel_id,
-            )
-            .await;
+            backfill_channel_history(&state, &token, &user_id, display_name.as_deref(), &buffer_id, &channel_id).await;
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     });
@@ -80,14 +61,7 @@ pub(super) fn spawn_backfill(
 /// "notification" event, neither of which should fire for messages from
 /// potentially weeks ago just because this is the first time nobilis has
 /// seen the channel.
-pub(super) async fn backfill_channel_history(
-    state: &AppState,
-    token: &str,
-    user_id: &str,
-    own_display_name: Option<&str>,
-    buffer_id: &str,
-    channel_id: &str,
-) {
+pub(super) async fn backfill_channel_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
     match state.store.has_messages(buffer_id) {
         Ok(true) => return,
         Ok(false) => {}
@@ -145,18 +119,9 @@ pub(super) async fn backfill_channel_history(
 ///
 /// Returns how many messages were recovered.
 pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Result<usize> {
-    let buffer = state
-        .runtime
-        .get_buffer(buffer_id)
-        .context("no such buffer")?;
-    let config = state
-        .accounts
-        .get_discord(&buffer.account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this buffer")?;
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
 
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -194,13 +159,7 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
 
     // Same storage path as any other history read, so recovered messages get
     // the current guard and preview caching rather than a parallel copy.
-    store_history_messages(
-        state,
-        buffer_id,
-        &missing,
-        &config.user_id,
-        config.display_name.as_deref(),
-    );
+    store_history_messages(state, buffer_id, &missing, &config.user_id, config.display_name.as_deref());
     state.runtime.refresh_buffer_activity(state, buffer_id);
     Ok(missing.len())
 }
@@ -210,36 +169,20 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
 /// Spaced out deliberately: this runs right after connecting, alongside
 /// everything else a fresh connection does, and a burst of requests is the
 /// quickest way to be rate-limited by a service that has just let us in.
-pub(super) fn spawn_dm_catch_up(
-    state: AppState,
-    config: DiscordAccountConfig,
-    channels: HashMap<String, (String, String)>,
-) {
+pub(super) fn spawn_dm_catch_up(state: AppState, config: DiscordAccountConfig, channels: HashMap<String, (String, String)>) {
     tokio::spawn(async move {
         let account_id = config.account_id();
         let dms: Vec<(String, String)> = channels
             .iter()
             .filter(|(_, (_, kind))| kind == "dm")
             .filter_map(|(channel_id, (name, _))| {
-                let buffer = state
-                    .runtime
-                    .list_buffers()
-                    .into_iter()
-                    .find(|b| b.account_id == account_id && &b.name == name)?;
+                let buffer = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && &b.name == name)?;
                 Some((buffer.id, channel_id.clone()))
             })
             .collect();
 
         for (buffer_id, channel_id) in dms {
-            catch_up_channel(
-                &state,
-                &config.token,
-                &config.user_id,
-                config.display_name.as_deref(),
-                &buffer_id,
-                &channel_id,
-            )
-            .await;
+            catch_up_channel(&state, &config.token, &config.user_id, config.display_name.as_deref(), &buffer_id, &channel_id).await;
             tokio::time::sleep(std::time::Duration::from_millis(400)).await;
         }
     });
@@ -264,17 +207,13 @@ pub async fn catch_up_channel(
     channel_id: &str,
 ) {
     let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else {
-        tracing::info!(
-            "discord: catching up {buffer_id} skipped - a fetch for it is already under way"
-        );
+        tracing::info!("discord: catching up {buffer_id} skipped - a fetch for it is already under way");
         return;
     };
     let result: Result<()> = async {
         // Nothing stored means this is a first sight, which the initial
         // backfill already covers.
-        let Some(after_id) = state.store.newest_msg_id(buffer_id)? else {
-            return Ok(());
-        };
+        let Some(after_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
         let resp = http_client_for(token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("after", after_id.as_str())])
@@ -285,17 +224,11 @@ pub async fn catch_up_channel(
         if resp.status().is_success() {
             let messages: Vec<Value> = resp.json().await.context("parsing missed messages")?;
             if !messages.is_empty() {
-                tracing::info!(
-                    "discord: {} message(s) missed in {buffer_id}",
-                    messages.len()
-                );
+                tracing::info!("discord: {} message(s) missed in {buffer_id}", messages.len());
             }
             store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
         } else {
-            tracing::info!(
-                "discord: catching up {buffer_id}: Discord answered {}",
-                resp.status()
-            );
+            tracing::info!("discord: catching up {buffer_id}: Discord answered {}", resp.status());
         }
         Ok(())
     }
@@ -305,21 +238,10 @@ pub async fn catch_up_channel(
     }
 }
 
-pub async fn extend_history(
-    state: &AppState,
-    token: &str,
-    user_id: &str,
-    own_display_name: Option<&str>,
-    buffer_id: &str,
-    channel_id: &str,
-) {
-    let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else {
-        return;
-    };
+pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
+    let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else { return };
     let result: Result<()> = async {
-        let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else {
-            return Ok(());
-        };
+        let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else { return Ok(()) };
         let resp = http_client_for(token)
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("before", before_id.as_str())])
@@ -350,20 +272,9 @@ pub async fn extend_history(
 ///
 /// Returns how many messages were stored, so a caller can tell the difference
 /// between "here is more" and "there is no more".
-pub async fn load_newer(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    message_id: &str,
-) -> Result<usize> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<usize> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("after", message_id)])
@@ -374,39 +285,16 @@ pub async fn load_newer(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "reading the rest of the channel")
-        );
+        bail!("{}", discord_error_text(status, &text, "reading the rest of the channel"));
     }
-    let messages: Vec<Value> = resp
-        .json()
-        .await
-        .context("reading the rest of the channel")?;
-    store_history_messages(
-        state,
-        buffer_id,
-        &messages,
-        &cfg.user_id,
-        cfg.display_name.as_deref(),
-    );
+    let messages: Vec<Value> = resp.json().await.context("reading the rest of the channel")?;
+    store_history_messages(state, buffer_id, &messages, &cfg.user_id, cfg.display_name.as_deref());
     Ok(messages.len())
 }
 
-pub async fn load_context(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    message_id: &str,
-) -> Result<i64> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str) -> Result<i64> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("around", message_id)])
@@ -417,22 +305,10 @@ pub async fn load_context(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "reading that part of the channel")
-        );
+        bail!("{}", discord_error_text(status, &text, "reading that part of the channel"));
     }
-    let messages: Vec<Value> = resp
-        .json()
-        .await
-        .context("reading that part of the channel")?;
-    store_history_messages(
-        state,
-        buffer_id,
-        &messages,
-        &cfg.user_id,
-        cfg.display_name.as_deref(),
-    );
+    let messages: Vec<Value> = resp.json().await.context("reading that part of the channel")?;
+    store_history_messages(state, buffer_id, &messages, &cfg.user_id, cfg.display_name.as_deref());
 
     messages
         .iter()

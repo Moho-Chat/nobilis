@@ -92,10 +92,7 @@ fn script_challenge(html: &str) -> Option<(String, Option<u32>, Option<i8>)> {
     let rest = &html[start..];
     let salt = &rest[..rest.find('"')?];
     let args_end = rest.find(')')?;
-    let mut numbers = rest[salt.len() + 1..args_end]
-        .split(',')
-        .map(str::trim)
-        .filter(|a| !a.is_empty());
+    let mut numbers = rest[salt.len() + 1..args_end].split(',').map(str::trim).filter(|a| !a.is_empty());
     let difficulty = numbers.next().and_then(|d| d.parse().ok());
     let steps = numbers.next().and_then(|s| s.parse().ok());
     Some((salt.to_string(), difficulty, steps))
@@ -113,14 +110,8 @@ impl Challenge {
             .or_else(|| call.as_ref().map(|c| c.0.clone()))
             .context("challenge page carries no challenge - neither data-ttrs-challenge nor a ttrs_challenge(...) call")?;
         let difficulty = match attr(html, "data-ttrs-difficulty") {
-            Some(d) => d
-                .trim()
-                .parse::<u32>()
-                .context("data-ttrs-difficulty is not a number")?,
-            None => call
-                .as_ref()
-                .and_then(|c| c.1)
-                .context("challenge page gives no difficulty")?,
+            Some(d) => d.trim().parse::<u32>().context("data-ttrs-difficulty is not a number")?,
+            None => call.as_ref().and_then(|c| c.1).context("challenge page gives no difficulty")?,
         };
         // Absent step count means a single step.
         let steps = attr(html, "data-ttrs-steps")
@@ -142,11 +133,7 @@ impl Challenge {
         if difficulty > MAX_DIFFICULTY {
             bail!("challenge difficulty {difficulty} exceeds the {MAX_DIFFICULTY}-bit nonce space, so no solution need exist");
         }
-        Ok(Challenge {
-            salt,
-            difficulty,
-            steps,
-        })
+        Ok(Challenge { salt, difficulty, steps })
     }
 
     /// Brute-force a nonce. CPU-bound; call from `spawn_blocking`.
@@ -156,18 +143,12 @@ impl Challenge {
     /// attack, and that multiplier applies to the bit count, so a base of
     /// 18 becomes 72: far beyond what any 32-bit nonce can satisfy.
     pub fn solve(&self) -> Option<Solution> {
-        let threads = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
-            .min(16);
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(16);
         let found = Arc::new(AtomicBool::new(false));
         let answer = Arc::new(AtomicU32::new(0));
         // Start somewhere unpredictable so repeated challenges with the
         // same salt don't all replay the same nonce sequence.
-        let start = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+        let start = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
         let total_budget = u32::MAX as u64 + 1;
 
         std::thread::scope(|scope| {
@@ -204,11 +185,7 @@ impl Challenge {
         let nonce = answer.load(Ordering::Acquire);
         let mut buf = self.salt.as_bytes().to_vec();
         let salt_len = buf.len();
-        Some(Solution {
-            salt: self.salt.clone(),
-            nonce,
-            hash: hash_candidate(&mut buf, salt_len, nonce),
-        })
+        Some(Solution { salt: self.salt.clone(), nonce, hash: hash_candidate(&mut buf, salt_len, nonce) })
     }
 }
 
@@ -222,10 +199,7 @@ fn attr(html: &str, name: &str) -> Option<String> {
         let end = start + name.len();
         offset = end;
 
-        let starts_cleanly = html[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
+        let starts_cleanly = html[..start].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
         if !starts_cleanly {
             continue;
         }
@@ -283,22 +257,10 @@ pub async fn clear(http: &HttpClient, url: &str, max_steps: usize) -> Result<usi
 /// absorbed into the caller's cookie jar.
 async fn submit(http: &HttpClient, url: &str, sol: &Solution) -> Result<()> {
     let base = url::Url::parse(url)?;
-    let submit_url = format!(
-        "{}://{}{SUBMIT_PATH}",
-        base.scheme(),
-        base.host_str().context("URL has no host")?
-    );
+    let submit_url = format!("{}://{}{SUBMIT_PATH}", base.scheme(), base.host_str().context("URL has no host")?);
 
     tracing::debug!(nonce = sol.nonce, hash = %hex::encode(sol.hash), "submitting gate solution");
-    let resp = http
-        .post_form(
-            &submit_url,
-            &[
-                ("salt", sol.salt.as_str()),
-                ("nonce", &sol.nonce.to_string()),
-            ],
-        )
-        .await?;
+    let resp = http.post_form(&submit_url, &[("salt", sol.salt.as_str()), ("nonce", &sol.nonce.to_string())]).await?;
     if !(200..300).contains(&resp.status) {
         bail!("gate solution rejected with HTTP {}", resp.status);
     }
@@ -338,8 +300,7 @@ mod tests {
 
     #[test]
     fn parses_a_challenge_page() {
-        let html =
-            r#"<html data-ttrs-challenge="abc123" data-ttrs-difficulty="8" data-ttrs-steps="2">"#;
+        let html = r#"<html data-ttrs-challenge="abc123" data-ttrs-difficulty="8" data-ttrs-steps="2">"#;
         let c = Challenge::parse(html).unwrap();
         assert_eq!(c.salt, "abc123");
         assert_eq!(c.difficulty, 8);
@@ -354,8 +315,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_algorithms() {
-        let html =
-            r#"<html data-ttrs-challenge="s" data-ttrs-difficulty="4" data-ttrs-algorithm="md5">"#;
+        let html = r#"<html data-ttrs-challenge="s" data-ttrs-difficulty="4" data-ttrs-algorithm="md5">"#;
         assert!(Challenge::parse(html).is_err());
     }
 
@@ -367,14 +327,8 @@ mod tests {
 
     #[test]
     fn solves_a_low_difficulty_challenge() {
-        let c = Challenge {
-            salt: "test-salt".to_string(),
-            difficulty: 8,
-            steps: 1,
-        };
-        let sol = c
-            .solve()
-            .expect("difficulty 8 should always be solvable quickly");
+        let c = Challenge { salt: "test-salt".to_string(), difficulty: 8, steps: 1 };
+        let sol = c.solve().expect("difficulty 8 should always be solvable quickly");
         assert!(check_zeros(8, &sol.hash));
         assert_eq!(sol.salt, "test-salt");
     }

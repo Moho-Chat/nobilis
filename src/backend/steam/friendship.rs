@@ -36,17 +36,12 @@ pub fn parse_target(text: &str) -> Result<Target, String> {
         return Err("type who to add: a Steam id, a friend code, or an account name".to_string());
     }
     if let Some(inner) = text.strip_prefix("[U:1:").and_then(|t| t.strip_suffix(']')) {
-        return inner
-            .parse::<u32>()
-            .map(|n| Target::Id(steamid::steamid_of(n)))
-            .map_err(|_| format!("{text} is not a Steam id"));
+        return inner.parse::<u32>().map(|n| Target::Id(steamid::steamid_of(n))).map_err(|_| format!("{text} is not a Steam id"));
     }
     // An invite link, `s.team/p/<code>/<token>`, or a profile address in the
     // same code's form: it says which account, and is asked as a request.
     if text.contains("s.team/p/") || text.contains("/user/") {
-        return super::invites::account_of_link(text)
-            .map(|n| Target::Id(steamid::steamid_of(n)))
-            .ok_or_else(|| "that is not a Steam invite link".to_string());
+        return super::invites::account_of_link(text).map(|n| Target::Id(steamid::steamid_of(n))).ok_or_else(|| "that is not a Steam invite link".to_string());
     }
     // A profile address. Only the numeric form says who it is; a custom name
     // in one is looked up on the website, which this does not talk to.
@@ -58,9 +53,7 @@ pub fn parse_target(text: &str) -> Result<Target, String> {
         };
     }
     if text.bytes().all(|b| b.is_ascii_digit()) {
-        let n: u64 = text
-            .parse()
-            .map_err(|_| format!("{text} is too long to be a Steam id"))?;
+        let n: u64 = text.parse().map_err(|_| format!("{text} is too long to be a Steam id"))?;
         // A friend code is the account number alone; a full id is that plus
         // the fixed part for a person.
         return match steamid::account_of(n) {
@@ -82,31 +75,16 @@ pub struct Added {
 /// Asks somebody to be our friend, or says yes to their request.
 pub async fn add(link: &Link, target: &Target) -> Result<Added, String> {
     let request = match target {
-        Target::Id(id) => ClientAddFriend {
-            steamid_to_add: Some(*id),
-            accountname_or_email_to_add: None,
-        },
-        Target::Name(name) => ClientAddFriend {
-            steamid_to_add: None,
-            accountname_or_email_to_add: Some(name.clone()),
-        },
+        Target::Id(id) => ClientAddFriend { steamid_to_add: Some(*id), accountname_or_email_to_add: None },
+        Target::Name(name) => ClientAddFriend { steamid_to_add: None, accountname_or_email_to_add: Some(name.clone()) },
     };
-    let answer: ClientAddFriendResponse = link
-        .ask(emsg::CLIENT_ADD_FRIEND, &request)
-        .await
-        .map_err(|e| e.to_string())?;
+    let answer: ClientAddFriendResponse = link.ask(emsg::CLIENT_ADD_FRIEND, &request).await.map_err(|e| e.to_string())?;
     let code = answer.eresult.unwrap_or(eresult::FAIL);
-    tracing::info!(
-        "steam: asking to add {target:?}: result {code}, id {:?}",
-        answer.steam_id_added
-    );
+    tracing::info!("steam: asking to add {target:?}: result {code}, id {:?}", answer.steam_id_added);
     if code != eresult::OK {
         return Err(refusal_of(code, target));
     }
-    Ok(Added {
-        steamid: answer.steam_id_added.unwrap_or_default(),
-        name: answer.persona_name_added.filter(|n| !n.is_empty()),
-    })
+    Ok(Added { steamid: answer.steam_id_added.unwrap_or_default(), name: answer.persona_name_added.filter(|n| !n.is_empty()) })
 }
 
 /// What a refusal of an add means to the person who asked.
@@ -117,15 +95,9 @@ pub async fn add(link: &Link, target: &Target) -> Result<Added, String> {
 fn refusal_of(code: i32, target: &Target) -> String {
     // What an add means by some answers is not what they mean elsewhere.
     let words = match code {
-        eresult::NO_MATCH | eresult::ACCOUNT_NOT_FOUND => {
-            "Steam found nobody by that name or number".to_string()
-        }
-        eresult::LIMIT_EXCEEDED => {
-            "a friends list can only hold so many people, and one of the two is full".to_string()
-        }
-        eresult::ACCESS_DENIED => {
-            "this person's settings do not allow a friend request from you".to_string()
-        }
+        eresult::NO_MATCH | eresult::ACCOUNT_NOT_FOUND => "Steam found nobody by that name or number".to_string(),
+        eresult::LIMIT_EXCEEDED => "a friends list can only hold so many people, and one of the two is full".to_string(),
+        eresult::ACCESS_DENIED => "this person's settings do not allow a friend request from you".to_string(),
         other => eresult::describe(other),
     };
     if code != eresult::FAIL {
@@ -143,13 +115,7 @@ fn refusal_of(code: i32, target: &Target) -> String {
 /// no answer to this; the friends list that follows is the answer.
 pub fn remove(link: &Link, steamid: u64) -> Result<(), String> {
     steamid::account_of(steamid).ok_or_else(|| "that is not a person's Steam id".to_string())?;
-    link.send(
-        emsg::CLIENT_REMOVE_FRIEND,
-        &ClientRemoveFriend {
-            friendid: Some(steamid),
-        },
-    )
-    .map_err(|e| e.to_string())
+    link.send(emsg::CLIENT_REMOVE_FRIEND, &ClientRemoveFriend { friendid: Some(steamid) }).map_err(|e| e.to_string())
 }
 
 fn person(roster: &Roster, account: u32) -> Value {
@@ -182,16 +148,10 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster, told: &mut H
     told.retain(|a| asking.contains(a));
     for account in asking {
         if told.insert(account) {
-            state.events.emit(
-                "steamFriendRequest",
-                json!({ "accountId": account_id, "request": person(roster, account) }),
-            );
+            state.events.emit("steamFriendRequest", json!({ "accountId": account_id, "request": person(roster, account) }));
         }
     }
-    state.events.emit(
-        "steamFriendRequests",
-        json!({ "accountId": account_id, "requests": now }),
-    );
+    state.events.emit("steamFriendRequests", json!({ "accountId": account_id, "requests": now }));
 }
 
 #[cfg(test)]
@@ -202,19 +162,9 @@ mod tests {
     use prost::Message;
 
     /// Steam's answer to an add: its own message, matched to the question by job.
-    fn reply(
-        request: &crate::backend::steam::wire::Packet,
-        body: Vec<u8>,
-    ) -> crate::backend::steam::wire::Packet {
+    fn reply(request: &crate::backend::steam::wire::Packet, body: Vec<u8>) -> crate::backend::steam::wire::Packet {
         use crate::backend::steam::{proto::Header, wire::Packet};
-        Packet::new(
-            emsg::CLIENT_ADD_FRIEND_RESPONSE,
-            Header {
-                jobid_target: request.header.jobid_source,
-                ..Header::default()
-            },
-            body,
-        )
+        Packet::new(emsg::CLIENT_ADD_FRIEND_RESPONSE, Header { jobid_target: request.header.jobid_source, ..Header::default() }, body)
     }
 
     #[test]
@@ -222,35 +172,19 @@ mod tests {
         let id = steamid::steamid_of(22202);
         assert_eq!(parse_target("76561197960287930"), Ok(Target::Id(id)));
         assert_eq!(parse_target("  76561197960287930\n"), Ok(Target::Id(id)));
-        assert_eq!(
-            parse_target("22202"),
-            Ok(Target::Id(id)),
-            "a friend code is the account number"
-        );
-        assert_eq!(
-            parse_target("https://s.team/p/dknq-cpfb/QWERTYUI"),
-            Ok(Target::Id(steamid::steamid_of(664476208))),
-            "an invite link says whose it is"
-        );
+        assert_eq!(parse_target("22202"), Ok(Target::Id(id)), "a friend code is the account number");
+        assert_eq!(parse_target("https://s.team/p/dknq-cpfb/QWERTYUI"), Ok(Target::Id(steamid::steamid_of(664476208))), "an invite link says whose it is");
         assert!(parse_target("https://s.team/p/not-code/TOKEN").is_err());
         assert_eq!(parse_target("[U:1:22202]"), Ok(Target::Id(id)));
-        assert_eq!(
-            parse_target("https://steamcommunity.com/profiles/76561197960287930/"),
-            Ok(Target::Id(id))
-        );
-        assert_eq!(
-            parse_target("mohotester"),
-            Ok(Target::Name("mohotester".to_string()))
-        );
+        assert_eq!(parse_target("https://steamcommunity.com/profiles/76561197960287930/"), Ok(Target::Id(id)));
+        assert_eq!(parse_target("mohotester"), Ok(Target::Name("mohotester".to_string())));
     }
 
     #[test]
     fn what_cannot_be_read_is_said_rather_than_guessed_at() {
         assert!(parse_target("").is_err());
         assert!(parse_target("   ").is_err());
-        assert!(parse_target("https://steamcommunity.com/id/somebody")
-            .unwrap_err()
-            .contains("custom name"));
+        assert!(parse_target("https://steamcommunity.com/id/somebody").unwrap_err().contains("custom name"));
         assert!(parse_target("https://steamcommunity.com/groups/x").is_err());
         assert!(parse_target("[U:1:abc]").is_err());
         // A group's id, which has the digits of an id and is not a person's.
@@ -263,40 +197,19 @@ mod tests {
         let url = serve(Box::new({
             let seen = seen.clone();
             move |packet| {
-                *seen.lock().unwrap() = Some((
-                    packet.emsg,
-                    ClientAddFriend::decode(packet.body.as_slice()).unwrap(),
-                ));
-                let body = ClientAddFriendResponse {
-                    eresult: Some(1),
-                    steam_id_added: Some(steamid::steamid_of(7)),
-                    persona_name_added: Some("Seven".into()),
-                };
+                *seen.lock().unwrap() = Some((packet.emsg, ClientAddFriend::decode(packet.body.as_slice()).unwrap()));
+                let body = ClientAddFriendResponse { eresult: Some(1), steam_id_added: Some(steamid::steamid_of(7)), persona_name_added: Some("Seven".into()) };
                 Some(vec![reply(&packet, body.encode_to_vec())])
             }
         }))
         .await;
-        let (link, _told) =
-            crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
-        let added = add(&link, &Target::Id(steamid::steamid_of(7)))
-            .await
-            .unwrap();
-        assert_eq!(
-            added,
-            Added {
-                steamid: steamid::steamid_of(7),
-                name: Some("Seven".into())
-            }
-        );
+        let (link, _told) = crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
+        let added = add(&link, &Target::Id(steamid::steamid_of(7))).await.unwrap();
+        assert_eq!(added, Added { steamid: steamid::steamid_of(7), name: Some("Seven".into()) });
         let (kind, sent) = seen.lock().unwrap().take().unwrap();
         assert_eq!(kind, emsg::CLIENT_ADD_FRIEND);
         assert_eq!(sent.steamid_to_add, Some(steamid::steamid_of(7)));
-        assert_eq!(
-            sent.accountname_or_email_to_add, None,
-            "one or the other, never both"
-        );
+        assert_eq!(sent.accountname_or_email_to_add, None, "one or the other, never both");
     }
 
     #[tokio::test]
@@ -305,67 +218,31 @@ mod tests {
         let url = serve(Box::new({
             let seen = seen.clone();
             move |packet| {
-                *seen.lock().unwrap() =
-                    Some(ClientAddFriend::decode(packet.body.as_slice()).unwrap());
-                let body = ClientAddFriendResponse {
-                    eresult: Some(1),
-                    steam_id_added: Some(steamid::steamid_of(8)),
-                    persona_name_added: None,
-                };
+                *seen.lock().unwrap() = Some(ClientAddFriend::decode(packet.body.as_slice()).unwrap());
+                let body = ClientAddFriendResponse { eresult: Some(1), steam_id_added: Some(steamid::steamid_of(8)), persona_name_added: None };
                 Some(vec![reply(&packet, body.encode_to_vec())])
             }
         }))
         .await;
-        let (link, _told) =
-            crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
-        let added = add(&link, &Target::Name("mohotester".into()))
-            .await
-            .unwrap();
+        let (link, _told) = crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
+        let added = add(&link, &Target::Name("mohotester".into())).await.unwrap();
         assert_eq!(added.name, None, "an empty or absent name is not a name");
-        assert_eq!(
-            seen.lock()
-                .unwrap()
-                .take()
-                .unwrap()
-                .accountname_or_email_to_add
-                .as_deref(),
-            Some("mohotester")
-        );
+        assert_eq!(seen.lock().unwrap().take().unwrap().accountname_or_email_to_add.as_deref(), Some("mohotester"));
     }
 
     #[tokio::test]
     async fn a_refusal_is_said_in_words_and_a_missing_result_is_a_failure() {
-        for (code, words) in [
-            (Some(42), "nobody"),
-            (Some(29), "already"),
-            (Some(40), "blocked"),
-            (Some(24), "limited account"),
-            (None, "limited"),
-        ] {
+        for (code, words) in [(Some(42), "nobody"), (Some(29), "already"), (Some(40), "blocked"), (Some(24), "limited account"), (None, "limited")] {
             let url = serve(Box::new(move |packet| {
-                let body = ClientAddFriendResponse {
-                    eresult: code,
-                    ..Default::default()
-                };
+                let body = ClientAddFriendResponse { eresult: code, ..Default::default() };
                 Some(vec![reply(&packet, body.encode_to_vec())])
             }))
             .await;
-            let (link, _told) = crate::backend::steam::link::open_with(
-                "test",
-                &url,
-                std::time::Duration::from_secs(5),
-            )
-            .await
-            .unwrap();
+            let (link, _told) = crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
             let err = add(&link, &Target::Name("x".into())).await.unwrap_err();
             assert!(err.contains(words), "{code:?} -> {err}");
             if code.is_none() {
-                assert!(
-                    err.contains("sign-in name"),
-                    "a name is not the same as an id: {err}"
-                );
+                assert!(err.contains("sign-in name"), "a name is not the same as an id: {err}");
             }
         }
     }
@@ -376,23 +253,14 @@ mod tests {
         let url = serve(Box::new({
             let seen = seen.clone();
             move |packet| {
-                *seen.lock().unwrap() = Some((
-                    packet.emsg,
-                    ClientRemoveFriend::decode(packet.body.as_slice()).unwrap(),
-                ));
+                *seen.lock().unwrap() = Some((packet.emsg, ClientRemoveFriend::decode(packet.body.as_slice()).unwrap()));
                 Some(vec![])
             }
         }))
         .await;
-        let (link, _told) =
-            crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5))
-                .await
-                .unwrap();
+        let (link, _told) = crate::backend::steam::link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
         assert!(remove(&link, 103582791429521412).is_err());
-        assert!(
-            seen.lock().unwrap().is_none(),
-            "nothing was sent for a bad id"
-        );
+        assert!(seen.lock().unwrap().is_none(), "nothing was sent for a bad id");
         remove(&link, steamid::steamid_of(9)).unwrap();
         for _ in 0..100 {
             if seen.lock().unwrap().is_some() {
@@ -401,23 +269,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let (kind, sent) = seen.lock().unwrap().take().unwrap();
-        assert_eq!(
-            (kind, sent.friendid),
-            (emsg::CLIENT_REMOVE_FRIEND, Some(steamid::steamid_of(9)))
-        );
+        assert_eq!((kind, sent.friendid), (emsg::CLIENT_REMOVE_FRIEND, Some(steamid::steamid_of(9))));
     }
 
     fn roster_with_requests() -> Roster {
         let mut r = Roster::default();
-        let entry = |a: u32, rel: u32| FriendsListEntry {
-            ulfriendid: Some(steamid::steamid_of(a)),
-            efriendrelationship: Some(rel),
-        };
-        r.apply_friends_list(&ClientFriendsList {
-            bincremental: Some(false),
-            friends: vec![entry(10, 3), entry(20, 2), entry(30, 4)],
-            ..Default::default()
-        });
+        let entry = |a: u32, rel: u32| FriendsListEntry { ulfriendid: Some(steamid::steamid_of(a)), efriendrelationship: Some(rel) };
+        r.apply_friends_list(&ClientFriendsList { bincremental: Some(false), friends: vec![entry(10, 3), entry(20, 2), entry(30, 4)], ..Default::default() });
         r
     }
 
@@ -426,15 +284,8 @@ mod tests {
         let now = snapshot(&roster_with_requests());
         assert_eq!(now["incoming"][0]["steamid"], steamid::text_of(20));
         assert_eq!(now["outgoing"][0]["steamid"], steamid::text_of(30));
-        assert_eq!(
-            now["incoming"].as_array().unwrap().len(),
-            1,
-            "a friend is not a request"
-        );
-        assert!(
-            now["incoming"][0]["name"].is_null(),
-            "not named until Steam says"
-        );
+        assert_eq!(now["incoming"].as_array().unwrap().len(), 1, "a friend is not a request");
+        assert!(now["incoming"][0]["name"].is_null(), "not named until Steam says");
     }
 
     #[tokio::test]
@@ -456,9 +307,6 @@ mod tests {
             }
         }
         assert_eq!((asked, lists), (1, 1), "the same list again says nothing");
-        assert_eq!(
-            state.runtime.steam_requests("steam:me")["incoming"][0]["steamid"],
-            steamid::text_of(20)
-        );
+        assert_eq!(state.runtime.steam_requests("steam:me")["incoming"][0]["steamid"], steamid::text_of(20));
     }
 }

@@ -12,27 +12,16 @@ use super::*;
 /// two things that matter in a stream chat: how long they have followed, and
 /// what they have earned here. Badges are what the chat itself already shows
 /// beside their name, so the profile agrees with the line above it.
-pub async fn profile(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    username: &str,
-) -> serde_json::Value {
+pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
     let mut profile = crate::profile::pending("kick", account_id, username);
     profile["pending"] = serde_json::json!(false);
 
-    let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-        return profile;
-    };
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return profile };
     let slug = api::normalise_slug(&buffer.name);
     let token = state.accounts.get_kick(account_id).and_then(|c| c.token);
-    let Ok(http) = api::client() else {
-        return profile;
-    };
+    let Ok(http) = api::client() else { return profile };
 
-    let Ok(body) = api::channel_user(&http, token.as_deref(), &slug, username).await else {
-        return profile;
-    };
+    let Ok(body) = api::channel_user(&http, token.as_deref(), &slug, username).await else { return profile };
 
     if let Some(id) = body["id"].as_i64() {
         profile["id"] = serde_json::json!(id.to_string());
@@ -45,11 +34,7 @@ pub async fn profile(
     }
     // "Following since" is Kick's own phrase and its own date format.
     if let Some(since) = body["following_since"].as_str() {
-        crate::profile::note(
-            &mut profile,
-            "Following since",
-            since.split('T').next().unwrap_or(since),
-        );
+        crate::profile::note(&mut profile, "Following since", since.split('T').next().unwrap_or(since));
     }
     if body["banned"].is_object() {
         crate::profile::note(&mut profile, "Banned", "yes, in this channel");
@@ -59,12 +44,7 @@ pub async fn profile(
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|b| {
-            b["text"]
-                .as_str()
-                .or_else(|| b["type"].as_str())
-                .map(str::to_string)
-        })
+        .filter_map(|b| b["text"].as_str().or_else(|| b["type"].as_str()).map(str::to_string))
         .collect();
     let moderator = body["badges"]
         .as_array()
@@ -183,29 +163,16 @@ pub(super) fn handle_event(
     // Rebuilt so the arms below can keep reading `frame.channel`, which is
     // how a channel is identified for every event that does not carry an id
     // of its own.
-    let frame = Delivery {
-        channel: channel.map(str::to_string),
-    };
+    let frame = Delivery { channel: channel.map(str::to_string) };
     match event {
         "pusher:error" => {
-            let msg = payload
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("Kick refused the connection");
+            let msg = payload.get("message").and_then(|m| m.as_str()).unwrap_or("Kick refused the connection");
             anyhow::bail!("{msg}");
         }
         e if e.ends_with("ChatMessageEvent") => {
-            let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else {
-                return Ok(());
-            };
-            let Some(slug) = watched.chatroom(msg.chatroom_id).cloned() else {
-                return Ok(());
-            };
-            let from = msg
-                .sender
-                .username
-                .clone()
-                .unwrap_or_else(|| "someone".to_string());
+            let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else { return Ok(()) };
+            let Some(slug) = watched.chatroom(msg.chatroom_id).cloned() else { return Ok(()) };
+            let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
             let reply_to = reply_preview(msg.metadata.as_ref());
             let style = style_of(msg.sender.identity.as_ref());
             // Kick has no viewer list to ask for, so the panel is built from
@@ -222,10 +189,7 @@ pub(super) fn handle_event(
                 let buffer_id = crate::model::buffer_id(account_id, &slug);
                 let roster = serde_json::json!(watched.roster(&slug));
                 state.runtime.set_presence(&buffer_id, roster.clone());
-                state.events.emit(
-                    "presenceChange",
-                    serde_json::json!({ "bufferId": buffer_id, "members": roster }),
-                );
+                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster }));
             }
             state.runtime.record_message_at(
                 state,
@@ -257,29 +221,16 @@ pub(super) fn handle_event(
         // Worth a line in the channel it happened in: somebody watching a
         // handful of streamers is largely watching for this.
         e if e.ends_with("StreamerIsLive") || e.ends_with("StopStreamBroadcast") => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             let live = e.ends_with("StreamerIsLive");
-            let what = if live {
-                "went live"
-            } else {
-                "ended the stream"
-            };
-            event_card(
-                state,
-                account_id,
-                &slug,
-                what,
-                "stream",
-                crate::model::Embed {
-                    kind: Some("stream".to_string()),
-                    author: Some(slug.clone()),
-                    title: Some(what.to_string()),
-                    icon: Some(if live { "live" } else { "offline" }.to_string()),
-                    ..Default::default()
-                },
-            );
+            let what = if live { "went live" } else { "ended the stream" };
+            event_card(state, account_id, &slug, what, "stream", crate::model::Embed {
+                kind: Some("stream".to_string()),
+                author: Some(slug.clone()),
+                title: Some(what.to_string()),
+                icon: Some(if live { "live" } else { "offline" }.to_string()),
+                ..Default::default()
+            });
             // And the header, which is otherwise still describing the stream
             // that just ended. Asked of Kick rather than assembled from this
             // event: the title and the game arrive with the channel, not with
@@ -297,9 +248,7 @@ pub(super) fn handle_event(
         // which ends the same way: that is the pin's, below, and taking it for a
         // message deleted left a pin on screen for ever after it was removed.
         e if e.ends_with("MessageDeletedEvent") && !pins::is_pin_event(e) => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             // The id is nested under `message` on this event and flat on
             // others Kick has sent; both name the same thing.
             let id = payload
@@ -308,27 +257,15 @@ pub(super) fn handle_event(
                 .or_else(|| payload.get("id"))
                 .and_then(|v| v.as_str());
             if let Some(id) = id {
-                state.runtime.delete_message(
-                    state,
-                    &crate::model::buffer_id(account_id, &slug),
-                    id,
-                );
+                state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &slug), id);
             }
         }
 
         // The chat's rules changing under everybody - followers-only going
         // on mid-stream is the usual reason a message stops sending.
         e if e.ends_with("ChatroomUpdatedEvent") => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
-            let flag = |name: &str| {
-                payload
-                    .get(name)
-                    .and_then(|v| v.get("enabled"))
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
+            let flag = |name: &str| payload.get(name).and_then(|v| v.get("enabled")).and_then(|v| v.as_bool()).unwrap_or(false);
             let slow = payload
                 .get("slow_mode")
                 .filter(|m| m.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -352,44 +289,27 @@ pub(super) fn handle_event(
         // line in the chat several times a second and buried the conversation
         // the poll is about.
         e if e.ends_with("PollUpdateEvent") => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             if let Some(line) = describe_poll(&payload) {
-                live_line(
-                    state,
-                    account_id,
-                    &slug,
-                    &poll_message_id(&slug, &payload),
-                    &line,
-                    "poll",
-                );
+                live_line(state, account_id, &slug, &poll_message_id(&slug, &payload), &line, "poll");
             }
             // And the poll itself, for the card that can be voted in. The
             // line above is the record of what was asked; this is the thing
             // on screen while it is still being asked.
             if let Ok(poll) = serde_json::from_value::<api::Poll>(payload["poll"].clone()) {
-                announce_poll(
-                    state,
-                    &crate::model::buffer_id(account_id, &slug),
-                    Some(&poll),
-                );
+                announce_poll(state, &crate::model::buffer_id(account_id, &slug), Some(&poll));
             }
         }
 
         // The poll is over. The line stays - what was asked and how it went is
         // worth keeping in the log - but stops claiming to be running.
         e if e.ends_with("PollDeleteEvent") => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             let buffer_id = crate::model::buffer_id(account_id, &slug);
             let id = poll_message_id(&slug, &payload);
             if let Ok(Some(stored)) = state.store.get_message(&buffer_id, &id) {
                 let ended = stored.body.replacen("poll:", "poll ended:", 1);
-                state
-                    .runtime
-                    .update_message(state, &buffer_id, &id, &ended, &[], &[]);
+                state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
             }
             announce_poll(state, &buffer_id, None);
         }
@@ -400,29 +320,18 @@ pub(super) fn handle_event(
         // a set of named outcomes wherever they sit, and shows nothing at all
         // rather than something wrong if the shape is not what it expects.
         e if e.contains("Prediction") => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             let buffer_id = crate::model::buffer_id(account_id, &slug);
             if e.ends_with("PredictionDeleteEvent") || e.ends_with("PredictionDeletedEvent") {
                 let id = prediction_message_id(&slug, &payload);
                 if let Ok(Some(stored)) = state.store.get_message(&buffer_id, &id) {
                     let ended = stored.body.replacen("prediction:", "prediction closed:", 1);
-                    state
-                        .runtime
-                        .update_message(state, &buffer_id, &id, &ended, &[], &[]);
+                    state.runtime.update_message(state, &buffer_id, &id, &ended, &[], &[]);
                 }
                 announce_prediction_gone(state, &buffer_id);
             } else {
                 if let Some(line) = describe_prediction(&payload) {
-                    live_line(
-                        state,
-                        account_id,
-                        &slug,
-                        &prediction_message_id(&slug, &payload),
-                        &line,
-                        "poll",
-                    );
+                    live_line(state, account_id, &slug, &prediction_message_id(&slug, &payload), &line, "poll");
                 }
                 // And the card, which is the same card a poll gets: the two
                 // are one question with a set of answers, and the money is a
@@ -441,9 +350,7 @@ pub(super) fn handle_event(
         // turn the feature off. Any event about a pin is handled, and its
         // direction is read from the name.
         e if pins::is_pin_event(e) => {
-            let Some(slug) = channel_of(watched, &frame.channel, &payload) else {
-                return Ok(());
-            };
+            let Some(slug) = channel_of(watched, &frame.channel, &payload) else { return Ok(()) };
             let buffer_id = crate::model::buffer_id(account_id, &slug);
             if pins::is_unpin(e) {
                 pins::announce(state, &buffer_id, None);
@@ -459,19 +366,12 @@ pub(super) fn handle_event(
         // A moderator emptying the room.
         e if e.ends_with("ChatroomClearEvent") => {
             if let Some(slug) = channel_of(watched, &frame.channel, &payload) {
-                event_card(
-                    state,
-                    account_id,
-                    &slug,
-                    "a moderator cleared the chat",
-                    "moderation",
-                    crate::model::Embed {
-                        kind: Some("moderation".to_string()),
-                        author: Some("A moderator".to_string()),
-                        title: Some("cleared the chat".to_string()),
-                        ..Default::default()
-                    },
-                );
+                event_card(state, account_id, &slug, "a moderator cleared the chat", "moderation", crate::model::Embed {
+                    kind: Some("moderation".to_string()),
+                    author: Some("A moderator".to_string()),
+                    title: Some("cleared the chat".to_string()),
+                    ..Default::default()
+                });
             }
         }
 
@@ -527,11 +427,7 @@ pub async fn backfill(
         if msg.content.is_empty() {
             continue;
         }
-        let from = msg
-            .sender
-            .username
-            .clone()
-            .unwrap_or_else(|| "someone".to_string());
+        let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
         state.runtime.record_message_at(
             state,
             account_id,
@@ -560,9 +456,7 @@ pub async fn backfill(
 ///
 /// History carries it in the same shape, so this is the one parser rather than
 /// a second one that could drift.
-pub(super) fn reply_preview_from_value(
-    metadata: Option<&serde_json::Value>,
-) -> Option<crate::model::ReplyPreview> {
+pub(super) fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
     let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
     reply_preview(Some(&parsed))
 }
@@ -573,14 +467,7 @@ pub(super) fn reply_preview_from_value(
 /// names attached. Ranked by what a reader is scanning for - who runs the
 /// channel, who moderates it - rather than by what is rarest.
 pub(super) fn strongest_badge(badges: &[api::Badge]) -> Option<String> {
-    for wanted in [
-        "broadcaster",
-        "moderator",
-        "vip",
-        "og",
-        "founder",
-        "subscriber",
-    ] {
+    for wanted in ["broadcaster", "moderator", "vip", "og", "founder", "subscriber"] {
         if badges.iter().any(|b| b.kind == wanted) {
             return Some(wanted.to_string());
         }
@@ -595,9 +482,7 @@ pub(super) fn strongest_badge(badges: &[api::Badge]) -> Option<String> {
 /// beside every nick is noise, while moderator, subscriber and verified are
 /// the ones a reader is actually scanning for.
 pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::SenderStyle {
-    let Some(identity) = identity else {
-        return crate::model::SenderStyle::default();
-    };
+    let Some(identity) = identity else { return crate::model::SenderStyle::default() };
     crate::model::SenderStyle {
         color: identity.color.clone().filter(|c| !c.is_empty()),
         badges: identity
@@ -615,9 +500,7 @@ pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::Se
 /// no author and no text is drawn as an empty quote above the message, which
 /// reads as something failing to load rather than as a reply. Better to show
 /// the message plainly than to show a hole above it.
-pub(super) fn reply_preview(
-    metadata: Option<&ReplyMetadata>,
-) -> Option<crate::model::ReplyPreview> {
+pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::ReplyPreview> {
     let metadata = metadata?;
     let original = metadata.original_message.as_ref()?;
     let from = metadata.original_sender.as_ref()?.username.clone()?;
@@ -625,9 +508,7 @@ pub(super) fn reply_preview(
         id: original.id.clone(),
         from,
         body: original.content.clone().unwrap_or_default(),
-        thread: false,
-        forwarded: false,
-    })
+        thread: false, forwarded: false })
 }
 
 /// One line for something somebody did in a channel, or None if this event is
@@ -643,10 +524,7 @@ pub(super) fn reply_preview(
 /// used: `username` and `sender.username` both appear across these events, and
 /// an event whose shape has moved on should degrade to being skipped rather
 /// than to a line with "unknown" in it.
-pub(super) fn describe_action(
-    event: &str,
-    p: &serde_json::Value,
-) -> Option<(&'static str, String)> {
+pub(super) fn describe_action(event: &str, p: &serde_json::Value) -> Option<(&'static str, String)> {
     // Matched exactly, on the last segment, rather than by suffix. Kick sends
     // one real subscription as three events on three subscriptions - measured
     // on a live subathon: `SubscriptionEvent`, `ChannelSubscriptionEvent` and
@@ -656,26 +534,11 @@ pub(super) fn describe_action(
     // are named as the duplicates they are.
     let name = event.rsplit('\\').next().unwrap_or(event);
 
-    let text = |key: &str| {
-        p.get(key)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-    };
+    let text = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string).filter(|s| !s.is_empty());
     let who = || {
         text("username")
-            .or_else(|| {
-                p.get("sender")
-                    .and_then(|s| s.get("username"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                p.get("user")
-                    .and_then(|s| s.get("username"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
+            .or_else(|| p.get("sender").and_then(|s| s.get("username")).and_then(|v| v.as_str()).map(str::to_string))
+            .or_else(|| p.get("user").and_then(|s| s.get("username")).and_then(|v| v.as_str()).map(str::to_string))
     };
 
     match name {
@@ -684,13 +547,10 @@ pub(super) fn describe_action(
             let reward = text("reward_title").or_else(|| text("title"))?;
             // What they typed with it, where the reward takes input - it is
             // the half that says what they actually asked for.
-            Some((
-                "reward",
-                match text("user_input") {
-                    Some(input) => format!("{who} redeemed {reward}: {input}"),
-                    None => format!("{who} redeemed {reward}"),
-                },
-            ))
+            Some(("reward", match text("user_input") {
+                Some(input) => format!("{who} redeemed {reward}: {input}"),
+                None => format!("{who} redeemed {reward}"),
+            }))
         }
 
         "GiftedSubscriptionsEvent" => {
@@ -699,32 +559,22 @@ pub(super) fn describe_action(
                 .get("gifted_usernames")
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
-                .or_else(|| {
-                    p.get("gifted_total")
-                        .and_then(|v| v.as_u64())
-                        .map(|n| n as usize)
-                })
+                .or_else(|| p.get("gifted_total").and_then(|v| v.as_u64()).map(|n| n as usize))
                 .unwrap_or(1);
-            Some((
-                "sub",
-                match count {
-                    0 | 1 => format!("{gifter} gifted a subscription"),
-                    n => format!("{gifter} gifted {n} subscriptions"),
-                },
-            ))
+            Some(("sub", match count {
+                0 | 1 => format!("{gifter} gifted a subscription"),
+                n => format!("{gifter} gifted {n} subscriptions"),
+            }))
         }
 
         // The one of the three that carries how long they have been
         // subscribed, which is the part worth saying.
         "SubscriptionEvent" => {
             let who = who()?;
-            Some((
-                "sub",
-                match p.get("months").and_then(|v| v.as_u64()) {
-                    Some(n) if n > 1 => format!("{who} subscribed - {n} months"),
-                    _ => format!("{who} subscribed"),
-                },
-            ))
+            Some(("sub", match p.get("months").and_then(|v| v.as_u64()) {
+                Some(n) if n > 1 => format!("{who} subscribed - {n} months"),
+                _ => format!("{who} subscribed"),
+            }))
         }
 
         // KICKs sent to a streamer: Kick's own money, spent in the chat. The
@@ -733,13 +583,7 @@ pub(super) fn describe_action(
         // skipped rather than drawn as "someone sent 0".
         "KicksGifted" | "KicksGiftedEvent" => {
             let (sender, amount) = kicks_of(p)?;
-            Some((
-                "kicks",
-                format!(
-                    "{sender} sent {amount} {}",
-                    if amount == 1 { "Kick" } else { "Kicks" }
-                ),
-            ))
+            Some(("kicks", format!("{sender} sent {amount} {}", if amount == 1 { "Kick" } else { "Kicks" })))
         }
 
         // Kick sends one raid as two events on two subscriptions, measured
@@ -751,23 +595,17 @@ pub(super) fn describe_action(
 
         "StreamHostEvent" => {
             let who = text("host_username").or_else(who)?;
-            Some((
-                "raid",
-                match p.get("number_viewers").and_then(|v| v.as_u64()) {
-                    Some(1) => format!("{who} raided with 1 viewer"),
-                    Some(n) if n > 1 => format!("{who} raided with {n} viewers"),
-                    _ => format!("{who} raided the channel"),
-                },
-            ))
+            Some(("raid", match p.get("number_viewers").and_then(|v| v.as_u64()) {
+                Some(1) => format!("{who} raided with 1 viewer"),
+                Some(n) if n > 1 => format!("{who} raided with {n} viewers"),
+                _ => format!("{who} raided the channel"),
+            }))
         }
 
         // Somebody timed out or banned. Said in the channel, because it is
         // moderation everybody in the room can see happening.
         "UserBannedEvent" => {
-            let who = p
-                .get("user")
-                .and_then(|u| u.get("username"))
-                .and_then(|v| v.as_str())?;
+            let who = p.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str())?;
             let by = p
                 .get("banned_by")
                 .and_then(|u| u.get("username"))
@@ -776,19 +614,13 @@ pub(super) fn describe_action(
                 .unwrap_or_default();
             // A ban carries no expiry and a timeout does, which is the whole
             // of what a reader wants to know from the line.
-            Some((
-                "moderation",
-                match p.get("expires_at").and_then(|v| v.as_str()) {
-                    Some(_) => format!("{who} was timed out{by}"),
-                    None => format!("{who} was banned{by}"),
-                },
-            ))
+            Some(("moderation", match p.get("expires_at").and_then(|v| v.as_str()) {
+                Some(_) => format!("{who} was timed out{by}"),
+                None => format!("{who} was banned{by}"),
+            }))
         }
         "UserUnbannedEvent" => {
-            let who = p
-                .get("user")
-                .and_then(|u| u.get("username"))
-                .and_then(|v| v.as_str())?;
+            let who = p.get("user").and_then(|u| u.get("username")).and_then(|v| v.as_str())?;
             Some(("moderation", format!("{who} is allowed back")))
         }
 
@@ -796,9 +628,7 @@ pub(super) fn describe_action(
         // on another subscription - `ChatMessageSentEvent` is the info line
         // Kick's own page draws from, and `LuckyUsers...` is the companion to
         // a gift that has already been announced.
-        "ChannelSubscriptionEvent"
-        | "ChatMessageSentEvent"
-        | "LuckyUsersWhoGotGiftSubscriptionsEvent" => None,
+        "ChannelSubscriptionEvent" | "ChatMessageSentEvent" | "LuckyUsersWhoGotGiftSubscriptionsEvent" => None,
 
         _ => None,
     }
@@ -806,12 +636,7 @@ pub(super) fn describe_action(
 
 /// Who sent KICKs and how many, from the payload wherever Kick puts them.
 fn kicks_of(p: &serde_json::Value) -> Option<(String, u64)> {
-    let name = |v: &serde_json::Value| {
-        v.as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
+    let name = |v: &serde_json::Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let sender = p
         .get("sender")
         .and_then(|s| s.get("username"))
@@ -819,10 +644,7 @@ fn kicks_of(p: &serde_json::Value) -> Option<(String, u64)> {
         .or_else(|| p.get("username").and_then(name))
         .or_else(|| p.get("sender_username").and_then(name))
         .or_else(|| p.get("user").and_then(|u| u.get("username")).and_then(name))?;
-    let number = |v: &serde_json::Value| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
-    };
+    let number = |v: &serde_json::Value| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()));
     let amount = p
         .get("gift")
         .and_then(|g| g.get("amount"))
@@ -866,26 +688,19 @@ fn tier_colour(tier: &str) -> i64 {
 ///   typed with it, and `color` the streamer's colour for the reward.
 pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::model::Embed> {
     let name = event.rsplit('\\').next().unwrap_or(event);
-    let text = |v: Option<&serde_json::Value>| {
-        v.and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
+    let text = |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     match name {
         "KicksGifted" | "KicksGiftedEvent" => {
             let (sender, amount) = kicks_of(p)?;
             let gift = p.get("gift");
-            let tier = text(gift.and_then(|g| g.get("tier")))
-                .or_else(|| text(gift.and_then(|g| g.get("type"))));
+            let tier = text(gift.and_then(|g| g.get("tier"))).or_else(|| text(gift.and_then(|g| g.get("type"))));
             Some(crate::model::Embed {
                 kind: Some("kicks".to_string()),
                 author: Some(sender),
                 author_color: text(p.get("sender").and_then(|s| s.get("username_color"))),
                 title: Some(amount.to_string()),
                 provider: text(gift.and_then(|g| g.get("name"))),
-                description: text(gift.and_then(|g| g.get("message")))
-                    .or_else(|| text(p.get("message"))),
+                description: text(gift.and_then(|g| g.get("message"))).or_else(|| text(p.get("message"))),
                 color: Some(tier.as_deref().map_or(0x53FC18, tier_colour)),
                 ..Default::default()
             })
@@ -898,11 +713,7 @@ pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::m
                 kind: Some("subscribe".to_string()),
                 author: Some(who),
                 // Months, where they are more than the first one.
-                title: p
-                    .get("months")
-                    .and_then(|v| v.as_u64())
-                    .filter(|n| *n > 1)
-                    .map(|n| n.to_string()),
+                title: p.get("months").and_then(|v| v.as_u64()).filter(|n| *n > 1).map(|n| n.to_string()),
                 ..Default::default()
             })
         }
@@ -911,14 +722,7 @@ pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::m
             Some(crate::model::Embed {
                 kind: Some("moderation".to_string()),
                 author: Some(who),
-                title: Some(
-                    if p.get("expires_at").and_then(|v| v.as_str()).is_some() {
-                        "was timed out"
-                    } else {
-                        "was banned"
-                    }
-                    .to_string(),
-                ),
+                title: Some(if p.get("expires_at").and_then(|v| v.as_str()).is_some() { "was timed out" } else { "was banned" }.to_string()),
                 description: text(p.get("banned_by").and_then(|u| u.get("username"))),
                 ..Default::default()
             })
@@ -937,11 +741,7 @@ pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::m
             Some(crate::model::Embed {
                 kind: Some("raid".to_string()),
                 author: Some(host),
-                title: p
-                    .get("number_viewers")
-                    .and_then(|v| v.as_u64())
-                    .filter(|n| *n > 0)
-                    .map(|n| n.to_string()),
+                title: p.get("number_viewers").and_then(|v| v.as_u64()).filter(|n| *n > 0).map(|n| n.to_string()),
                 description: text(p.get("optional_message")),
                 ..Default::default()
             })
@@ -969,10 +769,7 @@ pub(super) fn action_card(event: &str, p: &serde_json::Value) -> Option<crate::m
                 .map(|a| a.iter().filter_map(|n| text(Some(n))).collect())
                 .unwrap_or_default();
             let count = if names.is_empty() {
-                p.get("gifted_total")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1)
-                    .max(1)
+                p.get("gifted_total").and_then(|v| v.as_u64()).unwrap_or(1).max(1)
             } else {
                 names.len() as u64
             };
@@ -995,14 +792,7 @@ fn already_seen(slug: &str, line: &str, p: &serde_json::Value) -> bool {
     static RECENT: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
     let now = std::time::Instant::now();
-    let key = format!(
-        "{slug}\u{0}{line}\u{0}{}",
-        p.get("gift_transaction_id")
-            .or_else(|| p.get("created_at"))
-            .or_else(|| p.get("message"))
-            .map(|v| v.to_string())
-            .unwrap_or_default()
-    );
+    let key = format!("{slug}\u{0}{line}\u{0}{}", p.get("gift_transaction_id").or_else(|| p.get("created_at")).or_else(|| p.get("message")).map(|v| v.to_string()).unwrap_or_default());
     let mut recent = RECENT.lock().unwrap();
     recent.retain(|_, at| now.duration_since(*at) < Duration::from_secs(10));
     if recent.contains_key(&key) {
@@ -1013,30 +803,10 @@ fn already_seen(slug: &str, line: &str, p: &serde_json::Value) -> bool {
 }
 
 /// A line that carries a card.
-pub(super) fn event_card(
-    state: &AppState,
-    account_id: &str,
-    slug: &str,
-    what: &str,
-    kind: &str,
-    card: crate::model::Embed,
-) {
+pub(super) fn event_card(state: &AppState, account_id: &str, slug: &str, what: &str, kind: &str, card: crate::model::Embed) {
     state.runtime.record_message(
-        state,
-        account_id,
-        slug,
-        "channel",
-        slug,
-        what,
-        false,
-        kind,
-        None,
-        None,
-        false,
-        None,
-        vec![card],
-        Vec::new(),
-        None,
+        state, account_id, slug, "channel", slug, what, false, kind, None, None, false, None,
+        vec![card], Vec::new(), None,
     );
 }
 
@@ -1047,21 +817,8 @@ pub(super) fn event_card(
 /// person doing something, and the client draws that one on a plate.
 pub(super) fn system_line(state: &AppState, account_id: &str, slug: &str, what: &str, kind: &str) {
     state.runtime.record_message(
-        state,
-        account_id,
-        slug,
-        "channel",
-        slug,
-        what,
-        false,
-        kind,
-        None,
-        None,
-        false,
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
+        state, account_id, slug, "channel", slug, what, false, kind, None, None, false, None,
+        Vec::new(), Vec::new(), None,
     );
 }
 
@@ -1071,9 +828,7 @@ pub(super) fn system_line(state: &AppState, account_id: &str, slug: &str, what: 
 /// message from a reconnect's replay would be dated to the reconnect - the same
 /// problem `record_message_at` exists to solve everywhere else.
 pub(super) fn parse_timestamp(raw: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|t| t.timestamp())
+    chrono::DateTime::parse_from_rfc3339(raw).ok().map(|t| t.timestamp())
 }
 
 #[cfg(test)]
@@ -1083,10 +838,7 @@ mod tests {
 
     #[test]
     fn reads_kicks_timestamps() {
-        assert_eq!(
-            parse_timestamp("2026-01-08T23:32:57.000000Z"),
-            Some(1767915177)
-        );
+        assert_eq!(parse_timestamp("2026-01-08T23:32:57.000000Z"), Some(1767915177));
         assert_eq!(parse_timestamp("2026-01-08T23:32:57Z"), Some(1767915177));
         assert_eq!(parse_timestamp("not a time"), None);
     }
@@ -1112,17 +864,12 @@ mod tests {
             .expect("account");
         state.runtime.set_own_identity("kick:tester", "tester");
 
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\ChatMessageEvent",
-            serde_json::json!({
-                "id": "m1",
-                "chatroom_id": 2393554,
-                "content": "tester textgoeshere",
-                "sender": { "id": 9, "username": "someoneelse", "identity": null }
-            }),
-        );
+        feed(&state, &mut watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": "m1",
+            "chatroom_id": 2393554,
+            "content": "tester textgoeshere",
+            "sender": { "id": 9, "username": "someoneelse", "identity": null }
+        }));
 
         let stored = state
             .store
@@ -1130,10 +877,7 @@ mod tests {
             .expect("backlog");
         assert_eq!(stored.len(), 1);
         assert_eq!(stored[0].body, "@You textgoeshere");
-        assert!(
-            stored[0].is_highlight,
-            "still addressed, whatever it is called"
-        );
+        assert!(stored[0].is_highlight, "still addressed, whatever it is called");
     }
 
     #[test]
@@ -1145,18 +889,9 @@ mod tests {
             badge: badge.map(str::to_string),
         };
 
-        assert!(
-            w.heard("chan", speaker("first", None)),
-            "a new name is worth announcing"
-        );
-        assert!(
-            !w.heard("chan", speaker("first", None)),
-            "the same name saying more is not"
-        );
-        assert!(
-            w.heard("chan", speaker("first", Some("moderator"))),
-            "but their badges changing is"
-        );
+        assert!(w.heard("chan", speaker("first", None)), "a new name is worth announcing");
+        assert!(!w.heard("chan", speaker("first", None)), "the same name saying more is not");
+        assert!(w.heard("chan", speaker("first", Some("moderator"))), "but their badges changing is");
         assert!(w.heard("chan", speaker("second", None)));
 
         // Most recent first, so the newest arrival is at the top.
@@ -1170,45 +905,22 @@ mod tests {
     fn forgets_the_oldest_rather_than_growing_without_end() {
         let mut w = Watched::default();
         for i in 0..(SPEAKERS_REMEMBERED + 50) {
-            w.heard(
-                "chan",
-                Speaker {
-                    nick: format!("nick{i}"),
-                    user_id: None,
-                    badge: None,
-                },
-            );
+            w.heard("chan", Speaker { nick: format!("nick{i}"), user_id: None, badge: None });
         }
         assert_eq!(w.roster("chan").len(), SPEAKERS_REMEMBERED);
         // The most recent survive; a list nobody can scan is no better than
         // an empty one, and the newest names are the ones being read.
-        assert_eq!(
-            w.roster("chan")[0]["nick"],
-            format!("nick{}", SPEAKERS_REMEMBERED + 49)
-        );
+        assert_eq!(w.roster("chan")[0]["nick"], format!("nick{}", SPEAKERS_REMEMBERED + 49));
     }
 
     #[test]
     fn marks_somebody_by_the_badge_worth_finding_them_by() {
-        let badge = |kind: &str| api::Badge {
-            kind: kind.into(),
-            text: kind.into(),
-            count: None,
-        };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
         // Ranked by what a reader is scanning for, not by what is rarest: a
         // moderator who is also a subscriber shows as a moderator.
-        assert_eq!(
-            strongest_badge(&[badge("subscriber"), badge("moderator")]).as_deref(),
-            Some("moderator")
-        );
-        assert_eq!(
-            strongest_badge(&[badge("subscriber")]).as_deref(),
-            Some("subscriber")
-        );
-        assert_eq!(
-            strongest_badge(&[badge("broadcaster"), badge("moderator")]).as_deref(),
-            Some("broadcaster")
-        );
+        assert_eq!(strongest_badge(&[badge("subscriber"), badge("moderator")]).as_deref(), Some("moderator"));
+        assert_eq!(strongest_badge(&[badge("subscriber")]).as_deref(), Some("subscriber"));
+        assert_eq!(strongest_badge(&[badge("broadcaster"), badge("moderator")]).as_deref(), Some("broadcaster"));
         assert_eq!(strongest_badge(&[]), None);
         // A badge nobody ranks marks nobody, rather than marking everybody.
         assert_eq!(strongest_badge(&[badge("verified")]), None);
@@ -1217,19 +929,8 @@ mod tests {
     #[test]
     fn closing_a_channel_forgets_who_was_talking_in_it() {
         let mut w = watching_odablock();
-        w.heard(
-            "odablock",
-            Speaker {
-                nick: "someone".into(),
-                user_id: None,
-                badge: None,
-            },
-        );
-        assert_eq!(
-            w.roster("odablock").len(),
-            1,
-            "somebody was heard to begin with"
-        );
+        w.heard("odablock", Speaker { nick: "someone".into(), user_id: None, badge: None });
+        assert_eq!(w.roster("odablock").len(), 1, "somebody was heard to begin with");
         w.remove("odablock");
         assert!(w.roster("odablock").is_empty());
     }
@@ -1301,15 +1002,11 @@ mod tests {
     fn half_a_reply_is_no_reply() {
         // An empty quote above a message reads as something failing to load,
         // which is worse than showing the message plainly.
-        let no_sender: ReplyMetadata = serde_json::from_value(
-            serde_json::json!({ "original_message": { "id": "x", "content": "y" } }),
-        )
-        .unwrap();
+        let no_sender: ReplyMetadata =
+            serde_json::from_value(serde_json::json!({ "original_message": { "id": "x", "content": "y" } })).unwrap();
         assert!(reply_preview(Some(&no_sender)).is_none());
-        let no_message: ReplyMetadata = serde_json::from_value(
-            serde_json::json!({ "original_sender": { "username": "Greg" } }),
-        )
-        .unwrap();
+        let no_message: ReplyMetadata =
+            serde_json::from_value(serde_json::json!({ "original_sender": { "username": "Greg" } })).unwrap();
         assert!(reply_preview(Some(&no_message)).is_none());
     }
 
@@ -1317,9 +1014,7 @@ mod tests {
     fn reads_a_redemption() {
         let p = serde_json::json!({ "username": "GayHayride", "reward_title": "CAT PATS", "user_input": "" });
         assert_eq!(
-            describe_action("App\\Events\\RewardRedeemedEvent", &p)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("App\\Events\\RewardRedeemedEvent", &p).map(|(_, line)| line).as_deref(),
             Some("GayHayride redeemed CAT PATS")
         );
     }
@@ -1330,9 +1025,7 @@ mod tests {
         // takes input at all.
         let p = serde_json::json!({ "username": "Hecklephish", "reward_title": "CAT TREATS", "user_input": "for Mittens" });
         assert_eq!(
-            describe_action("App\\Events\\RewardRedeemedEvent", &p)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("App\\Events\\RewardRedeemedEvent", &p).map(|(_, line)| line).as_deref(),
             Some("Hecklephish redeemed CAT TREATS: for Mittens")
         );
     }
@@ -1340,37 +1033,16 @@ mod tests {
     #[test]
     fn reads_subscriptions_and_gifts_and_raids() {
         let subbed = serde_json::json!({ "username": "someone", "months": 1 });
-        assert_eq!(
-            describe_action("SubscriptionEvent", &subbed)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("someone subscribed")
-        );
+        assert_eq!(describe_action("SubscriptionEvent", &subbed).map(|(_, l)| l).as_deref(), Some("someone subscribed"));
 
         let resub = serde_json::json!({ "username": "someone", "months": 7 });
-        assert_eq!(
-            describe_action("SubscriptionEvent", &resub)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("someone subscribed - 7 months")
-        );
+        assert_eq!(describe_action("SubscriptionEvent", &resub).map(|(_, l)| l).as_deref(), Some("someone subscribed - 7 months"));
 
-        let gifts =
-            serde_json::json!({ "gifter_username": "big", "gifted_usernames": ["a", "b", "c"] });
-        assert_eq!(
-            describe_action("GiftedSubscriptionsEvent", &gifts)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("big gifted 3 subscriptions")
-        );
+        let gifts = serde_json::json!({ "gifter_username": "big", "gifted_usernames": ["a", "b", "c"] });
+        assert_eq!(describe_action("GiftedSubscriptionsEvent", &gifts).map(|(_, l)| l).as_deref(), Some("big gifted 3 subscriptions"));
 
         let raid = serde_json::json!({ "host_username": "friend", "number_viewers": 42 });
-        assert_eq!(
-            describe_action("StreamHostEvent", &raid)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("friend raided with 42 viewers")
-        );
+        assert_eq!(describe_action("StreamHostEvent", &raid).map(|(_, l)| l).as_deref(), Some("friend raided with 42 viewers"));
     }
 
     #[test]
@@ -1379,12 +1051,7 @@ mod tests {
         // whose shape has moved on should be skipped rather than reported with
         // a hole in it.
         let nested = serde_json::json!({ "sender": { "username": "nested" }, "reward_title": "X" });
-        assert_eq!(
-            describe_action("RewardRedeemedEvent", &nested)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("nested redeemed X")
-        );
+        assert_eq!(describe_action("RewardRedeemedEvent", &nested).map(|(_, l)| l).as_deref(), Some("nested redeemed X"));
 
         let nameless = serde_json::json!({ "reward_title": "X" });
         assert_eq!(describe_action("RewardRedeemedEvent", &nameless), None);
@@ -1396,14 +1063,8 @@ mod tests {
         // These two are handled in the frame loop rather than here - one
         // removes a message and the other reports a chat mode - so this is
         // still the right answer for both.
-        assert_eq!(
-            describe_action("App\\Events\\MessageDeletedEvent", &p),
-            None
-        );
-        assert_eq!(
-            describe_action("App\\Events\\ChatroomUpdatedEvent", &p),
-            None
-        );
+        assert_eq!(describe_action("App\\Events\\MessageDeletedEvent", &p), None);
+        assert_eq!(describe_action("App\\Events\\ChatroomUpdatedEvent", &p), None);
     }
 
     #[test]
@@ -1415,21 +1076,13 @@ mod tests {
         // what reported the same person subscribing twice.
         let sub = serde_json::json!({ "chatroom_id": 2393554, "username": "doni433", "months": 1 });
         assert_eq!(
-            describe_action("App\\Events\\SubscriptionEvent", &sub)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("App\\Events\\SubscriptionEvent", &sub).map(|(_, line)| line).as_deref(),
             Some("doni433 subscribed")
         );
         let same = serde_json::json!({ "user_ids": [584331], "username": "doni433", "channel_id": 2401072 });
-        assert_eq!(
-            describe_action("App\\Events\\ChannelSubscriptionEvent", &same),
-            None
-        );
+        assert_eq!(describe_action("App\\Events\\ChannelSubscriptionEvent", &same), None);
         let info = serde_json::json!({ "message": { "action": "subscribe" }, "user": { "username": "doni433" } });
-        assert_eq!(
-            describe_action("App\\Events\\ChatMessageSentEvent", &info),
-            None
-        );
+        assert_eq!(describe_action("App\\Events\\ChatMessageSentEvent", &info), None);
     }
 
     #[test]
@@ -1440,37 +1093,23 @@ mod tests {
             "expires_at": "2026-09-02T04:00:00Z"
         });
         assert_eq!(
-            describe_action("App\\Events\\UserBannedEvent", &timeout)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("App\\Events\\UserBannedEvent", &timeout).map(|(_, line)| line).as_deref(),
             Some("someone was timed out by amod")
         );
 
         // No expiry is a ban, which is the difference worth reporting.
         let ban = serde_json::json!({ "user": { "username": "someone" }, "banned_by": { "username": "amod" } });
         assert_eq!(
-            describe_action("App\\Events\\UserBannedEvent", &ban)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("App\\Events\\UserBannedEvent", &ban).map(|(_, line)| line).as_deref(),
             Some("someone was banned by amod")
         );
 
         // A moderator who did not name themselves still produces a line.
         let anonymous = serde_json::json!({ "user": { "username": "someone" } });
-        assert_eq!(
-            describe_action("UserBannedEvent", &anonymous)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("someone was banned")
-        );
+        assert_eq!(describe_action("UserBannedEvent", &anonymous).map(|(_, l)| l).as_deref(), Some("someone was banned"));
 
         assert_eq!(
-            describe_action(
-                "App\\Events\\UserUnbannedEvent",
-                &serde_json::json!({ "user": { "username": "someone" } })
-            )
-            .map(|(_, l)| l)
-            .as_deref(),
+            describe_action("App\\Events\\UserUnbannedEvent", &serde_json::json!({ "user": { "username": "someone" } })).map(|(_, l)| l).as_deref(),
             Some("someone is allowed back")
         );
     }
@@ -1487,9 +1126,7 @@ mod tests {
             "gifted_total": 5
         });
         assert_eq!(
-            describe_action("GiftedSubscriptionsEvent", &p)
-                .map(|(_, line)| line)
-                .as_deref(),
+            describe_action("GiftedSubscriptionsEvent", &p).map(|(_, line)| line).as_deref(),
             Some("ItsDez gifted 5 subscriptions")
         );
     }
@@ -1506,16 +1143,9 @@ mod tests {
         assert_eq!(card.kind.as_deref(), Some("gift-sub"));
         assert_eq!(card.author.as_deref(), Some("ItsDez"));
         assert_eq!(card.title.as_deref(), Some("3"));
-        assert_eq!(
-            card.description.as_deref(),
-            Some("Interstelar\nRon_OSRS\nAuzzzii")
-        );
+        assert_eq!(card.description.as_deref(), Some("Interstelar\nRon_OSRS\nAuzzzii"));
         // One with no names - the count alone - is still a card.
-        let bare = action_card(
-            "GiftedSubscriptionsEvent",
-            &serde_json::json!({ "gifter_username": "a", "gifted_total": 10 }),
-        )
-        .unwrap();
+        let bare = action_card("GiftedSubscriptionsEvent", &serde_json::json!({ "gifter_username": "a", "gifted_total": 10 })).unwrap();
         assert_eq!(bare.title.as_deref(), Some("10"));
         assert_eq!(bare.description, None);
     }
@@ -1526,10 +1156,7 @@ mod tests {
             "sender": { "id": 7, "username": "Currington" },
             "gift": { "amount": 100, "name": "Full Send", "tier": "BASIC", "message": "lets go" }
         });
-        assert_eq!(
-            describe_action("KicksGifted", &nested),
-            Some(("kicks", "Currington sent 100 Kicks".to_string()))
-        );
+        assert_eq!(describe_action("KicksGifted", &nested), Some(("kicks", "Currington sent 100 Kicks".to_string())));
         let card = action_card("App\\Events\\KicksGifted", &nested).unwrap();
         assert_eq!(card.kind.as_deref(), Some("kicks"));
         assert_eq!(card.author.as_deref(), Some("Currington"));
@@ -1539,30 +1166,11 @@ mod tests {
         assert_eq!(card.color, Some(0x53FC18));
         // One Kick is singular, and a flat shape reads the same.
         let flat = serde_json::json!({ "username": "a", "amount": "1", "message": "hi" });
-        assert_eq!(
-            describe_action("KicksGifted", &flat)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("a sent 1 Kick")
-        );
-        assert_eq!(
-            action_card("KicksGifted", &flat)
-                .unwrap()
-                .description
-                .as_deref(),
-            Some("hi")
-        );
+        assert_eq!(describe_action("KicksGifted", &flat).map(|(_, l)| l).as_deref(), Some("a sent 1 Kick"));
+        assert_eq!(action_card("KicksGifted", &flat).unwrap().description.as_deref(), Some("hi"));
         // Nobody, or nothing, is not a gift.
-        assert!(describe_action(
-            "KicksGifted",
-            &serde_json::json!({ "gift": { "amount": 5 } })
-        )
-        .is_none());
-        assert!(describe_action(
-            "KicksGifted",
-            &serde_json::json!({ "sender": { "username": "a" }, "gift": { "amount": 0 } })
-        )
-        .is_none());
+        assert!(describe_action("KicksGifted", &serde_json::json!({ "gift": { "amount": 5 } })).is_none());
+        assert!(describe_action("KicksGifted", &serde_json::json!({ "sender": { "username": "a" }, "gift": { "amount": 0 } })).is_none());
     }
 
     #[test]
@@ -1574,12 +1182,7 @@ mod tests {
             "gift": { "gift_id": "full_send", "name": "Full Send", "amount": 100, "type": "BASIC", "tier": "BASIC", "character_limit": 0, "pinned_time": 0 },
             "created_at": "2026-10-11T00:42:57.551767966Z"
         });
-        assert_eq!(
-            describe_action("KicksGifted", &p)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("BlestRS sent 100 Kicks")
-        );
+        assert_eq!(describe_action("KicksGifted", &p).map(|(_, l)| l).as_deref(), Some("BlestRS sent 100 Kicks"));
         let card = action_card("KicksGifted", &p).unwrap();
         assert_eq!(card.author.as_deref(), Some("BlestRS"));
         assert_eq!(card.author_color.as_deref(), Some("#FF2C56"));
@@ -1599,28 +1202,14 @@ mod tests {
     fn a_raid_is_one_card_and_a_redeem_keeps_its_colour() {
         let raid = serde_json::json!({ "chatroom_id": 1, "optional_message": null, "number_viewers": 25, "host_username": "kreationX" });
         let card = action_card("App\\Events\\StreamHostEvent", &raid).unwrap();
-        assert_eq!(
-            (
-                card.kind.as_deref(),
-                card.author.as_deref(),
-                card.title.as_deref()
-            ),
-            (Some("raid"), Some("kreationX"), Some("25"))
-        );
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("raid"), Some("kreationX"), Some("25")));
         // The same raid, said again on another subscription, is not another line.
         let again = serde_json::json!({ "message": { "numberOfViewers": 25 }, "user": { "username": "kreationX" } });
         assert!(describe_action("App\\Events\\StreamHostedEvent", &again).is_none());
 
         let redeem = serde_json::json!({ "reward_title": "5 TONGUE TWISTERS", "user_id": 1, "username": "onkhell", "user_input": "", "reward_background_color": "#FF55B3" });
         let card = action_card("RewardRedeemedEvent", &redeem).unwrap();
-        assert_eq!(
-            (
-                card.kind.as_deref(),
-                card.author.as_deref(),
-                card.title.as_deref()
-            ),
-            (Some("redeem"), Some("onkhell"), Some("5 TONGUE TWISTERS"))
-        );
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("redeem"), Some("onkhell"), Some("5 TONGUE TWISTERS")));
         assert_eq!(card.color, Some(0xFF55B3));
         assert_eq!(card.description, None);
     }
@@ -1637,82 +1226,34 @@ mod tests {
             "created_at": "2026-10-11T00:42:57.551767966Z"
         });
         for _ in 0..2 {
-            handle_event(
-                &state,
-                "kick:tester",
-                &mut watched,
-                "KicksGifted",
-                Some("channel_2401072"),
-                kicks.clone(),
-            )
-            .unwrap();
+            handle_event(&state, "kick:tester", &mut watched, "KicksGifted", Some("channel_2401072"), kicks.clone()).unwrap();
         }
         let gift = serde_json::json!({ "chatroom_id": 2393554, "gifted_usernames": ["a", "b"], "gifter_username": "kufallen", "gifted_total": 2 });
-        handle_event(
-            &state,
-            "kick:tester",
-            &mut watched,
-            "GiftedSubscriptionsEvent",
-            Some("chatroom_2393554"),
-            gift,
-        )
-        .unwrap();
+        handle_event(&state, "kick:tester", &mut watched, "GiftedSubscriptionsEvent", Some("chatroom_2393554"), gift).unwrap();
 
-        let rows = state
-            .store
-            .get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50)
-            .unwrap();
+        let rows = state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).unwrap();
         // The same gift on two subscriptions is one row.
-        assert_eq!(
-            rows.len(),
-            2,
-            "{:?}",
-            rows.iter().map(|m| &m.body).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            (rows[0].kind.as_str(), rows[0].body.as_str()),
-            ("kicks", "BlestRS sent 100 Kicks")
-        );
+        assert_eq!(rows.len(), 2, "{:?}", rows.iter().map(|m| &m.body).collect::<Vec<_>>());
+        assert_eq!((rows[0].kind.as_str(), rows[0].body.as_str()), ("kicks", "BlestRS sent 100 Kicks"));
         assert_eq!(rows[0].embeds[0].kind.as_deref(), Some("kicks"));
         assert_eq!(rows[0].embeds[0].author_color.as_deref(), Some("#FF2C56"));
-        assert_eq!(
-            (rows[1].kind.as_str(), rows[1].body.as_str()),
-            ("sub", "kufallen gifted 2 subscriptions")
-        );
+        assert_eq!((rows[1].kind.as_str(), rows[1].body.as_str()), ("sub", "kufallen gifted 2 subscriptions"));
         assert_eq!(rows[1].embeds[0].description.as_deref(), Some("a\nb"));
     }
 
     fn spoken(state: &AppState, watched: &mut Watched, id: &str, text: &str) {
-        feed(
-            state,
-            watched,
-            "App\\Events\\ChatMessageEvent",
-            serde_json::json!({
-                "id": id, "chatroom_id": 2393554, "content": text, "sender": { "id": 9, "username": "bob", "identity": null }
-            }),
-        );
+        feed(state, watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": id, "chatroom_id": 2393554, "content": text, "sender": { "id": 9, "username": "bob", "identity": null }
+        }));
     }
 
     #[tokio::test]
     async fn going_live_and_ending_are_said_in_the_channel() {
         let state = testkit::simulated_daemon("live-lines");
         let mut watched = testkit::watching_odablock();
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\StreamerIsLive",
-            serde_json::json!({}),
-        );
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\StopStreamBroadcast",
-            serde_json::json!({}),
-        );
-        assert_eq!(
-            testkit::lines(&state, "odablock"),
-            vec!["went live", "ended the stream"]
-        );
+        feed(&state, &mut watched, "App\\Events\\StreamerIsLive", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\StopStreamBroadcast", serde_json::json!({}));
+        assert_eq!(testkit::lines(&state, "odablock"), vec!["went live", "ended the stream"]);
     }
 
     #[test]
@@ -1723,18 +1264,8 @@ mod tests {
         spoken(&state, &mut watched, "nested", "goes");
         spoken(&state, &mut watched, "flat", "goes too");
         // Kick nests the id under `message` on one event and sends it flat on another.
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\MessageDeletedEvent",
-            serde_json::json!({ "message": { "id": "nested" } }),
-        );
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\MessageDeletedEvent",
-            serde_json::json!({ "id": "flat" }),
-        );
+        feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "message": { "id": "nested" } }));
+        feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "id": "flat" }));
         assert_eq!(testkit::lines(&state, "odablock"), vec!["stays"]);
     }
 
@@ -1742,16 +1273,8 @@ mod tests {
     fn a_moderator_emptying_the_room_is_said() {
         let state = testkit::simulated_daemon("cleared");
         let mut watched = testkit::watching_odablock();
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\ChatroomClearEvent",
-            serde_json::json!({}),
-        );
-        assert_eq!(
-            testkit::lines(&state, "odablock"),
-            vec!["a moderator cleared the chat"]
-        );
+        feed(&state, &mut watched, "App\\Events\\ChatroomClearEvent", serde_json::json!({}));
+        assert_eq!(testkit::lines(&state, "odablock"), vec!["a moderator cleared the chat"]);
     }
 
     #[test]
@@ -1759,49 +1282,23 @@ mod tests {
         let state = testkit::simulated_daemon("chat-modes");
         let mut watched = testkit::watching_odablock();
         let buffer = crate::model::buffer_id("kick:tester", "odablock");
-        state.runtime.set_kick_channel(
-            &buffer,
-            crate::runtime::KickChannel {
-                slug: "odablock".into(),
-                channel_id: 2401072,
-                history_cursor: None,
-                chatroom_id: 2393554,
-                subscribed: false,
-                followers_only: false,
-                subscribers_only: false,
-                slow_seconds: None,
-                emotes: Vec::new(),
-            },
-        );
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\ChatroomUpdatedEvent",
-            serde_json::json!({
-                "followers_mode": { "enabled": true },
-                "subscribers_mode": { "enabled": false },
-                "slow_mode": { "enabled": true, "message_interval": 30 }
-            }),
-        );
+        state.runtime.set_kick_channel(&buffer, crate::runtime::KickChannel {
+            slug: "odablock".into(), channel_id: 2401072, history_cursor: None, chatroom_id: 2393554, subscribed: false,
+            followers_only: false, subscribers_only: false, slow_seconds: None, emotes: Vec::new(),
+        });
+        feed(&state, &mut watched, "App\\Events\\ChatroomUpdatedEvent", serde_json::json!({
+            "followers_mode": { "enabled": true },
+            "subscribers_mode": { "enabled": false },
+            "slow_mode": { "enabled": true, "message_interval": 30 }
+        }));
         let now = state.runtime.kick_channel(&buffer).unwrap();
-        assert_eq!(
-            (now.followers_only, now.subscribers_only, now.slow_seconds),
-            (true, false, Some(30))
-        );
+        assert_eq!((now.followers_only, now.subscribers_only, now.slow_seconds), (true, false, Some(30)));
         // A slow mode that is switched off has no interval, whatever it still says.
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\ChatroomUpdatedEvent",
-            serde_json::json!({
-                "subscribers_mode": { "enabled": true }, "slow_mode": { "enabled": false, "message_interval": 30 }
-            }),
-        );
+        feed(&state, &mut watched, "App\\Events\\ChatroomUpdatedEvent", serde_json::json!({
+            "subscribers_mode": { "enabled": true }, "slow_mode": { "enabled": false, "message_interval": 30 }
+        }));
         let now = state.runtime.kick_channel(&buffer).unwrap();
-        assert_eq!(
-            (now.followers_only, now.subscribers_only, now.slow_seconds),
-            (false, true, None)
-        );
+        assert_eq!((now.followers_only, now.subscribers_only, now.slow_seconds), (false, true, None));
     }
 
     #[test]
@@ -1809,32 +1306,14 @@ mod tests {
         let state = testkit::simulated_daemon("pins");
         let mut watched = testkit::watching_odablock();
         let buffer = crate::model::buffer_id("kick:tester", "odablock");
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\PinnedMessageCreatedEvent",
-            serde_json::json!({
-                "message": { "id": "p1", "content": "read the rules", "sender": { "username": "mod" } }
-            }),
-        );
-        assert_eq!(
-            state.runtime.kick_pin(&buffer).map(|p| p.body),
-            Some("read the rules".to_string())
-        );
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageCreatedEvent", serde_json::json!({
+            "message": { "id": "p1", "content": "read the rules", "sender": { "username": "mod" } }
+        }));
+        assert_eq!(state.runtime.kick_pin(&buffer).map(|p| p.body), Some("read the rules".to_string()));
         // An event about a pin that says nothing readable leaves the pin up.
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\PinnedMessageCreatedEvent",
-            serde_json::json!({}),
-        );
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageCreatedEvent", serde_json::json!({}));
         assert!(state.runtime.kick_pin(&buffer).is_some());
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\PinnedMessageDeletedEvent",
-            serde_json::json!({}),
-        );
+        feed(&state, &mut watched, "App\\Events\\PinnedMessageDeletedEvent", serde_json::json!({}));
         assert!(state.runtime.kick_pin(&buffer).is_none());
     }
 
@@ -1850,62 +1329,25 @@ mod tests {
     #[test]
     fn a_raid_with_nobody_in_it_says_only_that_it_came() {
         let none = serde_json::json!({ "host_username": "friend", "number_viewers": 0 });
-        assert_eq!(
-            describe_action("StreamHostEvent", &none)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("friend raided the channel")
-        );
+        assert_eq!(describe_action("StreamHostEvent", &none).map(|(_, l)| l).as_deref(), Some("friend raided the channel"));
         let one = serde_json::json!({ "host_username": "friend", "number_viewers": 1 });
-        assert_eq!(
-            describe_action("StreamHostEvent", &one)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("friend raided with 1 viewer")
-        );
-        assert_eq!(
-            action_card("StreamHostEvent", &none).unwrap().title,
-            None,
-            "no count to put on the card"
-        );
+        assert_eq!(describe_action("StreamHostEvent", &one).map(|(_, l)| l).as_deref(), Some("friend raided with 1 viewer"));
+        assert_eq!(action_card("StreamHostEvent", &none).unwrap().title, None, "no count to put on the card");
     }
 
     #[test]
     fn a_sender_is_drawn_in_their_colour_with_the_badges_that_say_something() {
-        let badge = |kind: &str| api::Badge {
-            kind: kind.into(),
-            text: kind.into(),
-            count: None,
-        };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
         assert_eq!(style_of(None).color, None);
         let style = style_of(Some(&api::ChatIdentity {
             color: Some("#75FD46".into()),
-            badges: vec![
-                badge("moderator"),
-                badge("level"),
-                badge(""),
-                badge("subscriber"),
-            ],
+            badges: vec![badge("moderator"), badge("level"), badge(""), badge("subscriber")],
         }));
         assert_eq!(style.color.as_deref(), Some("#75FD46"));
         // An engagement level and a nameless badge say nothing about the person.
-        assert_eq!(
-            style
-                .badges
-                .iter()
-                .map(|b| b.kind.as_str())
-                .collect::<Vec<_>>(),
-            vec!["moderator", "subscriber"]
-        );
+        assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "subscriber"]);
         // A colour that is empty is no colour.
-        assert_eq!(
-            style_of(Some(&api::ChatIdentity {
-                color: Some(String::new()),
-                badges: vec![]
-            }))
-            .color,
-            None
-        );
+        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), badges: vec![] })).color, None);
     }
 
     #[test]
@@ -1915,23 +1357,10 @@ mod tests {
             "original_message": { "id": "abc", "content": "hello" }
         });
         let preview = reply_preview_from_value(Some(&whole)).unwrap();
-        assert_eq!(
-            (
-                preview.id.as_str(),
-                preview.from.as_str(),
-                preview.body.as_str()
-            ),
-            ("abc", "Greg", "hello")
-        );
+        assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.body.as_str()), ("abc", "Greg", "hello"));
         // Half of one is a hole above the message, and is left out.
-        assert!(reply_preview_from_value(Some(
-            &serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } })
-        ))
-        .is_none());
-        assert!(reply_preview_from_value(Some(
-            &serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } })
-        ))
-        .is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } }))).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } }))).is_none());
         assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } }))).is_none());
         assert!(reply_preview_from_value(None).is_none());
         assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata"))).is_none());
@@ -1940,69 +1369,22 @@ mod tests {
     #[test]
     fn every_kind_of_kick_event_is_a_card() {
         let sub = serde_json::json!({ "username": "bigkhernandez", "months": 21 });
-        assert_eq!(
-            describe_action("SubscriptionEvent", &sub)
-                .map(|(_, l)| l)
-                .as_deref(),
-            Some("bigkhernandez subscribed - 21 months")
-        );
+        assert_eq!(describe_action("SubscriptionEvent", &sub).map(|(_, l)| l).as_deref(), Some("bigkhernandez subscribed - 21 months"));
         let card = action_card("SubscriptionEvent", &sub).unwrap();
-        assert_eq!(
-            (
-                card.kind.as_deref(),
-                card.author.as_deref(),
-                card.title.as_deref()
-            ),
-            (Some("subscribe"), Some("bigkhernandez"), Some("21"))
-        );
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref()), (Some("subscribe"), Some("bigkhernandez"), Some("21")));
         // The first month has none to say.
-        assert_eq!(
-            action_card(
-                "SubscriptionEvent",
-                &serde_json::json!({ "username": "x", "months": 1 })
-            )
-            .unwrap()
-            .title,
-            None
-        );
-        assert_eq!(
-            action_card("SubscriptionEvent", &serde_json::json!({ "username": "x" }))
-                .unwrap()
-                .title,
-            None
-        );
+        assert_eq!(action_card("SubscriptionEvent", &serde_json::json!({ "username": "x", "months": 1 })).unwrap().title, None);
+        assert_eq!(action_card("SubscriptionEvent", &serde_json::json!({ "username": "x" })).unwrap().title, None);
 
         let ban = serde_json::json!({ "user": { "username": "troll" }, "banned_by": { "username": "mod" } });
         let card = action_card("App\\Events\\UserBannedEvent", &ban).unwrap();
-        assert_eq!(
-            (
-                card.kind.as_deref(),
-                card.author.as_deref(),
-                card.title.as_deref(),
-                card.description.as_deref()
-            ),
-            (
-                Some("moderation"),
-                Some("troll"),
-                Some("was banned"),
-                Some("mod")
-            )
-        );
+        assert_eq!((card.kind.as_deref(), card.author.as_deref(), card.title.as_deref(), card.description.as_deref()),
+            (Some("moderation"), Some("troll"), Some("was banned"), Some("mod")));
         let timeout = serde_json::json!({ "user": { "username": "troll" }, "expires_at": "2026-10-11T00:10:00Z" });
         let card = action_card("UserBannedEvent", &timeout).unwrap();
-        assert_eq!(
-            (card.title.as_deref(), card.description.as_deref()),
-            (Some("was timed out"), None)
-        );
-        let back = action_card(
-            "UserUnbannedEvent",
-            &serde_json::json!({ "user": { "username": "troll" } }),
-        )
-        .unwrap();
-        assert_eq!(
-            (back.author.as_deref(), back.title.as_deref()),
-            (Some("troll"), Some("is allowed back"))
-        );
+        assert_eq!((card.title.as_deref(), card.description.as_deref()), (Some("was timed out"), None));
+        let back = action_card("UserUnbannedEvent", &serde_json::json!({ "user": { "username": "troll" } })).unwrap();
+        assert_eq!((back.author.as_deref(), back.title.as_deref()), (Some("troll"), Some("is allowed back")));
         // Nobody named is nobody to draw a card about.
         assert!(action_card("UserBannedEvent", &serde_json::json!({})).is_none());
     }
@@ -2011,53 +1393,18 @@ mod tests {
     async fn the_stream_and_the_room_are_cards_too() {
         let state = testkit::simulated_daemon("event-cards");
         let mut watched = testkit::watching_odablock();
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\StreamerIsLive",
-            serde_json::json!({}),
-        );
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\StopStreamBroadcast",
-            serde_json::json!({}),
-        );
-        feed(
-            &state,
-            &mut watched,
-            "App\\Events\\ChatroomClearEvent",
-            serde_json::json!({}),
-        );
-        feed(
-            &state,
-            &mut watched,
-            "SubscriptionEvent",
-            serde_json::json!({ "username": "newcomer", "months": 3 }),
-        );
-        let rows = state
-            .store
-            .get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50)
-            .unwrap();
-        let cards: Vec<_> = rows
-            .iter()
-            .map(|m| {
-                (
-                    m.kind.as_str(),
-                    m.embeds[0].kind.as_deref().unwrap(),
-                    m.embeds[0].title.as_deref().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            cards,
-            vec![
-                ("stream", "stream", "went live"),
-                ("stream", "stream", "ended the stream"),
-                ("moderation", "moderation", "cleared the chat"),
-                ("sub", "subscribe", "3"),
-            ]
-        );
+        feed(&state, &mut watched, "App\\Events\\StreamerIsLive", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\StopStreamBroadcast", serde_json::json!({}));
+        feed(&state, &mut watched, "App\\Events\\ChatroomClearEvent", serde_json::json!({}));
+        feed(&state, &mut watched, "SubscriptionEvent", serde_json::json!({ "username": "newcomer", "months": 3 }));
+        let rows = state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).unwrap();
+        let cards: Vec<_> = rows.iter().map(|m| (m.kind.as_str(), m.embeds[0].kind.as_deref().unwrap(), m.embeds[0].title.as_deref().unwrap())).collect();
+        assert_eq!(cards, vec![
+            ("stream", "stream", "went live"),
+            ("stream", "stream", "ended the stream"),
+            ("moderation", "moderation", "cleared the chat"),
+            ("sub", "subscribe", "3"),
+        ]);
         assert_eq!(rows[0].embeds[0].icon.as_deref(), Some("live"));
         assert_eq!(rows[1].embeds[0].icon.as_deref(), Some("offline"));
         assert_eq!(rows[0].embeds[0].author.as_deref(), Some("odablock"));

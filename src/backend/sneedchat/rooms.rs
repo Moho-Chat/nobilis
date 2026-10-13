@@ -12,30 +12,22 @@ use super::*;
 /// else - no join date, no rank, no last seen. What it does carry is the id,
 /// and the id is a link to the forum profile where all of that lives, so that
 /// is what this offers rather than inventing the rest.
-pub fn profile(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    username: &str,
-) -> serde_json::Value {
+pub fn profile(state: &AppState, account_id: &str, buffer_id: &str, username: &str) -> serde_json::Value {
     let mut profile = crate::profile::pending("sneedchat", account_id, username);
     profile["pending"] = serde_json::json!(false);
 
     // The roster the room already has: their id and picture are in it.
     if let Some(members) = state.runtime.get_presence(buffer_id) {
-        if let Some(member) = members.as_array().into_iter().flatten().find(|m| {
-            m["nick"]
-                .as_str()
-                .is_some_and(|n| n.eq_ignore_ascii_case(username))
-        }) {
+        if let Some(member) = members
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["nick"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(username)))
+        {
             if let Some(id) = member["userId"].as_str() {
                 profile["id"] = serde_json::json!(id);
                 if let Some(config) = state.accounts.get_sneedchat(account_id) {
-                    crate::profile::note(
-                        &mut profile,
-                        "Profile",
-                        format!("https://{}/members/{id}", config.site_host()),
-                    );
+                    crate::profile::note(&mut profile, "Profile", format!("https://{}/members/{id}", config.site_host()));
                 }
             }
             if let Some(avatar) = member["avatarUrl"].as_str() {
@@ -77,17 +69,10 @@ pub fn refresh_rooms(state: AppState, account_id: String) {
 }
 
 pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedChatRoom>> {
-    let config = state
-        .accounts
-        .get_sneedchat(account_id)
-        .ok_or_else(|| anyhow!("no such account"))?;
+    let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let transport = build_transport(state, &config, account_id).await?;
     let host = config.site_host();
-    let session = Session::new(
-        transport,
-        format!("https://{host}"),
-        DEFAULT_USER_AGENT.to_string(),
-    );
+    let session = Session::new(transport, format!("https://{host}"), DEFAULT_USER_AGENT.to_string());
     restore_session(&session, &config);
     read_catalogue(&session, &host).await
 }
@@ -99,10 +84,7 @@ pub async fn list_rooms(state: &AppState, account_id: &str) -> Result<Vec<SneedC
 /// and without Tor that address cannot be reached.
 pub(super) async fn read_catalogue(session: &Session, host: &str) -> Result<Vec<SneedChatRoom>> {
     let url = format!("https://{host}/test-chat");
-    let resp = session
-        .fetch(&url)
-        .await
-        .context("fetching the chat page")?;
+    let resp = session.fetch(&url).await.context("fetching the chat page")?;
     if !(200..400).contains(&resp.status) {
         bail!("the chat page answered HTTP {}", resp.status);
     }
@@ -116,9 +98,7 @@ pub(super) async fn read_catalogue(session: &Session, host: &str) -> Result<Vec<
 /// Keeps the catalogue and tells the window, which draws the Join page's list
 /// from it.
 pub(super) fn publish_catalogue(state: &AppState, account_id: &str, rooms: &[SneedChatRoom]) {
-    state
-        .runtime
-        .set_sneedchat_room_catalogue(account_id, rooms.to_vec());
+    state.runtime.set_sneedchat_room_catalogue(account_id, rooms.to_vec());
     state.events.emit(
         "sneedchatRooms",
         serde_json::json!({
@@ -132,11 +112,7 @@ pub(super) fn publish_catalogue(state: &AppState, account_id: &str, rooms: &[Sne
 /// calls general, or else the first it lists. From the site's own list, so
 /// nothing here assumes what the site's rooms are called or numbered.
 pub(super) fn courtesy_room(catalogue: &[SneedChatRoom]) -> Option<SneedChatRoom> {
-    catalogue
-        .iter()
-        .find(|r| r.name == "general")
-        .or_else(|| catalogue.first())
-        .cloned()
+    catalogue.iter().find(|r| r.name == "general").or_else(|| catalogue.first()).cloned()
 }
 
 /// The room switcher, out of the chat page's markup.
@@ -148,20 +124,10 @@ pub(super) fn courtesy_room(catalogue: &[SneedChatRoom]) -> Option<SneedChatRoom
 pub(super) fn parse_rooms(html: &str) -> Vec<SneedChatRoom> {
     let mut rooms = Vec::new();
     for chunk in html.split("class=\"chat-room\"").skip(1) {
-        let Some(id) = chunk
-            .split("data-id=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-        else {
-            continue;
-        };
+        let Some(id) = chunk.split("data-id=\"").nth(1).and_then(|rest| rest.split('"').next()) else { continue };
         let Ok(id) = id.parse::<u32>() else { continue };
         // The link's own text, which is the room's name as the site writes it.
-        let Some(label) = chunk
-            .split_once('>')
-            .map(|(_, rest)| rest)
-            .and_then(|rest| rest.split('<').next())
-        else {
+        let Some(label) = chunk.split_once('>').map(|(_, rest)| rest).and_then(|rest| rest.split('<').next()) else {
             continue;
         };
         let name = slug(label);
@@ -217,18 +183,9 @@ pub(super) mod room_list_tests {
     fn a_new_account_opens_the_room_the_site_calls_general() {
         use crate::accounts::SneedChatRoom;
         use crate::backend::sneedchat::rooms::courtesy_room;
-        let room = |id: u32, name: &str| SneedChatRoom {
-            id,
-            name: name.to_string(),
-        };
-        assert_eq!(
-            courtesy_room(&[room(16, "fishtank"), room(7, "general")]),
-            Some(room(7, "general"))
-        );
-        assert_eq!(
-            courtesy_room(&[room(16, "fishtank"), room(19, "sports")]),
-            Some(room(16, "fishtank"))
-        );
+        let room = |id: u32, name: &str| SneedChatRoom { id, name: name.to_string() };
+        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(7, "general")]), Some(room(7, "general")));
+        assert_eq!(courtesy_room(&[room(16, "fishtank"), room(19, "sports")]), Some(room(16, "fishtank")));
         assert_eq!(courtesy_room(&[]), None);
     }
 
@@ -263,25 +220,11 @@ pub(super) mod room_list_tests {
 /// room's own permanent connection (see `run_room`). There's no "switch
 /// active room" step needed since every configured room is already
 /// connected simultaneously.
-pub(super) fn room_sender_for_buffer(
-    state: &AppState,
-    account_id: &str,
-    buffer_name: &str,
-) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state
-        .accounts
-        .get_sneedchat(account_id)
-        .ok_or_else(|| anyhow!("no such account"))?;
+pub(super) fn room_sender_for_buffer(state: &AppState, account_id: &str, buffer_name: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
+    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     let room_name = room_name_of(buffer_name);
-    let room = cfg
-        .rooms
-        .iter()
-        .find(|r| r.name == room_name)
-        .ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
-    state
-        .runtime
-        .sneedchat_sender(account_id, room.id)
-        .ok_or_else(|| anyhow!("not currently connected to this room"))
+    let room = cfg.rooms.iter().find(|r| r.name == room_name).ok_or_else(|| anyhow!("\"{buffer_name}\" isn't one of this account's configured rooms"))?;
+    state.runtime.sneedchat_sender(account_id, room.id).ok_or_else(|| anyhow!("not currently connected to this room"))
 }
 
 /// What a room's buffer is called.
@@ -306,19 +249,14 @@ pub(super) fn room_name_of(buffer_name: &str) -> &str {
 /// A whisper belongs to no room, so it does not matter which carries it - but
 /// there has to be one, since the only way to say anything at all is over a
 /// room's socket.
-pub(super) fn any_room_sender(
-    state: &AppState,
-    account_id: &str,
-) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
-    let cfg = state
-        .accounts
-        .get_sneedchat(account_id)
-        .ok_or_else(|| anyhow!("no such account"))?;
+pub(super) fn any_room_sender(state: &AppState, account_id: &str) -> Result<tokio::sync::mpsc::UnboundedSender<String>> {
+    let cfg = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
     cfg.rooms
         .iter()
         .find_map(|r| state.runtime.sneedchat_sender(account_id, r.id))
         .ok_or_else(|| anyhow!("whispers travel over a room's connection - open a room on the Join page to send one"))
 }
+
 
 /// Applies a roster delta to a room and republishes it.
 ///
@@ -367,12 +305,7 @@ pub(super) fn update_roster(
     // over the roster as it is by then and said again.
     let wanted: Vec<(String, String)> = joined
         .iter()
-        .filter_map(|u| {
-            Some((
-                u.id.clone(),
-                u.avatar_url.clone().filter(|a| !a.is_empty())?,
-            ))
-        })
+        .filter_map(|u| Some((u.id.clone(), u.avatar_url.clone().filter(|a| !a.is_empty())?)))
         .collect();
     if !wanted.is_empty() {
         tokio::spawn({
@@ -383,10 +316,7 @@ pub(super) fn update_roster(
 }
 
 /// The roster as last published: who is there, and the picture each has.
-fn published_roster(
-    state: &AppState,
-    buffer_id: &str,
-) -> std::collections::BTreeMap<String, (String, Option<String>)> {
+fn published_roster(state: &AppState, buffer_id: &str) -> std::collections::BTreeMap<String, (String, Option<String>)> {
     state
         .runtime
         .get_presence(buffer_id)
@@ -396,30 +326,15 @@ fn published_roster(
         .filter_map(|m| {
             let id = m.get("userId")?.as_str()?.to_string();
             let nick = m.get("nick")?.as_str()?.to_string();
-            let avatar = m
-                .get("avatarUrl")
-                .and_then(|a| a.as_str())
-                .map(str::to_string);
+            let avatar = m.get("avatarUrl").and_then(|a| a.as_str()).map(str::to_string);
             Some((id, (nick, avatar)))
         })
         .collect()
 }
 
 /// Fetches pictures and puts them on whoever is still in the room.
-async fn add_pictures(
-    state: &AppState,
-    http: &super::http::HttpClient,
-    host: &str,
-    buffer_id: &str,
-    wanted: Vec<(String, String)>,
-) {
-    let found = futures::future::join_all(wanted.iter().map(|(id, raw)| async move {
-        (
-            id.clone(),
-            super::media::cached_avatar_path(http, host, id, raw).await,
-        )
-    }))
-    .await;
+async fn add_pictures(state: &AppState, http: &super::http::HttpClient, host: &str, buffer_id: &str, wanted: Vec<(String, String)>) {
+    let found = futures::future::join_all(wanted.iter().map(|(id, raw)| async move { (id.clone(), super::media::cached_avatar_path(http, host, id, raw).await) })).await;
     // Read afresh: people came and went while these were being fetched, and a
     // roster built from before would bring back whoever has left.
     let mut now = published_roster(state, buffer_id);
@@ -440,17 +355,9 @@ async fn add_pictures(
 /// Orders and publishes a roster: sorted here rather than left to the client,
 /// since every other backend hands over a sorted one and a five-hundred-name
 /// list in map order would be unreadable.
-fn publish_roster(
-    state: &AppState,
-    buffer_id: &str,
-    by_id: &std::collections::BTreeMap<String, (String, Option<String>)>,
-) {
+fn publish_roster(state: &AppState, buffer_id: &str, by_id: &std::collections::BTreeMap<String, (String, Option<String>)>) {
     let mut members: Vec<(&String, &(String, Option<String>))> = by_id.iter().collect();
-    members.sort_by(|(_, (a, _)), (_, (b, _))| {
-        a.to_lowercase()
-            .cmp(&b.to_lowercase())
-            .then_with(|| a.cmp(b))
-    });
+    members.sort_by(|(_, (a, _)), (_, (b, _))| a.to_lowercase().cmp(&b.to_lowercase()).then_with(|| a.cmp(b)));
     let member_list = serde_json::json!(members
         .into_iter()
         .map(|(id, (nick, avatar))| {
@@ -465,10 +372,7 @@ fn publish_roster(
     // the roster from subscribe's replay rather than waiting for the next
     // arrival or departure - which in a quiet room could be a long wait.
     state.runtime.set_presence(buffer_id, member_list.clone());
-    state.events.emit(
-        "presenceChange",
-        serde_json::json!({ "bufferId": buffer_id, "members": member_list }),
-    );
+    state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 #[cfg(test)]
@@ -477,30 +381,14 @@ pub(super) mod buffer_name_tests {
 
     #[test]
     fn knows_its_own_name_either_way_round() {
-        assert!(name_matches(
-            "Ancient Pioneer",
-            "ancientpioneer",
-            "Ancient Pioneer"
-        ));
-        assert!(name_matches(
-            "Ancient Pioneer",
-            "ancientpioneer",
-            "ancientpioneer"
-        ));
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "Ancient Pioneer"));
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "ancientpioneer"));
         // Trimmed and case-insensitive, because the echo is matched against
         // whichever name the site happened to be showing.
-        assert!(name_matches(
-            "Ancient Pioneer",
-            "ancientpioneer",
-            "  ancient pioneer  "
-        ));
+        assert!(name_matches("Ancient Pioneer", "ancientpioneer", "  ancient pioneer  "));
         // Somebody else, which must never match - a false match drops a real
         // whisper instead of a duplicate line.
-        assert!(!name_matches(
-            "Ancient Pioneer",
-            "ancientpioneer",
-            "no-exit"
-        ));
+        assert!(!name_matches("Ancient Pioneer", "ancientpioneer", "no-exit"));
         // An account with no display name set still matches on its login name,
         // and an empty candidate matches nothing.
         assert!(name_matches("", "ancientpioneer", "AncientPioneer"));
@@ -538,55 +426,20 @@ mod roster_tests {
     }
 
     fn user(id: &str, name: &str, avatar: Option<&str>) -> protocol::WireUser {
-        serde_json::from_value(
-            serde_json::json!({ "id": id, "username": name, "avatar_url": avatar }),
-        )
-        .unwrap()
+        serde_json::from_value(serde_json::json!({ "id": id, "username": name, "avatar_url": avatar })).unwrap()
     }
 
     fn members(state: &AppState) -> Vec<(String, Option<String>)> {
-        let list = state
-            .runtime
-            .get_presence(&crate::model::buffer_id(ACCOUNT, "general"))
-            .unwrap();
-        list.as_array()
-            .unwrap()
-            .iter()
-            .map(|m| {
-                (
-                    m["nick"].as_str().unwrap().to_string(),
-                    m["avatarUrl"].as_str().map(str::to_string),
-                )
-            })
-            .collect()
+        let list = state.runtime.get_presence(&crate::model::buffer_id(ACCOUNT, "general")).unwrap();
+        list.as_array().unwrap().iter().map(|m| (m["nick"].as_str().unwrap().to_string(), m["avatarUrl"].as_str().map(str::to_string))).collect()
     }
 
     #[tokio::test]
     async fn the_list_is_published_at_once_with_nobody_waiting_on_a_picture() {
         let state = simulated_daemon("sneedchat-roster-plain");
-        update_roster(
-            &state,
-            &client(),
-            "example.invalid",
-            ACCOUNT,
-            "general",
-            &[user("2", "bob", None), user("1", "Amy", None)],
-            &[],
-        );
-        assert_eq!(
-            members(&state),
-            [("Amy".to_string(), None), ("bob".to_string(), None)],
-            "sorted, and no picture is no picture"
-        );
-        update_roster(
-            &state,
-            &client(),
-            "example.invalid",
-            ACCOUNT,
-            "general",
-            &[],
-            &["2".to_string()],
-        );
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("2", "bob", None), user("1", "Amy", None)], &[]);
+        assert_eq!(members(&state), [("Amy".to_string(), None), ("bob".to_string(), None)], "sorted, and no picture is no picture");
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[], &["2".to_string()]);
         assert_eq!(members(&state).len(), 1);
     }
 
@@ -594,17 +447,12 @@ mod roster_tests {
     async fn picture_server() -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // A PNG's signature and a few more bytes: enough to be sniffed as one.
-        let png: Vec<u8> = vec![
-            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
-            0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0,
-        ];
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0];
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
+                let Ok((mut sock, _)) = listener.accept().await else { return };
                 let png = png.clone();
                 tokio::spawn(async move {
                     let mut buf = [0u8; 2048];
@@ -620,22 +468,13 @@ mod roster_tests {
 
     #[tokio::test]
     async fn pictures_follow_the_list_and_stay_through_later_arrivals() {
-        let dir =
-            std::env::temp_dir().join(format!("nobilis-roster-avatars-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nobilis-roster-avatars-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = Some(dir.clone());
         let base = picture_server().await;
         let state = simulated_daemon("sneedchat-roster-pictures");
 
-        update_roster(
-            &state,
-            &client(),
-            "example.invalid",
-            ACCOUNT,
-            "general",
-            &[user("7", "Amy", Some(&format!("{base}/a.png")))],
-            &[],
-        );
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("7", "Amy", Some(&format!("{base}/a.png")))], &[]);
         // On screen first, without the picture.
         assert_eq!(members(&state), [("Amy".to_string(), None)]);
         let mut with = None;
@@ -650,25 +489,9 @@ mod roster_tests {
         assert!(path.contains("7."), "a file named for the user: {path}");
 
         // Somebody arrives, and Amy keeps hers.
-        update_roster(
-            &state,
-            &client(),
-            "example.invalid",
-            ACCOUNT,
-            "general",
-            &[user("8", "Bob", None)],
-            &[],
-        );
+        update_roster(&state, &client(), "example.invalid", ACCOUNT, "general", &[user("8", "Bob", None)], &[]);
         let list = members(&state);
-        assert_eq!(
-            list.iter()
-                .find(|m| m.0 == "Amy")
-                .unwrap()
-                .1
-                .as_deref()
-                .map(|p| p.contains("7.")),
-            Some(true)
-        );
+        assert_eq!(list.iter().find(|m| m.0 == "Amy").unwrap().1.as_deref().map(|p| p.contains("7.")), Some(true));
         assert_eq!(list.iter().find(|m| m.0 == "Bob").unwrap().1, None);
 
         *crate::backend::sneedchat::media::TEST_CACHE.lock().unwrap() = None;

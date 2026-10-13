@@ -43,9 +43,7 @@ impl StreamKey {
     pub fn parse(key: &str) -> Option<StreamKey> {
         let parts: Vec<&str> = key.split(':').collect();
         match parts.as_slice() {
-            ["guild", guild, channel, user]
-                if !guild.is_empty() && !channel.is_empty() && !user.is_empty() =>
-            {
+            ["guild", guild, channel, user] if !guild.is_empty() && !channel.is_empty() && !user.is_empty() => {
                 Some(StreamKey {
                     guild_id: Some((*guild).to_string()),
                     channel_id: (*channel).to_string(),
@@ -91,16 +89,8 @@ pub const OP_STREAM_SET_PAUSED: u64 = 22;
 /// The account has to already be in the voice channel: a stream is carried
 /// alongside a voice connection rather than instead of one, and asking for
 /// one from outside gets a frame Discord ignores without saying why.
-pub fn start(
-    state: &AppState,
-    account_id: &str,
-    guild_id: Option<&str>,
-    channel_id: &str,
-) -> Result<()> {
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
+pub fn start(state: &AppState, account_id: &str, guild_id: Option<&str>, channel_id: &str) -> Result<()> {
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
     sender.send(
         json!({
             "op": OP_STREAM_CREATE,
@@ -123,12 +113,8 @@ pub fn start(
 
 /// Stops broadcasting.
 pub fn stop(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> {
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
-    sender
-        .send(json!({ "op": OP_STREAM_DELETE, "d": { "stream_key": stream_key } }).to_string())?;
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
+    sender.send(json!({ "op": OP_STREAM_DELETE, "d": { "stream_key": stream_key } }).to_string())?;
     Ok(())
 }
 
@@ -137,39 +123,23 @@ pub fn stop(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> 
 /// Discord uses this to stop sending a stream nobody is looking at, and to
 /// show viewers a paused badge rather than a frozen frame they will read as a
 /// broken connection.
-pub fn set_paused(
-    state: &AppState,
-    account_id: &str,
-    stream_key: &str,
-    paused: bool,
-) -> Result<()> {
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
-    sender.send(
-        json!({ "op": OP_STREAM_SET_PAUSED, "d": { "stream_key": stream_key, "paused": paused } })
-            .to_string(),
-    )?;
+pub fn set_paused(state: &AppState, account_id: &str, stream_key: &str, paused: bool) -> Result<()> {
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
+    sender
+        .send(json!({ "op": OP_STREAM_SET_PAUSED, "d": { "stream_key": stream_key, "paused": paused } }).to_string())?;
     Ok(())
 }
 
 /// Asks to watch somebody else's stream.
 pub fn watch(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> {
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
     sender.send(json!({ "op": OP_STREAM_WATCH, "d": { "stream_key": stream_key } }).to_string())?;
     Ok(())
 }
 
 /// Keeps a stream this account is watching alive.
 pub fn ping(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> {
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
     sender.send(json!({ "op": OP_STREAM_PING, "d": { "stream_key": stream_key } }).to_string())?;
     Ok(())
 }
@@ -234,9 +204,8 @@ impl PendingStream {
 /// and the connection opening, and putting a transient of that kind in the
 /// runtime means remembering to sweep it when an account goes.
 fn pending() -> &'static std::sync::Mutex<std::collections::HashMap<String, PendingStream>> {
-    static PENDING: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, PendingStream>>,
-    > = std::sync::OnceLock::new();
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PendingStream>>> =
+        std::sync::OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
@@ -257,9 +226,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     // once from a log beats a field guessed at twice.
     tracing::info!("discord[{account_id}]: {dispatch} {}", redacted(d));
 
-    let Some(stream_key) = d["stream_key"].as_str() else {
-        return;
-    };
+    let Some(stream_key) = d["stream_key"].as_str() else { return };
     let owner = StreamKey::owner(stream_key);
     let own = state.accounts.get_discord(account_id).map(|a| a.user_id);
     let mine = matches!((&owner, &own), (Some(o), Some(u)) if o == u);
@@ -299,9 +266,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     // stream exists is enough - opened a duplicate that invalidated the first.
     if has_connection(account_id) || connecting(account_id, stream_key) {
         let mut all = pending().lock().unwrap();
-        all.entry(slot(account_id, stream_key))
-            .or_default()
-            .absorb(d);
+        all.entry(slot(account_id, stream_key)).or_default().absorb(d);
         return;
     }
     let ready = {
@@ -311,16 +276,10 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         entry.complete().then(|| entry.clone())
     };
     let Some(ready) = ready else {
-        tracing::debug!(
-            "discord[{account_id}]: {dispatch} for {stream_key}, still waiting for the other half"
-        );
+        tracing::debug!("discord[{account_id}]: {dispatch} for {stream_key}, still waiting for the other half");
         return;
     };
-    if !opening()
-        .lock()
-        .unwrap()
-        .insert(slot(account_id, stream_key))
-    {
+    if !opening().lock().unwrap().insert(slot(account_id, stream_key)) {
         return;
     }
     tracing::info!("discord[{account_id}]: stream {stream_key} is ready to connect");
@@ -329,9 +288,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
     // one place sending a second thing, and it identifies with the session
     // the voice connection already made.
     let Some(session_id) = state.voice.session_id(account_id) else {
-        tracing::warn!(
-            "discord[{account_id}]: a stream arrived with no voice session to attach it to"
-        );
+        tracing::warn!("discord[{account_id}]: a stream arrived with no voice session to attach it to");
         return;
     };
     let Some(user) = own else { return };
@@ -360,10 +317,7 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
             if sound_wanted(account_id) {
                 sender.clone().start_audio(account_id.to_string());
             }
-            senders()
-                .lock()
-                .unwrap()
-                .insert(account_id.to_string(), sender);
+            senders().lock().unwrap().insert(account_id.to_string(), sender);
             state.events.emit(
                 "discordStream",
                 json!({ "accountId": account_id, "streamKey": stream_key, "own": true, "ready": true }),
@@ -377,26 +331,18 @@ pub async fn note_stream(state: &AppState, account_id: &str, dispatch: &str, d: 
         // rather than caught by a wildcard, so adding a third role is a
         // compile error here instead of a silent no-op.
         Ok(super::streamconn::Connected::Watching(_)) => {
-            tracing::error!(
-                "discord[{account_id}]: asked to host {stream_key} and got a viewer back"
-            );
+            tracing::error!("discord[{account_id}]: asked to host {stream_key} and got a viewer back");
         }
         Err(e) => {
             tracing::warn!("discord[{account_id}]: the stream connection failed: {e:#}");
-            last_error()
-                .lock()
-                .unwrap()
-                .insert(account_id.to_string(), format!("{e:#}"));
+            last_error().lock().unwrap().insert(account_id.to_string(), format!("{e:#}"));
             state.events.emit(
                 "discordStream",
                 json!({ "accountId": account_id, "streamKey": stream_key, "own": true, "error": e.to_string() }),
             );
         }
     }
-    opening()
-        .lock()
-        .unwrap()
-        .remove(&slot(account_id, stream_key));
+    opening().lock().unwrap().remove(&slot(account_id, stream_key));
 }
 
 /// Streams whose connection is being opened right now.
@@ -412,10 +358,7 @@ fn opening() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
 }
 
 fn connecting(account_id: &str, stream_key: &str) -> bool {
-    opening()
-        .lock()
-        .unwrap()
-        .contains(&slot(account_id, stream_key))
+    opening().lock().unwrap().contains(&slot(account_id, stream_key))
 }
 
 /// The live stream connections, by account.
@@ -423,13 +366,10 @@ fn connecting(account_id: &str, stream_key: &str) -> bool {
 /// One at a time: Discord's own client shares one screen, and a second stream
 /// from one account would need a second connection and a second key for no
 /// gain anybody has asked for.
-fn senders() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>,
-> {
+fn senders() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>>
+{
     static SENDERS: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::StreamSender>>>,
     > = std::sync::OnceLock::new();
     SENDERS.get_or_init(Default::default)
 }
@@ -437,62 +377,39 @@ fn senders() -> &'static std::sync::Mutex<
 /// Whether this account has a stream connection up, whether or not its group
 /// is ready yet.
 fn has_connection(account_id: &str) -> bool {
-    senders()
-        .lock()
-        .unwrap()
-        .get(account_id)
-        .is_some_and(|s| s.is_live())
+    senders().lock().unwrap().get(account_id).is_some_and(|s| s.is_live())
 }
 
 /// Whether the next stream from each account carries the computer's sound.
 fn sound() -> &'static std::sync::Mutex<std::collections::HashMap<String, bool>> {
-    static SOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
-        std::sync::OnceLock::new();
+    static SOUND: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> = std::sync::OnceLock::new();
     SOUND.get_or_init(Default::default)
 }
 
 /// Says whether the stream about to start should carry sound. On unless said
 /// otherwise, which is what Discord's own client does.
 pub fn set_sound(account_id: &str, wanted: bool) {
-    sound()
-        .lock()
-        .unwrap()
-        .insert(account_id.to_string(), wanted);
+    sound().lock().unwrap().insert(account_id.to_string(), wanted);
 }
 
 fn sound_wanted(account_id: &str) -> bool {
-    sound()
-        .lock()
-        .unwrap()
-        .get(account_id)
-        .copied()
-        .unwrap_or(true)
+    sound().lock().unwrap().get(account_id).copied().unwrap_or(true)
 }
 
 /// What the next stream from each account is sent at, as chosen when it was
 /// started.
-fn qualities(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>> {
-    static QUALITY: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>>,
-    > = std::sync::OnceLock::new();
+fn qualities() -> &'static std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>> {
+    static QUALITY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, super::voiceconn::VideoQuality>>> =
+        std::sync::OnceLock::new();
     QUALITY.get_or_init(Default::default)
 }
 
 pub fn set_quality(account_id: &str, quality: super::voiceconn::VideoQuality) {
-    qualities()
-        .lock()
-        .unwrap()
-        .insert(account_id.to_string(), quality);
+    qualities().lock().unwrap().insert(account_id.to_string(), quality);
 }
 
 pub fn quality(account_id: &str) -> super::voiceconn::VideoQuality {
-    qualities()
-        .lock()
-        .unwrap()
-        .get(account_id)
-        .copied()
-        .unwrap_or_default()
+    qualities().lock().unwrap().get(account_id).copied().unwrap_or_default()
 }
 
 /// Puts one encoded frame on the wire.
@@ -513,9 +430,8 @@ pub async fn send_frame(account_id: &str, frame: &[u8], timestamp_micros: i64) -
 /// and useless; the server's own refusal - a token it would not take, a
 /// server it could not find - is the sentence somebody can act on.
 fn last_error() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static ERRORS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, String>>,
-    > = std::sync::OnceLock::new();
+    static ERRORS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
     ERRORS.get_or_init(Default::default)
 }
 
@@ -542,10 +458,7 @@ pub fn close(account_id: &str) {
         sender.stop();
     }
     let prefix = format!("{account_id}|");
-    opening()
-        .lock()
-        .unwrap()
-        .retain(|k| !k.starts_with(&prefix));
+    opening().lock().unwrap().retain(|k| !k.starts_with(&prefix));
 }
 
 /// A dispatch with its credentials taken out.
@@ -569,13 +482,8 @@ fn redacted(d: &Value) -> String {
 /// A stream that has ended, ours or anybody's.
 pub fn note_stream_gone(state: &AppState, account_id: &str, d: &Value) {
     tracing::info!("discord[{account_id}]: STREAM_DELETE {}", redacted(d));
-    let Some(stream_key) = d["stream_key"].as_str() else {
-        return;
-    };
-    pending()
-        .lock()
-        .unwrap()
-        .remove(&slot(account_id, stream_key));
+    let Some(stream_key) = d["stream_key"].as_str() else { return };
+    pending().lock().unwrap().remove(&slot(account_id, stream_key));
     state.events.emit(
         "discordStream",
         json!({
@@ -595,19 +503,15 @@ pub fn note_stream_gone(state: &AppState, account_id: &str, d: &Value) {
 /// dispatches - the same ones that arrive for streams nobody here asked
 /// about. This is what tells the two apart.
 fn wanted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static WANTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
+    static WANTED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
     WANTED.get_or_init(Default::default)
 }
 
 /// The connections currently receiving a picture, by `account|key`.
-fn watchers() -> &'static std::sync::Mutex<
-    std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>,
-> {
+fn watchers() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>>
+{
     static WATCHERS: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<super::streamconn::Watching>>>,
     > = std::sync::OnceLock::new();
     WATCHERS.get_or_init(Default::default)
 }
@@ -619,28 +523,17 @@ fn watchers() -> &'static std::sync::Mutex<
 /// back for it is acted on rather than merely noted. Nothing is connected
 /// here - the endpoint does not exist yet.
 pub fn start_watching(state: &AppState, account_id: &str, stream_key: &str) -> Result<()> {
-    if watchers()
-        .lock()
-        .unwrap()
-        .contains_key(&slot(account_id, stream_key))
-    {
+    if watchers().lock().unwrap().contains_key(&slot(account_id, stream_key)) {
         return Ok(());
     }
-    wanted()
-        .lock()
-        .unwrap()
-        .insert(slot(account_id, stream_key));
+    wanted().lock().unwrap().insert(slot(account_id, stream_key));
     watch(state, account_id, stream_key)?;
     // What is already known about it, which after a STREAM_CREATE is the RTC
     // channel and after a second watch of the same stream may be everything.
     if let Some(held) = held(account_id, stream_key) {
         tracing::info!(
             "discord[{account_id}]: {stream_key} is already {}",
-            if held.complete() {
-                "fully described"
-            } else {
-                "partly described"
-            }
+            if held.complete() { "fully described" } else { "partly described" }
         );
     }
     // Discord stops sending a stream nobody has said they are still there
@@ -719,23 +612,11 @@ async fn join_stream(state: &AppState, account_id: &str, stream_key: &str, d: &V
     }
 }
 
-async fn open_viewer(
-    state: &AppState,
-    account_id: &str,
-    stream_key: &str,
-    ready: &PendingStream,
-) -> Result<()> {
+async fn open_viewer(state: &AppState, account_id: &str, stream_key: &str, ready: &PendingStream) -> Result<()> {
     // The same voice session the channel connection made. A stream is one
     // account in one place receiving a second thing, not a second login.
-    let session_id = state
-        .voice
-        .session_id(account_id)
-        .context("there is no voice session to attach a viewer to")?;
-    let user = state
-        .accounts
-        .get_discord(account_id)
-        .map(|a| a.user_id)
-        .context("no account")?;
+    let session_id = state.voice.session_id(account_id).context("there is no voice session to attach a viewer to")?;
+    let user = state.accounts.get_discord(account_id).map(|a| a.user_id).context("no account")?;
     let owner = StreamKey::owner(stream_key)
         .and_then(|o| o.parse::<u64>().ok())
         .context("that stream key names nobody")?;
@@ -775,10 +656,7 @@ async fn open_viewer(
     .await?;
     match connected {
         super::streamconn::Connected::Watching(watching) => {
-            watchers()
-                .lock()
-                .unwrap()
-                .insert(slot(account_id, stream_key), watching);
+            watchers().lock().unwrap().insert(slot(account_id, stream_key), watching);
             state.events.emit(
                 "discordStream",
                 json!({ "accountId": account_id, "streamKey": stream_key, "own": false, "watching": true }),
@@ -787,28 +665,19 @@ async fn open_viewer(
         }
         // Asked for as a viewer, so this cannot arrive - named rather than
         // ignored so a third role is a compile error rather than silence.
-        super::streamconn::Connected::Sending(_) => Err(anyhow::anyhow!(
-            "asked to watch {stream_key} and got a sender back"
-        )),
+        super::streamconn::Connected::Sending(_) => Err(anyhow::anyhow!("asked to watch {stream_key} and got a sender back")),
     }
 }
 
 /// What is known about one of this account's streams, if anything.
 pub fn held(account_id: &str, stream_key: &str) -> Option<PendingStream> {
-    pending()
-        .lock()
-        .unwrap()
-        .get(&slot(account_id, stream_key))
-        .cloned()
+    pending().lock().unwrap().get(&slot(account_id, stream_key)).cloned()
 }
 
 /// Forgets everything held for an account.
 pub fn forget(account_id: &str) {
     let prefix = format!("{account_id}|");
-    pending()
-        .lock()
-        .unwrap()
-        .retain(|k, _| !k.starts_with(&prefix));
+    pending().lock().unwrap().retain(|k, _| !k.starts_with(&prefix));
     close(account_id);
 }
 
@@ -827,11 +696,7 @@ mod tests {
         };
         assert_eq!(in_guild.to_wire(), "guild:111:222:333");
 
-        let in_dm = StreamKey {
-            guild_id: None,
-            channel_id: "222".into(),
-            user_id: "333".into(),
-        };
+        let in_dm = StreamKey { guild_id: None, channel_id: "222".into(), user_id: "333".into() };
         assert_eq!(in_dm.to_wire(), "call:222:333");
 
         // And back again, unchanged.
@@ -843,10 +708,7 @@ mod tests {
     /// on knowing which shape the key is.
     #[test]
     fn the_owner_comes_out_of_either_shape() {
-        assert_eq!(
-            StreamKey::owner("guild:111:222:333").as_deref(),
-            Some("333")
-        );
+        assert_eq!(StreamKey::owner("guild:111:222:333").as_deref(), Some("333"));
         assert_eq!(StreamKey::owner("call:222:333").as_deref(), Some("333"));
         assert_eq!(StreamKey::owner("nonsense"), None);
     }
@@ -857,44 +719,23 @@ mod tests {
     #[test]
     fn a_malformed_key_is_not_a_key() {
         assert_eq!(StreamKey::parse(""), None);
-        assert_eq!(
-            StreamKey::parse("guild:111:222"),
-            None,
-            "too few parts for a guild"
-        );
-        assert_eq!(
-            StreamKey::parse("call:222:333:444"),
-            None,
-            "too many for a call"
-        );
-        assert_eq!(
-            StreamKey::parse("guild::222:333"),
-            None,
-            "an empty guild id"
-        );
+        assert_eq!(StreamKey::parse("guild:111:222"), None, "too few parts for a guild");
+        assert_eq!(StreamKey::parse("call:222:333:444"), None, "too many for a call");
+        assert_eq!(StreamKey::parse("guild::222:333"), None, "an empty guild id");
         assert_eq!(StreamKey::parse("call:222:"), None, "an empty user id");
-        assert_eq!(
-            StreamKey::parse("stream:222:333"),
-            None,
-            "a prefix that is neither"
-        );
+        assert_eq!(StreamKey::parse("stream:222:333"), None, "a prefix that is neither");
     }
 
     /// The two dispatches arrive in either order and neither is usable
     /// alone, so absorbing one must not undo the other.
     #[test]
     fn the_two_halves_of_a_handshake_merge_in_either_order() {
-        let created =
-            json!({ "stream_key": "call:222:333", "rtc_server_id": "rtc-9", "paused": true });
-        let server =
-            json!({ "stream_key": "call:222:333", "endpoint": "eu.discord.media", "token": "t0k" });
+        let created = json!({ "stream_key": "call:222:333", "rtc_server_id": "rtc-9", "paused": true });
+        let server = json!({ "stream_key": "call:222:333", "endpoint": "eu.discord.media", "token": "t0k" });
 
         let mut first = PendingStream::default();
         first.absorb(&created);
-        assert!(
-            !first.complete(),
-            "a stream with no server to reach is not ready"
-        );
+        assert!(!first.complete(), "a stream with no server to reach is not ready");
         first.absorb(&server);
         assert!(first.complete());
 
@@ -943,6 +784,7 @@ mod tests {
         let plain = json!({ "stream_key": "call:1:2" });
         assert!(!redacted(&plain).contains("redacted"));
     }
+
 }
 
 /// The best stream an account may send.
@@ -959,21 +801,9 @@ pub struct StreamLimit {
 /// Nitro Classic, 1080p60; 2 is Nitro, the source at 60.
 pub fn stream_limit(premium_type: u8) -> StreamLimit {
     match premium_type {
-        2 => StreamLimit {
-            max_height: 2160,
-            max_framerate: 60,
-            source: true,
-        },
-        1 => StreamLimit {
-            max_height: 1080,
-            max_framerate: 60,
-            source: false,
-        },
-        _ => StreamLimit {
-            max_height: 720,
-            max_framerate: 30,
-            source: false,
-        },
+        2 => StreamLimit { max_height: 2160, max_framerate: 60, source: true },
+        1 => StreamLimit { max_height: 1080, max_framerate: 60, source: false },
+        _ => StreamLimit { max_height: 720, max_framerate: 30, source: false },
     }
 }
 
@@ -983,14 +813,7 @@ mod limit_tests {
 
     #[test]
     fn an_account_without_nitro_streams_at_720p30() {
-        assert_eq!(
-            stream_limit(0),
-            StreamLimit {
-                max_height: 720,
-                max_framerate: 30,
-                source: false
-            }
-        );
+        assert_eq!(stream_limit(0), StreamLimit { max_height: 720, max_framerate: 30, source: false });
         // Nitro Basic does not include a better stream.
         assert_eq!(stream_limit(3), stream_limit(0));
         assert_eq!(stream_limit(1).max_height, 1080);

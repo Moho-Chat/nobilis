@@ -63,9 +63,7 @@ impl std::fmt::Display for CallError {
             }
             CallError::Closed => write!(f, "the connection to Steam ended"),
             CallError::TimedOut => write!(f, "Steam did not answer in time"),
-            CallError::Unreadable(why) => {
-                write!(f, "an answer from Steam could not be read: {why}")
-            }
+            CallError::Unreadable(why) => write!(f, "an answer from Steam could not be read: {why}"),
         }
     }
 }
@@ -111,14 +109,8 @@ pub async fn open(key: &str, url: &str) -> Result<(Link, mpsc::UnboundedReceiver
     open_with(key, url, CALL_TIMEOUT).await
 }
 
-pub async fn open_with(
-    key: &str,
-    url: &str,
-    timeout: Duration,
-) -> Result<(Link, mpsc::UnboundedReceiver<Packet>)> {
-    let (socket, _) = crate::net::route::websocket(key, url)
-        .await
-        .with_context(|| format!("connecting to {url}"))?;
+pub async fn open_with(key: &str, url: &str, timeout: Duration) -> Result<(Link, mpsc::UnboundedReceiver<Packet>)> {
+    let (socket, _) = crate::net::route::websocket(key, url).await.with_context(|| format!("connecting to {url}"))?;
     let (mut sink, mut stream) = socket.split();
     let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (told, told_rx) = mpsc::unbounded_channel::<Packet>();
@@ -150,12 +142,7 @@ pub async fn open_with(
                 let bytes = match frame {
                     Ws::Binary(bytes) => bytes,
                     Ws::Close(close) => {
-                        why = format!(
-                            "Steam closed it: {}",
-                            close
-                                .map(|c| format!("{} {}", c.code, c.reason))
-                                .unwrap_or_else(|| "no reason given".to_string())
-                        );
+                        why = format!("Steam closed it: {}", close.map(|c| format!("{} {}", c.code, c.reason)).unwrap_or_else(|| "no reason given".to_string()));
                         break;
                     }
                     // Pings are answered by the library; text is not a thing
@@ -247,10 +234,7 @@ impl Link {
     /// Sends a message that expects no answer.
     pub fn send<M: Message>(&self, emsg: u32, message: &M) -> Result<(), CallError> {
         let packet = Packet::new(emsg, self.header(true), message.encode_to_vec());
-        self.0
-            .out
-            .send(packet.encode())
-            .map_err(|_| CallError::Closed)
+        self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
     }
 
     /// A service method that is said and not answered: Steam's `SendNotification`,
@@ -259,15 +243,8 @@ impl Link {
         let mut header = self.header(true);
         header.target_job_name = Some(method.to_string());
         header.realm = Some(1);
-        let packet = Packet::new(
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT,
-            header,
-            request.encode_to_vec(),
-        );
-        self.0
-            .out
-            .send(packet.encode())
-            .map_err(|_| CallError::Closed)
+        let packet = Packet::new(emsg::SERVICE_METHOD_CALL_FROM_CLIENT, header, request.encode_to_vec());
+        self.0.out.send(packet.encode()).map_err(|_| CallError::Closed)
     }
 
     /// A question to Steam in one of its older messages, and the answer.
@@ -276,11 +253,7 @@ impl Link {
     /// result code is inside the answer rather than in its header, so it is
     /// the caller's to read. What matches the answer to the question is the
     /// same job id.
-    pub async fn ask<Q: Message, A: Message + Default>(
-        &self,
-        emsg: u32,
-        request: &Q,
-    ) -> Result<A, CallError> {
+    pub async fn ask<Q: Message, A: Message + Default>(&self, emsg: u32, request: &Q) -> Result<A, CallError> {
         let job = self.0.next_job.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -313,12 +286,7 @@ impl Link {
     /// `method` is the service and method as Steam names them, `Service.Method#1`.
     /// `signed_in` says whether to speak as the account: the calls that make
     /// signing in possible are made before there is one.
-    pub async fn call<Q: Message, A: Message + Default>(
-        &self,
-        method: &str,
-        request: &Q,
-        signed_in: bool,
-    ) -> Result<A, CallError> {
+    pub async fn call<Q: Message, A: Message + Default>(&self, method: &str, request: &Q, signed_in: bool) -> Result<A, CallError> {
         let job = self.0.next_job.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -333,11 +301,7 @@ impl Link {
         header.jobid_source = Some(job);
         header.target_job_name = Some(method.to_string());
         header.realm = Some(1);
-        let kind = if signed_in {
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT
-        } else {
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED
-        };
+        let kind = if signed_in { emsg::SERVICE_METHOD_CALL_FROM_CLIENT } else { emsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED };
         let packet = Packet::new(kind, header, request.encode_to_vec());
         if self.0.out.send(packet.encode()).is_err() {
             self.0.jobs.lock().unwrap().by_job.remove(&job);
@@ -356,15 +320,7 @@ impl Link {
         if code != eresult::OK {
             // Steam asking for its agreement to be accepted puts the page for it in the answer, and
             // that page is the whole of what can be done about it.
-            let said = answer
-                .header
-                .error_message
-                .filter(|m| !m.is_empty())
-                .or_else(|| {
-                    (code == eresult::MUST_AGREE_TO_SSA)
-                        .then(|| agreement_page(&answer.body))
-                        .flatten()
-                });
+            let said = answer.header.error_message.filter(|m| !m.is_empty()).or_else(|| (code == eresult::MUST_AGREE_TO_SSA).then(|| agreement_page(&answer.body)).flatten());
             return Err(CallError::Refused(code, said));
         }
         A::decode(answer.body.as_slice()).map_err(|e| CallError::Unreadable(e.to_string()))
@@ -382,9 +338,7 @@ fn agreement_page(body: &[u8]) -> Option<String> {
         poll: Option<String>,
     }
     let page = Page::decode(body).ok()?;
-    page.sign_in
-        .or(page.poll)
-        .filter(|u| u.starts_with("https://"))
+    page.sign_in.or(page.poll).filter(|u| u.starts_with("https://"))
 }
 
 #[cfg(test)]
@@ -403,36 +357,9 @@ mod agreement_tests {
             #[prost(string, optional, tag = "8")]
             url: Option<String>,
         }
-        assert_eq!(
-            agreement_page(
-                &Begin {
-                    url: Some("https://login.steampowered.com/a".into())
-                }
-                .encode_to_vec()
-            )
-            .as_deref(),
-            Some("https://login.steampowered.com/a")
-        );
-        assert_eq!(
-            agreement_page(
-                &Poll {
-                    url: Some("https://login.steampowered.com/b".into())
-                }
-                .encode_to_vec()
-            )
-            .as_deref(),
-            Some("https://login.steampowered.com/b")
-        );
-        assert_eq!(
-            agreement_page(
-                &Poll {
-                    url: Some("javascript:alert(1)".into())
-                }
-                .encode_to_vec()
-            ),
-            None,
-            "only an https address is passed on"
-        );
+        assert_eq!(agreement_page(&Begin { url: Some("https://login.steampowered.com/a".into()) }.encode_to_vec()).as_deref(), Some("https://login.steampowered.com/a"));
+        assert_eq!(agreement_page(&Poll { url: Some("https://login.steampowered.com/b".into()) }.encode_to_vec()).as_deref(), Some("https://login.steampowered.com/b"));
+        assert_eq!(agreement_page(&Poll { url: Some("javascript:alert(1)".into()) }.encode_to_vec()), None, "only an https address is passed on");
         assert_eq!(agreement_page(&[0xff, 0xff]), None);
     }
 }
@@ -454,9 +381,7 @@ pub(crate) mod fake {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let Ok((tcp, _)) = listener.accept().await else {
-                return;
-            };
+            let Ok((tcp, _)) = listener.accept().await else { return };
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
             while let Some(Ok(frame)) = ws.next().await {
                 let Ws::Binary(bytes) = frame else { continue };
@@ -483,11 +408,7 @@ pub(crate) mod fake {
     pub fn answer(request: &Packet, code: i32, body: Vec<u8>) -> Packet {
         Packet::new(
             emsg::SERVICE_METHOD_RESPONSE,
-            Header {
-                jobid_target: request.header.jobid_source,
-                eresult: Some(code),
-                ..Header::default()
-            },
+            Header { jobid_target: request.header.jobid_source, eresult: Some(code), ..Header::default() },
             body,
         )
     }
@@ -509,51 +430,23 @@ mod tests {
     #[tokio::test]
     async fn a_question_gets_its_own_answer_whatever_arrives_between() {
         let url = serve(Box::new(|req| {
-            assert_eq!(
-                req.header.target_job_name.as_deref(),
-                Some("Authentication.GetPasswordRSAPublicKey#1")
-            );
+            assert_eq!(req.header.target_job_name.as_deref(), Some("Authentication.GetPasswordRSAPublicKey#1"));
             let ask = GetPasswordRsaPublicKeyRequest::decode(req.body.as_slice()).unwrap();
             assert_eq!(ask.account_name.as_deref(), Some("someone"));
             // News first, to be sure the answer is matched by its job and not
             // by being the next thing to arrive.
             Some(vec![
-                tell(
-                    emsg::CLIENT_ACCOUNT_INFO,
-                    ClientAccountInfo {
-                        persona_name: Some("Some One".into()),
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                ),
-                answer(
-                    &req,
-                    1,
-                    GetPasswordRsaPublicKeyResponse {
-                        publickey_mod: Some("AB".into()),
-                        publickey_exp: Some("010001".into()),
-                        timestamp: Some(7),
-                    }
-                    .encode_to_vec(),
-                ),
+                tell(emsg::CLIENT_ACCOUNT_INFO, ClientAccountInfo { persona_name: Some("Some One".into()), ..Default::default() }.encode_to_vec()),
+                answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some("AB".into()), publickey_exp: Some("010001".into()), timestamp: Some(7) }.encode_to_vec()),
             ])
         }))
         .await;
         let (link, mut told) = open(KEY, &url).await.unwrap();
         let got: GetPasswordRsaPublicKeyResponse = link
-            .call(
-                "Authentication.GetPasswordRSAPublicKey#1",
-                &GetPasswordRsaPublicKeyRequest {
-                    account_name: Some("someone".into()),
-                },
-                false,
-            )
+            .call("Authentication.GetPasswordRSAPublicKey#1", &GetPasswordRsaPublicKeyRequest { account_name: Some("someone".into()) }, false)
             .await
             .unwrap();
-        assert_eq!(
-            (got.publickey_mod.as_deref(), got.timestamp),
-            (Some("AB"), Some(7))
-        );
+        assert_eq!((got.publickey_mod.as_deref(), got.timestamp), (Some("AB"), Some(7)));
         let news = told.recv().await.unwrap();
         assert_eq!(news.emsg, emsg::CLIENT_ACCOUNT_INFO);
     }
@@ -571,26 +464,17 @@ mod tests {
         .await;
         let (link, _told) = open(KEY, &url).await.unwrap();
         let _: ClientLogOff = link.call("A.B#1", &ClientLogOff {}, false).await.unwrap();
-        link.set_identity(Identity {
-            steamid: 76561197960287930,
-            session: 55,
-        });
+        link.set_identity(Identity { steamid: 76561197960287930, session: 55 });
         let _: ClientLogOff = link.call("A.B#1", &ClientLogOff {}, true).await.unwrap();
 
         let seen = seen.lock().unwrap();
-        assert_eq!(
-            seen[0].emsg,
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED
-        );
+        assert_eq!(seen[0].emsg, emsg::SERVICE_METHOD_CALL_FROM_CLIENT_NON_AUTHED);
         assert_eq!(seen[0].header.steamid, None);
         assert_eq!(seen[0].header.realm, Some(1));
         assert_eq!(seen[1].emsg, emsg::SERVICE_METHOD_CALL_FROM_CLIENT);
         assert_eq!(seen[1].header.steamid, Some(76561197960287930));
         assert_eq!(seen[1].header.client_sessionid, Some(55));
-        assert_ne!(
-            seen[0].header.jobid_source, seen[1].header.jobid_source,
-            "each question is its own job"
-        );
+        assert_ne!(seen[0].header.jobid_source, seen[1].header.jobid_source, "each question is its own job");
     }
 
     #[tokio::test]
@@ -602,41 +486,24 @@ mod tests {
         }))
         .await;
         let (link, _told) = open(KEY, &url).await.unwrap();
-        let err = link
-            .call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false)
-            .await
-            .unwrap_err();
+        let err = link.call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
         assert!(matches!(&err, CallError::Refused(84, Some(m)) if m == "slow down"));
         assert!(err.to_string().contains("limiting"));
-        assert!(
-            err.to_string().contains("(slow down)"),
-            "Steam's own words are kept: {err}"
-        );
+        assert!(err.to_string().contains("(slow down)"), "Steam's own words are kept: {err}");
     }
 
     #[tokio::test]
     async fn a_batch_is_taken_apart_and_its_news_arrives_in_order() {
         let url = serve(Box::new(|_| {
             let inside = [
-                tell(
-                    emsg::CLIENT_FRIENDS_LIST,
-                    ClientFriendsList {
-                        bincremental: Some(false),
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                ),
-                tell(
-                    emsg::CLIENT_PERSONA_STATE,
-                    ClientPersonaState::default().encode_to_vec(),
-                ),
+                tell(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), ..Default::default() }.encode_to_vec()),
+                tell(emsg::CLIENT_PERSONA_STATE, ClientPersonaState::default().encode_to_vec()),
             ];
             Some(vec![tell(emsg::MULTI, wire::pack_multi(&inside, true))])
         }))
         .await;
         let (link, mut told) = open(KEY, &url).await.unwrap();
-        link.send(emsg::CLIENT_HEART_BEAT, &ClientHeartBeat::default())
-            .unwrap();
+        link.send(emsg::CLIENT_HEART_BEAT, &ClientHeartBeat::default()).unwrap();
         assert_eq!(told.recv().await.unwrap().emsg, emsg::CLIENT_FRIENDS_LIST);
         assert_eq!(told.recv().await.unwrap().emsg, emsg::CLIENT_PERSONA_STATE);
     }
@@ -645,51 +512,28 @@ mod tests {
     async fn a_connection_that_ends_fails_the_questions_waiting_and_closes_the_news() {
         let url = serve(Box::new(|_| None)).await;
         let (link, mut told) = open(KEY, &url).await.unwrap();
-        let err = link
-            .call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false)
-            .await
-            .unwrap_err();
+        let err = link.call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
         assert!(matches!(err, CallError::Closed), "{err:?}");
-        assert!(
-            told.recv().await.is_none(),
-            "the news stops when the connection does"
-        );
+        assert!(told.recv().await.is_none(), "the news stops when the connection does");
         // And asking after it has gone fails at once rather than waiting.
-        let err = link
-            .call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false)
-            .await
-            .unwrap_err();
+        let err = link.call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
         assert!(matches!(err, CallError::Closed), "{err:?}");
     }
 
     #[tokio::test]
     async fn no_answer_is_a_timeout_and_the_job_is_forgotten() {
         let url = serve(Box::new(|_| Some(Vec::new()))).await;
-        let (link, _told) = open_with(KEY, &url, Duration::from_millis(150))
-            .await
-            .unwrap();
-        let err = link
-            .call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false)
-            .await
-            .unwrap_err();
+        let (link, _told) = open_with(KEY, &url, Duration::from_millis(150)).await.unwrap();
+        let err = link.call::<_, ClientLogOff>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
         assert!(matches!(err, CallError::TimedOut), "{err:?}");
-        assert!(
-            link.0.jobs.lock().unwrap().by_job.is_empty(),
-            "a question nobody is waiting on is not kept"
-        );
+        assert!(link.0.jobs.lock().unwrap().by_job.is_empty(), "a question nobody is waiting on is not kept");
     }
 
     #[tokio::test]
     async fn an_answer_that_is_not_what_was_asked_for_is_unreadable_not_a_panic() {
-        let url = serve(Box::new(|req| {
-            Some(vec![answer(&req, 1, vec![0xff, 0xff, 0xff])])
-        }))
-        .await;
+        let url = serve(Box::new(|req| Some(vec![answer(&req, 1, vec![0xff, 0xff, 0xff])]))).await;
         let (link, _told) = open(KEY, &url).await.unwrap();
-        let err = link
-            .call::<_, ClientFriendsList>("A.B#1", &ClientLogOff {}, false)
-            .await
-            .unwrap_err();
+        let err = link.call::<_, ClientFriendsList>("A.B#1", &ClientLogOff {}, false).await.unwrap_err();
         assert!(matches!(err, CallError::Unreadable(_)), "{err:?}");
     }
 
@@ -714,8 +558,6 @@ mod tests {
         assert!(other.is_open());
         drop(other);
         drop(told);
-        tokio::time::timeout(Duration::from_secs(5), closed.notified())
-            .await
-            .expect("the server saw the connection close");
+        tokio::time::timeout(Duration::from_secs(5), closed.notified()).await.expect("the server saw the connection close");
     }
 }

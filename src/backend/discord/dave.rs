@@ -72,10 +72,7 @@ pub fn read_binary(data: &[u8]) -> Option<BinaryFrame<'_>> {
     if data.len() < 3 {
         return None;
     }
-    Some(BinaryFrame {
-        opcode: data[2],
-        payload: &data[3..],
-    })
+    Some(BinaryFrame { opcode: data[2], payload: &data[3..] })
 }
 
 /// A binary frame to send. No sequence: that direction does not carry one.
@@ -110,29 +107,20 @@ impl Dave {
     /// `version` is what the session description said, not what the identify
     /// asked for - the server decides, and zero means it decided against.
     pub fn new(version: u16, user_id: &str, channel_id: &str) -> Result<Option<Dave>> {
-        let Some(version) = NonZeroU16::new(version) else {
-            return Ok(None);
-        };
+        let Some(version) = NonZeroU16::new(version) else { return Ok(None) };
         let user = user_id.parse::<u64>().context("that is not a user id")?;
         // The *stream's* channel, not the conversation's: a Go Live session
         // is its own group, and naming the wrong channel builds a group
         // nobody else is in.
-        let channel = channel_id
-            .parse::<u64>()
-            .context("that is not a channel id")?;
+        let channel = channel_id.parse::<u64>().context("that is not a channel id")?;
         let session = davey::DaveSession::new(version, user, channel, None)
             .map_err(|e| anyhow::anyhow!("could not start DAVE: {e:?}"))?;
-        Ok(Some(Dave {
-            session,
-            version: version.get(),
-        }))
+        Ok(Some(Dave { session, version: version.get() }))
     }
 
     /// This device asking to join the group.
     pub fn key_package(&mut self) -> Result<Vec<u8>> {
-        self.session
-            .create_key_package()
-            .map_err(|e| anyhow::anyhow!("could not make a key package: {e:?}"))
+        self.session.create_key_package().map_err(|e| anyhow::anyhow!("could not make a key package: {e:?}"))
     }
 
     pub fn ready(&self) -> bool {
@@ -204,23 +192,16 @@ impl Dave {
             OP_PROPOSALS => {
                 // The first byte says whether these are being added or taken
                 // away, and the rest are the proposals themselves.
-                let Some((kind, proposals)) = frame.payload.split_first() else {
-                    return Reply::Nothing;
-                };
+                let Some((kind, proposals)) = frame.payload.split_first() else { return Reply::Nothing };
                 let operation = match kind {
                     0 => davey::ProposalsOperationType::APPEND,
                     1 => davey::ProposalsOperationType::REVOKE,
                     other => {
-                        tracing::warn!(
-                            "dave: proposals with an operation of {other}, which is neither"
-                        );
+                        tracing::warn!("dave: proposals with an operation of {other}, which is neither");
                         return Reply::Nothing;
                     }
                 };
-                match self
-                    .session
-                    .process_proposals(operation, proposals, recognised)
-                {
+                match self.session.process_proposals(operation, proposals, recognised) {
                     Ok(Some(cw)) => {
                         // A commit with a welcome after it, both in one
                         // frame - the welcome is optional and its absence is
@@ -239,9 +220,7 @@ impl Dave {
                 }
             }
             OP_ANNOUNCE_COMMIT_TRANSITION => {
-                let Some((transition, commit)) = split_transition(frame.payload) else {
-                    return Reply::Nothing;
-                };
+                let Some((transition, commit)) = split_transition(frame.payload) else { return Reply::Nothing };
                 match self.session.process_commit(commit) {
                     Ok(()) => self.acknowledge(transition),
                     Err(e) => {
@@ -249,23 +228,17 @@ impl Dave {
                         // Said rather than ignored: the server rebuilds the
                         // group for a client that admits it is lost, and
                         // stays silent for one that pretends otherwise.
-                        Reply::Json(
-                            json!({ "op": OP_INVALID_COMMIT_WELCOME, "d": { "transition_id": transition } }),
-                        )
+                        Reply::Json(json!({ "op": OP_INVALID_COMMIT_WELCOME, "d": { "transition_id": transition } }))
                     }
                 }
             }
             OP_WELCOME => {
-                let Some((transition, welcome)) = split_transition(frame.payload) else {
-                    return Reply::Nothing;
-                };
+                let Some((transition, welcome)) = split_transition(frame.payload) else { return Reply::Nothing };
                 match self.session.process_welcome(welcome) {
                     Ok(()) => self.acknowledge(transition),
                     Err(e) => {
                         tracing::warn!("dave: a welcome would not apply: {e:?}");
-                        Reply::Json(
-                            json!({ "op": OP_INVALID_COMMIT_WELCOME, "d": { "transition_id": transition } }),
-                        )
+                        Reply::Json(json!({ "op": OP_INVALID_COMMIT_WELCOME, "d": { "transition_id": transition } }))
                     }
                 }
             }
@@ -327,10 +300,7 @@ fn split_transition(payload: &[u8]) -> Option<(u64, &[u8])> {
     if payload.len() < 2 {
         return None;
     }
-    Some((
-        u16::from_be_bytes([payload[0], payload[1]]) as u64,
-        &payload[2..],
-    ))
+    Some((u16::from_be_bytes([payload[0], payload[1]]) as u64, &payload[2..]))
 }
 
 #[cfg(test)]
@@ -364,22 +334,13 @@ mod tests {
     /// The other direction has no sequence number.
     #[test]
     fn what_goes_out_carries_only_its_opcode() {
-        assert_eq!(
-            write_binary(OP_KEY_PACKAGE, &[1, 2, 3]),
-            vec![OP_KEY_PACKAGE, 1, 2, 3]
-        );
-        assert_eq!(
-            write_binary(OP_COMMIT_WELCOME, &[]),
-            vec![OP_COMMIT_WELCOME]
-        );
+        assert_eq!(write_binary(OP_KEY_PACKAGE, &[1, 2, 3]), vec![OP_KEY_PACKAGE, 1, 2, 3]);
+        assert_eq!(write_binary(OP_COMMIT_WELCOME, &[]), vec![OP_COMMIT_WELCOME]);
     }
 
     #[test]
     fn a_transition_id_is_read_off_the_front() {
-        assert_eq!(
-            split_transition(&[0x00, 0x05, 0xAA]),
-            Some((5, &[0xAA][..]))
-        );
+        assert_eq!(split_transition(&[0x00, 0x05, 0xAA]), Some((5, &[0xAA][..])));
         assert_eq!(split_transition(&[0x01, 0x00]), Some((256, &[][..])));
         assert_eq!(split_transition(&[0x01]), None);
     }
@@ -389,12 +350,8 @@ mod tests {
     /// encrypt everything for an audience of one.
     #[test]
     fn no_version_means_no_session() {
-        assert!(Dave::new(0, "1339667204756475924", "1540954302632300564")
-            .unwrap()
-            .is_none());
-        assert!(Dave::new(1, "1339667204756475924", "1540954302632300564")
-            .unwrap()
-            .is_some());
+        assert!(Dave::new(0, "1339667204756475924", "1540954302632300564").unwrap().is_none());
+        assert!(Dave::new(1, "1339667204756475924", "1540954302632300564").unwrap().is_some());
         // And an id that is not a number is refused rather than silently
         // becoming zero, which would put this device in somebody else's
         // group.

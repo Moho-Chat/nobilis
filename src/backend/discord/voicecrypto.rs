@@ -90,16 +90,13 @@ impl Sealer {
         Ok(Self {
             mode,
             aes: match mode {
-                Mode::Aes256Gcm => {
-                    Some(Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("bad key"))?)
-                }
+                Mode::Aes256Gcm => Some(Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("bad key"))?),
                 _ => None,
             },
             cha: match mode {
-                Mode::XChaCha20Poly1305 => Some(
-                    XChaCha20Poly1305::new_from_slice(key)
-                        .map_err(|_| anyhow::anyhow!("bad key"))?,
-                ),
+                Mode::XChaCha20Poly1305 => {
+                    Some(XChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow::anyhow!("bad key"))?)
+                }
                 _ => None,
             },
             counter: rand::random(),
@@ -167,13 +164,7 @@ pub fn open(mode: Mode, key: &[u8], packet: &[u8], header_len: usize) -> anyhow:
 /// was right. Getting it wrong is not subtle in its effect and completely
 /// silent in its cause: every packet fails to open and there is nothing to
 /// say why.
-pub fn open_at(
-    mode: Mode,
-    key: &[u8],
-    packet: &[u8],
-    aad_len: usize,
-    body_at: usize,
-) -> anyhow::Result<Vec<u8>> {
+pub fn open_at(mode: Mode, key: &[u8], packet: &[u8], aad_len: usize, body_at: usize) -> anyhow::Result<Vec<u8>> {
     if aad_len > packet.len() || body_at > packet.len() {
         anyhow::bail!("that span is longer than the packet");
     }
@@ -199,8 +190,7 @@ pub fn open_at(
         Mode::XChaCha20Poly1305 => {
             let mut nonce = chacha20poly1305::XNonce::default();
             nonce[..NONCE_LEN].copy_from_slice(counter);
-            let cipher =
-                XChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow::anyhow!("bad key"))?;
+            let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow::anyhow!("bad key"))?;
             cipher
                 .decrypt_in_place_detached(&nonce, header, &mut body, tag.into())
                 .map_err(|_| anyhow::anyhow!("the packet did not open"))?;
@@ -221,12 +211,7 @@ pub fn open_at(
 /// `open_at` does for a Go Live stream is not needed where the rule is known.
 ///
 /// Returns the media payload alone, with RTP padding removed.
-pub fn open_rtp(
-    mode: Mode,
-    key: &[u8],
-    packet: &[u8],
-    parsed: &super::rtp::Parsed,
-) -> anyhow::Result<Vec<u8>> {
+pub fn open_rtp(mode: Mode, key: &[u8], packet: &[u8], parsed: &super::rtp::Parsed) -> anyhow::Result<Vec<u8>> {
     let extended = packet.first().is_some_and(|b| b & 0x10 != 0);
     let authenticated = parsed.fixed_len + if extended { 4 } else { 0 };
     let mut body = open_at(mode, key, packet, authenticated, authenticated)?;
@@ -289,10 +274,7 @@ mod tests {
 
             let aad = header.len();
             let starts_at = header.len() + extension.len();
-            assert_eq!(
-                open_at(mode, &key(), &packet, aad, starts_at).unwrap(),
-                body
-            );
+            assert_eq!(open_at(mode, &key(), &packet, aad, starts_at).unwrap(), body);
             // And the readings that do not describe this packet are refused
             // rather than returning something plausible - which is what makes
             // trying them in turn a safe way to find the right one.
@@ -321,11 +303,7 @@ mod tests {
             // The header travels in the clear - the far end reads the
             // sequence number and the SSRC before it can decrypt anything.
             assert_eq!(&sealed[..12], &header, "{mode:?}");
-            assert_eq!(
-                sealed.len(),
-                12 + packet.payload.len() + OVERHEAD,
-                "{mode:?}"
-            );
+            assert_eq!(sealed.len(), 12 + packet.payload.len() + OVERHEAD, "{mode:?}");
 
             let opened = open(mode, &key(), &sealed, 12).expect("opening");
             assert_eq!(opened, packet.payload, "{mode:?}");
@@ -380,10 +358,7 @@ mod tests {
             Some(Mode::XChaCha20Poly1305)
         );
         // The deprecated ones, and anything invented since.
-        assert_eq!(
-            Mode::negotiate(&["xsalsa20_poly1305", "something_new"]),
-            None
-        );
+        assert_eq!(Mode::negotiate(&["xsalsa20_poly1305", "something_new"]), None);
         assert_eq!(Mode::negotiate::<&str>(&[]), None);
     }
 
@@ -416,10 +391,7 @@ mod tests {
         let packet = sealer.seal(&clear, &secret).unwrap();
 
         let parsed = super::super::rtp::parse_header(&packet).unwrap();
-        assert_eq!(
-            open_rtp(Mode::Aes256Gcm, &key, &packet, &parsed).unwrap(),
-            opus
-        );
+        assert_eq!(open_rtp(Mode::Aes256Gcm, &key, &packet, &parsed).unwrap(), opus);
     }
 
     #[test]
@@ -429,9 +401,6 @@ mod tests {
         let clear = [0x80u8, 120, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3];
         let packet = sealer.seal(&clear, b"frame").unwrap();
         let parsed = super::super::rtp::parse_header(&packet).unwrap();
-        assert_eq!(
-            open_rtp(Mode::XChaCha20Poly1305, &key, &packet, &parsed).unwrap(),
-            b"frame"
-        );
+        assert_eq!(open_rtp(Mode::XChaCha20Poly1305, &key, &packet, &parsed).unwrap(), b"frame");
     }
 }

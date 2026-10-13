@@ -111,8 +111,7 @@ pub fn parse_header(bytes: &[u8]) -> Option<Parsed> {
     if extended {
         // The extension is a four-byte header - two bytes of profile, two of
         // length - followed by that many 32-bit words.
-        let words =
-            u16::from_be_bytes([*bytes.get(header_len + 2)?, *bytes.get(header_len + 3)?]) as usize;
+        let words = u16::from_be_bytes([*bytes.get(header_len + 2)?, *bytes.get(header_len + 3)?]) as usize;
         header_len += 4 + words * 4;
     }
     if bytes.len() < header_len {
@@ -252,19 +251,13 @@ mod tests {
         bytes[14] = 0x00;
         bytes[15] = 0x03;
         let parsed = parse_header(&bytes).expect("Discord sends an extension on every packet");
-        assert_eq!(
-            parsed.header_len, 28,
-            "12 fixed + 4 extension header + 3 words"
-        );
+        assert_eq!(parsed.header_len, 28, "12 fixed + 4 extension header + 3 words");
     }
 
     #[test]
     fn something_that_is_not_a_packet_is_refused_rather_than_guessed_at() {
         assert!(parse_header(&[]).is_none());
-        assert!(
-            parse_header(&[0u8; 8]).is_none(),
-            "too short to be a header"
-        );
+        assert!(parse_header(&[0u8; 8]).is_none(), "too short to be a header");
         assert!(parse_header(&[0u8; 12]).is_none(), "version 0 is not RTP");
         // An extension claiming more words than the datagram holds.
         let mut bytes = vec![0u8; 16];
@@ -302,11 +295,7 @@ mod tests {
     fn a_small_frame_is_one_packet_that_starts_and_finishes_it() {
         let packets = packetise_vp8(&[1, 2, 3, 4], 7, 100, 900);
         assert_eq!(packets.len(), 1);
-        assert_eq!(
-            packets[0].payload[0] & 0x10,
-            0x10,
-            "S bit set on the first packet"
-        );
+        assert_eq!(packets[0].payload[0] & 0x10, 0x10, "S bit set on the first packet");
         assert!(packets[0].marker, "and the marker on the last");
         assert_eq!(&packets[0].payload[1..], &[1, 2, 3, 4]);
         assert_eq!(packets[0].sequence, 100);
@@ -320,20 +309,13 @@ mod tests {
     fn a_large_frame_is_split_and_reassembles_to_itself() {
         let frame: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let packets = packetise_vp8(&frame, 9, 65_534, 4_000);
-        assert!(
-            packets.len() > 1,
-            "a 10 KB frame does not fit in one packet"
-        );
+        assert!(packets.len() > 1, "a 10 KB frame does not fit in one packet");
 
         // Only the first says it starts a frame; only the last says it ends
         // one. Getting either wrong is a picture that never appears.
         assert_eq!(packets[0].payload[0] & 0x10, 0x10);
         for p in &packets[1..] {
-            assert_eq!(
-                p.payload[0] & 0x10,
-                0,
-                "only the first packet starts the frame"
-            );
+            assert_eq!(p.payload[0] & 0x10, 0, "only the first packet starts the frame");
         }
         assert!(packets.last().unwrap().marker);
         for p in &packets[..packets.len() - 1] {
@@ -342,11 +324,7 @@ mod tests {
 
         // Every packet fits, descriptor included.
         for p in &packets {
-            assert!(
-                p.payload.len() <= MAX_PAYLOAD,
-                "{} is over the MTU",
-                p.payload.len()
-            );
+            assert!(p.payload.len() <= MAX_PAYLOAD, "{} is over the MTU", p.payload.len());
         }
 
         // One timestamp for the whole frame, and sequence numbers that go
@@ -354,17 +332,11 @@ mod tests {
         assert!(packets.iter().all(|p| p.timestamp == 4_000));
         assert_eq!(packets[0].sequence, 65_534);
         assert_eq!(packets[1].sequence, 65_535);
-        assert_eq!(
-            packets[2].sequence, 0,
-            "the sequence wraps rather than overflowing"
-        );
+        assert_eq!(packets[2].sequence, 0, "the sequence wraps rather than overflowing");
 
         // And the frame comes back out of them unchanged, which is the whole
         // claim.
-        let rebuilt: Vec<u8> = packets
-            .iter()
-            .flat_map(|p| p.payload[1..].iter().copied())
-            .collect();
+        let rebuilt: Vec<u8> = packets.iter().flat_map(|p| p.payload[1..].iter().copied()).collect();
         assert_eq!(rebuilt, frame);
     }
 
@@ -387,15 +359,7 @@ mod tests {
     /// numbered over the top of the one before.
     #[test]
     fn the_count_agrees_with_the_packets() {
-        for len in [
-            1,
-            100,
-            MAX_PAYLOAD - 2,
-            MAX_PAYLOAD - 1,
-            MAX_PAYLOAD,
-            MAX_PAYLOAD * 3 + 7,
-            10_000,
-        ] {
+        for len in [1, 100, MAX_PAYLOAD - 2, MAX_PAYLOAD - 1, MAX_PAYLOAD, MAX_PAYLOAD * 3 + 7, 10_000] {
             let frame = vec![7u8; len];
             assert_eq!(
                 packet_count_vp8(&frame),

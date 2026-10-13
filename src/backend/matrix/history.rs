@@ -18,33 +18,17 @@ use super::*;
 ///
 /// v1 rather than v3: it was added after the v3 client API was frozen, and
 /// lives under /client/v1 on every server that has it.
-pub async fn event_at(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    ts_ms: i64,
-    forwards: bool,
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
+pub async fn event_at(state: &AppState, account_id: &str, buffer_id: &str, ts_ms: i64, forwards: bool) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let url = format!(
         "{}/_matrix/client/v1/rooms/{}/timestamp_to_event?ts={ts_ms}&dir={}",
         account.homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         if forwards { "f" } else { "b" }
     );
-    let resp = http::get_json(&url, &account.access_token)
-        .await
-        .context("asking where that day is")?;
-    let event_id = resp["event_id"]
-        .as_str()
-        .context("the server named no event there")?;
+    let resp = http::get_json(&url, &account.access_token).await.context("asking where that day is")?;
+    let event_id = resp["event_id"].as_str().context("the server named no event there")?;
     Ok(serde_json::json!({
         "eventId": event_id,
         // Seconds, like every other timestamp this daemon hands out; the
@@ -64,42 +48,21 @@ pub async fn event_at(
 /// thread shows the same messages in the same shape whether they arrived
 /// live, in room history, or through this - and so anything already stored
 /// keeps its edits and reactions instead of being replaced by a plainer copy.
-pub async fn fetch_thread(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    root_id: &str,
-) -> Result<Vec<crate::model::Message>> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
+pub async fn fetch_thread(state: &AppState, account_id: &str, buffer_id: &str, root_id: &str) -> Result<Vec<crate::model::Message>> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let root = url::form_urlencoded::byte_serialize(root_id.as_bytes()).collect::<String>();
     // v1, not v3: relations were added to the spec after the v3 client API was
     // frozen, and live under /client/v1 for every server that has them.
-    let url =
-        format!("{base}/_matrix/client/v1/rooms/{room}/relations/{root}/m.thread?dir=f&limit=100");
+    let url = format!("{base}/_matrix/client/v1/rooms/{room}/relations/{root}/m.thread?dir=f&limit=100");
 
     match http::get_json(&url, &account.access_token).await {
         Ok(resp) => {
             let session = state.runtime.get_matrix_machine(account_id);
             for event in resp["chunk"].as_array().into_iter().flatten() {
-                store_thread_event(
-                    state,
-                    account_id,
-                    buffer_id,
-                    &room_id,
-                    &account.user_id,
-                    session.as_deref(),
-                    event,
-                )
-                .await;
+                store_thread_event(state, account_id, buffer_id, &room_id, &account.user_id, session.as_deref(), event).await;
             }
         }
         // A thread nobody has added to, a server that does not implement
@@ -108,8 +71,7 @@ pub async fn fetch_thread(
         Err(e) => tracing::debug!("matrix: reading thread {root_id}: {e:#}"),
     }
 
-    state.store.thread_messages(buffer_id, root_id)
-}
+    state.store.thread_messages(buffer_id, root_id)}
 
 /// Fetches the conversation around one event and stores it.
 ///
@@ -131,33 +93,17 @@ pub async fn fetch_thread(
 ///
 /// Returns how many messages were stored, so a caller can tell "here is more"
 /// from "there is no more".
-pub async fn load_newer(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-) -> Result<usize> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
+pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<usize> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
 
-    let anchored = http::get_json(
-        &format!("{base}/_matrix/client/v3/rooms/{room}/context/{event}?limit=1"),
-        &account.access_token,
-    )
-    .await
-    .context("finding that part of the room")?;
-    let end = anchored["end"]
-        .as_str()
-        .context("the server gave no way to read forward from there")?;
+    let anchored = http::get_json(&format!("{base}/_matrix/client/v3/rooms/{room}/context/{event}?limit=1"), &account.access_token)
+        .await
+        .context("finding that part of the room")?;
+    let end = anchored["end"].as_str().context("the server gave no way to read forward from there")?;
     let from = url::form_urlencoded::byte_serialize(end.as_bytes()).collect::<String>();
     let resp = http::get_json(
         &format!("{base}/_matrix/client/v3/rooms/{room}/messages?dir=f&limit=50&from={from}"),
@@ -170,86 +116,33 @@ pub async fn load_newer(
     let mut added = 0usize;
     // dir=f already reads oldest first, unlike the backward page.
     for event in resp["chunk"].as_array().cloned().unwrap_or_default() {
-        if store_history_event(
-            state,
-            &account,
-            account_id,
-            buffer_id,
-            &room_id,
-            session.as_ref(),
-            &event,
-        )
-        .await
-        {
+        if store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &event).await {
             added += 1;
         }
     }
     Ok(added)
 }
 
-pub async fn load_context(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-) -> Result<i64> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
+pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str) -> Result<i64> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let event = url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>();
     let url = format!("{base}/_matrix/client/v3/rooms/{room}/context/{event}?limit=30");
-    let resp = http::get_json(&url, &account.access_token)
-        .await
-        .context("reading that part of the room")?;
+    let resp = http::get_json(&url, &account.access_token).await.context("reading that part of the room")?;
 
     let session = state.runtime.get_matrix_machine(account_id);
     // Oldest first, so the store reads in the order it was said: the events
     // before this one arrive newest-first from the server.
-    let before: Vec<Value> = resp["events_before"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let before: Vec<Value> = resp["events_before"].as_array().cloned().unwrap_or_default();
     for event in before.iter().rev() {
-        store_history_event(
-            state,
-            &account,
-            account_id,
-            buffer_id,
-            &room_id,
-            session.as_ref(),
-            event,
-        )
-        .await;
+        store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), event).await;
     }
     let target = resp["event"].clone();
-    store_history_event(
-        state,
-        &account,
-        account_id,
-        buffer_id,
-        &room_id,
-        session.as_ref(),
-        &target,
-    )
-    .await;
+    store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &target).await;
     for event in resp["events_after"].as_array().cloned().unwrap_or_default() {
-        store_history_event(
-            state,
-            &account,
-            account_id,
-            buffer_id,
-            &room_id,
-            session.as_ref(),
-            &event,
-        )
-        .await;
+        store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), &event).await;
     }
 
     // From the event itself rather than from the store: an event that would
@@ -261,30 +154,15 @@ pub async fn load_context(
         .context("the server did not say when that message was sent")
 }
 
-pub async fn backfill(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    limit: u32,
-) -> Result<usize> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let Some(from) = state.runtime.matrix_back_token(account_id, &room_id) else {
-        return Ok(0);
-    };
+pub async fn backfill(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<usize> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let Some(from) = state.runtime.matrix_back_token(account_id, &room_id) else { return Ok(0) };
 
     let base = account.homeserver_url.trim_end_matches('/');
     let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let from_enc = url::form_urlencoded::byte_serialize(from.as_bytes()).collect::<String>();
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit={limit}&from={from_enc}"
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{room}/messages?dir=b&limit={limit}&from={from_enc}");
     let resp = http::get_json(&url, &account.access_token).await?;
 
     // The sync loop's own session, not a second one: opening the crypto
@@ -297,17 +175,7 @@ pub async fn backfill(
     // the order it was said.
     let chunk: Vec<Value> = resp["chunk"].as_array().cloned().unwrap_or_default();
     for event in chunk.iter().rev() {
-        if store_history_event(
-            state,
-            &account,
-            account_id,
-            buffer_id,
-            &room_id,
-            session.as_ref(),
-            event,
-        )
-        .await
-        {
+        if store_history_event(state, &account, account_id, buffer_id, &room_id, session.as_ref(), event).await {
             added += 1;
         }
     }
@@ -316,9 +184,7 @@ pub async fn backfill(
     // beginning, and the token is left alone so a later call does not loop
     // over the same page forever.
     if let Some(end) = resp["end"].as_str() {
-        state
-            .runtime
-            .set_matrix_back_token(account_id, &room_id, end, false);
+        state.runtime.set_matrix_back_token(account_id, &room_id, end, false);
     }
     Ok(added)
 }
@@ -336,20 +202,9 @@ pub async fn backfill(
 /// Each one carries what the panel needs to be worth opening - who started
 /// it, how many replies it has, whether this account has said anything in it
 /// - which is exactly what the server sends alongside the root event.
-pub async fn list_threads(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    limit: u32,
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str, limit: u32) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     // Client v1, not v3: threads arrived after v3 was frozen, the same way
@@ -364,18 +219,14 @@ pub async fn list_threads(
         "{base}/_matrix/client/v1/rooms/{encoded_room}/threads?include=all&limit={}",
         limit.clamp(1, 100)
     );
-    let resp = http::get_json(&url, &account.access_token)
-        .await
-        .context("listing threads")?;
+    let resp = http::get_json(&url, &account.access_token).await.context("listing threads")?;
 
     let session = state.runtime.get_matrix_machine(account_id);
     let room = ruma_common::RoomId::parse(&room_id).ok();
     let members = state.runtime.get_matrix_room_members(account_id, &room_id);
     let mut threads = Vec::new();
     for root in resp["chunk"].as_array().into_iter().flatten() {
-        let Some(root_id) = root["event_id"].as_str() else {
-            continue;
-        };
+        let Some(root_id) = root["event_id"].as_str() else { continue };
         let root = read_event(&session, room.as_deref(), root).await;
         let sender = root["sender"].as_str().unwrap_or_default();
         let relation = &root["unsigned"]["m.relations"]["m.thread"];
@@ -383,10 +234,7 @@ pub async fn list_threads(
         // threads is actually looking at.
         let latest = read_event(&session, room.as_deref(), &relation["latest_event"]).await;
         let name_of = |user: &str| {
-            members
-                .get(user)
-                .cloned()
-                .unwrap_or_else(|| protocol::mxid_localpart(user))
+            members.get(user).cloned().unwrap_or_else(|| protocol::mxid_localpart(user))
         };
         threads.push(serde_json::json!({
             "rootId": root_id,
@@ -403,7 +251,5 @@ pub async fn list_threads(
             "lastTs": latest["origin_server_ts"].as_i64().map(|ms| ms / 1000),
         }));
     }
-    Ok(
-        serde_json::json!({ "bufferId": buffer_id, "threads": threads, "next": resp["next_batch"].clone() }),
-    )
+    Ok(serde_json::json!({ "bufferId": buffer_id, "threads": threads, "next": resp["next_batch"].clone() }))
 }

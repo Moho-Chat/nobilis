@@ -44,8 +44,7 @@ pub struct Locked {
 }
 
 fn pending() -> &'static std::sync::Mutex<HashMap<String, Vec<Locked>>> {
-    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<Locked>>>> =
-        std::sync::OnceLock::new();
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Vec<Locked>>>> = std::sync::OnceLock::new();
     PENDING.get_or_init(Default::default)
 }
 
@@ -96,13 +95,8 @@ pub async fn note_locked(
         }
     }
 
-    let Ok(room) = ruma_common::RoomId::parse(room_id) else {
-        return;
-    };
-    if let Err(e) = session
-        .request_room_key(homeserver_url, access_token, event, &room)
-        .await
-    {
+    let Ok(room) = ruma_common::RoomId::parse(room_id) else { return };
+    if let Err(e) = session.request_room_key(homeserver_url, access_token, event, &room).await {
         tracing::debug!("matrix[{account_id}]: asking for the key to {event_id}: {e:#}");
     }
 }
@@ -127,9 +121,7 @@ pub async fn retry_locked(state: &AppState, session: &CryptoSession, account_id:
             opened.push(locked.event_id.clone());
             continue;
         };
-        let Ok(decrypted) = crypto::decrypt_room_event(session, &locked.event, &room).await else {
-            continue;
-        };
+        let Ok(decrypted) = crypto::decrypt_room_event(session, &locked.event, &room).await else { continue };
         // Only what a message is. A reaction or an edit that could not be
         // read is dropped rather than rewritten: there is no placeholder on
         // screen for either, so there is nothing to correct, and replaying
@@ -137,14 +129,7 @@ pub async fn retry_locked(state: &AppState, session: &CryptoSession, account_id:
         let content = &decrypted["content"];
         let (body, _) = protocol::message_body(content);
         if !body.is_empty() {
-            state.runtime.update_message(
-                state,
-                &locked.buffer_id,
-                &locked.event_id,
-                &body,
-                &[],
-                &[],
-            );
+            state.runtime.update_message(state, &locked.buffer_id, &locked.event_id, &body, &[], &[]);
         }
         opened.push(locked.event_id.clone());
     }
@@ -152,10 +137,7 @@ pub async fn retry_locked(state: &AppState, session: &CryptoSession, account_id:
     if opened.is_empty() {
         return;
     }
-    tracing::debug!(
-        "matrix[{account_id}]: {} message(s) became readable",
-        opened.len()
-    );
+    tracing::debug!("matrix[{account_id}]: {} message(s) became readable", opened.len());
     let mut all = pending().lock().unwrap();
     if let Some(waiting) = all.get_mut(account_id) {
         waiting.retain(|l| !opened.contains(&l.event_id));
@@ -193,10 +175,7 @@ mod tests {
         }
         assert_eq!(waiting.len(), MAX_PENDING);
         // The newest survive, which are the ones somebody is looking at.
-        assert_eq!(
-            waiting.last().unwrap().event_id,
-            format!("${}", MAX_PENDING + 49)
-        );
+        assert_eq!(waiting.last().unwrap().event_id, format!("${}", MAX_PENDING + 49));
         assert_eq!(waiting.first().unwrap().event_id, "$50");
     }
 
@@ -205,15 +184,8 @@ mod tests {
     #[test]
     fn the_same_message_is_only_waited_on_once() {
         let mut waiting = vec![locked("$a")];
-        let news: Vec<bool> = ["$a", "$b", "$a"]
-            .iter()
-            .map(|id| hold(&mut waiting, locked(id)))
-            .collect();
-        assert_eq!(
-            news,
-            [false, true, false],
-            "only a message not already waiting is news"
-        );
+        let news: Vec<bool> = ["$a", "$b", "$a"].iter().map(|id| hold(&mut waiting, locked(id))).collect();
+        assert_eq!(news, [false, true, false], "only a message not already waiting is news");
         assert_eq!(waiting.len(), 2);
     }
 }

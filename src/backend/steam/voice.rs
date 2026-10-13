@@ -50,14 +50,8 @@ fn say<Q: Message>(link: &Link, method: &str, request: &Q) -> Result<(), String>
     link.notify(method, request).map_err(|e| e.to_string())
 }
 
-async fn ask<Q: Message, A: Message + Default>(
-    link: &Link,
-    method: &str,
-    request: &Q,
-) -> Result<A, String> {
-    link.call(method, request, true)
-        .await
-        .map_err(|e| voice_refusal(&e, method))
+async fn ask<Q: Message, A: Message + Default>(link: &Link, method: &str, request: &Q) -> Result<A, String> {
+    link.call(method, request, true).await.map_err(|e| voice_refusal(&e, method))
 }
 
 /// What the window reads at the front of a failure that may be gone in a moment, as the Steam client
@@ -67,60 +61,36 @@ pub const AGAIN: &str = "[again] ";
 /// Why a voice call was refused, in the words that fit it. A failure that is the server's and
 /// passing is marked [`AGAIN`] for the window to try again; being refused for good is said.
 fn voice_refusal(error: &super::link::CallError, method: &str) -> String {
-    use super::eresult as e;
     use super::link::CallError;
+    use super::eresult as e;
     let transient = match error {
         CallError::TimedOut => true,
-        CallError::Refused(code, _) => matches!(
-            *code,
-            e::FAIL | e::BUSY | e::TIMEOUT | e::SERVICE_UNAVAILABLE | 32 | 33 | 37 | 55
-        ),
+        CallError::Refused(code, _) => matches!(*code, e::FAIL | e::BUSY | e::TIMEOUT | e::SERVICE_UNAVAILABLE | 32 | 33 | 37 | 55),
         _ => false,
     };
     if transient {
         return format!("{AGAIN}{}", refusal(error));
     }
     match error {
-        CallError::Refused(e::ACCESS_DENIED, _) if method.starts_with("ChatRoom.JoinVoiceChat") => {
-            "you may not join voice in this room".to_string()
-        }
-        CallError::Refused(e::ACCESS_DENIED, _)
-            if method.starts_with("VoiceChat.RequestOneOnOneChat") =>
-        {
-            "this person is not taking calls from you".to_string()
-        }
-        CallError::Refused(e::BLOCKED, _) | CallError::Refused(e::IGNORED, _) => {
-            "this person cannot be called".to_string()
-        }
+        CallError::Refused(e::ACCESS_DENIED, _) if method.starts_with("ChatRoom.JoinVoiceChat") => "you may not join voice in this room".to_string(),
+        CallError::Refused(e::ACCESS_DENIED, _) if method.starts_with("VoiceChat.RequestOneOnOneChat") => "this person is not taking calls from you".to_string(),
+        CallError::Refused(e::BLOCKED, _) | CallError::Refused(e::IGNORED, _) => "this person cannot be called".to_string(),
         CallError::Refused(e::LIMIT_EXCEEDED, _) => "the voice chat is full".to_string(),
-        CallError::Refused(
-            e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_PARAM | e::INVALID_STATE,
-            _,
-        ) if method.starts_with("ChatRoom.JoinVoiceChat") => "this room has no voice".to_string(),
-        CallError::Refused(e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_STATE, _) => {
-            "that call is over".to_string()
-        }
+        CallError::Refused(e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_PARAM | e::INVALID_STATE, _) if method.starts_with("ChatRoom.JoinVoiceChat") => "this room has no voice".to_string(),
+        CallError::Refused(e::NO_MATCH | e::FILE_NOT_FOUND | e::INVALID_STATE, _) => "that call is over".to_string(),
         other => refusal(other),
     }
 }
 
 /// One thing the window asks of the voice, and what Steam answers.
 pub async fn act(state: &AppState, account_id: &str, params: &Value) -> Result<Value, String> {
-    let link = state
-        .runtime
-        .steam_link(account_id)
-        .ok_or("this Steam account is not connected")?;
+    let link = state.runtime.steam_link(account_id).ok_or("this Steam account is not connected")?;
     let op = params["op"].as_str().ok_or("steamVoice needs an \"op\"")?;
     match op {
         // The offer, and the answer from the server that will carry the session.
         "initiate" => {
-            let request = InitiateWebRTCConnectionRequest {
-                sdp: text(params, "sdp"),
-                browser_name: text(params, "browserName"),
-                browser_version: text(params, "browserVersion"),
-            };
-            let answer: InitiateWebRTCConnectionResponse =
-                ask(&link, "WebRTCClient.InitiateWebRTCConnection#1", &request).await?;
+            let request = InitiateWebRTCConnectionRequest { sdp: text(params, "sdp"), browser_name: text(params, "browserName"), browser_version: text(params, "browserVersion") };
+            let answer: InitiateWebRTCConnectionResponse = ask(&link, "WebRTCClient.InitiateWebRTCConnection#1", &request).await?;
             Ok(json!({ "remoteDescription": answer.remote_description }))
         }
         // A new offer on a session that is up (the browser's own renegotiation).
@@ -132,8 +102,7 @@ pub async fn act(state: &AppState, account_id: &str, params: &Value) -> Result<V
                 port_webrtc_session_client: num(params, "clientPort"),
                 sdp: text(params, "sdp"),
             };
-            let answer: UpdateWebRTCConnectionResponse =
-                ask(&link, "WebRTCClient.UpdateWebRTCConnection#1", &request).await?;
+            let answer: UpdateWebRTCConnectionResponse = ask(&link, "WebRTCClient.UpdateWebRTCConnection#1", &request).await?;
             Ok(json!({ "remoteDescription": answer.remote_description }))
         }
         // The window has taken the server's new offer and answered it.
@@ -145,44 +114,17 @@ pub async fn act(state: &AppState, account_id: &str, params: &Value) -> Result<V
                 port_webrtc_session_client: num(params, "clientPort"),
                 remote_description_version: id_of(params, "version"),
             };
-            let _: AcknowledgeUpdatedRemoteDescriptionResponse = ask(
-                &link,
-                "WebRTCClient.AcknowledgeUpdatedRemoteDescription#1",
-                &request,
-            )
-            .await?;
+            let _: AcknowledgeUpdatedRemoteDescriptionResponse = ask(&link, "WebRTCClient.AcknowledgeUpdatedRemoteDescription#1", &request).await?;
             Ok(json!({}))
         }
         "joinRoom" => {
-            let (Some(group), Some(room)) = (id_of(params, "groupId"), id_of(params, "roomId"))
-            else {
-                return Err("joinRoom needs a group and a room".into());
-            };
-            let answer: RoomJoinVoiceChatResponse = ask(
-                &link,
-                "ChatRoom.JoinVoiceChat#1",
-                &RoomJoinVoiceChatRequest {
-                    chat_group_id: Some(group),
-                    chat_id: Some(room),
-                },
-            )
-            .await?;
+            let (Some(group), Some(room)) = (id_of(params, "groupId"), id_of(params, "roomId")) else { return Err("joinRoom needs a group and a room".into()) };
+            let answer: RoomJoinVoiceChatResponse = ask(&link, "ChatRoom.JoinVoiceChat#1", &RoomJoinVoiceChatRequest { chat_group_id: Some(group), chat_id: Some(room) }).await?;
             Ok(json!({ "voiceChatId": answer.voice_chatid.map(|v| v.to_string()) }))
         }
         "leaveRoom" => {
-            let (Some(group), Some(room)) = (id_of(params, "groupId"), id_of(params, "roomId"))
-            else {
-                return Err("leaveRoom needs a group and a room".into());
-            };
-            let _: RoomLeaveVoiceChatResponse = ask(
-                &link,
-                "ChatRoom.LeaveVoiceChat#1",
-                &RoomLeaveVoiceChatRequest {
-                    chat_group_id: Some(group),
-                    chat_id: Some(room),
-                },
-            )
-            .await?;
+            let (Some(group), Some(room)) = (id_of(params, "groupId"), id_of(params, "roomId")) else { return Err("leaveRoom needs a group and a room".into()) };
+            let _: RoomLeaveVoiceChatResponse = ask(&link, "ChatRoom.LeaveVoiceChat#1", &RoomLeaveVoiceChatRequest { chat_group_id: Some(group), chat_id: Some(room) }).await?;
             Ok(json!({}))
         }
         // Which stream is ours, once the session is connected: what makes the chat
@@ -201,26 +143,19 @@ pub async fn act(state: &AppState, account_id: &str, params: &Value) -> Result<V
                 accepts_webrtc_video: Some(false),
                 sends_webrtc_video: Some(false),
             };
-            let answer: UpdateVoiceChatWebRTCDataResponse =
-                ask(&link, "VoiceChat.UpdateVoiceChatWebRTCData#1", &request).await?;
+            let answer: UpdateVoiceChatWebRTCDataResponse = ask(&link, "VoiceChat.UpdateVoiceChatWebRTCData#1", &request).await?;
             Ok(json!({ "sendLogs": answer.send_client_voice_logs.unwrap_or(false) }))
         }
         // How we are showing to the others in the call: muted, deafened, no microphone.
         "status" => {
-            let own = state
-                .accounts
-                .get_steam(account_id)
-                .map(|c| c.steamid)
-                .ok_or("this Steam account is not set up")?;
+            let own = state.accounts.get_steam(account_id).map(|c| c.steamid).ok_or("this Steam account is not set up")?;
             let request = UserVoiceStatusNotification {
                 voice_chatid: id_of(params, "voiceChatId"),
                 user_steamid: Some(own),
                 user_muted_mic_locally: Some(params["micMuted"].as_bool().unwrap_or(false)),
                 user_muted_output_locally: Some(params["outputMuted"].as_bool().unwrap_or(false)),
                 user_has_no_mic_for_session: Some(params["noMic"].as_bool().unwrap_or(false)),
-                user_webaudio_sample_rate: params["sampleRate"]
-                    .as_i64()
-                    .and_then(|n| i32::try_from(n).ok()),
+                user_webaudio_sample_rate: params["sampleRate"].as_i64().and_then(|n| i32::try_from(n).ok()),
                 user_sends_video: Some(false),
             };
             say(&link, "VoiceChat.NotifyUserVoiceStatus#1", &request)?;
@@ -228,54 +163,29 @@ pub async fn act(state: &AppState, account_id: &str, params: &Value) -> Result<V
         }
         "requestCall" => {
             let partner = id_of(params, "steamid").ok_or("requestCall needs a person")?;
-            let answer: RequestOneOnOneChatResponse = ask(
-                &link,
-                "VoiceChat.RequestOneOnOneChat#1",
-                &RequestOneOnOneChatRequest {
-                    steamid_partner: Some(partner),
-                },
-            )
-            .await?;
+            let answer: RequestOneOnOneChatResponse = ask(&link, "VoiceChat.RequestOneOnOneChat#1", &RequestOneOnOneChatRequest { steamid_partner: Some(partner) }).await?;
             Ok(json!({ "voiceChatId": answer.voice_chatid.map(|v| v.to_string()) }))
         }
         "answerCall" => {
             let partner = id_of(params, "steamid").ok_or("answerCall needs a person")?;
-            let request = AnswerOneOnOneChatRequest {
-                voice_chatid: id_of(params, "voiceChatId"),
-                steamid_partner: Some(partner),
-                accepted_request: Some(params["accept"].as_bool().unwrap_or(true)),
-            };
-            let _: AnswerOneOnOneChatResponse =
-                ask(&link, "VoiceChat.AnswerOneOnOneChat#1", &request).await?;
+            let request = AnswerOneOnOneChatRequest { voice_chatid: id_of(params, "voiceChatId"), steamid_partner: Some(partner), accepted_request: Some(params["accept"].as_bool().unwrap_or(true)) };
+            let _: AnswerOneOnOneChatResponse = ask(&link, "VoiceChat.AnswerOneOnOneChat#1", &request).await?;
             Ok(json!({}))
         }
         // Hanging up on them: it ends the call for both.
         "endCall" => {
             let partner = id_of(params, "steamid").ok_or("endCall needs a person")?;
-            let _: EndOneOnOneChatResponse = ask(
-                &link,
-                "VoiceChat.EndOneOnOneChat#1",
-                &EndOneOnOneChatRequest {
-                    steamid_partner: Some(partner),
-                },
-            )
-            .await?;
+            let _: EndOneOnOneChatResponse = ask(&link, "VoiceChat.EndOneOnOneChat#1", &EndOneOnOneChatRequest { steamid_partner: Some(partner) }).await?;
             Ok(json!({}))
         }
         // Leaving it running for them, where they can come back to it.
         "leaveCall" => {
             let partner = id_of(params, "steamid").ok_or("leaveCall needs a person")?;
-            let request = LeaveOneOnOneChatRequest {
-                steamid_partner: Some(partner),
-                voice_chatid: id_of(params, "voiceChatId"),
-            };
-            let _: LeaveOneOnOneChatResponse =
-                ask(&link, "VoiceChat.LeaveOneOnOneChat#1", &request).await?;
+            let request = LeaveOneOnOneChatRequest { steamid_partner: Some(partner), voice_chatid: id_of(params, "voiceChatId") };
+            let _: LeaveOneOnOneChatResponse = ask(&link, "VoiceChat.LeaveOneOnOneChat#1", &request).await?;
             Ok(json!({}))
         }
-        other => Err(format!(
-            "{other} is not something Steam voice can be asked to do"
-        )),
+        other => Err(format!("{other} is not something Steam voice can be asked to do")),
     }
 }
 
@@ -297,25 +207,15 @@ fn status_json(s: &UserVoiceStatusNotification) -> Value {
 /// Returns whether it was.
 pub fn heard(state: &AppState, account_id: &str, method: &str, body: &[u8]) -> bool {
     let tell = |kind: &str, data: Value| {
-        state.events.emit(
-            "steamVoice",
-            json!({ "accountId": account_id, "kind": kind, "data": data }),
-        );
+        state.events.emit("steamVoice", json!({ "accountId": account_id, "kind": kind, "data": data }));
     };
     match method {
         "WebRTCClientNotifications.NotifyWebRTCSessionConnected#1" => {
-            let Ok(n) = WebRTCSessionConnectedNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "sessionConnected",
-                json!({ "ssrc": n.ssrc, "clientIp": n.client_ip, "clientPort": n.client_port, "serverIp": n.server_ip, "serverPort": n.server_port }),
-            );
+            let Ok(n) = WebRTCSessionConnectedNotification::decode(body) else { return true };
+            tell("sessionConnected", json!({ "ssrc": n.ssrc, "clientIp": n.client_ip, "clientPort": n.client_port, "serverIp": n.server_ip, "serverPort": n.server_port }));
         }
         "WebRTCClientNotifications.NotifyWebRTCUpdateRemoteDescription#1" => {
-            let Ok(n) = WebRTCUpdateRemoteDescriptionNotification::decode(body) else {
-                return true;
-            };
+            let Ok(n) = WebRTCUpdateRemoteDescriptionNotification::decode(body) else { return true };
             tell(
                 "remoteDescription",
                 json!({
@@ -325,76 +225,38 @@ pub fn heard(state: &AppState, account_id: &str, method: &str, body: &[u8]) -> b
                 }),
             );
         }
-        "VoiceChatClient.NotifyUserJoinedVoiceChat#1"
-        | "VoiceChatClient.NotifyUserLeftVoiceChat#1" => {
+        "VoiceChatClient.NotifyUserJoinedVoiceChat#1" | "VoiceChatClient.NotifyUserLeftVoiceChat#1" => {
             let joined = method.contains("Joined");
-            let Ok(n) = UserJoinedVoiceChatNotification::decode(body) else {
-                return true;
-            };
-            let (group, room) = (
-                n.chat_group_id.filter(|g| *g != 0),
-                n.chatid.filter(|c| *c != 0),
-            );
-            if let (Some(group), Some(room), Some(user)) =
-                (group, room, n.user_steamid.and_then(steamid::account_of))
-            {
+            let Ok(n) = UserJoinedVoiceChatNotification::decode(body) else { return true };
+            let (group, room) = (n.chat_group_id.filter(|g| *g != 0), n.chatid.filter(|c| *c != 0));
+            if let (Some(group), Some(room), Some(user)) = (group, room, n.user_steamid.and_then(steamid::account_of)) {
                 chatgroups::voice_changed(state, account_id, group, room, user, joined);
             }
-            tell(
-                if joined { "userJoined" } else { "userLeft" },
-                json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "steamid": n.user_steamid.map(who), "groupId": group.map(|g| g.to_string()), "roomId": room.map(|r| r.to_string()) }),
-            );
+            tell(if joined { "userJoined" } else { "userLeft" }, json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "steamid": n.user_steamid.map(who), "groupId": group.map(|g| g.to_string()), "roomId": room.map(|r| r.to_string()) }));
         }
         "VoiceChatClient.NotifyVoiceChatEnded#1" => {
-            let Ok(n) = VoiceChatEndedNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "ended",
-                json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "groupId": n.chat_group_id.map(|g| g.to_string()), "roomId": n.chatid.map(|r| r.to_string()) }),
-            );
+            let Ok(n) = VoiceChatEndedNotification::decode(body) else { return true };
+            tell("ended", json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "groupId": n.chat_group_id.map(|g| g.to_string()), "roomId": n.chatid.map(|r| r.to_string()) }));
         }
         "VoiceChatClient.NotifyUserVoiceStatus#1" => {
-            let Ok(n) = UserVoiceStatusNotification::decode(body) else {
-                return true;
-            };
+            let Ok(n) = UserVoiceStatusNotification::decode(body) else { return true };
             tell("status", status_json(&n));
         }
         "VoiceChatClient.NotifyAllUsersVoiceStatus#1" => {
-            let Ok(n) = AllMembersStatusNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "allStatus",
-                json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "users": n.users.iter().map(status_json).collect::<Vec<_>>() }),
-            );
+            let Ok(n) = AllMembersStatusNotification::decode(body) else { return true };
+            tell("allStatus", json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "users": n.users.iter().map(status_json).collect::<Vec<_>>() }));
         }
         "VoiceChatClient.NotifyOneOnOneChatRequested#1" => {
-            let Ok(n) = OneOnOneChatRequestedNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "callRequested",
-                json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "steamid": n.steamid_partner.map(who) }),
-            );
+            let Ok(n) = OneOnOneChatRequestedNotification::decode(body) else { return true };
+            tell("callRequested", json!({ "voiceChatId": n.voice_chatid.map(|v| v.to_string()), "steamid": n.steamid_partner.map(who) }));
         }
         "VoiceChatClient.NotifyOneOnOneChatResponse#1" => {
-            let Ok(n) = OneOnOneChatRequestResponseNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "callResponse",
-                json!({ "voiceChatId": n.voicechat_id.map(|v| v.to_string()), "steamid": n.steamid_partner.map(who), "accepted": n.accepted_request.unwrap_or(false) }),
-            );
+            let Ok(n) = OneOnOneChatRequestResponseNotification::decode(body) else { return true };
+            tell("callResponse", json!({ "voiceChatId": n.voicechat_id.map(|v| v.to_string()), "steamid": n.steamid_partner.map(who), "accepted": n.accepted_request.unwrap_or(false) }));
         }
         "ChatRoomClient.NotifyShouldRejoinChatRoomVoiceChat#1" => {
-            let Ok(n) = RoomNotifyShouldRejoinChatRoomVoiceChatNotification::decode(body) else {
-                return true;
-            };
-            tell(
-                "shouldRejoin",
-                json!({ "groupId": n.chat_group_id.map(|g| g.to_string()), "roomId": n.chat_id.map(|r| r.to_string()) }),
-            );
+            let Ok(n) = RoomNotifyShouldRejoinChatRoomVoiceChatNotification::decode(body) else { return true };
+            tell("shouldRejoin", json!({ "groupId": n.chat_group_id.map(|g| g.to_string()), "roomId": n.chat_id.map(|r| r.to_string()) }));
         }
         _ => return false,
     }
@@ -423,137 +285,49 @@ mod tests {
     #[tokio::test]
     async fn what_the_server_says_of_the_session_reaches_the_window_in_the_window_s_words() {
         let state = simulated_daemon("steam-voice-heard");
-        let connected = WebRTCSessionConnectedNotification {
-            ssrc: Some(5),
-            client_ip: Some(1),
-            client_port: Some(2),
-            server_ip: Some(3),
-            server_port: Some(4),
-        };
-        let (known, event) = told(
-            &state,
-            "WebRTCClientNotifications.NotifyWebRTCSessionConnected#1",
-            connected.encode_to_vec(),
-        );
+        let connected = WebRTCSessionConnectedNotification { ssrc: Some(5), client_ip: Some(1), client_port: Some(2), server_ip: Some(3), server_port: Some(4) };
+        let (known, event) = told(&state, "WebRTCClientNotifications.NotifyWebRTCSessionConnected#1", connected.encode_to_vec());
         assert!(known);
         let event = event.unwrap();
-        assert_eq!(
-            (
-                event["kind"].as_str(),
-                event["data"]["ssrc"].as_u64(),
-                event["data"]["serverPort"].as_u64()
-            ),
-            (Some("sessionConnected"), Some(5), Some(4))
-        );
+        assert_eq!((event["kind"].as_str(), event["data"]["ssrc"].as_u64(), event["data"]["serverPort"].as_u64()), (Some("sessionConnected"), Some(5), Some(4)));
 
         let offer = WebRTCUpdateRemoteDescriptionNotification {
             remote_description: Some("{}".into()),
             remote_description_version: Some(u64::MAX - 1),
-            ssrcs_to_accountids: vec![WebRTCUpdateRemoteDescriptionNotificationSsrcAccount {
-                ssrc: Some(9),
-                accountid: Some(100),
-            }],
+            ssrcs_to_accountids: vec![WebRTCUpdateRemoteDescriptionNotificationSsrcAccount { ssrc: Some(9), accountid: Some(100) }],
         };
-        let (_, event) = told(
-            &state,
-            "WebRTCClientNotifications.NotifyWebRTCUpdateRemoteDescription#1",
-            offer.encode_to_vec(),
-        );
+        let (_, event) = told(&state, "WebRTCClientNotifications.NotifyWebRTCUpdateRemoteDescription#1", offer.encode_to_vec());
         let data = event.unwrap()["data"].clone();
-        assert_eq!(
-            data["version"],
-            (u64::MAX - 1).to_string(),
-            "a 64-bit number crosses as text, since the window cannot hold it"
-        );
-        assert_eq!(
-            (
-                data["ssrcs"][0]["ssrc"].as_u64(),
-                data["ssrcs"][0]["steamid"].as_str()
-            ),
-            (Some(9), Some("76561197960265828"))
-        );
+        assert_eq!(data["version"], (u64::MAX - 1).to_string(), "a 64-bit number crosses as text, since the window cannot hold it");
+        assert_eq!((data["ssrcs"][0]["ssrc"].as_u64(), data["ssrcs"][0]["steamid"].as_str()), (Some(9), Some("76561197960265828")));
 
-        let call = OneOnOneChatRequestedNotification {
-            voice_chatid: Some(u64::MAX),
-            steamid_partner: Some(steamid::steamid_of(100)),
-        };
-        let (_, event) = told(
-            &state,
-            "VoiceChatClient.NotifyOneOnOneChatRequested#1",
-            call.encode_to_vec(),
-        );
+        let call = OneOnOneChatRequestedNotification { voice_chatid: Some(u64::MAX), steamid_partner: Some(steamid::steamid_of(100)) };
+        let (_, event) = told(&state, "VoiceChatClient.NotifyOneOnOneChatRequested#1", call.encode_to_vec());
         let data = event.unwrap()["data"].clone();
-        assert_eq!(
-            (data["voiceChatId"].as_str(), data["steamid"].as_str()),
-            (Some("18446744073709551615"), Some("76561197960265828"))
-        );
+        assert_eq!((data["voiceChatId"].as_str(), data["steamid"].as_str()), (Some("18446744073709551615"), Some("76561197960265828")));
 
-        let (known, event) = told(
-            &state,
-            "VoiceChatClient.NotifyNothingInParticular#1",
-            Vec::new(),
-        );
-        assert!(
-            !known && event.is_none(),
-            "a method this does not know is not told"
-        );
+        let (known, event) = told(&state, "VoiceChatClient.NotifyNothingInParticular#1", Vec::new());
+        assert!(!known && event.is_none(), "a method this does not know is not told");
     }
 
     #[test]
     fn a_passing_failure_is_marked_for_trying_again_and_being_refused_for_good_is_said() {
         use crate::backend::steam::link::CallError;
-        assert!(
-            voice_refusal(&CallError::Refused(2, None), "ChatRoom.JoinVoiceChat#1")
-                .starts_with(AGAIN)
-        );
-        assert!(voice_refusal(
-            &CallError::TimedOut,
-            "WebRTCClient.InitiateWebRTCConnection#1"
-        )
-        .starts_with(AGAIN));
-        assert_eq!(
-            voice_refusal(&CallError::Refused(15, None), "ChatRoom.JoinVoiceChat#1"),
-            "you may not join voice in this room"
-        );
-        assert_eq!(
-            voice_refusal(
-                &CallError::Refused(15, None),
-                "VoiceChat.RequestOneOnOneChat#1"
-            ),
-            "this person is not taking calls from you"
-        );
-        assert_eq!(
-            voice_refusal(
-                &CallError::Refused(40, None),
-                "VoiceChat.RequestOneOnOneChat#1"
-            ),
-            "this person cannot be called"
-        );
-        assert_eq!(
-            voice_refusal(&CallError::Refused(25, None), "ChatRoom.JoinVoiceChat#1"),
-            "the voice chat is full"
-        );
-        assert_eq!(
-            voice_refusal(&CallError::Refused(42, None), "ChatRoom.JoinVoiceChat#1"),
-            "this room has no voice"
-        );
-        assert!(
-            !voice_refusal(&CallError::Closed, "VoiceChat.EndOneOnOneChat#1").starts_with(AGAIN)
-        );
+        assert!(voice_refusal(&CallError::Refused(2, None), "ChatRoom.JoinVoiceChat#1").starts_with(AGAIN));
+        assert!(voice_refusal(&CallError::TimedOut, "WebRTCClient.InitiateWebRTCConnection#1").starts_with(AGAIN));
+        assert_eq!(voice_refusal(&CallError::Refused(15, None), "ChatRoom.JoinVoiceChat#1"), "you may not join voice in this room");
+        assert_eq!(voice_refusal(&CallError::Refused(15, None), "VoiceChat.RequestOneOnOneChat#1"), "this person is not taking calls from you");
+        assert_eq!(voice_refusal(&CallError::Refused(40, None), "VoiceChat.RequestOneOnOneChat#1"), "this person cannot be called");
+        assert_eq!(voice_refusal(&CallError::Refused(25, None), "ChatRoom.JoinVoiceChat#1"), "the voice chat is full");
+        assert_eq!(voice_refusal(&CallError::Refused(42, None), "ChatRoom.JoinVoiceChat#1"), "this room has no voice");
+        assert!(!voice_refusal(&CallError::Closed, "VoiceChat.EndOneOnOneChat#1").starts_with(AGAIN));
     }
 
     #[test]
     fn numbers_cross_as_text_and_a_number_too_big_for_its_place_is_not_one() {
-        assert_eq!(
-            id_of(&json!({ "a": "18446744073709551615" }), "a"),
-            Some(u64::MAX)
-        );
+        assert_eq!(id_of(&json!({ "a": "18446744073709551615" }), "a"), Some(u64::MAX));
         assert_eq!(id_of(&json!({ "a": 5 }), "a"), Some(5));
         assert_eq!(id_of(&json!({}), "a"), None);
-        assert_eq!(
-            num(&json!({ "n": 4294967296u64 }), "n"),
-            None,
-            "a number too big for 32 bits is not one"
-        );
+        assert_eq!(num(&json!({ "n": 4294967296u64 }), "n"), None, "a number too big for 32 bits is not one");
     }
 }

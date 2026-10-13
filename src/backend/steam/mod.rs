@@ -24,11 +24,8 @@
 //! - `cm` - finding a connection manager to connect to
 //! - `link` - one connection: asking it things, and hearing what it says
 
-pub mod account;
-pub mod apps;
 pub mod auth;
 pub mod bbcode;
-pub mod blocked;
 pub mod chat;
 pub mod chatgroups;
 pub mod cm;
@@ -38,23 +35,26 @@ pub mod eresult;
 pub mod friends;
 pub mod friendship;
 pub mod groups;
-pub mod history;
 pub mod invites;
+pub mod history;
 pub mod link;
 pub mod login;
+pub mod account;
+pub mod apps;
+pub mod blocked;
 pub mod notices;
 pub mod prefs;
 pub mod presence;
+pub mod profile;
 #[cfg(test)]
 mod probe;
-pub mod profile;
 pub mod proto;
 pub mod publish;
 pub mod reactions;
 pub mod steamid;
+pub mod web;
 pub mod voice;
 pub mod voicewire;
-pub mod web;
 pub mod wire;
 
 pub use connect::spawn;
@@ -82,49 +82,26 @@ pub fn sign_off(link: link::Link) {
 /// Says why a refusal may be what it is, when the account is one Steam holds back.
 pub fn explained(account_id: &str, why: String) -> String {
     let facts = account::held(account_id);
-    if facts
-        .family_view
-        .is_some_and(|(_, holds_friends)| holds_friends)
-    {
+    if facts.family_view.is_some_and(|(_, holds_friends)| holds_friends) {
         return format!("{why} (Family View is on for this account and holds friends and chat back; unlock it in Steam to chat)");
     }
     why
 }
 
 /// Sends a direct message in the conversation `buffer` is, and stores it.
-pub async fn send_message(
-    state: &AppState,
-    buffer: &crate::model::Buffer,
-    body: &str,
-) -> Result<(), String> {
+pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
     // A room of a chat group is spoken in as a group, not to a person.
     if chatgroups::is_room(buffer) {
         return chatgroups::send(state, buffer, body).await;
     }
-    let link = state
-        .runtime
-        .steam_link(&buffer.account_id)
-        .ok_or("this Steam account is not connected")?;
-    let recipient = buffer
-        .remote_id
-        .clone()
-        .ok_or("this conversation is not with a Steam account")?;
+    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
     let sent = chat::send(&link, &recipient, body).await.map_err(|why| {
-        tracing::info!(
-            "steam[{}]: a message to {recipient} was not sent: {why}",
-            buffer.account_id
-        );
+        tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id);
         explained(&buffer.account_id, why)
     })?;
-    tracing::info!(
-        "steam[{}]: sent a message to {recipient} as {}",
-        buffer.account_id,
-        sent.id
-    );
-    let own = state
-        .runtime
-        .own_identity(&buffer.account_id)
-        .unwrap_or_default();
+    tracing::info!("steam[{}]: sent a message to {recipient} as {}", buffer.account_id, sent.id);
+    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
     state.runtime.record_message_at(
         state,
         &buffer.account_id,
@@ -162,28 +139,14 @@ pub async fn send_files(
     files: &[(String, bool)],
     progress: Option<&crate::upload::Progress>,
 ) -> Result<(), String> {
-    let link = state
-        .runtime
-        .steam_link(&buffer.account_id)
-        .ok_or("this Steam account is not connected")?;
-    let friend = buffer
-        .remote_id
-        .clone()
-        .ok_or("this conversation is not with a Steam account")?;
-    let config = state
-        .accounts
-        .get_steam(&buffer.account_id)
-        .ok_or("this Steam account is not connected")?;
+    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let friend = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
+    let config = state.accounts.get_steam(&buffer.account_id).ok_or("this Steam account is not connected")?;
     // Refused before anything is sent, so a bad file does not leave the words
     // sent and the pictures not.
     for (path, _) in files {
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(path);
-        let size = std::fs::metadata(path)
-            .map(|m| m.len())
-            .map_err(|e| format!("reading {name}: {e}"))?;
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
+        let size = std::fs::metadata(path).map(|m| m.len()).map_err(|e| format!("reading {name}: {e}"))?;
         if let Some(why) = web::refusal(name, size) {
             return Err(why);
         }
@@ -192,27 +155,10 @@ pub async fn send_files(
         send_message(state, buffer, caption).await?;
     }
     for (path, spoiler) in files {
-        let url = web::send_file(
-            &link,
-            &buffer.account_id,
-            config.steamid,
-            &config.refresh_token,
-            &friend,
-            path,
-            *spoiler,
-            progress,
-        )
-        .await
-        .inspect_err(|why| {
-            tracing::info!(
-                "steam[{}]: a file to {friend} was not sent: {why}",
-                buffer.account_id
-            )
-        })?;
-        tracing::info!(
-            "steam[{}]: sent a file to {friend}: {url}",
-            buffer.account_id
-        );
+        let url = web::send_file(&link, &buffer.account_id, config.steamid, &config.refresh_token, &friend, path, *spoiler, progress)
+            .await
+            .inspect_err(|why| tracing::info!("steam[{}]: a file to {friend} was not sent: {why}", buffer.account_id))?;
+        tracing::info!("steam[{}]: sent a file to {friend}: {url}", buffer.account_id);
     }
     Ok(())
 }

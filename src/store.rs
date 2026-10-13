@@ -40,6 +40,7 @@ impl Store {
         let conn = Connection::open(db_path)
             .with_context(|| format!("opening scrollback db at {}", db_path.display()))?;
 
+
         // Only takes effect for a brand-new file (or after a full VACUUM,
         // which isn't done automatically here since that could be slow on
         // an existing multi-month scrollback.db) - lets incremental_vacuum
@@ -81,9 +82,7 @@ impl Store {
         // filesystem that supports it, and a database on NFS or similar will
         // quietly stay in rollback mode. Worth a line in the log rather than a
         // silent assumption, since it is the difference above.
-        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
-            row.get::<_, String>(0)
-        }) {
+        match conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get::<_, String>(0)) {
             Ok(mode) if mode.eq_ignore_ascii_case("wal") => {}
             Ok(mode) => tracing::warn!(
                 "scrollback db stayed in {mode} journal mode - every message will fsync"
@@ -308,9 +307,7 @@ impl Store {
         // Losing a real reaction count is a smaller wrong than showing 33,224
         // of them, and only Matrix is touched - Discord's counts come from its
         // own message snapshots and were never inflated.
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
         if version < 1 {
             match conn.execute("UPDATE messages SET reactions = '[]' WHERE buffer_id LIKE 'matrix:%' AND reactions <> '[]'", []) {
                 Ok(n) if n > 0 => tracing::info!("scrollback: cleared inflated reaction counts on {n} Matrix message(s)"),
@@ -337,20 +334,14 @@ impl Store {
             let _ = conn.execute_batch("PRAGMA user_version = 2;");
         }
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(Self { conn: Mutex::new(conn) })
     }
 
     /// The reactions on one message, counted from the events on record.
     ///
     /// The single place that turns reaction events into the numbers a client
     /// draws, so add and remove cannot disagree about what a count means.
-    fn recount_matrix_reactions(
-        conn: &Connection,
-        buffer_id: &str,
-        msg_id: &str,
-    ) -> Result<Vec<Reaction>> {
+    fn recount_matrix_reactions(conn: &Connection, buffer_id: &str, msg_id: &str) -> Result<Vec<Reaction>> {
         let mut stmt = conn.prepare(
             "SELECT emoji, COUNT(*), MAX(is_me) FROM matrix_reactions
              WHERE buffer_id = ?1 AND msg_id = ?2
@@ -368,10 +359,7 @@ impl Store {
         })?;
         let reactions: Vec<Reaction> = rows.collect::<rusqlite::Result<_>>()?;
         let json = serde_json::to_string(&reactions)?;
-        conn.execute(
-            "UPDATE messages SET reactions = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
-            params![json, buffer_id, msg_id],
-        )?;
+        conn.execute("UPDATE messages SET reactions = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![json, buffer_id, msg_id])?;
         Ok(reactions)
     }
 
@@ -380,14 +368,7 @@ impl Store {
     /// `None` means this exact event was already counted, which is the whole
     /// point: a replayed timeline changes nothing and the client is told
     /// nothing, rather than being told a larger number.
-    pub fn matrix_reaction_add(
-        &self,
-        event_id: &str,
-        buffer_id: &str,
-        msg_id: &str,
-        emoji: &str,
-        is_me: bool,
-    ) -> Result<Option<Vec<Reaction>>> {
+    pub fn matrix_reaction_add(&self, event_id: &str, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool) -> Result<Option<Vec<Reaction>>> {
         let conn = self.conn.lock().unwrap();
         let inserted = conn.execute(
             "INSERT OR IGNORE INTO matrix_reactions (event_id, buffer_id, msg_id, emoji, is_me) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -396,34 +377,22 @@ impl Store {
         if inserted == 0 {
             return Ok(None);
         }
-        Ok(Some(Self::recount_matrix_reactions(
-            &conn, buffer_id, msg_id,
-        )?))
+        Ok(Some(Self::recount_matrix_reactions(&conn, buffer_id, msg_id)?))
     }
 
     /// Forget a redacted reaction, returning where it was and what is left.
     ///
     /// `None` for an event that was never a reaction we counted, which is how
     /// the caller tells a reaction redaction from a message deletion.
-    pub fn matrix_reaction_remove(
-        &self,
-        event_id: &str,
-    ) -> Result<Option<(String, String, Vec<Reaction>)>> {
+    pub fn matrix_reaction_remove(&self, event_id: &str) -> Result<Option<(String, String, Vec<Reaction>)>> {
         let conn = self.conn.lock().unwrap();
         let found: Option<(String, String)> = conn
-            .query_row(
-                "SELECT buffer_id, msg_id FROM matrix_reactions WHERE event_id = ?1",
-                params![event_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row("SELECT buffer_id, msg_id FROM matrix_reactions WHERE event_id = ?1", params![event_id], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .optional()?;
-        let Some((buffer_id, msg_id)) = found else {
-            return Ok(None);
-        };
-        conn.execute(
-            "DELETE FROM matrix_reactions WHERE event_id = ?1",
-            params![event_id],
-        )?;
+        let Some((buffer_id, msg_id)) = found else { return Ok(None) };
+        conn.execute("DELETE FROM matrix_reactions WHERE event_id = ?1", params![event_id])?;
         let reactions = Self::recount_matrix_reactions(&conn, &buffer_id, &msg_id)?;
         Ok(Some((buffer_id, msg_id, reactions)))
     }
@@ -456,21 +425,9 @@ impl Store {
         // (the column's own schema default, '[]', already covers that) -
         // this only matters for history backfill, which sees whatever
         // Discord's message-list response already reports.
-        let reactions_json = if initial_reactions.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(initial_reactions)?)
-        };
-        let embeds_json = if embeds.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(embeds)?)
-        };
-        let attachments_json = if attachments.is_empty() {
-            None
-        } else {
-            Some(serde_json::to_string(attachments)?)
-        };
+        let reactions_json = if initial_reactions.is_empty() { None } else { Some(serde_json::to_string(initial_reactions)?) };
+        let embeds_json = if embeds.is_empty() { None } else { Some(serde_json::to_string(embeds)?) };
+        let attachments_json = if attachments.is_empty() { None } else { Some(serde_json::to_string(attachments)?) };
         let inserted = conn.execute(
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
@@ -515,14 +472,7 @@ impl Store {
     /// false (a harmless no-op for the caller) if the message was never
     /// recorded locally in the first place - editing something outside
     /// our loaded history isn't something there's a visible row to update.
-    pub fn update_message_body(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        body: &str,
-        embeds: &[Embed],
-        attachments: &[Attachment],
-    ) -> Result<bool> {
+    pub fn update_message_body(&self, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let embeds_json = serde_json::to_string(embeds)?;
         let attachments_json = serde_json::to_string(attachments)?;
@@ -553,12 +503,7 @@ impl Store {
 
     /// Puts the cards on a message without marking it edited: a link being
     /// described after the fact is not something its sender did.
-    pub fn set_message_embeds(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        embeds: &[Embed],
-    ) -> Result<bool> {
+    pub fn set_message_embeds(&self, buffer_id: &str, msg_id: &str, embeds: &[Embed]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let json = serde_json::to_string(embeds)?;
         let rows = conn.execute(
@@ -568,30 +513,16 @@ impl Store {
         Ok(rows > 0)
     }
 
-    pub fn update_message_body_silent(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        body: &str,
-    ) -> Result<bool> {
+    pub fn update_message_body_silent(&self, buffer_id: &str, msg_id: &str, body: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "UPDATE messages SET body = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
-            params![body, buffer_id, msg_id],
-        )?;
+        let rows = conn.execute("UPDATE messages SET body = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![body, buffer_id, msg_id])?;
         Ok(rows > 0)
     }
 
     /// Rewrites a message stored in the old shape, where attachments were
     /// links appended to its text: the text without them, and the list. Not
     /// an edit, so not marked as one.
-    pub fn repair_message_media(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        body: &str,
-        attachments: &[Attachment],
-    ) -> Result<bool> {
+    pub fn repair_message_media(&self, buffer_id: &str, msg_id: &str, body: &str, attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
@@ -604,12 +535,7 @@ impl Store {
     /// Replaces a message's attachment list without touching its text or
     /// marking it edited - for a cached preview arriving, or links being
     /// re-signed after they expired. Neither is a change the sender made.
-    pub fn update_message_attachments(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        attachments: &[Attachment],
-    ) -> Result<bool> {
+    pub fn update_message_attachments(&self, buffer_id: &str, msg_id: &str, attachments: &[Attachment]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let json = serde_json::to_string(attachments)?;
         let rows = conn.execute(
@@ -631,34 +557,20 @@ impl Store {
             // The attachments as well as the text: a cached Sneedchat file is
             // named by its attachment now, and only in the text in rows
             // written before that (see the version 2 migration).
-            let mut stmt = tx.prepare(
-                "SELECT body || char(10) || attachments FROM messages WHERE buffer_id = ?1",
-            )?;
+            let mut stmt = tx.prepare("SELECT body || char(10) || attachments FROM messages WHERE buffer_id = ?1")?;
             let rows = stmt.query_map(params![buffer_id], |row| row.get::<_, String>(0))?;
             rows.collect::<std::result::Result<_, _>>()?
         };
-        tx.execute(
-            "DELETE FROM messages WHERE buffer_id = ?1",
-            params![buffer_id],
-        )?;
-        tx.execute(
-            "DELETE FROM matrix_reactions WHERE buffer_id = ?1",
-            params![buffer_id],
-        )?;
-        tx.execute(
-            "DELETE FROM live_cards WHERE buffer_id = ?1",
-            params![buffer_id],
-        )?;
+        tx.execute("DELETE FROM messages WHERE buffer_id = ?1", params![buffer_id])?;
+        tx.execute("DELETE FROM matrix_reactions WHERE buffer_id = ?1", params![buffer_id])?;
+        tx.execute("DELETE FROM live_cards WHERE buffer_id = ?1", params![buffer_id])?;
         tx.commit()?;
         Ok(bodies)
     }
 
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let rows = conn.execute(
-            "DELETE FROM messages WHERE buffer_id = ?1 AND msg_id = ?2",
-            params![buffer_id, msg_id],
-        )?;
+        let rows = conn.execute("DELETE FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
         Ok(rows > 0)
     }
 
@@ -671,12 +583,7 @@ impl Store {
     /// was there to change, so a caller can stay quiet about one it does not
     /// have - a moderator clearing reactions on something older than this
     /// client's scrollback is not an error.
-    pub fn set_reactions(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        reactions: &[Reaction],
-    ) -> Result<bool> {
+    pub fn set_reactions(&self, buffer_id: &str, msg_id: &str, reactions: &[Reaction]) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let json = serde_json::to_string(reactions)?;
         let changed = conn.execute(
@@ -686,25 +593,12 @@ impl Store {
         Ok(changed > 0)
     }
 
-    pub fn update_reaction(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        emoji: &str,
-        is_me: bool,
-        add: bool,
-    ) -> Result<Option<Vec<Reaction>>> {
+    pub fn update_reaction(&self, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool, add: bool) -> Result<Option<Vec<Reaction>>> {
         let conn = self.conn.lock().unwrap();
         let existing: Option<String> = conn
-            .query_row(
-                "SELECT reactions FROM messages WHERE buffer_id = ?1 AND msg_id = ?2",
-                params![buffer_id, msg_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT reactions FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id], |row| row.get(0))
             .optional()?;
-        let Some(existing) = existing else {
-            return Ok(None);
-        };
+        let Some(existing) = existing else { return Ok(None) };
         let mut reactions: Vec<Reaction> = serde_json::from_str(&existing).unwrap_or_default();
 
         if let Some(r) = reactions.iter_mut().find(|r| r.emoji == emoji) {
@@ -725,20 +619,12 @@ impl Store {
             // extract_reactions in backend/discord/messages.rs, which does know
             // it) - not worth widening this incremental-update path just
             // for that narrow a window.
-            reactions.push(Reaction {
-                emoji: emoji.to_string(),
-                count: 1,
-                me: is_me,
-                animated: false,
-            });
+            reactions.push(Reaction { emoji: emoji.to_string(), count: 1, me: is_me, animated: false });
         }
         reactions.retain(|r| r.count > 0);
 
         let json = serde_json::to_string(&reactions)?;
-        conn.execute(
-            "UPDATE messages SET reactions = ?1 WHERE buffer_id = ?2 AND msg_id = ?3",
-            params![json, buffer_id, msg_id],
-        )?;
+        conn.execute("UPDATE messages SET reactions = ?1 WHERE buffer_id = ?2 AND msg_id = ?3", params![json, buffer_id, msg_id])?;
         Ok(Some(reactions))
     }
 
@@ -765,20 +651,13 @@ impl Store {
             params![old_id, new_id],
         )?;
         // A warning on the conversation goes with it.
-        conn.execute(
-            "UPDATE OR IGNORE buffer_notices SET buffer_id = ?2 WHERE buffer_id = ?1",
-            params![old_id, new_id],
-        )?;
+        conn.execute("UPDATE OR IGNORE buffer_notices SET buffer_id = ?2 WHERE buffer_id = ?1", params![old_id, new_id])?;
         Ok(moved)
     }
 
     pub fn has_messages(&self, buffer_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages WHERE buffer_id = ?1)",
-            params![buffer_id],
-            |row| row.get(0),
-        )?;
+        let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE buffer_id = ?1)", params![buffer_id], |row| row.get(0))?;
         Ok(exists)
     }
 
@@ -795,9 +674,7 @@ impl Store {
             return Ok(HashSet::new());
         }
         let conn = self.conn.lock().unwrap();
-        let placeholders = std::iter::repeat_n("?", ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT msg_id FROM messages WHERE buffer_id = ?1 AND msg_id IN ({placeholders})"
         ))?;
@@ -818,11 +695,7 @@ impl Store {
     /// messages seen since the current daemon process started.
     pub fn last_activity(&self, buffer_id: &str) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
-        let ts: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(ts), 0) FROM messages WHERE buffer_id = ?1",
-            params![buffer_id],
-            |row| row.get(0),
-        )?;
+        let ts: i64 = conn.query_row("SELECT COALESCE(MAX(ts), 0) FROM messages WHERE buffer_id = ?1", params![buffer_id], |row| row.get(0))?;
         Ok(ts)
     }
 
@@ -833,11 +706,7 @@ impl Store {
     pub fn oldest_msg_id(&self, buffer_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let id = conn
-            .query_row(
-                "SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts ASC LIMIT 1",
-                params![buffer_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts ASC LIMIT 1", params![buffer_id], |row| row.get(0))
             .optional()?;
         Ok(id)
     }
@@ -847,11 +716,7 @@ impl Store {
     pub fn newest_msg_id(&self, buffer_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock().unwrap();
         let id = conn
-            .query_row(
-                "SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts DESC LIMIT 1",
-                params![buffer_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT msg_id FROM messages WHERE buffer_id = ?1 ORDER BY ts DESC LIMIT 1", params![buffer_id], |row| row.get(0))
             .optional()?;
         Ok(id)
     }
@@ -869,56 +734,28 @@ impl Store {
         let reply_to_id: Option<String> = row.get("reply_to_id")?;
         let reply_to = reply_to_id.map(|id| ReplyPreview {
             id,
-            from: row
-                .get::<_, Option<String>>("reply_to_from")
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            body: row
-                .get::<_, Option<String>>("reply_to_body")
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-            thread: row
-                .get::<_, Option<i64>>("reply_is_thread")
-                .ok()
-                .flatten()
-                .unwrap_or(0)
-                != 0,
-            forwarded: row
-                .get::<_, Option<i64>>("reply_forwarded")
-                .ok()
-                .flatten()
-                .unwrap_or(0)
-                != 0,
-        });
+            from: row.get::<_, Option<String>>("reply_to_from").ok().flatten().unwrap_or_default(),
+            body: row.get::<_, Option<String>>("reply_to_body").ok().flatten().unwrap_or_default(),
+            thread: row.get::<_, Option<i64>>("reply_is_thread").ok().flatten().unwrap_or(0) != 0,
+            forwarded: row.get::<_, Option<i64>>("reply_forwarded").ok().flatten().unwrap_or(0) != 0 });
         let json_column = |name: &str| -> String {
-            row.get::<_, Option<String>>(name)
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "[]".to_string())
+            row.get::<_, Option<String>>(name).ok().flatten().unwrap_or_else(|| "[]".to_string())
         };
-        let reactions: Vec<Reaction> =
-            serde_json::from_str(&json_column("reactions")).unwrap_or_default();
+        let reactions: Vec<Reaction> = serde_json::from_str(&json_column("reactions")).unwrap_or_default();
         let embeds: Vec<Embed> = serde_json::from_str(&json_column("embeds")).unwrap_or_default();
-        let mut attachments: Vec<Attachment> =
-            serde_json::from_str(&json_column("attachments")).unwrap_or_default();
+        let mut attachments: Vec<Attachment> = serde_json::from_str(&json_column("attachments")).unwrap_or_default();
         drop_missing_local_copies(&mut attachments);
         let badges = serde_json::from_str(&json_column("badges")).unwrap_or_default();
         let components = serde_json::from_str(&json_column("components")).unwrap_or_default();
         Ok(Message {
             id: row.get::<_, Option<String>>("msg_id")?.unwrap_or_default(),
             buffer_id: buffer_id.to_string(),
-            from: row
-                .get::<_, Option<String>>("from_nick")?
-                .unwrap_or_default(),
+            from: row.get::<_, Option<String>>("from_nick")?.unwrap_or_default(),
             body: row.get::<_, Option<String>>("body")?.unwrap_or_default(),
             ts: row.get("ts")?,
             is_action: row.get::<_, i64>("is_action")? != 0,
             is_highlight: row.get::<_, i64>("is_highlight")? != 0,
-            kind: row
-                .get::<_, Option<String>>("kind")?
-                .unwrap_or_else(|| "chat".to_string()),
+            kind: row.get::<_, Option<String>>("kind")?.unwrap_or_else(|| "chat".to_string()),
             reply_to,
             edited: row.get::<_, i64>("edited")? != 0,
             // The column is 0 for never edited, 1 for edited at a time nobody
@@ -946,9 +783,7 @@ impl Store {
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![buffer_id, before, limit], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, before, limit], |row| Self::row_to_message(buffer_id, row))?;
         let mut out: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
         out.reverse();
         Ok(out)
@@ -961,12 +796,7 @@ impl Store {
     /// that service's backend immediately after the message lands, and adding
     /// a twentieth parameter would make every other backend say "no
     /// components" in a language none of them speak.
-    pub fn set_components(
-        &self,
-        buffer_id: &str,
-        msg_id: &str,
-        components: &[crate::model::Component],
-    ) -> Result<()> {
+    pub fn set_components(&self, buffer_id: &str, msg_id: &str, components: &[crate::model::Component]) -> Result<()> {
         if components.is_empty() {
             return Ok(());
         }
@@ -993,9 +823,7 @@ impl Store {
              WHERE buffer_id = ?1 AND from_nick IS NOT NULL AND from_nick != ''
              GROUP BY from_nick ORDER BY MAX(ts) DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![buffer_id, limit.max(1)], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, limit.max(1)], |row| row.get::<_, String>(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1014,10 +842,7 @@ impl Store {
              ORDER BY ts DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![buffer_prefix, nick])?;
-        Ok(rows
-            .next()?
-            .map(|row| row.get::<_, String>(0))
-            .transpose()?)
+        Ok(rows.next()?.map(|row| row.get::<_, String>(0)).transpose()?)
     }
 
     /// The conversation from one moment forward, oldest first.
@@ -1034,9 +859,7 @@ impl Store {
              WHERE buffer_id = ?1 AND ts > ?2
              ORDER BY ts ASC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![buffer_id, after, limit], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, after, limit], |row| Self::row_to_message(buffer_id, row))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1050,13 +873,7 @@ impl Store {
     /// `after` is exclusive and `until` inclusive, so passing the last
     /// timestamp of one page as the `after` of the next neither repeats a
     /// message nor drops one.
-    pub fn messages_between(
-        &self,
-        buffer_id: &str,
-        after: i64,
-        until: i64,
-        limit: i64,
-    ) -> Result<Vec<Message>> {
+    pub fn messages_between(&self, buffer_id: &str, after: i64, until: i64, limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 500 };
         let mut stmt = conn.prepare(
@@ -1065,9 +882,7 @@ impl Store {
              WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
              ORDER BY ts ASC LIMIT ?4",
         )?;
-        let rows = stmt.query_map(params![buffer_id, after, until, limit], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, after, until, limit], |row| Self::row_to_message(buffer_id, row))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1087,11 +902,9 @@ impl Store {
     pub fn oldest_message_ts(&self, buffer_id: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         Ok(conn
-            .query_row(
-                "SELECT MIN(ts) FROM messages WHERE buffer_id = ?1",
-                params![buffer_id],
-                |r| r.get::<_, Option<i64>>(0),
-            )
+            .query_row("SELECT MIN(ts) FROM messages WHERE buffer_id = ?1", params![buffer_id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
             .unwrap_or(None))
     }
 
@@ -1110,18 +923,14 @@ impl Store {
         let mut older = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
         ))?;
-        let rows = older.query_map(params![buffer_id, ts, span], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = older.query_map(params![buffer_id, ts, span], |row| Self::row_to_message(buffer_id, row))?;
         let mut out: Vec<Message> = rows.collect::<rusqlite::Result<_>>()?;
         out.reverse();
 
         let mut newer = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts > ?2 ORDER BY ts ASC LIMIT ?3"
         ))?;
-        let rows = newer.query_map(params![buffer_id, ts, span], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = newer.query_map(params![buffer_id, ts, span], |row| Self::row_to_message(buffer_id, row))?;
         out.extend(rows.collect::<rusqlite::Result<Vec<Message>>>()?);
         Ok(out)
     }
@@ -1148,9 +957,7 @@ impl Store {
     pub fn mentions(&self, known_channels: &[String], limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 100 };
-        let places = std::iter::repeat_n("?", known_channels.len())
-            .collect::<Vec<_>>()
-            .join(",");
+        let places = std::iter::repeat_n("?", known_channels.len()).collect::<Vec<_>>().join(",");
         let legacy = if known_channels.is_empty() {
             String::new()
         } else {
@@ -1163,10 +970,7 @@ impl Store {
              ORDER BY ts DESC LIMIT ?"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let mut params: Vec<&dyn rusqlite::ToSql> = known_channels
-            .iter()
-            .map(|b| b as &dyn rusqlite::ToSql)
-            .collect();
+        let mut params: Vec<&dyn rusqlite::ToSql> = known_channels.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
         params.push(&limit);
         let rows = stmt.query_map(params.as_slice(), |row| {
             // The buffer is read back per row rather than stamped from a
@@ -1225,15 +1029,7 @@ impl Store {
     /// The card on screen changes every few seconds while people vote; what
     /// is kept is the latest of it, so what is read back afterwards is how it
     /// finished rather than how it opened.
-    pub fn record_live_card(
-        &self,
-        buffer_id: &str,
-        kind: &str,
-        card_id: &str,
-        title: &str,
-        body: &str,
-        ts: i64,
-    ) -> Result<()> {
+    pub fn record_live_card(&self, buffer_id: &str, kind: &str, card_id: &str, title: &str, body: &str, ts: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO live_cards (buffer_id, kind, card_id, title, body, ts)
@@ -1257,10 +1053,7 @@ impl Store {
     /// The warnings of one account's conversations: each with its state, or
     /// none for a warning that was said in the log before anything recorded it.
     /// Found by the log line a warning leaves, which has an id of its own.
-    pub fn account_notices(
-        &self,
-        account_id: &str,
-    ) -> Result<Vec<(String, String, Option<String>)>> {
+    pub fn account_notices(&self, account_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
         let conn = self.conn.lock().unwrap();
         let like = format!("{account_id}|%");
         let mut stmt = conn.prepare(
@@ -1268,26 +1061,17 @@ impl Store {
              LEFT JOIN buffer_notices n ON n.buffer_id = m.buffer_id AND n.notice_id = m.msg_id
              WHERE m.buffer_id LIKE ?1 AND m.msg_id LIKE 'notice:%'",
         )?;
-        let rows = stmt.query_map(params![like], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        let rows = stmt.query_map(params![like], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
     /// The polls or predictions this conversation has seen, newest first.
-    pub fn live_cards(
-        &self,
-        buffer_id: &str,
-        kind: &str,
-        limit: i64,
-    ) -> Result<Vec<(String, i64)>> {
+    pub fn live_cards(&self, buffer_id: &str, kind: &str, limit: i64) -> Result<Vec<(String, i64)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT body, ts FROM live_cards WHERE buffer_id = ?1 AND kind = ?2 ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![buffer_id, kind, limit], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
+        let rows = stmt.query_map(params![buffer_id, kind, limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 
@@ -1320,11 +1104,7 @@ impl Store {
 
     /// Drops the oldest transfers beyond `keep`.
     /// Replaces the saved layout - every buffer and rail entry - in one go.
-    pub fn save_layout(
-        &self,
-        buffers: &[crate::model::Buffer],
-        groups: &[crate::model::BufferGroup],
-    ) -> Result<()> {
+    pub fn save_layout(&self, buffers: &[crate::model::Buffer], groups: &[crate::model::BufferGroup]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM known_buffers", [])?;
@@ -1345,23 +1125,15 @@ impl Store {
 
     /// The saved layout, as last written. Rows that no longer read are
     /// skipped rather than failing the start.
-    pub fn load_layout(
-        &self,
-    ) -> Result<(Vec<crate::model::Buffer>, Vec<crate::model::BufferGroup>)> {
+    pub fn load_layout(&self) -> Result<(Vec<crate::model::Buffer>, Vec<crate::model::BufferGroup>)> {
         let conn = self.conn.lock().unwrap();
         let read = |table: &str| -> Result<Vec<String>> {
             let mut stmt = conn.prepare(&format!("SELECT data FROM {table}"))?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             Ok(rows.collect::<std::result::Result<_, _>>()?)
         };
-        let buffers = read("known_buffers")?
-            .iter()
-            .filter_map(|d| serde_json::from_str(d).ok())
-            .collect();
-        let groups = read("known_groups")?
-            .iter()
-            .filter_map(|d| serde_json::from_str(d).ok())
-            .collect();
+        let buffers = read("known_buffers")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
+        let groups = read("known_groups")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
         Ok((buffers, groups))
     }
 
@@ -1380,11 +1152,7 @@ impl Store {
     pub fn media_source(&self, path: &str) -> Result<Option<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let text: Option<String> = conn
-            .query_row(
-                "SELECT source FROM media_sources WHERE path = ?1",
-                params![path],
-                |r| r.get(0),
-            )
+            .query_row("SELECT source FROM media_sources WHERE path = ?1", params![path], |r| r.get(0))
             .optional()?;
         Ok(text.and_then(|t| serde_json::from_str(&t).ok()))
     }
@@ -1424,20 +1192,12 @@ impl Store {
     ///
     /// Newest first, since a search for something said recently is the common
     /// case and a caller showing ten results wants those ten.
-    pub fn search_messages(
-        &self,
-        buffer_id: &str,
-        query: &str,
-        limit: i64,
-    ) -> Result<Vec<Message>> {
+    pub fn search_messages(&self, buffer_id: &str, query: &str, limit: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 50 };
         // LIKE's own wildcards have to be neutralised, or searching for "50%"
         // silently matches everything beginning "50".
-        let escaped = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
+        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
             "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
@@ -1445,9 +1205,7 @@ impl Store {
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![buffer_id, pattern, limit], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, pattern, limit], |row| Self::row_to_message(buffer_id, row))?;
         rows.collect::<rusqlite::Result<_>>().map_err(Into::into)
     }
 }
@@ -1462,9 +1220,7 @@ impl Store {
 fn drop_missing_local_copies(attachments: &mut [Attachment]) {
     let gone = |p: &Option<String>| -> bool {
         let Some(p) = p.as_deref() else { return false };
-        let Some(rest) = p.strip_prefix("file://") else {
-            return false;
-        };
+        let Some(rest) = p.strip_prefix("file://") else { return false };
         !std::path::Path::new(rest).exists()
     };
     for att in attachments.iter_mut() {
@@ -1514,9 +1270,7 @@ impl Store {
              WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR msg_id = ?2)
              ORDER BY ts ASC, rowid ASC",
         )?;
-        let rows = stmt.query_map(params![buffer_id, root_id], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let rows = stmt.query_map(params![buffer_id, root_id], |row| Self::row_to_message(buffer_id, row))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -1527,9 +1281,7 @@ impl Store {
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;
-        let mut rows = stmt.query_map(params![buffer_id, msg_id], |row| {
-            Self::row_to_message(buffer_id, row)
-        })?;
+        let mut rows = stmt.query_map(params![buffer_id, msg_id], |row| Self::row_to_message(buffer_id, row))?;
         match rows.next() {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
@@ -1575,12 +1327,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let like = format!("{account_id}|%");
         let mut gone = 0;
-        for table in [
-            "messages",
-            "live_cards",
-            "matrix_reactions",
-            "buffer_notices",
-        ] {
+        for table in ["messages", "live_cards", "matrix_reactions", "buffer_notices"] {
             gone += conn.execute(
                 &format!("DELETE FROM {table} WHERE buffer_id = ?1 OR buffer_id LIKE ?2"),
                 params![account_id, like],
@@ -1588,10 +1335,7 @@ impl Store {
         }
         // Transfers are filed against the account rather than a buffer: a DCC
         // send belongs to a connection, not to a channel.
-        gone += conn.execute(
-            "DELETE FROM transfers WHERE account_id = ?1",
-            params![account_id],
-        )?;
+        gone += conn.execute("DELETE FROM transfers WHERE account_id = ?1", params![account_id])?;
         Ok(gone)
     }
 
@@ -1631,9 +1375,7 @@ impl Store {
             if free <= KEEP_FREE {
                 break;
             }
-            let take = CHUNK_PAGES
-                .min(free - KEEP_FREE)
-                .min(MAX_PAGES_PER_CALL - reclaimed);
+            let take = CHUNK_PAGES.min(free - KEEP_FREE).min(MAX_PAGES_PER_CALL - reclaimed);
             // Stepped to completion rather than run with `execute_batch`,
             // which is how this quietly did almost nothing before. SQLite
             // implements this pragma as a statement that frees *one page per
@@ -1656,6 +1398,7 @@ impl Store {
     }
 }
 
+
 /// Takes the daemon's own cached-file links out of stored message text and
 /// makes them attachments - see the version 2 migration in `Store::open`.
 ///
@@ -1675,8 +1418,7 @@ fn move_cached_links_to_attachments(conn: &Connection) -> Result<usize> {
         if found.is_empty() {
             continue;
         }
-        let mut list: Vec<crate::model::Attachment> =
-            serde_json::from_str(&attachments).unwrap_or_default();
+        let mut list: Vec<crate::model::Attachment> = serde_json::from_str(&attachments).unwrap_or_default();
         list.extend(found);
         conn.execute(
             "UPDATE messages SET body = ?1, attachments = ?2 WHERE id = ?3",
@@ -1696,32 +1438,15 @@ fn cached_links_in(body: &str) -> (String, Vec<crate::model::Attachment>) {
     while let Some(at) = rest.find("file://") {
         text.push_str(&rest[..at]);
         let tail = &rest[at..];
-        let end = tail
-            .find(|c: char| c.is_whitespace() || c == '[' || c == ']')
-            .unwrap_or(tail.len());
+        let end = tail.find(|c: char| c.is_whitespace() || c == '[' || c == ']').unwrap_or(tail.len());
         let link = &tail[..end];
         let path = link.trim_start_matches("file://");
-        let parent = std::path::Path::new(path)
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str());
-        let name = std::path::Path::new(path)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
+        let parent = std::path::Path::new(path).parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
         if parent == Some("sneedchat-attachments") && !name.is_empty() {
-            let ext = name
-                .rsplit('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
             found.push(crate::model::Attachment {
-                kind: if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") {
-                    "video"
-                } else {
-                    "image"
-                }
-                .to_string(),
+                kind: if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" }.to_string(),
                 filename: Some(name.to_string()),
                 path: Some(link.to_string()),
                 ..Default::default()
@@ -1755,28 +1480,8 @@ mod tests {
     }
 
     fn append(s: &Store, buffer: &str, id: &str) {
-        s.append_message(
-            buffer,
-            id,
-            "someone",
-            "hi",
-            1,
-            false,
-            false,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            "channel",
-            None,
-            &[],
-        )
-        .expect("appending");
+        s.append_message(buffer, id, "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
+            .expect("appending");
     }
 
     #[test]
@@ -1785,9 +1490,7 @@ mod tests {
         append(&s, "b", "m1");
         let before = s.get_message("b", "m1").unwrap().unwrap();
         assert!(!before.edited && before.edited_ts.is_none());
-        assert!(s
-            .update_message_body("b", "m1", "hi again", &[], &[])
-            .unwrap());
+        assert!(s.update_message_body("b", "m1", "hi again", &[], &[]).unwrap());
         let after = s.get_message("b", "m1").unwrap().unwrap();
         assert!(after.edited);
         let at = after.edited_ts.expect("the time it was edited");
@@ -1822,24 +1525,12 @@ mod tests {
                 .unwrap()
                 .execute_batch("PRAGMA journal_mode = DELETE;")
                 .expect("back to the old journal");
-            assert_eq!(
-                journal_mode(&old),
-                "delete",
-                "the fixture is not in the old mode"
-            );
+            assert_eq!(journal_mode(&old), "delete", "the fixture is not in the old mode");
         }
         let reopened = Store::open(&old_path).expect("reopening store");
-        assert_eq!(
-            journal_mode(&reopened),
-            "wal",
-            "an existing db was left in rollback mode"
-        );
+        assert_eq!(journal_mode(&reopened), "wal", "an existing db was left in rollback mode");
 
-        assert_eq!(
-            journal_mode(&s),
-            "wal",
-            "a fresh db was not created in WAL mode"
-        );
+        assert_eq!(journal_mode(&s), "wal", "a fresh db was not created in WAL mode");
 
         // Both, and in that order. SQLite refuses to set auto_vacuum on a
         // database already in WAL mode and does not say so, so getting these
@@ -1851,10 +1542,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
             .expect("asking auto_vacuum");
-        assert_eq!(
-            auto_vacuum, 2,
-            "2 is INCREMENTAL; 0 means the vacuum can never reclaim anything"
-        );
+        assert_eq!(auto_vacuum, 2, "2 is INCREMENTAL; 0 means the vacuum can never reclaim anything");
 
         // And the fsync-per-message setting that is the other half of it.
         let sync: i64 = s
@@ -1863,10 +1551,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA synchronous", [], |row| row.get(0))
             .expect("asking synchronous");
-        assert_eq!(
-            sync, 1,
-            "1 is NORMAL; 2 is the FULL this was costing 26ms a message"
-        );
+        assert_eq!(sync, 1, "1 is NORMAL; 2 is the FULL this was costing 26ms a message");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1894,11 +1579,9 @@ mod tests {
         let old_path = dir.join("rollback.db");
         let _ = std::fs::remove_file(&old_path);
         let old = Store::open(&old_path).expect("opening store");
-        old.conn
-            .lock()
-            .unwrap()
-            .execute_batch("PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;")
-            .expect("back to the old settings");
+        old.conn.lock().unwrap().execute_batch(
+            "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL;"
+        ).expect("back to the old settings");
 
         let time = |s: &Store, tag: &str| {
             let start = std::time::Instant::now();
@@ -1910,10 +1593,7 @@ mod tests {
         let before = time(&old, "old");
         let after = time(&wal, "new");
         println!("rollback+FULL {before:.2}ms per message, WAL+NORMAL {after:.2}ms per message");
-        assert!(
-            after < before,
-            "WAL was not faster: {after:.2}ms against {before:.2}ms"
-        );
+        assert!(after < before, "WAL was not faster: {after:.2}ms against {before:.2}ms");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1937,10 +1617,7 @@ mod tests {
                 .expect("asking the freelist")
         };
         let before = free(&s);
-        assert!(
-            before > 200,
-            "the fixture freed only {before} pages - it cannot show the difference"
-        );
+        assert!(before > 200, "the fixture freed only {before} pages - it cannot show the difference");
 
         let reclaimed = s.incremental_vacuum().expect("vacuuming");
         let after = free(&s);
@@ -1971,39 +1648,15 @@ mod tests {
         let left = |buffer: &str| s.get_backlog(buffer, 0, 50).expect("backlog").len();
         assert_eq!(left("matrix:@a:server|!room"), 0);
         assert_eq!(left("matrix:@a:server|!other"), 0);
-        assert_eq!(
-            left("matrix:@a:server.uk|!room"),
-            1,
-            "a different account was emptied"
-        );
+        assert_eq!(left("matrix:@a:server.uk|!room"), 1, "a different account was emptied");
         assert_eq!(left("irc:libera|#chat"), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Like `append`, but with text worth searching for.
     fn append_saying(s: &Store, buffer: &str, id: &str, body: &str) {
-        s.append_message(
-            buffer,
-            id,
-            "someone",
-            body,
-            1,
-            false,
-            false,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            "channel",
-            None,
-            &[],
-        )
-        .expect("appending");
+        s.append_message(buffer, id, "someone", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
+            .expect("appending");
     }
 
     /// The bug this table exists for: an initial sync replays the recent
@@ -2014,51 +1667,34 @@ mod tests {
         let (s, _dir) = store();
         append(&s, "matrix:me|Room", "$msg1");
 
-        let first = s
-            .matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false)
-            .unwrap();
+        let first = s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
         assert_eq!(first.expect("a new reaction is news")[0].count, 1);
 
         // The same event, ten more times, as a flapping homeserver would.
         for _ in 0..10 {
             assert!(
-                s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false)
-                    .unwrap()
-                    .is_none(),
+                s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🙏", false).unwrap().is_none(),
                 "a reaction already counted is not news, and must not be re-counted"
             );
         }
 
-        let again = s
-            .matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🙏", false)
-            .unwrap();
-        assert_eq!(
-            again.expect("a different event is a different reaction")[0].count,
-            2
-        );
+        let again = s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
+        assert_eq!(again.expect("a different event is a different reaction")[0].count, 2);
     }
 
     #[test]
     fn a_redacted_reaction_stops_being_counted() {
         let (s, _dir) = store();
         append(&s, "matrix:me|Room", "$msg1");
-        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🔥", false)
-            .unwrap();
-        s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🔥", false)
-            .unwrap();
+        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "🔥", false).unwrap();
+        s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "🔥", false).unwrap();
 
-        let (buffer, msg, left) = s
-            .matrix_reaction_remove("$rx1")
-            .unwrap()
-            .expect("that was a reaction");
+        let (buffer, msg, left) = s.matrix_reaction_remove("$rx1").unwrap().expect("that was a reaction");
         assert_eq!((buffer.as_str(), msg.as_str()), ("matrix:me|Room", "$msg1"));
         assert_eq!(left[0].count, 1);
 
         // The last one leaves no entry at all rather than a zero.
-        let (_, _, none_left) = s
-            .matrix_reaction_remove("$rx2")
-            .unwrap()
-            .expect("that was a reaction");
+        let (_, _, none_left) = s.matrix_reaction_remove("$rx2").unwrap().expect("that was a reaction");
         assert!(none_left.is_empty());
 
         // Something that was never a reaction is not one now - which is how
@@ -2070,12 +1706,8 @@ mod tests {
     fn my_own_reaction_is_marked_as_mine_among_others() {
         let (s, _dir) = store();
         append(&s, "matrix:me|Room", "$msg1");
-        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "👍", false)
-            .unwrap();
-        let with_mine = s
-            .matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "👍", true)
-            .unwrap()
-            .unwrap();
+        s.matrix_reaction_add("$rx1", "matrix:me|Room", "$msg1", "👍", false).unwrap();
+        let with_mine = s.matrix_reaction_add("$rx2", "matrix:me|Room", "$msg1", "👍", true).unwrap().unwrap();
         assert_eq!(with_mine[0].count, 2);
         assert!(with_mine[0].me, "one of these is mine");
 
@@ -2090,85 +1722,33 @@ mod tests {
         let (s, _dir) = store();
         append(&s, "matrix:me|Room", "$msg1");
         append(&s, "matrix:me|Room", "$msg2");
-        s.matrix_reaction_add("$a", "matrix:me|Room", "$msg1", "🙏", false)
-            .unwrap();
-        s.matrix_reaction_add("$b", "matrix:me|Room", "$msg1", "😂", false)
-            .unwrap();
-        let other = s
-            .matrix_reaction_add("$c", "matrix:me|Room", "$msg2", "🙏", false)
-            .unwrap()
-            .unwrap();
+        s.matrix_reaction_add("$a", "matrix:me|Room", "$msg1", "🙏", false).unwrap();
+        s.matrix_reaction_add("$b", "matrix:me|Room", "$msg1", "😂", false).unwrap();
+        let other = s.matrix_reaction_add("$c", "matrix:me|Room", "$msg2", "🙏", false).unwrap().unwrap();
 
         assert_eq!(other.len(), 1, "another message's reactions are its own");
         assert_eq!(other[0].count, 1);
 
-        let first = s
-            .get_message("matrix:me|Room", "$msg1")
-            .unwrap()
-            .expect("message is there");
+        let first = s.get_message("matrix:me|Room", "$msg1").unwrap().expect("message is there");
         assert_eq!(first.reactions.len(), 2);
         assert!(first.reactions.iter().all(|r| r.count == 1));
     }
 
     fn mention(s: &Store, buffer: &str, id: &str, kind: &str) {
-        s.append_message(
-            buffer,
-            id,
-            "someone",
-            "hey you",
-            1,
-            false,
-            true,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            kind,
-            None,
-            &[],
-        )
-        .expect("appending");
+        s.append_message(buffer, id, "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, kind, None, &[])
+            .expect("appending");
     }
 
     /// Like `append`, but at a time - so "newest" can be checked.
     fn append_at(s: &Store, buffer: &str, id: &str, ts: i64) {
-        s.append_message(
-            buffer,
-            id,
-            "someone",
-            "hi",
-            ts,
-            false,
-            false,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            "channel",
-            None,
-            &[],
-        )
-        .expect("appending");
+        s.append_message(buffer, id, "someone", "hi", ts, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
+            .expect("appending");
     }
 
     #[test]
     fn finds_the_newest_message_to_mark_a_room_read_up_to() {
         let (s, _dir) = store();
-        assert_eq!(
-            s.newest_message_id("b").unwrap(),
-            None,
-            "an empty room has nothing to have read"
-        );
+        assert_eq!(s.newest_message_id("b").unwrap(), None, "an empty room has nothing to have read");
 
         append_at(&s, "b", "$one", 100);
         append_at(&s, "b", "$two", 300);
@@ -2190,11 +1770,7 @@ mod tests {
         mention(&st, "irc|#chan", "1", "channel");
 
         let found = st.mentions(&[], 50).unwrap();
-        assert_eq!(
-            found.len(),
-            1,
-            "a mention must not need its channel to be open"
-        );
+        assert_eq!(found.len(), 1, "a mention must not need its channel to be open");
         assert_eq!(found[0].buffer_id, "irc|#chan");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2216,43 +1792,12 @@ mod tests {
         // were in have nothing to vouch for them but the live buffer list,
         // which is exactly what this used to rely on.
         let (st, dir) = store();
-        st.append_message(
-            "irc|#old",
-            "1",
-            "someone",
-            "hey you",
-            1,
-            false,
-            true,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            "channel",
-            None,
-            &[],
-        )
-        .unwrap();
-        st.conn
-            .lock()
-            .unwrap()
-            .execute("UPDATE messages SET buffer_kind = NULL", [])
+        st.append_message("irc|#old", "1", "someone", "hey you", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap();
+        st.conn.lock().unwrap().execute("UPDATE messages SET buffer_kind = NULL", []).unwrap();
 
-        assert!(
-            st.mentions(&[], 50).unwrap().is_empty(),
-            "nothing vouches for it"
-        );
-        assert_eq!(
-            st.mentions(&["irc|#old".to_string()], 50).unwrap().len(),
-            1,
-            "the live list still does"
-        );
+        assert!(st.mentions(&[], 50).unwrap().is_empty(), "nothing vouches for it");
+        assert_eq!(st.mentions(&["irc|#old".to_string()], 50).unwrap().len(), 1, "the live list still does");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2272,7 +1817,7 @@ mod tests {
             path: None,
             error: None,
             ts: 42,
-            kind: "dcc".to_string(),
+                    kind: "dcc".to_string(),
         };
         st.record_transfer(&row).unwrap();
         row.received = 100;
@@ -2296,59 +1841,15 @@ mod tests {
         // same one, over and over, for a message read hours ago.
         let (st, dir) = store();
         let first = st
-            .append_message(
-                "room",
-                "uuid-1",
-                "someone",
-                "hi",
-                1,
-                false,
-                true,
-                "chat",
-                None,
-                &[],
-                false,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                "channel",
-                None,
-                &[],
-            )
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
         let again = st
-            .append_message(
-                "room",
-                "uuid-1",
-                "someone",
-                "hi",
-                1,
-                false,
-                true,
-                "chat",
-                None,
-                &[],
-                false,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                "channel",
-                None,
-                &[],
-            )
+            .append_message("room", "uuid-1", "someone", "hi", 1, false, true, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending again");
 
         assert!(first, "the first time is new");
         assert!(!again, "the second time is a replay, not a message");
-        assert_eq!(
-            st.get_backlog("room", i64::MAX, 50).unwrap().len(),
-            1,
-            "and only one was kept"
-        );
+        assert_eq!(st.get_backlog("room", i64::MAX, 50).unwrap().len(), 1, "and only one was kept");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2359,50 +1860,10 @@ mod tests {
         // silently drop it.
         let (st, dir) = store();
         assert!(st
-            .append_message(
-                "room",
-                "shared",
-                "someone",
-                "hi",
-                1,
-                false,
-                false,
-                "chat",
-                None,
-                &[],
-                false,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                "channel",
-                None,
-                &[]
-            )
+            .append_message("room", "shared", "someone", "hi", 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap());
         assert!(st
-            .append_message(
-                "Whispers",
-                "shared",
-                "someone",
-                "hi",
-                1,
-                false,
-                false,
-                "whisper",
-                None,
-                &[],
-                false,
-                None,
-                &[],
-                &[],
-                None,
-                None,
-                "channel",
-                None,
-                &[]
-            )
+            .append_message("Whispers", "shared", "someone", "hi", 1, false, false, "whisper", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2433,11 +1894,7 @@ mod tests {
         append_saying(&st, "a", "2", "50 people showed up");
 
         let hits = st.search_messages("a", "50%", 50).unwrap();
-        assert_eq!(
-            hits.len(),
-            1,
-            "the percent sign was treated as a wildcard: {hits:?}"
-        );
+        assert_eq!(hits.len(), 1, "the percent sign was treated as a wildcard: {hits:?}");
         assert_eq!(hits[0].id, "1");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2467,18 +1924,9 @@ mod tests {
         ];
         drop_missing_local_copies(&mut attachments);
 
-        assert!(
-            attachments[0].thumbnail_path.is_some(),
-            "a file that exists was dropped"
-        );
-        assert!(
-            attachments[0].path.is_none(),
-            "a swept original was still advertised"
-        );
-        assert!(
-            attachments[1].thumbnail_path.is_none(),
-            "a swept thumbnail was still advertised"
-        );
+        assert!(attachments[0].thumbnail_path.is_some(), "a file that exists was dropped");
+        assert!(attachments[0].path.is_none(), "a swept original was still advertised");
+        assert!(attachments[1].thumbnail_path.is_none(), "a swept thumbnail was still advertised");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2492,10 +1940,7 @@ mod tests {
             ..Default::default()
         }];
         drop_missing_local_copies(&mut attachments);
-        assert_eq!(
-            attachments[0].url.as_deref(),
-            Some("https://cdn.discordapp.com/attachments/1/2/a.png")
-        );
+        assert_eq!(attachments[0].url.as_deref(), Some("https://cdn.discordapp.com/attachments/1/2/a.png"));
     }
 
     #[test]
@@ -2504,9 +1949,7 @@ mod tests {
         append(&s, "discord:a|#chan", "100");
         append(&s, "discord:a|#chan", "101");
 
-        let known = s
-            .existing_msg_ids("discord:a|#chan", &["100", "101", "102"])
-            .unwrap();
+        let known = s.existing_msg_ids("discord:a|#chan", &["100", "101", "102"]).unwrap();
         assert_eq!(known.len(), 2);
         assert!(known.contains("100") && known.contains("101"));
         // 102 is what a refill would go on to store.
@@ -2522,20 +1965,14 @@ mod tests {
         let (s, dir) = store();
         append(&s, "discord:a|#one", "100");
 
-        assert!(s
-            .existing_msg_ids("discord:a|#two", &["100"])
-            .unwrap()
-            .is_empty());
+        assert!(s.existing_msg_ids("discord:a|#two", &["100"]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn an_empty_request_asks_the_database_nothing() {
         let (s, dir) = store();
-        assert!(s
-            .existing_msg_ids("discord:a|#chan", &[])
-            .unwrap()
-            .is_empty());
+        assert!(s.existing_msg_ids("discord:a|#chan", &[]).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -2549,27 +1986,7 @@ mod dedupe_tests {
     }
 
     fn put(s: &Store, buffer: &str, id: &str, body: &str) {
-        let _ = s.append_message(
-            buffer,
-            id,
-            "nick",
-            body,
-            1,
-            false,
-            false,
-            "chat",
-            None,
-            &[],
-            false,
-            None,
-            &[],
-            &[],
-            None,
-            None,
-            "channel",
-            None,
-            &[],
-        );
+        let _ = s.append_message(buffer, id, "nick", body, 1, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[]);
     }
 
     /// A backend replaying history it already has - Sneedchat does this on
@@ -2616,10 +2033,7 @@ mod dedupe_tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].kind, "image");
         assert_eq!(found[0].filename.as_deref(), Some("9623396.jpeg"));
-        assert_eq!(
-            found[0].path.as_deref(),
-            Some("file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg")
-        );
+        assert_eq!(found[0].path.as_deref(), Some("file:///home/a/.cache/nobilis/sneedchat-attachments/9623396.jpeg"));
 
         let (same, none) = cached_links_in("nothing cached here");
         assert_eq!(same, "nothing cached here");
@@ -2640,8 +2054,7 @@ mod dedupe_tests {
             "id": "acct|guild:1", "accountId": "acct", "service": "discord", "kind": "guild", "name": "A server"
         }))
         .unwrap();
-        s.save_layout(std::slice::from_ref(&buffer), std::slice::from_ref(&group))
-            .unwrap();
+        s.save_layout(std::slice::from_ref(&buffer), std::slice::from_ref(&group)).unwrap();
         let (buffers, groups) = s.load_layout().unwrap();
         assert_eq!(buffers.len(), 1);
         assert_eq!(buffers[0].id, "acct|#one");

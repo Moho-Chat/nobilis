@@ -35,18 +35,10 @@ pub(super) fn parse_entry(entry: &Value, now: i64) -> (String, DiscordMute) {
     let guild = entry["guild_id"].as_str().unwrap_or(DM_SCOPE).to_string();
     let mut channels = HashMap::new();
     for over in entry["channel_overrides"].as_array().into_iter().flatten() {
-        let Some(channel_id) = over["channel_id"].as_str() else {
-            continue;
-        };
+        let Some(channel_id) = over["channel_id"].as_str() else { continue };
         channels.insert(channel_id.to_string(), still_muted(over, now));
     }
-    (
-        guild,
-        DiscordMute {
-            muted: still_muted(entry, now),
-            channels,
-        },
-    )
+    (guild, DiscordMute { muted: still_muted(entry, now), channels })
 }
 
 /// Whether a mute flag is a mute now.
@@ -59,9 +51,7 @@ fn still_muted(block: &Value, now: i64) -> bool {
         return false;
     }
     match block["mute_config"]["end_time"].as_str() {
-        Some(at) => chrono::DateTime::parse_from_rfc3339(at)
-            .map(|t| t.timestamp() > now)
-            .unwrap_or(true),
+        Some(at) => chrono::DateTime::parse_from_rfc3339(at).map(|t| t.timestamp() > now).unwrap_or(true),
         None => true,
     }
 }
@@ -103,25 +93,11 @@ fn override_body(channel_id: &str, muted: bool) -> Value {
 /// A muted channel still counts what was said to its reader - Discord keeps
 /// the mention badge on one - and stops sounding on every device signed in to
 /// the account. Direct messages are the `@me` scope.
-pub async fn set_muted(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    muted: bool,
-) -> anyhow::Result<()> {
+pub async fn set_muted(state: &AppState, account_id: &str, buffer_id: &str, muted: bool) -> anyhow::Result<()> {
     use anyhow::Context;
-    let config = state
-        .accounts
-        .get_discord(account_id)
-        .context("no such account")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("not a Discord conversation")?;
-    let guild = state
-        .runtime
-        .get_discord_guild(buffer_id)
-        .unwrap_or_else(|| DM_SCOPE.to_string());
+    let config = state.accounts.get_discord(account_id).context("no such account")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("not a Discord conversation")?;
+    let guild = state.runtime.get_discord_guild(buffer_id).unwrap_or_else(|| DM_SCOPE.to_string());
     let response = send_write(
         http_client_for(&config.token)
             .patch(format!("{API_BASE}/users/@me/guilds/{guild}/settings"))
@@ -131,11 +107,7 @@ pub async fn set_muted(
     .await?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!(
-            "Discord refused to {} it (HTTP {})",
-            if muted { "mute" } else { "unmute" },
-            status.as_u16()
-        );
+        anyhow::bail!("Discord refused to {} it (HTTP {})", if muted { "mute" } else { "unmute" }, status.as_u16());
     }
     // The account's settings as they now are. The gateway says the same a
     // moment later; taking it here as well is what makes the change show
@@ -157,13 +129,8 @@ pub(super) fn apply(state: &AppState, account_id: &str) {
         if !buffer.id.starts_with(&prefix) {
             continue;
         }
-        let Some(channel_id) = state.runtime.get_discord_channel(&buffer.id) else {
-            continue;
-        };
-        let guild = state
-            .runtime
-            .get_discord_guild(&buffer.id)
-            .unwrap_or_else(|| DM_SCOPE.to_string());
+        let Some(channel_id) = state.runtime.get_discord_channel(&buffer.id) else { continue };
+        let guild = state.runtime.get_discord_guild(&buffer.id).unwrap_or_else(|| DM_SCOPE.to_string());
         let muted = state.runtime.discord_muted(account_id, &guild, &channel_id);
         // A local mute is still a local mute. This only ever says what
         // Discord says, so a channel muted here and not there goes back to
@@ -188,10 +155,7 @@ mod tests {
             override_body("100", true),
             json!({ "channel_overrides": { "100": { "muted": true, "mute_config": null } } })
         );
-        assert_eq!(
-            override_body("100", false)["channel_overrides"]["100"]["muted"],
-            false
-        );
+        assert_eq!(override_body("100", false)["channel_overrides"]["100"]["muted"], false);
     }
 
     /// A muted guild and, inside it, one channel muted on its own. Both are
@@ -258,23 +222,15 @@ mod tests {
     #[test]
     fn a_mute_is_over_at_its_end_time() {
         let ends = |at: i64| {
-            let end = chrono::DateTime::from_timestamp(at, 0)
-                .unwrap()
-                .to_rfc3339();
+            let end = chrono::DateTime::from_timestamp(at, 0).unwrap().to_rfc3339();
             json!({ "muted": true, "mute_config": { "end_time": end } })
         };
         assert!(still_muted(&ends(NOW + 1), NOW), "a second to go");
         assert!(!still_muted(&ends(NOW), NOW), "its moment");
         assert!(!still_muted(&ends(NOW - 1), NOW), "past");
         // An end time nobody can read is not a reason to say it is over.
-        assert!(still_muted(
-            &json!({ "muted": true, "mute_config": { "end_time": "someday" } }),
-            NOW
-        ));
-        assert!(
-            !still_muted(&json!({ "muted": false, "mute_config": null }), NOW),
-            "never muted"
-        );
+        assert!(still_muted(&json!({ "muted": true, "mute_config": { "end_time": "someday" } }), NOW));
+        assert!(!still_muted(&json!({ "muted": false, "mute_config": null }), NOW), "never muted");
     }
 
     /// Settings in the three shapes, and an entry that is not an object at all
@@ -283,33 +239,19 @@ mod tests {
     fn what_is_read_is_kept_and_what_is_not_an_entry_is_skipped() {
         let state = crate::backend::kick::testkit::simulated_daemon("discord-mutes");
         let acct = "discord:me";
-        note_settings(
-            &state,
-            acct,
-            &json!([
-                { "guild_id": "9", "muted": true },
-                "not an entry",
-                42,
-                { "guild_id": null, "muted": false, "channel_overrides": [{ "channel_id": "5", "muted": true }] }
-            ]),
-        );
-        assert!(
-            state.runtime.discord_muted(acct, "9", "anything"),
-            "a muted guild mutes what is in it"
-        );
-        assert!(
-            state.runtime.discord_muted(acct, DM_SCOPE, "5"),
-            "a muted direct message"
-        );
+        note_settings(&state, acct, &json!([
+            { "guild_id": "9", "muted": true },
+            "not an entry",
+            42,
+            { "guild_id": null, "muted": false, "channel_overrides": [{ "channel_id": "5", "muted": true }] }
+        ]));
+        assert!(state.runtime.discord_muted(acct, "9", "anything"), "a muted guild mutes what is in it");
+        assert!(state.runtime.discord_muted(acct, DM_SCOPE, "5"), "a muted direct message");
         assert!(!state.runtime.discord_muted(acct, DM_SCOPE, "6"));
         // One entry on its own, as an update sends it, and the wrapped form.
         note_settings(&state, acct, &json!({ "guild_id": "9", "muted": false }));
         assert!(!state.runtime.discord_muted(acct, "9", "anything"));
-        note_settings(
-            &state,
-            acct,
-            &json!({ "entries": [{ "guild_id": "9", "muted": true }] }),
-        );
+        note_settings(&state, acct, &json!({ "entries": [{ "guild_id": "9", "muted": true }] }));
         assert!(state.runtime.discord_muted(acct, "9", "anything"));
     }
 }

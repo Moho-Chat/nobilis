@@ -35,9 +35,7 @@ pub(super) const WHOX_TOKEN: &str = "042";
 
 /// Asks who is in a channel, in whichever dialect this server speaks.
 pub(super) fn ask(state: &AppState, account_id: &str, channel: &str) {
-    let Some(sender) = state.runtime.irc_sender(account_id) else {
-        return;
-    };
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return };
     let line = if state.runtime.irc_has_isupport(account_id, "WHOX") {
         format!("WHO {channel} {WHOX_FIELDS},{WHOX_TOKEN}")
     } else {
@@ -68,13 +66,8 @@ pub fn ask_roster(state: &AppState, account_id: &str, channel: &str) {
     // the socket does not - and marking that as asked would mean the roster
     // was never fetched at all: the one chance to ask spent on a connection
     // that could not carry it.
-    let Some(sender) = state.runtime.irc_sender(account_id) else {
-        return;
-    };
-    if !state
-        .runtime
-        .irc_roster_needed(&crate::model::buffer_id(account_id, channel))
-    {
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return };
+    if !state.runtime.irc_roster_needed(&crate::model::buffer_id(account_id, channel)) {
         return;
     }
     if let Err(e) = sender.send(Command::Raw("NAMES".to_string(), vec![channel.to_string()])) {
@@ -144,17 +137,8 @@ mod tests {
     /// this dialect at all.
     #[test]
     fn a_whox_reply_carries_the_account() {
-        let seen = read_whox(&args(&[
-            "me",
-            WHOX_TOKEN,
-            "#chat",
-            "ada",
-            "example.org",
-            "Ada",
-            "H",
-            "adalovelace",
-        ]))
-        .expect("a reply");
+        let seen = read_whox(&args(&["me", WHOX_TOKEN, "#chat", "ada", "example.org", "Ada", "H", "adalovelace"]))
+            .expect("a reply");
         assert_eq!(seen.channel, "#chat");
         assert_eq!(seen.nick, "Ada");
         assert_eq!(seen.host, "ada@example.org");
@@ -168,17 +152,7 @@ mod tests {
     /// fields may be in a different order entirely.
     #[test]
     fn a_reply_to_somebody_elses_question_is_left_alone() {
-        assert!(read_whox(&args(&[
-            "me",
-            "999",
-            "#chat",
-            "ada",
-            "example.org",
-            "Ada",
-            "H",
-            "acct"
-        ]))
-        .is_none());
+        assert!(read_whox(&args(&["me", "999", "#chat", "ada", "example.org", "Ada", "H", "acct"])).is_none());
         // And a truncated one is not read as if the missing fields were empty.
         assert!(read_whox(&args(&["me", WHOX_TOKEN, "#chat"])).is_none());
     }
@@ -188,25 +162,16 @@ mod tests {
     /// what anybody would guess, which is exactly why it is tested.
     #[test]
     fn the_flags_say_away_and_bot() {
-        let away = read_whox(&args(&[
-            "me", WHOX_TOKEN, "#chat", "u", "h", "Ada", "G", "acct",
-        ]))
-        .expect("a reply");
+        let away = read_whox(&args(&["me", WHOX_TOKEN, "#chat", "u", "h", "Ada", "G", "acct"])).expect("a reply");
         assert!(away.away);
 
-        let bot = read_whox(&args(&[
-            "me", WHOX_TOKEN, "#chat", "u", "h", "Hal", "HB", "acct",
-        ]))
-        .expect("a reply");
+        let bot = read_whox(&args(&["me", WHOX_TOKEN, "#chat", "u", "h", "Hal", "HB", "acct"])).expect("a reply");
         assert!(bot.bot);
         assert!(!bot.away);
 
         // An operator's star and a channel prefix ride in the same field and
         // must not be read as either.
-        let op = read_whox(&args(&[
-            "me", WHOX_TOKEN, "#chat", "u", "h", "Ada", "H*@", "acct",
-        ]))
-        .expect("a reply");
+        let op = read_whox(&args(&["me", WHOX_TOKEN, "#chat", "u", "h", "Ada", "H*@", "acct"])).expect("a reply");
         assert!(!op.away);
         assert!(!op.bot);
     }
@@ -215,17 +180,8 @@ mod tests {
     /// no account at all.
     #[test]
     fn a_plain_reply_carries_everything_but_the_account() {
-        let seen = read_who(&args(&[
-            "me",
-            "#chat",
-            "ada",
-            "example.org",
-            "irc.example.org",
-            "Ada",
-            "H",
-            "0 Ada Lovelace",
-        ]))
-        .expect("a reply");
+        let seen = read_who(&args(&["me", "#chat", "ada", "example.org", "irc.example.org", "Ada", "H", "0 Ada Lovelace"]))
+            .expect("a reply");
         assert_eq!(seen.channel, "#chat");
         assert_eq!(seen.nick, "Ada");
         assert_eq!(seen.host, "ada@example.org");

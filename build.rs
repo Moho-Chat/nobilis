@@ -16,11 +16,7 @@ fn main() {
     // A working tree with changes in it is not the commit it names, and
     // saying so is the whole point of showing a hash at all.
     let dirty = git(&["status", "--porcelain"]).is_some_and(|s| !s.trim().is_empty());
-    let stamp = if dirty {
-        format!("{commit}-modified")
-    } else {
-        commit
-    };
+    let stamp = if dirty { format!("{commit}-modified") } else { commit };
     println!("cargo:rustc-env=NOBILIS_BUILD_COMMIT={stamp}");
     println!("cargo:rustc-env=NOBILIS_VERSION_LABEL={}", version_label());
     println!("cargo:rerun-if-env-changed=NOBILIS_CHANNEL");
@@ -42,15 +38,10 @@ fn version_label() -> String {
         Some(_) => false,
         None => {
             git(&["rev-parse", "--abbrev-ref", "HEAD"]).is_some_and(|b| b.trim() == "master")
-                || git(&["tag", "--points-at", "HEAD"])
-                    .is_some_and(|tags| tags.lines().any(|t| t.trim() == format!("v{version}")))
+                || git(&["tag", "--points-at", "HEAD"]).is_some_and(|tags| tags.lines().any(|t| t.trim() == format!("v{version}")))
         }
     };
-    if release {
-        version
-    } else {
-        "development".to_string()
-    }
+    if release { version } else { "development".to_string() }
 }
 
 /// Asks cargo to run this again when the checkout moves.
@@ -70,18 +61,9 @@ fn watch_head() {
         return;
     }
     println!("cargo:rerun-if-changed={}", head.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        git_dir.join("packed-refs").display()
-    );
-    if let Some(reference) = std::fs::read_to_string(&head)
-        .ok()
-        .and_then(|h| h.strip_prefix("ref: ").map(|r| r.trim().to_string()))
-    {
-        println!(
-            "cargo:rerun-if-changed={}",
-            git_dir.join(reference).display()
-        );
+    println!("cargo:rerun-if-changed={}", git_dir.join("packed-refs").display());
+    if let Some(reference) = std::fs::read_to_string(&head).ok().and_then(|h| h.strip_prefix("ref: ").map(|r| r.trim().to_string())) {
+        println!("cargo:rerun-if-changed={}", git_dir.join(reference).display());
     }
 }
 
@@ -102,7 +84,5 @@ fn git_dir() -> Option<PathBuf> {
 
 fn git(args: &[&str]) -> Option<String> {
     let out = Command::new("git").args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

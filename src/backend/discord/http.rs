@@ -37,8 +37,7 @@ pub(super) const WRITE_GAP: Duration = Duration::from_millis(400);
 pub(super) const RATE_LIMIT_RETRIES: usize = 3;
 
 /// When the last write went out, so the next one can wait its turn.
-pub(super) static LAST_WRITE: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
+pub(super) static LAST_WRITE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// Waits for this write's turn, and takes it.
 async fn pace() {
@@ -46,9 +45,7 @@ async fn pace() {
     // is this machine's rather than one account's.
     let wait = {
         let mut last = LAST_WRITE.lock().unwrap();
-        let wait = last
-            .map(|at| WRITE_GAP.saturating_sub(at.elapsed()))
-            .unwrap_or_default();
+        let wait = last.map(|at| WRITE_GAP.saturating_sub(at.elapsed())).unwrap_or_default();
         *last = Some(std::time::Instant::now() + wait);
         wait
     };
@@ -66,8 +63,7 @@ where
     pace().await;
     for attempt in 0..=RATE_LIMIT_RETRIES {
         let resp = build()?.send().await.context("talking to Discord")?;
-        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES
-        {
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
         let pause = retry_after(&resp);
@@ -98,8 +94,7 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
         // that cannot be cloned is one this cannot retry, and is sent once.
         let again = current.try_clone();
         let resp = current.send().await.context("talking to Discord")?;
-        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES
-        {
+        if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
         let Some(again) = again else { return Ok(resp) };
@@ -117,11 +112,7 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
 /// number is not a reason to hammer, and one asking for half an hour is not a
 /// wait anybody would sit through inside a request.
 pub(super) fn retry_after(resp: &reqwest::Response) -> Duration {
-    pause_for(
-        resp.headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok()),
-    )
+    pause_for(resp.headers().get("retry-after").and_then(|v| v.to_str().ok()))
 }
 
 /// The wait a `Retry-After` value asks for; none given, or none that reads as
@@ -142,9 +133,7 @@ pub(super) fn http_client_for(key: &str) -> reqwest::Client {
 /// when the add form's switch says so, or when any Discord account is.
 pub(super) fn anonymous_client() -> reqwest::Client {
     let router = crate::net::route::router();
-    discord_client(
-        router.routed(&crate::net::route::pending_key("discord")) || router.wanted(SHARED_KEY),
-    )
+    discord_client(router.routed(&crate::net::route::pending_key("discord")) || router.wanted(SHARED_KEY))
 }
 
 /// Marked while any Discord account is routed.
@@ -195,11 +184,7 @@ pub(super) fn discord_error_text(status: reqwest::StatusCode, body: &str, doing:
             "Discord asked for a captcha before {doing}. moho does not answer Discord's captchas - doing so is what gets an account flagged for spam - so this has to be done on discord.com."
         );
     }
-    if let Some(message) = parsed
-        .get("message")
-        .and_then(|m| m.as_str())
-        .filter(|m| !m.is_empty())
-    {
+    if let Some(message) = parsed.get("message").and_then(|m| m.as_str()).filter(|m| !m.is_empty()) {
         return message.to_string();
     }
     if let Some(fields) = form_errors(&parsed) {

@@ -38,9 +38,7 @@ impl Outage {
         match self {
             Outage::Tor(why) => BufferLink::down("tor", why.clone()),
             Outage::Site(why) => BufferLink::down("site", why.clone()),
-            Outage::Chat => {
-                BufferLink::down("chat", format!("The chat is down - {host} itself is up"))
-            }
+            Outage::Chat => BufferLink::down("chat", format!("The chat is down - {host} itself is up")),
         }
     }
 
@@ -57,11 +55,9 @@ const TOR_PROBE: (&str, u16) = ("check.torproject.org", 443);
 /// How long one diagnosis is trusted - see the module comment.
 const REMEMBERED: Duration = Duration::from_secs(30);
 
-fn remembered(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Outage)>> {
-    static LAST: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Outage)>>,
-    > = std::sync::OnceLock::new();
+fn remembered() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Outage)>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, Outage)>>> =
+        std::sync::OnceLock::new();
     LAST.get_or_init(Default::default)
 }
 
@@ -75,10 +71,7 @@ pub async fn diagnose(account_id: &str, transport: &Transport, host: &str) -> Ou
     }
     let outage = ask(transport, host).await;
     tracing::info!("sneedchat[{account_id}]: {}", outage.describe(host));
-    remembered().lock().unwrap().insert(
-        account_id.to_string(),
-        (std::time::Instant::now(), outage.clone()),
-    );
+    remembered().lock().unwrap().insert(account_id.to_string(), (std::time::Instant::now(), outage.clone()));
     outage
 }
 
@@ -91,41 +84,23 @@ async fn ask(transport: &Transport, host: &str) -> Outage {
     let routed = !matches!(transport, Transport::Direct);
     if routed {
         let (probe, port) = TOR_PROBE;
-        let reached = tokio::time::timeout(
-            Duration::from_secs(30),
-            transport.connect(probe, port, true),
-        )
-        .await;
+        let reached = tokio::time::timeout(Duration::from_secs(30), transport.connect(probe, port, true)).await;
         if !matches!(reached, Ok(Ok(_))) {
             return Outage::Tor(match transport {
-                Transport::Socks { host, port } => {
-                    format!("The Tor proxy at {host}:{port} isn't carrying traffic")
-                }
+                Transport::Socks { host, port } => format!("The Tor proxy at {host}:{port} isn't carrying traffic"),
                 _ => "Tor isn't connecting".to_string(),
             });
         }
     }
 
-    let http = http::HttpClient::new(
-        transport.clone(),
-        http::CookieJar::new(),
-        DEFAULT_USER_AGENT.to_string(),
-    );
-    let front = tokio::time::timeout(
-        Duration::from_secs(30),
-        http.get_bytes(&format!("https://{host}/")),
-    )
-    .await;
+    let http = http::HttpClient::new(transport.clone(), http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
+    let front = tokio::time::timeout(Duration::from_secs(30), http.get_bytes(&format!("https://{host}/"))).await;
     match front {
         // The anti-bot gate is the forum answering too.
         Ok(Ok((status, _))) if status < 500 => Outage::Chat,
         Ok(Ok((status, _))) => Outage::Site(format!("{host} is down - it answered HTTP {status}")),
-        _ if routed => Outage::Site(format!(
-            "{host} isn't answering over Tor - Tor itself is working"
-        )),
-        _ => Outage::Site(format!(
-            "Can't reach {host} - the site, or this connection, is down"
-        )),
+        _ if routed => Outage::Site(format!("{host} isn't answering over Tor - Tor itself is working")),
+        _ => Outage::Site(format!("Can't reach {host} - the site, or this connection, is down")),
     }
 }
 
@@ -137,17 +112,8 @@ mod tests {
     #[test]
     fn each_outage_names_its_part() {
         let host = "kiwifarms.st";
-        assert_eq!(
-            Outage::Tor("Tor isn't connecting".into())
-                .link(host)
-                .cause
-                .as_deref(),
-            Some("tor")
-        );
-        assert_eq!(
-            Outage::Site("down".into()).link(host).cause.as_deref(),
-            Some("site")
-        );
+        assert_eq!(Outage::Tor("Tor isn't connecting".into()).link(host).cause.as_deref(), Some("tor"));
+        assert_eq!(Outage::Site("down".into()).link(host).cause.as_deref(), Some("site"));
         let chat = Outage::Chat.link(host);
         assert_eq!(chat.cause.as_deref(), Some("chat"));
         assert_eq!(chat.state, "down");
@@ -177,10 +143,7 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir().join("nobilis-health-probe");
         let tor = crate::net::tor::TorManager::new(&dir);
-        let client = tor
-            .get_or_bootstrap(|_| {})
-            .await
-            .expect("bootstrapping Tor");
+        let client = tor.get_or_bootstrap(|_| {}).await.expect("bootstrapping Tor");
         let outage = ask(&Transport::Tor(client), DEFAULT_ONION).await;
         println!("{outage:?}");
     }

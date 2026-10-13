@@ -21,16 +21,10 @@ fn base(account: &crate::accounts::MatrixAccountConfig) -> String {
 
 /// Every address that can reach this account.
 pub async fn third_party_ids(state: &AppState, account_id: &str) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let answer = http::get_json(
-        &format!("{}/_matrix/client/v3/account/3pid", base(&account)),
-        &account.access_token,
-    )
-    .await
-    .context("reading the account's addresses")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let answer = http::get_json(&format!("{}/_matrix/client/v3/account/3pid", base(&account)), &account.access_token)
+        .await
+        .context("reading the account's addresses")?;
     let listed: Vec<Value> = answer["threepids"]
         .as_array()
         .into_iter()
@@ -65,21 +59,11 @@ fn client_secret() -> String {
 ///
 /// Hands back the session id and the secret, because the second half of the
 /// flow needs both and neither can be re-derived.
-pub async fn request_email_token(
-    state: &AppState,
-    account_id: &str,
-    address: &str,
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn request_email_token(state: &AppState, account_id: &str, address: &str) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let secret = client_secret();
     let answer = http::post_json(
-        &format!(
-            "{}/_matrix/client/v3/account/3pid/email/requestToken",
-            base(&account)
-        ),
+        &format!("{}/_matrix/client/v3/account/3pid/email/requestToken", base(&account)),
         Some(&account.access_token),
         // `send_attempt` is how the server tells "send it again" from "the
         // request was retried": the same number means the same mail, a higher
@@ -89,9 +73,7 @@ pub async fn request_email_token(
     )
     .await
     .context("asking the server to send a confirmation")?;
-    let sid = answer["sid"]
-        .as_str()
-        .context("the server sent no session id")?;
+    let sid = answer["sid"].as_str().context("the server sent no session id")?;
     Ok(serde_json::json!({ "sid": sid, "clientSecret": secret }))
 }
 
@@ -103,10 +85,7 @@ pub async fn add_third_party_id(
     secret: &str,
     password: &str,
 ) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     http::post_with_password_uia(
         &format!("{}/_matrix/client/v3/account/3pid/add", base(&account)),
         &account.access_token,
@@ -125,16 +104,8 @@ pub async fn add_third_party_id(
 /// and the spec does not gate it. The answer says whether the *identity
 /// server* also let go, which can be "no idea" - the homeserver has forgotten
 /// it either way, and that is the part that governs who can sign in.
-pub async fn remove_third_party_id(
-    state: &AppState,
-    account_id: &str,
-    medium: &str,
-    address: &str,
-) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn remove_third_party_id(state: &AppState, account_id: &str, medium: &str, address: &str) -> Result<Value> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let answer = http::post_json(
         &format!("{}/_matrix/client/v3/account/3pid/delete", base(&account)),
         Some(&account.access_token),
@@ -142,9 +113,7 @@ pub async fn remove_third_party_id(
     )
     .await
     .context("removing the address")?;
-    Ok(
-        serde_json::json!({ "idServer": answer["id_server_unbind_result"].as_str().unwrap_or("no-support") }),
-    )
+    Ok(serde_json::json!({ "idServer": answer["id_server_unbind_result"].as_str().unwrap_or("no-support") }))
 }
 
 /// How this account can be closed, as a client can tell before trying.
@@ -158,16 +127,10 @@ pub async fn remove_third_party_id(
 /// link opens that action directly; it may not, and then all a client can do
 /// is send the person to the page and say so.
 pub async fn deactivation_route(state: &AppState, account_id: &str) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("no such Matrix account")?;
+    let account = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
     let base = base(&account);
     let mut metadata = None;
-    for path in [
-        "/_matrix/client/v1/auth_metadata",
-        "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
-    ] {
+    for path in ["/_matrix/client/v1/auth_metadata", "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata"] {
         if let Ok(v) = http::get_json_anonymous(&format!("{base}{path}")).await {
             if v["issuer"].as_str().is_some_and(|i| !i.is_empty()) {
                 metadata = Some(v);
@@ -184,10 +147,7 @@ pub(super) fn route_from_metadata(metadata: Option<&Value>) -> Value {
     let Some(m) = metadata else {
         return serde_json::json!({ "route": "password" });
     };
-    let Some(page) = m["account_management_uri"]
-        .as_str()
-        .filter(|u| !u.is_empty())
-    else {
+    let Some(page) = m["account_management_uri"].as_str().filter(|u| !u.is_empty()) else {
         return serde_json::json!({ "route": "none" });
     };
     let direct = m["account_management_actions_supported"]
@@ -213,16 +173,8 @@ pub(super) fn route_from_metadata(metadata: Option<&Value>) -> Value {
 /// messages as well. Off unless asked, because it is a separate decision and
 /// a much larger one - and because a server is allowed to ignore it, so a
 /// client promising it would be promising something it cannot deliver.
-pub async fn deactivate(
-    state: &AppState,
-    account_id: &str,
-    password: &str,
-    erase: bool,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn deactivate(state: &AppState, account_id: &str, password: &str, erase: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     http::post_with_password_uia(
         &format!("{}/_matrix/client/v3/account/deactivate", base(&account)),
         &account.access_token,
@@ -237,9 +189,7 @@ pub async fn deactivate(
         // like moho sent something malformed, when the truth is that this
         // account is closed somewhere else - see deactivation_route.
         if format!("{e:#}").contains("M_UNRECOGNIZED") {
-            anyhow::anyhow!(
-                "this homeserver closes accounts on its own account page, not through a client"
-            )
+            anyhow::anyhow!("this homeserver closes accounts on its own account page, not through a client")
         } else {
             e.context("closing the account")
         }
@@ -281,17 +231,11 @@ mod deactivation_tests {
         });
         let route = route_from_metadata(Some(&m));
         assert_eq!(route["direct"], true);
-        assert_eq!(
-            route["url"],
-            "https://mas.example/account/?action=org.matrix.account_deactivate"
-        );
+        assert_eq!(route["url"], "https://mas.example/account/?action=org.matrix.account_deactivate");
     }
 
     #[test]
     fn a_provider_with_no_account_page_leaves_nothing_to_offer() {
-        assert_eq!(
-            route_from_metadata(Some(&json!({ "issuer": "https://mas.example/" })))["route"],
-            "none"
-        );
+        assert_eq!(route_from_metadata(Some(&json!({ "issuer": "https://mas.example/" })))["route"], "none");
     }
 }

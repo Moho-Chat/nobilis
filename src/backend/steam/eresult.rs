@@ -172,17 +172,7 @@ pub fn describe(code: i32) -> String {
 
 /// Whether the saved sign-in is dead, so only a fresh sign-in can help.
 pub fn means_sign_in_again(code: i32) -> bool {
-    matches!(
-        code,
-        INVALID_PASSWORD
-            | REVOKED
-            | EXPIRED
-            | REQUIRE_PASSWORD_RE_ENTRY
-            | ACCOUNT_NOT_FOUND
-            | ACCOUNT_LOGON_DENIED
-            | ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR
-            | 126
-    )
+    matches!(code, INVALID_PASSWORD | REVOKED | EXPIRED | REQUIRE_PASSWORD_RE_ENTRY | ACCOUNT_NOT_FOUND | ACCOUNT_LOGON_DENIED | ACCOUNT_LOGIN_DENIED_NEED_TWO_FACTOR | 126)
 }
 
 /// Whether the answer is about the account or this client and so the same on every server and every
@@ -190,34 +180,13 @@ pub fn means_sign_in_again(code: i32) -> bool {
 /// longer takes, a clock that is wrong, a page only Steam's own site can show. Retrying only repeats
 /// it - and for the first two takes the other session back and forth.
 pub fn is_final(code: i32) -> bool {
-    matches!(
-        code,
-        LOGGED_IN_ELSEWHERE
-            | 34
-            | 50
-            | BANNED
-            | SUSPENDED
-            | ACCOUNT_DISABLED
-            | ACCOUNT_HAS_BEEN_DELETED
-            | ACCOUNT_LOCKED_DOWN
-            | IP_LOGIN_RESTRICTION_FAILED
-            | 105
-            | INVALID_PROTOCOL_VER
-            | CLIENT_NO_LONGER_SUPPORTED
-            | 69
-            | 74
-            | 93
-            | MUST_AGREE_TO_SSA
-    )
+    matches!(code, LOGGED_IN_ELSEWHERE | 34 | 50 | BANNED | SUSPENDED | ACCOUNT_DISABLED | ACCOUNT_HAS_BEEN_DELETED | ACCOUNT_LOCKED_DOWN | IP_LOGIN_RESTRICTION_FAILED | 105 | INVALID_PROTOCOL_VER | CLIENT_NO_LONGER_SUPPORTED | 69 | 74 | 93 | MUST_AGREE_TO_SSA)
 }
 
 /// Whether Steam is limiting how often this may be tried, so the answer is to wait before trying
 /// again, not to try another server.
 pub fn is_rate_limit(code: i32) -> bool {
-    matches!(
-        code,
-        RATE_LIMIT_EXCEEDED | ACCOUNT_LOGIN_DENIED_THROTTLE | LIMIT_EXCEEDED | COMMUNITY_COOLDOWN
-    )
+    matches!(code, RATE_LIMIT_EXCEEDED | ACCOUNT_LOGIN_DENIED_THROTTLE | LIMIT_EXCEEDED | COMMUNITY_COOLDOWN)
 }
 
 #[cfg(test)]
@@ -237,14 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn every_result_steam_defines_has_a_sentence_and_only_a_number_past_the_list_is_named_by_number(
-    ) {
+    fn every_result_steam_defines_has_a_sentence_and_only_a_number_past_the_list_is_named_by_number() {
         for code in 0..=130 {
             let said = describe(code);
-            assert!(
-                !said.starts_with("Steam answered with error"),
-                "{code} has no sentence"
-            );
+            assert!(!said.starts_with("Steam answered with error"), "{code} has no sentence");
             assert!(!said.is_empty());
         }
         assert_eq!(describe(131), "Steam answered with error 131");
@@ -254,33 +219,15 @@ mod tests {
 
     #[test]
     fn what_ends_a_session_for_good_what_waits_and_what_another_server_may_fix_are_told_apart() {
-        for code in [
-            LOGGED_IN_ELSEWHERE,
-            34,
-            50,
-            SUSPENDED,
-            ACCOUNT_LOCKED_DOWN,
-            105,
-            CLIENT_NO_LONGER_SUPPORTED,
-            93,
-            MUST_AGREE_TO_SSA,
-        ] {
+        for code in [LOGGED_IN_ELSEWHERE, 34, 50, SUSPENDED, ACCOUNT_LOCKED_DOWN, 105, CLIENT_NO_LONGER_SUPPORTED, 93, MUST_AGREE_TO_SSA] {
             assert!(is_final(code), "{code} is the same on every try");
         }
-        for code in [
-            RATE_LIMIT_EXCEEDED,
-            ACCOUNT_LOGIN_DENIED_THROTTLE,
-            LIMIT_EXCEEDED,
-            COMMUNITY_COOLDOWN,
-        ] {
+        for code in [RATE_LIMIT_EXCEEDED, ACCOUNT_LOGIN_DENIED_THROTTLE, LIMIT_EXCEEDED, COMMUNITY_COOLDOWN] {
             assert!(is_rate_limit(code) && !is_final(code));
         }
         assert!(means_sign_in_again(126));
         for code in [FAIL, TIMEOUT, SERVICE_UNAVAILABLE, 37, 55] {
-            assert!(
-                !is_final(code) && !is_rate_limit(code) && !means_sign_in_again(code),
-                "{code} may be better elsewhere"
-            );
+            assert!(!is_final(code) && !is_rate_limit(code) && !means_sign_in_again(code), "{code} may be better elsewhere");
         }
     }
 
@@ -297,10 +244,7 @@ mod tests {
     fn some_failures_are_the_servers_and_some_are_the_accounts() {
         assert!(means_sign_in_again(REVOKED));
         assert!(means_sign_in_again(INVALID_PASSWORD));
-        assert!(
-            !means_sign_in_again(RATE_LIMIT_EXCEEDED),
-            "waiting helps, signing in again does not"
-        );
+        assert!(!means_sign_in_again(RATE_LIMIT_EXCEEDED), "waiting helps, signing in again does not");
         assert!(!means_sign_in_again(SERVICE_UNAVAILABLE));
     }
 }

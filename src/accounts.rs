@@ -215,9 +215,7 @@ impl SneedChatAccountConfig {
         let onion = self.host.ends_with(".onion");
         match (self.use_tor, onion) {
             (false, true) => crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST.to_string(),
-            (true, false) if self.host == crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST => {
-                crate::backend::sneedchat::DEFAULT_ONION.to_string()
-            }
+            (true, false) if self.host == crate::backend::sneedchat::KIWIFARMS_CLEARNET_HOST => crate::backend::sneedchat::DEFAULT_ONION.to_string(),
             _ => self.host.clone(),
         }
     }
@@ -461,50 +459,19 @@ impl AccountStore {
         let (irc, discord, sneedchat, matrix, kick, steam) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            let file: AccountsFile =
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+            let file: AccountsFile = toml::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display()))?;
             let irc = file.irc.into_iter().map(|a| (a.account_id(), a)).collect();
-            let discord = file
-                .discord
-                .into_iter()
-                .map(|a| (a.account_id(), a))
-                .collect();
-            let sneedchat = file
-                .sneedchat
-                .into_iter()
-                .map(|a| (a.account_id(), a))
-                .collect();
-            let matrix = file
-                .matrix
-                .into_iter()
-                .map(|a| (a.account_id(), a))
-                .collect();
+            let discord = file.discord.into_iter().map(|a| (a.account_id(), a)).collect();
+            let sneedchat = file.sneedchat.into_iter().map(|a| (a.account_id(), a)).collect();
+            let matrix = file.matrix.into_iter().map(|a| (a.account_id(), a)).collect();
             let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
-            let steam = file
-                .steam
-                .into_iter()
-                .map(|a| (a.account_id(), a))
-                .collect();
+            let steam = file.steam.into_iter().map(|a| (a.account_id(), a)).collect();
             (irc, discord, sneedchat, matrix, kick, steam)
         } else {
-            (
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-                HashMap::new(),
-            )
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
-        Ok(Self {
-            path,
-            irc: Mutex::new(irc),
-            discord: Mutex::new(discord),
-            sneedchat: Mutex::new(sneedchat),
-            matrix: Mutex::new(matrix),
-            kick: Mutex::new(kick),
-            steam: Mutex::new(steam),
-        })
+        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sneedchat: Mutex::new(sneedchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick), steam: Mutex::new(steam) })
     }
 
     /// Callers already hold whichever map they just mutated - the others
@@ -571,13 +538,7 @@ impl AccountStore {
             return Ok(None);
         }
         irc.insert(id, config.clone());
-        self.persist(
-            &irc,
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(Some(config))
     }
 
@@ -609,13 +570,7 @@ impl AccountStore {
             config.use_tor = true;
         }
         discord.insert(id, config.clone());
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &discord,
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -629,10 +584,7 @@ impl AccountStore {
 
     /// Upserts like add_discord - re-adding the same username is how a user
     /// updates a changed password/TOTP secret, not a duplicate mistake.
-    pub fn add_sneedchat(
-        &self,
-        mut config: SneedChatAccountConfig,
-    ) -> Result<SneedChatAccountConfig> {
+    pub fn add_sneedchat(&self, mut config: SneedChatAccountConfig) -> Result<SneedChatAccountConfig> {
         let id = config.account_id();
         let mut sneedchat = self.sneedchat.lock().unwrap();
         // Strict routing survives signing in again, as long as the form still
@@ -641,13 +593,7 @@ impl AccountStore {
             config.strict_route = true;
         }
         sneedchat.insert(id, config.clone());
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &sneedchat,
-            &self.matrix.lock().unwrap(),
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -677,13 +623,7 @@ impl AccountStore {
             config.use_tor = true;
         }
         matrix.insert(id, config.clone());
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &matrix,
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -720,13 +660,7 @@ impl AccountStore {
             }
             steam.insert(id, config.clone());
         }
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(config)
     }
 
@@ -734,11 +668,7 @@ impl AccountStore {
     /// no such account.
     ///
     /// The lock is let go before the write: `persist` takes it again.
-    pub fn mutate_steam(
-        &self,
-        account_id: &str,
-        change: impl FnOnce(&mut SteamAccountConfig),
-    ) -> Result<bool> {
+    pub fn mutate_steam(&self, account_id: &str, change: impl FnOnce(&mut SteamAccountConfig)) -> Result<bool> {
         {
             let mut steam = self.steam.lock().unwrap();
             match steam.get_mut(account_id) {
@@ -746,13 +676,7 @@ impl AccountStore {
                 Some(account) => change(account),
             }
         }
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
         Ok(true)
     }
 
@@ -773,13 +697,7 @@ impl AccountStore {
             config.use_tor = true;
         }
         kick.insert(id, config.clone());
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &kick,
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(config)
     }
 
@@ -787,20 +705,12 @@ impl AccountStore {
     /// read in again - see `KickAccountConfig::followed_synced`.
     pub fn mark_kick_follows_synced(&self, account_id: &str) -> Result<bool> {
         let mut kick = self.kick.lock().unwrap();
-        let Some(config) = kick.get_mut(account_id) else {
-            return Ok(false);
-        };
+        let Some(config) = kick.get_mut(account_id) else { return Ok(false) };
         if config.followed_synced {
             return Ok(false);
         }
         config.followed_synced = true;
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &kick,
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(true)
     }
 
@@ -811,20 +721,12 @@ impl AccountStore {
     /// there tomorrow, and nothing else in the daemon knows you wanted it.
     pub fn set_kick_channels(&self, account_id: &str, channels: Vec<String>) -> Result<bool> {
         let mut kick = self.kick.lock().unwrap();
-        let Some(config) = kick.get_mut(account_id) else {
-            return Ok(false);
-        };
+        let Some(config) = kick.get_mut(account_id) else { return Ok(false) };
         if config.channels == channels {
             return Ok(false);
         }
         config.channels = channels;
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &self.matrix.lock().unwrap(),
-            &kick,
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
         Ok(true)
     }
 
@@ -833,25 +735,14 @@ impl AccountStore {
     /// point of passing it back into backend/matrix/auth.rs::login is
     /// getting the *same* one back), but is still updated here rather than
     /// assumed, in case a homeserver ever behaves unexpectedly.
-    pub fn set_matrix_session(
-        &self,
-        account_id: &str,
-        access_token: &str,
-        device_id: &str,
-    ) -> Result<bool> {
+    pub fn set_matrix_session(&self, account_id: &str, access_token: &str, device_id: &str) -> Result<bool> {
         let mut matrix = self.matrix.lock().unwrap();
         match matrix.get_mut(account_id) {
             None => Ok(false),
             Some(a) => {
                 a.access_token = access_token.to_string();
                 a.device_id = device_id.to_string();
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -865,13 +756,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.next_batch = Some(next_batch.to_string());
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -888,13 +773,7 @@ impl AccountStore {
             Some(a) => {
                 a.rooms = rooms;
                 a.rooms_chosen = true;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &sneedchat,
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -966,14 +845,14 @@ impl AccountStore {
         if let Some(a) = self.get_steam(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
-        self.get_kick(account_id)
-            .and_then(|a| pick(a.use_tor, a.strict_route))
+        self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
     }
 
     /// The old two-way switch: the service tunnel, or none.
     pub fn set_routed(&self, account_id: &str, routed: bool) -> Result<bool> {
         self.set_route_level(account_id, if routed { "service" } else { "clearnet" })
     }
+
 
     /// Called after a successful login once the `xf_user` cookie reveals the
     /// account's numeric id - best-effort, not required for the backend to
@@ -984,13 +863,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.user_id = Some(user_id);
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &sneedchat,
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -999,11 +872,7 @@ impl AccountStore {
     /// Records the session a browser sign-in produced, or the fresher one a
     /// connection has been handed since - the forum rotates `xf_session`, and
     /// a saved copy that is never updated is a saved copy that expires.
-    pub fn set_sneedchat_cookies(
-        &self,
-        account_id: &str,
-        cookies: std::collections::BTreeMap<String, String>,
-    ) -> Result<bool> {
+    pub fn set_sneedchat_cookies(&self, account_id: &str, cookies: std::collections::BTreeMap<String, String>) -> Result<bool> {
         let mut sneedchat = self.sneedchat.lock().unwrap();
         match sneedchat.get_mut(account_id) {
             None => Ok(false),
@@ -1014,13 +883,7 @@ impl AccountStore {
                     return Ok(true);
                 }
                 a.cookies = cookies;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &sneedchat,
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1030,77 +893,41 @@ impl AccountStore {
         {
             let mut irc = self.irc.lock().unwrap();
             if irc.remove(account_id).is_some() {
-                self.persist(
-                    &irc,
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut discord = self.discord.lock().unwrap();
             if discord.remove(account_id).is_some() {
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &discord,
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut sneedchat = self.sneedchat.lock().unwrap();
             if sneedchat.remove(account_id).is_some() {
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &sneedchat,
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let mut matrix = self.matrix.lock().unwrap();
             if matrix.remove(account_id).is_some() {
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         {
             let removed = self.steam.lock().unwrap().remove(account_id).is_some();
             if removed {
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
         let mut kick = self.kick.lock().unwrap();
         if kick.remove(account_id).is_some() {
-            self.persist(
-                &self.irc.lock().unwrap(),
-                &self.discord.lock().unwrap(),
-                &self.sneedchat.lock().unwrap(),
-                &self.matrix.lock().unwrap(),
-                &kick,
-            )?;
+            self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
             return Ok(true);
         }
         Ok(false)
@@ -1126,13 +953,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.dehydration_enabled = enabled;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1147,17 +968,9 @@ impl AccountStore {
     /// every refresh, and using a spent one is refused.
     pub fn set_matrix_oauth_refresh(&self, account_id: &str, refresh_token: &str) -> Result<bool> {
         let mut matrix = self.matrix.lock().unwrap();
-        let Some(a) = matrix.get_mut(account_id) else {
-            return Ok(false);
-        };
+        let Some(a) = matrix.get_mut(account_id) else { return Ok(false) };
         a.oauth_refresh_token = refresh_token.to_string();
-        self.persist(
-            &self.irc.lock().unwrap(),
-            &self.discord.lock().unwrap(),
-            &self.sneedchat.lock().unwrap(),
-            &matrix,
-            &self.kick.lock().unwrap(),
-        )?;
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
         Ok(true)
     }
 
@@ -1168,13 +981,7 @@ impl AccountStore {
             Some(a) => {
                 a.prefer_sliding_sync = prefer;
                 a.next_batch = None;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1191,13 +998,7 @@ impl AccountStore {
                 // starts a fresh stream, and a stored token from the other
                 // kind would be rejected on every attempt.
                 a.next_batch = None;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1209,18 +1010,8 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 let url = url.trim();
-                a.rtc_focus_url = if url.is_empty() {
-                    None
-                } else {
-                    Some(url.to_string())
-                };
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                a.rtc_focus_url = if url.is_empty() { None } else { Some(url.to_string()) };
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1228,11 +1019,7 @@ impl AccountStore {
 
     pub fn set_nickserv_password(&self, account_id: &str, password: &str) -> Result<bool> {
         self.mutate(account_id, |a| {
-            a.nickserv_password = if password.is_empty() {
-                None
-            } else {
-                Some(password.to_string())
-            }
+            a.nickserv_password = if password.is_empty() { None } else { Some(password.to_string()) }
         })
     }
 
@@ -1248,13 +1035,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.avatar_url = Some(url.to_string());
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &discord,
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1274,11 +1055,7 @@ impl AccountStore {
     /// nothing at all. Written out per store rather than looped, because the
     /// five configs are five types.
     pub fn set_display_name(&self, account_id: &str, name: &str) -> Result<bool> {
-        let value = if name.is_empty() {
-            None
-        } else {
-            Some(name.to_string())
-        };
+        let value = if name.is_empty() { None } else { Some(name.to_string()) };
         if self.mutate(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
@@ -1286,13 +1063,7 @@ impl AccountStore {
             let mut discord = self.discord.lock().unwrap();
             if let Some(a) = discord.get_mut(account_id) {
                 a.display_name = value;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &discord,
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &discord, &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
@@ -1300,13 +1071,7 @@ impl AccountStore {
             let mut sneedchat = self.sneedchat.lock().unwrap();
             if let Some(a) = sneedchat.get_mut(account_id) {
                 a.display_name = value;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &sneedchat,
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &sneedchat, &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
@@ -1314,13 +1079,7 @@ impl AccountStore {
             let mut matrix = self.matrix.lock().unwrap();
             if let Some(a) = matrix.get_mut(account_id) {
                 a.display_name = value;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &matrix,
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &matrix, &self.kick.lock().unwrap())?;
                 return Ok(true);
             }
         }
@@ -1332,13 +1091,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 a.display_name = value;
-                self.persist(
-                    &self.irc.lock().unwrap(),
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &kick,
-                )?;
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &kick)?;
                 Ok(true)
             }
         }
@@ -1366,11 +1119,7 @@ impl AccountStore {
         if let Some(a) = self.steam.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
-        self.kick
-            .lock()
-            .unwrap()
-            .get(account_id)
-            .and_then(|a| named(&a.display_name))
+        self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
     }
 
     /// Empty password means "leave whatever's stored untouched" - same
@@ -1390,11 +1139,7 @@ impl AccountStore {
     ) -> Result<bool> {
         self.mutate(account_id, |a| {
             a.sasl = enabled;
-            a.sasl_user = if sasl_user.is_empty() {
-                None
-            } else {
-                Some(sasl_user.to_string())
-            };
+            a.sasl_user = if sasl_user.is_empty() { None } else { Some(sasl_user.to_string()) };
             a.allow_plaintext_sasl = allow_plaintext;
             if !password.is_empty() {
                 a.password = Some(password.to_string());
@@ -1435,13 +1180,7 @@ impl AccountStore {
             None => Ok(false),
             Some(a) => {
                 f(a);
-                self.persist(
-                    &irc,
-                    &self.discord.lock().unwrap(),
-                    &self.sneedchat.lock().unwrap(),
-                    &self.matrix.lock().unwrap(),
-                    &self.kick.lock().unwrap(),
-                )?;
+                self.persist(&irc, &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 Ok(true)
             }
         }
@@ -1469,11 +1208,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,
-        display_name: a
-            .display_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| id.clone()),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| id.clone()),
         id,
         service: "irc".to_string(),
         state: state.to_string(),
@@ -1516,11 +1251,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,
-        display_name: a
-            .display_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| a.username.clone()),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
         has_nickserv_password: false,
@@ -1558,11 +1289,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,
-        display_name: a
-            .display_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| a.username.clone()),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         autojoin: String::new(),
         has_nickserv_password: false,
@@ -1579,14 +1306,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         ssl: true,
         has_password: !a.password.is_empty(),
         avatar_url: None,
-        sneedchat_rooms: a
-            .rooms
-            .iter()
-            .map(|r| crate::model::SneedChatRoomInfo {
-                id: r.id,
-                name: r.name.clone(),
-            })
-            .collect(),
+        sneedchat_rooms: a.rooms.iter().map(|r| crate::model::SneedChatRoomInfo { id: r.id, name: r.name.clone() }).collect(),
         tor_mode: Some(a.tor_mode.clone()),
         tor_proxy: a.proxy.clone(),
         use_tor: a.use_tor,
@@ -1612,11 +1332,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,
-        display_name: a
-            .display_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| a.username.clone()),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone()),
         state: state.to_string(),
         // The watched channels are deliberately not reported as `autojoin`.
         // That field is IRC's comma-separated string with IRC's meaning, and
@@ -1656,11 +1372,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
 ///
 /// `persona_name` is what Steam calls the account, learned on connecting; the
 /// sign-in name is shown until then.
-pub fn steam_account_to_json(
-    a: &SteamAccountConfig,
-    state: &str,
-    persona_name: Option<&str>,
-) -> Account {
+pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: Option<&str>) -> Account {
     Account {
         id: a.account_id(),
         service: "steam".to_string(),
@@ -1705,22 +1417,14 @@ pub fn steam_account_to_json(
 /// than being derivable from `a` alone - it reflects live in-memory
 /// BackupMachine state (see runtime.rs's matrix_backup_enabled), not
 /// anything persisted in MatrixAccountConfig.
-pub fn matrix_account_to_json(
-    a: &MatrixAccountConfig,
-    state: &str,
-    has_key_backup: bool,
-) -> Account {
+pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_backup: bool) -> Account {
     Account {
         id: a.account_id(),
         service: "matrix".to_string(),
         status: "online".to_string(),
         status_text: String::new(),
         auto_idle: false,
-        display_name: a
-            .display_name
-            .clone()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| a.user_id.clone()),
+        display_name: a.display_name.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.user_id.clone()),
         state: state.to_string(),
         autojoin: String::new(),
         has_nickserv_password: false,
@@ -1763,24 +1467,15 @@ mod display_name_tests {
         config.use_tor = true;
         assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION);
         config.host = "kiwifarms.st".to_string();
-        assert_eq!(
-            config.site_host(),
-            crate::backend::sneedchat::DEFAULT_ONION,
-            "Tor means the onion"
-        );
+        assert_eq!(config.site_host(), crate::backend::sneedchat::DEFAULT_ONION, "Tor means the onion");
         config.host = "example.test".to_string();
-        assert_eq!(
-            config.site_host(),
-            "example.test",
-            "a host of somebody's own is left alone"
-        );
+        assert_eq!(config.site_host(), "example.test", "a host of somebody's own is left alone");
     }
 
     use super::*;
 
     fn store(name: &str) -> AccountStore {
-        let path =
-            std::env::temp_dir().join(format!("nobilis-names-{name}-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("nobilis-names-{name}-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         AccountStore::open(path).expect("accounts")
     }
@@ -1791,28 +1486,17 @@ mod display_name_tests {
     #[test]
     fn every_service_can_be_renamed_locally() {
         let store = store("all-services");
-        store
-            .add_kick(KickAccountConfig {
-                username: "kotbarsik".into(),
-                ..Default::default()
-            })
-            .expect("kick");
+        store.add_kick(KickAccountConfig { username: "kotbarsik".into(), ..Default::default() }).expect("kick");
         let kick = "kick:kotbarsik";
         assert!(store.set_display_name(kick, "You").expect("set"));
         assert_eq!(store.display_name_override(kick).as_deref(), Some("You"));
-        assert_eq!(
-            kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name,
-            "You"
-        );
+        assert_eq!(kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name, "You");
 
         // And clearing it puts the service's own name back rather than
         // leaving an empty label.
         assert!(store.set_display_name(kick, "").expect("clear"));
         assert_eq!(store.display_name_override(kick), None);
-        assert_eq!(
-            kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name,
-            "kotbarsik"
-        );
+        assert_eq!(kick_account_to_json(&store.get_kick(kick).unwrap(), "connected").display_name, "kotbarsik");
     }
 
     #[test]
@@ -1827,22 +1511,13 @@ mod steam_account_tests {
     use super::*;
 
     fn store(name: &str) -> (AccountStore, PathBuf) {
-        let path = std::env::temp_dir().join(format!(
-            "nobilis-steam-accounts-{name}-{}.toml",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("nobilis-steam-accounts-{name}-{}.toml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         (AccountStore::open(path.clone()).expect("accounts"), path)
     }
 
     fn account(name: &str, token: &str) -> SteamAccountConfig {
-        SteamAccountConfig {
-            username: name.into(),
-            steamid: 76561197960287930,
-            refresh_token: token.into(),
-            session: "chat".into(),
-            ..Default::default()
-        }
+        SteamAccountConfig { username: name.into(), steamid: 76561197960287930, refresh_token: token.into(), session: "chat".into(), ..Default::default() }
     }
 
     #[test]
@@ -1852,23 +1527,11 @@ mod steam_account_tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("[[steam_account]]"), "{text}");
         assert!(text.contains("eyJ.token"));
-        assert!(
-            !text.to_lowercase().contains("password"),
-            "no password is ever written: {text}"
-        );
+        assert!(!text.to_lowercase().contains("password"), "no password is ever written: {text}");
 
         let reopened = AccountStore::open(path.clone()).unwrap();
-        let got = reopened
-            .get_steam("steam:someone")
-            .expect("found under its lower-case id");
-        assert_eq!(
-            (
-                got.username.as_str(),
-                got.steamid,
-                got.refresh_token.as_str()
-            ),
-            ("someone", 76561197960287930, "eyJ.token")
-        );
+        let got = reopened.get_steam("steam:someone").expect("found under its lower-case id");
+        assert_eq!((got.username.as_str(), got.steamid, got.refresh_token.as_str()), ("someone", 76561197960287930, "eyJ.token"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1891,15 +1554,9 @@ mod steam_account_tests {
         s.add_steam(account("someone", "new")).unwrap();
         let got = s.get_steam("steam:someone").unwrap();
         assert_eq!(got.refresh_token, "new");
-        assert!(
-            got.use_tor && got.strict_route,
-            "a re-login must not send a routed account out directly"
-        );
+        assert!(got.use_tor && got.strict_route, "a re-login must not send a routed account out directly");
         assert_eq!(s.route_level_of("steam:someone").as_deref(), Some("strict"));
-        assert_eq!(
-            s.display_name_override("steam:someone").as_deref(),
-            Some("Me on Steam")
-        );
+        assert_eq!(s.display_name_override("steam:someone").as_deref(), Some("Me on Steam"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -1912,13 +1569,7 @@ mod steam_account_tests {
         assert!(!s.remove("steam:one").unwrap());
         assert!(s.get_steam("steam:one").is_none());
         assert!(s.get_steam("steam:two").is_some());
-        assert!(
-            AccountStore::open(path.clone())
-                .unwrap()
-                .get_steam("steam:one")
-                .is_none(),
-            "the file forgot too"
-        );
+        assert!(AccountStore::open(path.clone()).unwrap().get_steam("steam:one").is_none(), "the file forgot too");
         let _ = std::fs::remove_file(path);
     }
 
@@ -1926,25 +1577,12 @@ mod steam_account_tests {
     fn the_account_is_listed_with_a_name_and_whether_it_is_signed_in() {
         let mut a = account("someone", "tok");
         let listed = steam_account_to_json(&a, "connected", None);
-        assert_eq!(
-            (
-                listed.service.as_str(),
-                listed.id.as_str(),
-                listed.display_name.as_str()
-            ),
-            ("steam", "steam:someone", "someone")
-        );
+        assert_eq!((listed.service.as_str(), listed.id.as_str(), listed.display_name.as_str()), ("steam", "steam:someone", "someone"));
         assert!(listed.has_password, "a token is what being signed in means");
         // Steam's name for the account stands in until the person picks one.
-        assert_eq!(
-            steam_account_to_json(&a, "connected", Some("Some One")).display_name,
-            "Some One"
-        );
+        assert_eq!(steam_account_to_json(&a, "connected", Some("Some One")).display_name, "Some One");
         a.display_name = Some("Mine".into());
-        assert_eq!(
-            steam_account_to_json(&a, "connected", Some("Some One")).display_name,
-            "Mine"
-        );
+        assert_eq!(steam_account_to_json(&a, "connected", Some("Some One")).display_name, "Mine");
         a.refresh_token.clear();
         assert!(!steam_account_to_json(&a, "disconnected", None).has_password);
     }
@@ -1952,27 +1590,12 @@ mod steam_account_tests {
     #[test]
     fn a_steam_account_does_not_disturb_the_others_in_the_file() {
         let (s, path) = store("others");
-        s.add_kick(KickAccountConfig {
-            username: "streamer".into(),
-            ..Default::default()
-        })
-        .unwrap();
+        s.add_kick(KickAccountConfig { username: "streamer".into(), ..Default::default() }).unwrap();
         s.add_steam(account("someone", "tok")).unwrap();
-        s.add_kick(KickAccountConfig {
-            username: "streamer".into(),
-            channels: vec!["x".into()],
-            ..Default::default()
-        })
-        .unwrap();
+        s.add_kick(KickAccountConfig { username: "streamer".into(), channels: vec!["x".into()], ..Default::default() }).unwrap();
         let reopened = AccountStore::open(path.clone()).unwrap();
-        assert_eq!(
-            reopened.get_kick("kick:streamer").unwrap().channels,
-            vec!["x".to_string()]
-        );
-        assert!(
-            reopened.get_steam("steam:someone").is_some(),
-            "writing another service's account kept this one"
-        );
+        assert_eq!(reopened.get_kick("kick:streamer").unwrap().channels, vec!["x".to_string()]);
+        assert!(reopened.get_steam("steam:someone").is_some(), "writing another service's account kept this one");
         let _ = std::fs::remove_file(path);
     }
 }

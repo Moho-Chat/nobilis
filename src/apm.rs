@@ -97,33 +97,23 @@ mod tests {
     #[test]
     fn an_echo_of_what_was_played_is_taken_out() {
         let mut apm = CallProcessor::new(true, false);
-        let tone = |n: usize| -> f32 {
-            (n as f32 * 2.0 * std::f32::consts::PI * 440.0 / RATE as f32).sin() * 0.3
-        };
+        let tone = |n: usize| -> f32 { (n as f32 * 2.0 * std::f32::consts::PI * 440.0 / RATE as f32).sin() * 0.3 };
         let mut heard_in = 0.0f32;
         let mut heard_out = 0.0f32;
         // Ten seconds, so the canceller has time to converge; measured over
         // the last two.
         for tick in 0..500usize {
             let base = tick * 960;
-            let played: Vec<i16> = (0..960)
-                .flat_map(|i| {
-                    let v = (tone(base + i) * i16::MAX as f32) as i16;
-                    [v, v]
-                })
-                .collect();
+            let played: Vec<i16> = (0..960).flat_map(|i| {
+                let v = (tone(base + i) * i16::MAX as f32) as i16;
+                [v, v]
+            }).collect();
             apm.render(&played);
             // The room: the same tone, a little later and quieter.
-            let mut mic: Vec<f32> = (0..960)
-                .flat_map(|i| {
-                    let v = if base + i >= 480 {
-                        tone(base + i - 480) * 0.5
-                    } else {
-                        0.0
-                    };
-                    [v, v]
-                })
-                .collect();
+            let mut mic: Vec<f32> = (0..960).flat_map(|i| {
+                let v = if base + i >= 480 { tone(base + i - 480) * 0.5 } else { 0.0 };
+                [v, v]
+            }).collect();
             let before: f32 = mic.iter().map(|s| s * s).sum();
             apm.capture(&mut mic);
             if tick >= 400 {
@@ -131,10 +121,7 @@ mod tests {
                 heard_out += mic.iter().map(|s| s * s).sum::<f32>();
             }
         }
-        assert!(
-            heard_out < heard_in * 0.1,
-            "echo energy went {heard_in} -> {heard_out}"
-        );
+        assert!(heard_out < heard_in * 0.1, "echo energy went {heard_in} -> {heard_out}");
     }
 
     #[test]

@@ -21,10 +21,7 @@ pub fn form_section<'a>(html: &'a str, marker: &str) -> Option<&'a str> {
             continue;
         }
         // Forms don't nest, so the next closing tag is ours.
-        let end = html[tag_end..]
-            .find("</form>")
-            .map(|i| tag_end + i)
-            .unwrap_or(html.len());
+        let end = html[tag_end..].find("</form>").map(|i| tag_end + i).unwrap_or(html.len());
         return Some(&html[start..end]);
     }
     None
@@ -47,9 +44,7 @@ pub fn inputs(html: &str) -> Vec<(String, String)> {
         let tag = &after[..end];
         rest = &after[end..];
 
-        let Some(name) = attr(tag, "name") else {
-            continue;
-        };
+        let Some(name) = attr(tag, "name") else { continue };
         let kind = attr(tag, "type").unwrap_or_else(|| "text".into());
         match kind.as_str() {
             "submit" | "button" | "image" | "file" | "reset" => continue,
@@ -70,16 +65,11 @@ pub fn attr(tag: &str, name: &str) -> Option<String> {
         let end = start + name.len();
         offset = end;
 
-        let clean_start = tag[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
+        let clean_start = tag[..start].chars().next_back().is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_');
         if !clean_start {
             continue;
         }
-        let Some(value) = tag[end..].trim_start().strip_prefix('=') else {
-            continue;
-        };
+        let Some(value) = tag[end..].trim_start().strip_prefix('=') else { continue };
         let value = value.trim_start();
         let extracted = if let Some(v) = value.strip_prefix('"') {
             v.split('"').next()
@@ -98,11 +88,7 @@ fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
-    s.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#039;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
+    s.replace("&amp;", "&").replace("&quot;", "\"").replace("&#039;", "'").replace("&lt;", "<").replace("&gt;", ">")
 }
 
 /// Replace or append a field, preserving the original ordering where
@@ -145,10 +131,7 @@ mod tests {
 
         let fields = inputs(section);
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(
-            names,
-            ["_xfToken", "login", "password", "remember", "_xfRedirect"]
-        );
+        assert_eq!(names, ["_xfToken", "login", "password", "remember", "_xfRedirect"]);
     }
 
     #[test]
@@ -187,10 +170,7 @@ mod tests {
     fn handles_single_quotes_and_unquoted_values() {
         let html = "<form action='/x'><input name='a' value='1'><input name=b value=2></form>";
         let fields = inputs(form_section(html, "/x").unwrap());
-        assert_eq!(
-            fields,
-            vec![("a".into(), "1".into()), ("b".into(), "2".into())]
-        );
+        assert_eq!(fields, vec![("a".into(), "1".into()), ("b".into(), "2".into())]);
     }
 
     #[test]
@@ -198,10 +178,7 @@ mod tests {
         let mut fields = vec![("a".to_string(), "1".to_string())];
         set(&mut fields, "a", "2");
         set(&mut fields, "b", "3");
-        assert_eq!(
-            fields,
-            vec![("a".into(), "2".into()), ("b".into(), "3".into())]
-        );
+        assert_eq!(fields, vec![("a".into(), "2".into()), ("b".into(), "3".into())]);
     }
 
     #[test]

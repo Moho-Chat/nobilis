@@ -152,11 +152,7 @@ mod tests {
 
     #[test]
     fn malformed_packets_are_refused() {
-        assert_eq!(
-            plausible(&[], 5760),
-            None,
-            "empty is the caller's concealment, not a packet"
-        );
+        assert_eq!(plausible(&[], 5760), None, "empty is the caller's concealment, not a packet");
         // Code 0 with a frame over 1275 bytes.
         let mut p = vec![CELT_20MS];
         p.extend(std::iter::repeat_n(0u8, 1276));
@@ -202,9 +198,7 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let len = (seed % 64) as usize;
-            let bytes: Vec<u8> = (0..len)
-                .map(|i| (seed >> (i % 56)) as u8 ^ i as u8)
-                .collect();
+            let bytes: Vec<u8> = (0..len).map(|i| (seed >> (i % 56)) as u8 ^ i as u8).collect();
             let _ = plausible(&bytes, 5760);
         }
     }
@@ -220,22 +214,16 @@ mod real_packets {
     #[test]
     fn everything_the_encoder_makes_passes() {
         let mut seed = 12345u32;
-        for &app in &[
-            opus2::Application::Voip,
-            opus2::Application::Audio,
-            opus2::Application::LowDelay,
-        ] {
+        for &app in &[opus2::Application::Voip, opus2::Application::Audio, opus2::Application::LowDelay] {
             for &bitrate in &[8_000, 32_000, 64_000, 128_000, 510_000] {
                 // 2.5, 5, 10, 20, 40, 60 ms per channel at 48 kHz.
                 for &frame in &[120usize, 240, 480, 960, 1920, 2880] {
-                    let mut enc =
-                        opus2::Encoder::new(48_000, opus2::Channels::Stereo, app).unwrap();
+                    let mut enc = opus2::Encoder::new(48_000, opus2::Channels::Stereo, app).unwrap();
                     enc.set_bitrate(opus2::Bitrate::Bits(bitrate)).unwrap();
                     let pcm: Vec<i16> = (0..frame * 2)
                         .map(|i| {
                             seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-                            (((i as f32 * 0.05).sin() * 8000.0) as i32 + (seed >> 20) as i32 - 2048)
-                                as i16
+                            (((i as f32 * 0.05).sin() * 8000.0) as i32 + (seed >> 20) as i32 - 2048) as i16
                         })
                         .collect();
                     let mut out = vec![0u8; 4000];

@@ -32,10 +32,7 @@ pub(super) struct GatewayAuthFailed;
 
 impl std::fmt::Display for GatewayAuthFailed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Discord rejected this login (session revoked) - reconnect from the Accounts pane"
-        )
+        write!(f, "Discord rejected this login (session revoked) - reconnect from the Accounts pane")
     }
 }
 
@@ -77,26 +74,16 @@ impl std::error::Error for ReconnectRequested {}
 
 pub(super) async fn next_json<S>(stream: &mut S) -> Result<Value>
 where
-    S: futures::Stream<
-            Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>,
-        > + Unpin,
+    S: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     loop {
         match stream.next().await {
-            Some(Ok(WsMessage::Text(text))) => {
-                return serde_json::from_str(&text).context("parsing gateway JSON")
-            }
+            Some(Ok(WsMessage::Text(text))) => return serde_json::from_str(&text).context("parsing gateway JSON"),
             Some(Ok(WsMessage::Close(frame))) => {
-                if frame
-                    .as_ref()
-                    .is_some_and(|f| u16::from(f.code) == CLOSE_CODE_AUTH_FAILED)
-                {
+                if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_AUTH_FAILED) {
                     return Err(GatewayAuthFailed.into());
                 }
-                if frame
-                    .as_ref()
-                    .is_some_and(|f| u16::from(f.code) == CLOSE_CODE_RATE_LIMITED)
-                {
+                if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_RATE_LIMITED) {
                     return Err(GatewayRateLimited.into());
                 }
                 bail!("connection closed: {frame:?}")
@@ -142,9 +129,7 @@ pub fn spawn(state: AppState, config: DiscordAccountConfig) {
             state.runtime.remove_task_handle(&account_id);
         }
     });
-    state
-        .runtime
-        .insert_task_handle(&account_id, join_handle.abort_handle());
+    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 pub(super) const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
@@ -198,35 +183,21 @@ pub(super) struct Resume {
     seq: u64,
 }
 
-pub(super) async fn run_gateway_with_retry(
-    state: &AppState,
-    config: &DiscordAccountConfig,
-    account_id: &str,
-) {
+pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
     let mut session = GatewaySession::default();
-    state
-        .runtime
-        .set_conn_state(state, account_id, ConnState::Connecting, None);
+    state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
-        let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session))
-            .catch_unwind()
-            .await;
+        let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session)).catch_unwind().await;
         let requested_reconnect =
             matches!(&result, Ok(Err(e)) if e.downcast_ref::<ReconnectRequested>().is_some());
-        let rate_limited =
-            matches!(&result, Ok(Err(e)) if e.downcast_ref::<GatewayRateLimited>().is_some());
+        let rate_limited = matches!(&result, Ok(Err(e)) if e.downcast_ref::<GatewayRateLimited>().is_some());
         let detail = match result {
             Ok(Ok(())) => "gateway session ended".to_string(),
             Ok(Err(e)) => {
                 if e.downcast_ref::<GatewayAuthFailed>().is_some() {
                     tracing::warn!("discord[{account_id}]: {e} - giving up, needs a fresh login");
-                    state.runtime.set_conn_state(
-                        state,
-                        account_id,
-                        ConnState::AuthFailed,
-                        Some(&e.to_string()),
-                    );
+                    state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some(&e.to_string()));
                     return;
                 }
                 tracing::warn!("discord[{account_id}]: {e}");
@@ -237,18 +208,9 @@ pub(super) async fn run_gateway_with_retry(
                 "internal error (see nobilis logs)".to_string()
             }
         };
-        let wait = state.runtime.next_retry_delay(
-            account_id,
-            &mut delay,
-            RECONNECT_INITIAL_DELAY,
-            RECONNECT_MAX_DELAY,
-        );
+        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
         // Told to slow down: not before the window it speaks of is over.
-        let wait = if rate_limited {
-            wait.max(RATE_LIMITED_WAIT)
-        } else {
-            wait
-        };
+        let wait = if rate_limited { wait.max(RATE_LIMITED_WAIT) } else { wait };
         // Discord asking for a reconnect (op 7) is routine - it does it to
         // every client every hour or so, to move it between servers - and
         // asks that it be done at once, picking the session up where it
@@ -261,39 +223,23 @@ pub(super) async fn run_gateway_with_retry(
         // set_conn_state() first (in case run_gateway got as far as
         // Connected before dying, which report_retry() alone can't correct -
         // it only ever re-stamps an *already*-"connecting" state).
-        state
-            .runtime
-            .set_conn_state(state, account_id, ConnState::Connecting, None);
+        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
 }
 
-pub(super) async fn run_gateway(
-    state: &AppState,
-    config: &DiscordAccountConfig,
-    session: &mut GatewaySession,
-) -> Result<()> {
+pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &mut GatewaySession) -> Result<()> {
     // Disjoint borrows, so the resume state can be updated while the maps
     // are being passed around mutably.
-    let GatewaySession {
-        resume,
-        channel_map,
-        guild_context,
-    } = session;
+    let GatewaySession { resume, channel_map, guild_context } = session;
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
-    let connect_url = resume
-        .as_ref()
-        .map(|r| r.url.clone())
-        .unwrap_or_else(|| GATEWAY_URL.to_string());
-    let (ws, _resp) = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        crate::net::route::websocket(&config.token, connect_url.as_str()),
-    )
-    .await
-    .map_err(|_| anyhow!("timed out connecting to Discord's gateway"))?
-    .context("connecting to Discord's gateway")?;
+    let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());
+    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::route::websocket(&config.token, connect_url.as_str()))
+        .await
+        .map_err(|_| anyhow!("timed out connecting to Discord's gateway"))?
+        .context("connecting to Discord's gateway")?;
     let (sink, mut stream) = ws.split();
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -313,13 +259,8 @@ pub(super) async fn run_gateway(
     }
     let _forwarder_guard = AbortOnDrop(forwarder);
 
-    let hello = next_json(&mut stream)
-        .await
-        .context("waiting for gateway hello")?;
-    let heartbeat_interval = hello["d"]["heartbeat_interval"]
-        .as_u64()
-        .unwrap_or(41_250)
-        .max(1);
+    let hello = next_json(&mut stream).await.context("waiting for gateway hello")?;
+    let heartbeat_interval = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41_250).max(1);
 
     // Discord's own documented client contract: if an ack (op 11) hasn't
     // arrived by the time the next heartbeat is due, the connection is
@@ -337,10 +278,7 @@ pub(super) async fn run_gateway(
     let hb_ack_pending = ack_pending.clone();
     let hb_stale_notify = stale_notify.clone();
     let heartbeat_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(
-            rand::random::<u64>() % heartbeat_interval,
-        ))
-        .await;
+        tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % heartbeat_interval)).await;
         let mut ticker = tokio::time::interval(Duration::from_millis(heartbeat_interval));
         loop {
             ticker.tick().await;
@@ -348,10 +286,7 @@ pub(super) async fn run_gateway(
                 hb_stale_notify.notify_one();
                 break;
             }
-            if hb_tx
-                .send(json!({ "op": 1, "d": Value::Null }).to_string())
-                .is_err()
-            {
+            if hb_tx.send(json!({ "op": 1, "d": Value::Null }).to_string()).is_err() {
                 break;
             }
         }
@@ -364,9 +299,7 @@ pub(super) async fn run_gateway(
     // Exposed so setAccountStatus can push a presence update onto this
     // connection rather than waiting for a reconnect to carry it.
     let account_id = config.account_id();
-    state
-        .runtime
-        .set_discord_gateway_sender(&account_id, out_tx.clone());
+    state.runtime.set_discord_gateway_sender(&account_id, out_tx.clone());
     struct ClearSenderOnDrop<'a>(&'a AppState, String);
     impl Drop for ClearSenderOnDrop<'_> {
         fn drop(&mut self) {
@@ -381,7 +314,7 @@ pub(super) async fn run_gateway(
     if let Some(r) = resume.as_ref() {
         out_tx.send(json!({ "op": 6, "d": { "token": config.token, "session_id": r.session_id, "seq": r.seq } }).to_string())?;
     } else {
-        out_tx.send(
+    out_tx.send(
         json!({
             "op": 2,
             "d": {
@@ -434,16 +367,8 @@ pub(super) async fn run_gateway(
                 if tally_since.elapsed() >= Duration::from_secs(60) {
                     let mut kinds: Vec<_> = tally.iter().collect();
                     kinds.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
-                    let line: Vec<String> = kinds
-                        .iter()
-                        .take(8)
-                        .map(|(k, n)| format!("{k}={n}"))
-                        .collect();
-                    tracing::info!(
-                        "discord[{account_id}]: the last minute, by kind: {} ({} channels known)",
-                        line.join(", "),
-                        channel_map.len()
-                    );
+                    let line: Vec<String> = kinds.iter().take(8).map(|(k, n)| format!("{k}={n}")).collect();
+                    tracing::info!("discord[{account_id}]: the last minute, by kind: {} ({} channels known)", line.join(", "), channel_map.len());
                     tally.clear();
                     tally_since = std::time::Instant::now();
                 }
@@ -457,12 +382,7 @@ pub(super) async fn run_gateway(
                     // of Discord's hourly reconnects, until something forced
                     // a fresh login.
                     "RESUMED" => {
-                        state.runtime.set_conn_state(
-                            state,
-                            &account_id,
-                            ConnState::Connected,
-                            None,
-                        );
+                        state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
                         tracing::info!("discord[{account_id}]: resumed");
                     }
                     "READY" => {
@@ -479,8 +399,7 @@ pub(super) async fn run_gateway(
                         // it - `premium_type` 1 is Classic, 2 is Nitro, 3 is
                         // Basic, and all three buy the cross-guild use this
                         // cares about; 0 or absent is none.
-                        let premium =
-                            d["user"]["premium_type"].as_u64().unwrap_or(0).min(255) as u8;
+                        let premium = d["user"]["premium_type"].as_u64().unwrap_or(0).min(255) as u8;
                         // And which tier, because a stream's ceiling differs
                         // between them where emoji do not.
                         state.runtime.set_discord_premium(&account_id, premium);
@@ -491,9 +410,7 @@ pub(super) async fn run_gateway(
                         if let Some(session_id) = d["session_id"].as_str() {
                             // Also what an interaction has to name - see
                             // Runtime::set_discord_gateway_session.
-                            state
-                                .runtime
-                                .set_discord_gateway_session(&account_id, session_id);
+                            state.runtime.set_discord_gateway_session(&account_id, session_id);
                             *resume = Some(Resume {
                                 session_id: session_id.to_string(),
                                 url: d["resume_gateway_url"]
@@ -504,19 +421,9 @@ pub(super) async fn run_gateway(
                             });
                         }
                         if let Some(hash) = d["user"]["avatar"].as_str() {
-                            let url = format!(
-                                "https://cdn.discordapp.com/avatars/{}/{hash}.png",
-                                config.user_id
-                            );
-                            if state
-                                .accounts
-                                .set_discord_avatar_url(&account_id, &url)
-                                .unwrap_or(false)
-                            {
-                                state.events.emit(
-                                    "accountAvatarChanged",
-                                    json!({ "accountId": account_id, "avatarUrl": url }),
-                                );
+                            let url = format!("https://cdn.discordapp.com/avatars/{}/{hash}.png", config.user_id);
+                            if state.accounts.set_discord_avatar_url(&account_id, &url).unwrap_or(false) {
+                                state.events.emit("accountAvatarChanged", json!({ "accountId": account_id, "avatarUrl": url }));
                             }
                         }
 
@@ -548,12 +455,7 @@ pub(super) async fn run_gateway(
                             .as_array()
                             .into_iter()
                             .flatten()
-                            .filter_map(|p| {
-                                Some((
-                                    p["user"]["id"].as_str()?,
-                                    p["status"].as_str().unwrap_or("offline"),
-                                ))
-                            })
+                            .filter_map(|p| Some((p["user"]["id"].as_str()?, p["status"].as_str().unwrap_or("offline"))))
                             .collect();
 
                         if let Some(relationships) = d["relationships"].as_array() {
@@ -566,9 +468,7 @@ pub(super) async fn run_gateway(
                                 // answered, which is how it used to be.
                                 // 2 is blocked, which is not a friend and is
                                 // not waiting for anything.
-                                .filter(|r| {
-                                    matches!(r["type"].as_i64(), Some(1) | Some(3) | Some(4))
-                                })
+                                .filter(|r| matches!(r["type"].as_i64(), Some(1) | Some(3) | Some(4)))
                                 .filter_map(|r| friend_json(r, &presences))
                                 .collect();
                             state.runtime.set_discord_friends(&account_id, friends);
@@ -577,13 +477,7 @@ pub(super) async fn run_gateway(
                         let mut new_dm_buffers: Vec<(String, String)> = Vec::new();
                         if let Some(dms) = d["private_channels"].as_array() {
                             for ch in dms {
-                                if let Some(pair) = register_dm_channel(
-                                    state,
-                                    &account_id,
-                                    ch,
-                                    channel_map,
-                                    &presences,
-                                ) {
+                                if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
                                     new_dm_buffers.push(pair);
                                 }
                             }
@@ -593,16 +487,9 @@ pub(super) async fn run_gateway(
                         // status, and the rosters above were made with the
                         // status alone.
                         for p in d["presences"].as_array().into_iter().flatten() {
-                            let Some(user_id) = p["user"]["id"].as_str() else {
-                                continue;
-                            };
+                            let Some(user_id) = p["user"]["id"].as_str() else { continue };
                             if let Some(activity) = super::presence::activity_of(&p["activities"]) {
-                                update_presence_in_rosters(
-                                    state,
-                                    user_id,
-                                    p["status"].as_str().unwrap_or("offline"),
-                                    Some(activity),
-                                );
+                                update_presence_in_rosters(state, user_id, p["status"].as_str().unwrap_or("offline"), Some(activity));
                             }
                         }
                         // Conversations are the ones people notice a gap in,
@@ -612,12 +499,7 @@ pub(super) async fn run_gateway(
                         // mostly wasted.
                         spawn_dm_catch_up(state.clone(), config.clone(), channel_map.clone());
 
-                        state.runtime.set_conn_state(
-                            state,
-                            &account_id,
-                            ConnState::Connected,
-                            None,
-                        );
+                        state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
                         tracing::info!("discord[{account_id}]: ready as {username}");
 
                         // For an account in relatively few guilds, READY's own
@@ -644,49 +526,28 @@ pub(super) async fn run_gateway(
                         // traffic for channel ids that never appeared there) -
                         // fetch the full list over REST as a follow-up rather
                         // than trusting the gateway snapshot alone.
-                        match http_client_for(&config.token)
-                            .get(format!("{API_BASE}/users/@me/channels"))
-                            .header("Authorization", &config.token)
-                            .send()
-                            .await
-                        {
+                        match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
                             Ok(resp) => {
                                 let body = resp.text().await.unwrap_or_default();
                                 match serde_json::from_str::<Vec<Value>>(&body) {
                                     Ok(channels) => {
                                         for ch in &channels {
-                                            if let Some(pair) = register_dm_channel(
-                                                state,
-                                                &account_id,
-                                                ch,
-                                                channel_map,
-                                                &presences,
-                                            ) {
+                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
                                                 new_dm_buffers.push(pair);
                                             }
                                         }
                                     }
-                                    Err(e) => tracing::warn!(
-                                        "discord[{account_id}]: parsing /users/@me/channels: {e}"
-                                    ),
+                                    Err(e) => tracing::warn!("discord[{account_id}]: parsing /users/@me/channels: {e}"),
                                 }
                             }
-                            Err(e) => tracing::warn!(
-                                "discord[{account_id}]: fetching /users/@me/channels: {e}"
-                            ),
+                            Err(e) => tracing::warn!("discord[{account_id}]: fetching /users/@me/channels: {e}"),
                         }
 
                         // The direct messages now exist, so the settings
                         // read at the top of READY have somewhere to land.
                         mutes::apply(state, &account_id);
 
-                        spawn_backfill(
-                            state.clone(),
-                            config.token.clone(),
-                            config.user_id.clone(),
-                            config.display_name.clone(),
-                            new_dm_buffers,
-                        );
+                        spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_dm_buffers);
                     }
                     "GUILD_CREATE" => {
                         register_guild_channels(state, config, d, channel_map).await;
@@ -704,10 +565,7 @@ pub(super) async fn run_gateway(
                             // gateway task owns this map, and a profile
                             // asked for from an RPC needs the same roles to
                             // say what somebody is in a guild.
-                            state.runtime.set_discord_guild_roles(
-                                guild_id,
-                                d["roles"].as_array().cloned().unwrap_or_default(),
-                            );
+                            state.runtime.set_discord_guild_roles(guild_id, d["roles"].as_array().cloned().unwrap_or_default());
                             guild_context.insert(guild_id.to_string(), d.clone());
                         }
                     }
@@ -721,20 +579,14 @@ pub(super) async fn run_gateway(
                     // now, which is why a thread only ever appeared if this
                     // account was already in it when the client connected.
                     "THREAD_CREATE" | "THREAD_UPDATE" | "THREAD_LIST_SYNC" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else {
-                            continue;
-                        };
-                        let Some(guild) = guild_context.get(guild_id).cloned() else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        let Some(guild) = guild_context.get(guild_id).cloned() else { continue };
                         // Registered by re-running the guild with these
                         // threads on it, so the naming, the heading and the
                         // permission check are the same code that ran at
                         // connect rather than a second copy of it.
                         let threads = match t {
-                            "THREAD_LIST_SYNC" => {
-                                d["threads"].as_array().cloned().unwrap_or_default()
-                            }
+                            "THREAD_LIST_SYNC" => d["threads"].as_array().cloned().unwrap_or_default(),
                             _ => vec![d.clone()],
                         };
                         // A rename is a new name, and a buffer's identity is
@@ -743,17 +595,9 @@ pub(super) async fn run_gateway(
                         if t == "THREAD_UPDATE" {
                             if let Some(id) = d["id"].as_str() {
                                 if let Some((old_name, _)) = channel_map.get(id).cloned() {
-                                    let renamed = d["name"].as_str().map(|n| {
-                                        format!(
-                                            "{}/#{n}",
-                                            guild["name"].as_str().unwrap_or("guild")
-                                        )
-                                    });
+                                    let renamed = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
                                     if renamed.as_deref() != Some(old_name.as_str()) {
-                                        state.runtime.remove_buffer(
-                                            state,
-                                            &crate::model::buffer_id(&account_id, &old_name),
-                                        );
+                                        state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
                                         channel_map.remove(id);
                                     }
                                 }
@@ -770,18 +614,12 @@ pub(super) async fn run_gateway(
                     "THREAD_DELETE" => {
                         let Some(id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(id) {
-                            state
-                                .runtime
-                                .remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
+                            state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
                         }
                     }
 
                     "CHANNEL_CREATE" | "CHANNEL_UPDATE" => {
-                        let Some(channel_id) =
-                            d["channel_id"].as_str().or_else(|| d["id"].as_str())
-                        else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         match d["guild_id"].as_str() {
                             // A guild channel is placed by re-running the
                             // guild's own registration with this one channel
@@ -789,36 +627,22 @@ pub(super) async fn run_gateway(
                             // permission check are the same code that ran at
                             // connect rather than a second copy of it.
                             Some(guild_id) => {
-                                let Some(guild) = guild_context.get(guild_id).cloned() else {
-                                    continue;
-                                };
+                                let Some(guild) = guild_context.get(guild_id).cloned() else { continue };
                                 // A rename has to drop the old buffer first:
                                 // the buffer's identity is its name, so the
                                 // new one would otherwise appear alongside
                                 // the old rather than replace it.
                                 if let Some((old_name, _)) = channel_map.get(channel_id).cloned() {
-                                    let new_name = d["name"].as_str().map(|n| {
-                                        format!(
-                                            "{}/#{n}",
-                                            guild["name"].as_str().unwrap_or("guild")
-                                        )
-                                    });
+                                    let new_name = d["name"].as_str().map(|n| format!("{}/#{n}", guild["name"].as_str().unwrap_or("guild")));
                                     if new_name.as_deref() == Some(old_name.as_str()) {
                                         // Nothing to re-register, but the topic is edited
                                         // in place and arrives this way.
                                         if let Some(topic) = d.get("topic") {
-                                            state.runtime.set_buffer_topic(
-                                                state,
-                                                &crate::model::buffer_id(&account_id, &old_name),
-                                                topic.as_str().unwrap_or_default(),
-                                            );
+                                            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(&account_id, &old_name), topic.as_str().unwrap_or_default());
                                         }
                                         continue;
                                     }
-                                    state.runtime.remove_buffer(
-                                        state,
-                                        &crate::model::buffer_id(&account_id, &old_name),
-                                    );
+                                    state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
                                     channel_map.remove(channel_id);
                                 }
                                 let mut one = guild.clone();
@@ -856,18 +680,12 @@ pub(super) async fn run_gateway(
                     // arrives - so the expiry is carried rather than left for
                     // each frontend to invent its own.
                     "TYPING_START" => {
-                        let Some(channel_id) = d["channel_id"].as_str() else {
-                            continue;
-                        };
-                        let Some(user_id) = d["user_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        let Some(user_id) = d["user_id"].as_str() else { continue };
                         if user_id == config.user_id {
                             continue;
                         }
-                        let Some((name, _)) = channel_map.get(channel_id) else {
-                            continue;
-                        };
+                        let Some((name, _)) = channel_map.get(channel_id) else { continue };
                         // A guild event carries the member; a DM carries no
                         // member object at all, which is why the remembered
                         // name matters rather than being a nicety. Empty
@@ -876,16 +694,8 @@ pub(super) async fn run_gateway(
                         let nick = d["member"]["nick"]
                             .as_str()
                             .filter(|s| !s.is_empty())
-                            .or_else(|| {
-                                d["member"]["user"]["global_name"]
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                            })
-                            .or_else(|| {
-                                d["member"]["user"]["username"]
-                                    .as_str()
-                                    .filter(|s| !s.is_empty())
-                            })
+                            .or_else(|| d["member"]["user"]["global_name"].as_str().filter(|s| !s.is_empty()))
+                            .or_else(|| d["member"]["user"]["username"].as_str().filter(|s| !s.is_empty()))
                             .map(str::to_string)
                             .or_else(|| state.runtime.discord_known_name(&account_id, user_id))
                             .unwrap_or_else(|| "Someone".to_string());
@@ -905,12 +715,8 @@ pub(super) async fn run_gateway(
                     // the acking, so a client acting on it also settles its
                     // own state rather than needing to guess.
                     "MESSAGE_ACK" => {
-                        let Some(channel_id) = d["channel_id"].as_str() else {
-                            continue;
-                        };
-                        let Some((name, _)) = channel_map.get(channel_id) else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        let Some((name, _)) = channel_map.get(channel_id) else { continue };
                         state.events.emit(
                             "bufferRead",
                             json!({
@@ -933,28 +739,16 @@ pub(super) async fn run_gateway(
                         if let Some(row) = friend_json(d, &HashMap::new()) {
                             friends.push(row);
                         }
-                        state
-                            .runtime
-                            .set_discord_friends(&account_id, friends.clone());
-                        state.events.emit(
-                            "discordFriends",
-                            json!({ "accountId": account_id, "friends": friends }),
-                        );
+                        state.runtime.set_discord_friends(&account_id, friends.clone());
+                        state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
                     }
 
                     "RELATIONSHIP_REMOVE" => {
-                        let Some(user_id) = d["id"].as_str() else {
-                            continue;
-                        };
+                        let Some(user_id) = d["id"].as_str() else { continue };
                         let mut friends = state.runtime.get_discord_friends(&account_id);
                         friends.retain(|f| f["userId"].as_str() != Some(user_id));
-                        state
-                            .runtime
-                            .set_discord_friends(&account_id, friends.clone());
-                        state.events.emit(
-                            "discordFriends",
-                            json!({ "accountId": account_id, "friends": friends }),
-                        );
+                        state.runtime.set_discord_friends(&account_id, friends.clone());
+                        state.events.emit("discordFriends", json!({ "accountId": account_id, "friends": friends }));
                     }
 
                     // Somebody joined or left a group message. Not
@@ -962,9 +756,7 @@ pub(super) async fn run_gateway(
                     // point is the change made from a phone, or by another
                     // person in the group, which this had no way to hear.
                     "CHANNEL_RECIPIENT_ADD" | "CHANNEL_RECIPIENT_REMOVE" => {
-                        let Some(channel_id) = d["channel_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
                         people::recipient_changed(
                             state,
                             &account_id,
@@ -975,13 +767,9 @@ pub(super) async fn run_gateway(
                     }
 
                     "CHANNEL_DELETE" => {
-                        let Some(channel_id) = d["id"].as_str() else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["id"].as_str() else { continue };
                         if let Some((name, _)) = channel_map.remove(channel_id) {
-                            state
-                                .runtime
-                                .remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
+                            state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &name));
                         }
                     }
 
@@ -994,9 +782,7 @@ pub(super) async fn run_gateway(
                     // account may read, and the list is otherwise whatever
                     // it was at connect.
                     "GUILD_ROLE_CREATE" | "GUILD_ROLE_UPDATE" | "GUILD_ROLE_DELETE" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         if guild_context.contains_key(guild_id) {
                             resync_guild(state, config, guild_id, channel_map).await;
                         }
@@ -1011,62 +797,40 @@ pub(super) async fn run_gateway(
                     // call, so it also covers the rules being agreed to in
                     // Discord's own client while this one is running.
                     "GUILD_MEMBER_UPDATE" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
                         if d["user"]["id"].as_str() != Some(config.user_id.as_str()) {
                             continue;
                         }
                         if d["pending"].as_bool().unwrap_or(false) {
                             continue;
                         }
-                        state
-                            .runtime
-                            .clear_discord_guild_pending(state, &account_id, guild_id);
+                        state.runtime.clear_discord_guild_pending(state, &account_id, guild_id);
                         // The gate lifting is one reason to re-read; our own
                         // roles changing is the other, since that is what
                         // decides which channels are permitted. A nickname
                         // change arrives here too and is no reason at all,
                         // so the roles are compared rather than assumed.
-                        let was_gated = state
-                            .runtime
-                            .take_discord_gated(&guild_group_id(&account_id, guild_id));
-                        let roles_now: Vec<String> = d["roles"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|r| r.as_str().map(String::from))
-                            .collect();
-                        let roles_changed = state.runtime.set_discord_own_roles(
-                            &guild_group_id(&account_id, guild_id),
-                            roles_now,
-                        );
+                        let was_gated = state.runtime.take_discord_gated(&guild_group_id(&account_id, guild_id));
+                        let roles_now: Vec<String> = d["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str().map(String::from)).collect();
+                        let roles_changed = state.runtime.set_discord_own_roles(&guild_group_id(&account_id, guild_id), roles_now);
                         if was_gated || roles_changed {
                             resync_guild(state, config, guild_id, channel_map).await;
                         }
                     }
 
                     "GUILD_DELETE" => {
-                        let Some(guild_id) = d["id"].as_str() else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["id"].as_str() else { continue };
                         if d["unavailable"].as_bool() == Some(true) {
                             continue;
                         }
                         guild_context.remove(guild_id);
-                        for buffer_id in state
-                            .runtime
-                            .discord_buffers_in_guild(&account_id, guild_id)
-                        {
-                            if let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id)
-                            {
+                        for buffer_id in state.runtime.discord_buffers_in_guild(&account_id, guild_id) {
+                            if let Some(channel_id) = state.runtime.get_discord_channel(&buffer_id) {
                                 channel_map.remove(&channel_id);
                             }
                             state.runtime.remove_buffer(state, &buffer_id);
                         }
-                        state
-                            .runtime
-                            .remove_buffer_group(state, &guild_group_id(&account_id, guild_id));
+                        state.runtime.remove_buffer_group(state, &guild_group_id(&account_id, guild_id));
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
@@ -1092,30 +856,19 @@ pub(super) async fn run_gateway(
                             tracing::info!("discord[{account_id}]: a message in {buffer_name} was dropped - it has nothing to show (type {})", d["type"]);
                             continue;
                         }
-                        let body = resolve_mentions(
-                            &body,
-                            d,
-                            &config.user_id,
-                            config.display_name.as_deref(),
-                        );
+                        let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
                         let is_mention = mentions_own_user(d, &config.user_id);
                         let reply_to = extract_reply(d);
                         let real_msg_id = d["id"].as_str().map(|s| s.to_string());
                         let avatar_url = author_avatar_url(author);
                         if author["system"].as_bool() == Some(true) && kind == "dm" {
-                            state.runtime.set_buffer_read_only(
-                                state,
-                                &model::buffer_id(&account_id, &buffer_name),
-                                Some(super::people::OFFICIAL_ONLY),
-                            );
+                            state.runtime.set_buffer_read_only(state, &model::buffer_id(&account_id, &buffer_name), Some(super::people::OFFICIAL_ONLY));
                         }
                         // Kept against their id as well as put on the message.
                         // A direct call's voice states carry no member object,
                         // so a face seen here is the only one its call view
                         // will ever have to show.
-                        if let (Some(id), Some(url)) =
-                            (author["id"].as_str(), avatar_url.as_deref())
-                        {
+                        if let (Some(id), Some(url)) = (author["id"].as_str(), avatar_url.as_deref()) {
                             state.runtime.remember_discord_avatar(&account_id, id, url);
                         }
                         // Discord's gateway echoes a user's own sent messages
@@ -1138,23 +891,7 @@ pub(super) async fn run_gateway(
                         // The author's id travels with the message. It is what a profile
                         // lookup asks Discord about - a display name is not something
                         // the API accepts - and what a moderation action would need.
-                        state.runtime.record_message(
-                            state,
-                            &account_id,
-                            &buffer_name,
-                            &kind,
-                            &from,
-                            &body,
-                            false,
-                            "chat",
-                            reply_to,
-                            real_msg_id.clone(),
-                            is_mention,
-                            avatar_url,
-                            embeds,
-                            attachments,
-                            author["id"].as_str().map(str::to_string),
-                        );
+                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id.clone(), is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
                         // Who wrote a forwarded message, which the snapshot
                         // does not say. A read of the original, so it happens
                         // after the message is already on screen rather than
@@ -1166,14 +903,7 @@ pub(super) async fn run_gateway(
                                 let buffer_id = model::buffer_id(&account_id, &buffer_name);
                                 let reference = d["message_reference"].clone();
                                 tokio::spawn(async move {
-                                    name_forward(
-                                        &state,
-                                        &account_id,
-                                        &buffer_id,
-                                        &msg_id,
-                                        &reference,
-                                    )
-                                    .await;
+                                    name_forward(&state, &account_id, &buffer_id, &msg_id, &reference).await;
                                 });
                             }
                         }
@@ -1191,22 +921,13 @@ pub(super) async fn run_gateway(
                             }
                         }
                         if !thumb_target.1.is_empty() {
-                            cache_thumbnails(
-                                state.clone(),
-                                thumb_target.0,
-                                thumb_target.1,
-                                thumb_target.2,
-                            );
+                            cache_thumbnails(state.clone(), thumb_target.0, thumb_target.1, thumb_target.2);
                         }
                     }
                     "MESSAGE_UPDATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else {
-                            continue;
-                        };
-                        let Some(msg_id) = d["id"].as_str() else {
-                            continue;
-                        };
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some(msg_id) = d["id"].as_str() else { continue };
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
                         // A vote - anybody's - comes back as an update to the
                         // message carrying the poll, with a recounted
@@ -1232,18 +953,8 @@ pub(super) async fn run_gateway(
                             if embeds.is_empty() {
                                 continue;
                             }
-                            let Ok(Some(stored)) = state.store.get_message(&buffer_id, msg_id)
-                            else {
-                                continue;
-                            };
-                            state.runtime.update_message(
-                                state,
-                                &buffer_id,
-                                msg_id,
-                                &stored.body,
-                                &embeds,
-                                &stored.attachments,
-                            );
+                            let Ok(Some(stored)) = state.store.get_message(&buffer_id, msg_id) else { continue };
+                            state.runtime.update_message(state, &buffer_id, msg_id, &stored.body, &embeds, &stored.attachments);
                             continue;
                         }
                         let embeds = extract_embeds(d);
@@ -1253,43 +964,23 @@ pub(super) async fn run_gateway(
                         // way any other attachment does.
                         attachments.extend(forwarded_attachments(d));
                         let body = extract_body(d).unwrap_or_default();
-                        let body = resolve_mentions(
-                            &body,
-                            d,
-                            &config.user_id,
-                            config.display_name.as_deref(),
-                        );
-                        state.runtime.update_message(
-                            state,
-                            &buffer_id,
-                            msg_id,
-                            &body,
-                            &embeds,
-                            &attachments,
-                        );
+                        let body = resolve_mentions(&body, d, &config.user_id, config.display_name.as_deref());
+                        state.runtime.update_message(state, &buffer_id, msg_id, &body, &embeds, &attachments);
                         // A bot editing its own message routinely swaps the
                         // buttons - a poll that closes, a page that turns.
                         note_components(state, &buffer_id, msg_id, d);
                     }
                     "MESSAGE_DELETE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else {
-                            continue;
-                        };
-                        let Some(msg_id) = d["id"].as_str() else {
-                            continue;
-                        };
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some(msg_id) = d["id"].as_str() else { continue };
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
                         state.runtime.delete_message(state, &buffer_id, msg_id);
                     }
                     "MESSAGE_REACTION_ADD" | "MESSAGE_REACTION_REMOVE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else {
-                            continue;
-                        };
-                        let Some(msg_id) = d["message_id"].as_str() else {
-                            continue;
-                        };
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some(msg_id) = d["message_id"].as_str() else { continue };
                         // Discord's own `<:name:id>` shorthand for custom
                         // emoji - unambiguous, and lets the frontend later
                         // regex-detect it to render the actual image via
@@ -1302,14 +993,7 @@ pub(super) async fn run_gateway(
                         };
                         let is_me = d["user_id"].as_str() == Some(config.user_id.as_str());
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
-                        state.runtime.update_reaction(
-                            state,
-                            &buffer_id,
-                            msg_id,
-                            &emoji_key,
-                            is_me,
-                            t == "MESSAGE_REACTION_ADD",
-                        );
+                        state.runtime.update_reaction(state, &buffer_id, msg_id, &emoji_key, is_me, t == "MESSAGE_REACTION_ADD");
                     }
                     // A server renamed, re-iconed, or changed its emoji. All
                     // three live in the guild object this client registered
@@ -1318,35 +1002,21 @@ pub(super) async fn run_gateway(
                     // already do for the same reason.
                     // A guild's calendar changing, and people marking
                     // themselves interested in what is on it.
-                    "GUILD_SCHEDULED_EVENT_CREATE"
-                    | "GUILD_SCHEDULED_EVENT_UPDATE"
-                    | "GUILD_SCHEDULED_EVENT_DELETE" => {
+                    "GUILD_SCHEDULED_EVENT_CREATE" | "GUILD_SCHEDULED_EVENT_UPDATE" | "GUILD_SCHEDULED_EVENT_DELETE" => {
                         super::events::note_change(state, &account_id, t, d);
                     }
                     "GUILD_SCHEDULED_EVENT_USER_ADD" | "GUILD_SCHEDULED_EVENT_USER_REMOVE" => {
-                        super::events::note_user(
-                            state,
-                            &account_id,
-                            &config.user_id,
-                            t == "GUILD_SCHEDULED_EVENT_USER_ADD",
-                            d,
-                        );
+                        super::events::note_user(state, &account_id, &config.user_id, t == "GUILD_SCHEDULED_EVENT_USER_ADD", d);
                     }
 
                     // A guild's soundboard: the whole list, asked for or
                     // replaced, and single sounds coming and going.
                     "SOUNDBOARD_SOUNDS" | "GUILD_SOUNDBOARD_SOUNDS_UPDATE" => {
                         if let Some(guild) = d["guild_id"].as_str() {
-                            super::soundboard::note_guild_sounds(
-                                &account_id,
-                                guild,
-                                &d["soundboard_sounds"],
-                            );
+                            super::soundboard::note_guild_sounds(&account_id, guild, &d["soundboard_sounds"]);
                         }
                     }
-                    "GUILD_SOUNDBOARD_SOUND_CREATE"
-                    | "GUILD_SOUNDBOARD_SOUND_UPDATE"
-                    | "GUILD_SOUNDBOARD_SOUND_DELETE" => {
+                    "GUILD_SOUNDBOARD_SOUND_CREATE" | "GUILD_SOUNDBOARD_SOUND_UPDATE" | "GUILD_SOUNDBOARD_SOUND_DELETE" => {
                         super::soundboard::note_sound_change(&account_id, t, d);
                     }
                     // Somebody set a soundboard sound off in a voice channel.
@@ -1360,27 +1030,14 @@ pub(super) async fn run_gateway(
                     // The channel exists either way; what this says is
                     // whether anything is on in it.
                     "STAGE_INSTANCE_CREATE" | "STAGE_INSTANCE_UPDATE" | "STAGE_INSTANCE_DELETE" => {
-                        let Some(channel) = d["channel_id"].as_str() else {
-                            continue;
-                        };
-                        let topic = (t != "STAGE_INSTANCE_DELETE")
-                            .then(|| d["topic"].as_str().unwrap_or_default());
-                        state
-                            .runtime
-                            .set_discord_stage_topic(&account_id, channel, topic);
-                        announce_voice_membership(
-                            state,
-                            &account_id,
-                            d["guild_id"].as_str(),
-                            Some(channel),
-                        );
+                        let Some(channel) = d["channel_id"].as_str() else { continue };
+                        let topic = (t != "STAGE_INSTANCE_DELETE").then(|| d["topic"].as_str().unwrap_or_default());
+                        state.runtime.set_discord_stage_topic(&account_id, channel, topic);
+                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), Some(channel));
                     }
 
                     "GUILD_UPDATE" | "GUILD_EMOJIS_UPDATE" | "GUILD_STICKERS_UPDATE" => {
-                        let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str())
-                        else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["guild_id"].as_str().or_else(|| d["id"].as_str()) else { continue };
                         if guild_context.contains_key(guild_id) {
                             resync_guild(state, config, guild_id, channel_map).await;
                         }
@@ -1402,18 +1059,9 @@ pub(super) async fn run_gateway(
                             let _ = state.accounts.set_display_name(&account_id, name);
                         }
                         if let (Some(avatar), Some(id)) = (d["avatar"].as_str(), d["id"].as_str()) {
-                            let url = format!(
-                                "https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128"
-                            );
-                            if state
-                                .accounts
-                                .set_discord_avatar_url(&account_id, &url)
-                                .unwrap_or(false)
-                            {
-                                state.events.emit(
-                                    "accountAvatarChanged",
-                                    json!({ "accountId": account_id, "avatarUrl": url }),
-                                );
+                            let url = format!("https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128");
+                            if state.accounts.set_discord_avatar_url(&account_id, &url).unwrap_or(false) {
+                                state.events.emit("accountAvatarChanged", json!({ "accountId": account_id, "avatarUrl": url }));
                             }
                         }
                     }
@@ -1427,14 +1075,8 @@ pub(super) async fn run_gateway(
                     // whatever comes back goes out as an interaction of its
                     // own - see submit_modal.
                     "INTERACTION_MODAL_CREATE" => {
-                        let modal = if d["modal"].is_object() {
-                            &d["modal"]
-                        } else {
-                            d
-                        };
-                        let channel = modal["channel_id"]
-                            .as_str()
-                            .or_else(|| d["channel_id"].as_str());
+                        let modal = if d["modal"].is_object() { &d["modal"] } else { d };
+                        let channel = modal["channel_id"].as_str().or_else(|| d["channel_id"].as_str());
                         // Where it belongs. A modal names its channel; where
                         // it does not, it belongs to whatever this account
                         // last asked for - which is the command that opened
@@ -1469,18 +1111,13 @@ pub(super) async fn run_gateway(
                     // conversation anyway.
                     "CHANNEL_PINS_UPDATE" => {
                         if let Some(channel_id) = d["channel_id"].as_str() {
-                            if let Some(buffer_id) = state
-                                .runtime
-                                .discord_buffer_for_channel(&account_id, channel_id)
-                            {
+                            if let Some(buffer_id) = state.runtime.discord_buffer_for_channel(&account_id, channel_id) {
                                 let state = state.clone();
                                 let account_id = account_id.clone();
                                 // In its own task: the gateway loop must keep
                                 // reading, and this is an HTTP round trip.
                                 tokio::spawn(async move {
-                                    if let Err(e) =
-                                        list_pinned(&state, &account_id, &buffer_id).await
-                                    {
+                                    if let Err(e) = list_pinned(&state, &account_id, &buffer_id).await {
                                         tracing::debug!("discord[{account_id}]: re-reading pins for {buffer_id}: {e:#}");
                                     }
                                 });
@@ -1495,13 +1132,8 @@ pub(super) async fn run_gateway(
                     }
 
                     "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else {
-                            continue;
-                        };
-                        if let Some(buffer_id) = state
-                            .runtime
-                            .discord_member_list_target(&account_id, guild_id)
-                        {
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        if let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) {
                             request_member_list(state, &buffer_id);
                         }
                     }
@@ -1510,16 +1142,9 @@ pub(super) async fn run_gateway(
                     // screen, since the per-message deletes are not sent.
                     "MESSAGE_DELETE_BULK" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else {
-                            continue;
-                        };
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
-                        for id in d["ids"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|v| v.as_str())
-                        {
+                        for id in d["ids"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
                             state.runtime.delete_message(state, &buffer_id, id);
                         }
                     }
@@ -1529,47 +1154,29 @@ pub(super) async fn run_gateway(
                     // that would otherwise take them off screen.
                     "MESSAGE_REACTION_REMOVE_ALL" | "MESSAGE_REACTION_REMOVE_EMOJI" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
-                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else {
-                            continue;
-                        };
-                        let Some(msg_id) = d["message_id"].as_str() else {
-                            continue;
-                        };
+                        let Some((buffer_name, _)) = channel_map.get(channel_id).cloned() else { continue };
+                        let Some(msg_id) = d["message_id"].as_str() else { continue };
                         let buffer_id = model::buffer_id(&account_id, &buffer_name);
-                        match d["emoji"]["name"]
-                            .as_str()
-                            .filter(|_| t == "MESSAGE_REACTION_REMOVE_EMOJI")
-                        {
+                        match d["emoji"]["name"].as_str().filter(|_| t == "MESSAGE_REACTION_REMOVE_EMOJI") {
                             Some(name) => {
                                 let key = match d["emoji"]["id"].as_str() {
                                     Some(id) => format!("<:{name}:{id}>"),
                                     None => name.to_string(),
                                 };
-                                state
-                                    .runtime
-                                    .remove_reaction_entirely(state, &buffer_id, msg_id, &key);
+                                state.runtime.remove_reaction_entirely(state, &buffer_id, msg_id, &key);
                             }
                             None => state.runtime.clear_reactions(state, &buffer_id, msg_id),
                         }
                     }
 
                     "GUILD_MEMBER_LIST_UPDATE" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else {
-                            continue;
-                        };
-                        let Some(buffer_id) = state
-                            .runtime
-                            .discord_member_list_target(&account_id, guild_id)
-                        else {
-                            continue;
-                        };
+                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
+                        let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) else { continue };
                         update_member_list(state, &buffer_id, d);
                     }
 
                     "VOICE_STATE_UPDATE" => {
-                        let Some(user_id) = d["user_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(user_id) = d["user_id"].as_str() else { continue };
                         let channel_id = d["channel_id"].as_str();
                         // The flags ride on the voice state - there is no
                         // separate dispatch for going live or turning a
@@ -1583,16 +1190,8 @@ pub(super) async fn run_gateway(
                         if flags.streaming || flags.video {
                             tracing::info!(
                                 "discord[{account_id}]: {user_id} is {}{}{} in {}",
-                                if flags.streaming {
-                                    "sharing a screen"
-                                } else {
-                                    ""
-                                },
-                                if flags.streaming && flags.video {
-                                    " and "
-                                } else {
-                                    ""
-                                },
+                                if flags.streaming { "sharing a screen" } else { "" },
+                                if flags.streaming && flags.video { " and " } else { "" },
                                 if flags.video { "on camera" } else { "" },
                                 channel_id.unwrap_or("nowhere")
                             );
@@ -1605,35 +1204,21 @@ pub(super) async fn run_gateway(
                             voice_member_avatar(d).as_deref(),
                             flags,
                         );
-                        announce_voice_membership(
-                            state,
-                            &account_id,
-                            d["guild_id"].as_str(),
-                            channel_id,
-                        );
+                        announce_voice_membership(state, &account_id, d["guild_id"].as_str(), channel_id);
 
                         if user_id == config.user_id {
                             // Into a stage's audience or out of it. Held off
                             // the microphone while in it.
-                            state.voice.set_suppressed(
-                                &account_id,
-                                channel_id.is_some() && flags.suppressed,
-                            );
+                            state.voice.set_suppressed(&account_id, channel_id.is_some() && flags.suppressed);
                             // Into a guild's voice channel: its own soundboard
                             // is asked for, so the board can offer it.
                             if let (Some(guild), Some(_)) = (d["guild_id"].as_str(), channel_id) {
-                                super::soundboard::request(
-                                    state,
-                                    &account_id,
-                                    &[guild.to_string()],
-                                );
+                                super::soundboard::request(state, &account_id, &[guild.to_string()]);
                             }
                             // Our own move. The session id here is half of what
                             // a voice connection needs; VOICE_SERVER_UPDATE
                             // carries the other half.
-                            state
-                                .runtime
-                                .set_discord_voice_self(&account_id, channel_id);
+                            state.runtime.set_discord_voice_self(&account_id, channel_id);
                             state.events.emit(
                                 "discordVoiceState",
                                 json!({
@@ -1650,17 +1235,13 @@ pub(super) async fn run_gateway(
                                 d["session_id"].as_str(),
                             )
                             .await;
-                        } else if let (Some(ours), Some(theirs)) =
-                            (state.runtime.discord_voice_self(&account_id), channel_id)
-                        {
+                        } else if let (Some(ours), Some(theirs)) = (state.runtime.discord_voice_self(&account_id), channel_id) {
                             // Somebody else arrived where we are. Leaving is
                             // the daemon's job rather than the caller's: by the
                             // time a client could react it would already have
                             // been in a channel with a stranger.
                             if ours == theirs && state.voice.options(&account_id).solo {
-                                tracing::info!(
-                                    "discord[{account_id}]: leaving voice - another user joined"
-                                );
+                                tracing::info!("discord[{account_id}]: leaving voice - another user joined");
                                 leave_voice(state, &account_id);
                                 state.events.emit(
                                     "discordVoiceLeft",
@@ -1682,15 +1263,10 @@ pub(super) async fn run_gateway(
                     // CALL_DELETE at all.
                     "CALL_CREATE" | "CALL_UPDATE" => {
                         tracing::info!("discord[{account_id}]: {t} {}", brief(d));
-                        let Some(channel_id) = d["channel_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
                         let ringing = d["ringing"]
                             .as_array()
-                            .map(|r| {
-                                r.iter()
-                                    .any(|u| u.as_str() == Some(config.user_id.as_str()))
-                            })
+                            .map(|r| r.iter().any(|u| u.as_str() == Some(config.user_id.as_str())))
                             .unwrap_or(false);
                         // Opening the conversation first where there is
                         // none: a first call from a new person arrives on a
@@ -1700,9 +1276,7 @@ pub(super) async fn run_gateway(
                     }
 
                     "CALL_DELETE" => {
-                        let Some(channel_id) = d["channel_id"].as_str() else {
-                            continue;
-                        };
+                        let Some(channel_id) = d["channel_id"].as_str() else { continue };
                         announce_call(state, &account_id, channel_id, false);
                     }
 
@@ -1748,25 +1322,15 @@ pub(super) async fn run_gateway(
                         // update_discord_presence itself is the friends-only
                         // gate (a no-op, no event emitted, for any user_id
                         // not already in this account's friends list).
-                        let Some(user_id) = d["user"]["id"].as_str() else {
-                            continue;
-                        };
+                        let Some(user_id) = d["user"]["id"].as_str() else { continue };
                         let status = d["status"].as_str().unwrap_or("offline");
-                        if state
-                            .runtime
-                            .update_discord_presence(&account_id, user_id, status)
-                        {
+                        if state.runtime.update_discord_presence(&account_id, user_id, status) {
                             state.events.emit("discordPresenceUpdate", json!({ "accountId": account_id, "userId": user_id, "status": status }));
                         }
                         // Also refresh any roster this person appears in, so
                         // an open channel's list follows them going online or
                         // away without waiting for a fresh subscription.
-                        update_presence_in_rosters(
-                            state,
-                            user_id,
-                            status,
-                            super::presence::activity_of(&d["activities"]),
-                        );
+                        update_presence_in_rosters(state, user_id, status, super::presence::activity_of(&d["activities"]));
                     }
                     // Everything this client does not act on.
                     //
@@ -1779,14 +1343,8 @@ pub(super) async fn run_gateway(
                     // saying at info, because those are the ones somebody is
                     // usually watching for.
                     other => {
-                        if other.starts_with("STREAM_")
-                            || other.starts_with("CALL_")
-                            || other.starts_with("VOICE_")
-                        {
-                            tracing::info!(
-                                "discord[{account_id}]: {other} (not handled here) {}",
-                                brief(d)
-                            );
+                        if other.starts_with("STREAM_") || other.starts_with("CALL_") || other.starts_with("VOICE_") {
+                            tracing::info!("discord[{account_id}]: {other} (not handled here) {}", brief(d));
                         } else {
                             tracing::debug!("discord[{account_id}]: {other} (not handled here)");
                         }
@@ -1845,9 +1403,7 @@ mod brief_tests {
     /// connection. A log is the one place it must never be.
     #[test]
     fn a_logged_payload_has_no_credentials_in_it() {
-        let line = brief(
-            &json!({ "endpoint": "eu.discord.media", "token": "a-real-secret", "secret_key": [1, 2, 3] }),
-        );
+        let line = brief(&json!({ "endpoint": "eu.discord.media", "token": "a-real-secret", "secret_key": [1, 2, 3] }));
         assert!(!line.contains("a-real-secret"), "{line}");
         assert!(!line.contains("[1,2,3]"), "{line}");
         assert!(line.contains("eu.discord.media"), "{line}");
@@ -1866,11 +1422,7 @@ mod brief_tests {
         // six hundred of them - 400 emoji is 1600 bytes and well under the
         // limit, which is the point of counting characters for a log.
         let emoji = brief(&json!({ "name": "\u{1F600}".repeat(900) }));
-        assert!(
-            emoji.ends_with('…'),
-            "{}",
-            &emoji[emoji.len().saturating_sub(20)..]
-        );
+        assert!(emoji.ends_with('…'), "{}", &emoji[emoji.len().saturating_sub(20)..]);
         assert!(emoji.is_char_boundary(emoji.len() - '…'.len_utf8()));
 
         // Short enough to say whole is said whole.
@@ -1879,20 +1431,15 @@ mod brief_tests {
     }
 }
 
+
 #[cfg(test)]
 mod close_code_tests {
     use super::*;
     use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 
     async fn closed_with(code: u16) -> anyhow::Error {
-        let frame = CloseFrame {
-            code: CloseCode::from(code),
-            reason: "Rate limited.".into(),
-        };
-        let mut stream =
-            futures::stream::iter(vec![Ok::<_, tokio_tungstenite::tungstenite::Error>(
-                WsMessage::Close(Some(frame)),
-            )]);
+        let frame = CloseFrame { code: CloseCode::from(code), reason: "Rate limited.".into() };
+        let mut stream = futures::stream::iter(vec![Ok::<_, tokio_tungstenite::tungstenite::Error>(WsMessage::Close(Some(frame)))]);
         next_json(&mut stream).await.unwrap_err()
     }
 
@@ -1905,14 +1452,8 @@ mod close_code_tests {
 
     #[tokio::test]
     async fn a_revoked_login_and_an_ordinary_close_stay_what_they_were() {
-        assert!(closed_with(4004)
-            .await
-            .downcast_ref::<GatewayAuthFailed>()
-            .is_some());
+        assert!(closed_with(4004).await.downcast_ref::<GatewayAuthFailed>().is_some());
         let plain = closed_with(1000).await;
-        assert!(
-            plain.downcast_ref::<GatewayRateLimited>().is_none()
-                && plain.downcast_ref::<GatewayAuthFailed>().is_none()
-        );
+        assert!(plain.downcast_ref::<GatewayRateLimited>().is_none() && plain.downcast_ref::<GatewayAuthFailed>().is_none());
     }
 }

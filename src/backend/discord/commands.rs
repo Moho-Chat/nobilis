@@ -13,20 +13,9 @@ use super::*;
 /// question with the right answer: a bot can be installed guild-wide and
 /// still be unusable in the channel somebody is typing in, and the same
 /// endpoint is what Discord's own client asks when a `/` is typed.
-pub async fn list_commands(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    query: &str,
-) -> Result<Value> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+pub async fn list_commands(state: &AppState, account_id: &str, buffer_id: &str, query: &str) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let mut params: Vec<(&str, String)> = vec![
         // Type 1 is a slash command. The other two - the ones on the
         // right-click menus for a message or a person - have nowhere to be
@@ -39,9 +28,7 @@ pub async fn list_commands(
         params.push(("query", query.to_string()));
     }
     let resp = http_client_for(&cfg.token)
-        .get(format!(
-            "{API_BASE}/channels/{channel_id}/application-commands/search"
-        ))
+        .get(format!("{API_BASE}/channels/{channel_id}/application-commands/search"))
         .query(&params)
         .header("Authorization", &cfg.token)
         .send()
@@ -50,21 +37,14 @@ pub async fn list_commands(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "reading the commands")
-        );
+        bail!("{}", discord_error_text(status, &text, "reading the commands"));
     }
     let answer: Value = resp.json().await.context("reading the commands")?;
 
     // Which bot each command belongs to, so the list can say who answers it -
     // two servers commonly have a /ban that does different things.
     let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for app in answer["applications"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-    {
+    for app in answer["applications"].as_array().cloned().unwrap_or_default() {
         if let (Some(id), Some(name)) = (app["id"].as_str(), app["name"].as_str()) {
             names.insert(id.to_string(), name.to_string());
         }
@@ -75,10 +55,7 @@ pub async fn list_commands(
         .unwrap_or_default()
         .into_iter()
         .map(|command| {
-            let application_id = command["application_id"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
+            let application_id = command["application_id"].as_str().unwrap_or_default().to_string();
             json!({
                 "id": command["id"],
                 "name": command["name"],
@@ -101,9 +78,7 @@ pub async fn list_commands(
 /// the only place it exists: `/wordle` and `/ban somebody [reason]` are the
 /// same kind of line to a menu, and one of them has to be assembled.
 pub fn command_usage(command: &Value) -> String {
-    let Some(options) = command["options"].as_array() else {
-        return String::new();
-    };
+    let Some(options) = command["options"].as_array() else { return String::new() };
     options
         .iter()
         // Subcommands and groups are a menu of their own rather than an
@@ -128,22 +103,9 @@ pub fn command_usage(command: &Value) -> String {
 /// kind it is and carries the data for that kind. Both need the gateway
 /// session id, which is Discord's way of asking that the thing doing this be
 /// a client somebody is actually using.
-pub(super) async fn interact(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    kind: i64,
-    application_id: &str,
-    data: Value,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+pub(super) async fn interact(state: &AppState, account_id: &str, buffer_id: &str, kind: i64, application_id: &str, data: Value) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let session_id = state
         .runtime
         .discord_gateway_session(account_id)
@@ -163,17 +125,15 @@ pub(super) async fn interact(
     // Where this was done, for the answer that may not say. A modal arrives
     // as its own dispatch moments later and does not always name the channel
     // it belongs to; the conversation somebody just acted in is the answer.
-    state
-        .runtime
-        .set_discord_last_interaction(account_id, buffer_id);
+    state.runtime.set_discord_last_interaction(account_id, buffer_id);
     let resp = send_write(
         http_client_for(&cfg.token)
-            .post(format!("{API_BASE}/interactions"))
-            .header("Authorization", &cfg.token)
-            .json(&payload),
-    )
+        .post(format!("{API_BASE}/interactions"))
+        .header("Authorization", &cfg.token)
+        .json(&payload)
+        )
     .await
-    .context("sending the interaction")?;
+        .context("sending the interaction")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -250,16 +210,8 @@ pub async fn submit_modal(
 }
 
 /// Runs one of the commands `list_commands` offered.
-pub async fn run_command(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    command: &Value,
-    options: Value,
-) -> Result<()> {
-    let application_id = command["application_id"]
-        .as_str()
-        .context("that command says which bot it belongs to")?;
+pub async fn run_command(state: &AppState, account_id: &str, buffer_id: &str, command: &Value, options: Value) -> Result<()> {
+    let application_id = command["application_id"].as_str().context("that command says which bot it belongs to")?;
     let data = json!({
         "version": command["version"],
         "id": command["id"],
@@ -284,20 +236,12 @@ pub async fn use_component(
     is_select: bool,
     values: Vec<String>,
 ) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     // Which bot to tell is on the message that carries the control, not on
     // the control itself - so it is read from the message rather than guessed.
     let resp = http_client_for(&cfg.token)
-        .get(format!(
-            "{API_BASE}/channels/{channel_id}/messages/{message_id}"
-        ))
+        .get(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))
         .header("Authorization", &cfg.token)
         .send()
         .await
@@ -305,10 +249,7 @@ pub async fn use_component(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "finding out whose button that is")
-        );
+        bail!("{}", discord_error_text(status, &text, "finding out whose button that is"));
     }
     let message: Value = resp.json().await.context("reading that message")?;
     let application_id = message["application_id"]
@@ -326,15 +267,7 @@ pub async fn use_component(
     if is_select {
         data["values"] = json!(values);
     }
-    interact_with_message(
-        state,
-        account_id,
-        buffer_id,
-        &application_id,
-        data,
-        message_id,
-    )
-    .await
+    interact_with_message(state, account_id, buffer_id, &application_id, data, message_id).await
 }
 
 /// The same as `interact`, naming the message a control belongs to.
@@ -346,14 +279,8 @@ pub(super) async fn interact_with_message(
     data: Value,
     message_id: &str,
 ) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let session_id = state
         .runtime
         .discord_gateway_session(account_id)
@@ -372,12 +299,12 @@ pub(super) async fn interact_with_message(
     }
     let resp = send_write(
         http_client_for(&cfg.token)
-            .post(format!("{API_BASE}/interactions"))
-            .header("Authorization", &cfg.token)
-            .json(&payload),
-    )
+        .post(format!("{API_BASE}/interactions"))
+        .header("Authorization", &cfg.token)
+        .json(&payload)
+        )
     .await
-    .context("sending the interaction")?;
+        .context("sending the interaction")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

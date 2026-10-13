@@ -27,8 +27,8 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use crate::state::AppState;
 use anyhow::{anyhow, bail, Context, Result};
+use crate::state::AppState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A DCC message we understood.
@@ -40,11 +40,7 @@ pub enum Dcc {
     /// The second half of RESUME: we say where we got to, they say where they
     /// will start. Their answer is the one that counts - a sender is free to
     /// answer with a different position, or not to answer at all.
-    Accept {
-        file_name: String,
-        port: u16,
-        position: u64,
-    },
+    Accept { file_name: String, port: u16, position: u64 },
     /// Recognised but not offered here - DCC CHAT and friends. Kept apart from
     /// "not DCC at all" so it can be answered with a reason rather than shown
     /// as a line of control characters.
@@ -86,9 +82,7 @@ pub fn parse_dcc(body: &str) -> Option<Dcc> {
     let inner = body.strip_prefix('\u{1}')?;
     // The trailing delimiter is supposed to be there and often is not.
     let inner = inner.strip_suffix('\u{1}').unwrap_or(inner);
-    let rest = inner
-        .strip_prefix("DCC ")
-        .or_else(|| inner.strip_prefix("dcc "))?;
+    let rest = inner.strip_prefix("DCC ").or_else(|| inner.strip_prefix("dcc "))?;
     let rest = rest.trim();
 
     let (verb, args) = rest.split_once(char::is_whitespace)?;
@@ -122,11 +116,7 @@ fn parse_accept(args: &str) -> Option<Dcc> {
     let mut numbers = rest.split_whitespace();
     let port: u16 = numbers.next()?.parse().ok()?;
     let position: u64 = numbers.next()?.parse().ok()?;
-    Some(Dcc::Accept {
-        file_name: name,
-        port,
-        position,
-    })
+    Some(Dcc::Accept { file_name: name, port, position })
 }
 
 /// `<name> <address> <port> <size> [token]`, where the name may be quoted.
@@ -149,11 +139,7 @@ fn parse_send(args: &str) -> Option<DccSend> {
             (parts[0].to_string(), parts[1..].join(" "))
         } else {
             // Take the numbers off the end and let the name keep its spaces.
-            let numeric_tail = parts
-                .iter()
-                .rev()
-                .take_while(|t| t.chars().all(|c| c.is_ascii_digit()))
-                .count();
+            let numeric_tail = parts.iter().rev().take_while(|t| t.chars().all(|c| c.is_ascii_digit())).count();
             let take = numeric_tail.min(4);
             if take < 3 || parts.len() <= take {
                 return None;
@@ -217,8 +203,8 @@ const MAX_NAME_CHARS: usize = 120;
 /// Windows keeps these reserved whatever extension follows, and opening one
 /// talks to a device instead of a file.
 const RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2",
+    "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 /// A name safe to join onto the download directory, from one that is not.
@@ -293,9 +279,8 @@ fn cap_length(name: &str) -> String {
 /// Keyed by port, which is what a `DCC ACCEPT` carries and what makes one
 /// offer different from another: the filename comes back echoed and quoted
 /// differently by every bot, and is not something to match on.
-static AWAITING_ACCEPT: std::sync::Mutex<
-    Option<std::collections::HashMap<u16, tokio::sync::oneshot::Sender<u64>>>,
-> = std::sync::Mutex::new(None);
+static AWAITING_ACCEPT: std::sync::Mutex<Option<std::collections::HashMap<u16, tokio::sync::oneshot::Sender<u64>>>> =
+    std::sync::Mutex::new(None);
 
 /// How long to wait for a `DCC ACCEPT` before starting from nothing.
 ///
@@ -308,8 +293,7 @@ const ACCEPT_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 fn park_for_accept(port: u16) -> tokio::sync::oneshot::Receiver<u64> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let mut held = AWAITING_ACCEPT.lock().unwrap();
-    held.get_or_insert_with(std::collections::HashMap::new)
-        .insert(port, tx);
+    held.get_or_insert_with(std::collections::HashMap::new).insert(port, tx);
     rx
 }
 
@@ -321,11 +305,7 @@ fn stop_waiting(port: u16) {
 
 /// Hands a sender's answer to whoever asked for it.
 fn deliver_accept(port: u16, position: u64) -> bool {
-    let waiting = AWAITING_ACCEPT
-        .lock()
-        .unwrap()
-        .as_mut()
-        .and_then(|m| m.remove(&port));
+    let waiting = AWAITING_ACCEPT.lock().unwrap().as_mut().and_then(|m| m.remove(&port));
     match waiting {
         Some(tx) => tx.send(position).is_ok(),
         None => false,
@@ -337,10 +317,7 @@ fn deliver_accept(port: u16, position: u64) -> bool {
 /// Alongside the eventual file rather than in a temp directory, so the rename
 /// at the end cannot cross a filesystem, and so an abandoned one is obvious.
 pub fn part_path(target: &Path) -> PathBuf {
-    let mut name = target
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
+    let mut name = target.file_name().map(|n| n.to_os_string()).unwrap_or_default();
     name.push(".part");
     target.with_file_name(name)
 }
@@ -362,10 +339,7 @@ fn acknowledgement(received: u64, size: u64) -> Vec<u8> {
 
 /// The file a `.part` is on its way to becoming.
 fn target_of(part: &Path) -> PathBuf {
-    let name = part
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let name = part.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     part.with_file_name(name.strip_suffix(".part").unwrap_or(&name))
 }
 
@@ -405,12 +379,8 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
 /// name that somehow survived would not.
 pub fn assert_inside(dir: &Path, target: &Path) -> Result<()> {
     let parent = target.parent().context("target has no parent directory")?;
-    let dir = dir
-        .canonicalize()
-        .with_context(|| format!("resolving {}", dir.display()))?;
-    let parent = parent
-        .canonicalize()
-        .with_context(|| format!("resolving {}", parent.display()))?;
+    let dir = dir.canonicalize().with_context(|| format!("resolving {}", dir.display()))?;
+    let parent = parent.canonicalize().with_context(|| format!("resolving {}", parent.display()))?;
     if dir != parent {
         bail!("refusing to write outside the download folder");
     }
@@ -508,32 +478,18 @@ pub(super) fn remember_request(account_id: &str, target: &str, body: &str) {
     }
     let lower = body.trim().to_lowercase();
     let is_request = (lower.starts_with("xdcc send") || lower.starts_with("xdcc get"))
-        && lower
-            .split_whitespace()
-            .nth(2)
-            .is_some_and(|n| n.trim_start_matches('#').parse::<u32>().is_ok());
+        && lower.split_whitespace().nth(2).is_some_and(|n| n.trim_start_matches('#').parse::<u32>().is_ok());
     if !is_request {
         return;
     }
     let mut held = LAST_REQUEST.lock().unwrap();
     held.get_or_insert_with(std::collections::HashMap::new)
-        .insert(
-            (account_id.to_string(), target.to_lowercase()),
-            body.trim().to_string(),
-        );
-    tracing::debug!(
-        "dcc: remembering \"{}\" to {target}, in case it has to be asked again",
-        body.trim()
-    );
+        .insert((account_id.to_string(), target.to_lowercase()), body.trim().to_string());
+    tracing::debug!("dcc: remembering \"{}\" to {target}, in case it has to be asked again", body.trim());
 }
 
 fn remembered_request(account_id: &str, nick: &str) -> Option<String> {
-    LAST_REQUEST
-        .lock()
-        .unwrap()
-        .as_ref()?
-        .get(&(account_id.to_string(), nick.to_lowercase()))
-        .cloned()
+    LAST_REQUEST.lock().unwrap().as_ref()?.get(&(account_id.to_string(), nick.to_lowercase())).cloned()
 }
 
 /// How far each part file has got, and how many times it has been asked for.
@@ -590,11 +546,7 @@ impl Default for DccPrefs {
 impl DccPrefs {
     /// Where files land, resolved.
     pub fn download_dir(&self) -> PathBuf {
-        resolve_download_dir(
-            self.directory.as_deref(),
-            dirs::download_dir(),
-            dirs::home_dir(),
-        )
+        resolve_download_dir(self.directory.as_deref(), dirs::download_dir(), dirs::home_dir())
     }
 }
 
@@ -612,11 +564,7 @@ impl DccPrefs {
 /// `$HOME/Downloads` as the default for that entry when it is unset, so that
 /// is what is used, which is also what Chromium does for the same question
 /// and so what the rest of moho already resolves to.
-fn resolve_download_dir(
-    configured: Option<&str>,
-    platform: Option<PathBuf>,
-    home: Option<PathBuf>,
-) -> PathBuf {
+fn resolve_download_dir(configured: Option<&str>, platform: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
     configured
         .filter(|d| !d.is_empty())
         .map(PathBuf::from)
@@ -635,33 +583,21 @@ mod download_dir_tests {
 
     #[test]
     fn somewhere_chosen_wins() {
-        assert_eq!(
-            resolve_download_dir(Some("/srv/files"), p("/home/a/Downloads"), p("/home/a")),
-            PathBuf::from("/srv/files")
-        );
+        assert_eq!(resolve_download_dir(Some("/srv/files"), p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/srv/files"));
     }
 
     #[test]
     fn otherwise_the_platform_answers() {
-        assert_eq!(
-            resolve_download_dir(None, p("/home/a/Downloads"), p("/home/a")),
-            PathBuf::from("/home/a/Downloads")
-        );
+        assert_eq!(resolve_download_dir(None, p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/home/a/Downloads"));
         // An empty setting is not a choice; it is the absence of one.
-        assert_eq!(
-            resolve_download_dir(Some(""), p("/home/a/Downloads"), p("/home/a")),
-            PathBuf::from("/home/a/Downloads")
-        );
+        assert_eq!(resolve_download_dir(Some(""), p("/home/a/Downloads"), p("/home/a")), PathBuf::from("/home/a/Downloads"));
     }
 
     #[test]
     fn a_machine_with_no_user_dirs_still_uses_a_downloads_folder() {
         // The case this exists for: no XDG_DOWNLOAD_DIR, so `dirs` says
         // nothing. Files must not end up loose in the home directory.
-        assert_eq!(
-            resolve_download_dir(None, None, p("/home/a")),
-            PathBuf::from("/home/a/Downloads")
-        );
+        assert_eq!(resolve_download_dir(None, None, p("/home/a")), PathBuf::from("/home/a/Downloads"));
     }
 }
 
@@ -679,10 +615,7 @@ impl DccPrefsStore {
             // to start over a bad preferences file would be worse than one
             // that asks before every transfer.
             .unwrap_or_default();
-        Self {
-            path,
-            inner: std::sync::Mutex::new(inner),
-        }
+        Self { path, inner: std::sync::Mutex::new(inner) }
     }
 
     pub fn get(&self) -> DccPrefs {
@@ -744,11 +677,7 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new(rate: u64) -> Self {
-        Self {
-            rate,
-            window_start: std::time::Instant::now(),
-            window_bytes: 0,
-        }
+        Self { rate, window_start: std::time::Instant::now(), window_bytes: 0 }
     }
 
     /// How much to ask for at once.
@@ -814,10 +743,7 @@ pub async fn receive(
         bail!("this is a reverse (passive) offer, which is received by listening rather than by connecting");
     }
     if max_bytes > 0 && offer.size > max_bytes {
-        bail!(
-            "offered file is {} bytes, over the {max_bytes} byte limit",
-            offer.size
-        );
+        bail!("offered file is {} bytes, over the {max_bytes} byte limit", offer.size);
     }
 
     tokio::fs::create_dir_all(dir)
@@ -837,16 +763,7 @@ pub async fn receive(
     // Checked before anything is opened, and again on the finished file.
     assert_inside(dir, &target)?;
 
-    let result = stream_to(
-        offer,
-        transport,
-        &part,
-        max_rate,
-        resume_from,
-        cancel,
-        &mut on_progress,
-    )
-    .await;
+    let result = stream_to(offer, transport, &part, max_rate, resume_from, cancel, &mut on_progress).await;
     finish(result, &part, &target, dir, cancel).await
 }
 
@@ -880,10 +797,7 @@ async fn finish(
             // was cancelled here - somebody who said stop did not mean
             // "stop and keep it for later".
             let scrap = cancel.load(std::sync::atomic::Ordering::Relaxed)
-                || tokio::fs::metadata(part)
-                    .await
-                    .map(|m| m.len() == 0)
-                    .unwrap_or(true);
+                || tokio::fs::metadata(part).await.map(|m| m.len() == 0).unwrap_or(true);
             if scrap {
                 let _ = tokio::fs::remove_file(part).await;
             } else {
@@ -908,19 +822,8 @@ async fn stream_to(
     // the route it tried, so wrapping it printed the address twice in one
     // sentence - which is what a failed transfer showed on the downloads
     // screen, in a line too long to fit because half of it was a repeat.
-    let stream = transport
-        .connect(&offer.addr.to_string(), offer.port, false)
-        .await?;
-    stream_socket(
-        stream,
-        offer,
-        part,
-        max_rate,
-        resume_from,
-        cancel,
-        on_progress,
-    )
-    .await
+    let stream = transport.connect(&offer.addr.to_string(), offer.port, false).await?;
+    stream_socket(stream, offer, part, max_rate, resume_from, cancel, on_progress).await
 }
 
 /// The half that moves bytes, once there is a socket to move them over.
@@ -941,6 +844,7 @@ async fn stream_socket<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+
     // Appending when resuming, and create_new otherwise: if the check that
     // picked this name raced with another transfer, a fresh one is an error
     // rather than two writers sharing a file. A resume has already looked at
@@ -982,10 +886,7 @@ where
             bail!("cancelled");
         }
         let want = limiter.read_size();
-        let n = stream
-            .read(&mut buf[..want])
-            .await
-            .context("reading from the sender")?;
+        let n = stream.read(&mut buf[..want]).await.context("reading from the sender")?;
         if n == 0 {
             break;
         }
@@ -1017,11 +918,7 @@ where
         let since = mark.0.elapsed();
         if since >= PROGRESS_EVERY || received == offer.size {
             let moved = received - mark.1;
-            let rate = if since.as_secs_f64() > 0.0 {
-                (moved as f64 / since.as_secs_f64()) as u64
-            } else {
-                0
-            };
+            let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
             mark = (std::time::Instant::now(), received);
             on_progress(Progress { received, rate });
         }
@@ -1063,30 +960,17 @@ const OFFER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 /// refused outright on a connection routed through a proxy. Sending from
 /// behind one needs the reverse form of this, where the receiver listens and
 /// we dial - and that is a different thing to build, not a flag to flip.
-pub async fn offer_file(
-    state: &AppState,
-    account_id: &str,
-    nick: &str,
-    path: &str,
-) -> Result<String> {
+pub async fn offer_file(state: &AppState, account_id: &str, nick: &str, path: &str) -> Result<String> {
     if nick.trim().is_empty() {
         bail!("no one to send it to");
     }
-    let transport = state
-        .runtime
-        .irc_transport(account_id)
-        .context("that connection is no longer up")?;
+    let transport = state.runtime.irc_transport(account_id).context("that connection is no longer up")?;
     if !matches!(transport, crate::net::tor::Transport::Direct) {
         bail!("this connection goes through a proxy, and sending a file means opening a port on it - which would give away the address the proxy is there to hide");
     }
-    let sender = state
-        .runtime
-        .irc_sender(account_id)
-        .context("that connection is no longer up")?;
+    let sender = state.runtime.irc_sender(account_id).context("that connection is no longer up")?;
 
-    let meta = tokio::fs::metadata(path)
-        .await
-        .with_context(|| format!("reading {path}"))?;
+    let meta = tokio::fs::metadata(path).await.with_context(|| format!("reading {path}"))?;
     if !meta.is_file() {
         bail!("only a file can be sent");
     }
@@ -1103,9 +987,7 @@ pub async fn offer_file(
 
     // Port 0 asks the system for a free one, which is what every client does:
     // a fixed port would collide with the second transfer.
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0))
-        .await
-        .context("opening a port to send from")?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.context("opening a port to send from")?;
     let port = listener.local_addr().context("reading the port")?.port();
     let advertise = advertised_address(state, account_id).await?;
 
@@ -1135,11 +1017,7 @@ pub async fn offer_file(
 
     // A name with a space in it has to be quoted or the receiver reads the
     // rest of it as the address.
-    let advertised_name = if name.contains(' ') {
-        format!("\"{name}\"")
-    } else {
-        name.clone()
-    };
+    let advertised_name = if name.contains(' ') { format!("\"{name}\"") } else { name.clone() };
     let ip_number = u32::from(advertise);
     let ctcp = format!("\u{1}DCC SEND {advertised_name} {ip_number} {port} {size}\u{1}");
     sender
@@ -1156,11 +1034,7 @@ pub async fn offer_file(
     let path = path.to_string();
     tokio::spawn(async move {
         let id = task_id;
-        let cancel = state
-            .runtime
-            .dcc_transfer(&id)
-            .map(|t| t.cancel)
-            .unwrap_or_default();
+        let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
         let accepted_state = state.clone();
         let accepted_id = id.clone();
         let progress_state = state.clone();
@@ -1172,9 +1046,9 @@ pub async fn offer_file(
             prefs_rate,
             &cancel,
             || {
-                if let Some(t) = accepted_state.runtime.update_dcc(&accepted_id, |t| {
-                    t.state = crate::runtime::DccState::Sending
-                }) {
+                if let Some(t) =
+                    accepted_state.runtime.update_dcc(&accepted_id, |t| t.state = crate::runtime::DccState::Sending)
+                {
                     announce(&accepted_state, &t);
                 }
             },
@@ -1260,9 +1134,7 @@ async fn serve_file(
     tracing::info!("dcc: {peer} is taking the file");
     on_accepted();
 
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening {path}"))?;
+    let mut file = tokio::fs::File::open(path).await.with_context(|| format!("opening {path}"))?;
     // The same limit as receiving, and for a better reason: an upload at full
     // speed is what makes the rest of a home connection unusable, since the
     // line is the narrow way round.
@@ -1276,10 +1148,7 @@ async fn serve_file(
             bail!("cancelled");
         }
         let want = limiter.read_size();
-        let n = file
-            .read(&mut buf[..want])
-            .await
-            .context("reading the file")?;
+        let n = file.read(&mut buf[..want]).await.context("reading the file")?;
         if n == 0 {
             break;
         }
@@ -1289,16 +1158,9 @@ async fn serve_file(
         let since = mark.0.elapsed();
         if since >= PROGRESS_EVERY || sent == size {
             let moved = sent - mark.1;
-            let rate = if since.as_secs_f64() > 0.0 {
-                (moved as f64 / since.as_secs_f64()) as u64
-            } else {
-                0
-            };
+            let rate = if since.as_secs_f64() > 0.0 { (moved as f64 / since.as_secs_f64()) as u64 } else { 0 };
             mark = (std::time::Instant::now(), sent);
-            on_progress(Progress {
-                received: sent,
-                rate,
-            });
+            on_progress(Progress { received: sent, rate });
         }
         limiter.take(n as u64).await;
     }
@@ -1326,22 +1188,17 @@ async fn serve_file(
 async fn advertised_address(state: &AppState, account_id: &str) -> Result<std::net::Ipv4Addr> {
     let prefs = state.dcc_prefs.get();
     if let Some(set) = prefs.advertised_ip.as_deref().filter(|s| !s.is_empty()) {
-        return set.parse::<std::net::Ipv4Addr>().with_context(|| {
-            format!("the address set for sending files, {set:?}, is not an IPv4 address")
-        });
+        return set
+            .parse::<std::net::Ipv4Addr>()
+            .with_context(|| format!("the address set for sending files, {set:?}, is not an IPv4 address"));
     }
 
-    let config = state
-        .accounts
-        .get_irc(account_id)
-        .context("account not connected")?;
+    let config = state.accounts.get_irc(account_id).context("account not connected")?;
     let port = config.port.unwrap_or(if config.ssl { 6697 } else { 6667 });
     // A connected UDP socket picks a route and a source address without
     // sending a packet, which is the portable way to ask "which of my
     // addresses would reach that host".
-    let probe = tokio::net::UdpSocket::bind(("0.0.0.0", 0))
-        .await
-        .context("finding this machine's address")?;
+    let probe = tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await.context("finding this machine's address")?;
     probe
         .connect((config.host.as_str(), port))
         .await
@@ -1367,9 +1224,7 @@ pub fn transport_for(config: &crate::accounts::IrcAccountConfig) -> crate::net::
     }
     // Whatever the connection itself went through; nowhere, rather than
     // directly, if that is somehow not up.
-    let (host, port) = router
-        .socks_now()
-        .unwrap_or_else(|| ("127.0.0.1".to_string(), 9));
+    let (host, port) = router.socks_now().unwrap_or_else(|| ("127.0.0.1".to_string(), 9));
     crate::net::tor::Transport::Socks { host, port }
 }
 
@@ -1379,34 +1234,19 @@ pub fn transport_for(config: &crate::accounts::IrcAccountConfig) -> crate::net::
 /// in. An offer that silently disappeared would be indistinguishable from one
 /// that never came, and somebody waiting on a file they asked a bot for would
 /// have nothing to go on.
-pub async fn incoming(
-    state: &AppState,
-    account_id: &str,
-    from: &str,
-    buffer: &str,
-    kind: &str,
-    dcc: Dcc,
-) {
+pub async fn incoming(state: &AppState, account_id: &str, from: &str, buffer: &str, kind: &str, dcc: Dcc) {
     let offer = match dcc {
         // Not an offer: an answer to one already in flight. Nothing is said
         // in the conversation about it - the transfer itself reports what it
         // is doing, and a line for every step of a handshake would be noise.
         Dcc::Accept { port, position, .. } => {
             if !deliver_accept(port, position) {
-                tracing::debug!(
-                    "dcc: a DCC ACCEPT arrived for port {port}, which nothing is waiting on"
-                );
+                tracing::debug!("dcc: a DCC ACCEPT arrived for port {port}, which nothing is waiting on");
             }
             return;
         }
         Dcc::Unsupported(verb) => {
-            note(
-                state,
-                account_id,
-                buffer,
-                kind,
-                &format!("{from} offered a DCC {verb}, which moho does not do."),
-            );
+            note(state, account_id, buffer, kind, &format!("{from} offered a DCC {verb}, which moho does not do."));
             return;
         }
         Dcc::Send(offer) => offer,
@@ -1420,10 +1260,7 @@ pub async fn incoming(
     // the proxy exists to hide, so it is refused there and only there - which
     // is the same rule sending a file follows.
     if offer.passive() {
-        let direct = matches!(
-            state.runtime.irc_transport(account_id),
-            Some(crate::net::tor::Transport::Direct)
-        );
+        let direct = matches!(state.runtime.irc_transport(account_id), Some(crate::net::tor::Transport::Direct));
         if !direct {
             note(
                 state,
@@ -1497,23 +1334,14 @@ pub async fn incoming(
         started_at: now_seconds(),
     };
     let Some(transfer) = state.runtime.add_dcc_offer(transfer) else {
-        note(
-            state,
-            account_id,
-            buffer,
-            kind,
-            &format!("{from} is offering more files than moho will queue up."),
-        );
+        note(state, account_id, buffer, kind, &format!("{from} is offering more files than moho will queue up."));
         return;
     };
 
     announce(state, &transfer);
 
     if prefs.auto_accept {
-        tracing::info!(
-            "dcc: accepting \"{}\" from {from} automatically",
-            transfer.file_name
-        );
+        tracing::info!("dcc: accepting \"{}\" from {from} automatically", transfer.file_name);
         accept(state, &transfer.id);
     }
 }
@@ -1523,9 +1351,7 @@ pub async fn incoming(
 /// Spawned rather than awaited: a transfer runs for as long as it runs, and
 /// the message loop that accepted it has other messages to read.
 pub fn accept(state: &AppState, id: &str) {
-    let Some(transfer) = state.runtime.dcc_transfer(id) else {
-        return;
-    };
+    let Some(transfer) = state.runtime.dcc_transfer(id) else { return };
     if transfer.state != crate::runtime::DccState::Offered {
         return;
     }
@@ -1546,10 +1372,7 @@ pub fn accept(state: &AppState, id: &str) {
     let id = id.to_string();
 
     tokio::spawn(async move {
-        if let Some(t) = state
-            .runtime
-            .update_dcc(&id, |t| t.state = crate::runtime::DccState::Receiving)
-        {
+        if let Some(t) = state.runtime.update_dcc(&id, |t| t.state = crate::runtime::DccState::Receiving) {
             announce(&state, &t);
         }
         tracing::info!(
@@ -1576,11 +1399,7 @@ pub fn accept(state: &AppState, id: &str) {
             }
         }
 
-        let cancel = state
-            .runtime
-            .dcc_transfer(&id)
-            .map(|t| t.cancel)
-            .unwrap_or_default();
+        let cancel = state.runtime.dcc_transfer(&id).map(|t| t.cancel).unwrap_or_default();
         let progress_state = state.clone();
         let progress_id = id.clone();
         let report = |p: Progress| {
@@ -1609,18 +1428,8 @@ pub fn accept(state: &AppState, id: &str) {
             )
             .await
         } else {
-            receive(
-                &offer,
-                &transport,
-                &dir,
-                prefs.max_bytes,
-                prefs.max_rate,
-                resume_from,
-                part_override,
-                &cancel,
-                report,
-            )
-            .await
+            receive(&offer, &transport, &dir, prefs.max_bytes, prefs.max_rate, resume_from, part_override, &cancel, report)
+                .await
         };
 
         match result {
@@ -1676,19 +1485,14 @@ async fn ask_again(state: &AppState, account_id: &str, from: &str, offer: &DccSe
         return;
     }
     let part = part_path(&dir.join(&offer.file_name));
-    let Ok(meta) = tokio::fs::metadata(&part).await else {
-        return;
-    };
+    let Ok(meta) = tokio::fs::metadata(&part).await else { return };
     let have = meta.len();
     if have == 0 || have >= offer.size {
         stop_chasing(&part);
         return;
     }
     let Some(request) = remembered_request(account_id, from) else {
-        tracing::debug!(
-            "dcc: nothing to re-send to {from}; leaving \"{}\" where it stopped",
-            offer.file_name
-        );
+        tracing::debug!("dcc: nothing to re-send to {from}; leaving \"{}\" where it stopped", offer.file_name);
         return;
     };
     if !should_ask_again(&part, have) {
@@ -1703,16 +1507,8 @@ async fn ask_again(state: &AppState, account_id: &str, from: &str, offer: &DccSe
     // arriving in the same breath is the kind of thing that gets a client
     // ignored.
     tokio::time::sleep(RETRY_AFTER).await;
-    let Some(sender) = state.runtime.irc_sender(account_id) else {
-        return;
-    };
-    if sender
-        .send(irc::proto::Command::PRIVMSG(
-            from.to_string(),
-            request.clone(),
-        ))
-        .is_err()
-    {
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return };
+    if sender.send(irc::proto::Command::PRIVMSG(from.to_string(), request.clone())).is_err() {
         return;
     }
     tracing::info!(
@@ -1757,23 +1553,12 @@ async fn receive_passive(
     mut on_progress: impl FnMut(Progress),
 ) -> Result<PathBuf> {
     if max_bytes > 0 && offer.size > max_bytes {
-        bail!(
-            "offered file is {} bytes, over the {max_bytes} byte limit",
-            offer.size
-        );
+        bail!("offered file is {} bytes, over the {max_bytes} byte limit", offer.size);
     }
-    let token = offer
-        .token
-        .clone()
-        .context("a passive offer with no token is one nothing could answer")?;
-    let sender = state
-        .runtime
-        .irc_sender(account_id)
-        .context("that connection is no longer up")?;
+    let token = offer.token.clone().context("a passive offer with no token is one nothing could answer")?;
+    let sender = state.runtime.irc_sender(account_id).context("that connection is no longer up")?;
 
-    tokio::fs::create_dir_all(dir)
-        .await
-        .with_context(|| format!("creating {}", dir.display()))?;
+    tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
     let (target, part): (PathBuf, PathBuf) = match part_override {
         Some(part) => (target_of(&part), part),
         None => {
@@ -1786,17 +1571,12 @@ async fn receive_passive(
 
     // Bound before anything is published, because the reply has to carry the
     // port and there is no port until something is listening on it.
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0))
-        .await
-        .context("opening a port to receive on")?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await.context("opening a port to receive on")?;
     let port = listener.local_addr().context("reading the port")?.port();
     let advertise = advertised_address(state, account_id).await?;
 
-    let advertised_name = if offer.file_name.contains(' ') {
-        format!("\"{}\"", offer.file_name)
-    } else {
-        offer.file_name.clone()
-    };
+    let advertised_name =
+        if offer.file_name.contains(' ') { format!("\"{}\"", offer.file_name) } else { offer.file_name.clone() };
     let reply = format!(
         "\u{1}DCC SEND {advertised_name} {} {port} {} {token}\u{1}",
         u32::from(advertise),
@@ -1805,10 +1585,7 @@ async fn receive_passive(
     sender
         .send(irc::proto::Command::PRIVMSG(from.to_string(), reply))
         .map_err(|e| anyhow!("answering {from}'s passive offer: {e}"))?;
-    tracing::info!(
-        "dcc: listening on {advertise}:{port} for {from} to send \"{}\"",
-        offer.file_name
-    );
+    tracing::info!("dcc: listening on {advertise}:{port} for {from} to send \"{}\"", offer.file_name);
 
     let accepted = tokio::time::timeout(PASSIVE_WAIT, listener.accept()).await;
     let (stream, peer) = match accepted {
@@ -1820,23 +1597,10 @@ async fn receive_passive(
     // gives us to check: the address was in the offer, and a connection from
     // anywhere else is somebody who read the reply off the channel.
     if peer.ip() != offer.addr {
-        bail!(
-            "something at {} connected instead of {}",
-            peer.ip(),
-            offer.addr
-        );
+        bail!("something at {} connected instead of {}", peer.ip(), offer.addr);
     }
 
-    let result = stream_socket(
-        stream,
-        offer,
-        &part,
-        max_rate,
-        resume_from,
-        cancel,
-        &mut on_progress,
-    )
-    .await;
+    let result = stream_socket(stream, offer, &part, max_rate, resume_from, cancel, &mut on_progress).await;
     finish(result, &part, &target, dir, cancel).await
 }
 
@@ -1864,36 +1628,22 @@ async fn negotiate_resume(
     dir: &Path,
 ) -> (u64, Option<PathBuf>) {
     let part = part_path(&dir.join(&offer.file_name));
-    let Ok(meta) = tokio::fs::metadata(&part).await else {
-        return (0, None);
-    };
+    let Ok(meta) = tokio::fs::metadata(&part).await else { return (0, None) };
     let have = meta.len();
     if have == 0 || have >= offer.size {
         return (0, None);
     }
-    let Some(sender) = state.runtime.irc_sender(account_id) else {
-        return (0, None);
-    };
+    let Some(sender) = state.runtime.irc_sender(account_id) else { return (0, None) };
 
     let waiting = park_for_accept(offer.port);
     // Quoted, because the name may contain spaces and the sender has to
     // match it against its own record of what it offered.
-    let ask = format!(
-        "\u{1}DCC RESUME \"{}\" {} {}\u{1}",
-        offer.file_name, offer.port, have
-    );
-    if sender
-        .send(irc::proto::Command::PRIVMSG(from.to_string(), ask))
-        .is_err()
-    {
+    let ask = format!("\u{1}DCC RESUME \"{}\" {} {}\u{1}", offer.file_name, offer.port, have);
+    if sender.send(irc::proto::Command::PRIVMSG(from.to_string(), ask)).is_err() {
         stop_waiting(offer.port);
         return (0, None);
     }
-    tracing::info!(
-        "dcc: asking {from} to continue \"{}\" from {have} of {}",
-        offer.file_name,
-        offer.size
-    );
+    tracing::info!("dcc: asking {from} to continue \"{}\" from {have} of {}", offer.file_name, offer.size);
 
     match tokio::time::timeout(ACCEPT_WAIT, waiting).await {
         Ok(Ok(position)) if position <= have => (position, Some(part)),
@@ -1914,12 +1664,8 @@ async fn negotiate_resume(
 
 /// Turns an offer down, or stops one already running.
 pub fn cancel(state: &AppState, id: &str, why: &str) {
-    let Some(transfer) = state.runtime.dcc_transfer(id) else {
-        return;
-    };
-    transfer
-        .cancel
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let Some(transfer) = state.runtime.dcc_transfer(id) else { return };
+    transfer.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     // A transfer already running ends through its own error path, which is
     // what removes the part file; only an unanswered offer is closed here.
     if transfer.state == crate::runtime::DccState::Offered {
@@ -1978,10 +1724,7 @@ pub fn announce(state: &AppState, t: &crate::runtime::DccTransfer) {
 /// would sit at whatever fraction it reached forever, with a cancel button
 /// that does nothing.
 pub fn restore_transfers(state: &AppState) {
-    let rows = match state
-        .store
-        .recent_transfers(crate::runtime::DCC_KEEP as i64)
-    {
+    let rows = match state.store.recent_transfers(crate::runtime::DCC_KEEP as i64) {
         Ok(rows) => rows,
         Err(e) => {
             tracing::warn!("dcc: reading past transfers: {e}");
@@ -1991,35 +1734,25 @@ pub fn restore_transfers(state: &AppState) {
     let mut restored = 0usize;
     for row in rows {
         let interrupted = matches!(row.state.as_str(), "offered" | "receiving" | "sending");
-        state
-            .runtime
-            .push_dcc_transfer(crate::runtime::DccTransfer {
-                id: row.id,
-                account_id: row.account_id,
-                outgoing: row.outgoing,
-                from: row.peer,
-                file_name: row.file_name,
-                raw_name: row.raw_name,
-                size: row.size,
-                received: row.received,
-                rate: 0,
-                state: if interrupted {
-                    crate::runtime::DccState::Failed
-                } else {
-                    crate::runtime::DccState::from_str(&row.state)
-                },
-                path: row.path,
-                error: if interrupted {
-                    Some("interrupted when moho was last closed".to_string())
-                } else {
-                    row.error
-                },
-                kind: crate::runtime::TransferKind::from_str(&row.kind),
-                cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                offer: None,
-                started_at: row.ts,
-            });
+        state.runtime.push_dcc_transfer(crate::runtime::DccTransfer {
+            id: row.id,
+            account_id: row.account_id,
+            outgoing: row.outgoing,
+            from: row.peer,
+            file_name: row.file_name,
+            raw_name: row.raw_name,
+            size: row.size,
+            received: row.received,
+            rate: 0,
+            state: if interrupted { crate::runtime::DccState::Failed } else { crate::runtime::DccState::from_str(&row.state) },
+            path: row.path,
+            error: if interrupted { Some("interrupted when moho was last closed".to_string()) } else { row.error },
+            kind: crate::runtime::TransferKind::from_str(&row.kind),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            offer: None,
+            started_at: row.ts,
+        });
         restored += 1;
     }
     if restored > 0 {
@@ -2067,10 +1800,7 @@ fn note(state: &AppState, account_id: &str, buffer: &str, kind: &str, text: &str
 }
 
 pub fn now_seconds() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
 }
 
 /// Sizes as a person reads them.
@@ -2117,19 +1847,10 @@ mod name_tests {
 
     #[test]
     fn the_ordinary_case_is_left_alone() {
-        assert_eq!(
-            safe_file_name("Some.Show.S01E01.mkv"),
-            "Some.Show.S01E01.mkv"
-        );
-        assert_eq!(
-            safe_file_name("a file with spaces.txt"),
-            "a file with spaces.txt"
-        );
+        assert_eq!(safe_file_name("Some.Show.S01E01.mkv"), "Some.Show.S01E01.mkv");
+        assert_eq!(safe_file_name("a file with spaces.txt"), "a file with spaces.txt");
         // Not everyone names files in English.
-        assert_eq!(
-            safe_file_name("日本語のファイル.zip"),
-            "日本語のファイル.zip"
-        );
+        assert_eq!(safe_file_name("日本語のファイル.zip"), "日本語のファイル.zip");
     }
 
     #[test]
@@ -2146,16 +1867,7 @@ mod name_tests {
     #[test]
     fn windows_devices_are_not_openable_by_accident() {
         // Reserved with any extension, which is the part that surprises people.
-        for raw in [
-            "CON",
-            "con.txt",
-            "NUL",
-            "COM1",
-            "com9.log",
-            "LPT1.tar.gz",
-            "AUX",
-            "PRN",
-        ] {
+        for raw in ["CON", "con.txt", "NUL", "COM1", "com9.log", "LPT1.tar.gz", "AUX", "PRN"] {
             let safe = safe_file_name(raw);
             let stem = safe.split('.').next().unwrap();
             assert!(
@@ -2179,11 +1891,7 @@ mod name_tests {
     fn an_absurd_name_is_shortened_but_still_says_what_it_is() {
         let raw = format!("{}.mkv", "a".repeat(500));
         let safe = safe_file_name(&raw);
-        assert!(
-            safe.chars().count() <= MAX_NAME_CHARS,
-            "{}",
-            safe.chars().count()
-        );
+        assert!(safe.chars().count() <= MAX_NAME_CHARS, "{}", safe.chars().count());
         assert!(safe.ends_with(".mkv"), "{safe:?}");
     }
 
@@ -2257,18 +1965,7 @@ mod transfer_tests {
 
     async fn run(dir: &Path, offer: &DccSend, max: u64) -> Result<PathBuf> {
         let cancel = AtomicBool::new(false);
-        receive(
-            offer,
-            &crate::net::tor::Transport::Direct,
-            dir,
-            max,
-            0,
-            0,
-            None,
-            &cancel,
-            |_| {},
-        )
-        .await
+        receive(offer, &crate::net::tor::Transport::Direct, dir, max, 0, 0, None, &cancel, |_| {}).await
     }
 
     #[tokio::test]
@@ -2276,9 +1973,7 @@ mod transfer_tests {
         let dir = temp_dir("whole");
         let body = vec![7u8; 200_000];
         let port = serve(body.clone()).await;
-        let path = run(&dir, &offer_of(port, "thing.bin", body.len() as u64), 0)
-            .await
-            .expect("should arrive");
+        let path = run(&dir, &offer_of(port, "thing.bin", body.len() as u64), 0).await.expect("should arrive");
 
         assert_eq!(path, dir.join("thing.bin"));
         assert_eq!(std::fs::read(&path).unwrap(), body);
@@ -2292,35 +1987,22 @@ mod transfer_tests {
         // Offers 10 bytes, sends 100_000. The size was a claim; this is what
         // stops the claim being the limit.
         let port = serve(vec![1u8; 100_000]).await;
-        let err = run(&dir, &offer_of(port, "liar.bin", 10), 0)
-            .await
-            .unwrap_err();
+        let err = run(&dir, &offer_of(port, "liar.bin", 10), 0).await.unwrap_err();
 
         assert!(format!("{err:#}").contains("more than"), "{err:#}");
-        assert!(
-            !dir.join("liar.bin").exists(),
-            "nothing should have been kept"
-        );
-        assert!(
-            !part_path(&dir.join("liar.bin")).exists(),
-            "no part file should survive"
-        );
+        assert!(!dir.join("liar.bin").exists(), "nothing should have been kept");
+        assert!(!part_path(&dir.join("liar.bin")).exists(), "no part file should survive");
     }
 
     #[tokio::test]
     async fn a_transfer_that_stops_early_keeps_what_it_got() {
         let dir = temp_dir("short");
         let port = serve(vec![2u8; 50]).await;
-        let err = run(&dir, &offer_of(port, "short.bin", 5_000), 0)
-            .await
-            .unwrap_err();
+        let err = run(&dir, &offer_of(port, "short.bin", 5_000), 0).await.unwrap_err();
 
         assert!(format!("{err:#}").contains("ended after"), "{err:#}");
         // Still not left looking whole - that half has not changed.
-        assert!(
-            !dir.join("short.bin").exists(),
-            "a partial file must not wear the final name"
-        );
+        assert!(!dir.join("short.bin").exists(), "a partial file must not wear the final name");
         // But kept, because it is the only thing a later RESUME can continue
         // from, and a sender hanging up two thirds of the way through a large
         // file is the ordinary case rather than the strange one.
@@ -2337,25 +2019,12 @@ mod transfer_tests {
         let port = serve(vec![3u8; 100_000]).await;
         let cancel = std::sync::atomic::AtomicBool::new(true);
         let offer = offer_of(port, "stopped.bin", 100_000);
-        let err = receive(
-            &offer,
-            &crate::net::tor::Transport::Direct,
-            &dir,
-            0,
-            0,
-            0,
-            None,
-            &cancel,
-            |_| {},
-        )
-        .await
-        .unwrap_err();
+        let err = receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 0, 0, None, &cancel, |_| {})
+            .await
+            .unwrap_err();
 
         assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
-        assert!(
-            !part_path(&dir.join("stopped.bin")).exists(),
-            "a cancelled transfer leaves nothing"
-        );
+        assert!(!part_path(&dir.join("stopped.bin")).exists(), "a cancelled transfer leaves nothing");
     }
 
     #[tokio::test]
@@ -2369,27 +2038,13 @@ mod transfer_tests {
         let port = serve(vec![9u8; 60]).await;
         let offer = offer_of(port, "half.bin", 100);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let got = receive(
-            &offer,
-            &crate::net::tor::Transport::Direct,
-            &dir,
-            0,
-            0,
-            40,
-            Some(part),
-            &cancel,
-            |_| {},
-        )
-        .await
-        .expect("the transfer should complete");
+        let got = receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 0, 40, Some(part), &cancel, |_| {})
+            .await
+            .expect("the transfer should complete");
 
         let whole = std::fs::read(&got).unwrap();
         assert_eq!(whole.len(), 100, "the two halves should make one file");
-        assert_eq!(
-            &whole[..40],
-            &[7u8; 40],
-            "what was already there is untouched"
-        );
+        assert_eq!(&whole[..40], &[7u8; 40], "what was already there is untouched");
         assert_eq!(&whole[40..], &[9u8; 60], "the rest is appended after it");
     }
 
@@ -2398,9 +2053,7 @@ mod transfer_tests {
         let dir = temp_dir("toobig");
         // Port 1 would refuse the connection, so reaching the size check is
         // the only way this can pass.
-        let err = run(&dir, &offer_of(1, "huge.bin", 10_000), 1_000)
-            .await
-            .unwrap_err();
+        let err = run(&dir, &offer_of(1, "huge.bin", 10_000), 1_000).await.unwrap_err();
         assert!(format!("{err:#}").contains("over the"), "{err:#}");
     }
 
@@ -2410,10 +2063,7 @@ mod transfer_tests {
         assert_eq!(acknowledgement(1024, 5_000), 1024u32.to_be_bytes().to_vec());
         // Right on the boundary: still four bytes, because the count can
         // still be said in four.
-        assert_eq!(
-            acknowledgement(7, u64::from(u32::MAX)),
-            7u32.to_be_bytes().to_vec()
-        );
+        assert_eq!(acknowledgement(7, u64::from(u32::MAX)), 7u32.to_be_bytes().to_vec());
 
         // One byte past it, and the width changes for the whole transfer -
         // including while the count is still small, which is the point. A
@@ -2444,18 +2094,9 @@ mod transfer_tests {
         // A token with a real port is still passive - some senders do this,
         // and answering it as an ordinary offer would dial a port that is
         // not listening.
-        assert!(DccSend {
-            port: 5000,
-            ..passive.clone()
-        }
-        .passive());
+        assert!(DccSend { port: 5000, ..passive.clone() }.passive());
         // Neither is an ordinary offer.
-        assert!(!DccSend {
-            port: 5000,
-            token: None,
-            ..passive
-        }
-        .passive());
+        assert!(!DccSend { port: 5000, token: None, ..passive }.passive());
     }
 
     #[tokio::test]
@@ -2477,16 +2118,12 @@ mod transfer_tests {
         let body: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
         std::fs::write(&path, &body).unwrap();
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
 
         // The receiving side, which is what a real client would be.
         let got = tokio::spawn(async move {
-            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
             let mut out = Vec::new();
             let mut buf = [0u8; 4096];
             while let Ok(n) = sock.read(&mut buf).await {
@@ -2499,49 +2136,27 @@ mod transfer_tests {
         });
 
         let cancel = AtomicBool::new(false);
-        serve_file(
-            listener,
-            path.to_str().unwrap(),
-            body.len() as u64,
-            0,
-            &cancel,
-            || {},
-            |_| {},
-        )
-        .await
-        .expect("should send");
+        serve_file(listener, path.to_str().unwrap(), body.len() as u64, 0, &cancel, || {}, |_| {})
+            .await
+            .expect("should send");
 
-        assert_eq!(
-            got.await.unwrap(),
-            body,
-            "what arrived is not what was sent"
-        );
+        assert_eq!(got.await.unwrap(), body, "what arrived is not what was sent");
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn an_offer_nobody_takes_gives_up_rather_than_waiting_forever() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let cancel = AtomicBool::new(false);
         let began = std::time::Instant::now();
-        let err = wait_for_taker(&listener, std::time::Duration::from_millis(300), &cancel)
-            .await
-            .unwrap_err();
+        let err = wait_for_taker(&listener, std::time::Duration::from_millis(300), &cancel).await.unwrap_err();
         assert!(format!("{err:#}").contains("did not accept"), "{err:#}");
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(3),
-            "it waited {:?}",
-            began.elapsed()
-        );
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "it waited {:?}", began.elapsed());
     }
 
     #[tokio::test]
     async fn cancelling_an_offer_nobody_has_taken_ends_it_at_once() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         tokio::spawn(async move {
@@ -2550,30 +2165,20 @@ mod transfer_tests {
         });
         let began = std::time::Instant::now();
         // An hour's patience, so only the cancel can be what ends it.
-        let err = wait_for_taker(&listener, std::time::Duration::from_secs(3600), &cancel)
-            .await
-            .unwrap_err();
+        let err = wait_for_taker(&listener, std::time::Duration::from_secs(3600), &cancel).await.unwrap_err();
         assert!(format!("{err:#}").contains("cancelled"), "{err:#}");
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(3),
-            "it waited {:?}",
-            began.elapsed()
-        );
+        assert!(began.elapsed() < std::time::Duration::from_secs(3), "it waited {:?}", began.elapsed());
     }
 
     #[tokio::test]
     async fn someone_who_connects_is_the_one_taken() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             let _ = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
         });
         let cancel = AtomicBool::new(false);
-        let (_, peer) = wait_for_taker(&listener, std::time::Duration::from_secs(5), &cancel)
-            .await
-            .expect("should accept");
+        let (_, peer) = wait_for_taker(&listener, std::time::Duration::from_secs(5), &cancel).await.expect("should accept");
         assert!(peer.ip().is_loopback());
     }
 
@@ -2589,29 +2194,13 @@ mod transfer_tests {
 
         let began = std::time::Instant::now();
         let offer = offer_of(port, "slow.bin", body.len() as u64);
-        receive(
-            &offer,
-            &crate::net::tor::Transport::Direct,
-            &dir,
-            0,
-            20 * 1024,
-            0,
-            None,
-            &cancel,
-            |_| {},
-        )
-        .await
-        .expect("should still arrive");
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 20 * 1024, 0, None, &cancel, |_| {})
+            .await
+            .expect("should still arrive");
         let took = began.elapsed();
 
-        assert!(
-            took >= std::time::Duration::from_millis(900),
-            "took {took:?}, so the limit did nothing"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("slow.bin")).unwrap().len(),
-            body.len()
-        );
+        assert!(took >= std::time::Duration::from_millis(900), "took {took:?}, so the limit did nothing");
+        assert_eq!(std::fs::read(dir.join("slow.bin")).unwrap().len(), body.len());
     }
 
     #[tokio::test]
@@ -2623,34 +2212,18 @@ mod transfer_tests {
         let seen = std::sync::Mutex::new(Vec::new());
 
         let offer = offer_of(port, "measured.bin", body.len() as u64);
-        receive(
-            &offer,
-            &crate::net::tor::Transport::Direct,
-            &dir,
-            0,
-            16 * 1024,
-            0,
-            None,
-            &cancel,
-            |p| {
-                seen.lock().unwrap().push((p.received, p.rate));
-            },
-        )
+        receive(&offer, &crate::net::tor::Transport::Direct, &dir, 0, 16 * 1024, 0, None, &cancel, |p| {
+            seen.lock().unwrap().push((p.received, p.rate));
+        })
         .await
         .unwrap();
 
         let seen = seen.lock().unwrap();
-        assert!(
-            !seen.is_empty(),
-            "a transfer should report progress at least once"
-        );
+        assert!(!seen.is_empty(), "a transfer should report progress at least once");
         // The last report is the whole file, which is what a finished bar
         // needs in order to reach the end.
         assert_eq!(seen.last().unwrap().0, body.len() as u64);
-        assert!(
-            seen.iter().any(|(_, rate)| *rate > 0),
-            "no report carried a rate: {seen:?}"
-        );
+        assert!(seen.iter().any(|(_, rate)| *rate > 0), "no report carried a rate: {seen:?}");
     }
 
     #[tokio::test]
@@ -2664,11 +2237,7 @@ mod transfer_tests {
         let second = run(&dir, &offer_of(port, "dup.bin", 64), 0).await.unwrap();
 
         assert_eq!(first, dir.join("dup.bin"));
-        assert_eq!(
-            second,
-            dir.join("dup (2).bin"),
-            "the first must not be replaced"
-        );
+        assert_eq!(second, dir.join("dup (2).bin"), "the first must not be replaced");
         assert!(first.exists() && second.exists());
     }
 
@@ -2677,15 +2246,9 @@ mod transfer_tests {
         let dir = temp_dir("traversal");
         let body = vec![9u8; 32];
         let port = serve(body).await;
-        let path = run(&dir, &offer_of(port, "../../../../tmp/escaped.bin", 32), 0)
-            .await
-            .unwrap();
+        let path = run(&dir, &offer_of(port, "../../../../tmp/escaped.bin", 32), 0).await.unwrap();
 
-        assert_eq!(
-            path.parent().unwrap(),
-            dir,
-            "it must sit directly in the download folder"
-        );
+        assert_eq!(path.parent().unwrap(), dir, "it must sit directly in the download folder");
         assert_eq!(path.file_name().unwrap(), "escaped.bin");
     }
 }
@@ -2725,23 +2288,14 @@ mod parse_tests {
 
     #[test]
     fn a_dotted_quad_and_an_ipv6_literal_both_read() {
-        assert_eq!(
-            send("\u{1}DCC SEND f 203.0.113.5 1 2\u{1}").addr,
-            "203.0.113.5".parse::<IpAddr>().unwrap()
-        );
-        assert_eq!(
-            send("\u{1}DCC SEND f 2001:db8::1 1 2\u{1}").addr,
-            "2001:db8::1".parse::<IpAddr>().unwrap()
-        );
+        assert_eq!(send("\u{1}DCC SEND f 203.0.113.5 1 2\u{1}").addr, "203.0.113.5".parse::<IpAddr>().unwrap());
+        assert_eq!(send("\u{1}DCC SEND f 2001:db8::1 1 2\u{1}").addr, "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn a_missing_trailing_delimiter_is_tolerated() {
         // Real clients omit it often enough that refusing would lose files.
-        assert_eq!(
-            send("\u{1}DCC SEND f.bin 3232235777 5000 1").file_name,
-            "f.bin"
-        );
+        assert_eq!(send("\u{1}DCC SEND f.bin 3232235777 5000 1").file_name, "f.bin");
     }
 
     #[test]
@@ -2759,10 +2313,7 @@ mod parse_tests {
             "\u{1}DCC SEND f 2851995649 5000 1\u{1}", // 169.254.0.1
             "\u{1}DCC SEND f ::1 5000 1\u{1}",
         ] {
-            assert!(
-                parse_dcc(body).is_none(),
-                "{body:?} should not parse into an offer"
-            );
+            assert!(parse_dcc(body).is_none(), "{body:?} should not parse into an offer");
         }
     }
 
@@ -2776,51 +2327,30 @@ mod parse_tests {
 
     #[test]
     fn other_dcc_verbs_are_named_rather_than_shown_as_control_codes() {
-        assert_eq!(
-            parse_dcc("\u{1}DCC CHAT chat 1 2\u{1}"),
-            Some(Dcc::Unsupported("CHAT".into()))
-        );
+        assert_eq!(parse_dcc("\u{1}DCC CHAT chat 1 2\u{1}"), Some(Dcc::Unsupported("CHAT".into())));
         // RESUME is what *we* send; a sender asking us to resume would mean
         // moho was the one sending, which it does not do.
-        assert_eq!(
-            parse_dcc("\u{1}DCC RESUME f 5000 100\u{1}"),
-            Some(Dcc::Unsupported("RESUME".into()))
-        );
+        assert_eq!(parse_dcc("\u{1}DCC RESUME f 5000 100\u{1}"), Some(Dcc::Unsupported("RESUME".into())));
 
         // ACCEPT is the answer to ours, and is read.
         assert_eq!(
             parse_dcc("\u{1}DCC ACCEPT file.bin 5000 4096\u{1}"),
-            Some(Dcc::Accept {
-                file_name: "file.bin".into(),
-                port: 5000,
-                position: 4096
-            })
+            Some(Dcc::Accept { file_name: "file.bin".into(), port: 5000, position: 4096 })
         );
         // Quoted, which is how every sender echoes a name with a space in it.
         assert_eq!(
             parse_dcc("\u{1}DCC ACCEPT \"two words.bin\" 5000 4096\u{1}"),
-            Some(Dcc::Accept {
-                file_name: "two words.bin".into(),
-                port: 5000,
-                position: 4096
-            })
+            Some(Dcc::Accept { file_name: "two words.bin".into(), port: 5000, position: 4096 })
         );
         // Unquoted with spaces, which some senders do: the two numbers are
         // taken from the end, where the shape of the line is fixed, and
         // everything before them is the name.
         assert_eq!(
             parse_dcc("\u{1}DCC ACCEPT two words.bin 5000 4096\u{1}"),
-            Some(Dcc::Accept {
-                file_name: "two words.bin".into(),
-                port: 5000,
-                position: 4096
-            })
+            Some(Dcc::Accept { file_name: "two words.bin".into(), port: 5000, position: 4096 })
         );
         // Not a resume at all, and not to be mistaken for one.
-        assert_eq!(
-            parse_dcc("\u{1}DCC ACCEPT nonsense\u{1}"),
-            Some(Dcc::Unsupported("ACCEPT".into()))
-        );
+        assert_eq!(parse_dcc("\u{1}DCC ACCEPT nonsense\u{1}"), Some(Dcc::Unsupported("ACCEPT".into())));
     }
 
     #[test]
@@ -2853,23 +2383,14 @@ mod auto_resume_tests {
     fn an_xdcc_request_is_remembered_and_nothing_else_is() {
         let acct = "irc:test";
         remember_request(acct, "bot", "xdcc send #42");
-        assert_eq!(
-            remembered_request(acct, "bot").as_deref(),
-            Some("xdcc send #42")
-        );
+        assert_eq!(remembered_request(acct, "bot").as_deref(), Some("xdcc send #42"));
         // Nicks are compared without case, the way IRC compares them.
-        assert_eq!(
-            remembered_request(acct, "BOT").as_deref(),
-            Some("xdcc send #42")
-        );
+        assert_eq!(remembered_request(acct, "BOT").as_deref(), Some("xdcc send #42"));
 
         // The later request wins: whatever is arriving now is the one worth
         // asking for again.
         remember_request(acct, "bot", "XDCC SEND 9");
-        assert_eq!(
-            remembered_request(acct, "bot").as_deref(),
-            Some("XDCC SEND 9")
-        );
+        assert_eq!(remembered_request(acct, "bot").as_deref(), Some("XDCC SEND 9"));
 
         // Ordinary conversation is not a request, and a channel is not a bot.
         remember_request(acct, "friend", "did you get the xdcc send working");

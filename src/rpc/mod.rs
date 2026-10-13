@@ -3,9 +3,9 @@ pub mod wire;
 
 use crate::state::AppState;
 use anyhow::{Context, Result};
-use futures::FutureExt;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use futures::FutureExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Starts the local JSON-RPC server.
@@ -137,13 +137,10 @@ async fn handle_line(state: &AppState, line: &str, subscriptions: &Subscriptions
         Err(e) => return wire::err_response(&serde_json::Value::Null, &e.to_string()).to_string(),
     };
 
-    let (result, error) =
-        methods::dispatch(state, &request.method, &request.params, subscriptions).await;
+    let (result, error) = methods::dispatch(state, &request.method, &request.params, subscriptions).await;
     match error {
         Some(msg) => wire::err_response(&request.id, &msg).to_string(),
-        None => {
-            wire::ok_response(&request.id, result.unwrap_or(serde_json::Value::Null)).to_string()
-        }
+        None => wire::ok_response(&request.id, result.unwrap_or(serde_json::Value::Null)).to_string(),
     }
 }
 

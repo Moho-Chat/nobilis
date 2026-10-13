@@ -60,9 +60,7 @@ pub const TIMELINE_LIMIT: u32 = 20;
 
 /// Whether this homeserver speaks it, by its own account.
 pub fn supported_in_versions(versions: &Value) -> bool {
-    versions["unstable_features"][SLIDING_FEATURE]
-        .as_bool()
-        .unwrap_or(false)
+    versions["unstable_features"][SLIDING_FEATURE].as_bool().unwrap_or(false)
 }
 
 /// The state a room needs for moho to draw it.
@@ -139,10 +137,7 @@ pub fn to_classic(resp: &Value) -> Value {
         // An invitation carries its stripped state and nothing else - no
         // timeline to read and no membership to act on until it is answered.
         if room["invite_state"].is_array() {
-            invite.insert(
-                room_id.clone(),
-                json!({ "invite_state": events(array(&room["invite_state"])) }),
-            );
+            invite.insert(room_id.clone(), json!({ "invite_state": events(array(&room["invite_state"])) }));
             continue;
         }
 
@@ -204,12 +199,7 @@ fn left_in(state: &Value) -> bool {
         .into_iter()
         .flatten()
         .filter(|e| e["type"].as_str() == Some("m.room.member"))
-        .any(|e| {
-            matches!(
-                e["content"]["membership"].as_str(),
-                Some("leave") | Some("ban")
-            )
-        })
+        .any(|e| matches!(e["content"]["membership"].as_str(), Some("leave") | Some("ban")))
 }
 
 #[cfg(test)]
@@ -287,10 +277,7 @@ mod tests {
             c["rooms"]["join"]["!a:example.org"]["account_data"]["events"][0]["type"],
             json!("m.marked_unread")
         );
-        assert_eq!(
-            c["account_data"]["events"][0]["type"],
-            json!("m.ignored_user_list")
-        );
+        assert_eq!(c["account_data"]["events"][0]["type"], json!("m.ignored_user_list"));
     }
 
     /// The crypto machine reads these three off the top level, so the e2ee
@@ -300,10 +287,7 @@ mod tests {
         let c = to_classic(&sample());
         assert_eq!(c["to_device"]["events"][0]["type"], json!("m.room_key"));
         assert_eq!(c["device_lists"]["changed"][0], json!("@x:example.org"));
-        assert_eq!(
-            c["device_one_time_keys_count"]["signed_curve25519"],
-            json!(42)
-        );
+        assert_eq!(c["device_one_time_keys_count"]["signed_curve25519"], json!(42));
     }
 
     #[test]
@@ -348,19 +332,13 @@ mod tests {
     fn a_missing_prev_batch_is_left_out_rather_than_written_as_null() {
         let resp = json!({ "pos": "s1", "rooms": { "!a:x": { "timeline": [] } } });
         let c = to_classic(&resp);
-        assert!(c["rooms"]["join"]["!a:x"]["timeline"]
-            .get("prev_batch")
-            .is_none());
+        assert!(c["rooms"]["join"]["!a:x"]["timeline"].get("prev_batch").is_none());
     }
 
     #[test]
     fn the_feature_flag_is_read_from_the_versions_answer() {
-        assert!(supported_in_versions(
-            &json!({ "unstable_features": { SLIDING_FEATURE: true } })
-        ));
-        assert!(!supported_in_versions(
-            &json!({ "unstable_features": { SLIDING_FEATURE: false } })
-        ));
+        assert!(supported_in_versions(&json!({ "unstable_features": { SLIDING_FEATURE: true } })));
+        assert!(!supported_in_versions(&json!({ "unstable_features": { SLIDING_FEATURE: false } })));
         assert!(!supported_in_versions(&json!({ "unstable_features": {} })));
         assert!(!supported_in_versions(&json!({})));
     }
@@ -369,37 +347,15 @@ mod tests {
     fn the_request_asks_for_the_state_a_room_needs_and_lazy_members() {
         let body = request_body();
         let state = &body["lists"]["all"]["required_state"];
-        let pairs: Vec<String> = state
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p[0].as_str().unwrap().to_string())
-            .collect();
-        for wanted in [
-            "m.room.name",
-            "m.room.encryption",
-            "m.room.power_levels",
-            "m.space.child",
-        ] {
-            assert!(
-                pairs.contains(&wanted.to_string()),
-                "{wanted} should be asked for"
-            );
+        let pairs: Vec<String> = state.as_array().unwrap().iter().map(|p| p[0].as_str().unwrap().to_string()).collect();
+        for wanted in ["m.room.name", "m.room.encryption", "m.room.power_levels", "m.space.child"] {
+            assert!(pairs.contains(&wanted.to_string()), "{wanted} should be asked for");
         }
         // The roster is the expensive one and is asked for lazily.
-        let members = state
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p[0] == "m.room.member")
-            .unwrap();
+        let members = state.as_array().unwrap().iter().find(|p| p[0] == "m.room.member").unwrap();
         assert_eq!(members[1], json!("$LAZY"));
         for ext in ["to_device", "e2ee", "account_data", "receipts", "typing"] {
-            assert_eq!(
-                body["extensions"][ext]["enabled"],
-                json!(true),
-                "{ext} should be enabled"
-            );
+            assert_eq!(body["extensions"][ext]["enabled"], json!(true), "{ext} should be enabled");
         }
     }
 }

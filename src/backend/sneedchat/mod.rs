@@ -29,24 +29,24 @@
 //! As in the other backends, the submodules are re-exported flat so callers
 //! say `backend::sneedchat::send_message` without knowing which file that is,
 //! and each opens with `use super::*` to share the imports below.
-pub mod auth;
 pub mod chat;
 pub mod connect;
-pub mod live;
 pub mod media;
 pub mod postimg;
 pub mod probes;
 pub mod rooms;
+pub mod live;
 pub mod send;
+pub mod auth;
 
 // Not `pub use`: what a room's socket does with a frame is this folder's
 // business; the files beside it want the helpers.
 use chat::*;
 pub use connect::*;
-pub use live::{leave_room, set_rooms};
 pub use media::*;
 pub use postimg::*;
 pub use rooms::*;
+pub use live::{leave_room, set_rooms};
 pub use send::*;
 pub mod captcha;
 pub mod form;

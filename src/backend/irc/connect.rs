@@ -69,32 +69,19 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
     // just because they happen to share an account_id.
     let generation = state.runtime.next_generation(&account_id);
     state.runtime.set_wants_connected(&account_id, true);
-    state
-        .runtime
-        .set_conn_state(&state, &account_id, ConnState::Connecting, None);
-    let delay = state
-        .runtime
-        .throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
+    state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
+    let delay = state.runtime.throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
     let join_handle = tokio::spawn({
         let account_id = account_id.clone();
         let state = state.clone();
         async move {
             if !delay.is_zero() {
-                state.runtime.report_progress(
-                    &state,
-                    &account_id,
-                    &format!(
-                        "Waiting {}s before connecting (reconnected too recently)...",
-                        delay.as_secs().max(1)
-                    ),
-                );
+                state.runtime.report_progress(&state, &account_id, &format!("Waiting {}s before connecting (reconnected too recently)...", delay.as_secs().max(1)));
                 tokio::time::sleep(delay).await;
             }
             let mut backoff = RECONNECT_INITIAL_DELAY;
             loop {
-                let result = std::panic::AssertUnwindSafe(run(&state, &config))
-                    .catch_unwind()
-                    .await;
+                let result = std::panic::AssertUnwindSafe(run(&state, &config)).catch_unwind().await;
                 let detail = match result {
                     Ok(Ok(())) => None,
                     Ok(Err(e)) => {
@@ -111,13 +98,7 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 // off *by* ending it - disconnect() sends QUIT, which is
                 // what brought us back here.
                 if !state.runtime.wants_connected(&account_id) {
-                    state.runtime.finish_connection(
-                        &state,
-                        &account_id,
-                        generation,
-                        ConnState::Disconnected,
-                        detail.as_deref(),
-                    );
+                    state.runtime.finish_connection(&state, &account_id, generation, ConnState::Disconnected, detail.as_deref());
                     return;
                 }
 
@@ -136,24 +117,13 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
                 // and asking on the strength of a stale answer is a command
                 // answered with an error.
                 state.runtime.clear_irc_caps(&account_id);
-                state
-                    .runtime
-                    .set_conn_state(&state, &account_id, ConnState::Connecting, None);
+                state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
                 let because = detail.unwrap_or_else(|| "Connection closed".to_string());
-                let wait = state.runtime.next_retry_delay(
-                    &account_id,
-                    &mut backoff,
-                    RECONNECT_INITIAL_DELAY,
-                    RECONNECT_MAX_DELAY,
-                );
-                state
-                    .runtime
-                    .report_retry(&state, &account_id, &because, wait);
+                let wait = state.runtime.next_retry_delay(&account_id, &mut backoff, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+                state.runtime.report_retry(&state, &account_id, &because, wait);
                 tokio::time::sleep(wait).await;
 
-                let pace = state
-                    .runtime
-                    .throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
+                let pace = state.runtime.throttle_connect_attempt(&account_id, MIN_RECONNECT_INTERVAL);
                 if !pace.is_zero() {
                     tokio::time::sleep(pace).await;
                 }
@@ -164,9 +134,7 @@ pub fn spawn(state: AppState, config: IrcAccountConfig) {
     // this is what lets setAccountConnected(false) cancel a connection
     // that's still stuck in DNS/TCP/TLS/registration, which has no Sender
     // yet for a graceful QUIT (see Runtime::disconnect()).
-    state
-        .runtime
-        .insert_task_handle(&account_id, join_handle.abort_handle());
+    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 pub fn send_autojoin(sender: &Sender, autojoin_csv: &str) {
@@ -221,23 +189,11 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
         let config = config.clone();
         // Each attempt hears the server afresh, and here rather than
         // around run(): a task-local does not follow into a spawned task.
-        async move {
-            HEARD
-                .scope(
-                    std::cell::RefCell::new(Farewell::default()),
-                    establish(&state, &config),
-                )
-                .await
-        }
+        async move { HEARD.scope(std::cell::RefCell::new(Farewell::default()), establish(&state, &config)).await }
     });
     let establish_abort = establish_task.abort_handle();
 
-    let (sender, mut stream, nickserv_wait, authenticated) = match tokio::time::timeout(
-        OVERALL_ESTABLISH_TIMEOUT,
-        establish_task,
-    )
-    .await
-    {
+    let (sender, mut stream, nickserv_wait, authenticated) = match tokio::time::timeout(OVERALL_ESTABLISH_TIMEOUT, establish_task).await {
         Err(_) => {
             // Best-effort: if establish() actually is cooperating (just
             // slow, not truly wedged), this frees it immediately instead
@@ -270,11 +226,7 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     // you talking to a wall. ISON is the universal way to ask - MONITOR is
     // better where it exists, but not every server has it and this needs no
     // capability negotiation to work anywhere.
-    let ison = tokio::spawn(poll_query_presence(
-        state.clone(),
-        account_id.clone(),
-        sender.clone(),
-    ));
+    let ison = tokio::spawn(poll_query_presence(state.clone(), account_id.clone(), sender.clone()));
 
     // And who to be told about whether or not there is a conversation open
     // with them. Cleared first: a reconnect knows nothing about who is on, and
@@ -289,9 +241,7 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
     // transfer starts: turning Tor off in settings does not move a connection
     // that is already established, and a transfer must follow the connection
     // rather than the setting.
-    state
-        .runtime
-        .set_irc_transport(&account_id, Some(dcc::transport_for(config)));
+    state.runtime.set_irc_transport(&account_id, Some(dcc::transport_for(config)));
 
     // A login that could not happen at connect - services were down, so the
     // server offered no SASL - happens here instead, when the server says
@@ -351,41 +301,17 @@ pub(super) async fn run(state: &AppState, config: &IrcAccountConfig) -> Result<(
 /// and this network has been set to allow it, a reconnect, whose registration
 /// logs in the ordinary way. Never after a refused password - reconnecting
 /// would only send it again.
-fn act_on_late_sasl(
-    state: &AppState,
-    account_id: &str,
-    sender: &Sender,
-    config: &IrcAccountConfig,
-    outs: Vec<super::latesasl::Out>,
-) {
+fn act_on_late_sasl(state: &AppState, account_id: &str, sender: &Sender, config: &IrcAccountConfig, outs: Vec<super::latesasl::Out>) {
     use super::latesasl::Out;
     let host = super::incoming::server_buffer(account_id);
     let note = |kind: &str, body: &str| {
-        state.runtime.record_message(
-            state,
-            account_id,
-            host,
-            "server",
-            "*",
-            body,
-            false,
-            kind,
-            None,
-            None,
-            false,
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
+        state.runtime.record_message(state, account_id, host, "server", "*", body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
     };
     for out in outs {
         match out {
             Out::Send(command) => {
                 if let Err(e) = sender.send(command) {
-                    tracing::warn!(
-                        "irc[{account_id}]: sending during the late SASL login failed: {e}"
-                    );
+                    tracing::warn!("irc[{account_id}]: sending during the late SASL login failed: {e}");
                 }
             }
             Out::LoggedIn { account } => {
@@ -398,17 +324,8 @@ fn act_on_late_sasl(
             }
             Out::Refused { why, credentials } => {
                 tracing::warn!("irc[{account_id}]: the late SASL login did not happen: {why}");
-                if let Some(pw) = config
-                    .nickserv_password
-                    .as_deref()
-                    .filter(|p| !p.is_empty())
-                {
-                    note(
-                        "error",
-                        &format!(
-                            "Couldn't log in with SASL: {why}. Identifying to NickServ instead."
-                        ),
-                    );
+                if let Some(pw) = config.nickserv_password.as_deref().filter(|p| !p.is_empty()) {
+                    note("error", &format!("Couldn't log in with SASL: {why}. Identifying to NickServ instead."));
                     if let Err(e) = sender.send_privmsg("NickServ", format!("IDENTIFY {pw}")) {
                         tracing::warn!("irc[{account_id}]: NickServ IDENTIFY failed to send: {e}");
                     }
@@ -437,10 +354,7 @@ fn act_on_late_sasl(
 /// Split out from run() specifically so it can be wrapped in one single
 /// outer timeout independent of its own inner per-step ones - see
 /// OVERALL_ESTABLISH_TIMEOUT's doc comment above.
-pub(super) async fn establish(
-    state: &AppState,
-    config: &IrcAccountConfig,
-) -> Result<(Sender, ClientStream, Option<NickservWait>, bool)> {
+pub(super) async fn establish(state: &AppState, config: &IrcAccountConfig) -> Result<(Sender, ClientStream, Option<NickservWait>, bool)> {
     let account_id = config.account_id();
 
     // A network that told us, over TLS, not to come back in plaintext.
@@ -461,19 +375,8 @@ pub(super) async fn establish(
     let mut config = config.clone();
     if !config.ssl {
         if let Some(policy) = state.irc_sts.policy(&config.host) {
-            tracing::info!(
-                "irc[{account_id}]: STS in force for {}, using TLS on port {}",
-                config.host,
-                policy.port
-            );
-            state.runtime.report_progress(
-                state,
-                &account_id,
-                &format!(
-                    "{} requires TLS (STS) - connecting on port {} instead",
-                    config.host, policy.port
-                ),
-            );
+            tracing::info!("irc[{account_id}]: STS in force for {}, using TLS on port {}", config.host, policy.port);
+            state.runtime.report_progress(state, &account_id, &format!("{} requires TLS (STS) - connecting on port {} instead", config.host, policy.port));
             config.ssl = true;
             config.port = Some(policy.port);
         }
@@ -487,14 +390,8 @@ pub(super) async fn establish(
     // Started here and only here, so a direct account never starts Tor.
     let router = crate::net::route::router();
     let socks = if router.routed(&account_id) {
-        state
-            .runtime
-            .report_progress(state, &account_id, "Starting Tor or reaching the proxy...");
-        Some(
-            router
-                .ready(|msg| state.runtime.report_progress(state, &account_id, msg))
-                .await?,
-        )
+        state.runtime.report_progress(state, &account_id, "Starting Tor or reaching the proxy...");
+        Some(router.ready(|msg| state.runtime.report_progress(state, &account_id, msg)).await?)
     } else {
         None
     };
@@ -515,24 +412,10 @@ pub(super) async fn establish(
         server: Some(config.host.clone()),
         port: Some(port),
         use_tls: Some(config.ssl),
-        username: Some(
-            config
-                .username
-                .clone()
-                .unwrap_or_else(|| config.nick.clone()),
-        ),
-        realname: Some(
-            config
-                .realname
-                .clone()
-                .unwrap_or_else(|| config.nick.clone()),
-        ),
+        username: Some(config.username.clone().unwrap_or_else(|| config.nick.clone())),
+        realname: Some(config.realname.clone().unwrap_or_else(|| config.nick.clone())),
         // SASL uses AUTHENTICATE, not the server PASS field.
-        password: if config.sasl {
-            None
-        } else {
-            config.password.clone()
-        },
+        password: if config.sasl { None } else { config.password.clone() },
         // The certificate SASL EXTERNAL authenticates with. Set on the
         // connection rather than sent in a message: EXTERNAL means "whoever
         // this TLS session already proved me to be", so without it here there
@@ -545,11 +428,7 @@ pub(super) async fn establish(
         ..Default::default()
     };
 
-    state.runtime.report_progress(
-        state,
-        &account_id,
-        &format!("Resolving and connecting to {}:{port}...", config.host),
-    );
+    state.runtime.report_progress(state, &account_id, &format!("Resolving and connecting to {}:{port}...", config.host));
 
     // from_config() does DNS + TCP + TLS handshake with no timeout of its
     // own - an unreachable address (e.g. a AAAA record with no real IPv6
@@ -583,10 +462,7 @@ pub(super) async fn establish(
     if !config.ssl {
         if let Some(raw) = offered_caps_raw(&sender, &mut stream).await {
             if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
-                bail!(
-                    "{} requires TLS (STS) - reconnecting on port {port}",
-                    config.host
-                );
+                bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
             }
         }
     }
@@ -596,22 +472,17 @@ pub(super) async fn establish(
     // SASL registers us normally, and then NickServ is still the way in.
     let mut authenticated = false;
     if config.sasl {
-        authenticated =
-            register_with_sasl(state, &account_id, &sender, &mut stream, config).await?;
+        authenticated = register_with_sasl(state, &account_id, &sender, &mut stream, config).await?;
     } else {
         // Same tail as the crate's own identify(), by way of the shared
         // helper: there is no SASL to negotiate here, but the capabilities
         // above are still worth asking for, and they have to be requested
         // before CAP END like any other.
-        state
-            .runtime
-            .report_progress(state, &account_id, "Registering (NICK/USER)...");
+        state.runtime.report_progress(state, &account_id, "Registering (NICK/USER)...");
         end_cap_and_register(state, &sender, &mut stream, config).await?;
     }
 
-    state
-        .runtime
-        .report_progress(state, &account_id, "Waiting for server welcome...");
+    state.runtime.report_progress(state, &account_id, "Waiting for server welcome...");
     let welcomed = wait_for_welcome(state, &account_id, &mut stream).await?;
 
     // Landed on the alt_nicks fallback above means our real nick's old
@@ -625,11 +496,7 @@ pub(super) async fn establish(
     // has been.
     if client.current_nickname() != config.nick {
         if let Some(pw) = &config.nickserv_password {
-            state.runtime.report_progress(
-                state,
-                &account_id,
-                "Reclaiming nickname from a stale session...",
-            );
+            state.runtime.report_progress(state, &account_id, "Reclaiming nickname from a stale session...");
             sender.send_privmsg("NickServ", format!("GHOST {} {pw}", config.nick))?;
             sender.send(Command::NICK(config.nick.clone()))?;
         }
@@ -645,12 +512,8 @@ pub(super) async fn establish(
             quit_message: quit_message(config),
         },
     );
-    state
-        .runtime
-        .set_conn_state(state, &account_id, ConnState::Connected, None);
-    state
-        .runtime
-        .ensure_buffer(state, &account_id, &config.host, "server");
+    state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
+    state.runtime.ensure_buffer(state, &account_id, &config.host, "server");
 
     // Ask to be told what people publish about themselves.
     //
@@ -661,9 +524,7 @@ pub(super) async fn establish(
     // for. Subscribing rather than asking per person because the point is the
     // roster: a GET each for everybody in a busy channel is a lot of round
     // trips to draw one column.
-    if state.runtime.irc_has_cap(&account_id, "draft/metadata")
-        || state.runtime.irc_has_cap(&account_id, "metadata-2")
-    {
+    if state.runtime.irc_has_cap(&account_id, "draft/metadata") || state.runtime.irc_has_cap(&account_id, "metadata-2") {
         if let Err(e) = sender.send(Command::Raw(
             "METADATA".to_string(),
             std::iter::once("*".to_string())
@@ -719,12 +580,7 @@ pub(super) async fn establish(
 /// connection looks like and a deliberate one should not. Trimmed, since a
 /// message of only spaces is the same as none.
 pub(super) fn quit_message(config: &IrcAccountConfig) -> String {
-    match config
-        .quit_message
-        .as_deref()
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-    {
+    match config.quit_message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(message) => message.to_string(),
         None => DEFAULT_QUIT_MESSAGE.to_string(),
     }
@@ -853,18 +709,10 @@ pub(super) fn cap_list<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> &
 /// looking for the star in one only meant the last continuation line was taken
 /// for the whole answer, and every capability advertised after it was silently
 /// never requested. Libera offers nineteen; this client was seeing nine.
-pub(super) fn cap_ls_page<'a>(
-    param: Option<&'a str>,
-    suffix: Option<&'a str>,
-) -> (bool, Vec<&'a str>) {
+pub(super) fn cap_ls_page<'a>(param: Option<&'a str>, suffix: Option<&'a str>) -> (bool, Vec<&'a str>) {
     let fields = [param, suffix];
     let more = fields.iter().any(|f| f.map(str::trim) == Some("*"));
-    let caps = fields
-        .into_iter()
-        .flatten()
-        .filter(|f| f.trim() != "*")
-        .flat_map(str::split_whitespace)
-        .collect();
+    let caps = fields.into_iter().flatten().filter(|f| f.trim() != "*").flat_map(str::split_whitespace).collect();
     (more, caps)
 }
 
@@ -914,10 +762,7 @@ fn note_sts_policy(state: &AppState, config: &IrcAccountConfig, caps: &str) -> O
     if config.ssl {
         let duration = advert.duration?;
         let port = config.port.unwrap_or(6697);
-        tracing::info!(
-            "irc[{account_id}]: STS for {} - TLS on port {port} for {duration}s",
-            config.host
-        );
+        tracing::info!("irc[{account_id}]: STS for {} - TLS on port {port} for {duration}s", config.host);
         state.irc_sts.remember(&config.host, port, duration);
         None
     } else {
@@ -927,9 +772,7 @@ fn note_sts_policy(state: &AppState, config: &IrcAccountConfig, caps: &str) -> O
         // life: the duration that actually binds is read from the
         // advertisement that arrives over TLS, on the connection this one is
         // about to be replaced by.
-        tracing::info!(
-            "irc[{account_id}]: STS offered over plaintext, reconnecting to port {port} over TLS"
-        );
+        tracing::info!("irc[{account_id}]: STS offered over plaintext, reconnecting to port {port} over TLS");
         state.irc_sts.remember(&config.host, port, 60);
         Some(port)
     }
@@ -976,41 +819,21 @@ pub(super) async fn end_cap_and_register(
         // USER and possibly a server password in the clear, which is the
         // exact thing the network just asked us not to do.
         if let Some(port) = note_sts_policy(state, config, &raw.join(" ")) {
-            bail!(
-                "{} requires TLS (STS) - reconnecting on port {port}",
-                config.host
-            );
+            bail!("{} requires TLS (STS) - reconnecting on port {port}", config.host);
         }
     }
-    let offered: Option<Vec<String>> = raw.map(|raw| {
-        raw.iter()
-            .map(|cap| cap.split('=').next().unwrap_or(cap).to_string())
-            .collect()
-    });
+    let offered: Option<Vec<String>> =
+        raw.map(|raw| raw.iter().map(|cap| cap.split('=').next().unwrap_or(cap).to_string()).collect());
     match offered {
         Some(offered) => {
-            let wanted: Vec<&str> = WANTED_CAPS
-                .iter()
-                .copied()
-                .filter(|cap| offered.iter().any(|o| o == cap))
-                .collect();
+            let wanted: Vec<&str> = WANTED_CAPS.iter().copied().filter(|cap| offered.iter().any(|o| o == cap)).collect();
             if !wanted.is_empty() {
-                sender.send(Command::CAP(
-                    None,
-                    CapSubCommand::REQ,
-                    None,
-                    Some(wanted.join(" ")),
-                ))?;
+                sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(wanted.join(" "))))?;
             }
         }
         None => {
             for cap in WANTED_CAPS {
-                sender.send(Command::CAP(
-                    None,
-                    CapSubCommand::REQ,
-                    None,
-                    Some((*cap).to_string()),
-                ))?;
+                sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some((*cap).to_string())))?;
             }
         }
     }
@@ -1026,15 +849,9 @@ pub(super) async fn end_cap_and_register(
     }
     sender.send(Command::NICK(config.nick.clone()))?;
     sender.send(Command::USER(
-        config
-            .username
-            .clone()
-            .unwrap_or_else(|| config.nick.clone()),
+        config.username.clone().unwrap_or_else(|| config.nick.clone()),
         "0".to_string(),
-        config
-            .realname
-            .clone()
-            .unwrap_or_else(|| config.nick.clone()),
+        config.realname.clone().unwrap_or_else(|| config.nick.clone()),
     ))?;
     Ok(())
 }
@@ -1044,31 +861,18 @@ pub(super) async fn end_cap_and_register(
 /// Two callers want two different things from a CAP LS
 /// out of one answer: negotiation wants names to compare against
 /// `WANTED_CAPS`, and STS wants the value it would otherwise have thrown away.
-pub(super) async fn offered_caps_raw(
-    sender: &Sender,
-    stream: &mut ClientStream,
-) -> Option<Vec<String>> {
+pub(super) async fn offered_caps_raw(sender: &Sender, stream: &mut ClientStream) -> Option<Vec<String>> {
     if sender.send_cap_ls(NegotiationVersion::V302).is_err() {
         return None;
     }
     let mut offered: Vec<String> = Vec::new();
     loop {
-        let msg = wait_for(stream, |m| {
-            matches!(&m.command, Command::CAP(_, CapSubCommand::LS, _, _))
-        })
-        .await
-        .ok()?;
-        let Command::CAP(_, _, ref param, ref suffix) = msg.command else {
-            return None;
-        };
+        let msg = wait_for(stream, |m| matches!(&m.command, Command::CAP(_, CapSubCommand::LS, _, _))).await.ok()?;
+        let Command::CAP(_, _, ref param, ref suffix) = msg.command else { return None };
         let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
         offered.extend(caps.into_iter().map(str::to_string));
         if !more {
-            tracing::debug!(
-                "irc: server offers {} capabilities: {}",
-                offered.len(),
-                offered.join(" ")
-            );
+            tracing::debug!("irc: server offers {} capabilities: {}", offered.len(), offered.join(" "));
             return Some(offered);
         }
     }
@@ -1076,11 +880,7 @@ pub(super) async fn offered_caps_raw(
 
 /// Returns the nick the server registered us under, which is not always the
 /// one asked for: Ergo, for one, renames a connection to its account on login.
-pub(super) async fn wait_for_welcome(
-    state: &AppState,
-    account_id: &str,
-    stream: &mut ClientStream,
-) -> Result<Option<String>> {
+pub(super) async fn wait_for_welcome(state: &AppState, account_id: &str, stream: &mut ClientStream) -> Result<Option<String>> {
     let result = tokio::time::timeout(REGISTRATION_TIMEOUT, async {
         loop {
             match stream.next().await {
@@ -1096,33 +896,11 @@ pub(super) async fn wait_for_welcome(
                     // point.
                     Command::Response(code, args) if is_connection_banner(*code) => {
                         if let Some(text) = banner_text(*code, args) {
-                            let host = account_id
-                                .split_once('@')
-                                .map(|(_, h)| h)
-                                .unwrap_or(account_id);
-                            state.runtime.record_message(
-                                state,
-                                account_id,
-                                host,
-                                "server",
-                                "*",
-                                &text,
-                                false,
-                                "system",
-                                None,
-                                None,
-                                false,
-                                None,
-                                Vec::new(),
-                                Vec::new(),
-                                None,
-                            );
+                            let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+                            state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                         }
                         if matches!(code, Response::RPL_WELCOME) {
-                            return Ok(args
-                                .first()
-                                .filter(|n| !n.is_empty() && *n != "*")
-                                .cloned());
+                            return Ok(args.first().filter(|n| !n.is_empty() && *n != "*").cloned());
                         }
                     }
                     // Capabilities are ACKed during registration, which is
@@ -1138,20 +916,11 @@ pub(super) async fn wait_for_welcome(
                         state.runtime.grant_irc_caps(account_id, caps);
                     }
                     Command::Response(Response::ERR_NICKNAMEINUSE, args) => {
-                        return Err(anyhow!(
-                            "nickname already in use{}",
-                            args.first().map(|n| format!(" ({n})")).unwrap_or_default()
-                        ))
+                        return Err(anyhow!("nickname already in use{}", args.first().map(|n| format!(" ({n})")).unwrap_or_default()))
                     }
-                    Command::Response(Response::ERR_NICKCOLLISION, _) => {
-                        return Err(anyhow!("nickname collision"))
-                    }
-                    Command::Response(Response::ERR_ERRONEOUSNICKNAME, _) => {
-                        return Err(anyhow!("erroneous nickname"))
-                    }
-                    Command::Response(Response::ERR_PASSWDMISMATCH, _) => {
-                        return Err(anyhow!("password mismatch"))
-                    }
+                    Command::Response(Response::ERR_NICKCOLLISION, _) => return Err(anyhow!("nickname collision")),
+                    Command::Response(Response::ERR_ERRONEOUSNICKNAME, _) => return Err(anyhow!("erroneous nickname")),
+                    Command::Response(Response::ERR_PASSWDMISMATCH, _) => return Err(anyhow!("password mismatch")),
                     _ => continue,
                 },
                 Some(Err(e)) => return Err(anyhow!(e)),
@@ -1163,16 +932,11 @@ pub(super) async fn wait_for_welcome(
 
     match result {
         Ok(inner) => inner,
-        Err(_) => Err(anyhow!(
-            "timed out waiting for server welcome (001) - check credentials/host"
-        )),
+        Err(_) => Err(anyhow!("timed out waiting for server welcome (001) - check credentials/host")),
     }
 }
 
-pub(super) async fn wait_for(
-    stream: &mut ClientStream,
-    pred: impl Fn(&Message) -> bool,
-) -> Result<Message> {
+pub(super) async fn wait_for(stream: &mut ClientStream, pred: impl Fn(&Message) -> bool) -> Result<Message> {
     tokio::time::timeout(REGISTRATION_TIMEOUT, async {
         loop {
             match stream.next().await {
@@ -1219,9 +983,7 @@ impl Farewell {
             // From the server itself, not a person. Kept apart from ERROR:
             // most of these are "*** Looking up your hostname", and one is
             // only offered as the reason when the server gave no other.
-            Command::NOTICE(_, words)
-                if !matches!(&m.prefix, Some(irc::proto::Prefix::Nickname(..))) =>
-            {
+            Command::NOTICE(_, words) if !matches!(&m.prefix, Some(irc::proto::Prefix::Nickname(..))) => {
                 self.notice = Some(words.clone());
                 true
             }
@@ -1235,9 +997,7 @@ impl Farewell {
     pub(super) fn closed(&self) -> anyhow::Error {
         match (self.error.clone(), self.notice.clone()) {
             (Some(words), _) => anyhow!("the server turned the connection away: {words}"),
-            (None, Some(words)) => {
-                anyhow!("connection closed during registration - the server's last words: {words}")
-            }
+            (None, Some(words)) => anyhow!("connection closed during registration - the server's last words: {words}"),
             (None, None) => anyhow!("connection closed during registration"),
         }
     }
@@ -1321,18 +1081,12 @@ mod quit_tests {
     use super::*;
 
     fn config(message: Option<&str>) -> IrcAccountConfig {
-        IrcAccountConfig {
-            quit_message: message.map(String::from),
-            ..Default::default()
-        }
+        IrcAccountConfig { quit_message: message.map(String::from), ..Default::default() }
     }
 
     #[test]
     fn builds_the_history_requests_the_spec_defines() {
-        assert_eq!(
-            chathistory_latest("#channel").to_string().trim_end(),
-            "CHATHISTORY LATEST #channel * 100"
-        );
+        assert_eq!(chathistory_latest("#channel").to_string().trim_end(), "CHATHISTORY LATEST #channel * 100");
         let before = chathistory_before("#channel", 1_767_915_177).unwrap();
         assert_eq!(
             before.to_string().trim_end(),
@@ -1345,9 +1099,7 @@ mod quit_tests {
         // Without this every replayed message is a fresh copy of one already
         // on screen: IRC has no id of its own, so the daemon generates one,
         // and a generated id can never match the message it duplicates.
-        let with_id: Message = "@msgid=abc123 :nick!u@h PRIVMSG #chan :hello"
-            .parse()
-            .unwrap();
+        let with_id: Message = "@msgid=abc123 :nick!u@h PRIVMSG #chan :hello".parse().unwrap();
         assert_eq!(message_id(&with_id).as_deref(), Some("abc123"));
 
         let without: Message = ":nick!u@h PRIVMSG #chan :hello".parse().unwrap();
@@ -1372,23 +1124,14 @@ mod quit_tests {
     #[test]
     fn mode_acts_on_the_channel_it_was_typed_in_unless_told_otherwise() {
         // The common case: no target named, so it is this channel.
-        assert_eq!(
-            split_mode_target("#here", "+o someone"),
-            ("#here", "+o someone")
-        );
+        assert_eq!(split_mode_target("#here", "+o someone"), ("#here", "+o someone"));
         assert_eq!(split_mode_target("#here", "-m"), ("#here", "-m"));
         // Asking rather than setting.
         assert_eq!(split_mode_target("#here", ""), ("#here", ""));
         assert_eq!(split_mode_target("#here", "b"), ("b", ""));
         // A target named explicitly.
-        assert_eq!(
-            split_mode_target("#here", "#other +o someone"),
-            ("#other", "+o someone")
-        );
-        assert_eq!(
-            split_mode_target("#here", "somenick +i"),
-            ("somenick", "+i")
-        );
+        assert_eq!(split_mode_target("#here", "#other +o someone"), ("#other", "+o someone"));
+        assert_eq!(split_mode_target("#here", "somenick +i"), ("somenick", "+i"));
     }
 
     #[test]
@@ -1403,17 +1146,10 @@ mod quit_tests {
 
     #[test]
     fn reads_every_spelling_of_a_mechanism() {
-        assert_eq!(
-            SaslMechanism::parse("external"),
-            Some(SaslMechanism::External)
-        );
+        assert_eq!(SaslMechanism::parse("external"), Some(SaslMechanism::External));
         assert_eq!(SaslMechanism::parse(" PLAIN "), Some(SaslMechanism::Plain));
         for spelling in ["SCRAM-SHA-256", "scram-sha256", "SCRAM_SHA_256"] {
-            assert_eq!(
-                SaslMechanism::parse(spelling),
-                Some(SaslMechanism::ScramSha256),
-                "for {spelling}"
-            );
+            assert_eq!(SaslMechanism::parse(spelling), Some(SaslMechanism::ScramSha256), "for {spelling}");
         }
         // Something we cannot do is not silently treated as something we can.
         assert_eq!(SaslMechanism::parse("SCRAM-SHA-1"), None);
@@ -1429,10 +1165,7 @@ mod quit_tests {
         let bare = IrcAccountConfig::default();
         assert_eq!(preferred_mechanism(&bare), SaslMechanism::Plain);
 
-        let with_cert = IrcAccountConfig {
-            sasl_cert_path: Some("/keys/libera.pem".into()),
-            ..Default::default()
-        };
+        let with_cert = IrcAccountConfig { sasl_cert_path: Some("/keys/libera.pem".into()), ..Default::default() };
         assert_eq!(preferred_mechanism(&with_cert), SaslMechanism::External);
 
         // Configuring a certificate and then naming a mechanism means the
@@ -1447,17 +1180,11 @@ mod quit_tests {
 
         // A mechanism nobody here speaks falls back rather than failing the
         // connection over a typo in a config file.
-        let nonsense = IrcAccountConfig {
-            sasl_mechanism: Some("magic".into()),
-            ..Default::default()
-        };
+        let nonsense = IrcAccountConfig { sasl_mechanism: Some("magic".into()), ..Default::default() };
         assert_eq!(preferred_mechanism(&nonsense), SaslMechanism::Plain);
 
         assert_eq!(
-            preferred_mechanism(&IrcAccountConfig {
-                sasl_mechanism: Some("scram-sha-256".into()),
-                ..Default::default()
-            }),
+            preferred_mechanism(&IrcAccountConfig { sasl_mechanism: Some("scram-sha-256".into()), ..Default::default() }),
             SaslMechanism::ScramSha256
         );
     }
@@ -1515,10 +1242,7 @@ mod cap_new_tests {
     /// A capability offered with a value is asked for by name.
     #[test]
     fn a_capability_offered_with_a_value_is_asked_for_by_name() {
-        assert_eq!(
-            caps_worth_requesting("draft/chathistory=50"),
-            vec!["draft/chathistory"]
-        );
+        assert_eq!(caps_worth_requesting("draft/chathistory=50"), vec!["draft/chathistory"]);
     }
 
     /// SASL is left alone on purpose - see `caps_worth_requesting`. Recording
@@ -1556,10 +1280,7 @@ mod cap_tests {
         // Both orderings of (param, suffix), because both occur.
         for (param, suffix) in [(Some("*"), Some("a b")), (Some("a b"), Some("*"))] {
             let (more, caps) = cap_ls_page(param, suffix);
-            assert!(
-                more,
-                "a line carrying a star has more to come: {param:?} {suffix:?}"
-            );
+            assert!(more, "a line carrying a star has more to come: {param:?} {suffix:?}");
             assert_eq!(caps, vec!["a", "b"], "{param:?} {suffix:?}");
         }
         // The final line carries no star and is the end of the answer, whichever
@@ -1578,20 +1299,14 @@ mod cap_tests {
     /// and the fields the crate makes of it.
     #[test]
     fn a_continuation_line_off_the_wire_says_more_is_coming() {
-        let msg: Message = ":irc.example CAP * LS * :multi-prefix away-notify\r\n"
-            .parse()
-            .unwrap();
-        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &msg.command else {
-            panic!("not CAP LS: {:?}", msg.command)
-        };
+        let msg: Message = ":irc.example CAP * LS * :multi-prefix away-notify\r\n".parse().unwrap();
+        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &msg.command else { panic!("not CAP LS: {:?}", msg.command) };
         let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
         assert!(more);
         assert_eq!(caps, vec!["multi-prefix", "away-notify"]);
 
         let last: Message = ":irc.example CAP * LS :sasl chghost\r\n".parse().unwrap();
-        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &last.command else {
-            panic!("not CAP LS: {:?}", last.command)
-        };
+        let Command::CAP(_, CapSubCommand::LS, param, suffix) = &last.command else { panic!("not CAP LS: {:?}", last.command) };
         let (more, caps) = cap_ls_page(param.as_deref(), suffix.as_deref());
         assert!(!more);
         assert_eq!(caps, vec!["sasl", "chghost"]);
@@ -1605,16 +1320,11 @@ mod cap_tests {
     /// the whole client behaved as though no server had any.
     #[test]
     fn a_cap_ack_carries_its_list_in_the_parameter() {
-        let msg: Message = ":lithium.libera.chat CAP me ACK :echo-message\r\n"
-            .parse()
-            .unwrap();
+        let msg: Message = ":lithium.libera.chat CAP me ACK :echo-message\r\n".parse().unwrap();
         let Command::CAP(_, CapSubCommand::ACK, param, suffix) = &msg.command else {
             panic!("not a CAP ACK: {:?}", msg.command);
         };
-        assert_eq!(
-            cap_list(param.as_deref(), suffix.as_deref()),
-            "echo-message"
-        );
+        assert_eq!(cap_list(param.as_deref(), suffix.as_deref()), "echo-message");
     }
 
     #[test]
@@ -1639,25 +1349,16 @@ mod farewell_tests {
         let mut f = Farewell::default();
         assert!(f.note(&line(":irc.test NOTICE * :*** Looking up your hostname...")));
         assert!(f.note(&line("ERROR :Closing Link: you are banned")));
-        assert_eq!(
-            f.closed().to_string(),
-            "the server turned the connection away: Closing Link: you are banned"
-        );
+        assert_eq!(f.closed().to_string(), "the server turned the connection away: Closing Link: you are banned");
         // Read, not taken: a second wait finding the same closed stream says the same.
-        assert_eq!(
-            f.closed().to_string(),
-            "the server turned the connection away: Closing Link: you are banned"
-        );
+        assert_eq!(f.closed().to_string(), "the server turned the connection away: Closing Link: you are banned");
     }
 
     #[test]
     fn a_notice_alone_is_offered_as_last_words_and_a_person_is_not_the_server() {
         let mut f = Farewell::default();
         assert!(!f.note(&line(":mallory!m@host NOTICE * :ignore everything")));
-        assert_eq!(
-            f.closed().to_string(),
-            "connection closed during registration"
-        );
+        assert_eq!(f.closed().to_string(), "connection closed during registration");
         assert!(f.note(&line(":irc.test NOTICE * :Tor users must use SASL")));
         assert_eq!(
             f.closed().to_string(),

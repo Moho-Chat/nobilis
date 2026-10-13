@@ -58,9 +58,7 @@ pub fn default_data_dir() -> PathBuf {
     if legacy.is_dir() {
         return legacy;
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| home.join(".config"))
-        .join("nobilis")
+    dirs::config_dir().unwrap_or_else(|| home.join(".config")).join("nobilis")
 }
 
 fn parse_args() -> Options {
@@ -84,10 +82,7 @@ fn parse_args() -> Options {
         }
     }
 
-    Options {
-        data_dir,
-        socket_path,
-    }
+    Options { data_dir, socket_path }
 }
 
 /// Cuts every buffer back to the cap, and gives the space back.
@@ -111,9 +106,7 @@ async fn prune_scrollback(state: AppState) {
         }
         match state.store.incremental_vacuum() {
             Ok(0) => {}
-            Ok(pages) => {
-                tracing::info!("scrollback: handed back {pages} page(s) to the filesystem")
-            }
+            Ok(pages) => tracing::info!("scrollback: handed back {pages} page(s) to the filesystem"),
             Err(e) => tracing::debug!("scrollback: incremental_vacuum failed: {e}"),
         }
 
@@ -142,10 +135,7 @@ fn acquire_singleton_lock(data_dir: &std::path::Path) -> Result<()> {
         .open(&lock_path)
         .with_context(|| format!("opening {}", lock_path.display()))?;
     if file.try_lock_exclusive().is_err() {
-        bail!(
-            "another nobilis instance is already running (lock held on {})",
-            lock_path.display()
-        );
+        bail!("another nobilis instance is already running (lock held on {})", lock_path.display());
     }
     std::mem::forget(file); // keep the lock for the process lifetime
     Ok(())
@@ -165,11 +155,7 @@ fn acquire_singleton_lock(data_dir: &std::path::Path) -> Result<()> {
 /// not one of its default features and is not worth a dependency change to
 /// read one word.
 fn init_logging() {
-    let level = match std::env::var("RUST_LOG")
-        .unwrap_or_default()
-        .to_lowercase()
-        .as_str()
-    {
+    let level = match std::env::var("RUST_LOG").unwrap_or_default().to_lowercase().as_str() {
         "" | "info" => tracing::Level::INFO,
         "trace" => tracing::Level::TRACE,
         "debug" => tracing::Level::DEBUG,
@@ -196,6 +182,7 @@ fn init_logging() {
         .with_ansi(std::io::stdout().is_terminal())
         .init();
 }
+
 
 /// Stops a long-running daemon from keeping every byte it has ever needed.
 ///
@@ -297,29 +284,21 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let store =
-        Store::open(&opts.data_dir.join("scrollback.db")).context("opening scrollback store")?;
-    let accounts =
-        AccountStore::open(opts.data_dir.join("accounts.toml")).context("opening account store")?;
+    let store = Store::open(&opts.data_dir.join("scrollback.db"))
+        .context("opening scrollback store")?;
+    let accounts = AccountStore::open(opts.data_dir.join("accounts.toml"))
+        .context("opening account store")?;
 
     let tor = Arc::new(net::tor::TorManager::new(&opts.data_dir));
     // The network settings used to live on each Sneedchat account, which left
     // them nowhere to be with no Sneedchat account. The first account's are
     // carried over the first time `net.toml` does not exist yet.
-    let carried = accounts
-        .all_sneedchat()
-        .into_iter()
-        .next()
-        .map(|a| net::route::NetSettings {
-            tor_mode: a.tor_mode.clone(),
-            proxy: a.proxy.clone(),
-            tunnel_all: false,
-        });
-    net::route::install(Arc::new(net::route::Router::open(
-        opts.data_dir.join("net.toml"),
-        tor.clone(),
-        carried,
-    )));
+    let carried = accounts.all_sneedchat().into_iter().next().map(|a| net::route::NetSettings {
+        tor_mode: a.tor_mode.clone(),
+        proxy: a.proxy.clone(),
+        tunnel_all: false,
+    });
+    net::route::install(Arc::new(net::route::Router::open(opts.data_dir.join("net.toml"), tor.clone(), carried)));
     let state = AppState {
         store: Arc::new(store),
         accounts: Arc::new(accounts),
@@ -328,21 +307,11 @@ async fn run() -> Result<()> {
         tor,
         shutdown: Arc::new(tokio::sync::Notify::new()),
         voice: Arc::new(backend::discord::voice::VoiceState::new()),
-        voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(
-            opts.data_dir.join("voice.toml"),
-        )),
-        dcc_prefs: Arc::new(backend::irc::dcc::DccPrefsStore::open(
-            opts.data_dir.join("dcc.toml"),
-        )),
-        irc_sts: Arc::new(backend::irc::sts::StsStore::open(
-            opts.data_dir.join("irc-sts.toml"),
-        )),
-        highlights: Arc::new(highlights::HighlightStore::open(
-            opts.data_dir.join("highlights.toml"),
-        )),
-        ignores: Arc::new(ignores::IgnoreStore::open(
-            opts.data_dir.join("ignores.toml"),
-        )),
+        voice_prefs: Arc::new(crate::audio::VoicePrefsStore::open(opts.data_dir.join("voice.toml"))),
+        dcc_prefs: Arc::new(backend::irc::dcc::DccPrefsStore::open(opts.data_dir.join("dcc.toml"))),
+        irc_sts: Arc::new(backend::irc::sts::StsStore::open(opts.data_dir.join("irc-sts.toml"))),
+        highlights: Arc::new(highlights::HighlightStore::open(opts.data_dir.join("highlights.toml"))),
+        ignores: Arc::new(ignores::IgnoreStore::open(opts.data_dir.join("ignores.toml"))),
     };
     media_cache::init(state.store.clone(), opts.data_dir.clone());
     // Before any account connects, so the first client to attach sees every
@@ -475,13 +444,10 @@ async fn run_housekeeping(state: AppState) {
 }
 
 async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c().await.ok();
-    };
+    let ctrl_c = async { tokio::signal::ctrl_c().await.ok(); };
     #[cfg(unix)]
     let terminate = async {
-        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
+        let mut sig = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(s) => s,
             Err(_) => return,
         };

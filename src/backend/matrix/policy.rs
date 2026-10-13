@@ -43,12 +43,7 @@ const RULE_TYPES: [(&str, &str); 6] = [
 ];
 
 fn strings(value: &Value) -> Vec<String> {
-    value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect()
+    value.as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)).collect()
 }
 
 /// Reads a room's whole moderation picture out of its state.
@@ -71,22 +66,14 @@ pub fn read(events: &[&Value]) -> Value {
             // Removal empties the content rather than deleting the event, so
             // an empty string is "no policy server" and not a server called
             // nothing.
-            policy_server = event["content"]["via"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            policy_server = event["content"]["via"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
             continue;
         }
         if let Some((_, about)) = RULE_TYPES.iter().find(|(name, _)| *name == kind) {
             // A rule is withdrawn by emptying its content, the same way every
             // other state event is - so one with no entity is a rule that has
             // been taken back rather than a rule against nobody.
-            let Some(entity) = event["content"]["entity"]
-                .as_str()
-                .filter(|e| !e.is_empty())
-            else {
-                continue;
-            };
+            let Some(entity) = event["content"]["entity"].as_str().filter(|e| !e.is_empty()) else { continue };
             rules.push(serde_json::json!({
                 "about": about,
                 "entity": entity,
@@ -99,8 +86,7 @@ pub fn read(events: &[&Value]) -> Value {
     // By what they are about and then by who, so the list reads the same way
     // twice - state comes back in no particular order.
     rules.sort_by(|a, b| {
-        (a["about"].as_str(), a["entity"].as_str())
-            .cmp(&(b["about"].as_str(), b["entity"].as_str()))
+        (a["about"].as_str(), a["entity"].as_str()).cmp(&(b["about"].as_str(), b["entity"].as_str()))
     });
 
     serde_json::json!({
@@ -121,27 +107,17 @@ pub fn read(events: &[&Value]) -> Value {
 
 /// Everything above, for one buffer's room.
 pub async fn room_policy(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no room for this conversation")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/state",
         account.homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
     );
-    let events = http::get_json(&url, &account.access_token)
-        .await
-        .context("reading the room's state")?;
+    let events = http::get_json(&url, &account.access_token).await.context("reading the room's state")?;
     let refs: Vec<&Value> = events.as_array().into_iter().flatten().collect();
     let mut answer = read(&refs);
-    answer["canChange"] = serde_json::json!(moderation::can_send_state_in_buffer(
-        state, account_id, buffer_id, SERVER_ACL
-    ));
+    answer["canChange"] = serde_json::json!(moderation::can_send_state_in_buffer(state, account_id, buffer_id, SERVER_ACL));
     Ok(answer)
 }
 
@@ -152,21 +128,12 @@ pub async fn room_policy(state: &AppState, account_id: &str, buffer_id: &str) ->
 /// server is a room nobody in it can speak in, and the state event that did
 /// it can then no longer be changed - so this reads the current ACL, edits
 /// only `deny`, and refuses outright to write one whose allow list is empty.
-pub async fn set_denied(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    server: &str,
-    denied: bool,
-) -> Result<()> {
+pub async fn set_denied(state: &AppState, account_id: &str, buffer_id: &str, server: &str, denied: bool) -> Result<()> {
     let server = server.trim();
     if server.is_empty() {
         anyhow::bail!("no server named");
     }
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no room for this conversation")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
     let existing = roomsettings::read_state_event(state, account_id, &room_id, SERVER_ACL)
         .await?
         .unwrap_or_else(|| serde_json::json!({}));
@@ -248,8 +215,7 @@ mod tests {
 
     #[test]
     fn a_policy_server_is_read_and_an_emptied_one_is_not() {
-        let named =
-            vec![json!({ "type": "m.room.policy", "content": { "via": "policy.example" } })];
+        let named = vec![json!({ "type": "m.room.policy", "content": { "via": "policy.example" } })];
         assert_eq!(read(&refs(&named))["policyServer"], "policy.example");
 
         let withdrawn = vec![json!({ "type": "m.room.policy", "content": {} })];

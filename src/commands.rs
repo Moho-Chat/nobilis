@@ -45,60 +45,15 @@ const SNEEDCHAT: &[&str] = &["sneedchat"];
 /// Ordered roughly by how often each is wanted, since a fuzzy match that ties
 /// keeps this order.
 pub const BUILTINS: &[Builtin] = &[
-    Builtin {
-        name: "me",
-        usage: "<action>",
-        description: "Say something as an action",
-        services: IRC_AND_MATRIX,
-    },
-    Builtin {
-        name: "join",
-        usage: "<#channel>",
-        description: "Join a channel",
-        services: IRC,
-    },
-    Builtin {
-        name: "part",
-        usage: "",
-        description: "Leave this channel",
-        services: IRC,
-    },
-    Builtin {
-        name: "msg",
-        usage: "<nick> <message>",
-        description: "Send somebody a private message",
-        services: IRC,
-    },
-    Builtin {
-        name: "nick",
-        usage: "<newnick>",
-        description: "Change your nick",
-        services: IRC,
-    },
-    Builtin {
-        name: "topic",
-        usage: "<text>",
-        description: "Set the channel topic",
-        services: IRC,
-    },
-    Builtin {
-        name: "away",
-        usage: "[reason]",
-        description: "Mark yourself away",
-        services: IRC,
-    },
-    Builtin {
-        name: "back",
-        usage: "",
-        description: "Stop being away",
-        services: IRC,
-    },
-    Builtin {
-        name: "whois",
-        usage: "<nick>",
-        description: "Look somebody up",
-        services: IRC,
-    },
+    Builtin { name: "me", usage: "<action>", description: "Say something as an action", services: IRC_AND_MATRIX },
+    Builtin { name: "join", usage: "<#channel>", description: "Join a channel", services: IRC },
+    Builtin { name: "part", usage: "", description: "Leave this channel", services: IRC },
+    Builtin { name: "msg", usage: "<nick> <message>", description: "Send somebody a private message", services: IRC },
+    Builtin { name: "nick", usage: "<newnick>", description: "Change your nick", services: IRC },
+    Builtin { name: "topic", usage: "<text>", description: "Set the channel topic", services: IRC },
+    Builtin { name: "away", usage: "[reason]", description: "Mark yourself away", services: IRC },
+    Builtin { name: "back", usage: "", description: "Stop being away", services: IRC },
+    Builtin { name: "whois", usage: "<nick>", description: "Look somebody up", services: IRC },
     Builtin {
         name: "location",
         usage: "<lat,lon or a map link> [name]",
@@ -111,36 +66,11 @@ pub const BUILTINS: &[Builtin] = &[
         description: "Stop hearing from somebody, or list who is ignored",
         services: EVERY,
     },
-    Builtin {
-        name: "unignore",
-        usage: "<name>",
-        description: "Hear from somebody again",
-        services: EVERY,
-    },
-    Builtin {
-        name: "notify",
-        usage: "[nick]",
-        description: "Watch for somebody arriving, or list who is watched",
-        services: IRC,
-    },
-    Builtin {
-        name: "unnotify",
-        usage: "<nick>",
-        description: "Stop watching for somebody",
-        services: IRC,
-    },
-    Builtin {
-        name: "whowas",
-        usage: "<nick>",
-        description: "Look up somebody who has left",
-        services: IRC,
-    },
-    Builtin {
-        name: "notice",
-        usage: "<target> <message>",
-        description: "Send a notice",
-        services: IRC,
-    },
+    Builtin { name: "unignore", usage: "<name>", description: "Hear from somebody again", services: EVERY },
+    Builtin { name: "notify", usage: "[nick]", description: "Watch for somebody arriving, or list who is watched", services: IRC },
+    Builtin { name: "unnotify", usage: "<nick>", description: "Stop watching for somebody", services: IRC },
+    Builtin { name: "whowas", usage: "<nick>", description: "Look up somebody who has left", services: IRC },
+    Builtin { name: "notice", usage: "<target> <message>", description: "Send a notice", services: IRC },
     // The same name twice, because the two services mean different things by
     // it. IRC's notice is aimed at somebody; Matrix's is a kind of message,
     // said to the room you are already in, so there is no target to name.
@@ -151,108 +81,28 @@ pub const BUILTINS: &[Builtin] = &[
         description: "Announce something, drawn apart from conversation",
         services: MATRIX,
     },
-    Builtin {
-        name: "ctcp",
-        usage: "<nick> <request>",
-        description: "Send a CTCP request",
-        services: IRC,
-    },
-    Builtin {
-        name: "invite",
-        usage: "<nick>",
-        description: "Invite somebody to this channel",
-        services: IRC,
-    },
-    Builtin {
-        name: "list",
-        usage: "[pattern]",
-        description: "List the network's channels",
-        services: IRC,
-    },
-    Builtin {
-        name: "kick",
-        usage: "<nick> [reason]",
-        description: "Remove somebody from the channel",
-        services: IRC,
-    },
-    Builtin {
-        name: "ban",
-        usage: "<nick>",
-        description: "Ban somebody from the channel",
-        services: IRC,
-    },
-    Builtin {
-        name: "unban",
-        usage: "<mask>",
-        description: "Lift a ban",
-        services: IRC,
-    },
-    Builtin {
-        name: "op",
-        usage: "<nick>",
-        description: "Give somebody operator status",
-        services: IRC,
-    },
-    Builtin {
-        name: "deop",
-        usage: "<nick>",
-        description: "Take operator status away",
-        services: IRC,
-    },
-    Builtin {
-        name: "voice",
-        usage: "<nick>",
-        description: "Give somebody voice",
-        services: IRC,
-    },
-    Builtin {
-        name: "devoice",
-        usage: "<nick>",
-        description: "Take voice away",
-        services: IRC,
-    },
-    Builtin {
-        name: "mode",
-        usage: "[target] <modes>",
-        description: "Set or read channel modes",
-        services: IRC,
-    },
+    Builtin { name: "ctcp", usage: "<nick> <request>", description: "Send a CTCP request", services: IRC },
+    Builtin { name: "invite", usage: "<nick>", description: "Invite somebody to this channel", services: IRC },
+    Builtin { name: "list", usage: "[pattern]", description: "List the network's channels", services: IRC },
+    Builtin { name: "kick", usage: "<nick> [reason]", description: "Remove somebody from the channel", services: IRC },
+    Builtin { name: "ban", usage: "<nick>", description: "Ban somebody from the channel", services: IRC },
+    Builtin { name: "unban", usage: "<mask>", description: "Lift a ban", services: IRC },
+    Builtin { name: "op", usage: "<nick>", description: "Give somebody operator status", services: IRC },
+    Builtin { name: "deop", usage: "<nick>", description: "Take operator status away", services: IRC },
+    Builtin { name: "voice", usage: "<nick>", description: "Give somebody voice", services: IRC },
+    Builtin { name: "devoice", usage: "<nick>", description: "Take voice away", services: IRC },
+    Builtin { name: "mode", usage: "[target] <modes>", description: "Set or read channel modes", services: IRC },
     // Text and nothing else, which is why they work everywhere: the message
     // that leaves is the one somebody would have typed by hand.
-    Builtin {
-        name: "shrug",
-        usage: "[message]",
-        description: "Append ¯\\_(ツ)_/¯",
-        services: TEXT_ONLY,
-    },
-    Builtin {
-        name: "tableflip",
-        usage: "[message]",
-        description: "Append (╯°□°)╯︵ ┻━┻",
-        services: TEXT_ONLY,
-    },
-    Builtin {
-        name: "unflip",
-        usage: "[message]",
-        description: "Append ┬─┬ ノ( ゜-゜ノ)",
-        services: TEXT_ONLY,
-    },
-    Builtin {
-        name: "spoiler",
-        usage: "<message>",
-        description: "Hide the message behind a spoiler",
-        services: SPOILERS,
-    },
+    Builtin { name: "shrug", usage: "[message]", description: "Append ¯\\_(ツ)_/¯", services: TEXT_ONLY },
+    Builtin { name: "tableflip", usage: "[message]", description: "Append (╯°□°)╯︵ ┻━┻", services: TEXT_ONLY },
+    Builtin { name: "unflip", usage: "[message]", description: "Append ┬─┬ ノ( ゜-゜ノ)", services: TEXT_ONLY },
+    Builtin { name: "spoiler", usage: "<message>", description: "Hide the message behind a spoiler", services: SPOILERS },
     // The one Sneedchat has. The site's own command, read here rather than
     // passed through so the whisper is recorded in this window too - see
     // backend/sneedchat/protocol.rs's parse_whisper_command, which also takes
     // "/whisper" and a name with a comma after it.
-    Builtin {
-        name: "w",
-        usage: "<@user|user id> <message>",
-        description: "Whisper somebody privately",
-        services: SNEEDCHAT,
-    },
+    Builtin { name: "w", usage: "<@user|user id> <message>", description: "Whisper somebody privately", services: SNEEDCHAT },
 ];
 
 /// The commands that are only a way of writing something, applied on the way
@@ -278,18 +128,11 @@ pub fn rewrite(service: &str, body: &str) -> Option<String> {
     let name = name.to_lowercase();
     // Only where it is offered. The menu and the rewriting have to agree, or
     // a service would quietly do something it never said it could.
-    if !BUILTINS
-        .iter()
-        .any(|c| c.name == name && c.services.contains(&service))
-    {
+    if !BUILTINS.iter().any(|c| c.name == name && c.services.contains(&service)) {
         return None;
     }
     let appended = |tail: &str| {
-        Some(if argument.is_empty() {
-            tail.to_string()
-        } else {
-            format!("{argument} {tail}")
-        })
+        Some(if argument.is_empty() { tail.to_string() } else { format!("{argument} {tail}") })
     };
     match name.as_str() {
         "shrug" => appended("¯\\_(ツ)_/¯"),
@@ -371,11 +214,7 @@ mod tests {
     #[test]
     fn scattered_letters_still_find_it() {
         let hits = matching("irc", "dv");
-        assert!(
-            hits.iter().any(|c| c.name == "devoice"),
-            "got {:?}",
-            hits.iter().map(|c| c.name).collect::<Vec<_>>()
-        );
+        assert!(hits.iter().any(|c| c.name == "devoice"), "got {:?}", hits.iter().map(|c| c.name).collect::<Vec<_>>());
     }
 
     #[test]
@@ -393,10 +232,7 @@ mod tests {
         // And every service has something, so no conversation opens a menu
         // with nothing in it.
         for service in ["kick", "discord", "sneedchat", "matrix"] {
-            assert!(
-                !matching(service, "").is_empty(),
-                "{service} offers nothing"
-            );
+            assert!(!matching(service, "").is_empty(), "{service} offers nothing");
         }
     }
 
@@ -419,12 +255,7 @@ mod tests {
 
     #[test]
     fn a_service_is_only_offered_what_it_can_do() {
-        let names = |service| {
-            matching(service, "")
-                .iter()
-                .map(|c| c.name)
-                .collect::<Vec<_>>()
-        };
+        let names = |service| matching(service, "").iter().map(|c| c.name).collect::<Vec<_>>();
         assert!(names("matrix").contains(&"me"));
         // Kick has no actions and no spoilers; it still has the text ones.
         assert!(!names("kick").contains(&"me"));
@@ -440,14 +271,8 @@ mod tests {
     fn the_text_ones_rewrite_what_is_sent() {
         use super::rewrite;
         assert_eq!(rewrite("kick", "/shrug").as_deref(), Some("¯\\_(ツ)_/¯"));
-        assert_eq!(
-            rewrite("irc", "/shrug well then").as_deref(),
-            Some("well then ¯\\_(ツ)_/¯")
-        );
-        assert_eq!(
-            rewrite("discord", "/spoiler the butler did it").as_deref(),
-            Some("||the butler did it||")
-        );
+        assert_eq!(rewrite("irc", "/shrug well then").as_deref(), Some("well then ¯\\_(ツ)_/¯"));
+        assert_eq!(rewrite("discord", "/spoiler the butler did it").as_deref(), Some("||the butler did it||"));
         // Not a command here, so not rewritten - the bars would be sent.
         assert_eq!(rewrite("irc", "/spoiler the butler did it"), None);
         // An escaped slash is somebody typing the word itself.

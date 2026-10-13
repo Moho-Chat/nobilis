@@ -49,17 +49,12 @@ pub(super) fn voice_member_avatar(vs: &Value) -> Option<String> {
 /// Carries the guild rather than the channel because a client showing a
 /// channel list needs to know that list is stale, and somebody leaving one
 /// channel for another changes two of its rows at once.
-pub(super) fn announce_voice_membership(
-    state: &AppState,
-    account_id: &str,
-    guild_id: Option<&str>,
-    channel_id: Option<&str>,
-) {
+pub(super) fn announce_voice_membership(state: &AppState, account_id: &str, guild_id: Option<&str>, channel_id: Option<&str>) {
     // A leave carries no guild, so it is recovered from the channel that was
     // left; without this, leaving would never refresh anyone's list.
-    let guild = guild_id.map(String::from).or_else(|| {
-        channel_id.and_then(|c| state.runtime.discord_guild_of_voice_channel(account_id, c))
-    });
+    let guild = guild_id
+        .map(String::from)
+        .or_else(|| channel_id.and_then(|c| state.runtime.discord_guild_of_voice_channel(account_id, c)));
     let Some(guild_id) = guild else { return };
     state.events.emit(
         "voiceMembershipChanged",
@@ -85,20 +80,11 @@ pub fn join_voice(
     channel_id: &str,
     options: voice::VoiceOptions,
 ) -> Result<()> {
-    let config = state
-        .accounts
-        .get_discord(account_id)
-        .context("no such Discord account")?;
-    let sender = state
-        .runtime
-        .discord_gateway_sender(account_id)
-        .context("account is not connected")?;
+    let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
+    let sender = state.runtime.discord_gateway_sender(account_id).context("account is not connected")?;
 
     if options.solo {
-        let occupants =
-            state
-                .runtime
-                .discord_voice_occupants(account_id, channel_id, &config.user_id);
+        let occupants = state.runtime.discord_voice_occupants(account_id, channel_id, &config.user_id);
         if !occupants.is_empty() {
             bail!("channel is not empty - {} already in it", occupants.len());
         }
@@ -106,9 +92,7 @@ pub fn join_voice(
     // Recorded before the join, since the handshake it triggers can complete
     // before this function returns.
     state.voice.set_options(account_id, options);
-    state
-        .voice
-        .note_flags(account_id, !options.transmit, !options.transmit);
+    state.voice.note_flags(account_id, !options.transmit, !options.transmit);
 
     sender.send(
         json!({
@@ -141,10 +125,7 @@ pub fn join_voice(
 /// - without it you are sitting in an empty channel they never hear about.
 pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Result<String> {
     let buffer_id = open_dm(state, account_id, user_id).await?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(&buffer_id)
-        .context("the DM has no channel")?;
+    let channel_id = state.runtime.get_discord_channel(&buffer_id).context("the DM has no channel")?;
     start_call(state, account_id, &channel_id).await?;
     Ok(buffer_id)
 }
@@ -157,16 +138,8 @@ pub async fn call_user(state: &AppState, account_id: &str, user_id: &str) -> Res
 /// stale. A channel with no buffer yet is a DM this account has never opened;
 /// there is nothing to ring against, so it is dropped rather than invented.
 pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringing: bool) {
-    let Some(buffer_id) = state
-        .runtime
-        .discord_buffer_for_channel(account_id, channel_id)
-    else {
-        return;
-    };
-    if !state
-        .runtime
-        .set_ringing(&buffer_id, account_id, channel_id, ringing)
-    {
+    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) else { return };
+    if !state.runtime.set_ringing(&buffer_id, account_id, channel_id, ringing) {
         return;
     }
     state.events.emit(
@@ -194,18 +167,8 @@ pub fn announce_call(state: &AppState, account_id: &str, channel_id: &str, ringi
 /// is actually ringing - a CALL_UPDATE saying the ringing has stopped in a
 /// conversation nobody ever opened has nothing to say and should not create
 /// one.
-pub async fn announce_call_opening_dm(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-    ringing: bool,
-) {
-    if ringing
-        && state
-            .runtime
-            .discord_buffer_for_channel(account_id, channel_id)
-            .is_none()
-    {
+pub async fn announce_call_opening_dm(state: &AppState, account_id: &str, channel_id: &str, ringing: bool) {
+    if ringing && state.runtime.discord_buffer_for_channel(account_id, channel_id).is_none() {
         if let Err(e) = people::adopt_dm_channel(state, account_id, channel_id).await {
             tracing::warn!("discord[{account_id}]: a call arrived on {channel_id} and it could not be opened: {e:#}");
         }
@@ -219,10 +182,7 @@ pub async fn announce_call_opening_dm(
 /// in the channel waiting, and ringing them back would make their client
 /// chime at a call they started.
 pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let options = voice::VoiceOptions {
-        solo: false,
-        transmit: true,
-    };
+    let options = voice::VoiceOptions { solo: false, transmit: true };
     join_voice(state, account_id, None, channel_id, options)?;
     // Answered, so it is no longer ringing - said here rather than waiting for
     // Discord to say it, since the person who pressed the button should not
@@ -238,18 +198,13 @@ pub fn accept_call(state: &AppState, account_id: &str, channel_id: &str) -> Resu
 /// a statement about yourself, and hanging up on the other four people is not
 /// what pressing it means.
 pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let _ = send_write(
         http_client_for(&cfg.token)
-            .post(format!(
-                "{API_BASE}/channels/{channel_id}/call/stop-ringing"
-            ))
-            .header("Authorization", &cfg.token)
-            .json(&json!({ "recipients": [&cfg.user_id] })),
-    )
+        .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({ "recipients": [&cfg.user_id] }))
+        )
     .await;
     announce_call(state, account_id, channel_id, false);
     Ok(())
@@ -259,10 +214,7 @@ pub async fn decline_call(state: &AppState, account_id: &str, channel_id: &str) 
 pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
     // Never solo-only: a call whose whole purpose is somebody else joining
     // cannot also refuse to be joined.
-    let options = voice::VoiceOptions {
-        solo: false,
-        transmit: true,
-    };
+    let options = voice::VoiceOptions { solo: false, transmit: true };
     join_voice(state, account_id, None, channel_id, options)?;
     ring(state, account_id, channel_id).await
 }
@@ -272,10 +224,7 @@ pub async fn start_call(state: &AppState, account_id: &str, channel_id: &str) ->
 /// Sent after joining rather than before: ringing a call you are not yet in is
 /// answered by Discord with a call that ends the moment they accept it.
 pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
             .post(format!("{API_BASE}/channels/{channel_id}/call/ring"))
@@ -296,18 +245,13 @@ pub async fn ring(state: &AppState, account_id: &str, channel_id: &str) -> Resul
 
 /// Stops a call ringing, for hanging up before it is answered.
 pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let _ = send_write(
         http_client_for(&cfg.token)
-            .post(format!(
-                "{API_BASE}/channels/{channel_id}/call/stop-ringing"
-            ))
-            .header("Authorization", &cfg.token)
-            .json(&json!({ "recipients": Value::Null })),
-    )
+        .post(format!("{API_BASE}/channels/{channel_id}/call/stop-ringing"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({ "recipients": Value::Null }))
+        )
     .await;
     Ok(())
 }
@@ -317,19 +261,10 @@ pub async fn stop_ringing(state: &AppState, account_id: &str, channel_id: &str) 
 /// Separate from actually stopping the audio, and both are needed: closing the
 /// microphone without saying so leaves everyone else looking at a live
 /// microphone icon wondering why you have gone quiet.
-pub fn announce_voice_flags(
-    state: &AppState,
-    account_id: &str,
-    muted: bool,
-    deafened: bool,
-) -> bool {
+pub fn announce_voice_flags(state: &AppState, account_id: &str, muted: bool, deafened: bool) -> bool {
     state.voice.note_flags(account_id, muted, deafened);
-    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else {
-        return false;
-    };
-    let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else {
-        return false;
-    };
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    let Some((guild_id, channel_id)) = state.voice.current_channel(account_id) else { return false };
     sender
         .send(
             json!({
@@ -352,9 +287,7 @@ pub fn announce_voice_flags(
 
 /// Leaves whatever voice channel this account is in. Safe to call when in none.
 pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
-    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else {
-        return false;
-    };
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
     // Hanging up before they answer has to stop the ringing too, or their
     // phone goes on buzzing for a call that no longer exists.
     if let Some((guild, channel)) = state.voice.current_channel(account_id) {
@@ -375,21 +308,9 @@ pub fn leave_voice(state: &AppState, account_id: &str) -> bool {
 ///
 /// The hand goes up as a timestamp, which is what orders the queue the
 /// stage's moderators see; down is the same field cleared.
-pub async fn set_stage_hand(
-    state: &AppState,
-    account_id: &str,
-    guild_id: &str,
-    channel_id: &str,
-    raised: bool,
-) -> Result<()> {
+pub async fn set_stage_hand(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, raised: bool) -> Result<()> {
     let when = raised.then(|| chrono::Utc::now().to_rfc3339());
-    patch_own_voice_state(
-        state,
-        account_id,
-        guild_id,
-        json!({ "channel_id": channel_id, "request_to_speak_timestamp": when }),
-    )
-    .await
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "request_to_speak_timestamp": when })).await
 }
 
 /// Moves this account onto the stage or back into the audience.
@@ -397,32 +318,12 @@ pub async fn set_stage_hand(
 /// Back to the audience is always allowed. Onto the stage is allowed to a
 /// moderator, or to somebody a moderator has invited up; anyone else is
 /// refused by Discord, and the refusal is what the caller shows.
-pub async fn set_stage_speaker(
-    state: &AppState,
-    account_id: &str,
-    guild_id: &str,
-    channel_id: &str,
-    speaking: bool,
-) -> Result<()> {
-    patch_own_voice_state(
-        state,
-        account_id,
-        guild_id,
-        json!({ "channel_id": channel_id, "suppress": !speaking }),
-    )
-    .await
+pub async fn set_stage_speaker(state: &AppState, account_id: &str, guild_id: &str, channel_id: &str, speaking: bool) -> Result<()> {
+    patch_own_voice_state(state, account_id, guild_id, json!({ "channel_id": channel_id, "suppress": !speaking })).await
 }
 
-async fn patch_own_voice_state(
-    state: &AppState,
-    account_id: &str,
-    guild_id: &str,
-    body: Value,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+async fn patch_own_voice_state(state: &AppState, account_id: &str, guild_id: &str, body: Value) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
             .patch(format!("{API_BASE}/guilds/{guild_id}/voice-states/@me"))

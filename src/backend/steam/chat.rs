@@ -60,32 +60,18 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
     let embeds = rendered.cards;
     let text = Some(rendered.text)
         .filter(|t| !t.trim().is_empty())
-        .or_else(|| {
-            n.message_no_bbcode
-                .as_deref()
-                .map(|t| t.trim_end().to_string())
-        })
+        .or_else(|| n.message_no_bbcode.as_deref().map(|t| t.trim_end().to_string()))
         .unwrap_or_default();
     if text.trim().is_empty() {
         return None;
     }
     let timestamp = n.rtime32_server_timestamp.unwrap_or_default();
-    Some(Incoming {
-        account,
-        text,
-        timestamp,
-        id: message_id(timestamp, n.ordinal.unwrap_or_default()),
-        from_us: n.local_echo.unwrap_or(false),
-        embeds,
-    })
+    Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false), embeds })
 }
 
 /// Who is typing to us, from a notification that says so.
 pub fn read_typing(n: &FriendMessagesIncoming) -> Option<u32> {
-    (n.chat_entry_type == Some(TYPING) && n.local_echo != Some(true))
-        .then_some(n.steamid_friend)
-        .flatten()
-        .and_then(steamid::account_of)
+    (n.chat_entry_type == Some(TYPING) && n.local_echo != Some(true)).then_some(n.steamid_friend).flatten().and_then(steamid::account_of)
 }
 
 /// Puts a message in the conversation it belongs to, starting the
@@ -93,27 +79,14 @@ pub fn read_typing(n: &FriendMessagesIncoming) -> Option<u32> {
 ///
 /// Returns whether anything was stored, and whether the person is new to the
 /// roster and so unknown - the caller asks Steam who they are.
-pub fn record_incoming(
-    state: &AppState,
-    account_id: &str,
-    roster: &mut Roster,
-    shown: &mut Conversations,
-    own_name: &str,
-    incoming: &Incoming,
-) -> (bool, bool) {
-    let stranger = roster.note_conversation(incoming.account)
-        || (roster.persona(incoming.account).is_none() && !roster.is_friend(incoming.account));
+pub fn record_incoming(state: &AppState, account_id: &str, roster: &mut Roster, shown: &mut Conversations, own_name: &str, incoming: &Incoming) -> (bool, bool) {
+    let stranger = roster.note_conversation(incoming.account) || (roster.persona(incoming.account).is_none() && !roster.is_friend(incoming.account));
     shown.publish(state, roster);
-    let Some(conversation) = shown.name_of(incoming.account).map(str::to_string) else {
-        return (false, stranger);
-    };
+    let Some(conversation) = shown.name_of(incoming.account).map(str::to_string) else { return (false, stranger) };
     let sender = if incoming.from_us {
         own_name.to_string()
     } else {
-        roster
-            .persona(incoming.account)
-            .and_then(|p| p.name.clone())
-            .unwrap_or_else(|| conversation.clone())
+        roster.persona(incoming.account).and_then(|p| p.name.clone()).unwrap_or_else(|| conversation.clone())
     };
     let stored = state.runtime.record_message_at(
         state,
@@ -122,24 +95,13 @@ pub fn record_incoming(
         "dm",
         &sender,
         // Read through the account's text filter, if it has one on: as Steam's own client does.
-        &(if incoming.from_us {
-            incoming.text.clone()
-        } else {
-            super::account::filtered(
-                account_id,
-                roster.is_friend(incoming.account),
-                &incoming.text,
-            )
-        }),
+        &(if incoming.from_us { incoming.text.clone() } else { super::account::filtered(account_id, roster.is_friend(incoming.account), &incoming.text) }),
         false,
         "chat",
         None,
         Some(incoming.id.clone()),
         false,
-        roster
-            .persona(incoming.account)
-            .filter(|_| !incoming.from_us)
-            .and_then(|p| p.avatar.clone()),
+        roster.persona(incoming.account).filter(|_| !incoming.from_us).and_then(|p| p.avatar.clone()),
         incoming.embeds.clone(),
         Vec::new(),
         (!incoming.from_us).then(|| steamid::text_of(incoming.account)),
@@ -166,19 +128,7 @@ const SEND_FOR: std::time::Duration = std::time::Duration::from_secs(60);
 fn passing(error: &CallError) -> bool {
     match error {
         CallError::TimedOut => true,
-        CallError::Refused(code, _) => matches!(
-            *code,
-            eresult::FAIL
-                | eresult::BUSY
-                | eresult::TIMEOUT
-                | eresult::SERVICE_UNAVAILABLE
-                | 32
-                | 33
-                | 35
-                | 36
-                | 37
-                | 55
-        ),
+        CallError::Refused(code, _) => matches!(*code, eresult::FAIL | eresult::BUSY | eresult::TIMEOUT | eresult::SERVICE_UNAVAILABLE | 32 | 33 | 35 | 36 | 37 | 55),
         CallError::Closed | CallError::Unreadable(_) => false,
     }
 }
@@ -189,33 +139,17 @@ fn passing(error: &CallError) -> bool {
 ///
 /// `unsafe_to_repeat` is for a send that has no id of its own to stop Steam taking it twice: it is
 /// repeated only when Steam said it failed, never when it merely did not answer.
-pub async fn send_with_patience<Q: prost::Message, A: prost::Message + Default>(
-    link: &Link,
-    method: &str,
-    request: &Q,
-    in_group: bool,
-    unsafe_to_repeat: bool,
-) -> Result<A, String> {
+pub async fn send_with_patience<Q: prost::Message, A: prost::Message + Default>(link: &Link, method: &str, request: &Q, in_group: bool, unsafe_to_repeat: bool) -> Result<A, String> {
     let began = std::time::Instant::now();
     let mut wait = 1;
     loop {
         match link.call::<Q, A>(method, request, true).await {
             Ok(answer) => return Ok(answer),
             Err(CallError::Refused(eresult::ACCESS_DENIED, _)) => {
-                return Err(if in_group {
-                    "you may not write in this group right now; you may be muted there, or not allowed".to_string()
-                } else {
-                    eresult::describe(eresult::ACCOUNT_NOT_FRIENDS)
-                })
+                return Err(if in_group { "you may not write in this group right now; you may be muted there, or not allowed".to_string() } else { eresult::describe(eresult::ACCOUNT_NOT_FRIENDS) })
             }
-            Err(CallError::Refused(eresult::RATE_LIMIT_EXCEEDED, _)) => {
-                return Err("you are sending too fast; wait a moment".to_string())
-            }
-            Err(error)
-                if passing(&error)
-                    && !(unsafe_to_repeat && matches!(error, CallError::TimedOut))
-                    && began.elapsed() < SEND_FOR =>
-            {
+            Err(CallError::Refused(eresult::RATE_LIMIT_EXCEEDED, _)) => return Err("you are sending too fast; wait a moment".to_string()),
+            Err(error) if passing(&error) && !(unsafe_to_repeat && matches!(error, CallError::TimedOut)) && began.elapsed() < SEND_FOR => {
                 tracing::info!("steam: {method} did not go ({error}); trying again in {wait}s");
                 tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
                 wait *= 2;
@@ -231,20 +165,13 @@ pub async fn send_with_patience<Q: prost::Message, A: prost::Message + Default>(
 /// id Steam gave the message and the second it stamped it, which the caller
 /// stores under so that an echo of it is recognised.
 pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<Sent, String> {
-    let steamid: u64 = recipient
-        .parse()
-        .ok()
-        .filter(|id| steamid::account_of(*id).is_some())
-        .ok_or("this conversation is not with a Steam account")?;
+    let steamid: u64 = recipient.parse().ok().filter(|id| steamid::account_of(*id).is_some()).ok_or("this conversation is not with a Steam account")?;
     let text = text.trim_end();
     if text.trim().is_empty() {
         return Err("there is nothing to send".to_string());
     }
     if text.chars().count() > MAX_LENGTH {
-        return Err(format!(
-            "Steam takes messages of up to {MAX_LENGTH} characters; this one is {}",
-            text.chars().count()
-        ));
+        return Err(format!("Steam takes messages of up to {MAX_LENGTH} characters; this one is {}", text.chars().count()));
     }
     let request = FriendMessagesSendRequest {
         steamid: Some(steamid),
@@ -258,30 +185,14 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<Sent, Stri
         low_priority: Some(false),
         client_message_id: Some(client_message_id()),
     };
-    let response: FriendMessagesSendResponse =
-        send_with_patience(link, "FriendMessages.SendMessage#1", &request, false, false)
-            .await
-            .inspect_err(|why| tracing::info!("steam: SendMessage was refused: {why}"))?;
-    tracing::debug!(
-        "steam: sent {text:?}; Steam stored {:?} ({:?} without tags)",
-        response.modified_message,
-        response.message_without_bb_code
-    );
+    let response: FriendMessagesSendResponse = send_with_patience(link, "FriendMessages.SendMessage#1", &request, false, false).await.inspect_err(|why| tracing::info!("steam: SendMessage was refused: {why}"))?;
+    tracing::debug!("steam: sent {text:?}; Steam stored {:?} ({:?} without tags)", response.modified_message, response.message_without_bb_code);
     let timestamp = response.server_timestamp.unwrap_or_default();
     // What Steam stored, which is the text with its emoticons found: ":steamhappy:"
     // comes back as a tag, and the log should hold what the other side will see.
-    let said = response
-        .modified_message
-        .as_deref()
-        .filter(|m| !m.trim().is_empty())
-        .unwrap_or(text);
+    let said = response.modified_message.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(text);
     let rendered = super::bbcode::render_message(said);
-    Ok(Sent {
-        id: message_id(timestamp, response.ordinal.unwrap_or_default()),
-        timestamp,
-        shown: rendered.text,
-        embeds: rendered.cards,
-    })
+    Ok(Sent { id: message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp, shown: rendered.text, embeds: rendered.cards })
 }
 
 /// A message that Steam took.
@@ -305,23 +216,11 @@ pub const TYPING: i32 = 2;
 /// text, which is how Steam's own client says it; sent without waiting, since
 /// nothing depends on it arriving.
 pub fn send_typing(link: &Link, recipient: &str) {
-    let Some(steamid) = recipient
-        .parse::<u64>()
-        .ok()
-        .filter(|id| steamid::account_of(*id).is_some())
-    else {
-        return;
-    };
+    let Some(steamid) = recipient.parse::<u64>().ok().filter(|id| steamid::account_of(*id).is_some()) else { return };
     let link = link.clone();
     tokio::spawn(async move {
-        let request = FriendMessagesSendRequest {
-            steamid: Some(steamid),
-            chat_entry_type: Some(TYPING),
-            ..Default::default()
-        };
-        let _: Result<FriendMessagesSendResponse, _> = link
-            .call("FriendMessages.SendMessage#1", &request, true)
-            .await;
+        let request = FriendMessagesSendRequest { steamid: Some(steamid), chat_entry_type: Some(TYPING), ..Default::default() };
+        let _: Result<FriendMessagesSendResponse, _> = link.call("FriendMessages.SendMessage#1", &request, true).await;
     });
 }
 
@@ -344,17 +243,11 @@ mod tests {
             let seen = seen.clone();
             Box::new(move |p| {
                 seen.lock().unwrap().push(p.clone());
-                Some(vec![answer(
-                    &p,
-                    1,
-                    FriendMessagesSendResponse::default().encode_to_vec(),
-                )])
+                Some(vec![answer(&p, 1, FriendMessagesSendResponse::default().encode_to_vec())])
             })
         })
         .await;
-        let (link, _told) = link::open_with("test", &url, Duration::from_secs(5))
-            .await
-            .unwrap();
+        let (link, _told) = link::open_with("test", &url, Duration::from_secs(5)).await.unwrap();
         send_typing(&link, "76561197960265729");
         // Nothing to send to when it is not somebody's id.
         send_typing(&link, "not an id");
@@ -367,15 +260,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
-        assert_eq!(
-            seen[0].header.target_job_name.as_deref(),
-            Some("FriendMessages.SendMessage#1")
-        );
+        assert_eq!(seen[0].header.target_job_name.as_deref(), Some("FriendMessages.SendMessage#1"));
         let body = FriendMessagesSendRequest::decode(seen[0].body.as_slice()).unwrap();
-        assert_eq!(
-            (body.steamid, body.chat_entry_type, body.message),
-            (Some(76561197960265729), Some(2), None)
-        );
+        assert_eq!((body.steamid, body.chat_entry_type, body.message), (Some(76561197960265729), Some(2), None));
     }
 
     #[test]
@@ -388,56 +275,19 @@ mod tests {
             rtime32_server_timestamp: Some(5),
             ..Default::default()
         };
-        assert_eq!(
-            read_incoming(&said(
-                "look [b]here[/b] [emoticon]steamhappy[/emoticon]",
-                "look here :steamhappy:"
-            ))
-            .unwrap()
-            .text,
-            "look **here** [steam:emote:steamhappy]"
-        );
+        assert_eq!(read_incoming(&said("look [b]here[/b] [emoticon]steamhappy[/emoticon]", "look here :steamhappy:")).unwrap().text, "look **here** [steam:emote:steamhappy]");
         // Nothing but tags: the plain copy is what there is to show.
-        assert_eq!(
-            read_incoming(&said("[roomeffect]x[/roomeffect]", "sends an effect"))
-                .unwrap()
-                .text,
-            "sends an effect"
-        );
-        assert_eq!(
-            read_incoming(&said("   ", "  ")),
-            None,
-            "and nothing at all is not a message"
-        );
+        assert_eq!(read_incoming(&said("[roomeffect]x[/roomeffect]", "sends an effect")).unwrap().text, "sends an effect");
+        assert_eq!(read_incoming(&said("   ", "  ")), None, "and nothing at all is not a message");
     }
 
     #[test]
     fn somebody_typing_is_told_from_a_message_and_from_ourselves_elsewhere() {
-        let from = |kind, echo| FriendMessagesIncoming {
-            steamid_friend: Some(steamid::steamid_of(7)),
-            chat_entry_type: Some(kind),
-            local_echo: Some(echo),
-            ..Default::default()
-        };
+        let from = |kind, echo| FriendMessagesIncoming { steamid_friend: Some(steamid::steamid_of(7)), chat_entry_type: Some(kind), local_echo: Some(echo), ..Default::default() };
         assert_eq!(read_typing(&from(2, false)), Some(7));
-        assert_eq!(
-            read_typing(&from(1, false)),
-            None,
-            "a message is not typing"
-        );
-        assert_eq!(
-            read_typing(&from(2, true)),
-            None,
-            "our own typing, from another client, is not somebody else's"
-        );
-        assert_eq!(
-            read_typing(&FriendMessagesIncoming {
-                chat_entry_type: Some(2),
-                ..Default::default()
-            }),
-            None,
-            "from nobody"
-        );
+        assert_eq!(read_typing(&from(1, false)), None, "a message is not typing");
+        assert_eq!(read_typing(&from(2, true)), None, "our own typing, from another client, is not somebody else's");
+        assert_eq!(read_typing(&FriendMessagesIncoming { chat_entry_type: Some(2), ..Default::default() }), None, "from nobody");
     }
 
     /// Steam refuses a message whose id is the wrong shape - as "not an
@@ -456,8 +306,8 @@ mod tests {
     use crate::backend::steam::friends::REL_FRIEND;
     use crate::backend::steam::link::{self, fake::*};
     use crate::backend::steam::wire::emsg;
-    use prost::Message;
     use std::time::Duration;
+    use prost::Message;
 
     const ACCOUNT: &str = "steam:tester";
 
@@ -476,21 +326,9 @@ mod tests {
     #[test]
     fn a_message_is_named_by_when_steam_stamped_it_and_its_place_in_that_second() {
         assert_eq!(message_id(1790000000, 0), "1790000000:0");
-        assert_ne!(
-            message_id(1790000000, 0),
-            message_id(1790000000, 1),
-            "two in the same second are two messages"
-        );
+        assert_ne!(message_id(1790000000, 0), message_id(1790000000, 1), "two in the same second are two messages");
         let read = read_incoming(&notice(22202, "hello", 1790000000, 3)).unwrap();
-        assert_eq!(
-            (
-                read.account,
-                read.text.as_str(),
-                read.id.as_str(),
-                read.from_us
-            ),
-            (22202, "hello", "1790000000:3", false)
-        );
+        assert_eq!((read.account, read.text.as_str(), read.id.as_str(), read.from_us), (22202, "hello", "1790000000:3", false));
     }
 
     #[test]
@@ -514,10 +352,7 @@ mod tests {
 
     #[test]
     fn the_text_is_the_message_and_trailing_space_is_dropped() {
-        assert_eq!(
-            read_incoming(&notice(1, "plain words", 1, 0)).unwrap().text,
-            "plain words"
-        );
+        assert_eq!(read_incoming(&notice(1, "plain words", 1, 0)).unwrap().text, "plain words");
         let mut raw_only = notice(1, "", 1, 0);
         raw_only.message_no_bbcode = None;
         raw_only.message = Some("raw words  ".into());
@@ -536,43 +371,18 @@ mod tests {
         let state = simulated_daemon("steam-chat-card");
         let mut roster = Roster::default();
         roster.apply_friends_list(&ClientFriendsList {
-            friends: vec![FriendsListEntry {
-                ulfriendid: Some(steamid::steamid_of(22202)),
-                efriendrelationship: Some(REL_FRIEND),
-            }],
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(22202)), efriendrelationship: Some(REL_FRIEND) }],
             ..Default::default()
         });
-        roster.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(22202)),
-                player_name: Some("Gabe".into()),
-                persona_state: Some(1),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
         let mut shown = Conversations::new(ACCOUNT);
         let raw = "[og url=\"http://x.salastil.com\" title=\"Home\" desc=\"A privacy-focused Twitter/X frontend\"]x.salastil.com[/og]";
         let incoming = read_incoming(&notice(22202, raw, 1790000100, 0)).unwrap();
         assert_eq!(incoming.text, "[x.salastil.com](http://x.salastil.com)");
         assert!(record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming).0);
-        let history = state
-            .store
-            .get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10)
-            .unwrap();
+        let history = state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
         let card = &history[0].embeds[0];
-        assert_eq!(
-            (
-                card.url.as_deref(),
-                card.title.as_deref(),
-                card.provider.as_deref()
-            ),
-            (
-                Some("http://x.salastil.com"),
-                Some("Home"),
-                Some("x.salastil.com")
-            )
-        );
+        assert_eq!((card.url.as_deref(), card.title.as_deref(), card.provider.as_deref()), (Some("http://x.salastil.com"), Some("Home"), Some("x.salastil.com")));
     }
 
     #[test]
@@ -580,43 +390,21 @@ mod tests {
         let state = simulated_daemon("steam-chat-record");
         let mut roster = Roster::default();
         roster.apply_friends_list(&ClientFriendsList {
-            friends: vec![FriendsListEntry {
-                ulfriendid: Some(steamid::steamid_of(22202)),
-                efriendrelationship: Some(REL_FRIEND),
-            }],
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(22202)), efriendrelationship: Some(REL_FRIEND) }],
             ..Default::default()
         });
-        roster.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(22202)),
-                player_name: Some("Gabe".into()),
-                persona_state: Some(1),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
         let mut shown = Conversations::new(ACCOUNT);
 
         let incoming = read_incoming(&notice(22202, "hello there", 1790000000, 0)).unwrap();
-        let (stored, stranger) =
-            record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming);
+        let (stored, stranger) = record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming);
         assert!(stored && !stranger);
         let (again, _) = record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming);
         assert!(!again, "the same message twice is one message");
 
-        let history = state
-            .store
-            .get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10)
-            .unwrap();
+        let history = state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(
-            (
-                history[0].from.as_str(),
-                history[0].body.as_str(),
-                history[0].ts
-            ),
-            ("Gabe", "hello there", 1790000000)
-        );
+        assert_eq!((history[0].from.as_str(), history[0].body.as_str(), history[0].ts), ("Gabe", "hello there", 1790000000));
         assert_eq!(history[0].id, "1790000000:0");
     }
 
@@ -625,38 +413,17 @@ mod tests {
         let state = simulated_daemon("steam-chat-echo");
         let mut roster = Roster::default();
         roster.apply_friends_list(&ClientFriendsList {
-            friends: vec![FriendsListEntry {
-                ulfriendid: Some(steamid::steamid_of(22202)),
-                efriendrelationship: Some(REL_FRIEND),
-            }],
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(22202)), efriendrelationship: Some(REL_FRIEND) }],
             ..Default::default()
         });
-        roster.apply_persona(&ClientPersonaState {
-            friends: vec![PersonaFriend {
-                friendid: Some(steamid::steamid_of(22202)),
-                player_name: Some("Gabe".into()),
-                persona_state: Some(1),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
+        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
         let mut shown = Conversations::new(ACCOUNT);
         state.runtime.set_own_identity(ACCOUNT, "Me");
 
         let mut echo = notice(22202, "from my phone", 1790000001, 0);
         echo.local_echo = Some(true);
-        record_incoming(
-            &state,
-            ACCOUNT,
-            &mut roster,
-            &mut shown,
-            "Me",
-            &read_incoming(&echo).unwrap(),
-        );
-        let history = state
-            .store
-            .get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10)
-            .unwrap();
+        record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &read_incoming(&echo).unwrap());
+        let history = state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
         assert_eq!(history.len(), 1, "in Gabe's conversation, not a new one");
         assert_eq!(history[0].from, "Me");
         assert!(history[0].is_own);
@@ -668,20 +435,12 @@ mod tests {
         let mut roster = Roster::default();
         let mut shown = Conversations::new(ACCOUNT);
         let incoming = read_incoming(&notice(777, "hi, we have not met", 1790000002, 0)).unwrap();
-        let (stored, stranger) =
-            record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming);
+        let (stored, stranger) = record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming);
         assert!(stored, "a message from a stranger is still a message");
         assert!(stranger, "and the caller should find out who they are");
         let name = shown.name_of(777).unwrap().to_string();
         assert_eq!(name, steamid::text_of(777));
-        assert_eq!(
-            state
-                .store
-                .get_backlog(&crate::model::buffer_id(ACCOUNT, &name), 0, 10)
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, &name), 0, 10).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -691,64 +450,23 @@ mod tests {
             let seen = seen.clone();
             Box::new(move |req| {
                 *seen.lock().unwrap() = Some(req.clone());
-                Some(vec![answer(
-                    &req,
-                    1,
-                    FriendMessagesSendResponse {
-                        modified_message: Some(
-                            "hi [b]there[/b] [emoticon]steamhappy[/emoticon]".into(),
-                        ),
-                        server_timestamp: Some(1790000003),
-                        ordinal: Some(2),
-                        message_without_bb_code: Some("hi there".into()),
-                    }
-                    .encode_to_vec(),
-                )])
+                Some(vec![answer(&req, 1, FriendMessagesSendResponse { modified_message: Some("hi [b]there[/b] [emoticon]steamhappy[/emoticon]".into()), server_timestamp: Some(1790000003), ordinal: Some(2), message_without_bb_code: Some("hi there".into()) }.encode_to_vec())])
             })
         })
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        link.set_identity(link::Identity {
-            steamid: 76561197960287930,
-            session: 4,
-        });
+        link.set_identity(link::Identity { steamid: 76561197960287930, session: 4 });
 
-        let sent = send(
-            &link,
-            "76561197960265729",
-            "hi [b]there[/b] :steamhappy:  \n",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            (sent.id.as_str(), sent.timestamp),
-            ("1790000003:2", 1790000003)
-        );
-        assert_eq!(
-            sent.shown, "hi **there** [steam:emote:steamhappy]",
-            "what is logged is what Steam stored, drawn as moho draws it"
-        );
+        let sent = send(&link, "76561197960265729", "hi [b]there[/b] :steamhappy:  \n").await.unwrap();
+        assert_eq!((sent.id.as_str(), sent.timestamp), ("1790000003:2", 1790000003));
+        assert_eq!(sent.shown, "hi **there** [steam:emote:steamhappy]", "what is logged is what Steam stored, drawn as moho draws it");
         let req = seen.lock().unwrap().clone().unwrap();
-        assert_eq!(
-            req.emsg,
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT,
-            "as the signed-in account"
-        );
-        assert_eq!(
-            req.header.target_job_name.as_deref(),
-            Some("FriendMessages.SendMessage#1")
-        );
+        assert_eq!(req.emsg, emsg::SERVICE_METHOD_CALL_FROM_CLIENT, "as the signed-in account");
+        assert_eq!(req.header.target_job_name.as_deref(), Some("FriendMessages.SendMessage#1"));
         let body = FriendMessagesSendRequest::decode(req.body.as_slice()).unwrap();
         assert_eq!(body.steamid, Some(76561197960265729));
-        assert_eq!(
-            body.message.as_deref(),
-            Some("hi [b]there[/b] :steamhappy:"),
-            "trailing space is dropped; the tags are sent as they came"
-        );
-        assert_eq!(
-            (body.chat_entry_type, body.contains_bbcode),
-            (Some(1), Some(true))
-        );
+        assert_eq!(body.message.as_deref(), Some("hi [b]there[/b] :steamhappy:"), "trailing space is dropped; the tags are sent as they came");
+        assert_eq!((body.chat_entry_type, body.contains_bbcode), (Some(1), Some(true)));
         assert_eq!(body.client_message_id.as_deref().map(str::len), Some(16));
     }
 
@@ -760,25 +478,11 @@ mod tests {
         }))
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        link.set_identity(link::Identity {
-            steamid: 76561197960287930,
-            session: 4,
-        });
-        let sent = send(&link, "76561197960265729", "https://x.test/p")
-            .await
-            .unwrap();
-        assert_eq!(
-            sent.shown, "https://x.test/p",
-            "the words are what was sent"
-        );
+        link.set_identity(link::Identity { steamid: 76561197960287930, session: 4 });
+        let sent = send(&link, "76561197960265729", "https://x.test/p").await.unwrap();
+        assert_eq!(sent.shown, "https://x.test/p", "the words are what was sent");
         assert_eq!(sent.embeds.len(), 1, "and the card is the sender's too");
-        assert_eq!(
-            (
-                sent.embeds[0].title.as_deref(),
-                sent.embeds[0].description.as_deref()
-            ),
-            (Some("A page"), Some("About it"))
-        );
+        assert_eq!((sent.embeds[0].title.as_deref(), sent.embeds[0].description.as_deref()), (Some("A page"), Some("About it")));
         assert!(sent.embeds[0].image_url.is_some());
     }
 
@@ -789,11 +493,7 @@ mod tests {
             let heard = heard.clone();
             Box::new(move |req| {
                 heard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Some(vec![answer(
-                    &req,
-                    1,
-                    FriendMessagesSendResponse::default().encode_to_vec(),
-                )])
+                Some(vec![answer(&req, 1, FriendMessagesSendResponse::default().encode_to_vec())])
             })
         })
         .await;
@@ -806,52 +506,26 @@ mod tests {
             let err = send(&link, to, text).await.unwrap_err();
             assert!(err.contains(why), "{to:?} {text:?}: {err}");
         }
-        let err = send(&link, "76561197960265729", &"x".repeat(2001))
-            .await
-            .unwrap_err();
+        let err = send(&link, "76561197960265729", &"x".repeat(2001)).await.unwrap_err();
         assert!(err.contains("2000"), "{err}");
-        assert_eq!(
-            heard.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "none of those reached Steam"
-        );
+        assert_eq!(heard.load(std::sync::atomic::Ordering::SeqCst), 0, "none of those reached Steam");
 
         // Exactly the limit is fine.
-        send(&link, "76561197960265729", &"x".repeat(2000))
-            .await
-            .unwrap();
+        send(&link, "76561197960265729", &"x".repeat(2000)).await.unwrap();
         assert_eq!(heard.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn a_send_that_fails_in_passing_is_tried_again_with_the_same_id_and_one_that_is_refused_is_not(
-    ) {
+    async fn a_send_that_fails_in_passing_is_tried_again_with_the_same_id_and_one_that_is_refused_is_not() {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let url = serve({
             let seen = seen.clone();
             Box::new(move |req| {
                 let mut seen = seen.lock().unwrap();
-                seen.push(
-                    FriendMessagesSendRequest::decode(req.body.as_slice())
-                        .unwrap()
-                        .client_message_id,
-                );
+                seen.push(FriendMessagesSendRequest::decode(req.body.as_slice()).unwrap().client_message_id);
                 // Fails the first time, as a busy server does, then goes through.
-                let code = if seen.len() == 1 {
-                    eresult::SERVICE_UNAVAILABLE
-                } else {
-                    1
-                };
-                Some(vec![answer(
-                    &req,
-                    code,
-                    FriendMessagesSendResponse {
-                        server_timestamp: Some(5),
-                        ordinal: Some(0),
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                )])
+                let code = if seen.len() == 1 { eresult::SERVICE_UNAVAILABLE } else { 1 };
+                Some(vec![answer(&req, code, FriendMessagesSendResponse { server_timestamp: Some(5), ordinal: Some(0), ..Default::default() }.encode_to_vec())])
             })
         })
         .await;
@@ -860,20 +534,12 @@ mod tests {
         assert_eq!(sent.timestamp, 5);
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "tried again after the first failure");
-        assert_eq!(
-            seen[0], seen[1],
-            "under the same id, so Steam cannot take it twice"
-        );
+        assert_eq!(seen[0], seen[1], "under the same id, so Steam cannot take it twice");
     }
 
     #[tokio::test]
     async fn being_refused_for_good_is_said_at_once_in_the_clients_words() {
-        for (code, words, in_group) in [
-            (eresult::ACCESS_DENIED, "friends", false),
-            (eresult::ACCESS_DENIED, "may not write in this group", true),
-            (eresult::RATE_LIMIT_EXCEEDED, "too fast", false),
-            (eresult::LIMITED_USER_ACCOUNT, "limited account", false),
-        ] {
+        for (code, words, in_group) in [(eresult::ACCESS_DENIED, "friends", false), (eresult::ACCESS_DENIED, "may not write in this group", true), (eresult::RATE_LIMIT_EXCEEDED, "too fast", false), (eresult::LIMITED_USER_ACCOUNT, "limited account", false)] {
             let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let url = serve({
                 let count = count.clone();
@@ -884,30 +550,15 @@ mod tests {
             })
             .await;
             let (link, _told) = link::open("steam:test", &url).await.unwrap();
-            let err = send_with_patience::<FriendMessagesSendRequest, FriendMessagesSendResponse>(
-                &link,
-                "FriendMessages.SendMessage#1",
-                &FriendMessagesSendRequest::default(),
-                in_group,
-                false,
-            )
-            .await
-            .unwrap_err();
+            let err = send_with_patience::<FriendMessagesSendRequest, FriendMessagesSendResponse>(&link, "FriendMessages.SendMessage#1", &FriendMessagesSendRequest::default(), in_group, false).await.unwrap_err();
             assert!(err.contains(words), "{code}: {err}");
-            assert_eq!(
-                count.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "{code} is not tried again"
-            );
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1, "{code} is not tried again");
         }
     }
 
     #[tokio::test]
     async fn steams_refusals_are_said_in_words() {
-        let url = serve(Box::new(|req| {
-            Some(vec![answer(&req, eresult::ACCOUNT_NOT_FRIENDS, Vec::new())])
-        }))
-        .await;
+        let url = serve(Box::new(|req| Some(vec![answer(&req, eresult::ACCOUNT_NOT_FRIENDS, Vec::new())]))).await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
         let err = send(&link, "76561197960265729", "hello").await.unwrap_err();
         assert!(err.contains("friends"), "{err}");

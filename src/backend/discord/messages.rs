@@ -18,14 +18,8 @@ use super::*;
 /// The same messages are usually already in scrollback, but not always - a
 /// channel's rules are typically pinned years before anybody reads them.
 pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/pins"))
         .header("Authorization", &cfg.token)
@@ -52,12 +46,7 @@ pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) ->
                 .filter(|s| !s.is_empty())
                 .or_else(|| author["username"].as_str())
                 .unwrap_or("unknown");
-            let body = resolve_mentions(
-                &extract_body(msg).unwrap_or_default(),
-                msg,
-                &cfg.user_id,
-                own_display_name.as_deref(),
-            );
+            let body = resolve_mentions(&extract_body(msg).unwrap_or_default(), msg, &cfg.user_id, own_display_name.as_deref());
             let ts = msg["timestamp"]
                 .as_str()
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
@@ -79,10 +68,7 @@ pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) ->
     let ids: Vec<&str> = pinned.iter().filter_map(|m| m["id"].as_str()).collect();
     // Told as well as answered, so the header's count is right for every
     // window watching this conversation rather than only the one that asked.
-    state.events.emit(
-        "pinnedMessages",
-        json!({ "bufferId": buffer_id, "pinned": ids }),
-    );
+    state.events.emit("pinnedMessages", json!({ "bufferId": buffer_id, "pinned": ids }));
     Ok(json!({ "bufferId": buffer_id, "pinned": pinned }))
 }
 
@@ -103,38 +89,14 @@ pub(super) fn describe_wordless(msg: &Value) -> String {
 /// Whether this account may is Discord's decision - MANAGE_MESSAGES in a
 /// guild, and anybody in a DM - so it is asked rather than worked out here,
 /// and a refusal is passed through in Discord's own words.
-pub async fn set_pinned(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    message_id: &str,
-    pinned: bool,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
+pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, pinned: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
     let url = format!("{API_BASE}/channels/{channel_id}/pins/{message_id}");
     let http = http_client_for(&cfg.token);
-    let request = if pinned {
-        http.put(url)
-    } else {
-        http.delete(url)
-    };
-    let doing = if pinned {
-        "pinning the message"
-    } else {
-        "unpinning the message"
-    };
-    let resp = request
-        .header("Authorization", &cfg.token)
-        .send()
-        .await
-        .context(doing)?;
+    let request = if pinned { http.put(url) } else { http.delete(url) };
+    let doing = if pinned { "pinning the message" } else { "unpinning the message" };
+    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -165,10 +127,7 @@ pub async fn set_pinned(
 /// `None` for a DM (no guild at all - `@me` is Discord's own link
 /// convention there).
 pub fn message_link(channel_id: &str, guild_id: Option<&str>, message_id: &str) -> String {
-    format!(
-        "https://discord.com/channels/{}/{channel_id}/{message_id}",
-        guild_id.unwrap_or("@me")
-    )
+    format!("https://discord.com/channels/{}/{channel_id}/{message_id}", guild_id.unwrap_or("@me"))
 }
 
 /// Discord sometimes puts the actually-useful content in `embeds` rather
@@ -409,10 +368,7 @@ mod forwarded_tests {
         assert_eq!(atts[0].kind, "image");
         // The message is not left blank either, since a client that draws no
         // attachment would otherwise show nothing at all.
-        assert_eq!(
-            extract_body(&d).as_deref(),
-            Some("> (forwarded 1 attachment)")
-        );
+        assert_eq!(extract_body(&d).as_deref(), Some("> (forwarded 1 attachment)"));
         // And the message's own attachments are untouched by this.
         assert!(extract_attachments(&d).is_empty());
     }
@@ -462,20 +418,14 @@ mod sticker_and_poll_tests {
         let stickers = extract_stickers(&d);
         assert_eq!(stickers.len(), 1);
         assert_eq!(stickers[0].filename.as_deref(), Some("sad cat.png"));
-        assert_eq!(
-            stickers[0].url.as_deref(),
-            Some("https://media.discordapp.net/stickers/42.png")
-        );
+        assert_eq!(stickers[0].url.as_deref(), Some("https://media.discordapp.net/stickers/42.png"));
         assert!(!is_empty_message("", &[], &stickers));
     }
 
     #[test]
     fn an_animated_sticker_keeps_its_own_format() {
         let d = json!({ "sticker_items": [{ "id": "7", "name": "dance", "format_type": 4 }] });
-        assert_eq!(
-            extract_stickers(&d)[0].url.as_deref(),
-            Some("https://media.discordapp.net/stickers/7.gif")
-        );
+        assert_eq!(extract_stickers(&d)[0].url.as_deref(), Some("https://media.discordapp.net/stickers/7.gif"));
     }
 
     /// A Lottie sticker is a vector animation, carried as the JSON it is
@@ -486,10 +436,7 @@ mod sticker_and_poll_tests {
         let stickers = extract_stickers(&d);
         assert_eq!(stickers.len(), 1);
         assert_eq!(stickers[0].kind, "lottie");
-        assert_eq!(
-            stickers[0].url.as_deref(),
-            Some("https://cdn.discordapp.com/stickers/9.json")
-        );
+        assert_eq!(stickers[0].url.as_deref(), Some("https://cdn.discordapp.com/stickers/9.json"));
         assert_eq!(extract_body(&d), None);
     }
 
@@ -516,10 +463,7 @@ mod sticker_and_poll_tests {
     /// A marker alone on a line says less than nothing.
     #[test]
     fn a_poll_with_no_answers_is_not_shown() {
-        assert_eq!(
-            extract_poll(&json!({ "poll": { "question": { "text": "?" }, "answers": [] } })),
-            None
-        );
+        assert_eq!(extract_poll(&json!({ "poll": { "question": { "text": "?" }, "answers": [] } })), None);
         assert_eq!(extract_poll(&json!({ "content": "hi" })), None);
     }
 }
@@ -561,9 +505,7 @@ pub(super) fn extract_stickers(d: &Value) -> Vec<Attachment> {
             Some(Attachment {
                 kind: "image".to_string(),
                 filename: Some(format!("{name}.{extension}")),
-                url: Some(format!(
-                    "https://media.discordapp.net/stickers/{id}.{extension}"
-                )),
+                url: Some(format!("https://media.discordapp.net/stickers/{id}.{extension}")),
                 mimetype: Some(mimetype.to_string()),
                 ..Default::default()
             })
@@ -590,15 +532,13 @@ pub(super) fn extract_poll(d: &Value) -> Option<String> {
             continue;
         }
         let emoji = answer["poll_media"]["emoji"]["name"].as_str().unwrap_or("");
-        out.push_str(&format!(
-            "\n• {emoji}{}{text}",
-            if emoji.is_empty() { "" } else { " " }
-        ));
+        out.push_str(&format!("\n• {emoji}{}{text}", if emoji.is_empty() { "" } else { " " }));
     }
     // A Lottie sticker or an empty poll would leave the marker alone on a
     // line, which says less than nothing.
     (out.lines().count() > 1).then_some(out)
 }
+
 
 /// What was forwarded, as lines quoting it.
 ///
@@ -610,9 +550,7 @@ pub(super) fn extract_poll(d: &Value) -> Option<String> {
 /// Recursive in the protocol and not here: a forward of a forward carries
 /// its own snapshot, and one level is what Discord itself draws.
 pub(super) fn forwarded_text(d: &Value) -> Vec<String> {
-    let Some(snapshots) = d["message_snapshots"].as_array() else {
-        return Vec::new();
-    };
+    let Some(snapshots) = d["message_snapshots"].as_array() else { return Vec::new() };
     snapshots
         .iter()
         .filter_map(|snapshot| {
@@ -629,15 +567,9 @@ pub(super) fn forwarded_text(d: &Value) -> Vec<String> {
             // What came with it. The pictures themselves are lifted into the
             // message's own attachments below; this is for the case where a
             // forward is *only* a picture, so the line is not empty.
-            let files = message["attachments"]
-                .as_array()
-                .map(|a| a.len())
-                .unwrap_or(0);
+            let files = message["attachments"].as_array().map(|a| a.len()).unwrap_or(0);
             if parts.is_empty() && files > 0 {
-                parts.push(format!(
-                    "> (forwarded {files} attachment{})",
-                    if files == 1 { "" } else { "s" }
-                ));
+                parts.push(format!("> (forwarded {files} attachment{})", if files == 1 { "" } else { "s" }));
             }
             if parts.is_empty() {
                 return None;
@@ -659,26 +591,15 @@ pub const FORWARD_MARK: &str = "Forwarded";
 ///
 /// Done afterwards rather than before, so a forward appears at once and gains
 /// its attribution a moment later, the same way a late link preview does.
-pub async fn name_forward(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    msg_id: &str,
-    reference: &Value,
-) {
-    let (Some(source_channel), Some(source_message)) = (
-        reference["channel_id"].as_str(),
-        reference["message_id"].as_str(),
-    ) else {
+pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, reference: &Value) {
+    let (Some(source_channel), Some(source_message)) =
+        (reference["channel_id"].as_str(), reference["message_id"].as_str())
+    else {
         return;
     };
-    let Some(cfg) = state.accounts.get_discord(account_id) else {
-        return;
-    };
+    let Some(cfg) = state.accounts.get_discord(account_id) else { return };
     let resp = http_client_for(&cfg.token)
-        .get(format!(
-            "{API_BASE}/channels/{source_channel}/messages?limit=1&around={source_message}"
-        ))
+        .get(format!("{API_BASE}/channels/{source_channel}/messages?limit=1&around={source_message}"))
         .header("Authorization", &cfg.token)
         .send()
         .await;
@@ -688,9 +609,7 @@ pub async fn name_forward(
     if !resp.status().is_success() {
         return;
     }
-    let Ok(found) = resp.json::<Value>().await else {
-        return;
-    };
+    let Ok(found) = resp.json::<Value>().await else { return };
     let original = found
         .as_array()
         .into_iter()
@@ -720,12 +639,7 @@ pub async fn name_forward(
         None if original["guild_id"].is_null() => " from a direct message".to_string(),
         None => String::new(),
     };
-    state.runtime.rename_reply_preview(
-        state,
-        buffer_id,
-        msg_id,
-        &format!("{FORWARD_MARK} from {name}{place}"),
-    );
+    state.runtime.rename_reply_preview(state, buffer_id, msg_id, &format!("{FORWARD_MARK} from {name}{place}"));
 }
 
 /// The files inside a forwarded message, as attachments of this one.
@@ -743,9 +657,7 @@ pub(super) fn forwarded_attachments(d: &Value) -> Vec<Attachment> {
 }
 
 pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
-    let Some(atts) = d["attachments"].as_array() else {
-        return Vec::new();
-    };
+    let Some(atts) = d["attachments"].as_array() else { return Vec::new() };
     // Whether somebody spoke this message rather than attaching a sound file.
     // The flag is on the message, the recording is on the attachment, so it is
     // read once here and carried down to each.
@@ -791,9 +703,7 @@ pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
 /// represented by extract_body's own media-URL handling above, so
 /// including it here too would just render an empty box under the media.
 pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
-    let Some(embeds) = d["embeds"].as_array() else {
-        return Vec::new();
-    };
+    let Some(embeds) = d["embeds"].as_array() else { return Vec::new() };
     embeds
         .iter()
         .filter_map(|embed| {
@@ -803,40 +713,22 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
             if embed["type"].as_str() == Some("gifv") {
                 return gif_embed(embed);
             }
-            let title = embed["title"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
-            let description = embed["description"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string());
+            let title = embed["title"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
+            let description = embed["description"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
             let fields: Vec<model::EmbedField> = embed["fields"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|f| {
-                    Some(model::EmbedField {
-                        name: f["name"].as_str()?.to_string(),
-                        value: f["value"].as_str()?.to_string(),
-                    })
-                })
+                .filter_map(|f| Some(model::EmbedField { name: f["name"].as_str()?.to_string(), value: f["value"].as_str()?.to_string() }))
                 .collect();
-            let footer = embed["footer"]["text"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let footer = embed["footer"]["text"].as_str().filter(|s| !s.is_empty()).map(str::to_string);
             if title.is_none() && description.is_none() && fields.is_empty() {
                 return None;
             }
             // A card with a name and nothing under it is how an embed that holds
             // its content somewhere this does not read looks. Logged whole, so
             // what Discord actually sent is on record rather than guessed at.
-            if description.is_none()
-                && fields.is_empty()
-                && embed["image"].is_null()
-                && embed["thumbnail"].is_null()
-            {
+            if description.is_none() && fields.is_empty() && embed["image"].is_null() && embed["thumbnail"].is_null() {
                 tracing::info!("discord: an embed with only a title, as sent: {embed}");
             }
             Some(Embed {
@@ -849,14 +741,8 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
                 // message's media sniffing, which pairs them with the embed
                 // in the frontend. Nothing to fetch here.
                 image_url: None,
-                provider: embed["provider"]["name"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
-                author: embed["author"]["name"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string),
+                provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                author: embed["author"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                 fields,
                 footer,
                 ..Default::default()
@@ -877,16 +763,9 @@ pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
 /// who read it, which is the same arrangement Discord's own client makes.
 fn gif_embed(embed: &Value) -> Option<Embed> {
     let video = &embed["video"];
-    let from_video = video["proxy_url"]
-        .as_str()
-        .or_else(|| video["url"].as_str())
-        .filter(|u| !u.is_empty());
+    let from_video = video["proxy_url"].as_str().or_else(|| video["url"].as_str()).filter(|u| !u.is_empty());
     let media = from_video
-        .or_else(|| {
-            embed["thumbnail"]["proxy_url"]
-                .as_str()
-                .filter(|u| !u.is_empty())
-        })
+        .or_else(|| embed["thumbnail"]["proxy_url"].as_str().filter(|u| !u.is_empty()))
         .or_else(|| embed["thumbnail"]["url"].as_str().filter(|u| !u.is_empty()))?;
     let size = |key: &str| {
         video[key]
@@ -899,20 +778,10 @@ fn gif_embed(embed: &Value) -> Option<Embed> {
         kind: Some("gif".to_string()),
         url: embed["url"].as_str().map(str::to_string),
         media_url: Some(media.to_string()),
-        media_kind: Some(
-            if from_video.is_some() {
-                "video"
-            } else {
-                "image"
-            }
-            .to_string(),
-        ),
+        media_kind: Some(if from_video.is_some() { "video" } else { "image" }.to_string()),
         width: size("width"),
         height: size("height"),
-        provider: embed["provider"]["name"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        provider: embed["provider"]["name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         ..Default::default()
     })
 }
@@ -942,18 +811,9 @@ fn safety_notice(embed: &Value) -> Embed {
     // the browser; "see details" is a page inside Discord's own app, which has
     // nowhere to go from here, so it is drawn without one.
     let cta = match value("ctas").as_deref() {
-        Some("learn_more_link") => Some(model::EmbedLink {
-            label: "Learn more".to_string(),
-            url: link.clone(),
-        }),
-        Some("policy_violation_detail") => Some(model::EmbedLink {
-            label: "See details in Discord".to_string(),
-            url: None,
-        }),
-        _ => link.clone().map(|url| model::EmbedLink {
-            label: "Learn more".to_string(),
-            url: Some(url),
-        }),
+        Some("learn_more_link") => Some(model::EmbedLink { label: "Learn more".to_string(), url: link.clone() }),
+        Some("policy_violation_detail") => Some(model::EmbedLink { label: "See details in Discord".to_string(), url: None }),
+        _ => link.clone().map(|url| model::EmbedLink { label: "Learn more".to_string(), url: Some(url) }),
     };
     let timestamp = value("timestamp")
         .and_then(|t| t.parse::<f64>().ok())
@@ -991,20 +851,11 @@ pub(super) fn author_avatar_url(author: &Value) -> Option<String> {
     let id = author["id"].as_str()?;
     let hash = author["avatar"].as_str()?;
     let ext = if hash.starts_with("a_") { "gif" } else { "png" };
-    Some(format!(
-        "https://cdn.discordapp.com/avatars/{id}/{hash}.{ext}"
-    ))
+    Some(format!("https://cdn.discordapp.com/avatars/{id}/{hash}.{ext}"))
 }
 
-pub(super) fn resolve_mentions(
-    body: &str,
-    d: &Value,
-    own_user_id: &str,
-    own_display_name: Option<&str>,
-) -> String {
-    let Some(mentions) = d["mentions"].as_array() else {
-        return body.to_string();
-    };
+pub(super) fn resolve_mentions(body: &str, d: &Value, own_user_id: &str, own_display_name: Option<&str>) -> String {
+    let Some(mentions) = d["mentions"].as_array() else { return body.to_string() };
     let mut out = body.to_string();
     for m in mentions {
         let Some(id) = m["id"].as_str() else { continue };
@@ -1012,21 +863,9 @@ pub(super) fn resolve_mentions(
             own_display_name
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    m["global_name"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| m["username"].as_str())
-                        .unwrap_or("you")
-                        .to_string()
-                })
+                .unwrap_or_else(|| m["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| m["username"].as_str()).unwrap_or("you").to_string())
         } else {
-            m["global_name"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| m["username"].as_str())
-                .unwrap_or("someone")
-                .to_string()
+            m["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| m["username"].as_str()).unwrap_or("someone").to_string()
         };
         out = out.replace(&format!("<@{id}>"), &format!("@{name}"));
         out = out.replace(&format!("<@!{id}>"), &format!("@{name}"));
@@ -1043,10 +882,7 @@ pub(super) fn resolve_mentions(
 /// IRC, which has no structured mention data) can never match a Discord
 /// mention.
 pub(super) fn mentions_own_user(d: &Value, own_user_id: &str) -> bool {
-    d["mentions"]
-        .as_array()
-        .map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(own_user_id)))
-        .unwrap_or(false)
+    d["mentions"].as_array().map(|arr| arr.iter().any(|m| m["id"].as_str() == Some(own_user_id))).unwrap_or(false)
 }
 
 /// A cached snapshot of the message being replied to, taken at receive
@@ -1079,48 +915,22 @@ pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
     if referenced.is_null() {
         // Reference exists but Discord didn't resolve it - still worth a
         // "replying to a message" placeholder rather than nothing at all.
-        return Some(ReplyPreview {
-            id: reply_id.to_string(),
-            ..Default::default()
-        });
+        return Some(ReplyPreview { id: reply_id.to_string(), ..Default::default() });
     }
     let author = &referenced["author"];
-    let from = author["global_name"]
-        .as_str()
-        .filter(|s| !s.is_empty())
-        .or_else(|| author["username"].as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown").to_string();
     let body = extract_body(referenced).unwrap_or_default();
-    Some(ReplyPreview {
-        id: reply_id.to_string(),
-        from,
-        body,
-        thread: false,
-        forwarded: false,
-    })
+    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false })
 }
 
 /// Shared by both the initial backfill and extend_history - Discord
 /// returns messages newest-first; both store oldest-first so scrollback
 /// reads top-to-bottom chronologically, matching getBacklog's contract.
-pub(super) fn store_history_messages(
-    state: &AppState,
-    buffer_id: &str,
-    messages: &[Value],
-    user_id: &str,
-    own_display_name: Option<&str>,
-) {
+pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages: &[Value], user_id: &str, own_display_name: Option<&str>) {
     for msg in messages.iter().rev() {
-        let Some(msg_id) = msg["id"].as_str() else {
-            continue;
-        };
+        let Some(msg_id) = msg["id"].as_str() else { continue };
         let author = &msg["author"];
-        let from = author["global_name"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .or_else(|| author["username"].as_str())
-            .unwrap_or("unknown");
+        let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown");
         let is_own = author["id"].as_str() == Some(user_id);
         let embeds = extract_embeds(msg);
         let mut attachments = extract_attachments(msg);
@@ -1138,41 +948,15 @@ pub(super) fn store_history_messages(
         let avatar_url = author_avatar_url(author);
         // Discord's own account says what it is on every message it sends, which
         // is a second way to know this conversation cannot be written in.
-        if author["system"].as_bool() == Some(true)
-            && state.runtime.buffer_kind_of(buffer_id) == "dm"
-        {
-            state.runtime.set_buffer_read_only(
-                state,
-                buffer_id,
-                Some(super::people::OFFICIAL_ONLY),
-            );
+        if author["system"].as_bool() == Some(true) && state.runtime.buffer_kind_of(buffer_id) == "dm" {
+            state.runtime.set_buffer_read_only(state, buffer_id, Some(super::people::OFFICIAL_ONLY));
         }
         let ts = msg["timestamp"]
             .as_str()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(
-            buffer_id,
-            msg_id,
-            from,
-            &body,
-            ts,
-            false,
-            false,
-            "chat",
-            reply_to.as_ref(),
-            &reactions,
-            is_own,
-            avatar_url.as_deref(),
-            &embeds,
-            &attachments,
-            author["id"].as_str(),
-            None,
-            &state.runtime.buffer_kind_of(buffer_id),
-            None,
-            &[],
-        ) {
+        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &[]) {
             tracing::warn!("discord: storing history message: {e}");
             continue;
         }
@@ -1201,12 +985,7 @@ pub(super) fn store_history_messages(
         // Backfilled messages need previews as much as live ones do - more so,
         // since a channel read for the first time is all history and none of it
         // would otherwise survive its links expiring.
-        cache_thumbnails(
-            state.clone(),
-            buffer_id.to_string(),
-            msg_id.to_string(),
-            attachments,
-        );
+        cache_thumbnails(state.clone(), buffer_id.to_string(), msg_id.to_string(), attachments);
     }
 }
 
@@ -1215,9 +994,7 @@ pub(super) fn store_history_messages(
 /// count and whether *we* are among the reactors, so this is a much
 /// simpler direct read rather than reconstructing state incrementally.
 pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
-    let Some(arr) = msg["reactions"].as_array() else {
-        return Vec::new();
-    };
+    let Some(arr) = msg["reactions"].as_array() else { return Vec::new() };
     arr.iter()
         .filter_map(|r| {
             let count = r["count"].as_i64()?;
@@ -1229,12 +1006,7 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
             };
             let me = r["me"].as_bool().unwrap_or(false);
             let animated = is_custom && r["emoji"]["animated"].as_bool().unwrap_or(false);
-            Some(Reaction {
-                emoji,
-                count,
-                me,
-                animated,
-            })
+            Some(Reaction { emoji, count, me, animated })
         })
         .collect()
 }
@@ -1246,18 +1018,13 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
 /// type numbers are turned into words on the way through - a frontend should
 /// not have to know that 2 means button.
 pub(super) fn extract_components(msg: &Value) -> Vec<model::Component> {
-    let Some(rows) = msg["components"].as_array() else {
-        return Vec::new();
-    };
+    let Some(rows) = msg["components"].as_array() else { return Vec::new() };
     let mut out = Vec::new();
     for (row_index, row) in rows.iter().enumerate() {
         // A row is itself a component (type 1) holding the real ones. A
         // message whose top level is already a control is not a shape Discord
         // sends, but reading it either way costs nothing.
-        let children = row["components"]
-            .as_array()
-            .cloned()
-            .unwrap_or_else(|| vec![row.clone()]);
+        let children = row["components"].as_array().cloned().unwrap_or_else(|| vec![row.clone()]);
         for child in children {
             let kind = match child["type"].as_i64() {
                 Some(2) => "button",
@@ -1292,19 +1059,13 @@ pub(super) fn extract_components(msg: &Value) -> Vec<model::Component> {
             out.push(model::Component {
                 kind: kind.to_string(),
                 custom_id: child["custom_id"].as_str().map(str::to_string),
-                label: child["label"]
-                    .as_str()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string),
+                label: child["label"].as_str().filter(|l| !l.is_empty()).map(str::to_string),
                 style: style.map(str::to_string),
                 url: child["url"].as_str().map(str::to_string),
                 disabled: child["disabled"].as_bool().unwrap_or(false),
                 // Written the way this client writes emoji everywhere else, so
                 // a button's picture renders like one in a message does.
-                emoji: match (
-                    child["emoji"]["name"].as_str(),
-                    child["emoji"]["id"].as_str(),
-                ) {
+                emoji: match (child["emoji"]["name"].as_str(), child["emoji"]["id"].as_str()) {
                     (Some(name), Some(id)) => Some(format!("<:{name}:{id}>")),
                     (Some(name), None) => Some(name.to_string()),
                     _ => None,
@@ -1379,10 +1140,7 @@ mod component_tests {
         assert_eq!(out[3].placeholder.as_deref(), Some("Pick a role"));
         assert_eq!(out[3].options.len(), 2);
         assert_eq!(out[3].options[0].value, "red");
-        assert_eq!(
-            out[3].options[0].description.as_deref(),
-            Some("the red one")
-        );
+        assert_eq!(out[3].options[0].description.as_deref(), Some("the red one"));
     }
 
     /// The rows are kept, because how they were laid out is something the bot
@@ -1457,10 +1215,7 @@ mod embed_body_tests {
                 "video": { "url": "https://www.youtube.com/embed/g1Sq1Nr58hM" }
             }]
         });
-        assert_eq!(
-            extract_body(&msg).as_deref(),
-            Some("https://www.youtube.com/watch?v=g1Sq1Nr58hM")
-        );
+        assert_eq!(extract_body(&msg).as_deref(), Some("https://www.youtube.com/watch?v=g1Sq1Nr58hM"));
     }
 
     /// An embed nobody linked - Discord attaches these to its own system
@@ -1472,10 +1227,7 @@ mod embed_body_tests {
             "content": "look at this",
             "embeds": [{ "image": { "url": "https://cdn.example/pic.png" } }]
         });
-        assert_eq!(
-            extract_body(&msg).as_deref(),
-            Some("look at this\nhttps://cdn.example/pic.png")
-        );
+        assert_eq!(extract_body(&msg).as_deref(), Some("look at this\nhttps://cdn.example/pic.png"));
     }
 
     /// The source link being absent from the text is the same situation: the
@@ -1489,10 +1241,7 @@ mod embed_body_tests {
                 "image": { "url": "https://example.com/hero.png" }
             }]
         });
-        assert_eq!(
-            extract_body(&msg).as_deref(),
-            Some("no links here\nhttps://example.com/hero.png")
-        );
+        assert_eq!(extract_body(&msg).as_deref(), Some("no links here\nhttps://example.com/hero.png"));
     }
 }
 
@@ -1558,11 +1307,7 @@ mod attachment_tests {
         // paths dropped it instead of storing it.
         let d = json!({ "content": "", "attachments": [{ "url": "https://cdn/a.png", "content_type": "image/png" }] });
         let body = extract_body(&d).unwrap_or_default();
-        assert!(!is_empty_message(
-            &body,
-            &extract_embeds(&d),
-            &extract_attachments(&d)
-        ));
+        assert!(!is_empty_message(&body, &extract_embeds(&d), &extract_attachments(&d)));
     }
 
     #[test]
@@ -1570,27 +1315,17 @@ mod attachment_tests {
         // Pin notices and thread markers really do have nothing to show.
         let d = json!({ "content": "", "attachments": [], "embeds": [] });
         let body = extract_body(&d).unwrap_or_default();
-        assert!(is_empty_message(
-            &body,
-            &extract_embeds(&d),
-            &extract_attachments(&d)
-        ));
+        assert!(is_empty_message(&body, &extract_embeds(&d), &extract_attachments(&d)));
     }
 
     #[test]
     fn unwraps_a_static_custom_emoji() {
-        assert_eq!(
-            reaction_path_segment("<:pepege:123456789>"),
-            "pepege:123456789"
-        );
+        assert_eq!(reaction_path_segment("<:pepege:123456789>"), "pepege:123456789");
     }
 
     #[test]
     fn unwraps_an_animated_custom_emoji() {
-        assert_eq!(
-            reaction_path_segment("<a:vibing:987654321>"),
-            "vibing:987654321"
-        );
+        assert_eq!(reaction_path_segment("<a:vibing:987654321>"), "vibing:987654321");
     }
 
     #[test]
@@ -1660,14 +1395,8 @@ pub(super) fn automod_alert(d: &Value) -> Option<String> {
     if !why.is_empty() {
         line.push_str(&format!(" - {}", why.join(", ")));
     }
-    if let Some(secs) = field("timeout_duration")
-        .and_then(|t| t.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-    {
-        line.push_str(&format!(
-            ", and timed them out for {}",
-            super::send::describe_seconds(secs)
-        ));
+    if let Some(secs) = field("timeout_duration").and_then(|t| t.parse::<u64>().ok()).filter(|s| *s > 0) {
+        line.push_str(&format!(", and timed them out for {}", super::send::describe_seconds(secs)));
     }
     // What they wrote. In the embed's description, as Discord sends it; the
     // message's own content is empty.
@@ -1687,15 +1416,9 @@ pub(super) fn automod_alert(d: &Value) -> Option<String> {
 /// AutoMod saying something about itself rather than about a message.
 fn automod_notification(embed: &Value) -> String {
     let field = |name: &str| -> Option<&str> {
-        embed["fields"]
-            .as_array()?
-            .iter()
-            .find(|f| f["name"].as_str() == Some(name))?["value"]
-            .as_str()
+        embed["fields"].as_array()?.iter().find(|f| f["name"].as_str() == Some(name))?["value"].as_str()
     };
-    let by = field("action_by_user_id")
-        .map(|u| format!(" by <@{u}>"))
-        .unwrap_or_default();
+    let by = field("action_by_user_id").map(|u| format!(" by <@{u}>")).unwrap_or_default();
     match field("notification_type") {
         Some("activity_alerts_enabled") => format!("AutoMod activity alerts were turned on{by}"),
         Some("raid") | Some("mention_raid") => "AutoMod suspects a raid on this server".to_string(),
@@ -1741,10 +1464,7 @@ mod automod_tests {
             ]),
             "",
         );
-        assert_eq!(
-            automod_alert(&d).unwrap(),
-            "AutoMod flagged a message - rule \"Spam\", and timed them out for 10 minutes"
-        );
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod flagged a message - rule \"Spam\", and timed them out for 10 minutes");
     }
 
     /// As Discord actually sends it: the content empty, the blocked text in
@@ -1774,10 +1494,7 @@ mod automod_tests {
             "type": "auto_moderation_notification",
             "fields": [{ "name": "notification_type", "value": "activity_alerts_enabled" }, { "name": "action_by_user_id", "value": "1677" }]
         }]});
-        assert_eq!(
-            automod_alert(&d).unwrap(),
-            "AutoMod activity alerts were turned on by <@1677>"
-        );
+        assert_eq!(automod_alert(&d).unwrap(), "AutoMod activity alerts were turned on by <@1677>");
     }
 
     #[test]
@@ -1793,31 +1510,12 @@ mod automod_tests {
 /// and capped, because the tooltip it is for names a handful and says how many
 /// more. The name is the account's own ("global name"), which is what Discord
 /// shows beside it; a server nickname would be better and is not in this answer.
-pub async fn list_reactors(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    message_id: &str,
-    emoji: &str,
-    limit: u8,
-) -> Result<Value> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this conversation")?;
-    let mut url = url::Url::parse(&format!(
-        "{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions"
-    ))
-    .context("building the reactions URL")?;
-    url.path_segments_mut()
-        .map_err(|_| anyhow!("reactions URL cannot be a base"))?
-        .push(super::send::reaction_path_segment(emoji));
-    url.query_pairs_mut()
-        .append_pair("limit", &limit.clamp(1, 100).to_string());
+pub async fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, emoji: &str, limit: u8) -> Result<Value> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{message_id}/reactions")).context("building the reactions URL")?;
+    url.path_segments_mut().map_err(|_| anyhow!("reactions URL cannot be a base"))?.push(super::send::reaction_path_segment(emoji));
+    url.query_pairs_mut().append_pair("limit", &limit.clamp(1, 100).to_string());
     let resp = http_client_for(&cfg.token)
         .get(url)
         .header("Authorization", &cfg.token)
@@ -1827,21 +1525,14 @@ pub async fn list_reactors(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "reading who reacted")
-        );
+        bail!("{}", discord_error_text(status, &text, "reading who reacted"));
     }
     let people: Vec<Value> = resp.json().await.context("reading who reacted")?;
     let users: Vec<Value> = people
         .iter()
         .filter_map(|u| {
             let id = u["id"].as_str()?;
-            let name = u["global_name"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .or_else(|| u["username"].as_str())
-                .unwrap_or("unknown");
+            let name = u["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| u["username"].as_str()).unwrap_or("unknown");
             Some(json!({ "id": id, "name": name }))
         })
         .collect();
@@ -1863,10 +1554,7 @@ mod embed_extract_tests {
         let e = extract_embeds(&d);
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].fields.len(), 1, "a field with no value is not one");
-        assert_eq!(
-            (e[0].fields[0].name.as_str(), e[0].fields[0].value.as_str()),
-            ("Status", "Open")
-        );
+        assert_eq!((e[0].fields[0].name.as_str(), e[0].fields[0].value.as_str()), ("Status", "Open"));
         assert_eq!(e[0].footer.as_deref(), Some("via the desk"));
     }
 
@@ -1887,18 +1575,9 @@ mod embed_extract_tests {
 /// card was thin is also logged whole, so that what Discord really sent is on
 /// record.
 pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
-    let buffer = state
-        .runtime
-        .get_buffer(buffer_id)
-        .context("no such buffer")?;
-    let config = state
-        .accounts
-        .get_discord(&buffer.account_id)
-        .context("account not connected")?;
-    let channel_id = state
-        .runtime
-        .get_discord_channel(buffer_id)
-        .context("no known Discord channel for this buffer")?;
+    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
+    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
+    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50")])
@@ -1912,12 +1591,8 @@ pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
     let messages: Vec<Value> = resp.json().await.context("reading the conversation")?;
     let mut updated = 0;
     for msg in &messages {
-        let Some(msg_id) = msg["id"].as_str() else {
-            continue;
-        };
-        let Ok(Some(stored)) = state.store.get_message(buffer_id, msg_id) else {
-            continue;
-        };
+        let Some(msg_id) = msg["id"].as_str() else { continue };
+        let Ok(Some(stored)) = state.store.get_message(buffer_id, msg_id) else { continue };
         let fresh = extract_embeds(msg);
         let thin = |e: &model::Embed| e.description.is_none() && e.fields.is_empty();
         if !stored.embeds.is_empty() && stored.embeds.iter().all(thin) {
@@ -1932,17 +1607,8 @@ pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
         // Different, not just richer: a card read better than before replaces
         // the one saved.
         let same = serde_json::to_value(&fresh).ok() == serde_json::to_value(&stored.embeds).ok();
-        if !fresh.is_empty()
-            && !same
-            && state
-                .store
-                .set_message_embeds(buffer_id, msg_id, &fresh)
-                .unwrap_or(false)
-        {
-            state.events.emit(
-                "messageUpdated",
-                json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": fresh }),
-            );
+        if !fresh.is_empty() && !same && state.store.set_message_embeds(buffer_id, msg_id, &fresh).unwrap_or(false) {
+            state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": fresh }));
             updated += 1;
         }
     }
@@ -1971,30 +1637,14 @@ mod safety_notice_tests {
 
     #[test]
     fn the_notice_is_read_as_a_card_not_as_a_list_of_fields() {
-        let e = extract_embeds(&notice(
-            "default",
-            "learn_more_link",
-            json!([{ "name": "learn_more_link", "value": "https://support.discord.com/x" }]),
-        ));
+        let e = extract_embeds(&notice("default", "learn_more_link", json!([{ "name": "learn_more_link", "value": "https://support.discord.com/x" }])));
         assert_eq!(e.len(), 1);
-        assert_eq!(
-            e[0].title.as_deref(),
-            Some("We removed a violation from your account")
-        );
-        assert_eq!(
-            e[0].description.as_deref(),
-            Some("We reviewed a violation and removed it.")
-        );
-        assert!(
-            e[0].fields.is_empty(),
-            "its own labelled values are not shown as lines"
-        );
+        assert_eq!(e[0].title.as_deref(), Some("We removed a violation from your account"));
+        assert_eq!(e[0].description.as_deref(), Some("We reviewed a violation and removed it."));
+        assert!(e[0].fields.is_empty(), "its own labelled values are not shown as lines");
         assert_eq!(e[0].kind.as_deref(), Some("notice"));
         let cta = e[0].cta.as_ref().unwrap();
-        assert_eq!(
-            (cta.label.as_str(), cta.url.as_deref()),
-            ("Learn more", Some("https://support.discord.com/x"))
-        );
+        assert_eq!((cta.label.as_str(), cta.url.as_deref()), ("Learn more", Some("https://support.discord.com/x")));
         assert!(e[0].timestamp.as_deref().unwrap().starts_with("2026-"));
     }
 
@@ -2038,10 +1688,7 @@ mod gif_tests {
         let e = extract_embeds(&gifv());
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].kind.as_deref(), Some("gif"));
-        assert_eq!(
-            e[0].url.as_deref(),
-            Some("https://tenor.com/view/rickroll-gif-22954713")
-        );
+        assert_eq!(e[0].url.as_deref(), Some("https://tenor.com/view/rickroll-gif-22954713"));
         assert_eq!((e[0].width, e[0].height), (Some(640), Some(640)));
         assert_eq!(e[0].provider.as_deref(), Some("Tenor"));
         assert_eq!(e[0].media_kind.as_deref(), Some("video"));
@@ -2056,19 +1703,10 @@ mod gif_tests {
     #[test]
     fn it_is_played_from_discords_own_copy_so_the_third_party_is_not_told() {
         let e = extract_embeds(&gifv());
-        assert_eq!(
-            e[0].media_url.as_deref(),
-            Some("https://images-ext-1.discordapp.net/external/x.mp4")
-        );
+        assert_eq!(e[0].media_url.as_deref(), Some("https://images-ext-1.discordapp.net/external/x.mp4"));
         let mut direct = gifv();
-        direct["embeds"][0]["video"]
-            .as_object_mut()
-            .unwrap()
-            .remove("proxy_url");
-        assert_eq!(
-            extract_embeds(&direct)[0].media_url.as_deref(),
-            Some("https://media.tenor.com/x.mp4")
-        );
+        direct["embeds"][0]["video"].as_object_mut().unwrap().remove("proxy_url");
+        assert_eq!(extract_embeds(&direct)[0].media_url.as_deref(), Some("https://media.tenor.com/x.mp4"));
     }
 
     #[test]
@@ -2080,10 +1718,7 @@ mod gif_tests {
     #[test]
     fn the_picture_is_not_also_added_to_the_words() {
         // Whether or not the link is in the text: the embed is what carries it.
-        assert_eq!(
-            extract_body(&gifv()).as_deref(),
-            Some("https://tenor.com/view/rickroll-gif-22954713")
-        );
+        assert_eq!(extract_body(&gifv()).as_deref(), Some("https://tenor.com/view/rickroll-gif-22954713"));
         let mut quiet = gifv();
         quiet["content"] = json!("");
         assert_eq!(extract_body(&quiet), None);

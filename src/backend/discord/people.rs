@@ -24,14 +24,10 @@ pub(super) fn register_dm_channel(
     }
     let name = dm_channel_name(ch);
     let buf = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state
-        .runtime
-        .set_discord_channel(state, &buf.id, channel_id);
+    state.runtime.set_discord_channel(state, &buf.id, channel_id);
     // Discord's own notices come from an account flagged `system`, and nothing
     // sent back to it goes anywhere.
-    state
-        .runtime
-        .set_buffer_read_only(state, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
+    state.runtime.set_buffer_read_only(state, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
     // Its notices were saved before their cards could be read whole, and saved
     // history is not fetched again, so they are read once a run, a little after
     // connecting - one request, for the latest page.
@@ -51,9 +47,7 @@ pub(super) fn register_dm_channel(
     // here in the channel object, and they are the whole roster.
     set_dm_presence(state, &buf.id, ch, presences);
     ensure_dm_group(state, account_id);
-    state
-        .runtime
-        .set_buffer_group(state, &buf.id, &dm_group_id(account_id));
+    state.runtime.set_buffer_group(state, &buf.id, &dm_group_id(account_id));
     channel_map.insert(channel_id.to_string(), (name, "dm".to_string()));
     Some((buf.id, channel_id.to_string()))
 }
@@ -64,9 +58,7 @@ pub(super) const OFFICIAL_ONLY: &str = "This chat is reserved for official Disco
 /// A direct message with Discord itself: one recipient, and it is the platform's
 /// own `system` account.
 pub(super) fn is_system_dm(ch: &Value) -> bool {
-    ch["recipients"]
-        .as_array()
-        .is_some_and(|r| r.len() == 1 && r[0]["system"].as_bool() == Some(true))
+    ch["recipients"].as_array().is_some_and(|r| r.len() == 1 && r[0]["system"].as_bool() == Some(true))
 }
 
 /// The picture to show for a direct message: the other person's.
@@ -97,9 +89,7 @@ pub(super) fn default_avatar_url(user: &Value) -> Option<String> {
         Some(d) if d != "0" => d.parse::<u64>().unwrap_or(0) % 5,
         _ => (id.parse::<u64>().ok()? >> 22) % 6,
     };
-    Some(format!(
-        "https://cdn.discordapp.com/embed/avatars/{index}.png"
-    ))
+    Some(format!("https://cdn.discordapp.com/embed/avatars/{index}.png"))
 }
 
 /// A DM channel's display name, derived from its `recipients` array (their
@@ -112,12 +102,7 @@ pub(super) fn dm_channel_name(ch: &Value) -> String {
         .filter(|r| !r.is_empty())
         .map(|r| {
             r.iter()
-                .filter_map(|u| {
-                    u["global_name"]
-                        .as_str()
-                        .filter(|s| !s.is_empty())
-                        .or_else(|| u["username"].as_str())
-                })
+                .filter_map(|u| u["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| u["username"].as_str()))
                 .collect::<Vec<_>>()
                 .join(", ")
         })
@@ -141,25 +126,13 @@ pub(super) fn dm_channel_name(ch: &Value) -> String {
 /// carries the day they joined *this* guild and their roles in it. It is
 /// refused for somebody who shares no space with this account, and refused
 /// under rate limiting - in both cases what is already known still shows.
-pub async fn profile(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    user_id: &str,
-    name: &str,
-) -> Value {
+pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_id: &str, name: &str) -> Value {
     let mut profile = crate::profile::pending("discord", account_id, name);
     profile["pending"] = json!(false);
     profile["id"] = json!(user_id);
-    crate::profile::set(
-        &mut profile,
-        "createdTs",
-        crate::profile::snowflake_created(user_id).map(|ts| json!(ts)),
-    );
+    crate::profile::set(&mut profile, "createdTs", crate::profile::snowflake_created(user_id).map(|ts| json!(ts)));
 
-    let Some(config) = state.accounts.get_discord(account_id) else {
-        return profile;
-    };
+    let Some(config) = state.accounts.get_discord(account_id) else { return profile };
     let guild_id = state
         .runtime
         .get_buffer(buffer_id)
@@ -193,15 +166,9 @@ pub async fn profile(
         }
     }
 
-    let response = http_client_for(&config.token)
-        .get(&url)
-        .header("Authorization", &config.token)
-        .send()
-        .await;
+    let response = http_client_for(&config.token).get(&url).header("Authorization", &config.token).send().await;
     let Ok(body) = response else { return profile };
-    let Ok(body) = body.json::<Value>().await else {
-        return profile;
-    };
+    let Ok(body) = body.json::<Value>().await else { return profile };
 
     let user = &body["user"];
     if let Some(display) = user["global_name"].as_str().filter(|s| !s.is_empty()) {
@@ -211,19 +178,13 @@ pub async fn profile(
         profile["name"] = json!(username);
     }
     if let (Some(avatar), Some(id)) = (user["avatar"].as_str(), user["id"].as_str()) {
-        profile["avatarUrl"] = json!(format!(
-            "https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128"
-        ));
+        profile["avatarUrl"] = json!(format!("https://cdn.discordapp.com/avatars/{id}/{avatar}.png?size=128"));
     }
     if let Some(bio) = user["bio"].as_str().filter(|s| !s.trim().is_empty()) {
         crate::profile::note(&mut profile, "About", bio.trim());
     }
     if let Some(since) = body["premium_since"].as_str() {
-        crate::profile::note(
-            &mut profile,
-            "Nitro since",
-            since.split('T').next().unwrap_or(since),
-        );
+        crate::profile::note(&mut profile, "Nitro since", since.split('T').next().unwrap_or(since));
     }
 
     // The same facts from the endpoint, where it answered - it does not for
@@ -242,9 +203,7 @@ pub async fn profile(
 /// Seconds since the epoch from an ISO 8601 timestamp, which is how Discord
 /// writes every date it sends.
 pub(super) fn parse_iso8601_seconds(text: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|dt| dt.timestamp())
+    chrono::DateTime::parse_from_rfc3339(text).ok().map(|dt| dt.timestamp())
 }
 
 /// Starts (or reuses - Discord's own API dedups this server-side) a DM
@@ -273,15 +232,8 @@ pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str) -
 /// and yields a group. Sending a one-element list where the singular was meant
 /// creates a *group* of two rather than reusing the plain DM, which then sits
 /// beside it as a near-duplicate that behaves subtly differently.
-pub async fn open_dm_with(
-    state: &AppState,
-    account_id: &str,
-    user_ids: &[String],
-) -> Result<String> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn open_dm_with(state: &AppState, account_id: &str, user_ids: &[String]) -> Result<String> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     if user_ids.is_empty() {
         bail!("a conversation needs at least one other person");
     }
@@ -300,27 +252,22 @@ pub async fn open_dm_with(
     };
     let resp = send_write(
         http_client_for(&cfg.token)
-            .post(format!("{API_BASE}/users/@me/channels"))
-            .header("Authorization", &cfg.token)
-            .json(&body),
-    )
+        .post(format!("{API_BASE}/users/@me/channels"))
+        .header("Authorization", &cfg.token)
+        .json(&body)
+        )
     .await
-    .context("opening Discord DM")?;
+        .context("opening Discord DM")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "opening that conversation")
-        );
+        bail!("{}", discord_error_text(status, &text, "opening that conversation"));
     }
     let ch: Value = resp.json().await.context("invalid JSON response")?;
     let channel_id = ch["id"].as_str().context("no channel id in response")?;
     let name = dm_channel_name(&ch);
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state
-        .runtime
-        .set_discord_channel(state, &buffer.id, channel_id);
+    state.runtime.set_discord_channel(state, &buffer.id, channel_id);
     if let Some(avatar) = dm_avatar_url(&ch) {
         state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
     }
@@ -328,9 +275,7 @@ pub async fn open_dm_with(
     // to seed from; their first status update fills it in.
     set_dm_presence(state, &buffer.id, &ch, &HashMap::new());
     ensure_dm_group(state, account_id);
-    state
-        .runtime
-        .set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
+    state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
     Ok(buffer.id)
 }
 
@@ -342,21 +287,11 @@ pub async fn open_dm_with(
 ///
 /// The channel is asked for rather than guessed at, because its name is its
 /// recipients and the id says nothing about who they are.
-pub async fn adopt_dm_channel(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-) -> Result<String> {
-    if let Some(buffer_id) = state
-        .runtime
-        .discord_buffer_for_channel(account_id, channel_id)
-    {
+pub async fn adopt_dm_channel(state: &AppState, account_id: &str, channel_id: &str) -> Result<String> {
+    if let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) {
         return Ok(buffer_id);
     }
-    let config = state
-        .accounts
-        .get_discord(account_id)
-        .context("account is not connected")?;
+    let config = state.accounts.get_discord(account_id).context("account is not connected")?;
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}"))
         .header("Authorization", &config.token)
@@ -366,18 +301,13 @@ pub async fn adopt_dm_channel(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "opening that conversation")
-        );
+        bail!("{}", discord_error_text(status, &text, "opening that conversation"));
     }
     let ch: Value = resp.json().await.context("invalid JSON response")?;
 
     let name = dm_channel_name(&ch);
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
-    state
-        .runtime
-        .set_discord_channel(state, &buffer.id, channel_id);
+    state.runtime.set_discord_channel(state, &buffer.id, channel_id);
     if let Some(avatar) = dm_avatar_url(&ch) {
         state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
     }
@@ -385,9 +315,7 @@ pub async fn adopt_dm_channel(
     // arriving with READY, so their first status update fills it in.
     set_dm_presence(state, &buffer.id, &ch, &HashMap::new());
     ensure_dm_group(state, account_id);
-    state
-        .runtime
-        .set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
+    state.runtime.set_buffer_group(state, &buffer.id, &dm_group_id(account_id));
     Ok(buffer.id)
 }
 
@@ -399,33 +327,20 @@ pub(super) const GROUP_DM_MAX_OTHERS: usize = 9;
 /// Only groups. Discord answers this on a one-to-one DM with a 403, because
 /// there is nothing there to add to: growing a two-person DM into a group
 /// means making a new group, which is `open_dm_with` with the whole list.
-pub async fn add_to_group_dm(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-    user_id: &str,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn add_to_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
-            .put(format!(
-                "{API_BASE}/channels/{channel_id}/recipients/{user_id}"
-            ))
-            .header("Authorization", &cfg.token)
-            .json(&json!({})),
-    )
+        .put(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
+        .header("Authorization", &cfg.token)
+        .json(&json!({}))
+        )
     .await
-    .context("adding somebody to the group")?;
+        .context("adding somebody to the group")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "adding somebody to the group")
-        );
+        bail!("{}", discord_error_text(status, &text, "adding somebody to the group"));
     }
     Ok(())
 }
@@ -435,32 +350,19 @@ pub async fn add_to_group_dm(
 /// Removing yourself is how you leave one, and Discord treats it as the same
 /// call - which is why this does not refuse it. The caller decides what it
 /// means; `close_dm` is the one that says "leave" out loud.
-pub async fn remove_from_group_dm(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-    user_id: &str,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn remove_from_group_dm(state: &AppState, account_id: &str, channel_id: &str, user_id: &str) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
-            .delete(format!(
-                "{API_BASE}/channels/{channel_id}/recipients/{user_id}"
-            ))
-            .header("Authorization", &cfg.token),
-    )
+        .delete(format!("{API_BASE}/channels/{channel_id}/recipients/{user_id}"))
+        .header("Authorization", &cfg.token)
+        )
     .await
-    .context("removing somebody from the group")?;
+        .context("removing somebody from the group")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "removing somebody from the group")
-        );
+        bail!("{}", discord_error_text(status, &text, "removing somebody from the group"));
     }
     Ok(())
 }
@@ -471,33 +373,13 @@ pub async fn remove_from_group_dm(
 /// how Discord models it: a request already sent the other way makes the pair
 /// mutual. Refusing and withdrawing are both DELETE, and so is unfriending;
 /// what differs is only which of the three you were in.
-pub async fn answer_friend_request(
-    state: &AppState,
-    account_id: &str,
-    user_id: &str,
-    accept: bool,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: &str, accept: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let http = http_client_for(&cfg.token);
     let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
-    let request = if accept {
-        http.put(url).json(&json!({}))
-    } else {
-        http.delete(url)
-    };
-    let doing = if accept {
-        "accepting the friend request"
-    } else {
-        "declining the friend request"
-    };
-    let resp = request
-        .header("Authorization", &cfg.token)
-        .send()
-        .await
-        .context(doing)?;
+    let request = if accept { http.put(url).json(&json!({})) } else { http.delete(url) };
+    let doing = if accept { "accepting the friend request" } else { "declining the friend request" };
+    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -517,23 +399,11 @@ pub async fn answer_friend_request(
 ///
 /// The gateway's own RELATIONSHIP_ADD says it happened, the same way it does
 /// for a friend; this only has to make the request.
-pub async fn set_blocked(
-    state: &AppState,
-    account_id: &str,
-    user_id: &str,
-    blocked: bool,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn set_blocked(state: &AppState, account_id: &str, user_id: &str, blocked: bool) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let http = http_client_for(&cfg.token);
     let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
-    let doing = if blocked {
-        "blocking them"
-    } else {
-        "unblocking them"
-    };
+    let doing = if blocked { "blocking them" } else { "unblocking them" };
     let request = if blocked {
         http.put(url).json(&json!({ "type": 2 }))
     } else {
@@ -541,9 +411,7 @@ pub async fn set_blocked(
         // relationship you were in.
         http.delete(url)
     };
-    let resp = send_write(request.header("Authorization", &cfg.token))
-        .await
-        .context(doing)?;
+    let resp = send_write(request.header("Authorization", &cfg.token)).await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -621,17 +489,8 @@ pub(super) fn friend_json(relationship: &Value, presences: &HashMap<&str, &str>)
 /// recipients over with the channel itself. Their status is not included
 /// there, so everyone starts unknown and PRESENCE_UPDATE fills it in; for a
 /// friend that is usually immediate, since READY already carried it.
-pub(super) fn set_dm_presence(
-    state: &AppState,
-    buffer_id: &str,
-    channel: &Value,
-    presences: &HashMap<&str, &str>,
-) {
-    let account_id = state
-        .runtime
-        .get_buffer(buffer_id)
-        .map(|b| b.account_id)
-        .unwrap_or_default();
+pub(super) fn set_dm_presence(state: &AppState, buffer_id: &str, channel: &Value, presences: &HashMap<&str, &str>) {
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let mut members: Vec<Value> = channel["recipients"]
         .as_array()
         .into_iter()
@@ -656,19 +515,10 @@ pub(super) fn set_dm_presence(
     if members.is_empty() {
         return;
     }
-    members.sort_by(|a, b| {
-        a["nick"]
-            .as_str()
-            .unwrap_or("")
-            .to_lowercase()
-            .cmp(&b["nick"].as_str().unwrap_or("").to_lowercase())
-    });
+    members.sort_by(|a, b| a["nick"].as_str().unwrap_or("").to_lowercase().cmp(&b["nick"].as_str().unwrap_or("").to_lowercase()));
     let member_list = json!(members);
     state.runtime.set_presence(buffer_id, member_list.clone());
-    state.events.emit(
-        "presenceChange",
-        json!({ "bufferId": buffer_id, "members": member_list }),
-    );
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 /// Somebody joined or left a group message, told by the gateway.
@@ -683,22 +533,9 @@ pub(super) fn set_dm_presence(
 /// event carries one user and not the channel - there is no `recipients`
 /// array here to re-derive from, and asking Discord for one would be a
 /// request per membership change to learn what the event already said.
-pub(super) fn recipient_changed(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-    user: &Value,
-    joined: bool,
-) {
-    let Some(buffer_id) = state
-        .runtime
-        .discord_buffer_for_channel(account_id, channel_id)
-    else {
-        return;
-    };
-    let Some(user_id) = user["id"].as_str() else {
-        return;
-    };
+pub(super) fn recipient_changed(state: &AppState, account_id: &str, channel_id: &str, user: &Value, joined: bool) {
+    let Some(buffer_id) = state.runtime.discord_buffer_for_channel(account_id, channel_id) else { return };
+    let Some(user_id) = user["id"].as_str() else { return };
 
     let before: Vec<Value> = state
         .runtime
@@ -710,16 +547,11 @@ pub(super) fn recipient_changed(
         // group message is the only place some people are ever seen, and an
         // event naming them by id alone would otherwise have nothing to look
         // them up in.
-        state
-            .runtime
-            .remember_discord_name(account_id, user_id, &display_name(user));
+        state.runtime.remember_discord_name(account_id, user_id, &display_name(user));
     }
     let member_list = json!(roster_after(before, user, joined));
     state.runtime.set_presence(&buffer_id, member_list.clone());
-    state.events.emit(
-        "presenceChange",
-        json!({ "bufferId": buffer_id, "members": member_list }),
-    );
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 /// The roster a membership change leaves behind.
@@ -733,9 +565,7 @@ pub(super) fn recipient_changed(
 /// for somebody already there - a reconnect, a duplicated dispatch - and
 /// appending blindly would show them twice.
 pub(super) fn roster_after(mut members: Vec<Value>, user: &Value, joined: bool) -> Vec<Value> {
-    let Some(user_id) = user["id"].as_str() else {
-        return members;
-    };
+    let Some(user_id) = user["id"].as_str() else { return members };
     members.retain(|m| m["userId"].as_str() != Some(user_id));
     if joined {
         members.push(json!({
@@ -750,11 +580,7 @@ pub(super) fn roster_after(mut members: Vec<Value>, user: &Value, joined: bool) 
             "avatarUrl": super::messages::author_avatar_url(user),
         }));
         members.sort_by(|a, b| {
-            a["nick"]
-                .as_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .cmp(&b["nick"].as_str().unwrap_or("").to_lowercase())
+            a["nick"].as_str().unwrap_or("").to_lowercase().cmp(&b["nick"].as_str().unwrap_or("").to_lowercase())
         });
     }
     members
@@ -777,17 +603,14 @@ fn display_name(user: &Value) -> String {
 /// local matter, and leaving the guild is a different action with much larger
 /// consequences.
 pub async fn close_dm(state: &AppState, account_id: &str, channel_id: &str) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
-            .delete(format!("{API_BASE}/channels/{channel_id}"))
-            .header("Authorization", &cfg.token),
-    )
+        .delete(format!("{API_BASE}/channels/{channel_id}"))
+        .header("Authorization", &cfg.token)
+        )
     .await
-    .context("closing the conversation")?;
+        .context("closing the conversation")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -807,15 +630,8 @@ mod tests {
         // instead reads as broken rather than as a person with no picture.
         let modern = json!({ "id": "1339667204756475924", "discriminator": "0" });
         let url = default_avatar_url(&modern).expect("a modern account still has a default");
-        assert!(
-            url.starts_with("https://cdn.discordapp.com/embed/avatars/"),
-            "unexpected: {url}"
-        );
-        let index: u64 = url
-            .trim_start_matches("https://cdn.discordapp.com/embed/avatars/")
-            .trim_end_matches(".png")
-            .parse()
-            .unwrap();
+        assert!(url.starts_with("https://cdn.discordapp.com/embed/avatars/"), "unexpected: {url}");
+        let index: u64 = url.trim_start_matches("https://cdn.discordapp.com/embed/avatars/").trim_end_matches(".png").parse().unwrap();
         assert!(index < 6, "modern accounts pick one of six, got {index}");
 
         // The old scheme derives it from the discriminator instead.
@@ -886,11 +702,7 @@ mod tests {
             dm_avatar_url(&one).as_deref(),
             Some("https://cdn.discordapp.com/avatars/1/abc.png")
         );
-        let group =
-            json!({ "recipients": [{ "id": "1", "avatar": "a" }, { "id": "2", "avatar": "b" }] });
-        assert!(
-            dm_avatar_url(&group).is_none(),
-            "a group DM was given one member's face"
-        );
+        let group = json!({ "recipients": [{ "id": "1", "avatar": "a" }, { "id": "2", "avatar": "b" }] });
+        assert!(dm_avatar_url(&group).is_none(), "a group DM was given one member's face");
     }
 }

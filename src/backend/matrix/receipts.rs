@@ -23,12 +23,8 @@ pub(super) async fn fetch_read_receipts(
         homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(filter.as_bytes()).collect::<String>()
     );
-    let resp = http::get_json(&url, access_token)
-        .await
-        .context("receipt sync")?;
-    let Some(joined) = resp["rooms"]["join"].as_object() else {
-        return Ok(());
-    };
+    let resp = http::get_json(&url, access_token).await.context("receipt sync")?;
+    let Some(joined) = resp["rooms"]["join"].as_object() else { return Ok(()) };
     for (room_id, room) in joined {
         for event in room["ephemeral"]["events"].as_array().into_iter().flatten() {
             if event["type"].as_str() == Some("m.receipt") {
@@ -55,21 +51,11 @@ pub(super) async fn fetch_read_receipts(
 ///
 /// Our own receipts are dropped - every client hides your own marker, because
 /// the message you have read up to is the one you are looking at.
-pub(super) fn take_read_receipts(
-    state: &AppState,
-    account_id: &str,
-    room_id: &str,
-    own_user_id: &str,
-    content: &Value,
-) {
-    let Some(by_event) = content.as_object() else {
-        return;
-    };
+pub(super) fn take_read_receipts(state: &AppState, account_id: &str, room_id: &str, own_user_id: &str, content: &Value) {
+    let Some(by_event) = content.as_object() else { return };
     let mut changed = false;
     for (event_id, receipts) in by_event {
-        let Some(readers) = receipts["m.read"].as_object() else {
-            continue;
-        };
+        let Some(readers) = receipts["m.read"].as_object() else { continue };
         for (user_id, receipt) in readers {
             if user_id == own_user_id {
                 continue;
@@ -81,9 +67,7 @@ pub(super) fn take_read_receipts(
                 None | Some("main") => {}
                 Some(_) => continue,
             }
-            changed |= state
-                .runtime
-                .set_matrix_read_receipt(account_id, room_id, user_id, event_id);
+            changed |= state.runtime.set_matrix_read_receipt(account_id, room_id, user_id, event_id);
         }
     }
     if changed {
@@ -95,23 +79,17 @@ pub(super) fn take_read_receipts(
 /// caring about it. A no-op for anything that is not a Matrix room, so the
 /// caller need not first ask which protocol a buffer is.
 pub fn replay_read_receipts(state: &AppState, buffer_id: &str) {
-    let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-        return;
-    };
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return };
     if !buffer.account_id.starts_with("matrix:") {
         return;
     }
-    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
-        return;
-    };
+    let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else { return };
     emit_read_receipts(state, &buffer.account_id, &room_id);
 }
 
 /// Sends the room's whole set of read markers to the frontend.
 pub(super) fn emit_read_receipts(state: &AppState, account_id: &str, room_id: &str) {
-    let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) else {
-        return;
-    };
+    let Some((buffer_name, _)) = state.runtime.get_matrix_room_name(account_id, room_id) else { return };
     let members = state.runtime.get_matrix_room_members(account_id, room_id);
     let readers: Vec<Value> = state
         .runtime
@@ -156,28 +134,15 @@ pub(super) fn emit_read_receipts(state: &AppState, account_id: &str, room_id: &s
 /// the difference is whether other people are told - not whether your own
 /// devices agree. Sending nothing at all would have bought the same privacy
 /// by making the room unread again on every other device you own.
-pub async fn mark_read(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    publicly: bool,
-) -> Result<()> {
-    let Some(config) = state.accounts.get_matrix(account_id) else {
-        anyhow::bail!("no such account")
-    };
+pub async fn mark_read(state: &AppState, account_id: &str, buffer_id: &str, publicly: bool) -> Result<()> {
+    let Some(config) = state.accounts.get_matrix(account_id) else { anyhow::bail!("no such account") };
     let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
         anyhow::bail!("no known Matrix room for this buffer")
     };
     // The newest message this client actually holds. Nothing to say if the
     // room has never had one - and claiming to have read a room that is empty
     // would be a receipt pointing at nothing.
-    let Some(event_id) = state
-        .store
-        .newest_message_id(buffer_id)
-        .ok()
-        .flatten()
-        .filter(|id| id.starts_with('$'))
-    else {
+    let Some(event_id) = state.store.newest_message_id(buffer_id).ok().flatten().filter(|id| id.starts_with('$')) else {
         return Ok(());
     };
     let base = config.homeserver_url.trim_end_matches('/');
@@ -187,9 +152,7 @@ pub async fn mark_read(
     );
     let mut body = serde_json::json!({ "m.fully_read": event_id });
     body[if publicly { "m.read" } else { "m.read.private" }] = Value::String(event_id);
-    http::post_json(&url, Some(&config.access_token), body)
-        .await
-        .context("sending read markers")?;
+    http::post_json(&url, Some(&config.access_token), body).await.context("sending read markers")?;
     Ok(())
 }
 
@@ -209,11 +172,7 @@ pub const MARKED_UNREAD: [&str; 2] = ["m.marked_unread", "com.famedly.marked_unr
 pub fn marked_unread_in(events: &[Value]) -> Option<bool> {
     events
         .iter()
-        .find(|e| {
-            e["type"]
-                .as_str()
-                .is_some_and(|t| MARKED_UNREAD.contains(&t))
-        })
+        .find(|e| e["type"].as_str().is_some_and(|t| MARKED_UNREAD.contains(&t)))
         .and_then(|e| e["content"]["unread"].as_bool())
 }
 
@@ -224,58 +183,32 @@ pub fn marked_unread_in(events: &[Value]) -> Option<bool> {
 /// one. Written under the stable name only - a client old enough to want the
 /// unstable one will not be reading this account's rooms for much longer, and
 /// writing both would leave two facts to disagree.
-pub async fn set_marked_unread(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    unread: bool,
-) -> Result<()> {
-    let Some(config) = state.accounts.get_matrix(account_id) else {
-        anyhow::bail!("no such account")
-    };
+pub async fn set_marked_unread(state: &AppState, account_id: &str, buffer_id: &str, unread: bool) -> Result<()> {
+    let Some(config) = state.accounts.get_matrix(account_id) else { anyhow::bail!("no such account") };
     let Some(room_id) = state.runtime.get_matrix_room(buffer_id) else {
         anyhow::bail!("no known Matrix room for this buffer")
     };
     let base = config.homeserver_url.trim_end_matches('/');
     let user = url::form_urlencoded::byte_serialize(config.user_id.as_bytes()).collect::<String>();
     let room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let url =
-        format!("{base}/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread");
-    http::put_json(
-        &url,
-        &config.access_token,
-        serde_json::json!({ "unread": unread }),
-    )
-    .await
-    .context("setting the unread mark")?;
+    let url = format!("{base}/_matrix/client/v3/user/{user}/rooms/{room}/account_data/m.marked_unread");
+    http::put_json(&url, &config.access_token, serde_json::json!({ "unread": unread }))
+        .await
+        .context("setting the unread mark")?;
     Ok(())
 }
 
-pub async fn send_typing(
-    state: &AppState,
-    account_id: &str,
-    room_id: &str,
-    typing: bool,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn send_typing(state: &AppState, account_id: &str, room_id: &str, typing: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let room = url::form_urlencoded::byte_serialize(room_id.trim().as_bytes()).collect::<String>();
-    let user =
-        url::form_urlencoded::byte_serialize(account.user_id.trim().as_bytes()).collect::<String>();
+    let user = url::form_urlencoded::byte_serialize(account.user_id.trim().as_bytes()).collect::<String>();
     let body = if typing {
         serde_json::json!({ "typing": true, "timeout": crate::backend::discord::TYPING_TTL_MS })
     } else {
         serde_json::json!({ "typing": false })
     };
-    http::put_json(
-        &format!("{base}/_matrix/client/v3/rooms/{room}/typing/{user}"),
-        &account.access_token,
-        body,
-    )
-    .await?;
+    http::put_json(&format!("{base}/_matrix/client/v3/rooms/{room}/typing/{user}"), &account.access_token, body).await?;
     Ok(())
 }
 
@@ -290,10 +223,7 @@ mod marked_unread_tests {
     #[test]
     fn reads_either_spelling() {
         assert_eq!(marked_unread_in(&[ev("m.marked_unread", true)]), Some(true));
-        assert_eq!(
-            marked_unread_in(&[ev("com.famedly.marked_unread", true)]),
-            Some(true)
-        );
+        assert_eq!(marked_unread_in(&[ev("com.famedly.marked_unread", true)]), Some(true));
     }
 
     /// A room that was marked and then unmarked carries an explicit false, and
@@ -301,15 +231,9 @@ mod marked_unread_tests {
     /// value, not an absence.
     #[test]
     fn an_explicit_false_is_not_the_same_as_silence() {
-        assert_eq!(
-            marked_unread_in(&[ev("m.marked_unread", false)]),
-            Some(false)
-        );
+        assert_eq!(marked_unread_in(&[ev("m.marked_unread", false)]), Some(false));
         assert_eq!(marked_unread_in(&[]), None);
-        assert_eq!(
-            marked_unread_in(&[serde_json::json!({ "type": "m.tag", "content": {} })]),
-            None
-        );
+        assert_eq!(marked_unread_in(&[serde_json::json!({ "type": "m.tag", "content": {} })]), None);
     }
 
     /// Content that says nothing usable is silence rather than a guess.

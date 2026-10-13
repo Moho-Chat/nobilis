@@ -59,21 +59,9 @@ struct Inner {
 pub fn parse(json: &str) -> Result<Vec<Cm>> {
     let answer: Directory = serde_json::from_str(json).context("reading Steam's server list")?;
     if answer.response.success == Some(false) {
-        bail!(
-            "Steam's server list said no{}",
-            if answer.response.message.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", answer.response.message)
-            }
-        );
+        bail!("Steam's server list said no{}", if answer.response.message.is_empty() { String::new() } else { format!(": {}", answer.response.message) });
     }
-    let servers: Vec<Cm> = answer
-        .response
-        .serverlist
-        .into_iter()
-        .filter(|cm| cm.kind.is_empty() || cm.kind == "websockets")
-        .collect();
+    let servers: Vec<Cm> = answer.response.serverlist.into_iter().filter(|cm| cm.kind.is_empty() || cm.kind == "websockets").collect();
     if servers.is_empty() {
         bail!("Steam's server list had no servers in it");
     }
@@ -87,16 +75,7 @@ pub fn parse(json: &str) -> Result<Vec<Cm>> {
 /// stops being quiet, and a client that retries after a failure would walk
 /// the same list from the same start every time.
 pub fn ranked(mut servers: Vec<Cm>) -> Vec<Cm> {
-    servers.sort_by(|a, b| {
-        a.wtd_load
-            .partial_cmp(&b.wtd_load)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(
-                a.load
-                    .partial_cmp(&b.load)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
+    servers.sort_by(|a, b| a.wtd_load.partial_cmp(&b.wtd_load).unwrap_or(std::cmp::Ordering::Equal).then(a.load.partial_cmp(&b.load).unwrap_or(std::cmp::Ordering::Equal)));
     let head = servers.len().min(4);
     servers[..head].shuffle(&mut rand::thread_rng());
     servers
@@ -105,18 +84,10 @@ pub fn ranked(mut servers: Vec<Cm>) -> Vec<Cm> {
 /// Asks the directory, as `key` is routed.
 pub async fn discover(key: &str, cell: u32) -> Result<Vec<Cm>> {
     let router = crate::net::route::router();
-    let http = router.client_if("steam", router.routed(key), |b| {
-        b.timeout(Duration::from_secs(20))
-            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
-    });
+    let http = router.client_if("steam", router.routed(key), |b| b.timeout(Duration::from_secs(20)).user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"))));
     let body = http
         .get(DIRECTORY)
-        .query(&[
-            ("cellid", cell.to_string()),
-            ("cmtype", "websockets".to_string()),
-            ("realm", "steamglobal".to_string()),
-            ("maxcount", "20".to_string()),
-        ])
+        .query(&[("cellid", cell.to_string()), ("cmtype", "websockets".to_string()), ("realm", "steamglobal".to_string()), ("maxcount", "20".to_string())])
         .send()
         .await
         .context("asking Steam for a server")?
@@ -145,17 +116,12 @@ mod tests {
         assert_eq!(servers[0].endpoint, "cmp1-iad1.steamserver.net:443");
         assert_eq!(servers[0].dc, "iad1");
         assert_eq!(servers[1].wtd_load, 3.763_047_695_159_912);
-        assert_eq!(
-            servers[0].url(),
-            "wss://cmp1-iad1.steamserver.net:443/cmsocket/"
-        );
+        assert_eq!(servers[0].url(), "wss://cmp1-iad1.steamserver.net:443/cmsocket/");
     }
 
     #[test]
     fn a_refusal_or_an_empty_list_is_an_error_that_says_so() {
-        let refused =
-            parse(r#"{"response":{"serverlist":[],"success":false,"message":"rate limited"}}"#)
-                .unwrap_err();
+        let refused = parse(r#"{"response":{"serverlist":[],"success":false,"message":"rate limited"}}"#).unwrap_err();
         assert!(format!("{refused:#}").contains("rate limited"));
         assert!(parse(r#"{"response":{"serverlist":[],"success":true}}"#).is_err());
         assert!(parse("<html>not json</html>").is_err());
@@ -166,16 +132,8 @@ mod tests {
 
     #[test]
     fn the_least_loaded_come_first_and_all_of_them_are_kept() {
-        let cm = |name: &str, wtd: f64| Cm {
-            endpoint: name.into(),
-            dc: String::new(),
-            kind: "websockets".into(),
-            load: 0.0,
-            wtd_load: wtd,
-        };
-        let list: Vec<Cm> = (0..10)
-            .map(|i| cm(&format!("s{i}"), (10 - i) as f64))
-            .collect();
+        let cm = |name: &str, wtd: f64| Cm { endpoint: name.into(), dc: String::new(), kind: "websockets".into(), load: 0.0, wtd_load: wtd };
+        let list: Vec<Cm> = (0..10).map(|i| cm(&format!("s{i}"), (10 - i) as f64)).collect();
         let order = ranked(list);
         assert_eq!(order.len(), 10);
         // The four best, in some order, then the rest strictly by load.
@@ -188,20 +146,8 @@ mod tests {
 
     #[test]
     fn who_goes_first_among_the_best_is_not_always_the_same() {
-        let cm = |name: &str| Cm {
-            endpoint: name.into(),
-            dc: String::new(),
-            kind: "websockets".into(),
-            load: 0.0,
-            wtd_load: 0.0,
-        };
-        let firsts: std::collections::HashSet<String> = (0..200)
-            .map(|_| {
-                ranked((0..4).map(|i| cm(&format!("s{i}"))).collect())[0]
-                    .endpoint
-                    .clone()
-            })
-            .collect();
+        let cm = |name: &str| Cm { endpoint: name.into(), dc: String::new(), kind: "websockets".into(), load: 0.0, wtd_load: 0.0 };
+        let firsts: std::collections::HashSet<String> = (0..200).map(|_| ranked((0..4).map(|i| cm(&format!("s{i}"))).collect())[0].endpoint.clone()).collect();
         assert!(firsts.len() > 1, "always {firsts:?}");
     }
 }

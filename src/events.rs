@@ -14,10 +14,7 @@ pub struct Event {
 
 impl Event {
     pub fn is_scoped(&self) -> bool {
-        matches!(
-            self.name,
-            "message" | "presenceChange" | "messageUpdated" | "messageDeleted" | "reactionsChanged"
-        )
+        matches!(self.name, "message" | "presenceChange" | "messageUpdated" | "messageDeleted" | "reactionsChanged")
     }
 
     pub fn buffer_id(&self) -> Option<&str> {

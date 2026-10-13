@@ -65,31 +65,14 @@ fn account_data_url(homeserver_url: &str, user_id: &str, kind: &str) -> String {
 ///
 /// A missing event answers 404 and that is an ordinary answer rather than a
 /// failure: an account that has never used secret storage has none of these.
-pub async fn read_account_data(
-    homeserver_url: &str,
-    token: &str,
-    user_id: &str,
-    kind: &str,
-) -> Option<Value> {
-    http::get_json(&account_data_url(homeserver_url, user_id, kind), token)
-        .await
-        .ok()
+pub async fn read_account_data(homeserver_url: &str, token: &str, user_id: &str, kind: &str) -> Option<Value> {
+    http::get_json(&account_data_url(homeserver_url, user_id, kind), token).await.ok()
 }
 
-pub async fn write_account_data(
-    homeserver_url: &str,
-    token: &str,
-    user_id: &str,
-    kind: &str,
-    body: Value,
-) -> Result<()> {
-    http::put_json(
-        &account_data_url(homeserver_url, user_id, kind),
-        token,
-        body,
-    )
-    .await
-    .with_context(|| format!("writing {kind}"))?;
+pub async fn write_account_data(homeserver_url: &str, token: &str, user_id: &str, kind: &str, body: Value) -> Result<()> {
+    http::put_json(&account_data_url(homeserver_url, user_id, kind), token, body)
+        .await
+        .with_context(|| format!("writing {kind}"))?;
     Ok(())
 }
 
@@ -107,34 +90,21 @@ pub async fn default_key_id(homeserver_url: &str, token: &str, user_id: &str) ->
 /// The description on the server says which of the two it is expecting and
 /// carries a MAC, so a wrong answer is refused here rather than producing a
 /// key that silently decrypts nothing.
-pub async fn unlock(
-    homeserver_url: &str,
-    token: &str,
-    user_id: &str,
-    input: &str,
-) -> Result<SecretStorageKey> {
+pub async fn unlock(homeserver_url: &str, token: &str, user_id: &str, input: &str) -> Result<SecretStorageKey> {
     let Some(key_id) = default_key_id(homeserver_url, token, user_id).await else {
         bail!("this account has no secret storage yet")
     };
-    let content = read_account_data(
-        homeserver_url,
-        token,
-        user_id,
-        &format!("{KEY_EVENT_PREFIX}{key_id}"),
-    )
-    .await
-    .context("the account names a secret storage key it does not describe")?;
+    let content = read_account_data(homeserver_url, token, user_id, &format!("{KEY_EVENT_PREFIX}{key_id}"))
+        .await
+        .context("the account names a secret storage key it does not describe")?;
     // Rebuilt from the event type as well as the body, because the key's own
     // id lives in the type - `m.secret_storage.key.<id>` - and not in the
     // content. That is why this cannot simply be deserialised.
-    let raw = serde_json::value::to_raw_value(&content)
+    let raw = serde_json::value::to_raw_value(&content).context("unreadable secret storage key description")?;
+    let content = SecretStorageKeyEventContent::from_parts(&format!("{KEY_EVENT_PREFIX}{key_id}"), &raw)
         .context("unreadable secret storage key description")?;
-    let content =
-        SecretStorageKeyEventContent::from_parts(&format!("{KEY_EVENT_PREFIX}{key_id}"), &raw)
-            .context("unreadable secret storage key description")?;
-    SecretStorageKey::from_account_data(input, content).map_err(|e| {
-        anyhow::anyhow!("that passphrase or recovery code did not open secret storage: {e}")
-    })
+    SecretStorageKey::from_account_data(input, content)
+        .map_err(|e| anyhow::anyhow!("that passphrase or recovery code did not open secret storage: {e}"))
 }
 
 /// Makes an account's secret storage, and makes it the default.
@@ -142,12 +112,7 @@ pub async fn unlock(
 /// Answers with the recovery code to write down. A passphrase, where one was
 /// given, is a second way in rather than a replacement - the code is what
 /// works when the passphrase is forgotten, which is the case this exists for.
-pub async fn create(
-    homeserver_url: &str,
-    token: &str,
-    user_id: &str,
-    passphrase: Option<&str>,
-) -> Result<(SecretStorageKey, String)> {
+pub async fn create(homeserver_url: &str, token: &str, user_id: &str, passphrase: Option<&str>) -> Result<(SecretStorageKey, String)> {
     let key = match passphrase.filter(|p| !p.is_empty()) {
         Some(p) => SecretStorageKey::new_from_passphrase(p),
         None => SecretStorageKey::new(),
@@ -165,14 +130,7 @@ pub async fn create(
         serde_json::to_value(key.event_content()).context("serialising the key description")?,
     )
     .await?;
-    write_account_data(
-        homeserver_url,
-        token,
-        user_id,
-        DEFAULT_KEY_EVENT,
-        json!({ "key": key.key_id() }),
-    )
-    .await?;
+    write_account_data(homeserver_url, token, user_id, DEFAULT_KEY_EVENT, json!({ "key": key.key_id() })).await?;
 
     Ok((key, recovery_code))
 }
@@ -206,14 +164,11 @@ pub async fn store_secret(
     let secret_name = SecretName::from(name);
     let encrypted = key.encrypt(plaintext.to_vec(), &secret_name);
 
-    let mut event = read_account_data(homeserver_url, token, user_id, name)
-        .await
-        .unwrap_or_else(|| json!({}));
+    let mut event = read_account_data(homeserver_url, token, user_id, name).await.unwrap_or_else(|| json!({}));
     if !event["encrypted"].is_object() {
         event["encrypted"] = json!({});
     }
-    event["encrypted"][key.key_id()] =
-        serde_json::to_value(&encrypted).context("serialising the secret")?;
+    event["encrypted"][key.key_id()] = serde_json::to_value(&encrypted).context("serialising the secret")?;
     write_account_data(homeserver_url, token, user_id, name, event).await
 }
 
@@ -270,9 +225,7 @@ mod tests {
     fn a_secret_cannot_be_read_under_a_different_name() {
         let key = SecretStorageKey::new();
         let encrypted = key.encrypt(b"secret".to_vec(), &SecretName::from(DEHYDRATION_SECRET));
-        assert!(key
-            .decrypt(&encrypted, &SecretName::from("m.megolm_backup.v1"))
-            .is_err());
+        assert!(key.decrypt(&encrypted, &SecretName::from("m.megolm_backup.v1")).is_err());
     }
 
     /// A recovery code opens what it locked, which is what makes this worth
@@ -283,8 +236,7 @@ mod tests {
         let code = key.to_base58();
         let content = key.event_content().clone();
 
-        let reopened =
-            SecretStorageKey::from_account_data(&code, content).expect("the code should open it");
+        let reopened = SecretStorageKey::from_account_data(&code, content).expect("the code should open it");
         assert_eq!(reopened.key_id(), key.key_id());
 
         let name = SecretName::from(DEHYDRATION_SECRET);
@@ -298,9 +250,8 @@ mod tests {
     fn a_passphrase_reopens_the_safe() {
         let key = SecretStorageKey::new_from_passphrase("correct horse battery staple");
         let content = key.event_content().clone();
-        let reopened =
-            SecretStorageKey::from_account_data("correct horse battery staple", content.clone())
-                .expect("the passphrase should open it");
+        let reopened = SecretStorageKey::from_account_data("correct horse battery staple", content.clone())
+            .expect("the passphrase should open it");
         assert_eq!(reopened.key_id(), key.key_id());
         // And the wrong one is refused rather than producing a key that
         // decrypts nothing.
@@ -309,11 +260,7 @@ mod tests {
 
     #[test]
     fn account_data_urls_escape_what_goes_in_them() {
-        let url = account_data_url(
-            "https://h.example.org/",
-            "@a:b.org",
-            "m.secret_storage.key.abc",
-        );
+        let url = account_data_url("https://h.example.org/", "@a:b.org", "m.secret_storage.key.abc");
         assert!(url.contains("%40a%3Ab.org"), "{url}");
         assert!(url.ends_with("m.secret_storage.key.abc"), "{url}");
         // The trailing slash on the homeserver must not double up.

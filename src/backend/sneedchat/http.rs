@@ -38,10 +38,7 @@ impl CookieJar {
     }
 
     pub fn set(&self, name: &str, value: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(name.to_string(), value.to_string());
+        self.inner.lock().unwrap().insert(name.to_string(), value.to_string());
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
@@ -54,12 +51,7 @@ impl CookieJar {
 
     /// Copy the jar out, for persisting a logged-in session between runs.
     pub fn snapshot(&self) -> std::collections::BTreeMap<String, String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
+        self.inner.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
     /// Merge saved cookies in, skipping empty saved values.
@@ -76,9 +68,7 @@ impl CookieJar {
     fn absorb(&self, resp: &hyper::Response<hyper::body::Incoming>) {
         for hv in resp.headers().get_all(SET_COOKIE) {
             let Ok(s) = hv.to_str() else { continue };
-            let Some(pair) = s.split(';').next() else {
-                continue;
-            };
+            let Some(pair) = s.split(';').next() else { continue };
             if let Some((k, v)) = pair.split_once('=') {
                 let (k, v) = (k.trim(), v.trim());
                 if v.is_empty() {
@@ -117,11 +107,7 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(transport: Transport, jar: CookieJar, user_agent: String) -> Self {
-        Self {
-            transport,
-            jar,
-            user_agent,
-        }
+        Self { transport, jar, user_agent }
     }
 
     pub async fn get(&self, url: &str) -> Result<Response> {
@@ -151,10 +137,7 @@ impl HttpClient {
             };
             url = resolve_url(&url, loc)?;
             // Per RFC 9110, 303 (and in practice 301/302) turn POST into GET.
-            if matches!(
-                status,
-                StatusCode::SEE_OTHER | StatusCode::FOUND | StatusCode::MOVED_PERMANENTLY
-            ) {
+            if matches!(status, StatusCode::SEE_OTHER | StatusCode::FOUND | StatusCode::MOVED_PERMANENTLY) {
                 method = Method::GET;
                 body = None;
             }
@@ -165,12 +148,7 @@ impl HttpClient {
     /// Send exactly one request, without following redirects. Useful when
     /// the redirect itself is the thing being read (e.g. a login POST's
     /// 303, which encodes success/failure/2FA in its `Location`).
-    pub async fn send_no_redirect(
-        &self,
-        method: Method,
-        url: &str,
-        body: Option<String>,
-    ) -> Result<Response> {
+    pub async fn send_no_redirect(&self, method: Method, url: &str, body: Option<String>) -> Result<Response> {
         self.send_once(method, url, body).await
     }
 
@@ -196,24 +174,12 @@ impl HttpClient {
 
     async fn send_once(&self, method: Method, url: &str, body: Option<String>) -> Result<Response> {
         let (status, headers, bytes) = self.send_once_raw(method, url, body).await?;
-        Ok(Response {
-            status,
-            headers,
-            body: String::from_utf8_lossy(&bytes).into_owned(),
-        })
+        Ok(Response { status, headers, body: String::from_utf8_lossy(&bytes).into_owned() })
     }
 
-    async fn send_once_raw(
-        &self,
-        method: Method,
-        url: &str,
-        body: Option<String>,
-    ) -> Result<(u16, hyper::HeaderMap, Bytes)> {
-        let content_type = body
-            .is_some()
-            .then_some("application/x-www-form-urlencoded");
-        self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, &[])
-            .await
+    async fn send_once_raw(&self, method: Method, url: &str, body: Option<String>) -> Result<(u16, hyper::HeaderMap, Bytes)> {
+        let content_type = body.is_some().then_some("application/x-www-form-urlencoded");
+        self.send_once_raw_bytes(method, url, body.map(Bytes::from), content_type, &[]).await
     }
 
     /// The actual connect/handshake/send/read path everything else in this
@@ -226,23 +192,14 @@ impl HttpClient {
     /// otherwise-identical request missing `Origin`/`Referer`, which
     /// Sneedchat's own site never needs, so it isn't part of the fixed
     /// header set below.
-    async fn send_once_raw_bytes(
-        &self,
-        method: Method,
-        url: &str,
-        body: Option<Bytes>,
-        content_type: Option<&str>,
-        extra_headers: &[(&str, &str)],
-    ) -> Result<(u16, hyper::HeaderMap, Bytes)> {
+    async fn send_once_raw_bytes(&self, method: Method, url: &str, body: Option<Bytes>, content_type: Option<&str>, extra_headers: &[(&str, &str)]) -> Result<(u16, hyper::HeaderMap, Bytes)> {
         let parsed = url::Url::parse(url).with_context(|| format!("parsing URL {url}"))?;
         let host = parsed.host_str().context("URL has no host")?.to_string();
         let tls = parsed.scheme() == "https";
         let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
 
         let stream = self.transport.connect(&host, port, tls).await?;
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .context("HTTP handshake")?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await.context("HTTP handshake")?;
         // The connection future drives IO; it ends when the response is done.
         let conn_task = tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -261,10 +218,7 @@ impl HttpClient {
             .uri(&path)
             .header("Host", host_header(&host, port, tls))
             .header("User-Agent", &self.user_agent)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            )
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
             .header("Accept-Language", "en-US,en;q=0.5")
             .header("Accept-Encoding", "identity")
             .header("Connection", "close");
@@ -279,20 +233,14 @@ impl HttpClient {
             req = req.header(*name, HeaderValue::from_str(value)?);
         }
 
-        let req = req
-            .body(Full::new(body.unwrap_or_default()))
-            .context("building request")?;
+        let req = req.body(Full::new(body.unwrap_or_default())).context("building request")?;
 
         let resp = sender.send_request(req).await.context("sending request")?;
         self.jar.absorb(&resp);
 
         let status = resp.status().as_u16();
         let headers = resp.headers().clone();
-        let collected = resp
-            .into_body()
-            .collect()
-            .await
-            .context("reading response body")?;
+        let collected = resp.into_body().collect().await.context("reading response body")?;
         conn_task.abort();
 
         Ok((status, headers, collected.to_bytes()))
@@ -303,19 +251,8 @@ impl HttpClient {
     /// `optsize`/`expire`/`numfiles`/`upload_session` alongside the file
     /// itself - see backend/sneedchat/mod.rs's send_attachment).
     /// `extra_headers` threads straight through to send_once_raw_bytes.
-    pub async fn post_multipart(
-        &self,
-        url: &str,
-        fields: &[MultipartField<'_>],
-        extra_headers: &[(&str, &str)],
-    ) -> Result<(u16, Bytes)> {
-        let boundary = format!(
-            "nobilis{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
+    pub async fn post_multipart(&self, url: &str, fields: &[MultipartField<'_>], extra_headers: &[(&str, &str)]) -> Result<(u16, Bytes)> {
+        let boundary = format!("nobilis{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
 
         let mut body = Vec::new();
         for field in fields {
@@ -323,12 +260,7 @@ impl HttpClient {
                 MultipartField::Text { name, value } => {
                     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
                 }
-                MultipartField::File {
-                    name,
-                    file_name,
-                    content_type,
-                    bytes,
-                } => {
+                MultipartField::File { name, file_name, content_type, bytes } => {
                     let safe_name = sanitize_upload_filename(file_name);
                     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{safe_name}\"\r\nContent-Type: {content_type}\r\n\r\n").as_bytes());
                     body.extend_from_slice(bytes);
@@ -342,15 +274,7 @@ impl HttpClient {
         let mut url = url.to_string();
         let mut body_opt = Some(Bytes::from(body));
         for _ in 0..5 {
-            let (status, headers, resp_bytes) = self
-                .send_once_raw_bytes(
-                    Method::POST,
-                    &url,
-                    body_opt.take(),
-                    Some(&content_type_header),
-                    extra_headers,
-                )
-                .await?;
+            let (status, headers, resp_bytes) = self.send_once_raw_bytes(Method::POST, &url, body_opt.take(), Some(&content_type_header), extra_headers).await?;
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             if !status_code.is_redirection() {
                 return Ok((status, resp_bytes));
@@ -366,16 +290,8 @@ impl HttpClient {
 
 /// One part of a `post_multipart` body.
 pub enum MultipartField<'a> {
-    Text {
-        name: &'a str,
-        value: &'a str,
-    },
-    File {
-        name: &'a str,
-        file_name: &'a str,
-        content_type: &'a str,
-        bytes: &'a Bytes,
-    },
+    Text { name: &'a str, value: &'a str },
+    File { name: &'a str, file_name: &'a str, content_type: &'a str, bytes: &'a Bytes },
 }
 
 /// Restricted to a safe character set rather than trusted verbatim - this
@@ -385,10 +301,7 @@ pub enum MultipartField<'a> {
 /// newline in an unusual filename corrupt the header. Never empty - falls
 /// back to a generic name so the multipart part always has *a* filename.
 fn sanitize_upload_filename(file_name: &str) -> String {
-    let safe: String = file_name
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
-        .collect();
+    let safe: String = file_name.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
     if safe.is_empty() {
         "upload".to_string()
     } else {
@@ -413,11 +326,7 @@ fn resolve_url(base: &str, loc: &str) -> Result<String> {
 
 /// Encode fields as `application/x-www-form-urlencoded`.
 pub(super) fn encode_form(fields: &[(&str, &str)]) -> String {
-    fields
-        .iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+    fields.iter().map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v))).collect::<Vec<_>>().join("&")
 }
 
 /// Percent-encode for `application/x-www-form-urlencoded`.
@@ -425,9 +334,7 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
             b' ' => out.push('+'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
@@ -465,18 +372,12 @@ mod tests {
 
     #[test]
     fn sanitizes_a_normal_filename_unchanged() {
-        assert_eq!(
-            sanitize_upload_filename("photo-2026_08.PNG"),
-            "photo-2026_08.PNG"
-        );
+        assert_eq!(sanitize_upload_filename("photo-2026_08.PNG"), "photo-2026_08.PNG");
     }
 
     #[test]
     fn strips_quotes_and_whitespace_from_a_filename() {
-        assert_eq!(
-            sanitize_upload_filename("my \"cool\" pic.png"),
-            "mycoolpic.png"
-        );
+        assert_eq!(sanitize_upload_filename("my \"cool\" pic.png"), "mycoolpic.png");
     }
 
     #[test]
@@ -487,21 +388,12 @@ mod tests {
 
     #[test]
     fn form_encoding_escapes_reserved_characters() {
-        assert_eq!(
-            encode_form(&[("a b", "c&d"), ("n", "1+2")]),
-            "a+b=c%26d&n=1%2B2"
-        );
+        assert_eq!(encode_form(&[("a b", "c&d"), ("n", "1+2")]), "a+b=c%26d&n=1%2B2");
     }
 
     #[test]
     fn redirects_resolve_relative_locations() {
-        assert_eq!(
-            resolve_url("http://h.onion/a/b", "/c").unwrap(),
-            "http://h.onion/c"
-        );
-        assert_eq!(
-            resolve_url("http://h.onion/a/b", "http://o/x").unwrap(),
-            "http://o/x"
-        );
+        assert_eq!(resolve_url("http://h.onion/a/b", "/c").unwrap(), "http://h.onion/c");
+        assert_eq!(resolve_url("http://h.onion/a/b", "http://o/x").unwrap(), "http://o/x");
     }
 }

@@ -21,29 +21,17 @@ pub(crate) fn simulated_daemon(name: &str) -> AppState {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch dir");
     AppState {
-        store: std::sync::Arc::new(
-            crate::store::Store::open(&dir.join("scrollback.db")).expect("store"),
-        ),
-        accounts: std::sync::Arc::new(
-            crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts"),
-        ),
+        store: std::sync::Arc::new(crate::store::Store::open(&dir.join("scrollback.db")).expect("store")),
+        accounts: std::sync::Arc::new(crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts")),
         events: crate::events::EventBus::new(),
         runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
         tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&dir)),
         shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
         voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
-        voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(
-            dir.join("voice.toml"),
-        )),
-        dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(
-            dir.join("dcc.toml"),
-        )),
-        irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(
-            dir.join("irc-sts.toml"),
-        )),
-        highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(
-            dir.join("highlights.toml"),
-        )),
+        voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
+        dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
+        irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(dir.join("irc-sts.toml"))),
+        highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
         ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
     }
 }
@@ -59,22 +47,9 @@ pub(super) fn lines(state: &AppState, slug: &str) -> Vec<String> {
         .collect()
 }
 
-pub(super) fn feed(
-    state: &AppState,
-    watched: &mut Watched,
-    event: &str,
-    payload: serde_json::Value,
-) {
+pub(super) fn feed(state: &AppState, watched: &mut Watched, event: &str, payload: serde_json::Value) {
     // odablock's own chatroom, as the fixture below sets it up.
-    handle_event(
-        state,
-        "kick:tester",
-        watched,
-        event,
-        Some("chatrooms.2393554.v2"),
-        payload,
-    )
-    .expect("handled");
+    handle_event(state, "kick:tester", watched, event, Some("chatrooms.2393554.v2"), payload).expect("handled");
 }
 
 /// odablock's real numbers: the chatroom and the channel differ, which is

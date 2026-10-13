@@ -15,19 +15,10 @@ use anyhow::bail;
 /// buffer the normal way once the next `/sync` poll sees it in
 /// `rooms.join` for the first time (process_sync_response's own first-
 /// seen-room handling) - nothing extra needed here.
-pub async fn join_room(
-    state: &AppState,
-    account_id: &str,
-    room_id_or_alias: &str,
-    via: &[String],
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn join_room(state: &AppState, account_id: &str, room_id_or_alias: &str, via: &[String]) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes())
-        .collect::<String>();
+    let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes()).collect::<String>();
     let mut url = format!("{base}/_matrix/client/v3/join/{encoded}");
     // Where to ask. A room id names a room and says nothing about who has it,
     // so joining one by id needs somebody already in it to route through -
@@ -37,13 +28,9 @@ pub async fn join_room(
     for (i, server) in via.iter().filter(|s| !s.trim().is_empty()).enumerate() {
         url.push(if i == 0 { '?' } else { '&' });
         url.push_str("server_name=");
-        url.push_str(
-            &url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>(),
-        );
+        url.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
     }
-    let resp = http::post_json(&url, Some(&account.access_token), serde_json::json!({}))
-        .await
-        .context("joining room")?;
+    let resp = http::post_json(&url, Some(&account.access_token), serde_json::json!({})).await.context("joining room")?;
 
     // Give the room a buffer now rather than when the next sync happens to
     // mention it. A join is somebody waiting: on a large room the server can
@@ -55,16 +42,7 @@ pub async fn join_room(
     // in it. Cleared by the first sync that carries the room - see
     // process_sync_response.
     if let Some(room_id) = resp["room_id"].as_str() {
-        register_room(
-            state,
-            account_id,
-            &account.user_id,
-            &account.homeserver_url,
-            &account.access_token,
-            room_id,
-            true,
-        )
-        .await;
+        register_room(state, account_id, &account.user_id, &account.homeserver_url, &account.access_token, room_id, true).await;
     }
     Ok(())
 }
@@ -102,22 +80,12 @@ pub async fn accept_invite(state: &AppState, account_id: &str, room_id: &str) ->
 /// makes a sticker a sticker: clients draw it without a filename, without a
 /// download button, and inline at its own size. moho has read them since
 /// stickers were supported and could send none.
-pub async fn send_sticker(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    mxc: &str,
-    body: &str,
-) -> Result<()> {
+pub async fn send_sticker(state: &AppState, account_id: &str, buffer_id: &str, mxc: &str, body: &str) -> Result<()> {
     // Looked up rather than rebuilt from the two things the window sent: the
     // pack this came from knows the image's size and type, and the window
     // does not. Falls back to what was sent for a sticker sent from anywhere
     // else - a pack that has since gone, or a mxc somebody typed.
-    let known = state
-        .runtime
-        .matrix_stickers(account_id)
-        .into_iter()
-        .find(|s| s.mxc == mxc);
+    let known = state.runtime.matrix_stickers(account_id).into_iter().find(|s| s.mxc == mxc);
     let sticker = stickers::Sticker {
         name: body.to_string(),
         pack: String::new(),
@@ -125,14 +93,7 @@ pub async fn send_sticker(
         body: body.to_string(),
         info: known.map(|s| s.info).unwrap_or(serde_json::Value::Null),
     };
-    send_typed_event(
-        state,
-        account_id,
-        buffer_id,
-        protocol::EVENT_STICKER,
-        stickers::sticker_event(&sticker),
-    )
-    .await
+    send_typed_event(state, account_id, buffer_id, protocol::EVENT_STICKER, stickers::sticker_event(&sticker)).await
 }
 
 /// Sends a place.
@@ -140,13 +101,7 @@ pub async fn send_sticker(
 /// A pin rather than live location sharing, which is a different feature with
 /// a different set of promises attached - this says "here is somewhere",
 /// once, and stops being true about nothing when the window closes.
-pub async fn send_location(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    place: &str,
-    label: &str,
-) -> Result<()> {
+pub async fn send_location(state: &AppState, account_id: &str, buffer_id: &str, place: &str, label: &str) -> Result<()> {
     let Some((latitude, longitude)) = stickers::parse_place(place) else {
         anyhow::bail!("that does not look like a place - try \"51.5, -0.12\" or a map link");
     };
@@ -171,38 +126,24 @@ pub async fn send_location(
 /// The reason travels with the knock and is what the people inside see, so it
 /// is worth writing: "asking to join" with no name attached is what most
 /// knocks look like, and most of those are ignored.
-pub async fn knock_room(
-    state: &AppState,
-    account_id: &str,
-    room_id_or_alias: &str,
-    via: &[String],
-    reason: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn knock_room(state: &AppState, account_id: &str, room_id_or_alias: &str, via: &[String], reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes())
-        .collect::<String>();
+    let encoded = url::form_urlencoded::byte_serialize(room_id_or_alias.trim().as_bytes()).collect::<String>();
     let mut url = format!("{base}/_matrix/client/v3/knock/{encoded}");
     // Same routing problem a join by room id has: the id names the room and
     // not who has it.
     for (i, server) in via.iter().filter(|s| !s.trim().is_empty()).enumerate() {
         url.push(if i == 0 { '?' } else { '&' });
         url.push_str("server_name=");
-        url.push_str(
-            &url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>(),
-        );
+        url.push_str(&url::form_urlencoded::byte_serialize(server.trim().as_bytes()).collect::<String>());
     }
     let body = if reason.trim().is_empty() {
         serde_json::json!({})
     } else {
         serde_json::json!({ "reason": reason.trim() })
     };
-    http::post_json(&url, Some(&account.access_token), body)
-        .await
-        .context("knocking on that room")?;
+    http::post_json(&url, Some(&account.access_token), body).await.context("knocking on that room")?;
     // Deliberately no buffer: a knock is not a join, and putting the room in
     // the list would say you are in somewhere you have only asked about. The
     // answer arrives as an invitation, which the invite list already shows.
@@ -216,27 +157,11 @@ pub async fn knock_room(
 /// something about it, and it is the only one a server's moderators can act
 /// on. It needs no power in the room: reporting is a thing anybody may do,
 /// which is the point of it.
-pub async fn report_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-    reason: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn report_message(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/report/{}",
-        encoded(&room_id),
-        encoded(event_id)
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report/{}", encoded(&room_id), encoded(event_id));
     // The score is a severity from -100 to 0 that no server this client has
     // met does anything with, and a number nobody chose is worse than no
     // number: the reason is what a moderator reads.
@@ -255,25 +180,11 @@ pub async fn report_message(
 /// message out of it would understate the thing being reported. Moderators
 /// get the room and the reason; they were never going to act on a single line
 /// of it anyway.
-pub async fn report_room(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    reason: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn report_room(state: &AppState, account_id: &str, buffer_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{}/report",
-        encoded(&room_id)
-    );
+    let url = format!("{base}/_matrix/client/v3/rooms/{}/report", encoded(&room_id));
     // Required here, unlike a message report: a room report carries no
     // content at all, so without a reason it says only that somebody
     // objected to somewhere, which is not something anybody can act on.
@@ -281,13 +192,7 @@ pub async fn report_room(
     if reason.is_empty() {
         bail!("a room report needs a reason - there is no message to speak for it");
     }
-    send_report(
-        &url,
-        &account.access_token,
-        serde_json::json!({ "reason": reason }),
-        "reporting that room",
-    )
-    .await
+    send_report(&url, &account.access_token, serde_json::json!({ "reason": reason }), "reporting that room").await
 }
 
 /// Reports a person to the people who run the homeserver.
@@ -296,27 +201,15 @@ pub async fn report_room(
 /// rooms - or who has done it in a direct message, where there is nobody else
 /// to see - cannot be described by pointing at one room or one line, and
 /// until this there was nothing in moho that said so.
-pub async fn report_user(
-    state: &AppState,
-    account_id: &str,
-    user_id: &str,
-    reason: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn report_user(state: &AppState, account_id: &str, user_id: &str, reason: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     if !user_id.starts_with('@') || !user_id.contains(':') {
         bail!("{user_id} is not a Matrix id");
     }
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!("{base}/_matrix/client/v3/users/{}/report", encoded(user_id));
     let reason = reason.trim();
-    let body = if reason.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::json!({ "reason": reason })
-    };
+    let body = if reason.is_empty() { serde_json::json!({}) } else { serde_json::json!({ "reason": reason }) };
     send_report(&url, &account.access_token, body, "reporting that person").await
 }
 
@@ -327,12 +220,7 @@ pub async fn report_user(
 /// has not caught up answers 404 with `M_UNRECOGNIZED` - which reads as "that
 /// room does not exist" and sends somebody looking for a mistake they did not
 /// make. Named for what it is instead.
-async fn send_report(
-    url: &str,
-    access_token: &str,
-    body: Value,
-    doing: &'static str,
-) -> Result<()> {
+async fn send_report(url: &str, access_token: &str, body: Value, doing: &'static str) -> Result<()> {
     match http::post_json(url, Some(access_token), body).await {
         Ok(_) => Ok(()),
         Err(e) if e.to_string().contains("M_UNRECOGNIZED") => {
@@ -394,12 +282,7 @@ fn typed_msgtype(body: &str) -> Result<(&'static str, &str)> {
 /// Absent - a null - when nobody was named, because an empty `m.mentions` is
 /// a positive statement that a message mentions nobody, and that is only
 /// worth sending when it is a correction.
-pub(super) fn intentional_mentions(
-    state: &AppState,
-    account_id: &str,
-    room_id: &str,
-    body: &str,
-) -> Value {
+pub(super) fn intentional_mentions(state: &AppState, account_id: &str, room_id: &str, body: &str) -> Value {
     let mut named: Vec<String> = Vec::new();
     let members = state.runtime.get_matrix_room_members(account_id, room_id);
 
@@ -430,13 +313,9 @@ pub(super) fn intentional_mentions(
 }
 
 pub async fn leave_room(state: &AppState, account_id: &str, room_id: &str) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let encoded =
-        url::form_urlencoded::byte_serialize(room_id.trim().as_bytes()).collect::<String>();
+    let encoded = url::form_urlencoded::byte_serialize(room_id.trim().as_bytes()).collect::<String>();
     http::post_json(
         &format!("{base}/_matrix/client/v3/rooms/{encoded}/leave"),
         Some(&account.access_token),
@@ -494,10 +373,7 @@ pub async fn create_room(
     is_public: bool,
     encrypted: bool,
 ) -> Result<String> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
     let mut body = serde_json::json!({
@@ -525,17 +401,10 @@ pub async fn create_room(
         }]);
     }
 
-    let resp = http::post_json(
-        &format!("{base}/_matrix/client/v3/createRoom"),
-        Some(&account.access_token),
-        body,
-    )
-    .await
-    .context("creating room")?;
-    resp["room_id"]
-        .as_str()
-        .map(str::to_string)
-        .context("createRoom response missing room_id")
+    let resp = http::post_json(&format!("{base}/_matrix/client/v3/createRoom"), Some(&account.access_token), body)
+        .await
+        .context("creating room")?;
+    resp["room_id"].as_str().map(str::to_string).context("createRoom response missing room_id")
 }
 
 /// The messages a room has pinned, as messages rather than as ids.
@@ -546,14 +415,8 @@ pub async fn create_room(
 /// listed - the room is saying something is pinned, and silently dropping it
 /// would be this client disagreeing with every other one.
 pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let session = state.runtime.get_matrix_machine(account_id);
@@ -588,9 +451,7 @@ pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) ->
             if let (Some(session), Some(room)) = (&session, &room) {
                 match crypto::decrypt_room_event(session, &event, room).await {
                     Ok(plain) => event = plain,
-                    Err(e) => {
-                        tracing::debug!("matrix: pinned event {event_id} would not decrypt: {e:#}")
-                    }
+                    Err(e) => tracing::debug!("matrix: pinned event {event_id} would not decrypt: {e:#}"),
                 }
             }
         }
@@ -619,21 +480,9 @@ pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) ->
 /// writing a stale list would unpin whatever somebody else pinned while this
 /// window was not looking. Whether this account may do it at all is the
 /// server's decision, and its refusal is reported in its own words.
-pub async fn set_pinned(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    event_id: &str,
-    pinned: bool,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, event_id: &str, pinned: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded_room = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
 
@@ -643,11 +492,7 @@ pub async fn set_pinned(
     let current: Vec<String> = match http::get_json(&url, &account.access_token).await {
         Ok(content) => content["pinned"]
             .as_array()
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| id.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| id.as_str().map(|s| s.to_string())).collect())
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
@@ -656,22 +501,10 @@ pub async fn set_pinned(
     if pinned {
         next.push(event_id.to_string());
     }
-    set_room_state(
-        state,
-        account_id,
-        buffer_id,
-        "m.room.pinned_events",
-        serde_json::json!({ "pinned": next }),
-    )
-    .await?;
+    set_room_state(state, account_id, buffer_id, "m.room.pinned_events", serde_json::json!({ "pinned": next })).await?;
     // Locally too, so the list is right before the next sync arrives.
-    state
-        .runtime
-        .set_matrix_pinned(account_id, &room_id, next.clone());
-    state.events.emit(
-        "pinnedMessages",
-        serde_json::json!({ "bufferId": buffer_id, "pinned": next }),
-    );
+    state.runtime.set_matrix_pinned(account_id, &room_id, next.clone());
+    state.events.emit("pinnedMessages", serde_json::json!({ "bufferId": buffer_id, "pinned": next }));
     Ok(())
 }
 
@@ -683,10 +516,7 @@ pub async fn set_room_state(
     event_type: &str,
     content: serde_json::Value,
 ) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     put_room_state(state, account_id, &room_id, event_type, "", content).await
 }
 
@@ -704,19 +534,14 @@ pub async fn put_room_state(
     state_key: &str,
     content: serde_json::Value,
 ) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/rooms/{}/state/{event_type}/{}",
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(state_key.as_bytes()).collect::<String>()
     );
-    http::put_json(&url, &account.access_token, content)
-        .await
-        .context("setting room state")?;
+    http::put_json(&url, &account.access_token, content).await.context("setting room state")?;
     Ok(())
 }
 
@@ -737,23 +562,9 @@ pub async fn put_room_state(
 /// from the space - and it is allowed to fail: setting `m.space.parent` needs
 /// power in the *child*, which somebody adding their own room to somebody
 /// else's space will not have.
-pub async fn set_space_child(
-    state: &AppState,
-    account_id: &str,
-    space_id: &str,
-    child_room_id: &str,
-    child: bool,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let via = account
-        .user_id
-        .split(':')
-        .nth(1)
-        .unwrap_or_default()
-        .to_string();
+pub async fn set_space_child(state: &AppState, account_id: &str, space_id: &str, child_room_id: &str, child: bool) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let via = account.user_id.split(':').nth(1).unwrap_or_default().to_string();
     let content = if child {
         // `via` is not decoration: without a server to route through, a client
         // that has never met this room cannot join it from the space listing.
@@ -761,48 +572,21 @@ pub async fn set_space_child(
     } else {
         serde_json::json!({})
     };
-    put_room_state(
-        state,
-        account_id,
-        space_id,
-        "m.space.child",
-        child_room_id,
-        content,
-    )
-    .await?;
+    put_room_state(state, account_id, space_id, "m.space.child", child_room_id, content).await?;
 
     let parent = if child {
         serde_json::json!({ "via": [via], "canonical": true })
     } else {
         serde_json::json!({})
     };
-    if let Err(e) = put_room_state(
-        state,
-        account_id,
-        child_room_id,
-        "m.space.parent",
-        space_id,
-        parent,
-    )
-    .await
-    {
-        tracing::debug!(
-            "matrix[{account_id}]: {child_room_id} keeps no parent for {space_id}: {e:#}"
-        );
+    if let Err(e) = put_room_state(state, account_id, child_room_id, "m.space.parent", space_id, parent).await {
+        tracing::debug!("matrix[{account_id}]: {child_room_id} keeps no parent for {space_id}: {e:#}");
     }
     Ok(())
 }
 
-pub async fn open_dm(
-    state: &AppState,
-    account_id: &str,
-    target_user_id: &str,
-    target_display_name: &str,
-) -> Result<String> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn open_dm(state: &AppState, account_id: &str, target_user_id: &str, target_display_name: &str) -> Result<String> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
     // Refused before anything is sent, and not only because it is a strange
@@ -814,10 +598,7 @@ pub async fn open_dm(
         anyhow::bail!("that is this account - there is nobody to open a conversation with");
     }
 
-    if let Some(room_id) = state
-        .runtime
-        .find_matrix_dm_room(account_id, target_user_id)
-    {
+    if let Some(room_id) = state.runtime.find_matrix_dm_room(account_id, target_user_id) {
         if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, &room_id) {
             let buffer = state.runtime.ensure_buffer(state, account_id, &name, &kind);
             return Ok(buffer.id);
@@ -831,10 +612,7 @@ pub async fn open_dm(
     )
     .await
     .context("creating DM room")?;
-    let room_id = create_resp["room_id"]
-        .as_str()
-        .context("createRoom response missing room_id")?
-        .to_string();
+    let room_id = create_resp["room_id"].as_str().context("createRoom response missing room_id")?.to_string();
 
     // The background sync loop runs concurrently and can plausibly have
     // already discovered and buffered this exact room by the time we get
@@ -849,21 +627,12 @@ pub async fn open_dm(
     // stray buffer exists for this room id and always (re)creating the
     // correctly-named "dm" one ourselves, regardless of which side got
     // here first.
-    if let Some(stray_buffer_id) = state
-        .runtime
-        .get_buffer_id_for_matrix_room(account_id, &room_id)
-    {
+    if let Some(stray_buffer_id) = state.runtime.get_buffer_id_for_matrix_room(account_id, &room_id) {
         state.runtime.remove_buffer(state, &stray_buffer_id);
     }
 
-    let name = if target_display_name.is_empty() {
-        target_user_id.to_string()
-    } else {
-        target_display_name.to_string()
-    };
-    state
-        .runtime
-        .set_matrix_room_name(account_id, &room_id, &name, "dm");
+    let name = if target_display_name.is_empty() { target_user_id.to_string() } else { target_display_name.to_string() };
+    state.runtime.set_matrix_room_name(account_id, &room_id, &name, "dm");
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, "dm");
     state.runtime.set_matrix_room(state, &buffer.id, &room_id);
 
@@ -895,14 +664,8 @@ pub async fn send_message(
     thread: bool,
     attachment_path: Option<&str>,
 ) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let is_encrypted = state.runtime.is_matrix_room_encrypted(buffer_id);
 
@@ -928,10 +691,7 @@ pub async fn send_message(
         // and refused rather than posted as text when what follows is not a
         // place, since "/location where are you" said out loud to a room is
         // not what anybody meant.
-        if let Some(rest) = body
-            .strip_prefix("/location ")
-            .or_else(|| body.strip_prefix("/place "))
-        {
+        if let Some(rest) = body.strip_prefix("/location ").or_else(|| body.strip_prefix("/place ")) {
             let (place, label) = stickers::split_place_and_label(rest)
                 .unwrap_or_else(|| (rest.to_string(), String::new()));
             return send_location(state, account_id, buffer_id, &place, &label).await;
@@ -994,27 +754,15 @@ pub async fn send_message(
     }
 
     let txn_id = model::next_message_id();
-    let encoded_room_id =
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let encoded_txn_id =
-        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>();
+    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let encoded_txn_id = url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>();
 
     let (event_type, body_json) = if is_encrypted {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let content = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                access_token,
-                &room_id_ruma,
-                member_ids,
-                protocol::EVENT_ROOM_MESSAGE,
-                plain_content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, protocol::EVENT_ROOM_MESSAGE, plain_content)
             .await
             .context("encrypting message")?;
         (protocol::EVENT_ROOM_ENCRYPTED, content)
@@ -1022,12 +770,8 @@ pub async fn send_message(
         (protocol::EVENT_ROOM_MESSAGE, plain_content)
     };
 
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{encoded_room_id}/send/{event_type}/{encoded_txn_id}"
-    );
-    http::put_json(&url, access_token, body_json)
-        .await
-        .context("sending message")?;
+    let url = format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/send/{event_type}/{encoded_txn_id}");
+    http::put_json(&url, access_token, body_json).await.context("sending message")?;
     Ok(())
 }
 
@@ -1055,19 +799,11 @@ pub async fn send_voice_message(
     duration_secs: f64,
     waveform: &[u8],
 ) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let is_encrypted = state.runtime.is_matrix_room_encrypted(buffer_id);
-    let file = path
-        .to_str()
-        .context("the recording has an unreadable path")?;
+    let file = path.to_str().context("the recording has an unreadable path")?;
 
     // What Element calls one, so a room's history reads consistently.
     let body = "Voice message";
@@ -1080,38 +816,22 @@ pub async fn send_voice_message(
     media::mark_as_voice(&mut content, duration_secs, waveform);
 
     let txn_id = model::next_message_id();
-    let encoded_room_id =
-        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let encoded_txn_id =
-        url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>();
+    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let encoded_txn_id = url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>();
     let (event_type, body_json) = if is_encrypted {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let encrypted = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                access_token,
-                &room_id_ruma,
-                member_ids,
-                protocol::EVENT_ROOM_MESSAGE,
-                content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, protocol::EVENT_ROOM_MESSAGE, content)
             .await
             .context("encrypting the voice message")?;
         (protocol::EVENT_ROOM_ENCRYPTED, encrypted)
     } else {
         (protocol::EVENT_ROOM_MESSAGE, content)
     };
-    let url = format!(
-        "{base}/_matrix/client/v3/rooms/{encoded_room_id}/send/{event_type}/{encoded_txn_id}"
-    );
-    http::put_json(&url, access_token, body_json)
-        .await
-        .context("sending the voice message")?;
+    let url = format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/send/{event_type}/{encoded_txn_id}");
+    http::put_json(&url, access_token, body_json).await.context("sending the voice message")?;
     Ok(())
 }
 
@@ -1136,22 +856,9 @@ pub(super) fn edit_content(target_event_id: &str, body: &str) -> serde_json::Val
 }
 
 /// Applies a real edit. `buffer_id` must already have a known room id.
-pub async fn edit_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    access_token: &str,
-    msg_id: &str,
-    body: &str,
-) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn edit_message(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str, body: &str) -> Result<()> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
     // Built once for both kinds of room. An edit reads the same either way,
@@ -1160,20 +867,11 @@ pub async fn edit_message(
     let content = edit_content(msg_id, body);
 
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let content = session
-            .share_and_encrypt_edit(
-                &account.homeserver_url,
-                access_token,
-                &room_id_ruma,
-                member_ids,
-                content,
-            )
+            .share_and_encrypt_edit(&account.homeserver_url, access_token, &room_id_ruma, member_ids, content)
             .await
             .context("encrypting edit")?;
         (protocol::EVENT_ROOM_ENCRYPTED, content)
@@ -1187,9 +885,7 @@ pub async fn edit_message(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    http::put_json(&url, access_token, body_json)
-        .await
-        .context("sending edit")?;
+    http::put_json(&url, access_token, body_json).await.context("sending edit")?;
     Ok(())
 }
 
@@ -1211,33 +907,17 @@ pub async fn send_typed_event(
     event_type: &str,
     content: Value,
 ) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let access_token = account.access_token.clone();
 
     let (sent_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, &access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let encrypted = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                &access_token,
-                &room_id_ruma,
-                member_ids,
-                event_type,
-                content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, event_type, content)
             .await
             .context("encrypting the event")?;
         (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
@@ -1251,9 +931,7 @@ pub async fn send_typed_event(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    http::put_json(&url, &access_token, body_json)
-        .await
-        .context("sending the event")?;
+    http::put_json(&url, &access_token, body_json).await.context("sending the event")?;
     Ok(())
 }
 
@@ -1274,29 +952,16 @@ pub async fn send_room_event(
     room_id: &str,
     content: Value,
 ) -> Result<String> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let access_token = account.access_token.clone();
 
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, &access_token, room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
         let encrypted = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                &access_token,
-                &room_id_ruma,
-                member_ids,
-                protocol::EVENT_ROOM_MESSAGE,
-                content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, protocol::EVENT_ROOM_MESSAGE, content)
             .await
             .context("encrypting the message")?;
         (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
@@ -1310,9 +975,7 @@ pub async fn send_room_event(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    let resp = http::put_json(&url, &access_token, body_json)
-        .await
-        .context("sending the message")?;
+    let resp = http::put_json(&url, &access_token, body_json).await.context("sending the message")?;
     resp["event_id"]
         .as_str()
         .map(|id| id.to_string())
@@ -1329,21 +992,9 @@ pub async fn send_room_event(
 /// The answer is recorded here as well as sent: the echo arrives on the next
 /// sync, and a card that does not move when pressed reads as a card that did
 /// not take the press.
-pub async fn vote_in_poll(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    poll_id: &str,
-    answer: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str, answer: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let access_token = account.access_token.clone();
 
@@ -1353,21 +1004,11 @@ pub async fn vote_in_poll(
     });
 
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, &access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let encrypted = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                &access_token,
-                &room_id_ruma,
-                member_ids,
-                polls::POLL_RESPONSE[0],
-                content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, &access_token, &room_id_ruma, member_ids, polls::POLL_RESPONSE[0], content)
             .await
             .context("encrypting the vote")?;
         (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
@@ -1381,14 +1022,10 @@ pub async fn vote_in_poll(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    http::put_json(&url, &access_token, body_json)
-        .await
-        .context("sending your vote")?;
+    http::put_json(&url, &access_token, body_json).await.context("sending your vote")?;
 
     if !state.runtime.matrix_poll_ended(buffer_id, poll_id) {
-        state
-            .runtime
-            .set_matrix_poll_vote(buffer_id, poll_id, &account.user_id, answer);
+        state.runtime.set_matrix_poll_vote(buffer_id, poll_id, &account.user_id, answer);
         polls::republish(state, account_id, buffer_id, poll_id, &account.user_id);
     }
     Ok(())
@@ -1414,14 +1051,8 @@ pub async fn start_poll(
     answers: &[String],
     disclosed: bool,
 ) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let access_token = account.access_token.clone();
 
@@ -1429,11 +1060,7 @@ pub async fn start_poll(
     if question.is_empty() {
         anyhow::bail!("a poll needs a question");
     }
-    let answers: Vec<&str> = answers
-        .iter()
-        .map(|a| a.trim())
-        .filter(|a| !a.is_empty())
-        .collect();
+    let answers: Vec<&str> = answers.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
     if answers.len() < 2 {
         anyhow::bail!("a poll needs at least two answers");
     }
@@ -1471,37 +1098,16 @@ pub async fn start_poll(
         "body": question,
     });
 
-    send_poll_event(
-        state,
-        &account,
-        base,
-        &access_token,
-        buffer_id,
-        &room_id,
-        polls::POLL_START[0],
-        content,
-    )
-    .await
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_START[0], content).await
 }
 
 /// Closes a poll, so its result is final and late votes are ignored.
 ///
 /// The other half nothing could do: a poll started here could be voted in and
 /// never finished, which leaves a card on screen that says "open" for ever.
-pub async fn end_poll(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    poll_id: &str,
-) -> Result<()> {
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known Matrix room for this buffer")?;
+pub async fn end_poll(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str) -> Result<()> {
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let access_token = account.access_token.clone();
 
@@ -1511,17 +1117,7 @@ pub async fn end_poll(
         "m.text": [{ "body": "The poll has closed." }],
         "body": "The poll has closed.",
     });
-    send_poll_event(
-        state,
-        &account,
-        base,
-        &access_token,
-        buffer_id,
-        &room_id,
-        polls::POLL_END[0],
-        content,
-    )
-    .await
+    send_poll_event(state, &account, base, &access_token, buffer_id, &room_id, polls::POLL_END[0], content).await
 }
 
 /// The part both halves share, including the encrypted-room path.
@@ -1541,21 +1137,11 @@ async fn send_poll_event(
     content: Value,
 ) -> Result<()> {
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(&account.account_id())
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(&account.account_id()).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
         let encrypted = session
-            .share_and_encrypt_content(
-                &account.homeserver_url,
-                access_token,
-                &room_id_ruma,
-                member_ids,
-                event_type,
-                content,
-            )
+            .share_and_encrypt_content(&account.homeserver_url, access_token, &room_id_ruma, member_ids, event_type, content)
             .await
             .context("encrypting the poll")?;
         (protocol::EVENT_ROOM_ENCRYPTED.to_string(), encrypted)
@@ -1569,29 +1155,15 @@ async fn send_poll_event(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    http::put_json(&url, access_token, body_json)
-        .await
-        .context("sending the poll")?;
+    http::put_json(&url, access_token, body_json).await.context("sending the poll")?;
     Ok(())
 }
 
 /// Redacts (deletes) a message. Redactions are always sent in cleartext,
 /// even in an encrypted room (per the C-S API spec) - no crypto involved.
-pub async fn delete_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    access_token: &str,
-    msg_id: &str,
-) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn delete_message(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str) -> Result<()> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     redact_event(&account.homeserver_url, access_token, &room_id, msg_id).await
 }
 
@@ -1600,51 +1172,24 @@ pub async fn delete_message(
 /// the specific `m.reaction` event we sent (see Runtime::
 /// get_matrix_own_reaction_event) - Matrix has no toggle-by-name endpoint
 /// like Discord's.
-pub async fn toggle_reaction(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    access_token: &str,
-    msg_id: &str,
-    emoji: &str,
-    add: bool,
-) -> Result<()> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
-    let account = state
-        .accounts
-        .get_matrix(account_id)
-        .context("account not connected")?;
+pub async fn toggle_reaction(state: &AppState, account_id: &str, buffer_id: &str, access_token: &str, msg_id: &str, emoji: &str, add: bool) -> Result<()> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
+    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
 
     if !add {
-        let Some(event_id) = state
-            .runtime
-            .get_matrix_own_reaction_event(buffer_id, msg_id, emoji)
-        else {
+        let Some(event_id) = state.runtime.get_matrix_own_reaction_event(buffer_id, msg_id, emoji) else {
             anyhow::bail!("no known reaction event to remove");
         };
         return redact_event(&account.homeserver_url, access_token, &room_id, &event_id).await;
     }
 
     let (event_type, body_json) = if state.runtime.is_matrix_room_encrypted(buffer_id) {
-        let session = state
-            .runtime
-            .get_matrix_machine(account_id)
-            .context("crypto session not ready yet")?;
+        let session = state.runtime.get_matrix_machine(account_id).context("crypto session not ready yet")?;
         let member_ids = joined_member_ids(base, access_token, &room_id).await?;
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).context("invalid room id")?;
         let content = session
-            .share_and_encrypt_reaction(
-                &account.homeserver_url,
-                access_token,
-                &room_id_ruma,
-                member_ids,
-                msg_id,
-                emoji,
-            )
+            .share_and_encrypt_reaction(&account.homeserver_url, access_token, &room_id_ruma, member_ids, msg_id, emoji)
             .await
             .context("encrypting reaction")?;
         (protocol::EVENT_ROOM_ENCRYPTED, content)
@@ -1659,32 +1204,18 @@ pub async fn toggle_reaction(
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    let resp = http::put_json(&url, access_token, body_json)
-        .await
-        .context("sending reaction")?;
+    let resp = http::put_json(&url, access_token, body_json).await.context("sending reaction")?;
     // The reaction we just sent won't come back to us until the next
     // /sync (record_matrix_reaction_event normally runs from the receive
     // path) - record it locally right away too, so an immediate un-react
     // (before that sync arrives) can still find its event id.
     if let Some(event_id) = resp["event_id"].as_str() {
-        state.runtime.record_matrix_reaction_event(
-            buffer_id,
-            msg_id,
-            emoji,
-            event_id,
-            true,
-            &account.user_id,
-        );
+        state.runtime.record_matrix_reaction_event(buffer_id, msg_id, emoji, event_id, true, &account.user_id);
     }
     Ok(())
 }
 
-pub(super) async fn redact_event(
-    homeserver_url: &str,
-    access_token: &str,
-    room_id: &str,
-    target_event_id: &str,
-) -> Result<()> {
+pub(super) async fn redact_event(homeserver_url: &str, access_token: &str, room_id: &str, target_event_id: &str) -> Result<()> {
     let base = homeserver_url.trim_end_matches('/');
     let txn_id = model::next_message_id();
     let url = format!(
@@ -1693,9 +1224,7 @@ pub(super) async fn redact_event(
         url::form_urlencoded::byte_serialize(target_event_id.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>(),
     );
-    http::put_json(&url, access_token, serde_json::json!({}))
-        .await
-        .context("redacting event")?;
+    http::put_json(&url, access_token, serde_json::json!({})).await.context("redacting event")?;
     Ok(())
 }
 
@@ -1714,10 +1243,7 @@ mod edit_tests {
         assert_eq!(c["body"], "* **bold** now");
         assert_eq!(c["m.new_content"]["body"], "**bold** now");
         assert_eq!(c["m.new_content"]["format"], "org.matrix.custom.html");
-        assert_eq!(
-            c["m.new_content"]["formatted_body"],
-            "<strong>bold</strong> now"
-        );
+        assert_eq!(c["m.new_content"]["formatted_body"], "<strong>bold</strong> now");
     }
 
     /// A plain edit stays plain - no format keys at all, rather than a
@@ -1746,15 +1272,9 @@ mod typed_msgtype_tests {
 
     #[test]
     fn a_notice_is_a_notice() {
-        assert_eq!(
-            typed_msgtype("/notice build #412 failed").unwrap(),
-            ("m.notice", "build #412 failed")
-        );
+        assert_eq!(typed_msgtype("/notice build #412 failed").unwrap(), ("m.notice", "build #412 failed"));
         // The spacing somebody typed is not part of what they announced.
-        assert_eq!(
-            typed_msgtype("/notice   spaced out  ").unwrap(),
-            ("m.notice", "spaced out")
-        );
+        assert_eq!(typed_msgtype("/notice   spaced out  ").unwrap(), ("m.notice", "spaced out"));
     }
 
     #[test]
@@ -1767,56 +1287,29 @@ mod typed_msgtype_tests {
 
     #[test]
     fn a_doubled_slash_escapes_the_command() {
-        assert_eq!(
-            typed_msgtype("//notice not a command").unwrap(),
-            ("m.text", "/notice not a command")
-        );
+        assert_eq!(typed_msgtype("//notice not a command").unwrap(), ("m.text", "/notice not a command"));
     }
 
     #[test]
     fn a_command_this_backend_does_not_know_is_said_as_typed() {
         // Matched by the whole word, so a room called "/noticeboard" is not
         // swallowed by the command that starts the same way.
-        assert_eq!(
-            typed_msgtype("/noticeboard").unwrap(),
-            ("m.text", "/noticeboard")
-        );
-        assert_eq!(
-            typed_msgtype("/whois someone").unwrap(),
-            ("m.text", "/whois someone")
-        );
+        assert_eq!(typed_msgtype("/noticeboard").unwrap(), ("m.text", "/noticeboard"));
+        assert_eq!(typed_msgtype("/whois someone").unwrap(), ("m.text", "/whois someone"));
     }
 }
 
 /// Who has reacted to a message with one emoji, by name. Matrix keeps no list
 /// of its own to ask for: this is what the session has seen go by, which for a
 /// room being read is nearly everything recent.
-pub fn list_reactors(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    msg_id: &str,
-    emoji: &str,
-) -> Result<Value> {
-    let room_id = state
-        .runtime
-        .get_matrix_room(buffer_id)
-        .context("no known room id for this buffer")?;
+pub fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, emoji: &str) -> Result<Value> {
+    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known room id for this buffer")?;
     let users: Vec<Value> = state
         .runtime
         .matrix_reactors(buffer_id, msg_id, emoji)
         .into_iter()
         .map(|id| {
-            let name = state
-                .runtime
-                .matrix_member_name(account_id, &room_id, &id)
-                .unwrap_or_else(|| {
-                    id.trim_start_matches('@')
-                        .split(':')
-                        .next()
-                        .unwrap_or(&id)
-                        .to_string()
-                });
+            let name = state.runtime.matrix_member_name(account_id, &room_id, &id).unwrap_or_else(|| id.trim_start_matches('@').split(':').next().unwrap_or(&id).to_string());
             serde_json::json!({ "id": id, "name": name })
         })
         .collect();

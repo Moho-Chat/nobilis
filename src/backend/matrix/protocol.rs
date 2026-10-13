@@ -35,11 +35,7 @@ pub fn event_id(event: &Value) -> Option<&str> {
 /// already looks like, e.g. IRC's nick, so this matches the existing
 /// convention rather than inventing a new placeholder shape.
 pub fn mxid_localpart(mxid: &str) -> String {
-    mxid.trim_start_matches('@')
-        .split(':')
-        .next()
-        .unwrap_or(mxid)
-        .to_string()
+    mxid.trim_start_matches('@').split(':').next().unwrap_or(mxid).to_string()
 }
 
 /// A sender's bare Matrix ID, stripped the same way mxid_localpart does -
@@ -72,11 +68,7 @@ pub fn message_body(content: &Value) -> (String, bool) {
 /// replied to and redacted, and it belongs beside the conversation. Only its
 /// weight changes.
 pub fn message_kind(content: &Value) -> &'static str {
-    if content["msgtype"].as_str() == Some("m.notice") {
-        "notice"
-    } else {
-        "message"
-    }
+    if content["msgtype"].as_str() == Some("m.notice") { "notice" } else { "message" }
 }
 
 /// Whether this is a voice message rather than an attached audio file.
@@ -101,10 +93,7 @@ pub fn location_of(content: &Value) -> Option<String> {
     let geo = content["geo_uri"].as_str()?;
     let point = geo.strip_prefix("geo:")?.split(';').next()?;
     let (lat, long) = point.split_once(',')?;
-    let described = content["body"]
-        .as_str()
-        .filter(|b| !b.is_empty())
-        .unwrap_or("Location");
+    let described = content["body"].as_str().filter(|b| !b.is_empty()).unwrap_or("Location");
     Some(format!(
         "{described} — https://www.openstreetmap.org/?mlat={}&mlon={}#map=16/{}/{}",
         lat.trim(),
@@ -132,9 +121,7 @@ pub fn formatted_body(content: &Value) -> Option<&str> {
 /// reaction" event; un-reacting is redacting the `m.reaction` event you sent -
 /// see Runtime::take_matrix_reaction_target).
 pub fn redaction_target(event: &Value) -> Option<&str> {
-    event["redacts"]
-        .as_str()
-        .or_else(|| event["content"]["redacts"].as_str())
+    event["redacts"].as_str().or_else(|| event["content"]["redacts"].as_str())
 }
 
 /// The target event id of an edit (`m.relates_to.rel_type == "m.replace"`),
@@ -143,11 +130,7 @@ pub fn redaction_target(event: &Value) -> Option<&str> {
 /// best-effort fallback body for clients that don't understand edits.
 pub fn edit_target(content: &Value) -> Option<&str> {
     let relates_to = &content["m.relates_to"];
-    if relates_to["rel_type"].as_str() == Some("m.replace") {
-        relates_to["event_id"].as_str()
-    } else {
-        None
-    }
+    if relates_to["rel_type"].as_str() == Some("m.replace") { relates_to["event_id"].as_str() } else { None }
 }
 
 /// The edit's real replacement content - pass this to message_body
@@ -188,10 +171,7 @@ pub fn reaction_target(content: &Value) -> Option<(&str, &str)> {
     if relates_to["rel_type"].as_str() != Some("m.annotation") {
         return None;
     }
-    Some((
-        relates_to["event_id"].as_str()?,
-        relates_to["key"].as_str()?,
-    ))
+    Some((relates_to["event_id"].as_str()?, relates_to["key"].as_str()?))
 }
 
 #[cfg(test)]
@@ -204,25 +184,13 @@ mod thread_tests {
     #[test]
     fn a_notice_is_its_own_kind_of_line() {
         use serde_json::json;
-        assert_eq!(
-            message_kind(&json!({ "msgtype": "m.notice", "body": "build failed" })),
-            "notice"
-        );
-        assert_eq!(
-            message_kind(&json!({ "msgtype": "m.text", "body": "hello" })),
-            "message"
-        );
+        assert_eq!(message_kind(&json!({ "msgtype": "m.notice", "body": "build failed" })), "notice");
+        assert_eq!(message_kind(&json!({ "msgtype": "m.text", "body": "hello" })), "message");
         // An emote is a person talking about themselves, not an
         // announcement; it keeps its own handling through `is_action`.
-        assert_eq!(
-            message_kind(&json!({ "msgtype": "m.emote", "body": "waves" })),
-            "message"
-        );
+        assert_eq!(message_kind(&json!({ "msgtype": "m.emote", "body": "waves" })), "message");
         // Media, and content with no msgtype at all, stay ordinary.
-        assert_eq!(
-            message_kind(&json!({ "msgtype": "m.image", "body": "cat.png" })),
-            "message"
-        );
+        assert_eq!(message_kind(&json!({ "msgtype": "m.image", "body": "cat.png" })), "message");
         assert_eq!(message_kind(&json!({ "body": "hello" })), "message");
     }
 
@@ -246,16 +214,14 @@ mod thread_tests {
 
     #[test]
     fn an_ordinary_reply_is_not_a_thread() {
-        let reply =
-            serde_json::json!({ "m.relates_to": { "m.in_reply_to": { "event_id": "$x" } } });
+        let reply = serde_json::json!({ "m.relates_to": { "m.in_reply_to": { "event_id": "$x" } } });
         assert_eq!(thread_root(&reply), None);
         assert_eq!(reply_target(&reply), Some("$x"));
     }
 
     #[test]
     fn an_edit_is_not_a_thread_either() {
-        let edit =
-            serde_json::json!({ "m.relates_to": { "rel_type": "m.replace", "event_id": "$x" } });
+        let edit = serde_json::json!({ "m.relates_to": { "rel_type": "m.replace", "event_id": "$x" } });
         assert_eq!(thread_root(&edit), None);
     }
 
@@ -305,23 +271,14 @@ mod tests {
             "geo_uri": "geo:52.2053,0.1218"
         });
         let line = location_of(&content).expect("a location");
-        assert!(
-            line.starts_with("The pub — https://www.openstreetmap.org/?mlat=52.2053&mlon=0.1218"),
-            "{line}"
-        );
+        assert!(line.starts_with("The pub — https://www.openstreetmap.org/?mlat=52.2053&mlon=0.1218"), "{line}");
 
         // A geo URI with a precision suffix is still a point.
-        let precise =
-            serde_json::json!({ "msgtype": "m.location", "geo_uri": "geo:52.2,0.12;u=35" });
-        assert!(location_of(&precise)
-            .expect("a location")
-            .starts_with("Location — "));
+        let precise = serde_json::json!({ "msgtype": "m.location", "geo_uri": "geo:52.2,0.12;u=35" });
+        assert!(location_of(&precise).expect("a location").starts_with("Location — "));
 
         // Anything else is not a location and must not be read as one.
-        assert_eq!(
-            location_of(&serde_json::json!({ "msgtype": "m.text", "body": "geo:1,2" })),
-            None
-        );
+        assert_eq!(location_of(&serde_json::json!({ "msgtype": "m.text", "body": "geo:1,2" })), None);
     }
 
     /// A voice message is an audio file with a note saying it was spoken.
@@ -332,13 +289,9 @@ mod tests {
             "org.matrix.msc3245.voice": {}
         })));
         // The stable name, for when it lands.
-        assert!(is_voice_message(
-            &serde_json::json!({ "msgtype": "m.audio", "m.voice": {} })
-        ));
+        assert!(is_voice_message(&serde_json::json!({ "msgtype": "m.audio", "m.voice": {} })));
         // An ordinary attached song is not a voice message.
-        assert!(!is_voice_message(
-            &serde_json::json!({ "msgtype": "m.audio" })
-        ));
+        assert!(!is_voice_message(&serde_json::json!({ "msgtype": "m.audio" })));
     }
 
     use super::formatted_body;
@@ -352,15 +305,11 @@ mod tests {
         let html = json!({ "format": "org.matrix.custom.html", "formatted_body": "<b>hi</b>", "body": "hi" });
         assert_eq!(formatted_body(&html), Some("<b>hi</b>"));
 
-        let other =
-            json!({ "format": "org.example.markdown", "formatted_body": "**hi**", "body": "hi" });
+        let other = json!({ "format": "org.example.markdown", "formatted_body": "**hi**", "body": "hi" });
         assert_eq!(formatted_body(&other), None);
 
         // A plain message, and an empty formatted body, both fall back.
         assert_eq!(formatted_body(&json!({ "body": "hi" })), None);
-        assert_eq!(
-            formatted_body(&json!({ "format": "org.matrix.custom.html", "formatted_body": "" })),
-            None
-        );
+        assert_eq!(formatted_body(&json!({ "format": "org.matrix.custom.html", "formatted_body": "" })), None);
     }
 }

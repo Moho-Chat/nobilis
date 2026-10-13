@@ -10,13 +10,7 @@ use super::*;
 /// is that mention, added by the daemon rather than left to each frontend to
 /// know the convention - and skipped when the message already opens with it,
 /// so replying twice to the same person does not stack them up.
-pub fn send_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_name: &str,
-    body: &str,
-    reply_to: Option<&str>,
-) -> Result<()> {
+pub fn send_message(state: &AppState, account_id: &str, buffer_name: &str, body: &str, reply_to: Option<&str>) -> Result<()> {
     // Typed rather than chosen from a menu, which is what somebody used to the
     // site will do. Routed through the same path either way, so it is recorded
     // as a whisper here too - passed straight through it would be a real
@@ -34,9 +28,7 @@ pub fn send_message(
         .get_presence(&buffer_id)
         .and_then(|members| {
             members.as_array().map(|list| {
-                list.iter()
-                    .filter_map(|m| m["nick"].as_str().map(str::to_string))
-                    .collect()
+                list.iter().filter_map(|m| m["nick"].as_str().map(str::to_string)).collect()
             })
         })
         .unwrap_or_default();
@@ -51,13 +43,9 @@ pub fn send_message(
         return send_whisper(state, account_id, &target, &text, Some(buffer_name));
     }
     let body = as_reply(body, reply_to);
-    let Some(text) = protocol::prepare_outgoing(&body) else {
-        return Ok(());
-    };
+    let Some(text) = protocol::prepare_outgoing(&body) else { return Ok(()) };
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender
-        .send(text)
-        .map_err(|_| anyhow!("chat socket closed"))?;
+    sender.send(text).map_err(|_| anyhow!("chat socket closed"))?;
     Ok(())
 }
 
@@ -89,9 +77,7 @@ pub fn send_whisper(
     if target.is_empty() {
         bail!("no one to whisper to");
     }
-    let Some(text) = protocol::prepare_outgoing(body) else {
-        return Ok(());
-    };
+    let Some(text) = protocol::prepare_outgoing(body) else { return Ok(()) };
     let sender = any_room_sender(state, account_id)?;
     let wire = protocol::prepare_whisper(target, &text);
     // The addressing, not the message: enough to tell a wrong command from a
@@ -100,31 +86,16 @@ pub fn send_whisper(
         "sneedchat[{account_id}]: sending whisper addressed {:?}",
         protocol::prepare_whisper(target, "")
     );
-    sender
-        .send(wire)
-        .map_err(|_| anyhow!("chat socket closed"))?;
+    sender.send(wire).map_err(|_| anyhow!("chat socket closed"))?;
 
     let me = state
         .accounts
         .get_sneedchat(account_id)
-        .map(|c| {
-            c.display_name
-                .filter(|n| !n.is_empty())
-                .unwrap_or(c.username)
-        })
+        .map(|c| c.display_name.filter(|n| !n.is_empty()).unwrap_or(c.username))
         .unwrap_or_default();
     let at = if target.starts_with('@') { "" } else { "@" };
     let named = target.trim_end_matches(',');
-    record_whisper(
-        state,
-        account_id,
-        &me,
-        &format!("{at}{named}, {text}"),
-        None,
-        None,
-        false,
-        from_buffer,
-    );
+    record_whisper(state, account_id, &me, &format!("{at}{named}, {text}"), None, None, false, from_buffer);
     Ok(())
 }
 
@@ -194,24 +165,12 @@ pub async fn send_attachment(
 ) -> Result<()> {
     // Only used to confirm the account is real before spending any time on
     // the upload - the transport below is deliberately unrelated to it.
-    state
-        .accounts
-        .get_sneedchat(account_id)
-        .ok_or_else(|| anyhow!("no such account"))?;
+    state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
 
     match host {
         None | Some(crate::upload::Host::Postimg) => {}
         Some(host) => {
-            return send_via_upload_host(
-                state,
-                account_id,
-                buffer_name,
-                caption,
-                file_path,
-                host,
-                progress,
-            )
-            .await
+            return send_via_upload_host(state, account_id, buffer_name, caption, file_path, host, progress).await
         }
     }
 
@@ -231,11 +190,7 @@ pub async fn send_attachment(
     };
 
     let wrapped = format!("[url={}][img]{}[/img][/url]", links.page, links.direct);
-    let text = if caption.trim().is_empty() {
-        wrapped
-    } else {
-        format!("{caption}\n{wrapped}")
-    };
+    let text = if caption.trim().is_empty() { wrapped } else { format!("{caption}\n{wrapped}") };
     // The caption already carries any mention the caller wanted; an image
     // post is not separately a reply.
     send_message(state, account_id, buffer_name, &text, None)
@@ -265,22 +220,12 @@ pub(super) async fn send_via_upload_host(
     // one client's: a link from a host the forum does not embed is a picture
     // nobody on the other end sees.
     if !host.offered_to("sneedchat") {
-        bail!(
-            "{} links don't show as pictures on Sneedchat - choose another image host for it",
-            host.id()
-        );
+        bail!("{} links don't show as pictures on Sneedchat - choose another image host for it", host.id());
     }
     let link = crate::upload::upload_reporting(host, file_path, None, progress).await?;
-    let file_name = std::path::Path::new(file_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("");
     let posted = posted_markup(file_name, &link);
-    let text = if caption.trim().is_empty() {
-        posted
-    } else {
-        format!("{caption}\n{posted}")
-    };
+    let text = if caption.trim().is_empty() { posted } else { format!("{caption}\n{posted}") };
     send_message(state, account_id, buffer_name, &text, None)
 }
 
@@ -297,33 +242,18 @@ pub(super) fn posted_markup(file_name: &str, link: &str) -> String {
 /// direct "edit accepted" reply - the edited message just comes back
 /// through the normal live stream with a bumped message_edit_date, which
 /// handle_frame already detects and applies via Runtime::update_message.
-pub fn edit_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_name: &str,
-    msg_id: &str,
-    body: &str,
-) -> Result<()> {
+pub fn edit_message(state: &AppState, account_id: &str, buffer_name: &str, msg_id: &str, body: &str) -> Result<()> {
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender
-        .send(protocol::prepare_edit(msg_id, body))
-        .map_err(|_| anyhow!("chat socket closed"))?;
+    sender.send(protocol::prepare_edit(msg_id, body)).map_err(|_| anyhow!("chat socket closed"))?;
     Ok(())
 }
 
 /// `deleteMessage`'s SneedChat branch - same "no direct reply" story as
 /// edit_message; the deletion gets applied locally once it's echoed back
 /// (either as a top-level `delete` batch or a `deleted`/`is_deleted` flag).
-pub fn delete_message(
-    state: &AppState,
-    account_id: &str,
-    buffer_name: &str,
-    msg_id: &str,
-) -> Result<()> {
+pub fn delete_message(state: &AppState, account_id: &str, buffer_name: &str, msg_id: &str) -> Result<()> {
     let sender = room_sender_for_buffer(state, account_id, buffer_name)?;
-    sender
-        .send(protocol::prepare_delete(msg_id))
-        .map_err(|_| anyhow!("chat socket closed"))?;
+    sender.send(protocol::prepare_delete(msg_id)).map_err(|_| anyhow!("chat socket closed"))?;
     Ok(())
 }
 
@@ -336,22 +266,10 @@ mod tests {
     /// something you can click.
     #[test]
     fn only_pictures_are_wrapped_for_display() {
-        assert_eq!(
-            posted_markup("cat.png", "https://files.catbox.moe/a.png"),
-            "[img]https://files.catbox.moe/a.png[/img]"
-        );
-        assert_eq!(
-            posted_markup("cat.JPEG", "https://x/a.jpeg"),
-            "[img]https://x/a.jpeg[/img]"
-        );
-        assert_eq!(
-            posted_markup("clip.mp4", "https://files.catbox.moe/b.mp4"),
-            "https://files.catbox.moe/b.mp4"
-        );
-        assert_eq!(
-            posted_markup("notes.pdf", "https://x/c.pdf"),
-            "https://x/c.pdf"
-        );
+        assert_eq!(posted_markup("cat.png", "https://files.catbox.moe/a.png"), "[img]https://files.catbox.moe/a.png[/img]");
+        assert_eq!(posted_markup("cat.JPEG", "https://x/a.jpeg"), "[img]https://x/a.jpeg[/img]");
+        assert_eq!(posted_markup("clip.mp4", "https://files.catbox.moe/b.mp4"), "https://files.catbox.moe/b.mp4");
+        assert_eq!(posted_markup("notes.pdf", "https://x/c.pdf"), "https://x/c.pdf");
         // No extension at all is not a picture.
         assert_eq!(posted_markup("README", "https://x/d"), "https://x/d");
     }
@@ -360,10 +278,7 @@ mod tests {
     fn a_reply_opens_with_the_mention_sneedchat_understands() {
         // Sneedchat has no reply field; answering somebody by name is what
         // the site's own client does and what its notifications look for.
-        assert_eq!(
-            super::as_reply("sure", Some("Alexcellence")),
-            "@Alexcellence, sure"
-        );
+        assert_eq!(super::as_reply("sure", Some("Alexcellence")), "@Alexcellence, sure");
         // Leading space would otherwise land between the comma and the text.
         assert_eq!(super::as_reply("   sure", Some("Bob")), "@Bob, sure");
     }
@@ -372,10 +287,7 @@ mod tests {
     fn replying_twice_does_not_stack_mentions() {
         // Somebody who types the mention themselves, or replies again to the
         // same person, should not end up with "@Bob, @Bob, ...".
-        assert_eq!(
-            super::as_reply("@Bob, already there", Some("Bob")),
-            "@Bob, already there"
-        );
+        assert_eq!(super::as_reply("@Bob, already there", Some("Bob")), "@Bob, already there");
     }
 
     #[test]

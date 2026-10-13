@@ -31,11 +31,7 @@ pub fn open_query(state: &AppState, account_id: &str, nick: &str) -> Result<Stri
 pub(super) const ISON_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Asks, repeatedly, which of the people we have conversations with are online.
-pub(super) async fn poll_query_presence(
-    state: AppState,
-    account_id: String,
-    sender: irc::client::Sender,
-) {
+pub(super) async fn poll_query_presence(state: AppState, account_id: String, sender: irc::client::Sender) {
     loop {
         tokio::time::sleep(ISON_INTERVAL).await;
 
@@ -45,11 +41,7 @@ pub(super) async fn poll_query_presence(
 
         // Conversation partners, plus anybody on the watch list - one poll
         // answers both questions, and a name in both is asked about once.
-        let watched = state
-            .accounts
-            .get_irc(&account_id)
-            .map(|c| notify_list(&c))
-            .unwrap_or_default();
+        let watched = state.accounts.get_irc(&account_id).map(|c| notify_list(&c)).unwrap_or_default();
         let mut nicks: Vec<String> = state
             .runtime
             .list_buffers()
@@ -74,10 +66,7 @@ pub(super) async fn poll_query_presence(
         // One request for everyone rather than one each: ISON takes a list,
         // and a server will answer a line of them in a single reply.
         for chunk in nicks.chunks(20) {
-            if sender
-                .send(Command::Raw("ISON".to_string(), chunk.to_vec()))
-                .is_err()
-            {
+            if sender.send(Command::Raw("ISON".to_string(), chunk.to_vec())).is_err() {
                 return;
             }
         }
@@ -89,13 +78,7 @@ pub(super) async fn poll_query_presence(
 /// Stored as typed, so the list reads back the way it was written; matched
 /// case-insensitively, because IRC nicks are.
 pub fn notify_list(config: &IrcAccountConfig) -> Vec<String> {
-    config
-        .notify
-        .split(',')
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(str::to_string)
-        .collect()
+    config.notify.split(',').map(str::trim).filter(|n| !n.is_empty()).map(str::to_string).collect()
 }
 
 /// Who on the watch list was last seen online, per account.
@@ -126,32 +109,9 @@ pub(super) fn note_presence(seen: &mut HashMap<String, bool>, nick: &str, online
 /// The server buffer because it is about the network rather than about any
 /// conversation - the same place a WHOIS answer and a network notice go.
 pub(super) fn announce_presence(state: &AppState, account_id: &str, nick: &str, online: bool) {
-    let host = account_id
-        .split_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(account_id);
-    let body = if online {
-        format!("{nick} is online")
-    } else {
-        format!("{nick} is offline")
-    };
-    state.runtime.record_message(
-        state,
-        account_id,
-        host,
-        "server",
-        "*",
-        &body,
-        false,
-        "system",
-        None,
-        None,
-        false,
-        None,
-        Vec::new(),
-        Vec::new(),
-        None,
-    );
+    let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+    let body = if online { format!("{nick} is online") } else { format!("{nick} is offline") };
+    state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
 }
 
 /// Starts watching, the good way where the server has it.
@@ -210,19 +170,16 @@ pub(super) fn settle_notify(state: &AppState, account_id: &str, watched: &[Strin
 }
 
 /// Nicks named by ISON replies since the last poll settled.
-pub(super) fn ison_replies(
-) -> &'static std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>> {
-    static REPLIES: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>>,
-    > = std::sync::OnceLock::new();
+pub(super) fn ison_replies() -> &'static std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>> {
+    static REPLIES: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::collections::HashSet<String>>>> =
+        std::sync::OnceLock::new();
     REPLIES.get_or_init(Default::default)
 }
 
 /// Accounts that have been asked at least once, so "no reply yet" and
 /// "everybody is offline" can be told apart.
 pub(super) fn ison_asked() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static ASKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
+    static ASKED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
     ASKED.get_or_init(Default::default)
 }
 
@@ -251,10 +208,7 @@ pub(super) fn apply_monitor(state: &AppState, account_id: &str, targets: &str, o
 /// ISON answers with only the nicks that *are* on, so anyone asked about and
 /// missing from the reply is offline - which is the answer this exists to get.
 pub(super) fn apply_ison(state: &AppState, account_id: &str, online: &str) {
-    let online: Vec<String> = online
-        .split_whitespace()
-        .map(|n| n.to_lowercase())
-        .collect();
+    let online: Vec<String> = online.split_whitespace().map(|n| n.to_lowercase()).collect();
     for buffer in state.runtime.list_buffers() {
         if buffer.account_id != account_id || buffer.kind != "dm" {
             continue;
@@ -268,10 +222,7 @@ pub(super) fn apply_ison(state: &AppState, account_id: &str, online: &str) {
             "status": if here { "online" } else { "offline" },
         }]);
         state.runtime.set_presence(&buffer.id, members.clone());
-        state.events.emit(
-            "presenceChange",
-            json!({ "bufferId": buffer.id, "members": members }),
-        );
+        state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": members }));
     }
 }
 
@@ -292,11 +243,7 @@ pub(super) fn irc_profile(
     let mut profile = crate::profile::pending("irc", account_id, nick);
     profile["pending"] = json!(false);
     crate::profile::set(&mut profile, "handle", whois.get("mask").cloned());
-    crate::profile::set(
-        &mut profile,
-        "idleSeconds",
-        whois.get("idleSeconds").cloned(),
-    );
+    crate::profile::set(&mut profile, "idleSeconds", whois.get("idleSeconds").cloned());
     // The signon time is when this connection started, which is the closest
     // thing IRC has to "joined" - and is what every client labels as such.
     crate::profile::set(&mut profile, "joinedTs", whois.get("signOnTs").cloned());
@@ -348,11 +295,7 @@ pub(super) fn irc_profile(
         profile["roles"] = json!(roles);
     }
     profile["isModerator"] = json!(moderator);
-    profile["status"] = json!(if state.runtime.is_irc_away(account_id, nick) {
-        "idle"
-    } else {
-        "online"
-    });
+    profile["status"] = json!(if state.runtime.is_irc_away(account_id, nick) { "idle" } else { "online" });
     profile
 }
 
@@ -364,15 +307,8 @@ pub(super) fn irc_profile(
 /// words, both looking like hostnames, neither of them a sentence.
 pub(super) fn is_netsplit(reason: &str) -> bool {
     let mut words = reason.split_whitespace();
-    let (Some(a), Some(b), None) = (words.next(), words.next(), words.next()) else {
-        return false;
-    };
-    let hostish = |w: &str| {
-        w.contains('.')
-            && !w.contains(':')
-            && w.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    };
+    let (Some(a), Some(b), None) = (words.next(), words.next(), words.next()) else { return false };
+    let hostish = |w: &str| w.contains('.') && !w.contains(':') && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
     hostish(a) && hostish(b)
 }
 
@@ -382,12 +318,7 @@ pub(super) fn is_netsplit(reason: &str) -> bool {
 pub(super) const SPLIT_REPORT_DELAY: Duration = Duration::from_secs(3);
 
 /// Reports one netsplit, once, after the quits have stopped arriving.
-pub(super) fn schedule_split_report(
-    state: AppState,
-    account_id: String,
-    channel: String,
-    reason: String,
-) {
+pub(super) fn schedule_split_report(state: AppState, account_id: String, channel: String, reason: String) {
     tokio::spawn(async move {
         tokio::time::sleep(SPLIT_REPORT_DELAY).await;
         let gone = state.runtime.take_irc_split(&account_id, &channel, &reason);
@@ -399,23 +330,7 @@ pub(super) fn schedule_split_report(
         } else {
             format!("{} people split from the network ({reason})", gone.len())
         };
-        state.runtime.record_message(
-            &state,
-            &account_id,
-            &channel,
-            "channel",
-            "*",
-            &line,
-            false,
-            "part",
-            None,
-            None,
-            false,
-            None,
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
+        state.runtime.record_message(&state, &account_id, &channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
     });
 }
 
@@ -447,10 +362,7 @@ impl Who {
     /// Somebody who has just arrived and is so far only a rank.
     #[cfg(test)]
     pub(super) fn ranked(rank: MemberRank) -> Self {
-        Self {
-            rank,
-            ..Self::default()
-        }
+        Self { rank, ..Self::default() }
     }
 
     /// Fills in what an answer carried, leaving alone what it did not.
@@ -483,12 +395,7 @@ impl Who {
 /// line moves them in all of them at once - and a roster that was not redrawn
 /// keeps showing them as present, which is precisely the thing away exists to
 /// correct.
-pub(super) fn refresh_rosters_containing(
-    state: &AppState,
-    account_id: &str,
-    nick: &str,
-    channels: &HashMap<String, HashMap<String, Who>>,
-) {
+pub(super) fn refresh_rosters_containing(state: &AppState, account_id: &str, nick: &str, channels: &HashMap<String, HashMap<String, Who>>) {
     for (channel, members) in channels.iter() {
         if members.contains_key(nick) {
             emit_presence(state, account_id, channel, members);
@@ -496,12 +403,7 @@ pub(super) fn refresh_rosters_containing(
     }
 }
 
-pub(super) fn emit_presence(
-    state: &AppState,
-    account_id: &str,
-    channel: &str,
-    members: &HashMap<String, Who>,
-) {
+pub(super) fn emit_presence(state: &AppState, account_id: &str, channel: &str, members: &HashMap<String, Who>) {
     let buffer_id = crate::model::buffer_id(account_id, channel);
     let member_list: Vec<_> = members
         .iter()
@@ -529,10 +431,7 @@ pub(super) fn emit_presence(
     // via subscribe's replay instead of waiting for the next incremental
     // change - see Runtime::get_presence and rpc/methods.rs's subscribe.
     state.runtime.set_presence(&buffer_id, member_list.clone());
-    state.events.emit(
-        "presenceChange",
-        json!({ "bufferId": buffer_id, "members": member_list }),
-    );
+    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
 }
 
 #[cfg(test)]

@@ -36,10 +36,7 @@ pub fn read_sound(v: &Value) -> Option<Sound> {
         id: v["sound_id"].as_str()?.to_string(),
         name: v["name"].as_str().unwrap_or("sound").to_string(),
         volume: v["volume"].as_f64().unwrap_or(1.0) as f32,
-        emoji_name: v["emoji_name"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string),
+        emoji_name: v["emoji_name"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         emoji_id: v["emoji_id"].as_str().map(str::to_string),
         guild_id: v["guild_id"].as_str().map(str::to_string),
     })
@@ -61,30 +58,16 @@ fn guilds() -> &'static ByGuild {
 /// A guild's whole list, as `SOUNDBOARD_SOUNDS` or
 /// `GUILD_SOUNDBOARD_SOUNDS_UPDATE` carry it.
 pub fn note_guild_sounds(account_id: &str, guild_id: &str, list: &Value) {
-    let sounds: Vec<Sound> = list
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(read_sound)
-        .collect();
-    guilds()
-        .lock()
-        .unwrap()
-        .insert((account_id.to_string(), guild_id.to_string()), sounds);
+    let sounds: Vec<Sound> = list.as_array().into_iter().flatten().filter_map(read_sound).collect();
+    guilds().lock().unwrap().insert((account_id.to_string(), guild_id.to_string()), sounds);
 }
 
 /// One sound added, changed or removed.
 pub fn note_sound_change(account_id: &str, dispatch: &str, d: &Value) {
-    let Some(guild_id) = d["guild_id"].as_str() else {
-        return;
-    };
-    let Some(id) = d["sound_id"].as_str() else {
-        return;
-    };
+    let Some(guild_id) = d["guild_id"].as_str() else { return };
+    let Some(id) = d["sound_id"].as_str() else { return };
     let mut all = guilds().lock().unwrap();
-    let list = all
-        .entry((account_id.to_string(), guild_id.to_string()))
-        .or_default();
+    let list = all.entry((account_id.to_string(), guild_id.to_string())).or_default();
     list.retain(|s| s.id != id);
     if dispatch != "GUILD_SOUNDBOARD_SOUND_DELETE" {
         if let Some(sound) = read_sound(d) {
@@ -117,13 +100,7 @@ async fn default_sounds(token: &str) -> Vec<Sound> {
             .ok()?;
         resp.status().is_success().then_some(())?;
         let body: Value = resp.json().await.ok()?;
-        Some(
-            body.as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(read_sound)
-                .collect::<Vec<_>>(),
-        )
+        Some(body.as_array().into_iter().flatten().filter_map(read_sound).collect::<Vec<_>>())
     }
     .await;
     match fetched {
@@ -138,12 +115,7 @@ async fn default_sounds(token: &str) -> Vec<Sound> {
 /// Everything this account could play, from the guild it is in: that guild's
 /// sounds first, then Discord's defaults, then the rest - each marked with
 /// whether it can be played here.
-pub async fn list(
-    state: &AppState,
-    account_id: &str,
-    guild_id: Option<&str>,
-    token: &str,
-) -> Vec<Value> {
+pub async fn list(state: &AppState, account_id: &str, guild_id: Option<&str>, token: &str) -> Vec<Value> {
     let defaults = default_sounds(token).await;
     let nitro = state.runtime.emoji_unrestricted(account_id);
     // This guild's own, then Discord's defaults, then every other guild's.
@@ -165,11 +137,8 @@ pub async fn list(
         }
     }
     elsewhere.sort_by_key(|(name, _, _)| name.to_lowercase());
-    let groups: Vec<(String, Vec<Sound>, bool)> = here
-        .into_iter()
-        .chain([("Default".to_string(), defaults, true)])
-        .chain(elsewhere)
-        .collect();
+    let groups: Vec<(String, Vec<Sound>, bool)> =
+        here.into_iter().chain([("Default".to_string(), defaults, true)]).chain(elsewhere).collect();
     groups
         .into_iter()
         .flat_map(|(group, sounds, usable)| {
@@ -190,26 +159,15 @@ pub async fn list(
 
 /// Sets a sound off in the channel this account is in. Everybody there -
 /// this account included - hears it when the gateway says it was played.
-pub async fn play(
-    state: &AppState,
-    account_id: &str,
-    channel_id: &str,
-    sound_id: &str,
-    source_guild_id: Option<&str>,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn play(state: &AppState, account_id: &str, channel_id: &str, sound_id: &str, source_guild_id: Option<&str>) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let mut body = json!({ "sound_id": sound_id });
     if let Some(g) = source_guild_id {
         body["source_guild_id"] = json!(g);
     }
     let resp = send_write(
         http_client_for(&cfg.token)
-            .post(format!(
-                "{API_BASE}/channels/{channel_id}/send-soundboard-sound"
-            ))
+            .post(format!("{API_BASE}/channels/{channel_id}/send-soundboard-sound"))
             .header("Authorization", &cfg.token)
             .json(&body),
     )
@@ -227,11 +185,7 @@ pub async fn play(
 /// decoded and handed to the call to mix in.
 pub async fn heard(state: &AppState, account_id: &str, d: &Value) {
     // A string for a guild's sound and, for some default ones, a number.
-    let Some(sound_id) = d["sound_id"]
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| d["sound_id"].as_u64().map(|n| n.to_string()))
-    else {
+    let Some(sound_id) = d["sound_id"].as_str().map(str::to_string).or_else(|| d["sound_id"].as_u64().map(|n| n.to_string())) else {
         return;
     };
     let sound_id = sound_id.as_str();
@@ -240,15 +194,8 @@ pub async fn heard(state: &AppState, account_id: &str, d: &Value) {
         return;
     }
     let volume = d["sound_volume"].as_f64().unwrap_or(1.0) as f32;
-    let token = state
-        .accounts
-        .get_discord(account_id)
-        .map(|c| c.token)
-        .unwrap_or_default();
-    match fetch(&token, sound_id)
-        .await
-        .and_then(|bytes| decode(&bytes))
-    {
+    let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+    match fetch(&token, sound_id).await.and_then(|bytes| decode(&bytes)) {
         Ok(mut pcm) => {
             crate::audio::apply_gain(&mut pcm, volume);
             state.voice.queue_effect(account_id, &pcm);
@@ -288,10 +235,7 @@ async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     if !resp.status().is_success() {
         bail!("Discord has no file for that sound ({})", resp.status());
     }
-    if resp
-        .content_length()
-        .is_some_and(|n| n as usize > LARGEST_BYTES)
-    {
+    if resp.content_length().is_some_and(|n| n as usize > LARGEST_BYTES) {
         bail!("that sound is larger than any soundboard sound can be");
     }
     // Read a piece at a time and stopped at the limit, rather than trusting
@@ -323,29 +267,18 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i16>> {
     use symphonia::core::meta::MetadataOptions;
     use symphonia::core::probe::Hint;
 
-    let source = MediaSourceStream::new(
-        Box::new(std::io::Cursor::new(bytes.to_vec())),
-        Default::default(),
-    );
+    let source = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes.to_vec())), Default::default());
     let probed = symphonia::default::get_probe()
-        .format(
-            &Hint::new(),
-            source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
+        .format(&Hint::new(), source, &FormatOptions::default(), &MetadataOptions::default())
         .map_err(|e| anyhow!("not a sound this can read: {e}"))?;
     let mut format = probed.format;
-    let track = format
-        .default_track()
-        .context("the file has no audio in it")?;
+    let track = format.default_track().context("the file has no audio in it")?;
     let track_id = track.id;
     let rate = track.codec_params.sample_rate.unwrap_or(48_000) as usize;
     // A guild's own sounds are Ogg Opus, which symphonia can unwrap but not
     // decode. libopus is here already for the calls themselves.
     if track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_OPUS {
-        let mut opus = opus2::Decoder::new(48_000, opus2::Channels::Stereo)
-            .map_err(|e| anyhow!("no Opus decoder: {e:?}"))?;
+        let mut opus = opus2::Decoder::new(48_000, opus2::Channels::Stereo).map_err(|e| anyhow!("no Opus decoder: {e:?}"))?;
         let mut out: Vec<i16> = Vec::new();
         let mut frame = vec![0i16; 5760 * 2];
         while let Ok(packet) = format.next_packet() {
@@ -375,19 +308,13 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i16>> {
         if packet.track_id() != track_id {
             continue;
         }
-        let Ok(decoded) = decoder.decode(&packet) else {
-            continue;
-        };
+        let Ok(decoded) = decoder.decode(&packet) else { continue };
         let spec = *decoded.spec();
         let channels = spec.channels.count().max(1);
         let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
         buf.copy_interleaved_ref(decoded);
         for frame in buf.samples().chunks(channels) {
-            let (l, r) = if channels == 1 {
-                (frame[0], frame[0])
-            } else {
-                (frame[0], frame[1])
-            };
+            let (l, r) = if channels == 1 { (frame[0], frame[0]) } else { (frame[0], frame[1]) };
             stereo.push(l);
             stereo.push(r);
         }
@@ -400,11 +327,7 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<i16>> {
 
 fn resample(stereo: &[f32], from: usize, to: usize) -> Vec<i16> {
     let frames = stereo.len() / 2;
-    let out_frames = if from == to {
-        frames
-    } else {
-        frames * to / from.max(1)
-    };
+    let out_frames = if from == to { frames } else { frames * to / from.max(1) };
     let mut out = Vec::with_capacity(out_frames * 2);
     for i in 0..out_frames {
         let pos = i as f64 * from as f64 / to as f64;
@@ -440,10 +363,7 @@ mod tests {
     fn a_sound_is_read_with_its_emoji() {
         let v = json!({ "sound_id": "1", "name": "quack", "volume": 0.5, "emoji_name": "🦆", "guild_id": "9", "available": true });
         let s = read_sound(&v).unwrap();
-        assert_eq!(
-            (s.id.as_str(), s.name.as_str(), s.volume),
-            ("1", "quack", 0.5)
-        );
+        assert_eq!((s.id.as_str(), s.name.as_str(), s.volume), ("1", "quack", 0.5));
         assert_eq!(s.emoji_name.as_deref(), Some("🦆"));
         assert!(read_sound(&json!({ "sound_id": "2", "available": false })).is_none());
     }
@@ -454,6 +374,7 @@ mod tests {
         assert_eq!(resample(&one_second_44k, 44_100, 48_000).len(), 48_000 * 2);
     }
 }
+
 
 #[cfg(test)]
 mod opus_guard_tests {
@@ -467,10 +388,7 @@ mod opus_guard_tests {
         let file = crate::oggopus::encode(&samples).unwrap();
         let pcm = super::decode(&file).unwrap();
         let seconds = pcm.len() as f64 / 2.0 / 48_000.0;
-        assert!(
-            (1.9..=2.1).contains(&seconds),
-            "decoded {seconds:.2}s of a 2s sound"
-        );
+        assert!((1.9..=2.1).contains(&seconds), "decoded {seconds:.2}s of a 2s sound");
     }
 
     /// Ogg's page checksum: CRC-32 with polynomial 0x04c11db7, not reflected,
@@ -480,11 +398,7 @@ mod opus_guard_tests {
         for &byte in page {
             crc ^= (byte as u32) << 24;
             for _ in 0..8 {
-                crc = if crc & 0x8000_0000 != 0 {
-                    (crc << 1) ^ 0x04c1_1db7
-                } else {
-                    crc << 1
-                };
+                crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04c1_1db7 } else { crc << 1 };
             }
         }
         crc
@@ -514,10 +428,7 @@ mod opus_guard_tests {
                 file[body] = (31 << 3) | 3;
                 file[body + 1] = 63;
             }
-            let len: usize = file[i + 27..i + 27 + segments]
-                .iter()
-                .map(|&b| b as usize)
-                .sum();
+            let len: usize = file[i + 27..i + 27 + segments].iter().map(|&b| b as usize).sum();
             // The page's checksum covers what was just changed. Left as it was
             // the container rejects the whole file before any packet is read,
             // and this would be testing that and not the check it is named for.
@@ -530,11 +441,6 @@ mod opus_guard_tests {
         // packets out; it must not panic or error the whole sound, and what
         // comes back is what was left of it - less than there was.
         let damaged = super::decode(&file).expect("a damaged sound is decoded as far as it goes");
-        assert!(
-            damaged.len() < whole.len(),
-            "{} of {} samples came through",
-            damaged.len(),
-            whole.len()
-        );
+        assert!(damaged.len() < whole.len(), "{} of {} samples came through", damaged.len(), whole.len());
     }
 }

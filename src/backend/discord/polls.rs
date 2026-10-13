@@ -35,21 +35,14 @@ pub(super) fn card(buffer_id: &str, message_id: &str, poll: &Value) -> Option<Va
             .into_iter()
             .flatten()
             .find(|c| c["id"].as_i64() == Some(id))
-            .map(|c| {
-                (
-                    c["count"].as_u64().unwrap_or(0),
-                    c["me_voted"].as_bool().unwrap_or(false),
-                )
-            })
+            .map(|c| (c["count"].as_u64().unwrap_or(0), c["me_voted"].as_bool().unwrap_or(false)))
             .unwrap_or((0, false))
     };
 
     let mut options: Vec<Value> = Vec::new();
     let mut voted_for: Option<i64> = None;
     for answer in poll["answers"].as_array().into_iter().flatten() {
-        let Some(id) = answer["answer_id"].as_i64() else {
-            continue;
-        };
+        let Some(id) = answer["answer_id"].as_i64() else { continue };
         let text = answer["poll_media"]["text"].as_str().unwrap_or("");
         let emoji = answer["poll_media"]["emoji"]["name"].as_str().unwrap_or("");
         // An answer can be an emoji and nothing else, which is a label.
@@ -110,9 +103,7 @@ fn now_secs() -> i64 {
 
 /// Discord's expiry is an ISO 8601 instant; this wants a unix second.
 fn parse_expiry(at: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(at)
-        .ok()
-        .map(|t| t.timestamp())
+    chrono::DateTime::parse_from_rfc3339(at).ok().map(|t| t.timestamp())
 }
 
 /// Draws the poll in a message, and writes it down.
@@ -121,25 +112,18 @@ fn parse_expiry(at: &str) -> Option<i64> {
 /// anybody comes back as a MESSAGE_UPDATE with a new tally in it, which is
 /// how the counts move without asking.
 pub(super) fn announce(state: &AppState, buffer_id: &str, message_id: &str, d: &Value) {
-    let Some(card) = card(buffer_id, message_id, &d["poll"]) else {
-        return;
-    };
+    let Some(card) = card(buffer_id, message_id, &d["poll"]) else { return };
     state.runtime.set_live_card(buffer_id, "poll", card.clone());
     // Kept as well as shown, so a channel's past polls are readable from the
     // history panel the way a Kick channel's or a Matrix room's are.
     let title = card["title"].as_str().unwrap_or_default().to_string();
     let ts = now_secs();
-    if let Err(e) =
-        state
-            .store
-            .record_live_card(buffer_id, "poll", message_id, &title, &card.to_string(), ts)
-    {
+    if let Err(e) = state.store.record_live_card(buffer_id, "poll", message_id, &title, &card.to_string(), ts) {
         tracing::debug!("discord: keeping the poll: {e:#}");
     }
-    state.events.emit(
-        "pollCard",
-        json!({ "bufferId": buffer_id, "kind": "poll", "poll": card }),
-    );
+    state
+        .events
+        .emit("pollCard", json!({ "bufferId": buffer_id, "kind": "poll", "poll": card }));
 }
 
 /// Draws a poll read back out of history, if it is still running.
@@ -163,26 +147,15 @@ pub(super) fn announce_if_open(state: &AppState, buffer_id: &str, message_id: &s
 ///
 /// Through `send_write`, so it is paced and waits out a rate limit like every
 /// other thing this account does rather than sends.
-pub async fn vote_in_poll(
-    state: &AppState,
-    account_id: &str,
-    buffer_id: &str,
-    message_id: &str,
-    answer_id: i64,
-) -> Result<()> {
-    let cfg = state
-        .accounts
-        .get_discord(account_id)
-        .context("account not connected")?;
+pub async fn vote_in_poll(state: &AppState, account_id: &str, buffer_id: &str, message_id: &str, answer_id: i64) -> Result<()> {
+    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .context("no known Discord channel for this conversation")?;
     let resp = send_write(
         http_client_for(&cfg.token)
-            .put(format!(
-                "{API_BASE}/channels/{channel_id}/polls/{message_id}/answers/@me"
-            ))
+            .put(format!("{API_BASE}/channels/{channel_id}/polls/{message_id}/answers/@me"))
             .header("Authorization", &cfg.token)
             .json(&json!({ "answer_ids": [answer_id.to_string()] })),
     )
@@ -190,10 +163,7 @@ pub async fn vote_in_poll(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!(
-            "{}",
-            discord_error_text(status, &text, "voting in the poll")
-        );
+        bail!("{}", discord_error_text(status, &text, "voting in the poll"));
     }
     // Nothing comes back but a 204. The new tally arrives as a MESSAGE_UPDATE
     // moments later and redraws the card, the same as anybody else's vote.
@@ -278,17 +248,9 @@ mod tests {
             "question": { "text": "?" },
             "answers": [{ "answer_id": 1, "poll_media": { "emoji": { "name": "👍" } } }]
         });
-        assert_eq!(
-            card("b", "1", &emoji_only).expect("a card")["options"][0]["label"],
-            "👍"
-        );
+        assert_eq!(card("b", "1", &emoji_only).expect("a card")["options"][0]["label"], "👍");
 
-        assert!(card(
-            "b",
-            "1",
-            &json!({ "question": { "text": "?" }, "answers": [] })
-        )
-        .is_none());
+        assert!(card("b", "1", &json!({ "question": { "text": "?" }, "answers": [] })).is_none());
         assert!(card("b", "1", &json!({})).is_none());
     }
 }
