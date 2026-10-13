@@ -1650,6 +1650,7 @@ impl Runtime {
             position: 0,
             syncing: false,
             link: None,
+            notice: None,
             encrypted: None,
             channel_modes: None,
             group_id: Some(model::account_group_id(account_id)),
@@ -2579,6 +2580,21 @@ impl Runtime {
                 return;
             }
             buffer.link = link;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
+    /// Puts a warning on a conversation, or takes it off. Broadcast only when it
+    /// changes, so a notice Steam says again is not announced again.
+    pub fn set_buffer_notice(&self, state: &AppState, buffer_id: &str, notice: Option<model::BufferNotice>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.notice == notice {
+                return;
+            }
+            buffer.notice = notice;
             buffer.clone()
         };
         state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());

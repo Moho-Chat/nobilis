@@ -242,6 +242,17 @@ impl BufferLink {
     }
 }
 
+/// A warning the service has put on a conversation, drawn above it until the
+/// person has seen it. Steam's "this person may not be who they appear to be".
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BufferNotice {
+    /// Which warning it is, for a client that draws them differently:
+    /// "suspicious".
+    pub kind: String,
+    /// What a person reads.
+    pub text: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Buffer {
     pub id: String,
@@ -286,6 +297,9 @@ pub struct Buffer {
     /// Set while this buffer's own connection is not up - see BufferLink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<BufferLink>,
+    /// A warning on this conversation, until it is dismissed - see BufferNotice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<BufferNotice>,
     /// Whether this room is end-to-end encrypted (Matrix only - absent,
     /// not `false`, for every other protocol, since "encrypted" isn't a
     /// meaningful concept for them at all). Drives the lock/unlock
@@ -969,6 +983,7 @@ mod tests {
             position: 0,
             syncing: false,
             link: None,
+            notice: None,
             encrypted: None,
             channel_modes: None,
             group_id: None,

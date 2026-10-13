@@ -2,11 +2,16 @@
 //!
 //! Steam can mark a conversation as suspicious - the person may not be who they
 //! appear to be, a common shape for a scam - and tells the account as a notice.
-//! It is said once in the conversation, in words, where the person will see it
-//! before they trust what follows. The notice is the same fact each time Steam
-//! raises it, so it is stored under an id of its own and said no more than once.
+//! It is said twice, so that it is not missed: once in the conversation, in
+//! words, as a warning line that stays in its place in the log, and again as a
+//! banner over the conversation that stays until the person dismisses it.
+//! Dismissing tells Steam, which does not raise it again; if Steam does raise a
+//! notice again - a new one - the banner comes back. The line is the same fact
+//! each time Steam raises it, so it is stored under an id of its own and said
+//! no more than once.
 
 use super::proto::{DismissSessionNotice, SessionNoticeNotification};
+use crate::model::BufferNotice;
 use super::steamid;
 use crate::state::AppState;
 
@@ -32,7 +37,8 @@ pub fn say(state: &AppState, account_id: &str, conversation: &str, friend: u32, 
         "Steam",
         text,
         false,
-        "system",
+        // A kind of its own, which the window draws in red so it is not scrolled past.
+        "warning",
         None,
         Some(format!("notice:{friend}:{notice_type}")),
         false,
@@ -49,9 +55,16 @@ pub fn say(state: &AppState, account_id: &str, conversation: &str, friend: u32, 
 /// A notice that arrived live, for a conversation that exists.
 pub fn heard(state: &AppState, account_id: &str, conversation: &str, notice: &SessionNoticeNotification) {
     let (Some(friend), Some(kind)) = (notice.steamid_friend.and_then(steamid::account_of), notice.notice_type) else { return };
-    // Raised, not lifted: there is nothing to say when Steam stops saying it.
+    let buffer = crate::model::buffer_id(account_id, conversation);
+    // Raised: said in the log, and held over the conversation until dismissed.
+    // Lifted: the banner goes, and the line stays where it was said.
     if notice.active.unwrap_or(true) {
         say(state, account_id, conversation, friend, kind);
+        if let Some(text) = words(kind) {
+            state.runtime.set_buffer_notice(state, &buffer, Some(BufferNotice { kind: "suspicious".to_string(), text: text.to_string() }));
+        }
+    } else if words(kind).is_some() {
+        state.runtime.set_buffer_notice(state, &buffer, None);
     }
 }
 
@@ -79,8 +92,30 @@ mod tests {
         heard(&state, ACCOUNT, "Gabe", &notice);
         let got = said(&state);
         assert_eq!(got.len(), 1, "raised twice, said once: {got:?}");
-        assert_eq!(got[0].0, "system");
+        assert_eq!(got[0].0, "warning");
+        let held = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).unwrap().notice;
+        assert_eq!(held.as_ref().map(|n| n.kind.as_str()), Some("suspicious"), "and held over the conversation");
         assert!(got[0].1.contains("may not be who they appear to be"));
+    }
+
+    #[test]
+    fn the_banner_is_taken_off_when_dismissed_and_comes_back_when_steam_says_it_again() {
+        let state = simulated_daemon("steam-notice-banner");
+        let raised = SessionNoticeNotification { steamid_friend: Some(steamid::steamid_of(100)), notice_type: Some(SUSPICIOUS), active: Some(true) };
+        heard(&state, ACCOUNT, "Gabe", &raised);
+        let id = crate::model::buffer_id(ACCOUNT, "Gabe");
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_some());
+        // Dismissed: the banner goes, and the line in the log stays.
+        state.runtime.set_buffer_notice(&state, &id, None);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
+        assert_eq!(said(&state).len(), 1);
+        // Steam raising it again is a new notice.
+        heard(&state, ACCOUNT, "Gabe", &raised);
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_some(), "a new notice is shown");
+        assert_eq!(said(&state).len(), 1, "though the log is not told twice");
+        // Steam lifting it takes the banner off.
+        heard(&state, ACCOUNT, "Gabe", &SessionNoticeNotification { active: Some(false), ..raised });
+        assert!(state.runtime.get_buffer(&id).unwrap().notice.is_none());
     }
 
     #[test]
