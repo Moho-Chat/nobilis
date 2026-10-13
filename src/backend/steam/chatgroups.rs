@@ -177,7 +177,7 @@ impl Group {
             .avatar_ugc_url
             .clone()
             .filter(|u| !u.is_empty())
-            .or_else(|| h.avatar_sha.as_deref().filter(|s| !s.is_empty() && s.iter().any(|b| *b != 0)).map(friends::avatar_url))
+            .or_else(|| h.avatar_sha.as_deref().filter(|s| !s.is_empty() && s.iter().any(|b| *b != 0)).map(group_picture))
             .or(self.avatar.take());
         if !h.roles.is_empty() {
             self.roles = h.roles.iter().filter_map(|r| Some((r.role_id?, pretty_role(r.name.as_deref().unwrap_or_default())))).collect();
@@ -251,6 +251,14 @@ impl Group {
             }
         }
     }
+}
+
+/// Where Steam serves a group's picture: by its hash, in the sizes 32, 64 and 256 - not the
+/// `_full` a person's is. (Found out the hard way: a picture just uploaded was a 404 at the
+/// person's address, and 200 here.)
+pub fn group_picture(hash: &[u8]) -> String {
+    let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+    format!("https://avatars.steamstatic.com/{hex}_256.jpg")
 }
 
 /// What a role is called: Steam's own default roles come as a localisation key.
@@ -411,7 +419,7 @@ pub async fn load(link: &Link, account_id: &str, own: u32) -> Result<Vec<u32>, S
         let Some(summary) = &pair.group_summary else { continue };
         let Some(id) = summary.chat_group_id else { continue };
         let mut g = Group { id, name: summary.chat_group_name.clone().unwrap_or_default(), tagline: summary.chat_group_tagline.clone().unwrap_or_default(), owner: summary.accountid_owner.unwrap_or(0), clan: summary.clanid.filter(|c| *c != 0), my_rank: summary.rank.unwrap_or(0), default_room: summary.default_chat_id.unwrap_or(0), default_role: summary.default_role_id.unwrap_or(0), disabled: summary.disabled.unwrap_or(false), ..Default::default() };
-        g.avatar = summary.avatar_ugc_url.clone().filter(|u| !u.is_empty()).or_else(|| summary.chat_group_avatar_sha.as_deref().filter(|s| s.iter().any(|b| *b != 0)).map(friends::avatar_url));
+        g.avatar = summary.avatar_ugc_url.clone().filter(|u| !u.is_empty()).or_else(|| summary.chat_group_avatar_sha.as_deref().filter(|s| s.iter().any(|b| *b != 0)).map(group_picture));
         g.take_rooms(&summary.chat_rooms);
         if let Some(full) = active.chat_states.iter().find(|s| s.header_state.as_ref().and_then(|h| h.chat_group_id) == Some(id)) {
             g.take_state(full, own);
@@ -1490,6 +1498,12 @@ mod tests {
         assert_eq!(mentionize("@Sammy no, mail@Al no", &people), "@Sammy no, mail@Al no", "a longer name or one inside a word is not them");
         assert_eq!(mentionize("@Al", &people), "[mention=7]@Al[/mention]");
         assert_eq!(mentionize("nobody @here", &people), "nobody @here");
+    }
+
+    #[test]
+    fn a_groups_picture_is_where_steam_serves_group_pictures() {
+        let hash: Vec<u8> = (0..20).collect();
+        assert_eq!(group_picture(&hash), "https://avatars.steamstatic.com/000102030405060708090a0b0c0d0e0f10111213_256.jpg");
     }
 
     #[test]

@@ -1122,3 +1122,38 @@ async fn a_webrtc_offer_is_answered_by_steam() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// A group's picture changed against real Steam, as an account that may: a throwaway group is made,
+/// its picture is sent and named to it, the address the rail would show is fetched, and the group is left.
+#[tokio::test]
+#[ignore = "needs a real Steam account that is not limited; makes and leaves a chat group on it"]
+async fn a_group_picture_is_changed() {
+    use super::chatgroups::{self as groups, Action};
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-avatar");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let made = groups::act(&state, &id, Action::Create { name: "moho picture probe".into() }).await.unwrap();
+    let rail = made["groupId"].as_str().unwrap().to_string();
+    let group = groups::group_of_rail_id(&rail).map(|(_, g)| g).unwrap();
+    println!("AVATAR made {rail}; before {:?}", groups::held(&id, group).and_then(|g| g.avatar));
+    let picture = format!("{}/.local/share/moho-dev/avatar.png", std::env::var("HOME").unwrap());
+    let done = groups::act(&state, &id, Action::Avatar { group, path: picture }).await;
+    println!("AVATAR change {done:?}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let url = groups::held(&id, group).and_then(|g| g.avatar);
+    println!("AVATAR after {url:?}; on the rail {:?}", state.runtime.list_buffer_groups().into_iter().find(|g| g.id == rail).and_then(|g| g.icon_url));
+    if let Some(url) = url {
+        let fetched = reqwest::get(&url).await;
+        println!("AVATAR fetched {:?}", fetched.map(|r| (r.status().as_u16(), r.headers().get("content-type").map(|v| v.to_str().unwrap_or("").to_string()))));
+    }
+    println!("AVATAR left {:?}", groups::act(&state, &id, Action::Leave { group }).await);
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+}
