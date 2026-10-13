@@ -299,7 +299,13 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         account_id,
         link: &link,
         own: steamid::account_of(steamid).unwrap_or_default(),
-        roster: Roster::default(),
+        // Starts from what people were called last time, so a conversation, a member list or a
+        // message is not drawn with a number until Steam has said who they are.
+        roster: {
+            let mut roster = Roster::default();
+            roster.remember(state.store.steam_names(account_id).unwrap_or_default());
+            roster
+        },
         asked: Default::default(),
         catch_up_at: None,
         catch_up_tries: 0,
@@ -355,6 +361,16 @@ impl AppNames {
 impl Drive<'_> {
     /// Asks the store what any game somebody is in is called, once each. Steam
     /// names only a game that is not its own.
+    /// Keeps what people are called now, in place of what they were, for the next start.
+    fn keep_names(&mut self) {
+        let fresh = self.roster.names_to_keep();
+        if !fresh.is_empty() {
+            if let Err(e) = self.state.store.remember_steam_names(self.account_id, &fresh) {
+                tracing::debug!("steam[{}]: names were not kept: {e}", self.account_id);
+            }
+        }
+    }
+
     fn ask_game_names(&mut self) {
         for app in self.roster.unnamed_apps() {
             if !self.apps.asked.insert(app) {
@@ -432,6 +448,7 @@ impl Drive<'_> {
                             renamed |= self.roster.set_preferences(prefs);
                         }
                         if renamed {
+                            self.keep_names();
                             self.shown.publish(self.state, &self.roster);
                         }
                         self.shown.apply_mutes(self.state, &self.roster);
@@ -516,6 +533,7 @@ impl Drive<'_> {
             emsg::CLIENT_PERSONA_STATE => {
                 if let Ok(update) = ClientPersonaState::decode(packet.body.as_slice()) {
                     let changed = self.roster.apply_persona(&update);
+                    self.keep_names();
                     if changed.iter().any(|a| self.roster.asked_us().contains(a) || self.roster.asked_by_us().contains(a)) {
                         friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
                     }
@@ -575,6 +593,7 @@ impl Drive<'_> {
                         if let Some(prefs) = changed.preferences.filter(|p| p.accountid.is_some() || changed.accountid.is_some()) {
                             let prefs = PerFriendPreferences { accountid: prefs.accountid.or(changed.accountid), ..prefs };
                             if self.roster.set_preferences(&prefs) {
+                                self.keep_names();
                                 self.shown.publish(self.state, &self.roster);
                             }
                             self.shown.apply_mutes(self.state, &self.roster);

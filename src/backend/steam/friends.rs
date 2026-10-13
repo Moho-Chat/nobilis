@@ -87,9 +87,48 @@ pub struct Roster {
     talking: std::collections::HashSet<u32>,
     /// What the games people are in are called, as the store has told us.
     app_names: HashMap<u64, String>,
+    /// What people were called when last seen, kept between runs: the name a conversation has from
+    /// the start of a session, in place of the person's number, until Steam says who they are now.
+    remembered: HashMap<u32, String>,
 }
 
 impl Roster {
+    /// Takes in what people were called last time.
+    pub fn remember(&mut self, names: impl IntoIterator<Item = (u32, String)>) {
+        self.remembered.extend(names);
+    }
+
+    /// What somebody is called now, if Steam or the account has said: the name the account gives
+    /// them, otherwise their own. Nothing for somebody not heard of yet - the number is not a name.
+    pub fn live_name(&self, account: u32) -> Option<String> {
+        self.nickname(account)
+            .map(clean_name)
+            .filter(|n| !n.is_empty())
+            .or_else(|| self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).filter(|n| !n.is_empty()))
+    }
+
+    /// What somebody is called, for showing: what they are called now when that is known, and
+    /// otherwise what they were called last time. Nothing for somebody never heard of.
+    pub fn display_name(&self, account: u32) -> Option<String> {
+        self.live_name(account).or_else(|| self.remembered.get(&account).map(|n| clean_name(n)).filter(|n| !n.is_empty()))
+    }
+
+    /// The names that are not what is remembered of them: everybody Steam or the account has named,
+    /// whether or not they are in a conversation, since a member of a group is as much shown by
+    /// name. Taken as remembered from now, and handed back to be kept.
+    pub fn names_to_keep(&mut self) -> Vec<(u32, String)> {
+        let accounts: Vec<u32> = self.personas.keys().copied().chain(self.preferences.keys().copied()).collect();
+        let mut fresh = Vec::new();
+        for account in accounts {
+            let Some(name) = self.live_name(account) else { continue };
+            if self.remembered.get(&account) != Some(&name) {
+                self.remembered.insert(account, name.clone());
+                fresh.push((account, name));
+            }
+        }
+        fresh
+    }
+
     /// Notes what a game is called.
     pub fn set_app_name(&mut self, app: u64, name: String) {
         self.app_names.insert(app, name);
@@ -258,7 +297,7 @@ impl Roster {
     /// without regard to case) every one of them has their account number
     /// added to it, which is stable and tells them apart; when only one is
     /// left the number is dropped again. Somebody not yet named is called by
-    /// their id.
+    /// what they were called last time, and failing that by their id.
     ///
     /// Distinct is the guarantee, not a hope: a friend can be called anything,
     /// including exactly what another friend's name becomes once decorated, so
@@ -276,10 +315,9 @@ impl Roster {
         // What the account calls them, if it has said; otherwise what they
         // call themselves.
         let base = |account: u32| -> String {
-            self.nickname(account)
-                .map(clean_name)
-                .filter(|n| !n.is_empty())
-                .or_else(|| self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).filter(|n| !n.is_empty()))
+            self.live_name(account)
+                // Not yet said this time: what they were called last, which is far likelier to be right than a number.
+                .or_else(|| self.remembered.get(&account).map(|n| clean_name(n)).filter(|n| !n.is_empty()))
                 .unwrap_or_else(|| steamid::text_of(account))
         };
         let people = self.participants();
@@ -368,6 +406,25 @@ mod tests {
 
     // The other standings a list carries, which matter here only as not being a friend.
     const REL_BLOCKED: u32 = 1;
+
+    #[test]
+    fn a_person_is_called_what_they_were_until_steam_says_who_they_are_and_what_is_said_is_kept() {
+        let mut r = Roster::default();
+        r.apply_friends_list(&ClientFriendsList {
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(7)), efriendrelationship: Some(REL_FRIEND) }],
+            ..Default::default()
+        });
+        r.remember([(7, "Old Name".to_string())]);
+        assert_eq!(r.conversation_names()[&7], "Old Name", "not the number, before Steam has said");
+        assert_eq!(r.display_name(7).as_deref(), Some("Old Name"));
+        assert!(r.names_to_keep().is_empty(), "nothing new to keep");
+        r.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(7)), player_name: Some("New Name".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
+        assert_eq!(r.conversation_names()[&7], "New Name", "and what they are called now once it is said");
+        assert_eq!(r.names_to_keep(), vec![(7, "New Name".to_string())], "which is kept in place of the old");
+        assert!(r.names_to_keep().is_empty());
+        // Somebody never heard of is only a number.
+        assert_eq!(r.display_name(8), None);
+    }
 
     #[test]
     fn a_nickname_is_what_a_friend_is_called_and_goes_back_to_their_name_when_taken() {

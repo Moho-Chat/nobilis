@@ -291,6 +291,17 @@ impl Store {
              );",
         );
 
+        // What each person on a Steam account was last called, by their number: so a start shows
+        // names, and not numbers until Steam has said who they are - see backend/steam/friends.rs.
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS steam_names (
+                 account_id TEXT NOT NULL,
+                 steamid INTEGER NOT NULL,
+                 name TEXT NOT NULL,
+                 PRIMARY KEY (account_id, steamid)
+             );",
+        );
+
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS media_sources (
                  path TEXT PRIMARY KEY,
@@ -1135,6 +1146,31 @@ impl Store {
         let buffers = read("known_buffers")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
         let groups = read("known_groups")?.iter().filter_map(|d| serde_json::from_str(d).ok()).collect();
         Ok((buffers, groups))
+    }
+
+    /// What the people on a Steam account were last called, by account number.
+    pub fn steam_names(&self, account_id: &str) -> Result<Vec<(u32, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT steamid, name FROM steam_names WHERE account_id = ?1")?;
+        let rows = stmt.query_map(params![account_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).filter_map(|(id, name)| Some((u32::try_from(id).ok()?, name))).collect())
+    }
+
+    /// Keeps what these people are called now, in place of what they were.
+    pub fn remember_steam_names(&self, account_id: &str, names: &[(u32, String)]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut put = tx.prepare(
+                "INSERT INTO steam_names (account_id, steamid, name) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(account_id, steamid) DO UPDATE SET name = excluded.name",
+            )?;
+            for (id, name) in names {
+                put.execute(params![account_id, i64::from(*id), name])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Records where a cached media file came from - see media_cache.rs.
@@ -1983,6 +2019,19 @@ mod dedupe_tests {
 
     fn store() -> Store {
         Store::open(std::path::Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn what_steam_people_were_called_is_kept_per_account_and_replaced_when_they_rename() {
+        let s = store();
+        assert!(s.steam_names("steam:a").unwrap().is_empty());
+        s.remember_steam_names("steam:a", &[(7, "Gabe".into()), (8, "Alyx".into())]).unwrap();
+        s.remember_steam_names("steam:b", &[(7, "Somebody else".into())]).unwrap();
+        s.remember_steam_names("steam:a", &[(7, "Gabe N.".into())]).unwrap();
+        let mut a = s.steam_names("steam:a").unwrap();
+        a.sort();
+        assert_eq!(a, vec![(7, "Gabe N.".to_string()), (8, "Alyx".to_string())]);
+        assert_eq!(s.steam_names("steam:b").unwrap(), vec![(7, "Somebody else".to_string())]);
     }
 
     fn put(s: &Store, buffer: &str, id: &str, body: &str) {

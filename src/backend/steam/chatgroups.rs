@@ -646,7 +646,7 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
 pub fn learn(account_id: &str, roster: &Roster, accounts: impl IntoIterator<Item = u32>) {
     with(account_id, |a| {
         for account in accounts {
-            if let Some(name) = roster.persona(account).and_then(|p| p.name.clone()).or_else(|| roster.nickname(account).map(str::to_string)) {
+            if let Some(name) = roster.persona(account).and_then(|p| p.name.clone()).or_else(|| roster.nickname(account).map(str::to_string)).or_else(|| roster.display_name(account)) {
                 a.people.insert(account, Person { name: friends::clean_name(&name), avatar: roster.persona(account).and_then(|p| p.avatar.clone()), friend: roster.is_friend(account) });
             }
         }
