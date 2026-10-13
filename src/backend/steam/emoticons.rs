@@ -27,9 +27,21 @@ pub fn picture(name: &str) -> String {
     format!("https://community.fastly.steamstatic.com/economy/emoticon/{name}")
 }
 
-/// The picture for a sticker.
+/// The picture for a sticker. Its name has spaces in it, so it is written the way
+/// an address takes them.
 pub fn sticker_picture(name: &str) -> String {
-    format!("https://community.fastly.steamstatic.com/economy/sticker/{name}")
+    let encoded: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+    format!("https://community.fastly.steamstatic.com/economy/sticker/{encoded}")
+}
+
+/// A sticker's name as Steam holds it: words, with spaces and a little punctuation
+/// in them ("Nyan GLaDOS"), unlike an emoticon's, which is one word. Nothing that
+/// could end a tag, a quote or a command early.
+pub fn valid_sticker(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().count() <= 64
+        && name == name.trim()
+        && name.chars().all(|c| c.is_alphanumeric() || " _-'.!&()+,".contains(c))
 }
 
 /// Whether the account has this sticker: what it is asked to send must be one it
@@ -44,7 +56,7 @@ fn valid(name: &str) -> bool {
 
 /// A name list in the order the picker offers it: most used first, then by
 /// name, each once, and only what is a name.
-fn ordered(mut have: Vec<(String, u32)>) -> Vec<String> {
+fn ordered(mut have: Vec<(String, u32)>, valid: fn(&str) -> bool) -> Vec<String> {
     have.retain(|(n, _)| valid(n));
     have.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())));
     have.dedup_by(|a, b| a.0 == b.0);
@@ -56,13 +68,13 @@ fn emoticon_entries(list: &ClientEmoticonList) -> Vec<EmojiEntry> {
     let have = list.emoticons.iter().filter_map(|e| Some((e.name.as_deref()?.trim_matches(':').to_string(), e.use_count.unwrap_or(0)))).collect();
     // The id says which service's picture it is, so the window builds the
     // right token for it; the name is what is typed between colons.
-    ordered(have).into_iter().map(|name| EmojiEntry { id: format!("steam:{name}"), url: Some(picture(&name)), name, animated: false, locked: false }).collect()
+    ordered(have, valid).into_iter().map(|name| EmojiEntry { id: format!("steam:{name}"), url: Some(picture(&name)), name, animated: false, locked: false }).collect()
 }
 
 /// The stickers the picker offers.
 fn sticker_entries(list: &ClientEmoticonList) -> Vec<EmojiEntry> {
     let have = list.stickers.iter().filter_map(|e| Some((e.name.as_deref()?.to_string(), e.use_count.unwrap_or(0)))).collect();
-    ordered(have).into_iter().map(|name| EmojiEntry { id: name.clone(), url: Some(sticker_picture(&name)), name, animated: false, locked: false }).collect()
+    ordered(have, valid_sticker).into_iter().map(|name| EmojiEntry { id: name.clone(), url: Some(sticker_picture(&name)), name, animated: false, locked: false }).collect()
 }
 
 fn source(id: &str, name: &str, emoji: Vec<EmojiEntry>) -> EmojiSource {
@@ -167,9 +179,17 @@ mod tests {
 
     #[test]
     fn stickers_are_offered_by_name_with_their_own_pictures() {
-        let list = ClientEmoticonList { stickers: vec![sticker("b", 0), sticker("CatSurprise", 3), sticker("bad name", 9)], ..Default::default() };
+        let list = ClientEmoticonList { stickers: vec![sticker("b", 0), sticker("CatSurprise", 3), sticker("Nyan GLaDOS", 9), sticker("bad[name]", 20), sticker(" padded", 8)], ..Default::default() };
         let got = sticker_entries(&list);
-        assert_eq!(got.iter().map(|e| (e.id.as_str(), e.url.as_deref().unwrap())).collect::<Vec<_>>(), [("CatSurprise", "https://community.fastly.steamstatic.com/economy/sticker/CatSurprise"), ("b", "https://community.fastly.steamstatic.com/economy/sticker/b")]);
+        assert_eq!(
+            got.iter().map(|e| (e.id.as_str(), e.url.as_deref().unwrap())).collect::<Vec<_>>(),
+            [
+                ("Nyan GLaDOS", "https://community.fastly.steamstatic.com/economy/sticker/Nyan%20GLaDOS"),
+                ("CatSurprise", "https://community.fastly.steamstatic.com/economy/sticker/CatSurprise"),
+                ("b", "https://community.fastly.steamstatic.com/economy/sticker/b")
+            ],
+            "a name has spaces in it and an address does not; a name that could end a tag is not offered"
+        );
     }
 
     #[test]
@@ -180,6 +200,8 @@ mod tests {
         assert!(!is_owned_sticker(&state, "steam:me", "Other"));
         assert!(!is_owned_sticker(&state, "steam:somebody", "CatSurprise"), "another account's is not this one's");
         assert!(!is_owned_sticker(&state, "steam:me", "Cat Surprise; and more"));
+        keep(&state, "steam:me", &ClientEmoticonList { stickers: vec![sticker("Nyan GLaDOS", 1)], ..Default::default() });
+        assert!(is_owned_sticker(&state, "steam:me", "Nyan GLaDOS"), "a name with spaces in it is one");
     }
 
     #[test]

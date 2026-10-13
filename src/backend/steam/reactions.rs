@@ -17,14 +17,17 @@ use serde_json::json;
 pub const EMOTICON: i32 = 1;
 pub const STICKER: i32 = 2;
 
-fn valid_name(name: &str) -> bool {
+fn valid_name(kind: i32, name: &str) -> bool {
+    if kind == STICKER {
+        return super::emoticons::valid_sticker(name);
+    }
     !name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// How a reaction is held here: the token the window draws as a picture.
 pub fn token(kind: i32, name: &str) -> Option<String> {
     let name = name.trim().trim_matches(':');
-    valid_name(name).then(|| format!("[steam:{}:{name}]", if kind == STICKER { "sticker" } else { "emote" }))
+    valid_name(kind, name).then(|| format!("[steam:{}:{name}]", if kind == STICKER { "sticker" } else { "emote" }))
 }
 
 /// What a token held here is, as Steam names it: its kind and its word.
@@ -36,7 +39,7 @@ pub fn parse_token(emoji: &str) -> Option<(i32, String)> {
         "sticker" => STICKER,
         _ => return None,
     };
-    valid_name(name).then(|| (kind, name.to_string()))
+    valid_name(kind, name).then(|| (kind, name.to_string()))
 }
 
 /// How Steam spells a reaction: an emoticon between colons, as in a message, and a
@@ -118,6 +121,8 @@ mod tests {
         assert_eq!(token(EMOTICON, ""), None);
         assert_eq!(parse_token("[steam:emote:steamhappy]"), Some((EMOTICON, "steamhappy".to_string())));
         assert_eq!(parse_token("[steam:sticker:CatSurprise]"), Some((STICKER, "CatSurprise".to_string())));
+        assert_eq!(token(STICKER, "Nyan GLaDOS").as_deref(), Some("[steam:sticker:Nyan GLaDOS]"), "a sticker's name has spaces in it");
+        assert_eq!(parse_token("[steam:sticker:Nyan GLaDOS]"), Some((STICKER, "Nyan GLaDOS".to_string())));
         for not in ["👍", "<:name:123>", "[steam:other:x]", "[steam:emote:a b]", "[steam:emote:]", "steam:emote:x"] {
             assert_eq!(parse_token(not), None, "{not}");
         }

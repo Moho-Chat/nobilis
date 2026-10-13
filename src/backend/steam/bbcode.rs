@@ -41,7 +41,12 @@ fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
             None => inner.to_string(),
         },
         "emoticon" => picture("emote", inner).unwrap_or_else(|| inner.to_string()),
-        "sticker" => picture("sticker", inner).unwrap_or_else(|| inner.to_string()),
+        // Named by its `type`, with nothing inside: `[sticker type="Nyan GLaDOS"
+        // limit="0"][/sticker]`. A name inside is read too.
+        "sticker" => {
+            let named = attr.and_then(|a| attribute(a, "type")).filter(|n| !n.is_empty()).unwrap_or(inner.trim());
+            if super::emoticons::valid_sticker(named) { format!("[steam:sticker:{named}]") } else { inner.to_string() }
+        }
         // What Steam writes for a file sent through its website: the address
         // as an attribute, and again as a link inside, which is not read. A
         // marker the window draws as the picture or video it names.
@@ -284,7 +289,11 @@ mod tests {
     fn emoticons_and_stickers_are_named_pictures() {
         assert_eq!(to_markup("hi [emoticon]steamhappy[/emoticon]!"), "hi [steam:emote:steamhappy]!");
         assert_eq!(to_markup("[emoticon]:steamhappy:[/emoticon]"), "[steam:emote:steamhappy]", "colons are not part of the name");
-        assert_eq!(to_markup("[sticker type=\"Cats\" limit=\"1\"]CatSurprise[/sticker]"), "[steam:sticker:CatSurprise]");
+        assert_eq!(to_markup("[sticker type=\"Nyan GLaDOS\" limit=\"0\"][/sticker]"), "[steam:sticker:Nyan GLaDOS]", "as Steam writes one: named by its type");
+        assert_eq!(to_markup("[sticker type=\"Keyboard Headcrab\" limit=\"0\"][/sticker]"), "[steam:sticker:Keyboard Headcrab]");
+        assert_eq!(to_markup("a [sticker type=\"Cats\" limit=\"1\"]CatSurprise[/sticker] b"), "a [steam:sticker:Cats] b", "the type is the name");
+        assert_eq!(to_markup("[sticker][/sticker]"), "", "no name, no sticker");
+        assert_eq!(to_markup("[sticker]CatSurprise[/sticker]"), "[steam:sticker:CatSurprise]", "or the name inside");
         // Anything that is not a name is not a picture, and is shown as it was.
         assert_eq!(to_markup("[emoticon]a b[/emoticon]"), "a b");
         assert_eq!(to_markup("[emoticon]x]y[/emoticon]"), "x]y");

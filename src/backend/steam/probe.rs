@@ -599,7 +599,7 @@ async fn the_newest_messages_as_steam_writes_them() {
     connect::spawn(state.clone(), sender.clone());
     within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
     let link = state.runtime.steam_link(&id).unwrap();
-    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 8).await;
+    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 14).await;
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
     }
