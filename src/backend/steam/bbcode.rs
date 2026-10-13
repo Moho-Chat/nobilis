@@ -77,6 +77,12 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         "center" | "c" | "color" | "bgcolor" | "size" | "smalltext" | "list" | "olist" | "dynamiclink" | "doclink" | "expand" | "table" | "tr" | "td" | "th" => inner.to_string(),
         // A person named in a group: the words are the name, with its @.
         "mention" => inner.to_string(),
+        // A friend's invitation to a group chat: `[invite chatgroupid="7" chatgroupname="Raiders"]`.
+        // Said in words; what it offers is answered on the Invitations tile.
+        "invite" => {
+            let name = attr.and_then(|a| attribute(a, "chatgroupname")).unwrap_or_default().replace(['[', ']'], "");
+            if name.trim().is_empty() { "Group chat invitation".to_string() } else { format!("Group chat invitation: {}", name.trim()) }
+        }
         // What Steam's own servers wrap a store address in (`[steamstore app="220"]`):
         // the address is the message, and the window makes a card of it as of any link.
         "steamstore" => inner.to_string(),
@@ -97,7 +103,7 @@ fn host_of(url: &str) -> Option<String> {
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
     "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention", "steamstore",
+    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention", "steamstore", "invite",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.
@@ -105,7 +111,7 @@ const RAW: &[&str] = &["code", "noparse"];
 
 /// An attribute written as `name="value"`, `name=value`, or among others
 /// (`src="..." width="..."`): the value, unquoted.
-fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
+pub(super) fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
     let lower = attrs.to_ascii_lowercase();
     let mut from = 0;
     while let Some(at) = lower[from..].find(&format!("{name}=")) {
@@ -329,6 +335,12 @@ mod tests {
         assert_eq!(to_markup("see [url=https://example.com/x fromclient=1]https://example.com/x[/url]!"), "see https://example.com/x!", "a link that is its own label is just the address");
         assert_eq!(to_markup("[url=\"https://example.com\"]quoted[/url]"), "[quoted](https://example.com)");
         assert_eq!(to_markup("[url=https://e.com]a ] b[/url]"), "[a \\] b](https://e.com)", "a bracket in the label cannot end it early");
+    }
+
+    #[test]
+    fn a_group_invitation_is_said_in_words() {
+        assert_eq!(to_markup("[invite  chatgroupid=\"78995476\" chatgroupname=\"moho official test\"][/invite]"), "Group chat invitation: moho official test");
+        assert_eq!(to_markup("[invite chatgroupid=\"7\"][/invite]"), "Group chat invitation");
     }
 
     #[test]

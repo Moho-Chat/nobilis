@@ -991,7 +991,7 @@ mod tests {
         let task = start(&state, url);
         eventually("the conversation to exist", || state.runtime.get_buffer(&gabe).is_some()).await;
         let buffer = state.runtime.get_buffer(&gabe).unwrap();
-        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into(), reactions: vec![], embeds: vec![] }]);
+        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into(), reactions: vec![], embeds: vec![], invite: None }]);
 
         eventually("what was missed", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 3).await;
         let texts: Vec<String> = state.store.get_backlog(&gabe, 0, 10).unwrap().into_iter().map(|m| m.body).collect();

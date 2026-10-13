@@ -4255,6 +4255,11 @@ pub async fn dispatch(
             None => (None, Some("steamChatGroups requires \"accountId\"".to_string())),
             Some(account_id) => (Some(backend::steam::chatgroups::to_json(account_id, p_str_opt(params, "groupId").and_then(|g| g.parse().ok()))), None),
         },
+        // The groups friends have invited a Steam account to, waiting on an answer.
+        "steamGroupInvites" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamGroupInvites requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(serde_json::Value::Array(backend::steam::chatgroups::invites_json(account_id))), None),
+        },
         // Who is in the voice rooms of a Steam group.
         "steamVoiceRooms" => match (p_str_opt(params, "accountId"), p_str_opt(params, "groupId").and_then(|g| g.parse().ok())) {
             (Some(account_id), Some(group)) => (Some(backend::steam::chatgroups::voice_rooms(account_id, group)), None),
@@ -4279,6 +4284,8 @@ pub async fn dispatch(
             let action = match (what, group) {
                 ("create", _) => Action::Create { name: text("name") },
                 ("join", _) => Action::Join { invite: text("invite") },
+                ("acceptInvite", Some(group)) => Action::AcceptInvite { group },
+                ("dismissInvite", Some(group)) => Action::DismissInvite { group },
                 ("leave", Some(group)) => Action::Leave { group },
                 ("rename", Some(group)) => Action::Rename { group, name: text("name") },
                 ("tagline", Some(group)) => Action::Tagline { group, text: text("text") },

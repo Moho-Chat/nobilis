@@ -125,7 +125,7 @@ pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body:
     Ok(())
 }
 
-/// Sends files to a friend, and the words that came with them.
+/// Sends files to a friend or into a room of a group, and the words that came with them.
 ///
 /// Steam has no caption: the words go first as a message of their own and each
 /// file is a message after it, which is how its own client sends the two. The
@@ -140,7 +140,16 @@ pub async fn send_files(
     progress: Option<&crate::upload::Progress>,
 ) -> Result<(), String> {
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
-    let friend = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
+    // A room of a group, or a friend.
+    let room = chatgroups::ids_of(buffer).filter(|_| chatgroups::is_room(buffer));
+    let friend = match room {
+        Some(_) => String::new(),
+        None => buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?,
+    };
+    let target = match room {
+        Some((group, room)) => web::FileTarget::Room { group, room },
+        None => web::FileTarget::Friend(&friend),
+    };
     let config = state.accounts.get_steam(&buffer.account_id).ok_or("this Steam account is not connected")?;
     // Refused before anything is sent, so a bad file does not leave the words
     // sent and the pictures not.
@@ -155,10 +164,10 @@ pub async fn send_files(
         send_message(state, buffer, caption).await?;
     }
     for (path, spoiler) in files {
-        let url = web::send_file(&link, &buffer.account_id, config.steamid, &config.refresh_token, &friend, path, *spoiler, progress)
+        let url = web::send_file(&link, &buffer.account_id, config.steamid, &config.refresh_token, target, path, *spoiler, progress)
             .await
-            .inspect_err(|why| tracing::info!("steam[{}]: a file to {friend} was not sent: {why}", buffer.account_id))?;
-        tracing::info!("steam[{}]: sent a file to {friend}: {url}", buffer.account_id);
+            .inspect_err(|why| tracing::info!("steam[{}]: a file to {} was not sent: {why}", buffer.account_id, buffer.name))?;
+        tracing::info!("steam[{}]: sent a file to {}: {url}", buffer.account_id, buffer.name);
     }
     Ok(())
 }

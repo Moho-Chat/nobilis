@@ -340,6 +340,80 @@ struct Account {
     /// Whether Steam has said what the groups are yet: before it has, an empty
     /// list means nothing, and acting on it would remove every channel.
     loaded: bool,
+    /// What friends have invited this account to by direct message, until it is answered.
+    invites: Vec<GroupInvite>,
+}
+
+/// A friend's invitation to a group: what their `[invite ...]` message says, and who sent it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GroupInvite {
+    pub group: u64,
+    /// The room it names, if it names one.
+    pub chat: Option<u64>,
+    pub name: String,
+    /// Who sent it, by the name they are shown under.
+    pub by: String,
+}
+
+/// What a friend's message offers, if it is an invitation to a group: the group, the room if one
+/// is named, and the name the sender saw it by.
+pub fn invite_in(bbcode: &str) -> Option<(u64, Option<u64>, String)> {
+    let start = bbcode.find("[invite")?;
+    let rest = &bbcode[start + "[invite".len()..];
+    let attrs = &rest[..rest.find(']')?];
+    // `[inviteurl ...]` is another tag.
+    if !attrs.is_empty() && !attrs.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let group = super::bbcode::attribute(attrs, "chatgroupid")?.trim().parse::<u64>().ok().filter(|g| *g != 0)?;
+    let chat = super::bbcode::attribute(attrs, "chatid").and_then(|c| c.trim().parse::<u64>().ok()).filter(|c| *c != 0);
+    let name = super::bbcode::attribute(attrs, "chatgroupname").unwrap_or_default().trim().to_string();
+    Some((group, chat, name))
+}
+
+/// Keeps an invitation that has arrived and tells the window, unless the account is in that group
+/// already or has the invitation.
+pub fn note_invite(state: &AppState, account_id: &str, by: &str, found: (u64, Option<u64>, String)) {
+    let (group, chat, name) = found;
+    let added = with(account_id, |a| {
+        if a.groups.contains_key(&group) || a.invites.iter().any(|i| i.group == group) {
+            return false;
+        }
+        a.invites.push(GroupInvite { group, chat, name, by: by.to_string() });
+        true
+    });
+    if added {
+        tell_invites(state, account_id);
+    }
+}
+
+/// What is waiting, as the Invitations tile reads a room's invitation.
+pub fn invites_json(account_id: &str) -> Vec<Value> {
+    let waiting = with(account_id, |a| a.invites.clone());
+    waiting
+        .iter()
+        .map(|i| {
+            let name = if i.name.is_empty() { "A group chat".to_string() } else { i.name.clone() };
+            json!({ "roomId": i.group.to_string(), "name": name, "avatarUrl": Value::Null, "inviter": i.by, "isDirect": false })
+        })
+        .collect()
+}
+
+fn tell_invites(state: &AppState, account_id: &str) {
+    state.events.emit("steamGroupInvites", json!({ "accountId": account_id, "invites": invites_json(account_id) }));
+}
+
+/// Takes down an invitation to a group the account is in by now, however it came to be.
+fn prune_invites(state: &AppState, account_id: &str) {
+    let changed = with(account_id, |a| {
+        let before = a.invites.len();
+        let held: Vec<u64> = a.groups.keys().copied().collect();
+        a.invites.retain(|i| !held.contains(&i.group));
+        a.invites.len() != before
+    });
+    if changed {
+        tell_invites(state, account_id);
+    }
 }
 
 static HELD: LazyLock<Mutex<HashMap<String, Account>>> = LazyLock::new(Default::default);
@@ -506,6 +580,7 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
     for (g, r, name) in existing {
         shown_before.entry((g, r)).or_insert(name);
     }
+    prune_invites(state, account_id);
     let rails: Vec<String> = groups.keys().map(|g| rail_id(account_id, *g)).collect();
     // A group that is gone: it takes its channels with it.
     for buffer_group in state.runtime.list_buffer_groups() {
@@ -1262,6 +1337,10 @@ pub fn group_refusal(error: &super::link::CallError) -> String {
 pub enum Action {
     Create { name: String },
     Join { invite: String },
+    /// Takes up a friend's invitation, which names the group and needs no link.
+    AcceptInvite { group: u64 },
+    /// Lets one go.
+    DismissInvite { group: u64 },
     Leave { group: u64 },
     Rename { group: u64, name: String },
     Tagline { group: u64, text: String },
@@ -1435,6 +1514,42 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             with(account_id, |a| a.groups.insert(group, g));
             keep_active(&link, account_id).await;
             Ok(json!({ "groupId": rail_id(account_id, group), "name": name }))
+        }
+        Action::AcceptInvite { group } => {
+            let invite = with(account_id, |a| a.invites.iter().find(|i| i.group == group).cloned()).ok_or("that invitation is gone")?;
+            let joined: Result<JoinChatGroupResponse, _> = link.call("ChatRoom.JoinChatRoomGroup#1", &JoinChatGroupRequest { chat_group_id: Some(group), invite_code: None, chat_id: invite.chat }, true).await;
+            let joined = match joined {
+                Ok(j) => j,
+                Err(e) => {
+                    // An invitation to a group that is gone, or that this account may not join, will not get better.
+                    if matches!(e, super::link::CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND | super::eresult::INVALID_STATE, _)) {
+                        with(account_id, |a| a.invites.retain(|i| i.group != group));
+                        tell_invites(state, account_id);
+                        return Err("that group is not there any more".to_string());
+                    }
+                    return Err(join_refusal(e));
+                }
+            };
+            let mut g = Group { id: group, name: invite.name.clone(), ..Default::default() };
+            if let Some(s) = &joined.state {
+                g.take_state(s, own);
+            }
+            if let Some(u) = &joined.user_chat_state {
+                g.take_user(u);
+            }
+            let name = g.name.clone();
+            with(account_id, |a| {
+                a.groups.insert(group, g);
+                a.invites.retain(|i| i.group != group);
+            });
+            tell_invites(state, account_id);
+            keep_active(&link, account_id).await;
+            Ok(json!({ "groupId": rail_id(account_id, group), "name": name }))
+        }
+        Action::DismissInvite { group } => {
+            with(account_id, |a| a.invites.retain(|i| i.group != group));
+            tell_invites(state, account_id);
+            Ok(json!({}))
         }
         Action::Leave { group } => {
             let _: LeaveChatGroupResponse = command(&link, "LeaveChatRoomGroup", &LeaveChatGroupRequest { chat_group_id: Some(group) }).await?;
@@ -1657,6 +1772,15 @@ pub fn to_json(account_id: &str, group: Option<u64>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_direct_invitation_is_read_from_the_message_that_carries_it() {
+        assert_eq!(invite_in("[invite  chatgroupid=\"78995476\" chatgroupname=\"moho official test\"][/invite]"), Some((78995476, None, "moho official test".to_string())));
+        assert_eq!(invite_in("see [invite chatgroupid=\"7\" chatid=\"70\" chatgroupname=\"A\"][/invite]"), Some((7, Some(70), "A".to_string())));
+        assert_eq!(invite_in("[invite chatgroupid=\"0\"][/invite]"), None, "no group");
+        assert_eq!(invite_in("[inviteurl chatgroupid=\"7\"][/inviteurl]"), None, "another tag");
+        assert_eq!(invite_in("an invite to nothing"), None);
+    }
 
     #[test]
     fn an_invite_is_found_in_a_link_and_in_a_bare_code() {

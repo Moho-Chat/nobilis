@@ -46,6 +46,8 @@ pub struct Incoming {
     pub from_us: bool,
     /// The web pages Steam's client described in it, which are cards.
     pub embeds: Vec<crate::model::Embed>,
+    /// An invitation to a group chat, if that is what it is.
+    pub invite: Option<(u64, Option<u64>, String)>,
 }
 
 /// Reads a notification, or says it is not a message to show.
@@ -66,7 +68,8 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
         return None;
     }
     let timestamp = n.rtime32_server_timestamp.unwrap_or_default();
-    Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false), embeds })
+    let invite = super::chatgroups::invite_in(n.message.as_deref().unwrap_or_default());
+    Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false), embeds, invite })
 }
 
 /// Who is typing to us, from a notification that says so.
@@ -109,6 +112,12 @@ pub fn record_incoming(state: &AppState, account_id: &str, roster: &mut Roster, 
         None,
         None,
     );
+    // What it offers is waiting on an answer, if it came from somebody else.
+    if stored && !incoming.from_us {
+        if let Some(found) = incoming.invite.clone() {
+            super::chatgroups::note_invite(state, account_id, &sender, found);
+        }
+    }
     (stored, stranger)
 }
 
@@ -383,6 +392,32 @@ mod tests {
         let history = state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
         let card = &history[0].embeds[0];
         assert_eq!((card.url.as_deref(), card.title.as_deref(), card.provider.as_deref()), (Some("http://x.salastil.com"), Some("Home"), Some("x.salastil.com")));
+    }
+
+    #[test]
+    fn a_friends_invitation_to_a_group_waits_to_be_answered() {
+        let state = simulated_daemon("steam-chat-invite");
+        let account = "steam:invitee";
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&ClientFriendsList {
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(22202)), efriendrelationship: Some(REL_FRIEND) }],
+            ..Default::default()
+        });
+        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
+        let mut shown = Conversations::new(account);
+        let raw = "[invite  chatgroupid=\"78995476\" chatgroupname=\"Raiders\"][/invite]";
+        let incoming = read_incoming(&notice(22202, raw, 1790000200, 0)).unwrap();
+        assert_eq!(incoming.text, "Group chat invitation: Raiders");
+        assert_eq!(incoming.invite, Some((78995476, None, "Raiders".to_string())));
+        assert!(record_incoming(&state, account, &mut roster, &mut shown, "Me", &incoming).0);
+        let waiting = crate::backend::steam::chatgroups::invites_json(account);
+        assert_eq!(waiting.len(), 1);
+        assert_eq!((waiting[0]["roomId"].as_str(), waiting[0]["name"].as_str(), waiting[0]["inviter"].as_str()), (Some("78995476"), Some("Raiders"), Some("Gabe")));
+        // The same one again is still one; what we sent ourselves is nobody's to answer.
+        let again = read_incoming(&notice(22202, raw, 1790000300, 0)).unwrap();
+        record_incoming(&state, account, &mut roster, &mut shown, "Me", &again);
+        assert_eq!(crate::backend::steam::chatgroups::invites_json(account).len(), 1);
+        crate::backend::steam::chatgroups::clear(account);
     }
 
     #[test]

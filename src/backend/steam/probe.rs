@@ -3072,8 +3072,12 @@ async fn a_group_watched_from_the_official_client() {
         .runtime
         .list_buffer_groups()
         .into_iter()
-        .find(|g| g.account_id == id && g.name == "moho official test")
-        .and_then(|g| groups::group_of_rail_id(&g.id).map(|(_, n)| n));
+        .filter(|g| g.account_id == id)
+        .filter_map(|g| groups::group_of_rail_id(&g.id).map(|(_, n)| n))
+        .find(|n| {
+            // The group asked for, which is the one the person at the other end is in.
+            std::env::var("MOHO_TEST_GROUP").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(78995476) == *n
+        });
     let group = match existing {
         Some(group) => {
             println!("OFFICIAL group {group} already exists and is used again");
@@ -3121,29 +3125,31 @@ async fn a_group_watched_from_the_official_client() {
     .await
     .unwrap();
     println!("OFFICIAL link {}", link["link"]);
-    println!(
-        "OFFICIAL invite the real account {:?}",
-        groups::act(
-            &state,
-            &id,
-            Action::InviteFriend {
-                group,
-                who: real.steamid
-            }
-        )
-        .await
-    );
+    // Asked once, when the group is made: the person is in it after that, and a card for every run
+    // is clutter in their direct messages.
+    if existing.is_none() {
+        println!(
+            "OFFICIAL invite the real account {:?}",
+            groups::act(
+                &state,
+                &id,
+                Action::InviteFriend {
+                    group,
+                    who: real.steamid
+                }
+            )
+            .await
+        );
+    }
     // A name two groups share carries the group's number, so look for either spelling.
     let room_name = |state: &crate::state::AppState| {
         state
             .runtime
             .list_buffers()
             .into_iter()
+            .filter(|b| b.account_id == id && b.name.ends_with("/#General"))
+            .find(|b| groups::ids_of(b).map(|(g, _)| g) == Some(group))
             .map(|b| b.name)
-            .find(|n| {
-                n.ends_with("/#General")
-                    && (n.starts_with("moho official test/") || n.contains(&format!("({group})")))
-            })
     };
     let mut waited = 0;
     while room_name(&state).is_none() && waited < 100 {
@@ -3179,6 +3185,8 @@ async fn a_group_watched_from_the_official_client() {
     let mut seen = 0usize;
     let mut last_members = 0usize;
     let mut last_voice: Vec<(u64, Vec<u32>)> = Vec::new();
+    let mut last_reactions: Vec<(String, String)> = Vec::new();
+    let mut last_invites = String::new();
     let began = std::time::Instant::now();
     let script: [(u64, &str); 6] = [
         (20, "moho test 1: a plain message. Reply in this chat, mention me with @Mohotester, and react to this message."),
@@ -3209,24 +3217,96 @@ async fn a_group_watched_from_the_official_client() {
         );
         if let Ok(text) = std::fs::read_to_string(&say) {
             let _ = std::fs::remove_file(&say);
+            // `!accept GROUP` and `!dismiss GROUP` answer an invitation that has arrived.
+            for line in text.lines() {
+                for (word, accept) in [("!accept ", true), ("!dismiss ", false)] {
+                    if let Some(number) = line.strip_prefix(word).and_then(|n| n.trim().parse::<u64>().ok()) {
+                        let action = if accept { Action::AcceptInvite { group: number } } else { Action::DismissInvite { group: number } };
+                        println!("OFFICIAL [{t}s] {} {number} -> {:?}", word.trim(), groups::act(&state, &id, action).await);
+                    }
+                }
+            }
             // Every group of this name, since an earlier run may have left more than one.
             let rooms: Vec<_> = state
                 .runtime
                 .list_buffers()
                 .into_iter()
-                .filter(|b| {
-                    b.account_id == id
-                        && b.name.starts_with("moho official test")
-                        && b.name.ends_with("/#General")
-                })
+                .filter(|b| b.account_id == id && b.name.ends_with("/#General"))
                 .collect();
             for room in &rooms {
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                    println!(
-                        "OFFICIAL [{t}s] saying in {} {line:?} -> {:?}",
-                        room.name,
-                        super::send_message(&state, room, line).await
-                    );
+                    // `!image PATH` sends a picture; `!react NAME` reacts with an emoticon to the
+                    // newest message somebody else wrote; anything else is said.
+                    let of_room = groups::ids_of(room).map(|(g, _)| g);
+                    if let Some(number) = line.strip_prefix("!leave ") {
+                        // `!leave GROUP`: only the room of that group acts on it.
+                        if let Ok(target) = number.trim().parse::<u64>() {
+                            if of_room == Some(target) {
+                                println!(
+                                    "OFFICIAL [{t}s] leaving {target} -> {:?}",
+                                    groups::act(&state, &id, Action::Leave { group: target }).await
+                                );
+                            }
+                        }
+                    } else if let Some(rest) = line.strip_prefix("!rename ") {
+                        // `!rename GROUP NEW NAME`: only the room of that group acts on it.
+                        let (number, name) = rest.split_once(' ').unwrap_or((rest, ""));
+                        if let Ok(target) = number.parse::<u64>() {
+                            if of_room == Some(target) {
+                                println!(
+                                    "OFFICIAL [{t}s] renaming {target} to {name:?} -> {:?}",
+                                    groups::act(
+                                        &state,
+                                        &id,
+                                        Action::Rename {
+                                            group: target,
+                                            name: name.to_string()
+                                        }
+                                    )
+                                    .await
+                                );
+                            }
+                        }
+                    } else if of_room != Some(group) {
+                        // Said, shown and reacted to only in the group the person is in.
+                    } else if let Some(path) = line.strip_prefix("!image ") {
+                        let files = [(path.trim().to_string(), false)];
+                        println!(
+                            "OFFICIAL [{t}s] picture {path} in {} -> {:?}",
+                            room.name,
+                            super::send_files(&state, room, "", &files, None).await
+                        );
+                    } else if let Some(name) = line.strip_prefix("!react ") {
+                        let own = state.runtime.own_identity(&id).unwrap_or_default();
+                        let newest = state
+                            .store
+                            .get_backlog(&room.id, 0, 100)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .rev()
+                            .find(|m| m.from != own && m.from != "*");
+                        match newest {
+                            Some(m) => println!(
+                                "OFFICIAL [{t}s] reacting {name} to {:?} -> {:?}",
+                                m.id,
+                                super::chatgroups::react(
+                                    &state,
+                                    room,
+                                    &m.id,
+                                    &format!("[steam:emote:{}]", name.trim()),
+                                    true
+                                )
+                                .await
+                            ),
+                            None => println!("OFFICIAL [{t}s] nothing from anybody else to react to"),
+                        }
+                    } else {
+                        println!(
+                            "OFFICIAL [{t}s] saying in {} {line:?} -> {:?}",
+                            room.name,
+                            super::send_message(&state, room, line).await
+                        );
+                    }
                 }
             }
         }
@@ -3241,6 +3321,20 @@ async fn a_group_watched_from_the_official_client() {
             );
         }
         seen = log.len();
+        let waiting = format!("{:?}", groups::invites_json(&id));
+        if waiting != last_invites {
+            println!("OFFICIAL [{t}s] invitations now {waiting}");
+            last_invites = waiting;
+        }
+        let reactions: Vec<(String, String)> = log
+            .iter()
+            .filter(|m| !m.reactions.is_empty())
+            .map(|m| (m.id.clone(), format!("{:?}", m.reactions)))
+            .collect();
+        if reactions != last_reactions {
+            println!("OFFICIAL [{t}s] reactions now {reactions:?}");
+            last_reactions = reactions;
+        }
         if t.is_multiple_of(20) {
             for b in state.runtime.list_buffers().into_iter().filter(|b| {
                 b.account_id == id

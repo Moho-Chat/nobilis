@@ -38,6 +38,8 @@ pub struct Past {
     pub reactions: Vec<crate::model::Reaction>,
     /// The web pages Steam's client described in it, which are cards.
     pub embeds: Vec<crate::model::Embed>,
+    /// An invitation to a group chat, if that is what it is.
+    pub invite: Option<(u64, Option<u64>, String)>,
 }
 
 impl Past {
@@ -54,7 +56,8 @@ fn read(message: &PastMessage, own: u32) -> Option<Past> {
     if text.trim().is_empty() {
         return None;
     }
-    Some(Past { account, timestamp: message.timestamp.unwrap_or_default(), ordinal: message.ordinal.unwrap_or_default(), text, reactions: super::reactions::from_history(own, &message.reactions), embeds })
+    let invite = super::chatgroups::invite_in(message.message.as_deref().unwrap_or_default());
+    Some(Past { account, timestamp: message.timestamp.unwrap_or_default(), ordinal: message.ordinal.unwrap_or_default(), text, reactions: super::reactions::from_history(own, &message.reactions), embeds, invite })
 }
 
 /// Asks for up to `count` messages of a conversation that are older than
@@ -235,6 +238,9 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, own: u32,
                 None,
                 None,
             );
+            if let Some(found) = p.invite.clone().filter(|_| p.account != own) {
+                super::chatgroups::note_invite(state, account_id, &friend_name, found);
+            }
         }
         // Read elsewhere, so whatever this window counted is not waiting.
         if unread == 0 {
@@ -334,7 +340,7 @@ mod tests {
         let blank = vec![past(FRIEND, 1, 0, "  "), past(0, 2, 0, "nobody"), PastMessage { accountid: Some(FRIEND), timestamp: Some(3), message: None, ordinal: None, reactions: vec![] }, past(FRIEND, 4, 0, "kept ")];
         let link = link_to(steam(blank, vec![], Arc::default())).await;
         let (got, _) = fetch(&link, steamid::steamid_of(ME), steamid::steamid_of(FRIEND), None, 50).await.unwrap();
-        assert_eq!(got, vec![Past { account: FRIEND, timestamp: 4, ordinal: 0, text: "kept".into(), reactions: vec![], embeds: vec![] }], "and trailing space is dropped");
+        assert_eq!(got, vec![Past { account: FRIEND, timestamp: 4, ordinal: 0, text: "kept".into(), reactions: vec![], embeds: vec![], invite: None }], "and trailing space is dropped");
     }
 
     #[tokio::test]
@@ -351,7 +357,7 @@ mod tests {
         // One of them was heard live first, under the id a live message gets.
         crate::backend::steam::chat::record_incoming(
             &state, ACCOUNT, &mut friends_list().0, &mut shown, "Me",
-            &crate::backend::steam::chat::Incoming { account: FRIEND, text: "three".into(), timestamp: 120, id: message_id(120, 0), from_us: false, embeds: Vec::new() },
+            &crate::backend::steam::chat::Incoming { account: FRIEND, text: "three".into(), timestamp: 120, id: message_id(120, 0), from_us: false, embeds: Vec::new(), invite: None },
         );
         assert_eq!(held(&state).len(), 1);
 

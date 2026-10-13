@@ -175,12 +175,20 @@ pub async fn may_upload(link: &Link, key: &str, steamid: u64, refresh_token: &st
 ///
 /// `key` is the account's id, which decides whether the traffic is routed.
 #[allow(clippy::too_many_arguments)]
+/// Who a file is for: a friend, or a room of a chat group. What the commit names is all that differs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FileTarget<'a> {
+    Friend(&'a str),
+    Room { group: u64, room: u64 },
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn send_file(
     link: &Link,
     key: &str,
     steamid: u64,
     refresh_token: &str,
-    friend: &str,
+    target: FileTarget<'_>,
     path: &str,
     spoiler: bool,
     progress: Option<&Progress>,
@@ -243,7 +251,7 @@ pub async fn send_file(
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    let commit = reqwest::multipart::Form::new()
+    let mut commit = reqwest::multipart::Form::new()
         .text("sessionid", session_id)
         .text("l", "english")
         .text("file_name", upload_name)
@@ -255,8 +263,13 @@ pub async fn send_file(
         .text("file_image_height", height.to_string())
         .text("timestamp", timestamp.to_string())
         .text("hmac", hmac)
-        .text("friend_steamid", friend.to_string())
         .text("spoiler", if spoiler { "1" } else { "0" });
+    // A friend is named by their id, a room by its group and its own number: as the client's own
+    // two kinds of conversation name theirs.
+    commit = match target {
+        FileTarget::Friend(friend) => commit.text("friend_steamid", friend.to_string()),
+        FileTarget::Room { group, room } => commit.text("chat_group_id", group.to_string()).text("chat_id", room.to_string()),
+    };
     let done = site(&http, &cookie, &format!("{SITE}/chat/commitfileupload/"), commit).await?;
     let result = done.result.unwrap_or_default();
     // Valve's own nesting: the call succeeded, and inside it there is a second
