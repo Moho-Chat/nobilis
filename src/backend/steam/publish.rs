@@ -78,7 +78,7 @@ impl Conversations {
             let persona = roster.persona(account);
             let status = persona.map_or("offline", |p| presence::status_of(p.state));
             let avatar = persona.and_then(|p| p.avatar.clone());
-            let activity = persona.and_then(|p| presence::activity(p.state, p.game.as_deref()));
+            let activity = persona.and_then(|p| presence::activity(p.state, roster.game_of(account).as_deref()));
             let detail = persona.map_or((None, None, None), |p| (presence::client_of(p.state, p.flags, p.on_deck), p.last_seen, p.rich.clone()));
             let next = Shown { name: name.clone(), status, activity: activity.clone(), avatar: avatar.clone(), detail: detail.clone() };
             let before = self.shown.get(&account);
@@ -221,6 +221,34 @@ mod tests {
         shown.publish(&state, &roster);
         let gabe = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).expect("renamed");
         assert!(gabe.notice.is_some(), "the banner is still up on the renamed conversation");
+    }
+
+    #[test]
+    fn a_game_on_steam_is_in_game_until_its_name_is_known_and_then_its_name() {
+        let state = simulated_daemon("steam-publish-game-by-number");
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&friends(&[22202, 22203]));
+        // Steam names no game of its own: the number alone, as it sends it.
+        let playing = |account: u32, app: u64| PersonaFriend { friendid: Some(steamid::steamid_of(account)), player_name: Some(format!("P{account}")), persona_state: Some(1), gameid: Some(app), game_played_app_id: Some(app as u32), ..Default::default() };
+        roster.apply_persona(&update(vec![playing(22202, 730), playing(22203, 730)]));
+        assert_eq!(roster.unnamed_apps(), vec![730], "one question for two people in the same game");
+        let mut shown = Conversations::new(ACCOUNT);
+        let mut rx = state.events.subscribe();
+        shown.publish(&state, &roster);
+        let said = events(&mut rx, "presenceChange");
+        let text = |said: &[serde_json::Value], who: &str| said.iter().rev().find(|e| e["bufferId"].as_str().is_some_and(|b| b.ends_with(who))).and_then(|e| e["members"][0]["activity"].clone().as_object().cloned());
+        assert_eq!(text(&said, "P22202").unwrap()["text"], "In game");
+        roster.set_app_name(730, "Counter-Strike 2".into());
+        assert!(roster.unnamed_apps().is_empty());
+        shown.publish(&state, &roster);
+        let said = events(&mut rx, "presenceChange");
+        assert_eq!(text(&said, "P22202").unwrap()["text"], "Counter-Strike 2", "named, and said again");
+        assert_eq!(text(&said, "P22203").unwrap()["kind"], "game");
+        // A game that has a name from Steam is not asked about, and stopping is stopping.
+        roster.apply_persona(&update(vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), game_name: Some("My Mod".into()), gameid: Some(1 << 40), ..Default::default() }]));
+        assert_eq!(roster.game_of(22202).as_deref(), Some("My Mod"));
+        roster.apply_persona(&update(vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), gameid: Some(0), ..Default::default() }]));
+        assert_eq!(roster.game_of(22202), None);
     }
 
     #[test]

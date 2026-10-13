@@ -33,8 +33,10 @@ pub struct Persona {
     pub name: Option<String>,
     /// Steam's state number; see `presence`.
     pub state: u32,
-    /// The game they are in, when they are in one.
+    /// The game they are in, when they are in one and Steam has said its name.
     pub game: Option<String>,
+    /// Its number, which is all Steam says of a game that is on Steam.
+    pub app: Option<u64>,
     /// The avatar's hash as hex.
     pub avatar: Option<String>,
     /// `EPersonaStateFlag`: which kind of client they are on, among other things.
@@ -74,9 +76,38 @@ pub struct Roster {
     /// us first. They need a conversation of their own and a name that does
     /// not clash with anyone else's, but they are not on the friends list.
     talking: std::collections::HashSet<u32>,
+    /// What the games people are in are called, as the store has told us.
+    app_names: HashMap<u64, String>,
 }
 
 impl Roster {
+    /// Notes what a game is called.
+    pub fn set_app_name(&mut self, app: u64, name: String) {
+        self.app_names.insert(app, name);
+    }
+
+    /// The game somebody is in, in words: the name Steam gave, or the one the
+    /// store gave for its number, or - while that is being asked - only that it
+    /// is a game.
+    pub fn game_of(&self, account: u32) -> Option<String> {
+        let persona = self.personas.get(&account)?;
+        if let Some(game) = persona.game.clone() {
+            return Some(game);
+        }
+        let app = persona.app?;
+        Some(self.app_names.get(&app).cloned().unwrap_or_else(|| "In game".to_string()))
+    }
+
+    /// Games people are in whose names are not known: what to ask the store.
+    /// Only a game on Steam, whose number fits the store's; one that is not has
+    /// a name from Steam, or none to be had.
+    pub fn unnamed_apps(&self) -> Vec<u64> {
+        let mut apps: Vec<u64> = self.personas.values().filter(|p| p.game.is_none()).filter_map(|p| p.app).filter(|a| *a <= u64::from(u32::MAX) && !self.app_names.contains_key(a)).collect();
+        apps.sort_unstable();
+        apps.dedup();
+        apps
+    }
+
     /// Takes in the friends list. A full list replaces what was held; an
     /// incremental one is only the people whose standing changed. Returns the
     /// accounts whose standing is now different.
@@ -266,6 +297,14 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
     // A game is cleared by saying there is none, not by leaving it out.
     if update.gameid == Some(0) || update.game_played_app_id == Some(0) {
         held.game = None;
+        held.app = None;
+    }
+    if let Some(app) = update.game_played_app_id.map(u64::from).filter(|a| *a > 0).or(update.gameid.filter(|g| *g > 0)) {
+        if held.app != Some(app) {
+            // A different game: what was said of the last is not said of this one.
+            held.game = None;
+        }
+        held.app = Some(app);
     }
     if let Some(game) = update.game_name.as_deref().filter(|g| !g.is_empty()) {
         held.game = Some(game.to_string());

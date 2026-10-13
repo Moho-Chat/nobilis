@@ -65,6 +65,16 @@ fn fill(card: &mut Value, info: Option<&FriendProfileInfoResponse>, level: Optio
     profile::note(card, "Summary", summary(info.summary.as_deref().unwrap_or_default()));
 }
 
+/// Adds the names they have had, newest first: the one they have now is the one
+/// the card is headed by, so it is not listed again.
+fn fill_names(card: &mut Value, names: &[(String, String)]) {
+    let now = card["name"].as_str().unwrap_or_default().to_string();
+    let history: Vec<Value> = names.iter().filter(|(n, _)| *n != now).map(|(name, when)| json!({ "name": name, "when": when })).collect();
+    if !history.is_empty() {
+        card["nameHistory"] = json!(history);
+    }
+}
+
 /// Adds what is already known from how they are showing.
 fn fill_from_presence(card: &mut Value, member: &Value) {
     profile::set(card, "status", member["status"].as_str().map(|s| json!(s)));
@@ -101,8 +111,16 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
     }
     if let Some(link) = state.runtime.steam_link(account_id) {
         let number = steamid::account_of(friend).unwrap_or_default();
-        let (info, level) = tokio::join!(ask_profile(&link, friend), ask_level(&link, number));
+        let config = state.accounts.get_steam(account_id);
+        let names = async {
+            match &config {
+                Some(c) => super::web::aliases(&link, account_id, c.steamid, &c.refresh_token, friend).await.unwrap_or_default(),
+                None => Vec::new(),
+            }
+        };
+        let (info, level, names) = tokio::join!(ask_profile(&link, friend), ask_level(&link, number), names);
         fill(&mut card, info.as_ref(), level);
+        fill_names(&mut card, &names);
     }
     card
 }
@@ -113,6 +131,16 @@ mod tests {
 
     fn labels(card: &Value) -> Vec<(String, String)> {
         card["extra"].as_array().map(|a| a.iter().map(|e| (e["label"].as_str().unwrap().to_string(), e["value"].as_str().unwrap().to_string())).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn the_names_they_have_had_are_listed_except_the_one_they_have() {
+        let mut card = profile::pending("steam", "steam:me", "Gabe");
+        fill_names(&mut card, &[("Gabe".into(), "1 Jan, 2024 @ 1:00pm".into()), ("Gabe Newell".into(), "3 Mar, 2019 @ 1:00am".into())]);
+        assert_eq!(card["nameHistory"], json!([{ "name": "Gabe Newell", "when": "3 Mar, 2019 @ 1:00am" }]));
+        let mut none = profile::pending("steam", "steam:me", "Gabe");
+        fill_names(&mut none, &[("Gabe".into(), "x".into())]);
+        assert!(none.get("nameHistory").is_none(), "only the present name: nothing to list");
     }
 
     #[test]

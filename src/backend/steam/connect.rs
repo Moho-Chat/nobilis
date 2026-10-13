@@ -295,6 +295,7 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         catch_up_at: None,
         catch_up_tries: 0,
         prefs_wanted: None,
+        apps: AppNames::new(),
         shown: Conversations::new(account_id),
     }
     .run(&mut told, heartbeat)
@@ -320,9 +321,40 @@ struct Drive<'a> {
     catch_up_tries: u32,
     /// What the account keeps about its friends, on its way.
     prefs_wanted: Option<tokio::sync::oneshot::Receiver<Vec<PerFriendPreferences>>>,
+    /// What the games people are in are called: asked of the store, once each.
+    apps: AppNames,
+}
+
+/// Games whose names have been asked for, so none is asked about twice, and
+/// where the answers come back to.
+struct AppNames {
+    asked: std::collections::HashSet<u64>,
+    heard: tokio::sync::mpsc::UnboundedReceiver<(u64, Option<String>)>,
+    to: tokio::sync::mpsc::UnboundedSender<(u64, Option<String>)>,
+}
+
+impl AppNames {
+    fn new() -> Self {
+        let (to, heard) = tokio::sync::mpsc::unbounded_channel();
+        Self { asked: Default::default(), heard, to }
+    }
 }
 
 impl Drive<'_> {
+    /// Asks the store what any game somebody is in is called, once each. Steam
+    /// names only a game that is not its own.
+    fn ask_game_names(&mut self) {
+        for app in self.roster.unnamed_apps() {
+            if !self.apps.asked.insert(app) {
+                continue;
+            }
+            let (to, key) = (self.apps.to.clone(), self.account_id.to_string());
+            tokio::spawn(async move {
+                let _ = to.send((app, super::apps::lookup(&key, app).await));
+            });
+        }
+    }
+
     async fn run(mut self, told: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>, heartbeat: Duration) -> Ending {
         self.shown.adopt(self.state, self.account_id);
         // The warnings still waiting to be seen from before this was started.
@@ -386,6 +418,12 @@ impl Drive<'_> {
                         }
                     }
                 }
+                heard = self.apps.heard.recv() => {
+                    if let Some((app, Some(name))) = heard {
+                        self.roster.set_app_name(app, name);
+                        self.shown.publish(self.state, &self.roster);
+                    }
+                }
                 packet = told.recv() => match packet {
                     None => return Ending::Closed,
                     Some(packet) => {
@@ -443,6 +481,7 @@ impl Drive<'_> {
                     if let Some(name) = self.roster.persona(self.own).and_then(|p| p.name.clone()) {
                         self.state.runtime.set_own_identity(self.account_id, &name);
                     }
+                    self.ask_game_names();
                     self.shown.publish(self.state, &self.roster);
                 }
             }
@@ -953,7 +992,7 @@ mod tests {
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
         link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None };
+        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None, apps: AppNames::new() };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {

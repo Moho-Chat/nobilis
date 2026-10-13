@@ -27,6 +27,7 @@ use super::proto::{GenerateAccessTokenRequest, GenerateAccessTokenResponse};
 use crate::upload::{Phase, Progress};
 use rand::Rng;
 use serde::Deserialize;
+use serde_json::Value;
 
 const SITE: &str = "https://steamcommunity.com";
 
@@ -277,6 +278,37 @@ fn plain(raw: &[u8]) -> String {
     String::from_utf8_lossy(raw).into_owned()
 }
 
+/// The names somebody has had, newest first, each with when Steam says they
+/// took it - in Steam's own words for the moment, which are not a date a
+/// program can rely on ("12 Oct, 2025 @ 6:03pm") and are shown as given.
+pub async fn aliases(link: &Link, key: &str, steamid: u64, refresh_token: &str, friend: u64) -> Result<Vec<(String, String)>, String> {
+    let (http, cookie, _) = login(link, key, steamid, refresh_token).await?;
+    let response = http
+        .get(format!("{SITE}/profiles/{friend}/ajaxaliases?l=english"))
+        .header("Cookie", cookie)
+        .header("Referer", format!("{SITE}/profiles/{friend}"))
+        .send()
+        .await
+        .map_err(|e| format!("could not reach Steam's website: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Steam's website refused it ({})", response.status()));
+    }
+    let raw = response.bytes().await.map_err(|e| e.to_string())?;
+    Ok(read_aliases(&plain(&raw)))
+}
+
+/// Reads the answer: a list of `{newname, timechanged}`.
+pub fn read_aliases(text: &str) -> Vec<(String, String)> {
+    let Ok(Value::Array(list)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    list.iter()
+        .filter_map(|entry| {
+            let name = entry["newname"].as_str()?.trim();
+            let when = entry["timechanged"].as_str().unwrap_or_default().trim();
+            (!name.is_empty()).then(|| (name.chars().take(64).collect(), when.chars().take(40).collect()))
+        })
+        .collect()
+}
+
 /// One call to the site, read as the client reads it: the body is JSON even
 /// when the status is an error, and its `message` is what to show.
 async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::multipart::Form) -> Result<Answer, String> {
@@ -342,6 +374,17 @@ mod tests {
         assert!(no.is_err(), "a refusal has no place to put anything");
         let plain: Begun = serde_json::from_value(serde_json::json!({ "ugcid": 5, "url_host": "h", "url_path": "/p", "use_https": false })).unwrap();
         assert!(!plain.use_https);
+    }
+
+    #[test]
+    fn a_name_history_is_read_as_names_and_the_moments_they_were_taken() {
+        let said = r#"[{"newname":"Gabe","timechanged":"12 Oct, 2025 @ 6:03pm"},{"newname":"  ","timechanged":"x"},{"newname":"Old Name","timechanged":"3 Mar, 2019 @ 1:00am"},{"newname":"No Time"}]"#;
+        assert_eq!(
+            read_aliases(said),
+            vec![("Gabe".to_string(), "12 Oct, 2025 @ 6:03pm".to_string()), ("Old Name".to_string(), "3 Mar, 2019 @ 1:00am".to_string()), ("No Time".to_string(), String::new())]
+        );
+        assert!(read_aliases("not json").is_empty());
+        assert!(read_aliases("{}").is_empty());
     }
 
     #[test]

@@ -718,3 +718,24 @@ async fn our_presence_is_set_and_idle_detection_moves_it() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// A friend's name history, read through the website as the signed-in account.
+/// Reads only.
+#[tokio::test]
+#[ignore = "needs a real Steam account and its friend; sends nothing"]
+async fn a_friends_name_history_is_read() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-aliases");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let got = super::web::aliases(&link, &id, sender.steamid, &sender.refresh_token, receiver.steamid).await;
+    println!("ALIASES {got:?}");
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
