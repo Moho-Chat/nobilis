@@ -61,7 +61,10 @@ impl Phase {
 
 impl Progress {
     pub fn new(events: crate::events::EventBus, id: &str) -> Progress {
-        Progress { events, id: id.to_string() }
+        Progress {
+            events,
+            id: id.to_string(),
+        }
     }
 
     /// Says which stage this is, and how big the file turned out to be.
@@ -192,7 +195,11 @@ impl Host {
         match self.accepted_extensions() {
             None => true,
             Some(table) => {
-                let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                let ext = file_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
                 table.iter().any(|(e, _)| *e == ext)
             }
         }
@@ -283,12 +290,18 @@ async fn upload_inner(
     // Through Tor or the proxy when uploads are routed - started first, so
     // the upload neither waits on a cold Tor nor fails for want of one.
     crate::net::route::router().ready_for_general().await?;
-    let bytes = tokio::fs::read(path).await.with_context(|| format!("reading {path}"))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading {path}"))?;
     if bytes.is_empty() {
         bail!("that file is empty");
     }
     if bytes.len() > host.max_bytes() {
-        bail!("that file is over {}'s {}MB limit", host.id(), host.max_bytes() / 1024 / 1024);
+        bail!(
+            "that file is over {}'s {}MB limit",
+            host.id(),
+            host.max_bytes() / 1024 / 1024
+        );
     }
     let file_name = std::path::Path::new(path)
         .file_name()
@@ -300,19 +313,28 @@ async fn upload_inner(
             .accepted_extensions()
             .map(|t| t.iter().map(|(e, _)| *e).collect::<Vec<_>>().join("/"))
             .unwrap_or_default();
-        bail!("{} does not take \"{file_name}\" - it accepts {taken}", host.id());
+        bail!(
+            "{} does not take \"{file_name}\" - it accepts {taken}",
+            host.id()
+        );
     }
 
     if let Some(progress) = progress {
         progress.at(Phase::Sending, bytes.len(), host.id());
     }
     match host {
-        Host::Catbox | Host::Litterbox => catbox_family(host, file_name, bytes, retention, progress).await,
+        Host::Catbox | Host::Litterbox => {
+            catbox_family(host, file_name, bytes, retention, progress).await
+        }
         // The direct image link, not the page about it. Sneedchat wraps both
         // in BBCode because it renders markup; a caller reaching this has
         // none, so what it wants is the URL that ends in a file extension -
         // it is what makes a link unfurl into a picture at the far end.
-        Host::Postimg => Ok(crate::backend::sneedchat::upload_to_postimg_reporting(path, progress).await?.direct),
+        Host::Postimg => Ok(
+            crate::backend::sneedchat::upload_to_postimg_reporting(path, progress)
+                .await?
+                .direct,
+        ),
         Host::Ibb => ibb(file_name, bytes, progress).await,
         Host::Imgur => imgur(file_name, bytes, progress).await,
     }
@@ -324,8 +346,14 @@ async fn upload_inner(
 /// Wider than any one host's list and narrower than ibb's: heic and tiff are
 /// images, and a browser draws neither.
 pub fn is_web_picture(file_name: &str) -> bool {
-    const SHOWN: &[&str] = &["png", "jpg", "jpeg", "jpe", "gif", "apng", "webp", "avif", "bmp", "svg", "ico"];
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    const SHOWN: &[&str] = &[
+        "png", "jpg", "jpeg", "jpe", "gif", "apng", "webp", "avif", "bmp", "svg", "ico",
+    ];
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     file_name.contains('.') && SHOWN.contains(&ext.as_str())
 }
 
@@ -367,18 +395,33 @@ const IMGUR_CLIENT_ID: &str = "d70305e7c3ac5c6";
 /// 2023 imgur deletes content not tied to an account once it judges it
 /// unused. The label says so, so the choice is made knowing it.
 async fn imgur(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> Result<String> {
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let content_type = IMGUR_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t).unwrap_or("application/octet-stream");
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = IMGUR_TYPES
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, t)| *t)
+        .unwrap_or("application/octet-stream");
     let size = bytes.len();
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(content_type)?;
-    let form = reqwest::multipart::Form::new().text("type", "file").part("image", part);
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name)
+        .mime_str(content_type)?;
+    let form = reqwest::multipart::Form::new()
+        .text("type", "file")
+        .part("image", part);
 
     if let Some(progress) = progress {
         progress.at(Phase::Waiting, size, Host::Imgur.id());
     }
     let resp = http_client()
         .post(IMGUR_UPLOAD)
-        .header(reqwest::header::AUTHORIZATION, format!("Client-ID {IMGUR_CLIENT_ID}"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Client-ID {IMGUR_CLIENT_ID}"),
+        )
         .multipart(form)
         .send()
         .await
@@ -455,8 +498,16 @@ const IBB_JSON: &str = "https://imgbb.com/json";
 /// the token, and the file as `source`. No `expiration`, which is the page's
 /// "Don't autodelete".
 async fn ibb(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> Result<String> {
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    let content_type = IBB_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t).unwrap_or("application/octet-stream");
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content_type = IBB_TYPES
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, t)| *t)
+        .unwrap_or("application/octet-stream");
 
     let page = http_client()
         .get(IBB_PAGE)
@@ -465,11 +516,18 @@ async fn ibb(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> 
         .map_err(|e| anyhow!("couldn't reach ibb.co: {}", with_causes(&e)))?;
     let cookies = session_cookies(page.headers());
     let html = page.text().await.unwrap_or_default();
-    let token = ibb_auth_token(&html).ok_or_else(|| anyhow!("ibb.co's upload page has no upload token in it - the site may have changed"))?;
+    let token = ibb_auth_token(&html).ok_or_else(|| {
+        anyhow!("ibb.co's upload page has no upload token in it - the site may have changed")
+    })?;
 
     let size = bytes.len();
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(content_type)?;
-    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name)
+        .mime_str(content_type)?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let form = reqwest::multipart::Form::new()
         .text("type", "file")
         .text("action", "upload")
@@ -498,7 +556,8 @@ async fn ibb(file_name: String, bytes: Vec<u8>, progress: Option<&Progress>) -> 
 fn ibb_auth_token(html: &str) -> Option<String> {
     let start = html.find("auth_token=\"")? + "auth_token=\"".len();
     let token = &html[start..start + html[start..].find('"')?];
-    (!token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric())).then(|| token.to_string())
+    (!token.is_empty() && token.chars().all(|c| c.is_ascii_alphanumeric()))
+        .then(|| token.to_string())
 }
 
 /// Every cookie a response set, as a `Cookie` header sends them back.
@@ -541,8 +600,12 @@ struct IbbError {
 /// original file, which is what a chat that unfurls a bare URL wants.
 fn ibb_link(status: reqwest::StatusCode, body: &str) -> Result<String> {
     match serde_json::from_str::<IbbReply>(body) {
-        Ok(IbbReply { image: Some(image), .. }) if image.url.starts_with("https://") => Ok(image.url),
-        Ok(IbbReply { error: Some(error), .. }) if !error.message.is_empty() => bail!("ibb.co refused the upload: {}", error.message),
+        Ok(IbbReply {
+            image: Some(image), ..
+        }) if image.url.starts_with("https://") => Ok(image.url),
+        Ok(IbbReply {
+            error: Some(error), ..
+        }) if !error.message.is_empty() => bail!("ibb.co refused the upload: {}", error.message),
         _ if !status.is_success() => bail!("ibb.co refused the upload: HTTP {status}"),
         _ => bail!("ibb.co did not return a link: {}", snippet(body)),
     }
@@ -579,7 +642,9 @@ async fn catbox_family(
     };
     let size = bytes.len();
     let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name);
-    let mut form = reqwest::multipart::Form::new().text("reqtype", "fileupload").part("fileToUpload", part);
+    let mut form = reqwest::multipart::Form::new()
+        .text("reqtype", "fileupload")
+        .part("fileToUpload", part);
     if host == Host::Litterbox {
         form = form.text("time", retention.unwrap_or("72h").to_string());
     }
@@ -666,23 +731,41 @@ mod tests {
     #[test]
     fn the_listing_says_what_each_host_will_take() {
         let listed = hosts();
-        let postimg = listed.iter().find(|h| h["id"] == "postimg").expect("postimg listed");
+        let postimg = listed
+            .iter()
+            .find(|h| h["id"] == "postimg")
+            .expect("postimg listed");
         assert_eq!(postimg["imagesOnly"], true);
-        let catbox = listed.iter().find(|h| h["id"] == "catbox").expect("catbox listed");
+        let catbox = listed
+            .iter()
+            .find(|h| h["id"] == "catbox")
+            .expect("catbox listed");
         assert_eq!(catbox["imagesOnly"], false);
-        let ibb = listed.iter().find(|h| h["id"] == "ibb").expect("ibb listed");
+        let ibb = listed
+            .iter()
+            .find(|h| h["id"] == "ibb")
+            .expect("ibb listed");
         assert_eq!(ibb["imagesOnly"], true);
         assert_eq!(listed.len(), 5);
         // imgur is the one host a service is kept from: Sneedchat does not
         // embed it.
-        let imgur = listed.iter().find(|h| h["id"] == "imgur").expect("imgur listed");
+        let imgur = listed
+            .iter()
+            .find(|h| h["id"] == "imgur")
+            .expect("imgur listed");
         assert_eq!(imgur["notFor"], serde_json::json!(["sneedchat"]));
         assert_eq!(catbox["notFor"], serde_json::json!([]));
     }
 
     #[test]
     fn host_names_round_trip() {
-        for h in [Host::Catbox, Host::Litterbox, Host::Postimg, Host::Ibb, Host::Imgur] {
+        for h in [
+            Host::Catbox,
+            Host::Litterbox,
+            Host::Postimg,
+            Host::Ibb,
+            Host::Imgur,
+        ] {
             assert_eq!(Host::parse(h.id()), Some(h));
         }
         assert_eq!(Host::parse("nowhere"), None);
@@ -707,7 +790,12 @@ mod tests {
         // And a client is told, so it can route round a refusal.
         let listed = hosts();
         let postimg = listed.iter().find(|h| h["id"] == "postimg").unwrap();
-        let accepts: Vec<&str> = postimg["accepts"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        let accepts: Vec<&str> = postimg["accepts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
         assert!(accepts.contains(&"png"));
         assert!(!accepts.contains(&"avif"));
         assert!(listed.iter().find(|h| h["id"] == "catbox").unwrap()["accepts"].is_null());
@@ -717,11 +805,17 @@ mod tests {
     /// after: the point of saying so is to send the person to another host.
     #[tokio::test]
     async fn an_images_only_host_refuses_a_video_without_uploading_it() {
-        let dir = std::env::temp_dir().join(format!("nobilis-upload-{}", crate::model::next_message_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nobilis-upload-{}",
+            crate::model::next_message_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("clip.mp4");
         std::fs::write(&file, b"not really a video").unwrap();
-        let err = upload_reporting(Host::Postimg, file.to_str().unwrap(), None, None).await.unwrap_err().to_string();
+        let err = upload_reporting(Host::Postimg, file.to_str().unwrap(), None, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("does not take"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -735,7 +829,10 @@ mod tests {
     /// down here.
     #[tokio::test]
     async fn a_refused_file_still_reports_that_it_finished() {
-        let dir = std::env::temp_dir().join(format!("nobilis-progress-{}", crate::model::next_message_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nobilis-progress-{}",
+            crate::model::next_message_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("clip.mp4");
         std::fs::write(&file, b"not really a video").unwrap();
@@ -755,7 +852,11 @@ mod tests {
             phases.push(event.data["phase"].as_str().unwrap_or_default().to_string());
         }
         assert_eq!(phases.first().map(String::as_str), Some("preparing"));
-        assert_eq!(phases.last().map(String::as_str), Some("done"), "phases were {phases:?}");
+        assert_eq!(
+            phases.last().map(String::as_str),
+            Some("done"),
+            "phases were {phases:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -776,9 +877,13 @@ mod tests {
     /// that is not a link is still a failure however cheerful its status.
     #[test]
     fn a_reply_that_is_not_a_link_still_fails() {
-        let err = link_from_response(Host::Catbox, reqwest::StatusCode::OK, "<html>go away</html>")
-            .unwrap_err()
-            .to_string();
+        let err = link_from_response(
+            Host::Catbox,
+            reqwest::StatusCode::OK,
+            "<html>go away</html>",
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("did not return a link"), "got {err}");
 
         let err = link_from_response(Host::Litterbox, reqwest::StatusCode::BAD_GATEWAY, "")
@@ -791,7 +896,9 @@ mod tests {
     #[test]
     fn a_long_reply_is_cut_on_a_character_boundary() {
         let page = "\u{201c}down for maintenance\u{201d} ".repeat(40);
-        let err = link_from_response(Host::Catbox, reqwest::StatusCode::OK, &page).unwrap_err().to_string();
+        let err = link_from_response(Host::Catbox, reqwest::StatusCode::OK, &page)
+            .unwrap_err()
+            .to_string();
         assert!(err.ends_with("..."), "got {err}");
         assert!(snippet(&page).chars().count() <= 203);
         // Short replies are shown whole, with nothing appended.
@@ -808,7 +915,10 @@ mod tests {
         assert!(!Host::Ibb.accepts("notes.txt"));
         assert_eq!(Host::Ibb.max_bytes(), 32_000_000);
         let listed = hosts();
-        let accepts = listed.iter().find(|h| h["id"] == "ibb").unwrap()["accepts"].as_array().unwrap().clone();
+        let accepts = listed.iter().find(|h| h["id"] == "ibb").unwrap()["accepts"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert!(accepts.iter().any(|v| v == "avif"));
     }
 
@@ -817,7 +927,10 @@ mod tests {
     fn the_upload_token_is_read_off_the_page() {
         let html = r#"PF.obj.config.json_api="https://imgbb.com/json";
 PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
-        assert_eq!(ibb_auth_token(html).as_deref(), Some("32dc939d0777df0367b9d127ee79b39aa27525fb"));
+        assert_eq!(
+            ibb_auth_token(html).as_deref(),
+            Some("32dc939d0777df0367b9d127ee79b39aa27525fb")
+        );
         assert_eq!(ibb_auth_token("<html>no config</html>"), None);
         assert_eq!(ibb_auth_token(r#"auth_token="";"#), None);
     }
@@ -825,8 +938,18 @@ PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
     #[test]
     fn the_session_cookie_goes_back_without_its_attributes() {
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.append(reqwest::header::SET_COOKIE, "PHPSESSID=abc123; path=/; secure; HttpOnly".parse().unwrap());
-        headers.append(reqwest::header::SET_COOKIE, "lang=en; expires=Thu, 01 Jan 2099 00:00:00 GMT".parse().unwrap());
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            "PHPSESSID=abc123; path=/; secure; HttpOnly"
+                .parse()
+                .unwrap(),
+        );
+        headers.append(
+            reqwest::header::SET_COOKIE,
+            "lang=en; expires=Thu, 01 Jan 2099 00:00:00 GMT"
+                .parse()
+                .unwrap(),
+        );
         assert_eq!(session_cookies(&headers), "PHPSESSID=abc123; lang=en");
     }
 
@@ -834,11 +957,18 @@ PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
     #[test]
     fn the_direct_link_is_taken_from_the_answer() {
         let body = r#"{"status_code":200,"success":{"message":"image uploaded","code":200},"image":{"name":"cat","url":"https://i.ibb.co/abc123/cat.png","url_viewer":"https://ibb.co/abc123","display_url":"https://i.ibb.co/xyz/cat.png","delete_url":"https://ibb.co/abc123/deadbeef"},"status_txt":"OK"}"#;
-        assert_eq!(ibb_link(reqwest::StatusCode::OK, body).unwrap(), "https://i.ibb.co/abc123/cat.png");
+        assert_eq!(
+            ibb_link(reqwest::StatusCode::OK, body).unwrap(),
+            "https://i.ibb.co/abc123/cat.png"
+        );
         let refused = r#"{"status_code":400,"error":{"message":"Invalid content type","code":311},"status_txt":"Bad Request"}"#;
-        let err = ibb_link(reqwest::StatusCode::BAD_REQUEST, refused).unwrap_err().to_string();
+        let err = ibb_link(reqwest::StatusCode::BAD_REQUEST, refused)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Invalid content type"), "got {err}");
-        let err = ibb_link(reqwest::StatusCode::OK, "<html>maintenance</html>").unwrap_err().to_string();
+        let err = ibb_link(reqwest::StatusCode::OK, "<html>maintenance</html>")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("did not return a link"), "got {err}");
     }
 
@@ -855,12 +985,23 @@ PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
     #[test]
     fn imgur_answers_are_read_for_the_file_or_the_reason() {
         let ok = r#"{"data":{"id":"AbC123x","deletehash":"zz","link":"https://i.imgur.com/AbC123x.png","type":"image/png"},"success":true,"status":200}"#;
-        assert_eq!(imgur_link(reqwest::StatusCode::OK, ok).unwrap(), "https://i.imgur.com/AbC123x.png");
+        assert_eq!(
+            imgur_link(reqwest::StatusCode::OK, ok).unwrap(),
+            "https://i.imgur.com/AbC123x.png"
+        );
         let refused = r#"{"data":{"error":"File type invalid (1)","request":"/3/image","method":"POST"},"success":false,"status":400}"#;
-        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, refused).unwrap_err().to_string().contains("File type invalid"));
+        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, refused)
+            .unwrap_err()
+            .to_string()
+            .contains("File type invalid"));
         let nested = r#"{"data":{"error":{"code":1003,"message":"File type invalid (1)","type":"ImgurException"}},"success":false,"status":400}"#;
-        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, nested).unwrap_err().to_string().contains("File type invalid"));
-        let err = imgur_link(reqwest::StatusCode::TOO_MANY_REQUESTS, "").unwrap_err().to_string();
+        assert!(imgur_link(reqwest::StatusCode::BAD_REQUEST, nested)
+            .unwrap_err()
+            .to_string()
+            .contains("File type invalid"));
+        let err = imgur_link(reqwest::StatusCode::TOO_MANY_REQUESTS, "")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("429"), "got {err}");
     }
 
@@ -877,11 +1018,17 @@ PF.obj.config.auth_token="32dc939d0777df0367b9d127ee79b39aa27525fb";"#;
     /// zero-byte upload and linking to nothing.
     #[tokio::test]
     async fn an_empty_file_is_refused() {
-        let dir = std::env::temp_dir().join(format!("nobilis-upload-{}", crate::model::next_message_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "nobilis-upload-{}",
+            crate::model::next_message_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("empty.png");
         std::fs::write(&file, b"").unwrap();
-        let err = upload_reporting(Host::Catbox, file.to_str().unwrap(), None, None).await.unwrap_err().to_string();
+        let err = upload_reporting(Host::Catbox, file.to_str().unwrap(), None, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("empty"), "got {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -30,8 +30,22 @@ pub async fn lookup(key: &str, app: u64) -> Option<String> {
     if router.routed(key) && router.ready_for_general().await.is_err() {
         return None;
     }
-    let http = router.client_if("steam", router.routed(key), |b| b.timeout(std::time::Duration::from_secs(15)).user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"))));
-    let answer: Value = http.get(STORE).query(&[("appids", app.to_string()), ("filters", "basic".to_string())]).send().await.ok()?.json().await.ok()?;
+    let http = router.client_if("steam", router.routed(key), |b| {
+        b.timeout(std::time::Duration::from_secs(15))
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+    });
+    let answer: Value = http
+        .get(STORE)
+        .query(&[
+            ("appids", app.to_string()),
+            ("filters", "basic".to_string()),
+        ])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
     name_in(&answer, app)
 }
 
@@ -45,8 +59,18 @@ mod tests {
         let said = json!({ "730": { "success": true, "data": { "type": "game", "name": "Counter-Strike 2", "steam_appid": 730 } } });
         assert_eq!(name_in(&said, 730).as_deref(), Some("Counter-Strike 2"));
         assert_eq!(name_in(&said, 731), None, "another game is not this one");
-        assert_eq!(name_in(&json!({ "99": { "success": false } }), 99), None, "a game the store does not know has no name");
-        assert_eq!(name_in(&json!({ "5": { "success": true, "data": { "name": "  " } } }), 5), None);
+        assert_eq!(
+            name_in(&json!({ "99": { "success": false } }), 99),
+            None,
+            "a game the store does not know has no name"
+        );
+        assert_eq!(
+            name_in(
+                &json!({ "5": { "success": true, "data": { "name": "  " } } }),
+                5
+            ),
+            None
+        );
         assert_eq!(name_in(&json!([]), 5), None);
     }
 }

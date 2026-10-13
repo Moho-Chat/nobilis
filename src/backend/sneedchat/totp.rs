@@ -26,7 +26,8 @@ pub fn generate_at(secret: &[u8], unix_time: u64, digits: u32, step: u64) -> Res
     }
 
     let counter = unix_time / step;
-    let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(secret).map_err(|e| anyhow::anyhow!("TOTP secret is not a valid HMAC key: {e}"))?;
+    let mut mac = <Hmac<Sha1> as KeyInit>::new_from_slice(secret)
+        .map_err(|e| anyhow::anyhow!("TOTP secret is not a valid HMAC key: {e}"))?;
     mac.update(&counter.to_be_bytes());
     let hash = mac.finalize().into_bytes();
 
@@ -34,32 +35,53 @@ pub fn generate_at(secret: &[u8], unix_time: u64, digits: u32, step: u64) -> Res
     // picks where to read a 4-byte window, and the top bit is masked off so
     // the value is positive regardless of the reader's integer signedness.
     let offset = (hash[hash.len() - 1] & 0x0f) as usize;
-    let binary = u32::from_be_bytes([hash[offset] & 0x7f, hash[offset + 1], hash[offset + 2], hash[offset + 3]]);
+    let binary = u32::from_be_bytes([
+        hash[offset] & 0x7f,
+        hash[offset + 1],
+        hash[offset + 2],
+        hash[offset + 3],
+    ]);
 
     let modulus = 10u32.pow(digits);
-    Ok(format!("{:0width$}", binary % modulus, width = digits as usize))
+    Ok(format!(
+        "{:0width$}",
+        binary % modulus,
+        width = digits as usize
+    ))
 }
 
 /// Generate the code for right now.
 pub fn generate_now(secret: &[u8]) -> Result<String> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).context("system clock is before the Unix epoch")?.as_secs();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
     generate_at(secret, now, DIGITS, STEP_SECS)
 }
 
 /// Decode a secret as shown during 2FA setup. Spaces and lowercase are
 /// accepted since that's how sites display them; padding is optional.
 pub fn decode_secret(secret: &str) -> Result<Vec<u8>> {
-    let cleaned: String = secret.chars().filter(|c| !c.is_whitespace() && *c != '-').collect::<String>().to_ascii_uppercase();
+    let cleaned: String = secret
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect::<String>()
+        .to_ascii_uppercase();
     if cleaned.is_empty() {
         bail!("TOTP secret is empty");
     }
-    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &cleaned).filter(|b| !b.is_empty()).context("TOTP secret is not valid base32")
+    base32::decode(base32::Alphabet::Rfc4648 { padding: false }, &cleaned)
+        .filter(|b| !b.is_empty())
+        .context("TOTP secret is not valid base32")
 }
 
 /// Seconds until the current code expires, for deciding whether a code
 /// about to be generated is about to roll over.
 pub fn seconds_remaining() -> u64 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     STEP_SECS - (now % STEP_SECS)
 }
 
@@ -79,7 +101,11 @@ mod tests {
             (2000000000, "69279037"),
             (20000000000, "65353130"),
         ] {
-            assert_eq!(generate_at(RFC_SECRET, time, 8, STEP_SECS).unwrap(), expected, "vector at T={time}");
+            assert_eq!(
+                generate_at(RFC_SECRET, time, 8, STEP_SECS).unwrap(),
+                expected,
+                "vector at T={time}"
+            );
         }
     }
 
@@ -114,7 +140,11 @@ mod tests {
     fn decodes_secrets_as_users_paste_them() {
         let canonical = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
         assert_eq!(decode_secret(canonical).unwrap(), RFC_SECRET);
-        for variant in ["gezdgnbvgy3tqojqgezdgnbvgy3tqojq", "GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ", "GEZD-GNBV-GY3T-QOJQ-GEZD-GNBV-GY3T-QOJQ"] {
+        for variant in [
+            "gezdgnbvgy3tqojqgezdgnbvgy3tqojq",
+            "GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ",
+            "GEZD-GNBV-GY3T-QOJQ-GEZD-GNBV-GY3T-QOJQ",
+        ] {
             assert_eq!(decode_secret(variant).unwrap(), RFC_SECRET, "{variant}");
         }
     }

@@ -12,8 +12,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use hyper::Method;
 
-use super::form;
 use super::captcha;
+use super::form;
 use super::http::{CookieJar, HttpClient, Response};
 use super::pow;
 use super::totp;
@@ -37,7 +37,10 @@ pub struct Credentials {
 impl std::fmt::Debug for Credentials {
     /// Hand-written so the password can't reach a log through a stray `{:?}`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials").field("username", &self.username).field("password", &"<redacted>").finish()
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }
 
@@ -89,9 +92,11 @@ pub struct Session {
 
 impl Session {
     pub fn new(transport: Transport, base: String, user_agent: String) -> Self {
-        Self { http: HttpClient::new(transport, CookieJar::new(), user_agent), base }
+        Self {
+            http: HttpClient::new(transport, CookieJar::new(), user_agent),
+            base,
+        }
     }
-
 
     /// Whether the current session is authenticated, costing one request.
     pub async fn is_authenticated(&self) -> Result<bool> {
@@ -100,7 +105,11 @@ impl Session {
     }
 
     /// Log in if the session isn't already authenticated.
-    pub async fn ensure_authenticated(&self, creds: &Credentials, two_factor: &TwoFactor) -> Result<()> {
+    pub async fn ensure_authenticated(
+        &self,
+        creds: &Credentials,
+        two_factor: &TwoFactor,
+    ) -> Result<()> {
         if self.is_authenticated().await? {
             return Ok(());
         }
@@ -113,7 +122,9 @@ impl Session {
         if resp.status != pow::GATE_STATUS {
             return Ok(resp);
         }
-        pow::clear(&self.http, url, MAX_GATE_STEPS).await.context("solving the gate")?;
+        pow::clear(&self.http, url, MAX_GATE_STEPS)
+            .await
+            .context("solving the gate")?;
         self.http.get(url).await
     }
 
@@ -175,7 +186,11 @@ impl Session {
     /// guessing at the delimiter.
     pub fn user_id(&self) -> Option<u32> {
         let raw = self.http.jar.get(USER_COOKIE)?;
-        let digits: String = raw.trim().chars().take_while(char::is_ascii_digit).collect();
+        let digits: String = raw
+            .trim()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
         digits.parse().ok()
     }
 
@@ -186,7 +201,8 @@ impl Session {
             return Ok(());
         }
 
-        let section = form::form_section(&page.body, "/login/login").context("could not find the login form; the site layout may have changed")?;
+        let section = form::form_section(&page.body, "/login/login")
+            .context("could not find the login form; the site layout may have changed")?;
         let mut fields = form::inputs(section);
 
         form::set(&mut fields, "login", &creds.username);
@@ -198,7 +214,9 @@ impl Session {
 
         tokio::time::sleep(FORM_DWELL).await;
 
-        let resp = self.post(&format!("{}/login/login", self.base), &fields).await?;
+        let resp = self
+            .post(&format!("{}/login/login", self.base), &fields)
+            .await?;
         match outcome(&resp)? {
             Outcome::TwoFactor(location) => {
                 let url = absolute(&self.base, &location)?;
@@ -214,11 +232,15 @@ impl Session {
         let provider = two_step_provider(&page.body)?;
         tracing::info!("two-factor challenge, provider {provider}");
 
-        let code = two_factor.code(&provider).context("obtaining the two-factor code")?;
+        let code = two_factor
+            .code(&provider)
+            .context("obtaining the two-factor code")?;
         let mut fields = two_step_fields(&page.body, &code)?;
         self.answer_captcha(&page.body, &mut fields).await?;
 
-        let resp = self.post(&format!("{}/login/two-step", self.base), &fields).await?;
+        let resp = self
+            .post(&format!("{}/login/two-step", self.base), &fields)
+            .await?;
         match outcome(&resp)? {
             Outcome::Success => self.confirm().await,
             Outcome::TwoFactor(_) => bail!("two-factor step failed: the code was not accepted"),
@@ -260,16 +282,24 @@ impl Session {
     /// Everything else is left unfollowed, since a 303 *is* the answer
     /// being read.
     async fn post(&self, url: &str, fields: &[(String, String)]) -> Result<Response> {
-        let pairs: Vec<(&str, &str)> = fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
         let body = super::http::encode_form(&pairs);
 
         let mut url = url.to_string();
         for _ in 0..3 {
-            let resp = self.http.send_no_redirect(Method::POST, &url, Some(body.clone())).await?;
+            let resp = self
+                .http
+                .send_no_redirect(Method::POST, &url, Some(body.clone()))
+                .await?;
             if !matches!(resp.status, 307 | 308) {
                 return Ok(resp);
             }
-            let Some(location) = redirect_target(&resp) else { return Ok(resp) };
+            let Some(location) = redirect_target(&resp) else {
+                return Ok(resp);
+            };
             let next = absolute(&url, &location)?;
             tracing::info!("re-posting to {next} after {} redirect", resp.status);
             url = next;
@@ -300,14 +330,18 @@ fn outcome(resp: &Response) -> Result<Outcome> {
     let location = redirect_target(resp);
 
     let Some(location) = location else {
-        return Ok(Outcome::Rejected(form_error(&resp.body).unwrap_or_else(|| format!("the server returned {status} without redirecting"))));
+        return Ok(Outcome::Rejected(form_error(&resp.body).unwrap_or_else(
+            || format!("the server returned {status} without redirecting"),
+        )));
     };
 
     if location.contains("two-step") {
         return Ok(Outcome::TwoFactor(location));
     }
     if location.contains("/login") {
-        return Ok(Outcome::Rejected(form_error(&resp.body).unwrap_or_else(|| format!("redirected back to {location}"))));
+        return Ok(Outcome::Rejected(
+            form_error(&resp.body).unwrap_or_else(|| format!("redirected back to {location}")),
+        ));
     }
     if (300..400).contains(&status) {
         return Ok(Outcome::Success);
@@ -318,12 +352,19 @@ fn outcome(resp: &Response) -> Result<Outcome> {
 /// Which second factor the server is asking for. Defaults to TOTP, which is
 /// what the form uses when it doesn't say.
 fn two_step_provider(html: &str) -> Result<String> {
-    let section = form::form_section(html, "two-step").context("could not find the two-step form")?;
-    Ok(form::inputs(section).into_iter().find(|(n, _)| n == "provider").map(|(_, v)| v).filter(|v| !v.is_empty()).unwrap_or_else(|| "totp".to_string()))
+    let section =
+        form::form_section(html, "two-step").context("could not find the two-step form")?;
+    Ok(form::inputs(section)
+        .into_iter()
+        .find(|(n, _)| n == "provider")
+        .map(|(_, v)| v)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "totp".to_string()))
 }
 
 fn two_step_fields(html: &str, code: &str) -> Result<Vec<(String, String)>> {
-    let section = form::form_section(html, "two-step").context("could not find the two-step form")?;
+    let section =
+        form::form_section(html, "two-step").context("could not find the two-step form")?;
     let mut fields = form::inputs(section);
     form::set(&mut fields, "code", code.trim());
     // Trusting this client makes the server issue xf_tfa_trust and stop
@@ -335,7 +376,10 @@ fn two_step_fields(html: &str, code: &str) -> Result<Vec<(String, String)>> {
 }
 
 fn redirect_target(resp: &Response) -> Option<String> {
-    resp.headers.get(hyper::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string)
+    resp.headers
+        .get(hyper::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 fn absolute(base: &str, location: &str) -> Result<String> {
@@ -345,11 +389,19 @@ fn absolute(base: &str, location: &str) -> Result<String> {
 /// Pull the human-readable error out of a re-rendered form, so a rejection
 /// reports "incorrect password" rather than just "HTTP 200".
 fn form_error(html: &str) -> Option<String> {
-    for marker in ["blockMessage--error", "js-errorMessage", "formRow-explain--error"] {
+    for marker in [
+        "blockMessage--error",
+        "js-errorMessage",
+        "formRow-explain--error",
+    ] {
         let Some(i) = html.find(marker) else { continue };
         let after = &html[i..];
-        let Some(start) = after.find('>') else { continue };
-        let Some(end) = after[start..].find('<') else { continue };
+        let Some(start) = after.find('>') else {
+            continue;
+        };
+        let Some(end) = after[start..].find('<') else {
+            continue;
+        };
         let text = strip_tags(&after[start + 1..start + end]);
         if !text.is_empty() {
             return Some(text);
@@ -378,7 +430,10 @@ mod tests {
 
     #[test]
     fn credentials_never_debug_print_the_password() {
-        let c = Credentials { username: "Null Test Account".into(), password: "hunter2".into() };
+        let c = Credentials {
+            username: "Null Test Account".into(),
+            password: "hunter2".into(),
+        };
         let rendered = format!("{c:?}");
         assert!(rendered.contains("Null Test Account"));
         assert!(!rendered.contains("hunter2"), "password leaked: {rendered}");
@@ -387,8 +442,12 @@ mod tests {
 
     #[test]
     fn detects_the_logged_in_marker() {
-        assert!(logged_in_marker(r#"<html id="XF" data-logged-in="true" data-xf="2.3">"#));
-        assert!(!logged_in_marker(r#"<html id="XF" data-logged-in="false" data-xf="2.3">"#));
+        assert!(logged_in_marker(
+            r#"<html id="XF" data-logged-in="true" data-xf="2.3">"#
+        ));
+        assert!(!logged_in_marker(
+            r#"<html id="XF" data-logged-in="false" data-xf="2.3">"#
+        ));
         assert!(!logged_in_marker("<html>"));
     }
 
@@ -396,7 +455,10 @@ mod tests {
     fn extracts_the_error_text_from_a_rejected_login() {
         let html = r#"<div class="blockMessage blockMessage--error">
             The requested user could not be found.</div>"#;
-        assert_eq!(form_error(html).unwrap(), "The requested user could not be found.");
+        assert_eq!(
+            form_error(html).unwrap(),
+            "The requested user could not be found."
+        );
     }
 
     #[test]
@@ -424,7 +486,13 @@ mod tests {
     #[test]
     fn two_step_submission_echoes_the_form_and_sets_our_fields() {
         let fields = two_step_fields(TWO_STEP_PAGE, "123456").unwrap();
-        let get = |n: &str| fields.iter().find(|(k, _)| k == n).map(|(_, v)| v.as_str()).unwrap_or_default();
+        let get = |n: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == n)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or_default()
+        };
 
         assert_eq!(get("_xfToken"), "1785255424,abcdef");
         assert_eq!(get("_xfRedirect"), "https://example.onion/");
@@ -437,9 +505,15 @@ mod tests {
     #[test]
     fn two_step_reads_the_provider_and_defaults_to_totp() {
         assert_eq!(two_step_provider(TWO_STEP_PAGE).unwrap(), "totp");
-        let email = TWO_STEP_PAGE.replace(r#"name="provider" value="totp""#, r#"name="provider" value="email""#);
+        let email = TWO_STEP_PAGE.replace(
+            r#"name="provider" value="totp""#,
+            r#"name="provider" value="email""#,
+        );
         assert_eq!(two_step_provider(&email).unwrap(), "email");
-        let none = TWO_STEP_PAGE.replace(r#"<input type="hidden" name="provider" value="totp" />"#, "");
+        let none = TWO_STEP_PAGE.replace(
+            r#"<input type="hidden" name="provider" value="totp" />"#,
+            "",
+        );
         assert_eq!(two_step_provider(&none).unwrap(), "totp");
         assert!(two_step_provider("<html><body>nope</body></html>").is_err());
     }
@@ -454,7 +528,10 @@ mod tests {
 
     #[test]
     fn relative_redirects_resolve_against_the_base() {
-        assert_eq!(absolute("https://h.onion", "/login/two-step?remember=1").unwrap(), "https://h.onion/login/two-step?remember=1");
+        assert_eq!(
+            absolute("https://h.onion", "/login/two-step?remember=1").unwrap(),
+            "https://h.onion/login/two-step?remember=1"
+        );
     }
 
     #[test]

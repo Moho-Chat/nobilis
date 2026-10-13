@@ -57,20 +57,27 @@ pub(super) fn presence_payload(status: &str, text: &str) -> serde_json::Value {
 /// `text` is the custom status when it is being set or cleared (`Some("")`), and
 /// `None` when only the status is being changed: the account's own setting is
 /// then left alone, rather than cleared by a change of colour.
-pub async fn apply_status(state: &AppState, account_id: &str, status: &str, text: Option<&str>) -> bool {
+pub async fn apply_status(
+    state: &AppState,
+    account_id: &str,
+    status: &str,
+    text: Option<&str>,
+) -> bool {
     if let Some(sender) = state.runtime.discord_gateway_sender(account_id) {
         // Opcode 3 is presence update.
         let said = state.runtime.account_status_text(account_id);
         let _ = sender.send(json!({ "op": 3, "d": presence_payload(status, &said) }).to_string());
     }
 
-    let Some(config) = state.accounts.get_discord(account_id) else { return false };
+    let Some(config) = state.accounts.get_discord(account_id) else {
+        return false;
+    };
     match send_write(
         http_client_for(&config.token)
-        .patch(format!("{API_BASE}/users/@me/settings"))
-        .header("Authorization", &config.token)
-        .json(&settings_body(status, text))
-        )
+            .patch(format!("{API_BASE}/users/@me/settings"))
+            .header("Authorization", &config.token)
+            .json(&settings_body(status, text)),
+    )
     .await
     {
         Ok(resp) if resp.status().is_success() => true,
@@ -93,9 +100,13 @@ pub async fn apply_status(state: &AppState, account_id: &str, status: &str, text
 /// writing it to the account's settings would turn a coffee break into the
 /// status every other device starts from.
 pub fn apply_session_presence(state: &AppState, account_id: &str, status: &str) -> bool {
-    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else { return false };
+    let Some(sender) = state.runtime.discord_gateway_sender(account_id) else {
+        return false;
+    };
     let said = state.runtime.account_status_text(account_id);
-    sender.send(json!({ "op": 3, "d": presence_payload(status, &said) }).to_string()).is_ok()
+    sender
+        .send(json!({ "op": 3, "d": presence_payload(status, &said) }).to_string())
+        .is_ok()
 }
 
 /// What goes to Discord's settings: the status, and the custom status only when
@@ -103,7 +114,11 @@ pub fn apply_session_presence(state: &AppState, account_id: &str, status: &str) 
 fn settings_body(status: &str, text: Option<&str>) -> serde_json::Value {
     let mut body = json!({ "status": discord_status(status) });
     if let Some(text) = text {
-        body["custom_status"] = if text.is_empty() { serde_json::Value::Null } else { json!({ "text": text }) };
+        body["custom_status"] = if text.is_empty() {
+            serde_json::Value::Null
+        } else {
+            json!({ "text": text })
+        };
     }
     body
 }
@@ -117,10 +132,16 @@ fn settings_body(status: &str, text: Option<&str>) -> serde_json::Value {
 /// does when you open a channel, which is also why the roster only exists for
 /// channels somebody is actually looking at.
 pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
-    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return false };
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+        return false;
+    };
     let account_id = buffer.account_id;
-    let Some(sender) = state.runtime.discord_gateway_sender(&account_id) else { return false };
-    let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else { return false };
+    let Some(sender) = state.runtime.discord_gateway_sender(&account_id) else {
+        return false;
+    };
+    let Some(channel_id) = state.runtime.get_discord_channel(buffer_id) else {
+        return false;
+    };
     let Some(guild_id) = state.runtime.get_discord_guild(buffer_id) else {
         // A DM has no guild and no member list to subscribe to; its
         // participants are already known from the channel itself.
@@ -129,7 +150,9 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 
     // The reply names the guild and a permissions-derived list id, never the
     // channel, so remember which buffer this was for.
-    state.runtime.set_discord_member_list_target(&account_id, &guild_id, buffer_id);
+    state
+        .runtime
+        .set_discord_member_list_target(&account_id, &guild_id, buffer_id);
 
     // Ranges are 100-member windows; one covers any channel we would show.
     sender
@@ -167,19 +190,35 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
 /// competing) as a sentence of words, since there is no picture for it.
 pub(super) fn activity_of(activities: &Value) -> Option<Value> {
     let list = activities.as_array()?;
-    let chosen = list.iter().find(|a| a["type"].as_i64() == Some(4)).or_else(|| list.first())?;
-    let said = |key: &str| chosen[key].as_str().map(str::trim).filter(|t| !t.is_empty());
+    let chosen = list
+        .iter()
+        .find(|a| a["type"].as_i64() == Some(4))
+        .or_else(|| list.first())?;
+    let said = |key: &str| {
+        chosen[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    };
     match chosen["type"].as_i64().unwrap_or(0) {
         4 => said("state").map(|t| json!({ "kind": "custom", "text": t })),
         // Streaming and competing are playing as far as a line can say.
         0 | 1 | 5 => said("name").map(|t| json!({ "kind": "game", "text": t })),
-        2 => said("state").or_else(|| said("details")).or_else(|| said("name")).map(|t| json!({ "kind": "music", "text": t })),
+        2 => said("state")
+            .or_else(|| said("details"))
+            .or_else(|| said("name"))
+            .map(|t| json!({ "kind": "music", "text": t })),
         3 => said("name").map(|t| json!({ "kind": "custom", "text": format!("Watching {t}") })),
         _ => None,
     }
 }
 
-pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
+pub(super) fn member_entry(
+    runtime: &crate::runtime::Runtime,
+    account_id: &str,
+    guild_id: &str,
+    item: &Value,
+) -> Option<Value> {
     let member = item.get("member")?;
     let user = &member["user"];
     let user_id = user["id"].as_str()?;
@@ -238,7 +277,12 @@ pub(super) fn member_entry(runtime: &crate::runtime::Runtime, account_id: &str, 
 /// that was meant to remove their old row removes a different one instead:
 /// the person is now listed twice, and the drift grows with every status
 /// change. So a header takes up its slot here and is left out at the end.
-fn window_entry(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, item: &Value) -> Option<Value> {
+fn window_entry(
+    runtime: &crate::runtime::Runtime,
+    account_id: &str,
+    guild_id: &str,
+    item: &Value,
+) -> Option<Value> {
     if let Some(group) = item.get("group") {
         return Some(json!({ "group": group["id"].as_str().unwrap_or("") }));
     }
@@ -269,7 +313,13 @@ pub(super) enum Applied {
 /// INSERT, UPDATE and DELETE address the window by index, which is why the
 /// list they are applied to is held in Discord's order - headers and all -
 /// rather than the sorted one that gets displayed.
-pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &str, guild_id: &str, window: &mut Vec<Value>, op: &Value) -> Applied {
+pub(super) fn apply_member_op(
+    runtime: &crate::runtime::Runtime,
+    account_id: &str,
+    guild_id: &str,
+    window: &mut Vec<Value>,
+    op: &Value,
+) -> Applied {
     let index = |op: &Value| op["index"].as_u64().map(|i| i as usize);
     match op["op"].as_str().unwrap_or("") {
         "SYNC" => {
@@ -295,20 +345,34 @@ pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &st
             }
             Applied::Changed
         }
-        "INSERT" => match (index(op), window_entry(runtime, account_id, guild_id, &op["item"])) {
+        "INSERT" => match (
+            index(op),
+            window_entry(runtime, account_id, guild_id, &op["item"]),
+        ) {
             (Some(i), Some(entry)) if i <= window.len() => {
                 let drawn = !is_group(&entry);
                 window.insert(i, entry);
                 // A header takes its slot but changes nothing anybody sees.
-                if drawn { Applied::Changed } else { Applied::Nothing }
+                if drawn {
+                    Applied::Changed
+                } else {
+                    Applied::Nothing
+                }
             }
             _ => Applied::Stale,
         },
-        "UPDATE" => match (index(op), window_entry(runtime, account_id, guild_id, &op["item"])) {
+        "UPDATE" => match (
+            index(op),
+            window_entry(runtime, account_id, guild_id, &op["item"]),
+        ) {
             (Some(i), Some(entry)) if i < window.len() => {
                 let drawn = !is_group(&entry) || !is_group(&window[i]);
                 window[i] = entry;
-                if drawn { Applied::Changed } else { Applied::Nothing }
+                if drawn {
+                    Applied::Changed
+                } else {
+                    Applied::Nothing
+                }
             }
             _ => Applied::Stale,
         },
@@ -316,7 +380,11 @@ pub(super) fn apply_member_op(runtime: &crate::runtime::Runtime, account_id: &st
             Some(i) if i < window.len() => {
                 let drawn = !is_group(&window[i]);
                 window.remove(i);
-                if drawn { Applied::Changed } else { Applied::Nothing }
+                if drawn {
+                    Applied::Changed
+                } else {
+                    Applied::Nothing
+                }
             }
             _ => Applied::Stale,
         },
@@ -344,14 +412,23 @@ pub(super) fn roster(window: &[Value]) -> Vec<Value> {
         .cloned()
         .collect();
     members.sort_by(|a, b| {
-        let (an, bn) = (a["nick"].as_str().unwrap_or(""), b["nick"].as_str().unwrap_or(""));
-        an.to_lowercase().cmp(&bn.to_lowercase()).then_with(|| an.cmp(bn))
+        let (an, bn) = (
+            a["nick"].as_str().unwrap_or(""),
+            b["nick"].as_str().unwrap_or(""),
+        );
+        an.to_lowercase()
+            .cmp(&bn.to_lowercase())
+            .then_with(|| an.cmp(bn))
     });
     members
 }
 
 pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
-    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+    let account_id = state
+        .runtime
+        .get_buffer(buffer_id)
+        .map(|b| b.account_id)
+        .unwrap_or_default();
     let mut window = state.runtime.discord_member_window(buffer_id);
     let mut changed = false;
 
@@ -369,7 +446,9 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
             // meanwhile: a stale roster reads better than an emptied one.
             Applied::Stale => {
                 tracing::debug!("discord: member window for {buffer_id} is out of step; resyncing");
-                state.runtime.set_discord_member_window(buffer_id, Vec::new());
+                state
+                    .runtime
+                    .set_discord_member_window(buffer_id, Vec::new());
                 request_member_list(state, buffer_id);
                 return;
             }
@@ -379,11 +458,16 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
     if !changed {
         return;
     }
-    state.runtime.set_discord_member_window(buffer_id, window.clone());
+    state
+        .runtime
+        .set_discord_member_window(buffer_id, window.clone());
 
     let member_list = json!(roster(&window));
     state.runtime.set_presence(buffer_id, member_list.clone());
-    state.events.emit("presenceChange", json!({ "bufferId": buffer_id, "members": member_list }));
+    state.events.emit(
+        "presenceChange",
+        json!({ "bufferId": buffer_id, "members": member_list }),
+    );
 }
 
 /// Updates one person's status wherever they are currently listed.
@@ -391,11 +475,23 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
 /// PRESENCE_UPDATE arrives for anyone the account can see, which is far more
 /// people than are in any open roster - so this only touches buffers that
 /// already list them, and says nothing otherwise.
-pub(super) fn update_presence_in_rosters(state: &AppState, user_id: &str, status: &str, activity: Option<Value>) {
+pub(super) fn update_presence_in_rosters(
+    state: &AppState,
+    user_id: &str,
+    status: &str,
+    activity: Option<Value>,
+) {
     for buffer in state.runtime.list_buffers() {
-        let Some(existing) = state.runtime.get_presence(&buffer.id) else { continue };
-        let Some(members) = existing.as_array() else { continue };
-        if !members.iter().any(|m| m["userId"].as_str() == Some(user_id)) {
+        let Some(existing) = state.runtime.get_presence(&buffer.id) else {
+            continue;
+        };
+        let Some(members) = existing.as_array() else {
+            continue;
+        };
+        if !members
+            .iter()
+            .any(|m| m["userId"].as_str() == Some(user_id))
+        {
             continue;
         }
         let updated: Vec<Value> = members
@@ -415,7 +511,10 @@ pub(super) fn update_presence_in_rosters(state: &AppState, user_id: &str, status
             .collect();
         let member_list = json!(updated);
         state.runtime.set_presence(&buffer.id, member_list.clone());
-        state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
+        state.events.emit(
+            "presenceChange",
+            json!({ "bufferId": buffer.id, "members": member_list }),
+        );
     }
 }
 
@@ -424,28 +523,50 @@ mod activity_tests {
     use super::*;
 
     fn said(activities: Value) -> Option<String> {
-        activity_of(&activities).map(|a| format!("{}:{}", a["kind"].as_str().unwrap(), a["text"].as_str().unwrap()))
+        activity_of(&activities).map(|a| {
+            format!(
+                "{}:{}",
+                a["kind"].as_str().unwrap(),
+                a["text"].as_str().unwrap()
+            )
+        })
     }
 
     #[test]
     fn a_game_is_named_bare_and_a_track_by_its_artist() {
-        assert_eq!(said(json!([{ "type": 0, "name": "Resident Evil 4" }])).as_deref(), Some("game:Resident Evil 4"));
+        assert_eq!(
+            said(json!([{ "type": 0, "name": "Resident Evil 4" }])).as_deref(),
+            Some("game:Resident Evil 4")
+        );
         assert_eq!(said(json!([{ "type": 2, "name": "Spotify", "details": "Judy Is a Punk", "state": "Ramones" }])).as_deref(), Some("music:Ramones"));
-        assert_eq!(said(json!([{ "type": 2, "name": "Spotify", "details": "Judy Is a Punk" }])).as_deref(), Some("music:Judy Is a Punk"));
-        assert_eq!(said(json!([{ "type": 2, "name": "Spotify" }])).as_deref(), Some("music:Spotify"));
+        assert_eq!(
+            said(json!([{ "type": 2, "name": "Spotify", "details": "Judy Is a Punk" }])).as_deref(),
+            Some("music:Judy Is a Punk")
+        );
+        assert_eq!(
+            said(json!([{ "type": 2, "name": "Spotify" }])).as_deref(),
+            Some("music:Spotify")
+        );
     }
 
     #[test]
     fn words_somebody_wrote_come_first_and_have_no_picture() {
         assert_eq!(said(json!([{ "type": 0, "name": "Dota 2" }, { "type": 4, "name": "Custom Status", "state": "ask questions", "emoji": { "name": "x" } }])).as_deref(), Some("custom:ask questions"));
-        assert_eq!(said(json!([{ "type": 3, "name": "a stream" }])).as_deref(), Some("custom:Watching a stream"));
+        assert_eq!(
+            said(json!([{ "type": 3, "name": "a stream" }])).as_deref(),
+            Some("custom:Watching a stream")
+        );
     }
 
     #[test]
     fn nothing_is_nothing_and_an_empty_line_is_not_a_line() {
         assert_eq!(said(json!([])), None);
         assert_eq!(said(json!(null)), None);
-        assert_eq!(said(json!([{ "type": 4, "state": "  " }])), None, "a custom status with only an emoji says nothing");
+        assert_eq!(
+            said(json!([{ "type": 4, "state": "  " }])),
+            None,
+            "a custom status with only an emoji says nothing"
+        );
         assert_eq!(said(json!([{ "type": 0, "name": "" }])), None);
         assert_eq!(said(json!([{ "type": 99, "name": "x" }])), None);
     }
@@ -455,7 +576,10 @@ mod activity_tests {
         let runtime = crate::runtime::Runtime::new();
         let item = json!({ "member": { "nick": "Gremlin", "user": { "id": "1", "username": "g" }, "presence": { "status": "online", "activities": [{ "type": 4, "state": "ask questions" }] } } });
         let entry = member_entry(&runtime, "discord:me", "", &item).unwrap();
-        assert_eq!(entry["activity"], json!({ "kind": "custom", "text": "ask questions" }));
+        assert_eq!(
+            entry["activity"],
+            json!({ "kind": "custom", "text": "ask questions" })
+        );
         let quiet = json!({ "member": { "nick": "Q", "user": { "id": "2", "username": "q" }, "presence": { "status": "online" } } });
         assert!(member_entry(&runtime, "discord:me", "", &quiet).unwrap()["activity"].is_null());
     }
@@ -475,7 +599,10 @@ mod window_tests {
     }
 
     fn names(window: &[Value]) -> Vec<String> {
-        roster(window).iter().map(|m| m["nick"].as_str().unwrap_or("").to_string()).collect()
+        roster(window)
+            .iter()
+            .map(|m| m["nick"].as_str().unwrap_or("").to_string())
+            .collect()
     }
 
     /// Only SYNC was ever applied, so a roster froze the moment a channel
@@ -487,21 +614,45 @@ mod window_tests {
         let mut window: Vec<Value> = Vec::new();
 
         let sync = json!({ "op": "SYNC", "range": [0, 99], "items": [member("1", "anna", "online"), member("2", "bob", "idle")] });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync), Applied::Changed);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync),
+            Applied::Changed
+        );
         assert_eq!(window.len(), 2);
         assert_eq!(window[0]["nick"], "anna");
 
         let insert = json!({ "op": "INSERT", "index": 1, "item": member("3", "carol", "online") });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &insert), Applied::Changed);
-        assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "carol", "bob"]);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &insert),
+            Applied::Changed
+        );
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m["nick"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["anna", "carol", "bob"]
+        );
 
         let update = json!({ "op": "UPDATE", "index": 0, "item": member("1", "anna", "offline") });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &update), Applied::Changed);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &update),
+            Applied::Changed
+        );
         assert_eq!(window[0]["away"], true);
 
         let delete = json!({ "op": "DELETE", "index": 1 });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &delete), Applied::Changed);
-        assert_eq!(window.iter().map(|m| m["nick"].as_str().unwrap()).collect::<Vec<_>>(), ["anna", "bob"]);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &delete),
+            Applied::Changed
+        );
+        assert_eq!(
+            window
+                .iter()
+                .map(|m| m["nick"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["anna", "bob"]
+        );
     }
 
     /// The reported bug, in the shape it actually arrives in.
@@ -532,8 +683,14 @@ mod window_tests {
             member("6", "finn", "offline"),
             member("7", "gail", "offline"),
         ]});
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync), Applied::Changed);
-        assert_eq!(names(&window), ["anna", "bob", "carol", "dave", "erin", "finn", "gail"]);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &sync),
+            Applied::Changed
+        );
+        assert_eq!(
+            names(&window),
+            ["anna", "bob", "carol", "dave", "erin", "finn", "gail"]
+        );
 
         // finn comes online: out of the offline section at 7, into the
         // online one at 3. Both indices are well inside the list, so with
@@ -542,7 +699,10 @@ mod window_tests {
             json!({ "op": "DELETE", "index": 7 }),
             json!({ "op": "INSERT", "index": 3, "item": member("6", "finn", "online") }),
         ] {
-            assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &op), Applied::Changed);
+            assert_eq!(
+                apply_member_op(&runtime, "discord:me", "guild", &mut window, &op),
+                Applied::Changed
+            );
         }
 
         assert_eq!(
@@ -550,7 +710,10 @@ mod window_tests {
             ["anna", "bob", "carol", "dave", "erin", "finn", "gail"],
             "finn moved; nobody was lost and nobody was listed twice"
         );
-        let finn = roster(&window).into_iter().find(|m| m["userId"] == "6").expect("finn");
+        let finn = roster(&window)
+            .into_iter()
+            .find(|m| m["userId"] == "6")
+            .expect("finn");
         assert_eq!(finn["status"], "online");
         assert_eq!(finn["away"], false);
     }
@@ -563,12 +726,18 @@ mod window_tests {
         let mut window: Vec<Value> = Vec::new();
 
         let header = json!({ "op": "INSERT", "index": 0, "item": group("online") });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &header), Applied::Nothing);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &header),
+            Applied::Nothing
+        );
         assert_eq!(window.len(), 1);
         assert!(roster(&window).is_empty());
 
         let person = json!({ "op": "INSERT", "index": 1, "item": member("1", "anna", "online") });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &person), Applied::Changed);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &person),
+            Applied::Changed
+        );
         assert_eq!(names(&window), ["anna"]);
     }
 
@@ -581,15 +750,24 @@ mod window_tests {
         let mut window: Vec<Value> = Vec::new();
 
         let past_end = json!({ "op": "DELETE", "index": 7 });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &past_end), Applied::Stale);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &past_end),
+            Applied::Stale
+        );
 
         let invalidate = json!({ "op": "INVALIDATE", "range": [0, 99] });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &invalidate), Applied::Stale);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &invalidate),
+            Applied::Stale
+        );
 
         // An item that is neither a person nor a header: nothing can be put
         // in its slot, so the slot cannot be kept straight either.
         let nonsense = json!({ "op": "INSERT", "index": 0, "item": { "thing": 1 } });
-        assert_eq!(apply_member_op(&runtime, "discord:me", "guild", &mut window, &nonsense), Applied::Stale);
+        assert_eq!(
+            apply_member_op(&runtime, "discord:me", "guild", &mut window, &nonsense),
+            Applied::Stale
+        );
     }
 
     /// Whatever the window holds, nobody is listed twice. This is the
@@ -624,8 +802,14 @@ mod status_tests {
     #[test]
     fn the_settings_leave_the_custom_status_alone_unless_it_is_being_changed() {
         assert!(settings_body("idle", None).get("custom_status").is_none());
-        assert_eq!(settings_body("idle", Some(""))["custom_status"], serde_json::Value::Null);
-        assert_eq!(settings_body("idle", Some("brb"))["custom_status"]["text"], "brb");
+        assert_eq!(
+            settings_body("idle", Some(""))["custom_status"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            settings_body("idle", Some("brb"))["custom_status"]["text"],
+            "brb"
+        );
         assert_eq!(settings_body("idle", None)["status"], "idle");
     }
 }

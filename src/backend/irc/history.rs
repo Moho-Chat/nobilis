@@ -35,7 +35,9 @@ pub fn chathistory_latest(target: &str) -> Message {
 /// milliseconds. Built from a unix second, which is what the store keeps.
 pub fn chathistory_before(target: &str, before_unix: i64) -> Option<Message> {
     let at = chrono::DateTime::from_timestamp(before_unix, 0)?.format("%Y-%m-%dT%H:%M:%S%.3fZ");
-    format!("CHATHISTORY BEFORE {target} timestamp={at} {CHATHISTORY_PAGE}").parse().ok()
+    format!("CHATHISTORY BEFORE {target} timestamp={at} {CHATHISTORY_PAGE}")
+        .parse()
+        .ok()
 }
 
 /// Waits for a CHATHISTORY page to land, or gives up.
@@ -52,7 +54,13 @@ pub async fn await_history(state: &AppState, buffer_id: &str, before: i64, limit
     let deadline = tokio::time::Instant::now() + PATIENCE;
     while tokio::time::Instant::now() < deadline {
         tokio::time::sleep(CHECK).await;
-        if state.store.get_backlog(buffer_id, before, limit).map(|m| m.len()).unwrap_or(0) > had {
+        if state
+            .store
+            .get_backlog(buffer_id, before, limit)
+            .map(|m| m.len())
+            .unwrap_or(0)
+            > had
+        {
             return;
         }
     }

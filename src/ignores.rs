@@ -48,11 +48,20 @@ impl IgnoreStore {
             // A file that will not parse must not stop the daemon starting -
             // ignoring nobody is a working configuration.
             .unwrap_or_default();
-        Self { path, inner: Mutex::new(inner) }
+        Self {
+            path,
+            inner: Mutex::new(inner),
+        }
     }
 
     pub fn for_account(&self, account_id: &str) -> Vec<String> {
-        self.inner.lock().unwrap().accounts.get(account_id).cloned().unwrap_or_default()
+        self.inner
+            .lock()
+            .unwrap()
+            .accounts
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Adds or removes one entry, and says whether anything changed.
@@ -95,7 +104,9 @@ impl IgnoreStore {
     fn update(&self, edit: impl FnOnce(&mut IgnorePrefs)) {
         let mut prefs = self.inner.lock().unwrap();
         edit(&mut prefs);
-        let Ok(text) = toml::to_string_pretty(&*prefs) else { return };
+        let Ok(text) = toml::to_string_pretty(&*prefs) else {
+            return;
+        };
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -148,7 +159,9 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
         }
     }
     // And anchored at the end unless it finishes with a wildcard.
-    parts.last().is_some_and(|last| last.is_empty() || rest.is_empty())
+    parts
+        .last()
+        .is_some_and(|last| last.is_empty() || rest.is_empty())
 }
 
 #[cfg(test)]
@@ -206,7 +219,10 @@ mod tests {
         assert!(store.for_account("irc:gone").is_empty());
         assert_eq!(store.for_account("irc:kept"), vec!["Other"]);
         let reopened = IgnoreStore::open(path);
-        assert!(reopened.for_account("irc:gone").is_empty(), "the file forgot too");
+        assert!(
+            reopened.for_account("irc:gone").is_empty(),
+            "the file forgot too"
+        );
         assert_eq!(reopened.for_account("irc:kept"), vec!["Other"]);
         let _ = std::fs::remove_dir_all(&dir);
     }

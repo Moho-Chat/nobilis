@@ -36,17 +36,20 @@ use js_int::UInt;
 use matrix_sdk_crypto::olm::EncryptionSettings;
 use matrix_sdk_crypto::types::requests::AnyOutgoingRequest;
 use matrix_sdk_crypto::{
-    CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder, TrustRequirement,
+    CollectStrategy, DecryptionSettings, EncryptionSyncChanges, OlmMachine, OlmMachineBuilder,
+    TrustRequirement,
 };
 use matrix_sdk_sqlite::SqliteCryptoStore;
 // For `event_type()` on a verification step's content - the wire needs the
 // name of the event, and only the trait knows it.
-use ruma_events::MessageLikeEventContent;
 use ruma_client_api::keys::{claim_keys, get_keys, upload_keys, upload_signatures};
 use ruma_client_api::sync::sync_events::DeviceLists;
 use ruma_client_api::to_device::send_event_to_device;
 use ruma_common::serde::Raw;
-use ruma_common::{DeviceId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedOneTimeKeyId, OwnedUserId, RoomId, UserId};
+use ruma_common::{
+    DeviceId, OneTimeKeyAlgorithm, OwnedDeviceId, OwnedOneTimeKeyId, OwnedUserId, RoomId, UserId,
+};
+use ruma_events::MessageLikeEventContent;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,11 +59,16 @@ use tokio::sync::Mutex as AsyncMutex;
 const EXPORT_ROUNDS: u32 = 500_000;
 
 pub fn decryption_settings() -> DecryptionSettings {
-    DecryptionSettings { sender_device_trust_requirement: TrustRequirement::Untrusted }
+    DecryptionSettings {
+        sender_device_trust_requirement: TrustRequirement::Untrusted,
+    }
 }
 
 pub fn encryption_settings() -> EncryptionSettings {
-    EncryptionSettings { sharing_strategy: CollectStrategy::AllDevices, ..Default::default() }
+    EncryptionSettings {
+        sharing_strategy: CollectStrategy::AllDevices,
+        ..Default::default()
+    }
 }
 
 /// One account's running `OlmMachine` plus the lock the crate's own
@@ -77,7 +85,16 @@ pub struct CryptoSession {
 /// directory name - `@`/`:` aren't valid on every filesystem this could
 /// run on.
 fn sanitize_account_id(account_id: &str) -> String {
-    account_id.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
+    account_id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Deletes an account's crypto store.
@@ -93,7 +110,9 @@ fn sanitize_account_id(account_id: &str) -> String {
 /// the log, not a refusal to remove the account - the account is going either
 /// way, and refusing would leave the caller with half a removal.
 pub fn forget(data_dir: &Path, account_id: &str) {
-    let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
+    let dir = data_dir
+        .join("matrix-crypto")
+        .join(sanitize_account_id(account_id));
     if !dir.exists() {
         return;
     }
@@ -124,11 +143,26 @@ impl CryptoSession {
     /// cache. If the store already has Olm identity keys for this user/
     /// device pair, those are reused (this is what makes device_id reuse
     /// across restarts actually matter - see auth.rs's module doc).
-    pub async fn open(data_dir: &Path, account_id: &str, user_id: &UserId, device_id: &DeviceId) -> Result<Self> {
-        let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
-        tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
-        let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = match OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).build().await {
+    pub async fn open(
+        data_dir: &Path,
+        account_id: &str,
+        user_id: &UserId,
+        device_id: &DeviceId,
+    ) -> Result<Self> {
+        let dir = data_dir
+            .join("matrix-crypto")
+            .join(sanitize_account_id(account_id));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("creating matrix crypto store directory")?;
+        let store = SqliteCryptoStore::open(&dir, None)
+            .await
+            .context("opening matrix crypto store")?;
+        let machine = match OlmMachineBuilder::new(user_id, device_id)
+            .with_crypto_store(store)
+            .build()
+            .await
+        {
             Ok(machine) => machine,
             // A store belonging to a different device, which happens whenever
             // somebody signs in again: the homeserver mints a new device, and
@@ -147,15 +181,24 @@ impl CryptoSession {
                     dir.display()
                 );
                 forget(data_dir, account_id);
-                tokio::fs::create_dir_all(&dir).await.context("recreating matrix crypto store directory")?;
-                let store = SqliteCryptoStore::open(&dir, None).await.context("reopening matrix crypto store")?;
-                OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).build()
+                tokio::fs::create_dir_all(&dir)
+                    .await
+                    .context("recreating matrix crypto store directory")?;
+                let store = SqliteCryptoStore::open(&dir, None)
+                    .await
+                    .context("reopening matrix crypto store")?;
+                OlmMachineBuilder::new(user_id, device_id)
+                    .with_crypto_store(store)
+                    .build()
                     .await
                     .context("initializing OlmMachine on a fresh store")?
             }
             Err(e) => return Err(e).context("initializing OlmMachine"),
         };
-        Ok(Self { machine, outgoing_lock: AsyncMutex::new(()) })
+        Ok(Self {
+            machine,
+            outgoing_lock: AsyncMutex::new(()),
+        })
     }
 
     /// Creates this account's crypto store around an Olm account made
@@ -181,14 +224,27 @@ impl CryptoSession {
         secrets: Option<&matrix_sdk_crypto::types::SecretsBundle>,
     ) -> Result<()> {
         forget(data_dir, account_id);
-        let dir = data_dir.join("matrix-crypto").join(sanitize_account_id(account_id));
-        tokio::fs::create_dir_all(&dir).await.context("creating matrix crypto store directory")?;
-        let store = SqliteCryptoStore::open(&dir, None).await.context("opening matrix crypto store")?;
-        let machine = OlmMachineBuilder::new(user_id, device_id).with_crypto_store(store).with_custom_account(Some(account)).build()
+        let dir = data_dir
+            .join("matrix-crypto")
+            .join(sanitize_account_id(account_id));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .context("creating matrix crypto store directory")?;
+        let store = SqliteCryptoStore::open(&dir, None)
+            .await
+            .context("opening matrix crypto store")?;
+        let machine = OlmMachineBuilder::new(user_id, device_id)
+            .with_crypto_store(store)
+            .with_custom_account(Some(account))
+            .build()
             .await
             .context("initializing OlmMachine with the QR sign-in's account")?;
         if let Some(secrets) = secrets {
-            machine.store().import_secrets_bundle(secrets).await.context("importing the secrets the other device sent")?;
+            machine
+                .store()
+                .import_secrets_bundle(secrets)
+                .await
+                .context("importing the secrets the other device sent")?;
         }
         Ok(())
     }
@@ -210,7 +266,9 @@ impl CryptoSession {
         };
         for request in requests {
             if let Err(e) = self.send_one(homeserver_url, access_token, &request).await {
-                tracing::warn!("matrix crypto: outgoing request failed (will retry next cycle): {e:#}");
+                tracing::warn!(
+                    "matrix crypto: outgoing request failed (will retry next cycle): {e:#}"
+                );
             }
         }
     }
@@ -226,10 +284,21 @@ impl CryptoSession {
     /// The cancellation is sent first where there is one: it withdraws an
     /// earlier request for the same session, so a room full of unreadable
     /// history asks once per session rather than once per message.
-    pub async fn request_room_key(&self, homeserver_url: &str, access_token: &str, event: &Value, room_id: &RoomId) -> Result<()> {
+    pub async fn request_room_key(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        event: &Value,
+        room_id: &RoomId,
+    ) -> Result<()> {
         let raw: Raw<matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent> =
-            Raw::from_json_string(event.to_string()).context("re-serializing event to ask for its key")?;
-        let (cancel, request) = self.machine.request_room_key(&raw, room_id).await.context("request_room_key")?;
+            Raw::from_json_string(event.to_string())
+                .context("re-serializing event to ask for its key")?;
+        let (cancel, request) = self
+            .machine
+            .request_room_key(&raw, room_id)
+            .await
+            .context("request_room_key")?;
         if let Some(cancel) = cancel {
             if let Err(e) = self.send_one(homeserver_url, access_token, &cancel).await {
                 tracing::debug!("matrix crypto: withdrawing the older key request: {e:#}");
@@ -283,7 +352,9 @@ impl CryptoSession {
                 return;
             }
         };
-        let Some((request_id, request)) = pending else { return };
+        let Some((request_id, request)) = pending else {
+            return;
+        };
 
         let base = homeserver_url.trim_end_matches('/');
         let url = format!(
@@ -294,19 +365,33 @@ impl CryptoSession {
         let resp = match http::put_json(&url, access_token, body).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("matrix crypto: uploading backup keys failed (will retry next cycle): {e:#}");
+                tracing::warn!(
+                    "matrix crypto: uploading backup keys failed (will retry next cycle): {e:#}"
+                );
                 return;
             }
         };
         let etag = resp["etag"].as_str().unwrap_or_default().to_string();
-        let count = resp["count"].as_u64().and_then(|n| UInt::try_from(n).ok()).unwrap_or_default();
+        let count = resp["count"]
+            .as_u64()
+            .and_then(|n| UInt::try_from(n).ok())
+            .unwrap_or_default();
         let response = ruma_client_api::backup::add_backup_keys::v3::Response::new(etag, count);
-        if let Err(e) = self.machine.mark_request_as_sent(&request_id, &response).await {
+        if let Err(e) = self
+            .machine
+            .mark_request_as_sent(&request_id, &response)
+            .await
+        {
             tracing::warn!("matrix crypto: mark_request_as_sent(KeysBackup) failed: {e}");
         }
     }
 
-    async fn send_one(&self, homeserver_url: &str, access_token: &str, request: &matrix_sdk_crypto::types::requests::OutgoingRequest) -> Result<()> {
+    async fn send_one(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        request: &matrix_sdk_crypto::types::requests::OutgoingRequest,
+    ) -> Result<()> {
         let base = homeserver_url.trim_end_matches('/');
         match request.request() {
             AnyOutgoingRequest::KeysUpload(req) => {
@@ -332,27 +417,51 @@ impl CryptoSession {
                 // keys" and "I am not uploading keys" are different requests,
                 // and only the second one is what an empty upload means.
                 if !req.one_time_keys.is_empty() {
-                    body.insert("one_time_keys".into(), serde_json::to_value(&req.one_time_keys)?);
+                    body.insert(
+                        "one_time_keys".into(),
+                        serde_json::to_value(&req.one_time_keys)?,
+                    );
                 }
                 if !req.fallback_keys.is_empty() {
-                    body.insert("fallback_keys".into(), serde_json::to_value(&req.fallback_keys)?);
+                    body.insert(
+                        "fallback_keys".into(),
+                        serde_json::to_value(&req.fallback_keys)?,
+                    );
                 }
                 let body = serde_json::Value::Object(body);
-                let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/upload"), Some(access_token), body).await.context("keys/upload")?;
+                let resp = http::post_json(
+                    &format!("{base}/_matrix/client/v3/keys/upload"),
+                    Some(access_token),
+                    body,
+                )
+                .await
+                .context("keys/upload")?;
                 let mut one_time_key_counts: BTreeMap<OneTimeKeyAlgorithm, UInt> = BTreeMap::new();
                 if let Some(obj) = resp["one_time_key_counts"].as_object() {
                     for (k, v) in obj {
                         if let Some(n) = v.as_u64() {
-                            one_time_key_counts.insert(OneTimeKeyAlgorithm::from(k.as_str()), UInt::try_from(n).unwrap_or_default());
+                            one_time_key_counts.insert(
+                                OneTimeKeyAlgorithm::from(k.as_str()),
+                                UInt::try_from(n).unwrap_or_default(),
+                            );
                         }
                     }
                 }
                 let response = upload_keys::v3::Response::new(one_time_key_counts);
-                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(KeysUpload)")?;
+                self.machine
+                    .mark_request_as_sent(request.request_id(), &response)
+                    .await
+                    .context("mark_request_as_sent(KeysUpload)")?;
             }
             AnyOutgoingRequest::KeysQuery(req) => {
                 let body = serde_json::json!({ "device_keys": req.device_keys });
-                let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/query"), Some(access_token), body).await.context("keys/query")?;
+                let resp = http::post_json(
+                    &format!("{base}/_matrix/client/v3/keys/query"),
+                    Some(access_token),
+                    body,
+                )
+                .await
+                .context("keys/query")?;
                 let mut response = get_keys::v3::Response::new();
                 response.device_keys = raw_nested_map(&resp["device_keys"]);
                 response.master_keys = raw_map(&resp["master_keys"]);
@@ -363,13 +472,23 @@ impl CryptoSession {
                         response.failures.insert(k.clone(), v.clone());
                     }
                 }
-                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(KeysQuery)")?;
+                self.machine
+                    .mark_request_as_sent(request.request_id(), &response)
+                    .await
+                    .context("mark_request_as_sent(KeysQuery)")?;
             }
             AnyOutgoingRequest::KeysClaim(req) => {
-                self.send_keys_claim(homeserver_url, access_token, request.request_id(), req).await?;
+                self.send_keys_claim(homeserver_url, access_token, request.request_id(), req)
+                    .await?;
             }
             AnyOutgoingRequest::ToDeviceRequest(req) => {
-                self.send_to_device_request(homeserver_url, access_token, request.request_id(), req).await?;
+                self.send_to_device_request(
+                    homeserver_url,
+                    access_token,
+                    request.request_id(),
+                    req,
+                )
+                .await?;
             }
             // The signature that makes a verification mean something outside
             // this client. Skipped here for a long time, which is why a
@@ -377,9 +496,13 @@ impl CryptoSession {
             // the emoji matched, both sides agreed, and nobody ever told the
             // homeserver.
             AnyOutgoingRequest::SignatureUpload(req) => {
-                self.post_signatures(homeserver_url, access_token, req).await?;
+                self.post_signatures(homeserver_url, access_token, req)
+                    .await?;
                 let response = upload_signatures::v3::Response::new();
-                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(SignatureUpload)")?;
+                self.machine
+                    .mark_request_as_sent(request.request_id(), &response)
+                    .await
+                    .context("mark_request_as_sent(SignatureUpload)")?;
             }
             // A verification step sent as a room event rather than to-device.
             //
@@ -391,16 +514,28 @@ impl CryptoSession {
                 let event_type = req.content.event_type().to_string();
                 let url = format!(
                     "{base}/_matrix/client/v3/rooms/{}/send/{event_type}/{}",
-                    url::form_urlencoded::byte_serialize(req.room_id.as_str().as_bytes()).collect::<String>(),
-                    url::form_urlencoded::byte_serialize(req.txn_id.as_str().as_bytes()).collect::<String>(),
+                    url::form_urlencoded::byte_serialize(req.room_id.as_str().as_bytes())
+                        .collect::<String>(),
+                    url::form_urlencoded::byte_serialize(req.txn_id.as_str().as_bytes())
+                        .collect::<String>(),
                 );
-                let body = serde_json::to_value(&req.content).context("serialising a verification step")?;
-                let resp = http::put_json(&url, access_token, body).await.context("sending a verification step")?;
+                let body = serde_json::to_value(&req.content)
+                    .context("serialising a verification step")?;
+                let resp = http::put_json(&url, access_token, body)
+                    .await
+                    .context("sending a verification step")?;
                 let response = ruma_client_api::message::send_message_event::v3::Response::new(
-                    ruma_common::OwnedEventId::try_from(resp["event_id"].as_str().unwrap_or("$unknown"))
-                        .unwrap_or_else(|_| ruma_common::OwnedEventId::try_from("$unknown").expect("static event id")),
+                    ruma_common::OwnedEventId::try_from(
+                        resp["event_id"].as_str().unwrap_or("$unknown"),
+                    )
+                    .unwrap_or_else(|_| {
+                        ruma_common::OwnedEventId::try_from("$unknown").expect("static event id")
+                    }),
                 );
-                self.machine.mark_request_as_sent(request.request_id(), &response).await.context("mark_request_as_sent(RoomMessage)")?;
+                self.machine
+                    .mark_request_as_sent(request.request_id(), &response)
+                    .await
+                    .context("mark_request_as_sent(RoomMessage)")?;
             }
             // Unreachable today and kept anyway: AnyOutgoingRequest is the
             // crate's enum, not ours, and a version that adds a variant
@@ -427,7 +562,10 @@ impl CryptoSession {
         }
         let parsed: ruma_events::AnyMessageLikeEvent =
             serde_json::from_value(event).context("reading a verification event")?;
-        self.machine.receive_verification_event(&parsed).await.context("receive_verification_event")?;
+        self.machine
+            .receive_verification_event(&parsed)
+            .await
+            .context("receive_verification_event")?;
         Ok(())
     }
 
@@ -453,9 +591,13 @@ impl CryptoSession {
         }
         let base = homeserver_url.trim_end_matches('/');
         let body = serde_json::to_value(&req.signed_keys).context("serialising signatures")?;
-        let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/signatures/upload"), Some(access_token), body)
-            .await
-            .context("keys/signatures/upload")?;
+        let resp = http::post_json(
+            &format!("{base}/_matrix/client/v3/keys/signatures/upload"),
+            Some(access_token),
+            body,
+        )
+        .await
+        .context("keys/signatures/upload")?;
         if let Some(failures) = resp["failures"].as_object().filter(|f| !f.is_empty()) {
             tracing::warn!("matrix: the homeserver refused some signatures: {failures:?}");
         }
@@ -499,7 +641,11 @@ impl CryptoSession {
         // everywhere, for everyone. The way back into an existing identity is
         // to verify this session against one that holds the keys.
         let own = UserId::parse(user_id).context("invalid own user id")?;
-        let published = self.machine.get_identity(&own, None).await.context("get_identity")?;
+        let published = self
+            .machine
+            .get_identity(&own, None)
+            .await
+            .context("get_identity")?;
         let held = self.machine.cross_signing_status().await;
         if published.is_some() && !held.has_master {
             anyhow::bail!(
@@ -507,13 +653,19 @@ impl CryptoSession {
             );
         }
 
-        let requests = self.machine.bootstrap_cross_signing(false).await.context("bootstrap_cross_signing")?;
+        let requests = self
+            .machine
+            .bootstrap_cross_signing(false)
+            .await
+            .context("bootstrap_cross_signing")?;
 
         // In the order the crate documents, which is the order the server
         // needs: the device's own keys, then the signing keys, then the
         // signatures that tie them together.
         if let Some(upload) = &requests.upload_keys_req {
-            self.send_one(homeserver_url, access_token, upload).await.context("uploading device keys")?;
+            self.send_one(homeserver_url, access_token, upload)
+                .await
+                .context("uploading device keys")?;
         }
 
         let mut body = serde_json::Map::new();
@@ -522,10 +674,16 @@ impl CryptoSession {
             body.insert("master_key".into(), serde_json::to_value(master)?);
         }
         if let Some(self_signing) = &keys.self_signing_key {
-            body.insert("self_signing_key".into(), serde_json::to_value(self_signing)?);
+            body.insert(
+                "self_signing_key".into(),
+                serde_json::to_value(self_signing)?,
+            );
         }
         if let Some(user_signing) = &keys.user_signing_key {
-            body.insert("user_signing_key".into(), serde_json::to_value(user_signing)?);
+            body.insert(
+                "user_signing_key".into(),
+                serde_json::to_value(user_signing)?,
+            );
         }
         http::post_with_password_uia(
             &format!("{base}/_matrix/client/v3/keys/device_signing/upload"),
@@ -537,9 +695,13 @@ impl CryptoSession {
         .await
         .context("publishing cross-signing keys")?;
 
-        self.post_signatures(homeserver_url, access_token, &requests.upload_signatures_req)
-            .await
-            .context("signing this device with the new identity")?;
+        self.post_signatures(
+            homeserver_url,
+            access_token,
+            &requests.upload_signatures_req,
+        )
+        .await
+        .context("signing this device with the new identity")?;
         Ok(())
     }
 
@@ -557,7 +719,12 @@ impl CryptoSession {
         if passphrase.is_empty() {
             anyhow::bail!("an export with no passphrase is a plain copy of your keys - choose one");
         }
-        let keys = self.machine.store().export_room_keys(|_| true).await.context("reading this session's room keys")?;
+        let keys = self
+            .machine
+            .store()
+            .export_room_keys(|_| true)
+            .await
+            .context("reading this session's room keys")?;
         let count = keys.len();
         // The same work factor Element writes, so a file from here costs an
         // attacker what a file from there does.
@@ -572,8 +739,13 @@ impl CryptoSession {
     /// those are different numbers and the second is the one that answers
     /// "did that do anything".
     pub async fn import_room_keys(&self, text: &str, passphrase: &str) -> Result<(usize, usize)> {
-        let keys = matrix_sdk_crypto::decrypt_room_key_export(std::io::Cursor::new(text), passphrase)
-            .map_err(|e| anyhow::anyhow!("that file would not open - wrong passphrase, or not a key export ({e})"))?;
+        let keys =
+            matrix_sdk_crypto::decrypt_room_key_export(std::io::Cursor::new(text), passphrase)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "that file would not open - wrong passphrase, or not a key export ({e})"
+                    )
+                })?;
         let total = keys.len();
         let result = self
             .machine
@@ -591,13 +763,28 @@ impl CryptoSession {
     /// `get_missing_sessions()`, which - unlike upload/query - hands back
     /// its request immediately rather than queuing it for the next
     /// `outgoing_requests()` call, per the crate's own API shape).
-    async fn send_keys_claim(&self, homeserver_url: &str, access_token: &str, request_id: &ruma_common::TransactionId, req: &claim_keys::v3::Request) -> Result<()> {
+    async fn send_keys_claim(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        request_id: &ruma_common::TransactionId,
+        req: &claim_keys::v3::Request,
+    ) -> Result<()> {
         let base = homeserver_url.trim_end_matches('/');
         let body = serde_json::json!({ "one_time_keys": req.one_time_keys });
-        let resp = http::post_json(&format!("{base}/_matrix/client/v3/keys/claim"), Some(access_token), body).await.context("keys/claim")?;
+        let resp = http::post_json(
+            &format!("{base}/_matrix/client/v3/keys/claim"),
+            Some(access_token),
+            body,
+        )
+        .await
+        .context("keys/claim")?;
         let one_time_keys = parse_claimed_otks(&resp["one_time_keys"]);
         let response = claim_keys::v3::Response::new(one_time_keys);
-        self.machine.mark_request_as_sent(request_id, &response).await.context("mark_request_as_sent(KeysClaim)")?;
+        self.machine
+            .mark_request_as_sent(request_id, &response)
+            .await
+            .context("mark_request_as_sent(KeysClaim)")?;
         Ok(())
     }
 
@@ -605,7 +792,13 @@ impl CryptoSession {
     /// back in. Shared the same way send_keys_claim is - `share_room_key`
     /// below hands back its `ToDeviceRequest`s directly rather than
     /// queuing them.
-    async fn send_to_device_request(&self, homeserver_url: &str, access_token: &str, request_id: &ruma_common::TransactionId, req: &matrix_sdk_crypto::types::requests::ToDeviceRequest) -> Result<()> {
+    async fn send_to_device_request(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        request_id: &ruma_common::TransactionId,
+        req: &matrix_sdk_crypto::types::requests::ToDeviceRequest,
+    ) -> Result<()> {
         let base = homeserver_url.trim_end_matches('/');
         let mut messages_json = serde_json::Map::new();
         for (user_id, devices) in &req.messages {
@@ -615,20 +808,28 @@ impl CryptoSession {
                     ruma_common::to_device::DeviceIdOrAllDevices::DeviceId(id) => id.to_string(),
                     ruma_common::to_device::DeviceIdOrAllDevices::AllDevices => "*".to_string(),
                 };
-                let content_value: Value = serde_json::from_str(content.json().get()).unwrap_or(Value::Null);
+                let content_value: Value =
+                    serde_json::from_str(content.json().get()).unwrap_or(Value::Null);
                 device_map.insert(key, content_value);
             }
             messages_json.insert(user_id.to_string(), Value::Object(device_map));
         }
         let url = format!(
             "{base}/_matrix/client/v3/sendToDevice/{}/{}",
-            url::form_urlencoded::byte_serialize(req.event_type.to_string().as_bytes()).collect::<String>(),
-            url::form_urlencoded::byte_serialize(req.txn_id.to_string().as_bytes()).collect::<String>(),
+            url::form_urlencoded::byte_serialize(req.event_type.to_string().as_bytes())
+                .collect::<String>(),
+            url::form_urlencoded::byte_serialize(req.txn_id.to_string().as_bytes())
+                .collect::<String>(),
         );
         let body = serde_json::json!({ "messages": Value::Object(messages_json) });
-        http::put_json(&url, access_token, body).await.context("sendToDevice")?;
+        http::put_json(&url, access_token, body)
+            .await
+            .context("sendToDevice")?;
         let response = send_event_to_device::v3::Response::new();
-        self.machine.mark_request_as_sent(request_id, &response).await.context("mark_request_as_sent(ToDevice)")?;
+        self.machine
+            .mark_request_as_sent(request_id, &response)
+            .await
+            .context("mark_request_as_sent(ToDevice)")?;
         Ok(())
     }
 
@@ -638,7 +839,13 @@ impl CryptoSession {
     /// the same room/member set. Split out from encryption itself so
     /// edits/reactions (encrypt_raw with a different event_type/content)
     /// can reuse the same key-sharing step as a plain message send.
-    async fn ensure_keys_shared(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: &[OwnedUserId]) -> Result<()> {
+    async fn ensure_keys_shared(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        room_id: &RoomId,
+        member_ids: &[OwnedUserId],
+    ) -> Result<()> {
         let members: Vec<&UserId> = member_ids.iter().map(|u| u.as_ref()).collect();
 
         // Queues a key query for this room's members if any are newly
@@ -677,21 +884,37 @@ impl CryptoSession {
         // call's argument shape was what fixed a "Send is not general
         // enough" build failure reported all the way up at rpc/mod.rs's
         // connection-handler spawn).
-        self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+        self.machine
+            .update_tracked_users(members.clone())
+            .await
+            .context("update_tracked_users")?;
 
         // Takes and releases the lock itself, which is why it is called
         // here and not after the guard below.
-        self.process_outgoing_requests(homeserver_url, access_token).await;
+        self.process_outgoing_requests(homeserver_url, access_token)
+            .await;
 
         let _guard = self.outgoing_lock.lock().await;
-        if let Some((request_id, claim_request)) = self.machine.get_missing_sessions(members.iter().copied()).await.context("get_missing_sessions")? {
-            self.send_keys_claim(homeserver_url, access_token, &request_id, &claim_request).await.context("establishing missing Olm sessions")?;
+        if let Some((request_id, claim_request)) = self
+            .machine
+            .get_missing_sessions(members.iter().copied())
+            .await
+            .context("get_missing_sessions")?
+        {
+            self.send_keys_claim(homeserver_url, access_token, &request_id, &claim_request)
+                .await
+                .context("establishing missing Olm sessions")?;
         }
 
-        let to_device_requests =
-            self.machine.share_room_key(room_id, members.iter().copied(), encryption_settings()).await.context("share_room_key")?;
+        let to_device_requests = self
+            .machine
+            .share_room_key(room_id, members.iter().copied(), encryption_settings())
+            .await
+            .context("share_room_key")?;
         for req in &to_device_requests {
-            self.send_to_device_request(homeserver_url, access_token, &req.txn_id, req).await.context("sharing room key")?;
+            self.send_to_device_request(homeserver_url, access_token, &req.txn_id, req)
+                .await
+                .context("sharing room key")?;
         }
         Ok(())
     }
@@ -718,7 +941,8 @@ impl CryptoSession {
             return Ok(0);
         }
         let users: Vec<OwnedUserId> = {
-            let mut users: Vec<OwnedUserId> = targets.iter().map(|(user, _)| user.clone()).collect();
+            let mut users: Vec<OwnedUserId> =
+                targets.iter().map(|(user, _)| user.clone()).collect();
             users.sort();
             users.dedup();
             users
@@ -727,17 +951,25 @@ impl CryptoSession {
         // ensure_keys_shared spells out above: the adaptor's type defeats
         // rustc's Send inference once this whole chain is inside a spawn.
         let members: Vec<&UserId> = users.iter().map(|u| u.as_ref()).collect();
-        self.machine.update_tracked_users(members.clone()).await.context("update_tracked_users")?;
+        self.machine
+            .update_tracked_users(members.clone())
+            .await
+            .context("update_tracked_users")?;
 
         // Takes and releases the lock itself, which is why it is called
         // here and not after the guard below.
-        self.process_outgoing_requests(homeserver_url, access_token).await;
+        self.process_outgoing_requests(homeserver_url, access_token)
+            .await;
 
         let _guard = self.outgoing_lock.lock().await;
-        if let Some((request_id, claim_request)) =
-            self.machine.get_missing_sessions(members.iter().copied()).await.context("get_missing_sessions")?
+        if let Some((request_id, claim_request)) = self
+            .machine
+            .get_missing_sessions(members.iter().copied())
+            .await
+            .context("get_missing_sessions")?
         {
-            self.send_keys_claim(homeserver_url, access_token, &request_id, &claim_request).await?;
+            self.send_keys_claim(homeserver_url, access_token, &request_id, &claim_request)
+                .await?;
         }
 
         // The devices as the machine knows them. One we have never heard of
@@ -750,7 +982,9 @@ impl CryptoSession {
                 // Deref: a `Device` is its data plus who is asking, and what
                 // the encryptor wants is the data.
                 Ok(Some(device)) => devices.push((*device).clone()),
-                Ok(None) => tracing::debug!("matrix crypto: no such device {user}/{device_id} for a call key"),
+                Ok(None) => tracing::debug!(
+                    "matrix crypto: no such device {user}/{device_id} for a call key"
+                ),
                 Err(e) => tracing::debug!("matrix crypto: looking up {user}/{device_id}: {e}"),
             }
         }
@@ -774,10 +1008,15 @@ impl CryptoSession {
             .await
             .context("encrypting a call key for its devices")?;
         for (device, code) in &withheld {
-            tracing::debug!("matrix crypto: call key withheld from {}: {code}", device.device_id());
+            tracing::debug!(
+                "matrix crypto: call key withheld from {}: {code}",
+                device.device_id()
+            );
         }
         for req in &requests {
-            self.send_to_device_request(homeserver_url, access_token, &req.txn_id, req).await.context("sending a call key")?;
+            self.send_to_device_request(homeserver_url, access_token, &req.txn_id, req)
+                .await
+                .context("sending a call key")?;
         }
         Ok(sent)
     }
@@ -786,9 +1025,20 @@ impl CryptoSession {
     /// plain send/edit, `m.reaction` for a reaction) for the room, once
     /// ensure_keys_shared has already run for the same room/members.
     /// Returns the ready-to-PUT `m.room.encrypted` content JSON.
-    async fn encrypt_raw(&self, room_id: &RoomId, event_type: &str, content: Value) -> Result<Value> {
-        let raw = Raw::new(&content).context("serializing content for encryption")?.cast_unchecked();
-        let encrypted = self.machine.encrypt_room_event_raw(room_id, event_type, &raw).await.context("encrypt_room_event_raw")?;
+    async fn encrypt_raw(
+        &self,
+        room_id: &RoomId,
+        event_type: &str,
+        content: Value,
+    ) -> Result<Value> {
+        let raw = Raw::new(&content)
+            .context("serializing content for encryption")?
+            .cast_unchecked();
+        let encrypted = self
+            .machine
+            .encrypt_room_event_raw(room_id, event_type, &raw)
+            .await
+            .context("encrypt_room_event_raw")?;
         serde_json::to_value(&encrypted.content).context("serializing encrypted content")
     }
 
@@ -798,8 +1048,17 @@ impl CryptoSession {
     /// below - exposed directly too for callers (e.g. a reply, which
     /// needs a plain `m.room.message` but with its own `m.relates_to`)
     /// that don't fit any of those three shapes exactly.
-    pub async fn share_and_encrypt_content(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, event_type: &str, content: Value) -> Result<Value> {
-        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids).await?;
+    pub async fn share_and_encrypt_content(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        room_id: &RoomId,
+        member_ids: Vec<OwnedUserId>,
+        event_type: &str,
+        content: Value,
+    ) -> Result<Value> {
+        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids)
+            .await?;
         self.encrypt_raw(room_id, event_type, content).await
     }
 
@@ -811,8 +1070,23 @@ impl CryptoSession {
     /// Used by the live probes and the backup tests; the send path calls
     /// `share_and_encrypt_content` directly.
     #[cfg(test)]
-    pub async fn share_and_encrypt(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, body: &str) -> Result<Value> {
-        self.share_and_encrypt_content(homeserver_url, access_token, room_id, member_ids, "m.room.message", serde_json::json!({ "msgtype": "m.text", "body": body })).await
+    pub async fn share_and_encrypt(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        room_id: &RoomId,
+        member_ids: Vec<OwnedUserId>,
+        body: &str,
+    ) -> Result<Value> {
+        self.share_and_encrypt_content(
+            homeserver_url,
+            access_token,
+            room_id,
+            member_ids,
+            "m.room.message",
+            serde_json::json!({ "msgtype": "m.text", "body": body }),
+        )
+        .await
     }
 
     /// Like share_and_encrypt, but for an edit: `body` becomes the new
@@ -822,26 +1096,50 @@ impl CryptoSession {
     /// Takes the content ready-made, like share_and_encrypt_content does.
     /// An edit's shape is the same encrypted or not, and building it twice
     /// meant a formatted body reaching one kind of room and not the other.
-    pub async fn share_and_encrypt_edit(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, content: Value) -> Result<Value> {
-        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids).await?;
+    pub async fn share_and_encrypt_edit(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        room_id: &RoomId,
+        member_ids: Vec<OwnedUserId>,
+        content: Value,
+    ) -> Result<Value> {
+        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids)
+            .await?;
         self.encrypt_raw(room_id, "m.room.message", content).await
     }
 
     /// Like share_and_encrypt, but for a reaction (`m.reaction`) - no
     /// plain-text fallback body needed, reactions have no unencrypted
     /// rendering to fall back to.
-    pub async fn share_and_encrypt_reaction(&self, homeserver_url: &str, access_token: &str, room_id: &RoomId, member_ids: Vec<OwnedUserId>, target_event_id: &str, emoji: &str) -> Result<Value> {
-        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids).await?;
+    pub async fn share_and_encrypt_reaction(
+        &self,
+        homeserver_url: &str,
+        access_token: &str,
+        room_id: &RoomId,
+        member_ids: Vec<OwnedUserId>,
+        target_event_id: &str,
+        emoji: &str,
+    ) -> Result<Value> {
+        self.ensure_keys_shared(homeserver_url, access_token, room_id, &member_ids)
+            .await?;
         let content = serde_json::json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": target_event_id, "key": emoji } });
         self.encrypt_raw(room_id, "m.reaction", content).await
     }
 }
 
-fn parse_claimed_otks(value: &Value) -> BTreeMap<OwnedUserId, BTreeMap<OwnedDeviceId, BTreeMap<OwnedOneTimeKeyId, Raw<ruma_common::encryption::OneTimeKey>>>> {
+fn parse_claimed_otks(
+    value: &Value,
+) -> BTreeMap<
+    OwnedUserId,
+    BTreeMap<OwnedDeviceId, BTreeMap<OwnedOneTimeKeyId, Raw<ruma_common::encryption::OneTimeKey>>>,
+> {
     let mut one_time_keys = BTreeMap::new();
     if let Some(users) = value.as_object() {
         for (user_id, devices) in users {
-            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else { continue };
+            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else {
+                continue;
+            };
             let mut device_map = BTreeMap::new();
             if let Some(devices) = devices.as_object() {
                 for (device_id, keys) in devices {
@@ -849,7 +1147,9 @@ fn parse_claimed_otks(value: &Value) -> BTreeMap<OwnedUserId, BTreeMap<OwnedDevi
                     let mut key_map = BTreeMap::new();
                     if let Some(keys) = keys.as_object() {
                         for (key_id, key_value) in keys {
-                            let Ok(key_id) = OwnedOneTimeKeyId::try_from(key_id.as_str()) else { continue };
+                            let Ok(key_id) = OwnedOneTimeKeyId::try_from(key_id.as_str()) else {
+                                continue;
+                            };
                             if let Ok(raw) = Raw::from_json_string(key_value.to_string()) {
                                 key_map.insert(key_id, raw);
                             }
@@ -868,7 +1168,9 @@ fn raw_map<T>(value: &Value) -> BTreeMap<OwnedUserId, Raw<T>> {
     let mut out = BTreeMap::new();
     if let Some(obj) = value.as_object() {
         for (user_id, v) in obj {
-            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else { continue };
+            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else {
+                continue;
+            };
             if let Ok(raw) = Raw::from_json_string(v.to_string()) {
                 out.insert(user_id, raw);
             }
@@ -881,7 +1183,9 @@ fn raw_nested_map<T>(value: &Value) -> BTreeMap<OwnedUserId, BTreeMap<OwnedDevic
     let mut out = BTreeMap::new();
     if let Some(users) = value.as_object() {
         for (user_id, devices) in users {
-            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else { continue };
+            let Ok(user_id) = OwnedUserId::try_from(user_id.as_str()) else {
+                continue;
+            };
             let mut device_map = BTreeMap::new();
             if let Some(devices) = devices.as_object() {
                 for (device_id, v) in devices {
@@ -903,15 +1207,25 @@ fn raw_nested_map<T>(value: &Value) -> BTreeMap<OwnedUserId, BTreeMap<OwnedDevic
 /// persisted, or a room key delivered in this batch can be lost on a
 /// crash between the two (see mod.rs's run_sync).
 pub async fn receive_sync_changes(session: &CryptoSession, sync_response: &Value) -> Vec<Value> {
-    let to_device_events = sync_response["to_device"]["events"].as_array().cloned().unwrap_or_default();
-    let to_device_events: Vec<Raw<ruma_events::AnyToDeviceEvent>> =
-        to_device_events.into_iter().filter_map(|e| Raw::from_json_string(e.to_string()).ok()).collect();
+    let to_device_events = sync_response["to_device"]["events"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let to_device_events: Vec<Raw<ruma_events::AnyToDeviceEvent>> = to_device_events
+        .into_iter()
+        .filter_map(|e| Raw::from_json_string(e.to_string()).ok())
+        .collect();
 
     let device_lists = parse_device_lists(&sync_response["device_lists"]);
     let one_time_keys_counts = parse_otk_counts(&sync_response["device_one_time_keys_count"]);
-    let unused_fallback_keys = sync_response["device_unused_fallback_key_types"].as_array().map(|arr| {
-        arr.iter().filter_map(|v| v.as_str()).map(OneTimeKeyAlgorithm::from).collect::<Vec<_>>()
-    });
+    let unused_fallback_keys = sync_response["device_unused_fallback_key_types"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(OneTimeKeyAlgorithm::from)
+                .collect::<Vec<_>>()
+        });
 
     let changes = EncryptionSyncChanges {
         to_device_events,
@@ -920,7 +1234,11 @@ pub async fn receive_sync_changes(session: &CryptoSession, sync_response: &Value
         unused_fallback_keys: unused_fallback_keys.as_deref(),
         next_batch_token: sync_response["next_batch"].as_str().map(String::from),
     };
-    match session.machine.receive_sync_changes(changes, &decryption_settings()).await {
+    match session
+        .machine
+        .receive_sync_changes(changes, &decryption_settings())
+        .await
+    {
         // The decrypted to-device events, which used to be thrown away.
         // Almost all of them are the machine's own business - room keys,
         // verification - but a call's media keys arrive this way too, and
@@ -949,7 +1267,10 @@ fn parse_otk_counts(value: &Value) -> BTreeMap<OneTimeKeyAlgorithm, UInt> {
     if let Some(obj) = value.as_object() {
         for (k, v) in obj {
             if let Some(n) = v.as_u64() {
-                out.insert(OneTimeKeyAlgorithm::from(k.as_str()), UInt::try_from(n).unwrap_or_default());
+                out.insert(
+                    OneTimeKeyAlgorithm::from(k.as_str()),
+                    UInt::try_from(n).unwrap_or_default(),
+                );
             }
         }
     }
@@ -973,24 +1294,38 @@ pub async fn decrypt_room_event_with_trust(
 ) -> Result<(Value, bool)> {
     let raw: Raw<matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent> =
         Raw::from_json_string(event.to_string()).context("re-serializing event for decryption")?;
-    let decrypted = session.machine.decrypt_room_event(&raw, room_id, &decryption_settings()).await.context("decrypt_room_event")?;
+    let decrypted = session
+        .machine
+        .decrypt_room_event(&raw, room_id, &decryption_settings())
+        .await
+        .context("decrypt_room_event")?;
     let verified = matches!(
         decrypted.encryption_info.verification_state,
         matrix_sdk_common::deserialized_responses::VerificationState::Verified
     );
-    let value: Value = serde_json::from_str(decrypted.event.json().get()).context("parsing decrypted event JSON")?;
+    let value: Value = serde_json::from_str(decrypted.event.json().get())
+        .context("parsing decrypted event JSON")?;
     Ok((value, verified))
 }
 
-pub async fn decrypt_room_event(session: &CryptoSession, event: &Value, room_id: &RoomId) -> Result<Value> {
+pub async fn decrypt_room_event(
+    session: &CryptoSession,
+    event: &Value,
+    room_id: &RoomId,
+) -> Result<Value> {
     // matrix-sdk-crypto uses its own lightweight `Event<C>` wrapper here
     // (types::events::room::encrypted::EncryptedEvent), not a ruma_events
     // type - Raw<T>'s phantom marker doesn't validate/parse eagerly, so
     // this is just a type-level relabeling of the same raw JSON bytes.
     let raw: Raw<matrix_sdk_crypto::types::events::room::encrypted::EncryptedEvent> =
         Raw::from_json_string(event.to_string()).context("re-serializing event for decryption")?;
-    let decrypted = session.machine.decrypt_room_event(&raw, room_id, &decryption_settings()).await.context("decrypt_room_event")?;
-    let value: Value = serde_json::from_str(decrypted.event.json().get()).context("parsing decrypted event JSON")?;
+    let decrypted = session
+        .machine
+        .decrypt_room_event(&raw, room_id, &decryption_settings())
+        .await
+        .context("decrypt_room_event")?;
+    let value: Value = serde_json::from_str(decrypted.event.json().get())
+        .context("parsing decrypted event JSON")?;
     Ok(value)
 }
 
@@ -1011,7 +1346,10 @@ mod forget_tests {
             sanitize_account_id("matrix:@salastil:matrix.salastil.com"),
             "matrix__salastil_matrix.salastil.com"
         );
-        assert_eq!(sanitize_account_id("matrix:@salastil:poa.st"), "matrix__salastil_poa.st");
+        assert_eq!(
+            sanitize_account_id("matrix:@salastil:poa.st"),
+            "matrix__salastil_poa.st"
+        );
     }
 
     /// The store is what makes this installation *that device*. The report
@@ -1040,7 +1378,10 @@ mod forget_tests {
             "initializing OlmMachine: no space left on device",
             "permission denied",
         ] {
-            assert!(!is_wrong_device(&other), "{other} must not throw the store away");
+            assert!(
+                !is_wrong_device(&other),
+                "{other} must not throw the store away"
+            );
         }
     }
 
@@ -1063,11 +1404,17 @@ mod forget_tests {
         forget(&data_dir, account);
 
         assert!(
-            !data_dir.join("matrix-crypto").join(sanitize_account_id(account)).exists(),
+            !data_dir
+                .join("matrix-crypto")
+                .join(sanitize_account_id(account))
+                .exists(),
             "the store outlived the account"
         );
         assert!(
-            data_dir.join("matrix-crypto").join(sanitize_account_id(neighbour)).exists(),
+            data_dir
+                .join("matrix-crypto")
+                .join(sanitize_account_id(neighbour))
+                .exists(),
             "the other account on the same machine lost its keys"
         );
         // Twice is not an error: removal has to be something that can be

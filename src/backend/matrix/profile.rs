@@ -16,16 +16,25 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
     profile["handle"] = Value::String(user_id.to_string());
     profile["name"] = Value::String(protocol::mxid_localpart(user_id));
 
-    let Some(account) = state.accounts.get_matrix(account_id) else { return profile };
+    let Some(account) = state.accounts.get_matrix(account_id) else {
+        return profile;
+    };
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded_user = url::form_urlencoded::byte_serialize(user_id.as_bytes()).collect::<String>();
 
-    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/profile/{encoded_user}"), &account.access_token).await {
+    if let Ok(resp) = http::get_json(
+        &format!("{base}/_matrix/client/v3/profile/{encoded_user}"),
+        &account.access_token,
+    )
+    .await
+    {
         if let Some(name) = resp["displayname"].as_str().filter(|n| !n.is_empty()) {
             profile["name"] = Value::String(name.to_string());
         }
         if let Some(mxc) = resp["avatar_url"].as_str() {
-            if let Some(path) = cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await {
+            if let Some(path) =
+                cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await
+            {
                 profile["avatarUrl"] = Value::String(path);
             }
         }
@@ -35,7 +44,10 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
     if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
         if let Some(levels) = state.runtime.get_matrix_power_levels(account_id, &room_id) {
             let creators = state.runtime.matrix_room_creators(account_id, &room_id);
-            let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+            let version = state
+                .runtime
+                .matrix_room_version(account_id, &room_id)
+                .unwrap_or_default();
             let level = moderation::effective_power(&levels, user_id, &creators, &version);
             // Matrix's own conventional names for the two ranks anybody
             // recognises. A room can set any number, so a level that is
@@ -60,12 +72,20 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
     // When they were last seen. `last_active_ago` is milliseconds, and is the
     // only "last seen" Matrix has - there is no join date to be had without
     // walking the room's whole state history.
-    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/presence/{encoded_user}/status"), &account.access_token).await {
+    if let Ok(resp) = http::get_json(
+        &format!("{base}/_matrix/client/v3/presence/{encoded_user}/status"),
+        &account.access_token,
+    )
+    .await
+    {
         if let Some(status) = resp["presence"].as_str() {
             profile["status"] = Value::String(status.to_string());
         }
         if let Some(ago) = resp["last_active_ago"].as_i64() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             profile["lastActiveTs"] = serde_json::json!(now - ago / 1000);
         }
         if let Some(message) = resp["status_msg"].as_str().filter(|m| !m.is_empty()) {
@@ -86,15 +106,22 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
 /// room you are in shows. Both exist on purpose, and only this one leaves the
 /// machine.
 pub async fn set_own_display_name(state: &AppState, account_id: &str, name: &str) -> Result<()> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/profile/{}/displayname",
         url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
     );
-    http::put_json(&url, &account.access_token, serde_json::json!({ "displayname": name }))
-        .await
-        .context("changing your display name")?;
+    http::put_json(
+        &url,
+        &account.access_token,
+        serde_json::json!({ "displayname": name }),
+    )
+    .await
+    .context("changing your display name")?;
     Ok(())
 }
 
@@ -104,7 +131,10 @@ pub async fn set_own_display_name(state: &AppState, account_id: &str, name: &str
 /// is shown to anybody who can see the account at all, including in rooms
 /// this client has never been in, and there is nobody to share a key with.
 pub async fn set_own_avatar(state: &AppState, account_id: &str, path: &str) -> Result<String> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let bytes = tokio::fs::read(path).await.context("reading the picture")?;
     let (filename, ext) = file_extension(path);
@@ -116,29 +146,42 @@ pub async fn set_own_avatar(state: &AppState, account_id: &str, path: &str) -> R
     let resp = http_client_post_bytes(&upload_url, &account.access_token, mime, bytes)
         .await
         .context("uploading the picture")?;
-    let content_uri = resp["content_uri"].as_str().context("the server took the picture but did not say where")?;
+    let content_uri = resp["content_uri"]
+        .as_str()
+        .context("the server took the picture but did not say where")?;
 
     let url = format!(
         "{base}/_matrix/client/v3/profile/{}/avatar_url",
         url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
     );
-    http::put_json(&url, &account.access_token, serde_json::json!({ "avatar_url": content_uri }))
-        .await
-        .context("setting your picture")?;
+    http::put_json(
+        &url,
+        &account.access_token,
+        serde_json::json!({ "avatar_url": content_uri }),
+    )
+    .await
+    .context("setting your picture")?;
     Ok(content_uri.to_string())
 }
 
 /// What the homeserver currently says this account is called and looks like.
 pub async fn own_profile(state: &AppState, account_id: &str) -> Result<Value> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/profile/{}",
         url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
     );
-    let profile = http::get_json(&url, &account.access_token).await.context("reading your profile")?;
+    let profile = http::get_json(&url, &account.access_token)
+        .await
+        .context("reading your profile")?;
     let avatar = match profile["avatar_url"].as_str() {
-        Some(mxc) => cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await,
+        Some(mxc) => {
+            cached_media_path(&account.homeserver_url, &account.access_token, mxc, "").await
+        }
         None => None,
     };
     Ok(serde_json::json!({
@@ -156,11 +199,19 @@ pub async fn own_profile(state: &AppState, account_id: &str) -> Result<Value> {
 /// per encrypted send is an acceptable cost for v1 (this project's other
 /// backends make comparable per-send round trips already, e.g. Discord's
 /// own REST send call).
-pub(super) async fn joined_member_ids(base: &str, access_token: &str, room_id: &str) -> Result<Vec<ruma_common::OwnedUserId>> {
-    let encoded_room_id = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
-    let resp = http::get_json(&format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/joined_members"), access_token)
-        .await
-        .context("fetching joined_members")?;
+pub(super) async fn joined_member_ids(
+    base: &str,
+    access_token: &str,
+    room_id: &str,
+) -> Result<Vec<ruma_common::OwnedUserId>> {
+    let encoded_room_id =
+        url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
+    let resp = http::get_json(
+        &format!("{base}/_matrix/client/v3/rooms/{encoded_room_id}/joined_members"),
+        access_token,
+    )
+    .await
+    .context("fetching joined_members")?;
     let members = resp["joined"]
         .as_object()
         .into_iter()
@@ -174,14 +225,21 @@ pub(super) async fn joined_member_ids(base: &str, access_token: &str, room_id: &
 ///
 /// Matrix has three presence values - online, unavailable and offline. Unavailable
 /// is idle, which is not offered: only online and offline (invisible) are sent.
-pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status: &str) -> Result<()> {
+pub async fn apply_status(
+    state: &AppState,
+    config: &MatrixAccountConfig,
+    status: &str,
+) -> Result<()> {
     match push_presence(state, config, status).await {
         // A homeserver limits how often presence may change, and some ask for
         // a long wait. The status is already recorded, so it is applied when
         // the wait is over rather than reported as a failure: what was asked
         // for happens, a little later, and nobody has to do it twice.
         Err(e) if e.downcast_ref::<http::RateLimited>().is_some() => {
-            let wait = e.downcast_ref::<http::RateLimited>().map(|r| r.0).unwrap_or_default();
+            let wait = e
+                .downcast_ref::<http::RateLimited>()
+                .map(|r| r.0)
+                .unwrap_or_default();
             defer_presence(state.clone(), config.clone(), wait);
             Ok(())
         }
@@ -191,7 +249,8 @@ pub async fn apply_status(state: &AppState, config: &MatrixAccountConfig, status
 
 /// Accounts with a presence change waiting out a limit; one is enough, since
 /// what it sends is whatever the status is when its time comes.
-static DEFERRED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+static DEFERRED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 fn defer_presence(state: AppState, config: MatrixAccountConfig, wait: std::time::Duration) {
     let account_id = config.account_id();

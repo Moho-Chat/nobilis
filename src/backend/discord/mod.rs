@@ -45,11 +45,13 @@
 //! submodule opens with `use super::*`, which is what puts this list in
 //! scope for all of them. They look unused here because nothing in this file
 //! uses them; they are used by every file beside it.
-pub mod voice;
 pub mod calls;
 pub mod commands;
-pub mod gateway;
 pub mod dave;
+pub mod events;
+pub mod forums;
+pub mod gateway;
+pub mod gifpicker;
 pub mod golive;
 pub mod guilds;
 pub mod history;
@@ -63,23 +65,21 @@ pub mod polls;
 pub mod presence;
 pub mod reassemble;
 pub mod rtp;
-pub mod streamconn;
-pub mod voicecrypto;
-pub mod voiceconn;
-pub mod videorx;
 pub mod search;
 pub mod send;
-pub mod stickers;
 pub mod soundboard;
-pub mod events;
-pub mod forums;
-pub mod gifpicker;
+pub mod stickers;
+pub mod streamconn;
+pub mod videorx;
+pub mod voice;
+pub mod voiceconn;
+pub mod voicecrypto;
 
 pub use calls::*;
 pub use commands::*;
 pub use forums::*;
-pub use gifpicker::*;
 pub use gateway::*;
+pub use gifpicker::*;
 pub use guilds::*;
 pub use history::*;
 // Nothing in `http` is for outside this folder - the plain import is what

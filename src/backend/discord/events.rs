@@ -37,16 +37,29 @@ fn current(e: &Value) -> bool {
 
 /// A guild's whole list, from READY or GUILD_CREATE.
 pub fn note_guild(account_id: &str, guild_id: &str, list: &Value) {
-    let events: Vec<Value> = list.as_array().into_iter().flatten().filter(|e| current(e)).cloned().collect();
-    known().lock().unwrap().insert((account_id.to_string(), guild_id.to_string()), events);
+    let events: Vec<Value> = list
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| current(e))
+        .cloned()
+        .collect();
+    known()
+        .lock()
+        .unwrap()
+        .insert((account_id.to_string(), guild_id.to_string()), events);
 }
 
 /// One event created, changed or removed. Says which guild, for the window.
 pub fn note_change(state: &AppState, account_id: &str, dispatch: &str, d: &Value) {
-    let (Some(guild_id), Some(id)) = (d["guild_id"].as_str(), d["id"].as_str()) else { return };
+    let (Some(guild_id), Some(id)) = (d["guild_id"].as_str(), d["id"].as_str()) else {
+        return;
+    };
     {
         let mut all = known().lock().unwrap();
-        let list = all.entry((account_id.to_string(), guild_id.to_string())).or_default();
+        let list = all
+            .entry((account_id.to_string(), guild_id.to_string()))
+            .or_default();
         let was = list.iter().position(|e| e["id"].as_str() == Some(id));
         let kept = dispatch != "GUILD_SCHEDULED_EVENT_DELETE" && current(d);
         match (was, kept) {
@@ -70,7 +83,12 @@ pub fn note_change(state: &AppState, account_id: &str, dispatch: &str, d: &Value
 
 /// Somebody marked an event as interesting, or stopped.
 pub fn note_user(state: &AppState, account_id: &str, own_user: &str, added: bool, d: &Value) {
-    let (Some(guild_id), Some(event_id)) = (d["guild_id"].as_str(), d["guild_scheduled_event_id"].as_str()) else { return };
+    let (Some(guild_id), Some(event_id)) = (
+        d["guild_id"].as_str(),
+        d["guild_scheduled_event_id"].as_str(),
+    ) else {
+        return;
+    };
     if d["user_id"].as_str() == Some(own_user) {
         let mut all = interested().lock().unwrap();
         let mine = all.entry(account_id.to_string()).or_default();
@@ -80,7 +98,11 @@ pub fn note_user(state: &AppState, account_id: &str, own_user: &str, added: bool
             mine.remove(event_id);
         }
     }
-    if let Some(list) = known().lock().unwrap().get_mut(&(account_id.to_string(), guild_id.to_string())) {
+    if let Some(list) = known()
+        .lock()
+        .unwrap()
+        .get_mut(&(account_id.to_string(), guild_id.to_string()))
+    {
         if let Some(e) = list.iter_mut().find(|e| e["id"].as_str() == Some(event_id)) {
             let n = e["user_count"].as_i64().unwrap_or(0) + if added { 1 } else { -1 };
             e["user_count"] = json!(n.max(0));
@@ -100,7 +122,12 @@ fn announce(state: &AppState, account_id: &str, guild_id: &str) {
 /// or on - the events row is there only when that is more than none - and
 /// which are on right now, each of which gets a card with a way to join it.
 pub fn summary(state: &AppState, account_id: &str, guild_id: &str) -> Value {
-    let events = known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default();
+    let events = known()
+        .lock()
+        .unwrap()
+        .get(&(account_id.to_string(), guild_id.to_string()))
+        .cloned()
+        .unwrap_or_default();
     let live: Vec<Value> = events
         .iter()
         .filter(|e| e["status"].as_u64() == Some(2))
@@ -124,13 +151,21 @@ pub fn summary(state: &AppState, account_id: &str, guild_id: &str) -> Value {
 
 #[cfg(test)]
 pub fn count(account_id: &str, guild_id: &str) -> usize {
-    known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).map(|l| l.len()).unwrap_or(0)
+    known()
+        .lock()
+        .unwrap()
+        .get(&(account_id.to_string(), guild_id.to_string()))
+        .map(|l| l.len())
+        .unwrap_or(0)
 }
 
 /// The guild's events as the window draws them, soonest first: refreshed
 /// from REST for the counts, and this account's interest in each.
 pub async fn list(state: &AppState, account_id: &str, guild_id: &str) -> Result<Vec<Value>> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/guilds/{guild_id}/scheduled-events"))
         .query(&[("with_user_count", "true")])
@@ -142,22 +177,38 @@ pub async fn list(state: &AppState, account_id: &str, guild_id: &str) -> Result<
         let fresh: Value = resp.json().await.context("reading the events")?;
         note_guild(account_id, guild_id, &fresh);
     }
-    let events = known().lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default();
+    let events = known()
+        .lock()
+        .unwrap()
+        .get(&(account_id.to_string(), guild_id.to_string()))
+        .cloned()
+        .unwrap_or_default();
 
     // Whether this account is interested in each, which only the event's own
     // list of interested people says. A handful of events; one read each.
-    let mut mine = interested().lock().unwrap().get(account_id).cloned().unwrap_or_default();
+    let mut mine = interested()
+        .lock()
+        .unwrap()
+        .get(account_id)
+        .cloned()
+        .unwrap_or_default();
     for e in &events {
         let Some(id) = e["id"].as_str() else { continue };
         if let Ok(resp) = http_client_for(&cfg.token)
-            .get(format!("{API_BASE}/guilds/{guild_id}/scheduled-events/{id}/users"))
+            .get(format!(
+                "{API_BASE}/guilds/{guild_id}/scheduled-events/{id}/users"
+            ))
             .query(&[("limit", "100")])
             .header("Authorization", &cfg.token)
             .send()
             .await
         {
             if let Ok(users) = resp.json::<Value>().await {
-                let me = users.as_array().into_iter().flatten().any(|u| u["user"]["id"].as_str() == Some(cfg.user_id.as_str()));
+                let me = users
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|u| u["user"]["id"].as_str() == Some(cfg.user_id.as_str()));
                 if me {
                     mine.insert(id.to_string());
                 } else {
@@ -166,27 +217,51 @@ pub async fn list(state: &AppState, account_id: &str, guild_id: &str) -> Result<
             }
         }
     }
-    interested().lock().unwrap().insert(account_id.to_string(), mine.clone());
+    interested()
+        .lock()
+        .unwrap()
+        .insert(account_id.to_string(), mine.clone());
 
-    let mut out: Vec<Value> = events.iter().map(|e| shape(state, account_id, guild_id, e, &mine)).collect();
+    let mut out: Vec<Value> = events
+        .iter()
+        .map(|e| shape(state, account_id, guild_id, e, &mine))
+        .collect();
     out.sort_by(|a, b| a["start"].as_str().cmp(&b["start"].as_str()));
     Ok(out)
 }
 
 /// One event as the window wants it.
-fn shape(state: &AppState, account_id: &str, guild_id: &str, e: &Value, mine: &HashSet<String>) -> Value {
+fn shape(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    e: &Value,
+    mine: &HashSet<String>,
+) -> Value {
     let id = e["id"].as_str().unwrap_or_default();
     let channel_id = e["channel_id"].as_str();
     let channel_name = channel_id.and_then(|c| {
-        state.runtime.discord_voice_channels(account_id, guild_id).into_iter().find(|v| v.id == c).map(|v| v.name)
+        state
+            .runtime
+            .discord_voice_channels(account_id, guild_id)
+            .into_iter()
+            .find(|v| v.id == c)
+            .map(|v| v.name)
     });
     let creator = &e["creator"];
-    let creator_name = creator["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| creator["username"].as_str());
+    let creator_name = creator["global_name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| creator["username"].as_str());
     let creator_avatar = match (creator["id"].as_str(), creator["avatar"].as_str()) {
-        (Some(uid), Some(hash)) => Some(format!("https://cdn.discordapp.com/avatars/{uid}/{hash}.png?size=64")),
+        (Some(uid), Some(hash)) => Some(format!(
+            "https://cdn.discordapp.com/avatars/{uid}/{hash}.png?size=64"
+        )),
         _ => None,
     };
-    let image = e["image"].as_str().map(|hash| format!("https://cdn.discordapp.com/guild-events/{id}/{hash}.png?size=512"));
+    let image = e["image"]
+        .as_str()
+        .map(|hash| format!("https://cdn.discordapp.com/guild-events/{id}/{hash}.png?size=512"));
     json!({
         "id": id,
         "guildId": guild_id,
@@ -229,7 +304,8 @@ pub fn creation_body(new: &NewEvent) -> Result<Value> {
     if new.name.trim().is_empty() {
         bail!("an event needs a name");
     }
-    let start = chrono::DateTime::parse_from_rfc3339(new.start).context("that start time is not a time")?;
+    let start =
+        chrono::DateTime::parse_from_rfc3339(new.start).context("that start time is not a time")?;
     if start <= chrono::Utc::now() {
         bail!("an event has to start in the future");
     }
@@ -241,7 +317,8 @@ pub fn creation_body(new: &NewEvent) -> Result<Value> {
         "privacy_level": 2,
     });
     if let Some(end) = new.end.filter(|e| !e.is_empty()) {
-        let end_at = chrono::DateTime::parse_from_rfc3339(end).context("that end time is not a time")?;
+        let end_at =
+            chrono::DateTime::parse_from_rfc3339(end).context("that end time is not a time")?;
         if end_at <= start {
             bail!("an event has to end after it starts");
         }
@@ -249,12 +326,19 @@ pub fn creation_body(new: &NewEvent) -> Result<Value> {
     }
     match new.kind {
         "voice" | "stage" => {
-            let channel = new.channel_id.filter(|c| !c.is_empty()).context("pick the channel it happens in")?;
+            let channel = new
+                .channel_id
+                .filter(|c| !c.is_empty())
+                .context("pick the channel it happens in")?;
             body["entity_type"] = json!(if new.kind == "stage" { 1 } else { 2 });
             body["channel_id"] = json!(channel);
         }
         _ => {
-            let location = new.location.map(str::trim).filter(|l| !l.is_empty()).context("say where it happens")?;
+            let location = new
+                .location
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .context("say where it happens")?;
             if body["scheduled_end_time"].is_null() {
                 bail!("an event somewhere else needs an end time");
             }
@@ -266,9 +350,17 @@ pub fn creation_body(new: &NewEvent) -> Result<Value> {
     Ok(body)
 }
 
-pub async fn create(state: &AppState, account_id: &str, guild_id: &str, new: &NewEvent<'_>) -> Result<()> {
+pub async fn create(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    new: &NewEvent<'_>,
+) -> Result<()> {
     let body = creation_body(new)?;
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
             .post(format!("{API_BASE}/guilds/{guild_id}/scheduled-events"))
@@ -282,11 +374,22 @@ pub async fn create(state: &AppState, account_id: &str, guild_id: &str, new: &Ne
 
 /// Start it now, end it, or cancel it - which are its status going to 2, 3
 /// or 4. Discord allows each only from the right state, and says so.
-pub async fn set_status(state: &AppState, account_id: &str, guild_id: &str, event_id: &str, status: u8) -> Result<()> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+pub async fn set_status(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    event_id: &str,
+    status: u8,
+) -> Result<()> {
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
     let resp = send_write(
         http_client_for(&cfg.token)
-            .patch(format!("{API_BASE}/guilds/{guild_id}/scheduled-events/{event_id}"))
+            .patch(format!(
+                "{API_BASE}/guilds/{guild_id}/scheduled-events/{event_id}"
+            ))
             .header("Authorization", &cfg.token)
             .json(&json!({ "status": status })),
     )
@@ -296,11 +399,26 @@ pub async fn set_status(state: &AppState, account_id: &str, guild_id: &str, even
 }
 
 /// Marks this account interested, or not.
-pub async fn set_interested(state: &AppState, account_id: &str, guild_id: &str, event_id: &str, on: bool) -> Result<()> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+pub async fn set_interested(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    event_id: &str,
+    on: bool,
+) -> Result<()> {
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
     let url = format!("{API_BASE}/guilds/{guild_id}/scheduled-events/{event_id}/users/@me");
-    let request = if on { http_client_for(&cfg.token).put(url) } else { http_client_for(&cfg.token).delete(url) };
-    let resp = send_write(request.header("Authorization", &cfg.token)).await.context("changing your interest")?;
+    let request = if on {
+        http_client_for(&cfg.token).put(url)
+    } else {
+        http_client_for(&cfg.token).delete(url)
+    };
+    let resp = send_write(request.header("Authorization", &cfg.token))
+        .await
+        .context("changing your interest")?;
     refused_says(resp, "mark interest in this event").await
 }
 
@@ -313,13 +431,25 @@ const INVITE_SECONDS: i64 = 7 * 24 * 3600;
 /// The invite is made on the event's own channel where it has one, so a
 /// newcomer lands where it happens; an event somewhere else lands them in the
 /// guild's first text channel.
-pub async fn invite_link(state: &AppState, account_id: &str, guild_id: &str, event_id: &str) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
+pub async fn invite_link(
+    state: &AppState,
+    account_id: &str,
+    guild_id: &str,
+    event_id: &str,
+) -> Result<Value> {
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
     let event = known()
         .lock()
         .unwrap()
         .get(&(account_id.to_string(), guild_id.to_string()))
-        .and_then(|l| l.iter().find(|e| e["id"].as_str() == Some(event_id)).cloned())
+        .and_then(|l| {
+            l.iter()
+                .find(|e| e["id"].as_str() == Some(event_id))
+                .cloned()
+        })
         .context("that event is not on this guild's list")?;
     let channel_id = match event["channel_id"].as_str() {
         Some(c) => c.to_string(),
@@ -349,7 +479,9 @@ pub async fn invite_link(state: &AppState, account_id: &str, guild_id: &str, eve
         bail!("Discord API error {status}: {text}");
     }
     let answer: Value = resp.json().await.context("reading the invite back")?;
-    let code = answer["code"].as_str().context("Discord made an invite with no code in it")?;
+    let code = answer["code"]
+        .as_str()
+        .context("Discord made an invite with no code in it")?;
     Ok(json!({
         "link": format!("https://discord.gg/{code}?event={event_id}"),
         "expiresDays": INVITE_SECONDS / 86_400,
@@ -364,7 +496,11 @@ pub async fn invite_link(state: &AppState, account_id: &str, guild_id: &str, eve
 /// where it has not seen a friend, from the friend's profile - which lists
 /// the guilds the two have in common.
 pub async fn share_targets(state: &AppState, account_id: &str, guild_id: &str) -> Vec<Value> {
-    let token = state.accounts.get_discord(account_id).map(|c| c.token).unwrap_or_default();
+    let token = state
+        .accounts
+        .get_discord(account_id)
+        .map(|c| c.token)
+        .unwrap_or_default();
     let friends: Vec<Value> = state
         .runtime
         .get_discord_friends(account_id)
@@ -373,7 +509,9 @@ pub async fn share_targets(state: &AppState, account_id: &str, guild_id: &str) -
         .collect();
     let mut out = Vec::new();
     for f in friends {
-        let Some(user_id) = f["userId"].as_str() else { continue };
+        let Some(user_id) = f["userId"].as_str() else {
+            continue;
+        };
         let mut in_server = state.runtime.discord_member(guild_id, user_id).is_some();
         if !in_server {
             if let Ok(resp) = http_client_for(&token)
@@ -384,7 +522,11 @@ pub async fn share_targets(state: &AppState, account_id: &str, guild_id: &str) -
                 .await
             {
                 if let Ok(profile) = resp.json::<Value>().await {
-                    in_server = profile["mutual_guilds"].as_array().into_iter().flatten().any(|g| g["id"].as_str() == Some(guild_id));
+                    in_server = profile["mutual_guilds"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|g| g["id"].as_str() == Some(guild_id));
                 }
             }
         }
@@ -438,7 +580,15 @@ mod tests {
     fn an_event_elsewhere_needs_a_place_and_an_end() {
         let start = later(24);
         let end = later(26);
-        let mut new = NewEvent { name: "Meetup", description: "", start: &start, end: None, kind: "external", channel_id: None, location: Some("The park") };
+        let mut new = NewEvent {
+            name: "Meetup",
+            description: "",
+            start: &start,
+            end: None,
+            kind: "external",
+            channel_id: None,
+            location: Some("The park"),
+        };
         assert!(creation_body(&new).is_err());
         new.end = Some(&end);
         let body = creation_body(&new).unwrap();
@@ -454,7 +604,16 @@ mod tests {
         let start = later(5);
         let before = later(4);
         let voice = |start: &str, end: Option<&str>| -> bool {
-            creation_body(&NewEvent { name: "x", description: "", start, end, kind: "voice", channel_id: Some("1"), location: None }).is_ok()
+            creation_body(&NewEvent {
+                name: "x",
+                description: "",
+                start,
+                end,
+                kind: "voice",
+                channel_id: Some("1"),
+                location: None,
+            })
+            .is_ok()
         };
         assert!(!voice(&past, None));
         assert!(!voice(&start, Some(&before)));
@@ -463,7 +622,11 @@ mod tests {
 
     #[test]
     fn finished_and_cancelled_events_are_not_listed() {
-        note_guild("a", "g", &json!([{ "id": "1", "status": 1 }, { "id": "2", "status": 3 }, { "id": "3", "status": 4 }, { "id": "4", "status": 2 }]));
+        note_guild(
+            "a",
+            "g",
+            &json!([{ "id": "1", "status": 1 }, { "id": "2", "status": 3 }, { "id": "3", "status": 4 }, { "id": "4", "status": 2 }]),
+        );
         assert_eq!(count("a", "g"), 2);
     }
 }

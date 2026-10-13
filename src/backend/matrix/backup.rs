@@ -25,7 +25,7 @@
 use super::crypto::CryptoSession;
 use super::http;
 use crate::state::AppState;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use matrix_sdk_crypto::backups::MegolmV1BackupKey;
 use matrix_sdk_crypto::olm::BackedUpRoomKey;
 use matrix_sdk_crypto::store::types::BackupDecryptionKey;
@@ -34,9 +34,21 @@ use ruma_client_api::backup::{KeyBackupData, RoomKeyBackup};
 use ruma_common::OwnedRoomId;
 use std::collections::BTreeMap;
 
-async fn account_session(state: &AppState, account_id: &str) -> Result<(crate::accounts::MatrixAccountConfig, std::sync::Arc<CryptoSession>)> {
-    let config = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
-    let session = state.runtime.get_matrix_machine(account_id).context("account is not connected")?;
+async fn account_session(
+    state: &AppState,
+    account_id: &str,
+) -> Result<(
+    crate::accounts::MatrixAccountConfig,
+    std::sync::Arc<CryptoSession>,
+)> {
+    let config = state
+        .accounts
+        .get_matrix(account_id)
+        .context("no such Matrix account")?;
+    let session = state
+        .runtime
+        .get_matrix_machine(account_id)
+        .context("account is not connected")?;
     Ok((config, session))
 }
 
@@ -45,7 +57,11 @@ async fn account_session(state: &AppState, account_id: &str) -> Result<(crate::a
 /// opening the store, before the sync loop starts - see this module's own
 /// doc comment on why `enable_backup_v1` alone doesn't survive a restart.
 /// Returns whether a backup was found and re-activated.
-pub async fn reactivate_on_connect(state: &AppState, account_id: &str, session: &CryptoSession) -> bool {
+pub async fn reactivate_on_connect(
+    state: &AppState,
+    account_id: &str,
+    session: &CryptoSession,
+) -> bool {
     let backup_machine = session.machine.backup_machine();
     let keys = match backup_machine.get_backup_keys().await {
         Ok(k) => k,
@@ -100,7 +116,12 @@ pub async fn reactivate_on_connect(state: &AppState, account_id: &str, session: 
 /// so it is not an error - and neither is a server that will not say, since
 /// the only thing this is used for is tidying up afterwards.
 async fn current_version(base: &str, access_token: &str) -> Option<String> {
-    let resp = http::get_json(&format!("{base}/_matrix/client/v3/room_keys/version"), access_token).await.ok()?;
+    let resp = http::get_json(
+        &format!("{base}/_matrix/client/v3/room_keys/version"),
+        access_token,
+    )
+    .await
+    .ok()?;
     resp["version"].as_str().map(str::to_string)
 }
 
@@ -109,7 +130,10 @@ async fn delete_version(base: &str, access_token: &str, version: &str) -> Result
         "{base}/_matrix/client/v3/room_keys/version/{}",
         url::form_urlencoded::byte_serialize(version.as_bytes()).collect::<String>()
     );
-    http::delete_json(&url, access_token).await.map(|_| ()).context("deleting the previous backup version")
+    http::delete_json(&url, access_token)
+        .await
+        .map(|_| ())
+        .context("deleting the previous backup version")
 }
 
 pub async fn setup_recovery_key(state: &AppState, account_id: &str) -> Result<String> {
@@ -124,17 +148,34 @@ pub async fn setup_recovery_key(state: &AppState, account_id: &str) -> Result<St
 
     let mut backup_info = key.to_backup_info();
     let backup_machine = session.machine.backup_machine();
-    backup_machine.sign_backup(&mut backup_info).await.context("signing backup auth data")?;
+    backup_machine
+        .sign_backup(&mut backup_info)
+        .await
+        .context("signing backup auth data")?;
 
     let body = serde_json::to_value(&backup_info).context("serializing backup auth data")?;
-    let resp =
-        http::post_json(&format!("{base}/_matrix/client/v3/room_keys/version"), Some(&config.access_token), body).await.context("room_keys/version")?;
-    let version = resp["version"].as_str().context("no version in room_keys/version response")?.to_string();
+    let resp = http::post_json(
+        &format!("{base}/_matrix/client/v3/room_keys/version"),
+        Some(&config.access_token),
+        body,
+    )
+    .await
+    .context("room_keys/version")?;
+    let version = resp["version"]
+        .as_str()
+        .context("no version in room_keys/version response")?
+        .to_string();
 
     let backup_key: MegolmV1BackupKey = key.megolm_v1_public_key();
     backup_key.set_version(version.clone());
-    backup_machine.enable_backup_v1(backup_key).await.context("enable_backup_v1")?;
-    backup_machine.save_decryption_key(Some(key), Some(version.clone())).await.context("save_decryption_key")?;
+    backup_machine
+        .enable_backup_v1(backup_key)
+        .await
+        .context("enable_backup_v1")?;
+    backup_machine
+        .save_decryption_key(Some(key), Some(version.clone()))
+        .await
+        .context("save_decryption_key")?;
     state.runtime.mark_matrix_backup_enabled(account_id);
 
     if let Some(previous) = previous.filter(|p| *p != version) {
@@ -159,27 +200,44 @@ pub struct RestoreSummary {
 /// backup on this session (restoring implies this device now has the
 /// key, so it can participate in future uploads too - same as a fresh
 /// setup_recovery_key would).
-pub async fn restore_from_recovery_key(state: &AppState, account_id: &str, recovery_key: &str) -> Result<RestoreSummary> {
+pub async fn restore_from_recovery_key(
+    state: &AppState,
+    account_id: &str,
+    recovery_key: &str,
+) -> Result<RestoreSummary> {
     let (config, session) = account_session(state, account_id).await?;
     let base = config.homeserver_url.trim_end_matches('/');
 
     let key = BackupDecryptionKey::from_base58(recovery_key).context("invalid recovery key")?;
 
-    let version_resp =
-        http::get_json(&format!("{base}/_matrix/client/v3/room_keys/version"), &config.access_token).await.context("fetching current backup version")?;
-    let info: RoomKeyBackupInfo = serde_json::from_value(version_resp.clone()).context("parsing backup auth data")?;
+    let version_resp = http::get_json(
+        &format!("{base}/_matrix/client/v3/room_keys/version"),
+        &config.access_token,
+    )
+    .await
+    .context("fetching current backup version")?;
+    let info: RoomKeyBackupInfo =
+        serde_json::from_value(version_resp.clone()).context("parsing backup auth data")?;
     if !key.backup_key_matches(&info) {
         bail!("this recovery key doesn't match the account's current backup");
     }
-    let version = version_resp["version"].as_str().context("no version in room_keys/version response")?.to_string();
+    let version = version_resp["version"]
+        .as_str()
+        .context("no version in room_keys/version response")?
+        .to_string();
 
     let keys_resp = http::get_json(
-        &format!("{base}/_matrix/client/v3/room_keys/keys?version={}", url::form_urlencoded::byte_serialize(version.as_bytes()).collect::<String>()),
+        &format!(
+            "{base}/_matrix/client/v3/room_keys/keys?version={}",
+            url::form_urlencoded::byte_serialize(version.as_bytes()).collect::<String>()
+        ),
         &config.access_token,
     )
     .await
     .context("fetching backed-up keys")?;
-    let rooms: BTreeMap<OwnedRoomId, RoomKeyBackup> = serde_json::from_value(keys_resp["rooms"].clone()).context("parsing backed-up room keys")?;
+    let rooms: BTreeMap<OwnedRoomId, RoomKeyBackup> =
+        serde_json::from_value(keys_resp["rooms"].clone())
+            .context("parsing backed-up room keys")?;
 
     let mut room_keys: BTreeMap<OwnedRoomId, BTreeMap<String, BackedUpRoomKey>> = BTreeMap::new();
     let mut total_keys = 0usize;
@@ -208,15 +266,27 @@ pub async fn restore_from_recovery_key(state: &AppState, account_id: &str, recov
 
     let backup_machine = session.machine.backup_machine();
     #[allow(deprecated)]
-    let result = backup_machine.import_backed_up_room_keys(room_keys, |_, _| {}).await.context("importing backed-up room keys")?;
+    let result = backup_machine
+        .import_backed_up_room_keys(room_keys, |_, _| {})
+        .await
+        .context("importing backed-up room keys")?;
 
     let backup_key = key.megolm_v1_public_key();
     backup_key.set_version(version.clone());
-    backup_machine.enable_backup_v1(backup_key).await.context("enable_backup_v1")?;
-    backup_machine.save_decryption_key(Some(key), Some(version)).await.context("save_decryption_key")?;
+    backup_machine
+        .enable_backup_v1(backup_key)
+        .await
+        .context("enable_backup_v1")?;
+    backup_machine
+        .save_decryption_key(Some(key), Some(version))
+        .await
+        .context("save_decryption_key")?;
     state.runtime.mark_matrix_backup_enabled(account_id);
 
-    Ok(RestoreSummary { imported_keys: result.imported_count, total_keys })
+    Ok(RestoreSummary {
+        imported_keys: result.imported_count,
+        total_keys,
+    })
 }
 
 #[cfg(test)]
@@ -240,23 +310,48 @@ mod tests {
     /// under the real `~/.config/nobilis`, keyed only by account_id (no
     /// device_id component), so two sessions of the same real account
     /// would collide on the same on-disk store there.
-    async fn login_device(homeserver: &str, username: &str, password: &str, tag: &str) -> TestDevice {
-        let login = super::super::auth::login(homeserver, username, password, None).await.expect("login failed");
-        let data_dir = std::env::temp_dir().join(format!("nobilis-matrix-backup-probe-{tag}-{}", std::process::id()));
+    async fn login_device(
+        homeserver: &str,
+        username: &str,
+        password: &str,
+        tag: &str,
+    ) -> TestDevice {
+        let login = super::super::auth::login(homeserver, username, password, None)
+            .await
+            .expect("login failed");
+        let data_dir = std::env::temp_dir().join(format!(
+            "nobilis-matrix-backup-probe-{tag}-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&data_dir).unwrap();
         let state = AppState {
-            store: std::sync::Arc::new(crate::store::Store::open(&data_dir.join("scrollback.db")).expect("opening store")),
-            accounts: std::sync::Arc::new(crate::accounts::AccountStore::open(data_dir.join("accounts.toml")).expect("opening accounts")),
+            store: std::sync::Arc::new(
+                crate::store::Store::open(&data_dir.join("scrollback.db")).expect("opening store"),
+            ),
+            accounts: std::sync::Arc::new(
+                crate::accounts::AccountStore::open(data_dir.join("accounts.toml"))
+                    .expect("opening accounts"),
+            ),
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(crate::runtime::Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&data_dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
-            voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(data_dir.join("voice.toml"))),
-            dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(data_dir.join("dcc.toml"))),
-            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
-            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
-            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(
+                data_dir.join("voice.toml"),
+            )),
+            dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(
+                data_dir.join("dcc.toml"),
+            )),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(
+                data_dir.join("irc-sts.toml"),
+            )),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(
+                data_dir.join("highlights.toml"),
+            )),
+            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(
+                data_dir.join("ignores.toml"),
+            )),
         };
         let config = crate::accounts::MatrixAccountConfig {
             use_tor: false,
@@ -269,26 +364,47 @@ mod tests {
             next_batch: None,
             used_sliding_sync: false,
             oauth_refresh_token: String::new(),
-        oauth_client_id: String::new(),
-        prefer_sliding_sync: false,
+            oauth_client_id: String::new(),
+            prefer_sliding_sync: false,
             dehydration_enabled: false,
             display_name: None,
             rtc_focus_url: None,
         };
-        let saved = state.accounts.add_matrix(config).expect("add_matrix failed");
+        let saved = state
+            .accounts
+            .add_matrix(config)
+            .expect("add_matrix failed");
         let account_id = saved.account_id();
 
         let user_id = ruma_common::UserId::parse(&login.user_id).expect("invalid user_id");
         let device_id_ruma = <&ruma_common::DeviceId>::from(login.device_id.as_str());
-        let session = std::sync::Arc::new(CryptoSession::open(&data_dir, &account_id, &user_id, device_id_ruma).await.expect("opening crypto store"));
-        state.runtime.set_matrix_machine(&account_id, session.clone());
+        let session = std::sync::Arc::new(
+            CryptoSession::open(&data_dir, &account_id, &user_id, device_id_ruma)
+                .await
+                .expect("opening crypto store"),
+        );
+        state
+            .runtime
+            .set_matrix_machine(&account_id, session.clone());
 
-        TestDevice { state, account_id, session, access_token: login.access_token, homeserver_url: homeserver.to_string(), user_id: login.user_id }
+        TestDevice {
+            state,
+            account_id,
+            session,
+            access_token: login.access_token,
+            homeserver_url: homeserver.to_string(),
+            user_id: login.user_id,
+        }
     }
 
     async fn logout(homeserver_url: &str, access_token: &str) {
         let base = homeserver_url.trim_end_matches('/');
-        let _ = http::post_json(&format!("{base}/_matrix/client/v3/logout"), Some(access_token), serde_json::json!({})).await;
+        let _ = http::post_json(
+            &format!("{base}/_matrix/client/v3/logout"),
+            Some(access_token),
+            serde_json::json!({}),
+        )
+        .await;
     }
 
     /// Device A creates a private encrypted room, sends one message, sets
@@ -316,7 +432,8 @@ mod tests {
             println!("MATRIX_PASSWORD not set, skipping");
             return;
         };
-        let homeserver = std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
+        let homeserver =
+            std::env::var("MATRIX_HOMESERVER").unwrap_or_else(|_| "https://matrix.org".to_string());
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let a = login_device(&homeserver, &username, &password, "a").await;
@@ -333,18 +450,36 @@ mod tests {
         )
         .await
         .expect("createRoom failed");
-        let room_id = create_resp["room_id"].as_str().expect("no room_id in createRoom response").to_string();
+        let room_id = create_resp["room_id"]
+            .as_str()
+            .expect("no room_id in createRoom response")
+            .to_string();
         println!("created encrypted test room {room_id}");
 
         let own_user_id = ruma_common::UserId::parse(&a.user_id).expect("invalid user_id");
-        a.session.machine.update_tracked_users(std::iter::once(own_user_id.as_ref())).await.expect("update_tracked_users");
+        a.session
+            .machine
+            .update_tracked_users(std::iter::once(own_user_id.as_ref()))
+            .await
+            .expect("update_tracked_users");
 
         let room_id_ruma = ruma_common::RoomId::parse(&room_id).expect("invalid room id");
-        let member_ids = super::super::joined_member_ids(base, &a.access_token, &room_id).await.expect("joined_member_ids");
+        let member_ids = super::super::joined_member_ids(base, &a.access_token, &room_id)
+            .await
+            .expect("joined_member_ids");
 
         let probe_body = format!("backup-probe-{}", crate::model::next_message_id());
-        let content =
-            a.session.share_and_encrypt(&a.homeserver_url, &a.access_token, &room_id_ruma, member_ids, &probe_body).await.expect("share_and_encrypt");
+        let content = a
+            .session
+            .share_and_encrypt(
+                &a.homeserver_url,
+                &a.access_token,
+                &room_id_ruma,
+                member_ids,
+                &probe_body,
+            )
+            .await
+            .expect("share_and_encrypt");
 
         let txn_id = crate::model::next_message_id();
         let send_url = format!(
@@ -352,8 +487,13 @@ mod tests {
             url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
             url::form_urlencoded::byte_serialize(txn_id.as_bytes()).collect::<String>()
         );
-        let send_resp = http::put_json(&send_url, &a.access_token, content).await.expect("sending encrypted message");
-        let event_id = send_resp["event_id"].as_str().expect("no event_id in send response").to_string();
+        let send_resp = http::put_json(&send_url, &a.access_token, content)
+            .await
+            .expect("sending encrypted message");
+        let event_id = send_resp["event_id"]
+            .as_str()
+            .expect("no event_id in send response")
+            .to_string();
         println!("sent encrypted probe message, event {event_id}");
 
         // The exact raw m.room.encrypted envelope, as any client would see
@@ -363,30 +503,63 @@ mod tests {
             url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>(),
             url::form_urlencoded::byte_serialize(event_id.as_bytes()).collect::<String>()
         );
-        let raw_event = http::get_json(&event_url, &a.access_token).await.expect("fetching sent event");
+        let raw_event = http::get_json(&event_url, &a.access_token)
+            .await
+            .expect("fetching sent event");
 
-        let recovery_key = setup_recovery_key(&a.state, &a.account_id).await.expect("setup_recovery_key");
+        let recovery_key = setup_recovery_key(&a.state, &a.account_id)
+            .await
+            .expect("setup_recovery_key");
 
         // Force the just-created room key to actually upload now, rather
         // than waiting for a sync cycle - this test doesn't run a's sync
         // loop (see login_device's own doc comment on why not).
-        a.session.run_pending_backup(&a.homeserver_url, &a.access_token).await;
+        a.session
+            .run_pending_backup(&a.homeserver_url, &a.access_token)
+            .await;
 
-        let version_resp = http::get_json(&format!("{base}/_matrix/client/v3/room_keys/version"), &a.access_token).await.expect("room_keys/version");
-        let info: RoomKeyBackupInfo = serde_json::from_value(version_resp.clone()).expect("parsing backup auth data");
-        let recovery_key_obj = BackupDecryptionKey::from_base58(&recovery_key).expect("parsing our own recovery key");
-        assert!(recovery_key_obj.backup_key_matches(&info), "server's backup public key doesn't match the recovery key we were given");
-        println!("server-side backup version confirmed: {}", version_resp["version"]);
+        let version_resp = http::get_json(
+            &format!("{base}/_matrix/client/v3/room_keys/version"),
+            &a.access_token,
+        )
+        .await
+        .expect("room_keys/version");
+        let info: RoomKeyBackupInfo =
+            serde_json::from_value(version_resp.clone()).expect("parsing backup auth data");
+        let recovery_key_obj =
+            BackupDecryptionKey::from_base58(&recovery_key).expect("parsing our own recovery key");
+        assert!(
+            recovery_key_obj.backup_key_matches(&info),
+            "server's backup public key doesn't match the recovery key we were given"
+        );
+        println!(
+            "server-side backup version confirmed: {}",
+            version_resp["version"]
+        );
 
         let c = login_device(&homeserver, &username, &password, "c").await;
 
-        let summary = restore_from_recovery_key(&c.state, &c.account_id, &recovery_key).await.expect("restore_from_recovery_key");
-        println!("restore summary: imported {}/{} keys", summary.imported_keys, summary.total_keys);
-        assert!(summary.imported_keys >= 1, "expected at least the probe message's room key to be imported");
+        let summary = restore_from_recovery_key(&c.state, &c.account_id, &recovery_key)
+            .await
+            .expect("restore_from_recovery_key");
+        println!(
+            "restore summary: imported {}/{} keys",
+            summary.imported_keys, summary.total_keys
+        );
+        assert!(
+            summary.imported_keys >= 1,
+            "expected at least the probe message's room key to be imported"
+        );
 
-        let decrypted = super::super::crypto::decrypt_room_event(&c.session, &raw_event, &room_id_ruma).await.expect("decrypt_room_event on device C");
+        let decrypted =
+            super::super::crypto::decrypt_room_event(&c.session, &raw_event, &room_id_ruma)
+                .await
+                .expect("decrypt_room_event on device C");
         let decrypted_body = decrypted["content"]["body"].as_str().unwrap_or_default();
-        assert_eq!(decrypted_body, probe_body, "device C decrypted the wrong content (or decryption silently produced garbage)");
+        assert_eq!(
+            decrypted_body, probe_body,
+            "device C decrypted the wrong content (or decryption silently produced garbage)"
+        );
         println!("independent restore+decrypt confirmed: {decrypted_body}");
 
         logout(&a.homeserver_url, &a.access_token).await;

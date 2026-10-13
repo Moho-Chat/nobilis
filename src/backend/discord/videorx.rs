@@ -93,7 +93,10 @@ impl VideoReceiver {
         self.asked.retain(|sequence, _| missing.contains(sequence));
         let mut ask = Vec::new();
         for sequence in missing {
-            let entry = self.asked.entry(sequence).or_insert((now - NACK_AGAIN_AFTER, 0));
+            let entry = self
+                .asked
+                .entry(sequence)
+                .or_insert((now - NACK_AGAIN_AFTER, 0));
             if entry.1 < NACK_TRIES && now.duration_since(entry.0) >= NACK_AGAIN_AFTER {
                 *entry = (now, entry.1 + 1);
                 ask.push(sequence);
@@ -128,7 +131,11 @@ impl VideoReceiver {
     /// Whether a keyframe should be asked for now: while the decoder is
     /// waiting for one, no oftener than `PLI_EVERY`.
     pub fn wants_keyframe(&mut self, now: Instant) -> bool {
-        if !self.waiting_for_keyframe || self.last_pli.is_some_and(|last| now.duration_since(last) < PLI_EVERY) {
+        if !self.waiting_for_keyframe
+            || self
+                .last_pli
+                .is_some_and(|last| now.duration_since(last) < PLI_EVERY)
+        {
             return false;
         }
         self.last_pli = Some(now);
@@ -149,7 +156,10 @@ pub fn unwrap_rtx(payload: &[u8]) -> Option<(u16, Vec<u8>)> {
     if payload.len() <= 2 {
         return None;
     }
-    Some((u16::from_be_bytes([payload[0], payload[1]]), payload[2..].to_vec()))
+    Some((
+        u16::from_be_bytes([payload[0], payload[1]]),
+        payload[2..].to_vec(),
+    ))
 }
 
 /// Every retransmission SSRC an `op 12` names, with the SSRC it resends for.
@@ -239,15 +249,30 @@ mod tests {
         let mut payload = vec![if start { 0x10 } else { 0x00 }];
         payload.push(if key { 0x00 } else { 0x01 });
         payload.extend_from_slice(&[0x9d, 0x01, 0x2a]);
-        Packet { payload_type: 103, sequence, timestamp: sequence as u32 * 3000, ssrc: 7, marker, payload }
+        Packet {
+            payload_type: 103,
+            sequence,
+            timestamp: sequence as u32 * 3000,
+            ssrc: 7,
+            marker,
+            payload,
+        }
     }
 
     #[test]
     fn a_nack_packs_nearby_losses_into_one_entry() {
         let packet = nack(1, 2, &[100, 101, 103, 117, 200]);
-        assert_eq!(&packet[..4], &[0x81, 205, 0, 5], "six words in all, written as one fewer");
+        assert_eq!(
+            &packet[..4],
+            &[0x81, 205, 0, 5],
+            "six words in all, written as one fewer"
+        );
         assert_eq!(&packet[4..12], &[0, 0, 0, 1, 0, 0, 0, 2]);
-        assert_eq!(&packet[12..16], &[0, 100, 0, 0b101], "101 is bit 0, 103 bit 2; 117 is too far");
+        assert_eq!(
+            &packet[12..16],
+            &[0, 100, 0, 0b101],
+            "101 is bit 0, 103 bit 2; 117 is too far"
+        );
         assert_eq!(&packet[16..20], &[0, 117, 0, 0]);
         assert_eq!(&packet[20..24], &[0, 200, 0, 0]);
     }
@@ -265,7 +290,10 @@ mod tests {
         let sealed = seal_rtcp(&mut sealer, &packet).unwrap();
         assert!(is_rtcp(&sealed));
         assert_eq!(&sealed[..8], &packet[..8]);
-        assert_eq!(open_at(Mode::Aes256Gcm, &key, &sealed, 8, 8).unwrap(), &packet[8..]);
+        assert_eq!(
+            open_at(Mode::Aes256Gcm, &key, &sealed, 8, 8).unwrap(),
+            &packet[8..]
+        );
     }
 
     #[test]
@@ -276,7 +304,8 @@ mod tests {
 
     #[test]
     fn retransmission_ssrcs_are_read_from_the_streams() {
-        let d = serde_json::json!({ "video_ssrc": 264, "streams": [{ "ssrc": 264, "rtx_ssrc": 265 }] });
+        let d =
+            serde_json::json!({ "video_ssrc": 264, "streams": [{ "ssrc": 264, "rtx_ssrc": 265 }] });
         assert!(rtx_pairs(&d).contains(&(265, 264)));
     }
 
@@ -289,7 +318,10 @@ mod tests {
         assert_eq!(rx.due_for_asking(t), vec![2]);
         assert!(rx.due_for_asking(t).is_empty(), "not again at once");
         assert_eq!(rx.due_for_asking(t + NACK_AGAIN_AFTER), vec![2]);
-        assert!(rx.due_for_asking(t + NACK_AGAIN_AFTER * 5).is_empty(), "twice is enough");
+        assert!(
+            rx.due_for_asking(t + NACK_AGAIN_AFTER * 5).is_empty(),
+            "twice is enough"
+        );
     }
 
     #[test]
@@ -315,13 +347,30 @@ mod tests {
         let first = rx.push(vp8(1, true, true, true), false, t);
         assert!(rx.admit(&first[0], true));
         rx.push(vp8(3, true, true, false), false, t);
-        let frames = rx.push(vp8(4, true, true, false), false, t + Duration::from_millis(200));
+        let frames = rx.push(
+            vp8(4, true, true, false),
+            false,
+            t + Duration::from_millis(200),
+        );
         assert!(frames[0].after_gap);
-        assert!(!rx.admit(&frames[0], false), "the frame after the loss is not decoded");
-        assert!(!rx.admit(&frames[1], false), "nor anything until a keyframe");
+        assert!(
+            !rx.admit(&frames[0], false),
+            "the frame after the loss is not decoded"
+        );
+        assert!(
+            !rx.admit(&frames[1], false),
+            "nor anything until a keyframe"
+        );
         assert!(rx.wants_keyframe(t));
-        assert!(!rx.wants_keyframe(t + Duration::from_millis(10)), "and not asked again at once");
-        let key = rx.push(vp8(5, true, true, true), false, t + Duration::from_millis(300));
+        assert!(
+            !rx.wants_keyframe(t + Duration::from_millis(10)),
+            "and not asked again at once"
+        );
+        let key = rx.push(
+            vp8(5, true, true, true),
+            false,
+            t + Duration::from_millis(300),
+        );
         assert!(rx.admit(&key[0], true));
         assert!(!rx.is_waiting_for_keyframe());
     }

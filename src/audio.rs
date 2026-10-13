@@ -7,8 +7,8 @@
 //! A frontend asks to join, leave, mute, or use a different device.
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use serde::Deserialize;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -113,7 +113,9 @@ pub fn apply_gain(samples: &mut [i16], gain: f32) {
         return;
     }
     for s in samples.iter_mut() {
-        *s = (*s as f32 * gain).round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        *s = (*s as f32 * gain)
+            .round()
+            .clamp(i16::MIN as f32, i16::MAX as f32) as i16;
     }
 }
 
@@ -131,7 +133,10 @@ impl VoicePrefsStore {
             // A corrupt or unreadable preferences file should not stop the
             // daemon starting; defaults are a working configuration.
             .unwrap_or_default();
-        Self { path, inner: Mutex::new(inner) }
+        Self {
+            path,
+            inner: Mutex::new(inner),
+        }
     }
 
     pub fn get(&self) -> VoicePrefs {
@@ -196,10 +201,20 @@ pub fn list_devices() -> Result<Vec<AudioDevice>> {
 
     let host = cpal::default_host();
     if let Some(device) = host.default_input_device() {
-        out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "input".into(), is_default: true });
+        out.push(AudioDevice {
+            id: DEFAULT_ID.into(),
+            name: device.to_string(),
+            kind: "input".into(),
+            is_default: true,
+        });
     }
     if let Some(device) = host.default_output_device() {
-        out.push(AudioDevice { id: DEFAULT_ID.into(), name: device.to_string(), kind: "output".into(), is_default: true });
+        out.push(AudioDevice {
+            id: DEFAULT_ID.into(),
+            name: device.to_string(),
+            kind: "output".into(),
+            is_default: true,
+        });
     }
     Ok(out)
 }
@@ -221,13 +236,23 @@ fn host_devices() -> Vec<AudioDevice> {
     if let Ok(devices) = host.input_devices() {
         for name in devices.map(|d| d.to_string()) {
             let is_default = Some(&name) == default_in.as_ref();
-            out.push(AudioDevice { id: name.clone(), name, kind: "input".into(), is_default });
+            out.push(AudioDevice {
+                id: name.clone(),
+                name,
+                kind: "input".into(),
+                is_default,
+            });
         }
     }
     if let Ok(devices) = host.output_devices() {
         for name in devices.map(|d| d.to_string()) {
             let is_default = Some(&name) == default_out.as_ref();
-            out.push(AudioDevice { id: name.clone(), name, kind: "output".into(), is_default });
+            out.push(AudioDevice {
+                id: name.clone(),
+                name,
+                kind: "output".into(),
+                is_default,
+            });
         }
     }
     out
@@ -258,14 +283,26 @@ fn pactl(args: &[&str]) -> Result<String> {
         .output()
         .context("running pactl")?;
     if !out.status.success() {
-        return Err(anyhow!("pactl {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(anyhow!(
+            "pactl {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn server_devices() -> Result<Vec<AudioDevice>> {
-    let mut out = parse_devices(&pactl(&["-f", "json", "list", "sources"])?, "input", pactl(&["get-default-source"]).unwrap_or_default().trim())?;
-    out.extend(parse_devices(&pactl(&["-f", "json", "list", "sinks"])?, "output", pactl(&["get-default-sink"]).unwrap_or_default().trim())?);
+    let mut out = parse_devices(
+        &pactl(&["-f", "json", "list", "sources"])?,
+        "input",
+        pactl(&["get-default-source"]).unwrap_or_default().trim(),
+    )?;
+    out.extend(parse_devices(
+        &pactl(&["-f", "json", "list", "sinks"])?,
+        "output",
+        pactl(&["get-default-sink"]).unwrap_or_default().trim(),
+    )?);
     Ok(out)
 }
 
@@ -279,11 +316,18 @@ fn parse_devices(json: &str, kind: &str, default_name: &str) -> Result<Vec<Audio
     let entries = parsed.as_array().context("pactl did not return a list")?;
     let mut out = Vec::new();
     for entry in entries {
-        let Some(id) = entry["name"].as_str() else { continue };
-        if kind == "input" && (id.ends_with(".monitor") || entry["monitor_of_sink_name"].is_string()) {
+        let Some(id) = entry["name"].as_str() else {
+            continue;
+        };
+        if kind == "input"
+            && (id.ends_with(".monitor") || entry["monitor_of_sink_name"].is_string())
+        {
             continue;
         }
-        let name = entry["description"].as_str().filter(|d| !d.is_empty()).unwrap_or(id);
+        let name = entry["description"]
+            .as_str()
+            .filter(|d| !d.is_empty())
+            .unwrap_or(id);
         out.push(AudioDevice {
             id: id.to_string(),
             name: name.to_string(),
@@ -401,7 +445,8 @@ fn our_streams(stream: Stream) -> Result<std::collections::HashSet<String>> {
 /// move: rerouting "everything this process records" to a new microphone would
 /// turn a shared screen's sound into that microphone.
 fn system_capture_streams() -> &'static Mutex<std::collections::HashSet<String>> {
-    static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    static HELD: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
     HELD.get_or_init(Default::default)
 }
 
@@ -412,8 +457,16 @@ fn route_stream(stream: Stream, device_id: &str) -> Result<bool> {
 /// Moves this process's streams to `device_id`, leaving alone the ones in
 /// `existing` - there before the capture being routed opened, so somebody
 /// else's - and any recording of the computer's own sound.
-fn route_stream_except(stream: Stream, device_id: &str, existing: &std::collections::HashSet<String>) -> Result<bool> {
-    let device_id = &if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
+fn route_stream_except(
+    stream: Stream,
+    device_id: &str,
+    existing: &std::collections::HashSet<String>,
+) -> Result<bool> {
+    let device_id = &if device_id.is_empty() {
+        default_device(stream)?
+    } else {
+        device_id.to_string()
+    };
     let protected = system_capture_streams().lock().unwrap().clone();
     let mine: Vec<String> = our_streams(stream)?
         .into_iter()
@@ -438,10 +491,15 @@ fn input_device(device_id: Option<&str>) -> Result<cpal::Device> {
     // Where there is not, moving is not on offer, and opening the device is
     // the only way a choice means anything. host_device_named only matches
     // ids that came from cpal, so this cannot fire on the pactl path.
-    if let Some(found) = device_id.filter(|d| !d.is_empty()).and_then(|id| host_device_named(id, "input")) {
+    if let Some(found) = device_id
+        .filter(|d| !d.is_empty())
+        .and_then(|id| host_device_named(id, "input"))
+    {
         return Ok(found);
     }
-    cpal::default_host().default_input_device().context("no default input device")
+    cpal::default_host()
+        .default_input_device()
+        .context("no default input device")
 }
 
 /// A running capture: a microphone, or what the computer is playing.
@@ -486,8 +544,15 @@ where
     F: FnMut(&[f32]) + Send + 'static,
 {
     let device = input_device(device_id)?;
-    let config = device.default_input_config().context("querying the input device")?;
-    open_input(device, config, sink, Route::Device(device_id.unwrap_or("").to_string()))
+    let config = device
+        .default_input_config()
+        .context("querying the input device")?;
+    open_input(
+        device,
+        config,
+        sink,
+        Route::Device(device_id.unwrap_or("").to_string()),
+    )
 }
 
 /// Where a freshly opened recording is pointed once it exists.
@@ -527,18 +592,28 @@ where
     #[cfg(target_os = "macos")]
     {
         let _ = sink;
-        Err(anyhow!("sharing the computer's sound is not supported on macOS yet"))
+        Err(anyhow!(
+            "sharing the computer's sound is not supported on macOS yet"
+        ))
     }
     #[cfg(target_os = "windows")]
     {
-        let device = cpal::default_host().default_output_device().context("no default output device to record")?;
-        let config = device.default_output_config().context("querying the output device")?;
+        let device = cpal::default_host()
+            .default_output_device()
+            .context("no default output device to record")?;
+        let config = device
+            .default_output_config()
+            .context("querying the output device")?;
         open_input(device, config, sink, Route::AsOpened)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        let device = cpal::default_host().default_input_device().context("no recording device to point at the output")?;
-        let config = device.default_input_config().context("querying the input device")?;
+        let device = cpal::default_host()
+            .default_input_device()
+            .context("no recording device to point at the output")?;
+        let config = device
+            .default_input_config()
+            .context("querying the input device")?;
         open_input(device, config, sink, Route::Monitor)
     }
 }
@@ -556,7 +631,12 @@ fn mixed_monitor(_mix: &Option<()>) -> Option<String> {
 
 /// Opens a recording, converts what it delivers to 48kHz stereo, and points it
 /// where `route` says.
-fn open_input<F>(device: cpal::Device, config: cpal::SupportedStreamConfig, mut sink: F, route: Route) -> Result<Capture>
+fn open_input<F>(
+    device: cpal::Device,
+    config: cpal::SupportedStreamConfig,
+    mut sink: F,
+    route: Route,
+) -> Result<Capture>
 where
     F: FnMut(&[f32]) + Send + 'static,
 {
@@ -586,7 +666,10 @@ where
     };
     let rate = config.sample_rate();
     let channels = config.channels();
-    tracing::info!("audio: capturing from {:?} at {rate}Hz {channels}ch", device.to_string());
+    tracing::info!(
+        "audio: capturing from {:?} at {rate}Hz {channels}ch",
+        device.to_string()
+    );
 
     let level = Arc::new(Mutex::new(0.0f32));
     let active = Arc::new(AtomicBool::new(true));
@@ -608,7 +691,11 @@ where
             let src = (i as u64 * rate as u64 / TARGET_RATE as u64) as usize;
             let base = src * channels as usize;
             let l = samples.get(base).copied().unwrap_or(0.0);
-            let r = if channels > 1 { samples.get(base + 1).copied().unwrap_or(l) } else { l };
+            let r = if channels > 1 {
+                samples.get(base + 1).copied().unwrap_or(l)
+            } else {
+                l
+            };
             out.push(l.clamp(-1.0, 1.0));
             out.push(r.clamp(-1.0, 1.0));
         }
@@ -646,7 +733,9 @@ where
             // worse than being told the choice did not take - but only a
             // choice can be betrayed. Failing to reach the default leaves the
             // stream wherever the sound server put it, which is a working call.
-            Err(e) if !want.is_empty() => return Err(e.context(format!("routing input to {want:?}"))),
+            Err(e) if !want.is_empty() => {
+                return Err(e.context(format!("routing input to {want:?}")))
+            }
             Err(e) => tracing::warn!("audio: could not route input to the default device: {e:#}"),
         },
         Route::Monitor => {
@@ -665,8 +754,14 @@ where
                 .with_context(|| format!("pointing the recording at {monitor}"))?;
             // Remembered, so that changing microphones mid-call leaves it
             // where it is.
-            system_streams = our_streams(Stream::Input)?.into_iter().filter(|i| !existing.contains(i)).collect();
-            system_capture_streams().lock().unwrap().extend(system_streams.iter().cloned());
+            system_streams = our_streams(Stream::Input)?
+                .into_iter()
+                .filter(|i| !existing.contains(i))
+                .collect();
+            system_capture_streams()
+                .lock()
+                .unwrap()
+                .extend(system_streams.iter().cloned());
             tracing::info!("audio: recording what is played, from {monitor}");
         }
         Route::AsOpened => {}
@@ -692,9 +787,7 @@ impl Capture {
     pub fn set_muted(&self, muted: bool) {
         self.active.store(!muted, Ordering::Relaxed);
     }
-
 }
-
 
 /// Whether the speakers are silenced.
 ///
@@ -767,14 +860,24 @@ impl Playback {
 /// As with capture, a chosen device is honoured by moving the stream once it
 /// exists rather than by opening that device directly.
 pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
-    let device = match device_id.filter(|d| !d.is_empty()).and_then(|id| host_device_named(id, "output")) {
+    let device = match device_id
+        .filter(|d| !d.is_empty())
+        .and_then(|id| host_device_named(id, "output"))
+    {
         Some(found) => found,
-        None => cpal::default_host().default_output_device().context("no default output device")?,
+        None => cpal::default_host()
+            .default_output_device()
+            .context("no default output device")?,
     };
-    let config = device.default_output_config().context("querying the output device")?;
+    let config = device
+        .default_output_config()
+        .context("querying the output device")?;
     let rate = config.sample_rate();
     let channels = config.channels();
-    tracing::info!("audio: playing to {:?} at {rate}Hz {channels}ch", device.to_string());
+    tracing::info!(
+        "audio: playing to {:?} at {rate}Hz {channels}ch",
+        device.to_string()
+    );
     let existing = our_streams(Stream::Output).unwrap_or_default();
 
     let buffer = Arc::new(Mutex::new(std::collections::VecDeque::<i16>::new()));
@@ -792,11 +895,18 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
                 // Mono output takes the left channel; anything wider than
                 // stereo repeats what there is rather than leaving silence in
                 // the surround channels.
-                let sample = buf.get(base + ch.min(TARGET_CHANNELS as usize - 1)).copied().unwrap_or(0);
-                write(frame * channels as usize + ch, sample as f32 / i16::MAX as f32);
+                let sample = buf
+                    .get(base + ch.min(TARGET_CHANNELS as usize - 1))
+                    .copied()
+                    .unwrap_or(0);
+                write(
+                    frame * channels as usize + ch,
+                    sample as f32 / i16::MAX as f32,
+                );
             }
         }
-        let consumed = (out_frames as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize * TARGET_CHANNELS as usize;
+        let consumed = (out_frames as u64 * TARGET_RATE as u64 / rate.max(1) as u64) as usize
+            * TARGET_CHANNELS as usize;
         let drop_n = consumed.min(buf.len());
         buf.drain(..drop_n);
     };
@@ -816,7 +926,10 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
             config.into(),
             move |data: &mut [i16], _: &_| {
                 let frames = data.len() / channels.max(1) as usize;
-                fill(frames, Box::new(|i, v| data[i] = (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16));
+                fill(
+                    frames,
+                    Box::new(|i, v| data[i] = (v.clamp(-1.0, 1.0) * i16::MAX as f32) as i16),
+                );
             },
             err,
             None,
@@ -835,7 +948,12 @@ pub fn start_playback(device_id: Option<&str>) -> Result<Playback> {
         Err(e) => tracing::warn!("audio: could not route output: {e:#}"),
     }
 
-    Ok(Playback { _stream: stream, buffer, peak: Mutex::new(0.0), received: std::sync::atomic::AtomicU64::new(0) })
+    Ok(Playback {
+        _stream: stream,
+        buffer,
+        peak: Mutex::new(0.0),
+        received: std::sync::atomic::AtomicU64::new(0),
+    })
 }
 
 /// Every application's sound except this program's, gathered into a sink of
@@ -867,7 +985,9 @@ impl ShareMix {
             std::process::Command::new(tool)
                 .arg("--version")
                 .output()
-                .with_context(|| format!("{tool} is not installed, so there is no PipeWire to build a mix with"))?;
+                .with_context(|| {
+                    format!("{tool} is not installed, so there is no PipeWire to build a mix with")
+                })?;
         }
         let sink = format!("nobilis_share_{}", std::process::id());
         let before = default_device(Stream::Output).ok();
@@ -895,7 +1015,9 @@ impl ShareMix {
                 match link_into(&target, &own_node) {
                     Ok(made) if made > 0 => {
                         linked += made;
-                        tracing::info!("audio: share mix now takes {linked} application channel(s)");
+                        tracing::info!(
+                            "audio: share mix now takes {linked} application channel(s)"
+                        );
                     }
                     Ok(_) => {}
                     Err(e) => tracing::debug!("audio: share mix: {e:#}"),
@@ -927,11 +1049,16 @@ impl Drop for ShareMix {
 /// own playback. Returns how many links it made.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn link_into(sink: &str, own_node: &str) -> Result<usize> {
-    let dump = std::process::Command::new("pw-dump").output().context("running pw-dump")?;
-    let graph: serde_json::Value = serde_json::from_slice(&dump.stdout).context("reading pw-dump")?;
+    let dump = std::process::Command::new("pw-dump")
+        .output()
+        .context("running pw-dump")?;
+    let graph: serde_json::Value =
+        serde_json::from_slice(&dump.stdout).context("reading pw-dump")?;
     let plan = links_to_make(&graph, sink, own_node, std::process::id());
     for (from, to) in &plan {
-        let _ = std::process::Command::new("pw-link").args([from.to_string(), to.to_string()]).output();
+        let _ = std::process::Command::new("pw-link")
+            .args([from.to_string(), to.to_string()])
+            .output();
     }
     Ok(plan.len())
 }
@@ -942,9 +1069,22 @@ fn link_into(sink: &str, own_node: &str) -> Result<usize> {
 /// output streams only; not our own (by node name or process); monitor ports
 /// never; a mono channel into both sides; and nothing already linked.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn links_to_make(graph: &serde_json::Value, sink: &str, own_node: &str, own_pid: u32) -> Vec<(u64, u64)> {
+pub fn links_to_make(
+    graph: &serde_json::Value,
+    sink: &str,
+    own_node: &str,
+    own_pid: u32,
+) -> Vec<(u64, u64)> {
     let objects = graph.as_array().map(|a| a.as_slice()).unwrap_or_default();
-    let kind = |o: &serde_json::Value| o["type"].as_str().unwrap_or("").rsplit(':').next().unwrap_or("").to_string();
+    let kind = |o: &serde_json::Value| {
+        o["type"]
+            .as_str()
+            .unwrap_or("")
+            .rsplit(':')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
     let props = |o: &serde_json::Value| o["info"]["props"].clone();
 
     let mut sink_node: Option<u64> = None;
@@ -960,15 +1100,19 @@ pub fn links_to_make(graph: &serde_json::Value, sink: &str, own_node: &str, own_
         if p["media.class"].as_str() != Some("Stream/Output/Audio") {
             continue;
         }
-        let pid = p["application.process.id"]
-            .as_u64()
-            .or_else(|| p["application.process.id"].as_str().and_then(|s| s.parse().ok()));
+        let pid = p["application.process.id"].as_u64().or_else(|| {
+            p["application.process.id"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+        });
         if name.starts_with(own_node) || pid == Some(own_pid as u64) {
             continue;
         }
         sources.insert(id);
     }
-    let Some(sink_node) = sink_node else { return Vec::new() };
+    let Some(sink_node) = sink_node else {
+        return Vec::new();
+    };
 
     let mut inputs: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
     let mut outputs: Vec<(u64, String)> = Vec::new();
@@ -982,14 +1126,21 @@ pub fn links_to_make(graph: &serde_json::Value, sink: &str, own_node: &str, own_
             Some("in") if node == Some(sink_node) => {
                 inputs.insert(channel, id);
             }
-            Some("out") if !monitor && node.is_some_and(|n| sources.contains(&n)) => outputs.push((id, channel)),
+            Some("out") if !monitor && node.is_some_and(|n| sources.contains(&n)) => {
+                outputs.push((id, channel))
+            }
             _ => {}
         }
     }
     let existing: std::collections::HashSet<(u64, u64)> = objects
         .iter()
         .filter(|o| kind(o) == "Link")
-        .filter_map(|o| Some((o["info"]["output-port-id"].as_u64()?, o["info"]["input-port-id"].as_u64()?)))
+        .filter_map(|o| {
+            Some((
+                o["info"]["output-port-id"].as_u64()?,
+                o["info"]["input-port-id"].as_u64()?,
+            ))
+        })
         .collect();
 
     let mut plan = Vec::new();
@@ -1015,8 +1166,16 @@ pub fn links_to_make(graph: &serde_json::Value, sink: &str, own_node: &str, own_
 /// A stream is only something the sound server can move once it is playing,
 /// and it takes a moment to appear - measured at 0.3 to 0.4 seconds here - so
 /// concluding it is missing straight away would fail every time.
-fn route_when_ready(stream: Stream, device_id: &str, existing: &std::collections::HashSet<String>) -> Result<String> {
-    let target = if device_id.is_empty() { default_device(stream)? } else { device_id.to_string() };
+fn route_when_ready(
+    stream: Stream,
+    device_id: &str,
+    existing: &std::collections::HashSet<String>,
+) -> Result<String> {
+    let target = if device_id.is_empty() {
+        default_device(stream)?
+    } else {
+        device_id.to_string()
+    };
     let mut last = Ok(false);
     for _ in 0..40 {
         last = route_stream_except(stream, &target, existing);
@@ -1030,7 +1189,6 @@ fn route_when_ready(stream: Stream, device_id: &str, existing: &std::collections
         Err(e) => Err(e),
     }
 }
-
 
 /// A live microphone, read in 20ms frames by whatever is sending it.
 ///
@@ -1104,14 +1262,23 @@ mod tests {
         // fail, and that anything reported is coherent.
         let devices = list_devices().expect("listing devices should not fail");
         for d in &devices {
-            assert!(!d.name.is_empty(), "a device with no name is not selectable");
+            assert!(
+                !d.name.is_empty(),
+                "a device with no name is not selectable"
+            );
             assert!(d.kind == "input" || d.kind == "output");
         }
         // At most one default per direction, or a picker cannot show which
         // one is in force.
         for kind in ["input", "output"] {
-            let defaults = devices.iter().filter(|d| d.kind == kind && d.is_default).count();
-            assert!(defaults <= 1, "{defaults} devices claim to be the default {kind}");
+            let defaults = devices
+                .iter()
+                .filter(|d| d.kind == kind && d.is_default)
+                .count();
+            assert!(
+                defaults <= 1,
+                "{defaults} devices claim to be the default {kind}"
+            );
         }
     }
 
@@ -1155,7 +1322,8 @@ mod tests {
     fn monitors_are_not_offered_as_microphones() {
         // Every output has a monitor source. Offering one as a microphone
         // means transmitting your own audio back into the call.
-        let devices = parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
+        let devices =
+            parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
         assert!(
             !devices.iter().any(|d| d.id.ends_with(".monitor")),
             "a monitor source was offered as an input: {devices:?}"
@@ -1165,11 +1333,15 @@ mod tests {
 
     #[test]
     fn devices_are_named_for_people_and_keyed_for_machines() {
-        let devices = parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
+        let devices =
+            parse_devices(SOURCES_JSON, "input", "alsa_input.usb-HyperX.analog-stereo").unwrap();
         let hyperx = &devices[0];
         assert_eq!(hyperx.name, "HyperX QuadCast S Analog Stereo");
         assert_eq!(hyperx.id, "alsa_input.usb-HyperX.analog-stereo");
-        assert!(hyperx.is_default, "the server's default device was not marked");
+        assert!(
+            hyperx.is_default,
+            "the server's default device was not marked"
+        );
 
         // A device with no description still has to be selectable, so it
         // falls back to the only name there is rather than showing blank.
@@ -1190,7 +1362,8 @@ mod tests {
         // into a device nobody is listening to.
         let output = default_device(Stream::Output).expect("a sound server to ask");
         assert!(!output.is_empty(), "the default sink resolved to nothing");
-        let input = default_device(Stream::Input).expect("a server with a sink should name a source");
+        let input =
+            default_device(Stream::Input).expect("a server with a sink should name a source");
         assert!(!input.is_empty(), "the default source resolved to nothing");
     }
 
@@ -1223,7 +1396,10 @@ mod tests {
         // Muting and then finding yourself live on the next run is the
         // failure this guards against.
         let reopened = VoicePrefsStore::open(path.clone());
-        assert_eq!(reopened.get().input.as_deref(), Some("alsa_input.usb-HyperX.analog-stereo"));
+        assert_eq!(
+            reopened.get().input.as_deref(),
+            Some("alsa_input.usb-HyperX.analog-stereo")
+        );
         assert!(reopened.get().mic_muted);
 
         // Garbage on disk must not stop the daemon starting.
@@ -1236,9 +1412,14 @@ mod tests {
     fn a_frame_is_handed_out_whole_or_not_at_all() {
         let (source, mut sink) = MicSource::new();
         sink(&[0.25f32; 1000]);
-        assert!(source.take(1920).is_none(), "half a frame is a click, not a frame");
+        assert!(
+            source.take(1920).is_none(),
+            "half a frame is a click, not a frame"
+        );
         sink(&[0.25f32; 920]);
-        let frame = source.take(1920).expect("a whole frame once it has arrived");
+        let frame = source
+            .take(1920)
+            .expect("a whole frame once it has arrived");
         assert_eq!(frame.len(), 1920);
         assert!(source.take(1).is_none(), "nothing is left over");
     }
@@ -1308,7 +1489,10 @@ mod tests {
         println!("recorded {samples} samples, peak {peak:.4}, streams {routed:?}");
         assert!(samples > 0, "the recording produced nothing");
         assert!(peak > 0.01, "silence - the recording is not on the monitor");
-        assert!(system_capture_streams().lock().unwrap().is_empty(), "closing it should release its stream");
+        assert!(
+            system_capture_streams().lock().unwrap().is_empty(),
+            "closing it should release its stream"
+        );
     }
 
     /// Opens the real default microphone. Ignored by default: it needs
@@ -1336,7 +1520,10 @@ mod tests {
         assert!(samples > 0, "the input stream produced nothing at all");
         // Three seconds of wall clock should yield roughly three seconds of
         // audio; a badly wrong resample ratio shows up here.
-        assert!(seconds > 1.5, "far less audio than elapsed time: {seconds:.2}s");
+        assert!(
+            seconds > 1.5,
+            "far less audio than elapsed time: {seconds:.2}s"
+        );
     }
 }
 

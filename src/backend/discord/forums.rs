@@ -17,7 +17,9 @@ const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 /// When a snowflake was made, in Unix seconds. A thread's id is the id of its
 /// first message, so this is when the post was made.
 fn snowflake_secs(id: &str) -> i64 {
-    id.parse::<u64>().map(|n| (((n >> 22) + DISCORD_EPOCH_MS) / 1000) as i64).unwrap_or(0)
+    id.parse::<u64>()
+        .map(|n| (((n >> 22) + DISCORD_EPOCH_MS) / 1000) as i64)
+        .unwrap_or(0)
 }
 
 /// The words of a first message, cut to what a card shows.
@@ -33,23 +35,38 @@ fn teaser(content: &str) -> String {
 /// A picture to put on the post's card: the first image attached to its first
 /// message, else the picture of the first link in it.
 fn post_thumbnail(first: &Value) -> Option<String> {
-    let attached = extract_attachments(first).into_iter().find(|a| a.kind == "image" || a.kind == "video");
+    let attached = extract_attachments(first)
+        .into_iter()
+        .find(|a| a.kind == "image" || a.kind == "video");
     if let Some(a) = attached {
         // A video has no still of its own here; Discord's proxy serves one.
         if a.kind == "image" {
             return a.url;
         }
     }
-    first["embeds"]
-        .as_array()?
-        .iter()
-        .find_map(|e| e["thumbnail"]["url"].as_str().or_else(|| e["image"]["url"].as_str()).map(str::to_string))
+    first["embeds"].as_array()?.iter().find_map(|e| {
+        e["thumbnail"]["url"]
+            .as_str()
+            .or_else(|| e["image"]["url"].as_str())
+            .map(str::to_string)
+    })
 }
 
 /// One post, from the thread and the first message that came with it.
-fn post_card(thread: &Value, first: Option<&Value>, tags: &[Value], own_user_id: &str, own_name: Option<&str>) -> Value {
+fn post_card(
+    thread: &Value,
+    first: Option<&Value>,
+    tags: &[Value],
+    own_user_id: &str,
+    own_name: Option<&str>,
+) -> Value {
     let id = thread["id"].as_str().unwrap_or_default();
-    let applied: Vec<&str> = thread["applied_tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()).collect();
+    let applied: Vec<&str> = thread["applied_tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.as_str())
+        .collect();
     let tag_names: Vec<Value> = applied
         .iter()
         .filter_map(|id| tags.iter().find(|t| t["id"].as_str() == Some(id)))
@@ -61,13 +78,29 @@ fn post_card(thread: &Value, first: Option<&Value>, tags: &[Value], own_user_id:
         })
         .collect();
     let author = first
-        .and_then(|m| m["author"]["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| m["author"]["username"].as_str()))
+        .and_then(|m| {
+            m["author"]["global_name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| m["author"]["username"].as_str())
+        })
         .unwrap_or("");
     let content = first
-        .map(|m| resolve_mentions(&extract_body(m).unwrap_or_default(), m, own_user_id, own_name))
+        .map(|m| {
+            resolve_mentions(
+                &extract_body(m).unwrap_or_default(),
+                m,
+                own_user_id,
+                own_name,
+            )
+        })
         .unwrap_or_default();
     let reaction = first.and_then(|m| extract_reactions(m).into_iter().max_by_key(|r| r.count));
-    let last = thread["last_message_id"].as_str().map(snowflake_secs).filter(|&t| t > 0).unwrap_or_else(|| snowflake_secs(id));
+    let last = thread["last_message_id"]
+        .as_str()
+        .map(snowflake_secs)
+        .filter(|&t| t > 0)
+        .unwrap_or_else(|| snowflake_secs(id));
     json!({
         "id": id,
         "name": thread["name"].as_str().unwrap_or("post"),
@@ -92,7 +125,10 @@ fn index_not_ready(answer: &Value) -> Option<std::time::Duration> {
     if answer["code"].as_u64() != Some(110_000) {
         return None;
     }
-    let secs = answer["retry_after"].as_f64().unwrap_or(2.0).clamp(0.5, 6.0);
+    let secs = answer["retry_after"]
+        .as_f64()
+        .unwrap_or(2.0)
+        .clamp(0.5, 6.0);
     Some(std::time::Duration::from_secs_f64(secs))
 }
 
@@ -106,7 +142,13 @@ struct SearchPage {
 /// Asks the thread search for one page - of the archive, or of the live posts.
 /// `None` where it will not answer (a refusal, or an index that never became
 /// ready); an empty page is an answer.
-async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: bool, offset: usize) -> Result<Option<SearchPage>> {
+async fn search_page(
+    token: &str,
+    channel_id: &str,
+    sort_by: &str,
+    archived: bool,
+    offset: usize,
+) -> Result<Option<SearchPage>> {
     // Discord builds a search index the first time one is asked for, and says so
     // with a success status and no threads - "not yet available", with how long to
     // wait. That is waited for, a few times, before it is given up on.
@@ -129,7 +171,10 @@ async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: boo
             .await
             .context("reading the forum")?;
         if !resp.status().is_success() {
-            tracing::debug!("discord: thread search (archived={archived}) answered {}", resp.status());
+            tracing::debug!(
+                "discord: thread search (archived={archived}) answered {}",
+                resp.status()
+            );
             return Ok(None);
         }
         let answer: Value = resp.json().await.context("reading the forum")?;
@@ -139,8 +184,17 @@ async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: boo
             continue;
         }
         let threads = answer["threads"].as_array().cloned().unwrap_or_default();
-        let has_more = answer["has_more"].as_bool().unwrap_or(threads.len() >= PAGE);
-        return Ok(Some(SearchPage { threads, firsts: answer["first_messages"].as_array().cloned().unwrap_or_default(), has_more }));
+        let has_more = answer["has_more"]
+            .as_bool()
+            .unwrap_or(threads.len() >= PAGE);
+        return Ok(Some(SearchPage {
+            threads,
+            firsts: answer["first_messages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
+            has_more,
+        }));
     }
     Ok(None)
 }
@@ -155,15 +209,33 @@ async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: boo
 /// have been read. Where the search will not answer at all - some servers and
 /// some accounts are refused it - the plain lists of live and archived threads
 /// stand in, with what they carry.
-pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &str, sort: &str, offset: usize) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this forum")?;
+pub async fn list_forum_posts(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    sort: &str,
+    offset: usize,
+) -> Result<Value> {
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this forum")?;
     let tags = state.runtime.discord_forum_tags(account_id, &channel_id);
-    let sort_by = if sort == "created" { "creation_time" } else { "last_message_time" };
+    let sort_by = if sort == "created" {
+        "creation_time"
+    } else {
+        "last_message_time"
+    };
 
     let card = |t: &Value, firsts: &[Value]| -> Value {
         let id = t["id"].as_str().unwrap_or_default();
-        let first = firsts.iter().find(|m| m["channel_id"].as_str() == Some(id) || m["id"].as_str() == Some(id));
+        let first = firsts
+            .iter()
+            .find(|m| m["channel_id"].as_str() == Some(id) || m["id"].as_str() == Some(id));
         post_card(t, first, &tags, &cfg.user_id, cfg.display_name.as_deref())
     };
 
@@ -175,7 +247,9 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
         // hundred live posts is not one anybody reads in one go).
         let mut at = 0;
         while at < 100 {
-            let Some(page) = search_page(&cfg.token, &channel_id, sort_by, false, at).await? else { break };
+            let Some(page) = search_page(&cfg.token, &channel_id, sort_by, false, at).await? else {
+                break;
+            };
             answered = true;
             let more = page.has_more;
             posts.extend(page.threads.iter().map(|t| card(t, &page.firsts)));
@@ -191,16 +265,30 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
         posts.extend(page.threads.iter().map(|t| card(t, &page.firsts)));
     }
     if answered {
-        return Ok(json!({ "posts": posts, "hasMore": has_more, "total": posts.len(), "tags": tag_list(&tags) }));
+        return Ok(
+            json!({ "posts": posts, "hasMore": has_more, "total": posts.len(), "tags": tag_list(&tags) }),
+        );
     }
     tracing::debug!("discord: the thread search is not answering; using the plain lists");
 
     // The fallback: the plain lists, and no paging.
     let listed = list_threads(state, account_id, buffer_id).await?;
-    let threads: Vec<Value> = listed["threads"].as_array().into_iter().flatten().filter_map(|t| t["thread"].as_object().map(|_| t["thread"].clone())).collect();
+    let threads: Vec<Value> = listed["threads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["thread"].as_object().map(|_| t["thread"].clone()))
+        .collect();
     let key = |t: &Value| -> i64 {
-        let last = t["last_message_id"].as_str().map(snowflake_secs).unwrap_or(0);
-        if sort == "created" { t["id"].as_str().map(snowflake_secs).unwrap_or(0) } else { last.max(t["id"].as_str().map(snowflake_secs).unwrap_or(0)) }
+        let last = t["last_message_id"]
+            .as_str()
+            .map(snowflake_secs)
+            .unwrap_or(0);
+        if sort == "created" {
+            t["id"].as_str().map(snowflake_secs).unwrap_or(0)
+        } else {
+            last.max(t["id"].as_str().map(snowflake_secs).unwrap_or(0))
+        }
     };
     let mut threads = threads;
     threads.sort_by_key(|t| std::cmp::Reverse(key(t)));
@@ -230,7 +318,15 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
     let posts: Vec<Value> = threads
         .iter()
         .enumerate()
-        .map(|(i, t)| post_card(t, firsts.get(i).and_then(|f| f.as_ref()), &tags, &cfg.user_id, cfg.display_name.as_deref()))
+        .map(|(i, t)| {
+            post_card(
+                t,
+                firsts.get(i).and_then(|f| f.as_ref()),
+                &tags,
+                &cfg.user_id,
+                cfg.display_name.as_deref(),
+            )
+        })
         .collect();
     Ok(json!({ "posts": posts, "hasMore": false, "total": posts.len(), "tags": tag_list(&tags) }))
 }
@@ -247,9 +343,22 @@ fn tag_list(tags: &[Value]) -> Vec<Value> {
 /// The words go through the same mention resolution as a message does, so a
 /// name typed in one is a ping like any other. Returns the thread's buffer, so
 /// the window can open what it just made.
-pub async fn create_forum_post(state: &AppState, account_id: &str, buffer_id: &str, title: &str, body: &str, tags: &[String]) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this forum")?;
+pub async fn create_forum_post(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    title: &str,
+    body: &str,
+    tags: &[String],
+) -> Result<Value> {
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this forum")?;
     let title = title.trim();
     if title.is_empty() {
         bail!("a post needs a title");
@@ -280,7 +389,9 @@ pub async fn create_forum_post(state: &AppState, account_id: &str, buffer_id: &s
         bail!("{}", discord_error_text(status, &text, "making the post"));
     }
     let thread: Value = resp.json().await.context("reading the new post")?;
-    let thread_id = thread["id"].as_str().context("Discord made a post with no id")?;
+    let thread_id = thread["id"]
+        .as_str()
+        .context("Discord made a post with no id")?;
     // Opened the way any post is, which files it under the forum and reads its
     // first page.
     open_thread(state, account_id, buffer_id, thread_id).await
@@ -332,10 +443,19 @@ mod tests {
     #[test]
     fn an_index_still_being_built_is_waited_for_not_read_as_an_empty_forum() {
         let building = json!({ "message": "Index not yet available. Try again later", "code": 110000, "documents_indexed": 0, "retry_after": 3 });
-        assert_eq!(index_not_ready(&building), Some(std::time::Duration::from_secs(3)));
-        assert_eq!(index_not_ready(&json!({ "threads": [], "total_results": 0 })), None);
+        assert_eq!(
+            index_not_ready(&building),
+            Some(std::time::Duration::from_secs(3))
+        );
+        assert_eq!(
+            index_not_ready(&json!({ "threads": [], "total_results": 0 })),
+            None
+        );
         // A wait that is absurdly long is not taken.
-        assert_eq!(index_not_ready(&json!({ "code": 110000, "retry_after": 600 })), Some(std::time::Duration::from_secs(6)));
+        assert_eq!(
+            index_not_ready(&json!({ "code": 110000, "retry_after": 600 })),
+            Some(std::time::Duration::from_secs(6))
+        );
     }
 
     #[test]

@@ -61,8 +61,15 @@ pub const POSTIMG_TYPES: &[(&str, &str)] = &[
 ];
 
 pub fn guess_postimg_content_type(file_name: &str) -> Option<&'static str> {
-    let ext = file_name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    POSTIMG_TYPES.iter().find(|(e, _)| *e == ext).map(|(_, t)| *t)
+    let ext = file_name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    POSTIMG_TYPES
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, t)| *t)
 }
 
 /// Matches the site's own `new Date().getTime()+Math.random().toString().
@@ -73,7 +80,10 @@ pub fn guess_postimg_content_type(file_name: &str) -> Option<&'static str> {
 /// de-dup/session key, not a validated token), but there's no reason to
 /// diverge from it either.
 pub(super) fn postimg_upload_session() -> String {
-    let millis = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let frac = format!("{:.16}", rand::random::<f64>());
     format!("{millis}{}", frac.trim_start_matches('0'))
 }
@@ -105,7 +115,8 @@ pub(super) fn extract_postimg_thumb_name(html: &str) -> Option<(String, String)>
         let tag = &html[tag_start..tag_end];
         search_from = tag_end;
 
-        if let (Some(name), Some(ext)) = (form::attr(tag, "data-name"), form::attr(tag, "data-ext")) {
+        if let (Some(name), Some(ext)) = (form::attr(tag, "data-name"), form::attr(tag, "data-ext"))
+        {
             return Some((name, ext));
         }
     }
@@ -128,15 +139,24 @@ pub async fn upload_to_postimg_reporting(
     if let Some(progress) = progress {
         progress.at(crate::upload::Phase::Preparing, 0, "postimg");
     }
-    let bytes = tokio::fs::read(file_path).await.with_context(|| format!("reading {file_path}"))?;
+    let bytes = tokio::fs::read(file_path)
+        .await
+        .with_context(|| format!("reading {file_path}"))?;
     if bytes.is_empty() {
         bail!("file is empty");
     }
     if bytes.len() > POSTIMG_MAX_UPLOAD_BYTES {
-        bail!("file is over postimg.cc's {}MB upload limit", POSTIMG_MAX_UPLOAD_BYTES / 1024 / 1024);
+        bail!(
+            "file is over postimg.cc's {}MB upload limit",
+            POSTIMG_MAX_UPLOAD_BYTES / 1024 / 1024
+        );
     }
 
-    let file_name = std::path::Path::new(file_path).file_name().and_then(|n| n.to_str()).unwrap_or("upload").to_string();
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("upload")
+        .to_string();
     let Some(content_type) = guess_postimg_content_type(&file_name) else {
         bail!("postimg.cc only accepts images (png/jpg/gif/webp/bmp), not \"{file_name}\"");
     };
@@ -150,30 +170,61 @@ pub async fn upload_to_postimg_reporting(
     } else {
         Transport::Direct
     };
-    let http = http::HttpClient::new(transport, http::CookieJar::new(), DEFAULT_USER_AGENT.to_string());
+    let http = http::HttpClient::new(
+        transport,
+        http::CookieJar::new(),
+        DEFAULT_USER_AGENT.to_string(),
+    );
     let session = postimg_upload_session();
     let bytes = Bytes::from(bytes);
     let fields = [
-        http::MultipartField::Text { name: "gallery", value: "" },
-        http::MultipartField::Text { name: "optsize", value: "0" },
-        http::MultipartField::Text { name: "expire", value: "604800" },
-        http::MultipartField::Text { name: "numfiles", value: "1" },
-        http::MultipartField::Text { name: "upload_session", value: &session },
-        http::MultipartField::File { name: "file", file_name: &file_name, content_type, bytes: &bytes },
+        http::MultipartField::Text {
+            name: "gallery",
+            value: "",
+        },
+        http::MultipartField::Text {
+            name: "optsize",
+            value: "0",
+        },
+        http::MultipartField::Text {
+            name: "expire",
+            value: "604800",
+        },
+        http::MultipartField::Text {
+            name: "numfiles",
+            value: "1",
+        },
+        http::MultipartField::Text {
+            name: "upload_session",
+            value: &session,
+        },
+        http::MultipartField::File {
+            name: "file",
+            file_name: &file_name,
+            content_type,
+            bytes: &bytes,
+        },
     ];
-    let extra_headers = [("Origin", POSTIMG_ORIGIN), ("Referer", &format!("{POSTIMG_ORIGIN}/"))];
+    let extra_headers = [
+        ("Origin", POSTIMG_ORIGIN),
+        ("Referer", &format!("{POSTIMG_ORIGIN}/")),
+    ];
 
     // Postimg is reached over Tor, so this wait is the long one: the whole
     // circuit is built and the file crosses it before anything comes back.
     if let Some(progress) = progress {
         progress.at(crate::upload::Phase::Waiting, bytes.len(), "postimg");
     }
-    let (status, resp_bytes) = http.post_multipart(POSTIMG_UPLOAD_URL, &fields, &extra_headers).await.context("uploading to postimg.cc")?;
+    let (status, resp_bytes) = http
+        .post_multipart(POSTIMG_UPLOAD_URL, &fields, &extra_headers)
+        .await
+        .context("uploading to postimg.cc")?;
     if !(200..300).contains(&status) {
         let snippet = String::from_utf8_lossy(&resp_bytes[..resp_bytes.len().min(300)]);
         bail!("postimg.cc upload failed with HTTP {status}: {snippet}");
     }
-    let parsed: PostimgUploadResponse = serde_json::from_slice(&resp_bytes).context("parsing postimg.cc response")?;
+    let parsed: PostimgUploadResponse =
+        serde_json::from_slice(&resp_bytes).context("parsing postimg.cc response")?;
     if let Some(err) = parsed.error {
         bail!("postimg.cc upload failed: {}", err.message);
     }
@@ -185,16 +236,27 @@ pub async fn upload_to_postimg_reporting(
     // postimg.cc's own "Thumbnail for forums" BBCode preset shown on that
     // page - the hash is a one-time delete credential, not part of the
     // link anyone else needs to view the image.
-    let full_page_url = parsed.url.ok_or_else(|| anyhow!("postimg.cc response had no url"))?;
-    let slug = full_page_url.strip_prefix("https://postimg.cc/").and_then(|rest| rest.split('/').next()).ok_or_else(|| anyhow!("unexpected postimg.cc url shape: {full_page_url}"))?;
+    let full_page_url = parsed
+        .url
+        .ok_or_else(|| anyhow!("postimg.cc response had no url"))?;
+    let slug = full_page_url
+        .strip_prefix("https://postimg.cc/")
+        .and_then(|rest| rest.split('/').next())
+        .ok_or_else(|| anyhow!("unexpected postimg.cc url shape: {full_page_url}"))?;
     let short_page_url = format!("https://postimg.cc/{slug}");
 
-    let page = http.get(&full_page_url).await.context("fetching postimg.cc result page")?;
-    let (name, ext) = extract_postimg_thumb_name(&page.body).ok_or_else(|| anyhow!("couldn't find the uploaded image's filename on {full_page_url}"))?;
+    let page = http
+        .get(&full_page_url)
+        .await
+        .context("fetching postimg.cc result page")?;
+    let (name, ext) = extract_postimg_thumb_name(&page.body)
+        .ok_or_else(|| anyhow!("couldn't find the uploaded image's filename on {full_page_url}"))?;
     let direct_url = format!("https://i.postimg.cc/{slug}/{name}.{ext}");
 
-
-    Ok(PostimgLinks { page: short_page_url, direct: direct_url })
+    Ok(PostimgLinks {
+        page: short_page_url,
+        direct: direct_url,
+    })
 }
 
 #[cfg(test)]

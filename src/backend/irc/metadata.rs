@@ -66,17 +66,35 @@ mod tests {
 
     #[test]
     fn reads_a_value_somebody_published() {
-        let got = parse_keyvalue(&args(&["alice", "avatar", "*", "https://example.net/a.png"]));
-        assert_eq!(got, Some(("alice".into(), "avatar".into(), Some("https://example.net/a.png".into()))));
+        let got = parse_keyvalue(&args(&[
+            "alice",
+            "avatar",
+            "*",
+            "https://example.net/a.png",
+        ]));
+        assert_eq!(
+            got,
+            Some((
+                "alice".into(),
+                "avatar".into(),
+                Some("https://example.net/a.png".into())
+            ))
+        );
     }
 
     /// A cleared key is the network saying somebody took their avatar down,
     /// which has to be distinguishable from never having had one.
     #[test]
     fn a_key_with_no_value_has_been_cleared() {
-        assert_eq!(parse_keyvalue(&args(&["alice", "avatar", "*"])), Some(("alice".into(), "avatar".into(), None)));
+        assert_eq!(
+            parse_keyvalue(&args(&["alice", "avatar", "*"])),
+            Some(("alice".into(), "avatar".into(), None))
+        );
         // An explicitly empty trailing parameter means the same thing.
-        assert_eq!(parse_keyvalue(&args(&["alice", "avatar", "*", ""])), Some(("alice".into(), "avatar".into(), None)));
+        assert_eq!(
+            parse_keyvalue(&args(&["alice", "avatar", "*", ""])),
+            Some(("alice".into(), "avatar".into(), None))
+        );
     }
 
     #[test]

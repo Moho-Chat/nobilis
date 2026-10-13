@@ -60,7 +60,10 @@ fn is_sticker(image: &Value, pack_usage: &Value) -> bool {
 /// emoticons in the same map, and they are different things: a sticker is an
 /// event of its own, an emoticon is an image inside a line of text.
 fn has_usage(image: &Value, pack_usage: &Value, want: &str) -> bool {
-    let usage = image.get("usage").filter(|u| u.is_array()).unwrap_or(pack_usage);
+    let usage = image
+        .get("usage")
+        .filter(|u| u.is_array())
+        .unwrap_or(pack_usage);
     match usage.as_array() {
         None => true,
         Some(list) if list.is_empty() => true,
@@ -81,7 +84,9 @@ pub fn read_emoticons(content: &Value, fallback_name: &str) -> Vec<Sticker> {
         .unwrap_or(fallback_name)
         .to_string();
     let pack_usage = content["pack"]["usage"].clone();
-    let Some(images) = content["images"].as_object() else { return Vec::new() };
+    let Some(images) = content["images"].as_object() else {
+        return Vec::new();
+    };
     images
         .iter()
         .filter(|(_, image)| has_usage(image, &pack_usage, "emoticon"))
@@ -94,7 +99,11 @@ pub fn read_emoticons(content: &Value, fallback_name: &str) -> Vec<Sticker> {
                 name: shortcode.clone(),
                 pack: pack_name.clone(),
                 mxc: mxc.to_string(),
-                body: image["body"].as_str().filter(|b| !b.trim().is_empty()).unwrap_or(shortcode).to_string(),
+                body: image["body"]
+                    .as_str()
+                    .filter(|b| !b.trim().is_empty())
+                    .unwrap_or(shortcode)
+                    .to_string(),
                 info: image["info"].clone(),
             })
         })
@@ -167,7 +176,10 @@ pub fn escape_html(text: &str) -> String {
 /// The shortcode is matched with its colons, so a bare word that happens to
 /// share a name with an emoticon is left alone: a Matrix emoticon is written
 /// deliberately, which is what the colons are for.
-pub fn inline_emoticons(html: &str, emoticons: &std::collections::BTreeMap<String, String>) -> String {
+pub fn inline_emoticons(
+    html: &str,
+    emoticons: &std::collections::BTreeMap<String, String>,
+) -> String {
     if emoticons.is_empty() || !html.contains(':') {
         return html.to_string();
     }
@@ -179,7 +191,9 @@ pub fn inline_emoticons(html: &str, emoticons: &std::collections::BTreeMap<Strin
         // The closing colon, on the same line: a colon at the end of a
         // sentence should not go hunting through the whole message for a
         // partner.
-        let end = after.find(':').filter(|e| !after[..*e].contains(char::is_whitespace));
+        let end = after
+            .find(':')
+            .filter(|e| !after[..*e].contains(char::is_whitespace));
         match end.and_then(|e| emoticons.get(&after[..e]).map(|mxc| (e, mxc))) {
             Some((e, mxc)) => {
                 let name = &after[..e];
@@ -248,7 +262,15 @@ pub fn parse_place(text: &str) -> Option<(f64, f64)> {
     // A pair of numbers, however spaced: "51.5, -0.12".
     let plain = text.trim_start_matches("geo:");
     if let Some((lat, lon)) = plain.split_once(',') {
-        if let (Ok(lat), Ok(lon)) = (lat.trim().parse::<f64>(), lon.trim().split(';').next().unwrap_or("").trim().parse::<f64>()) {
+        if let (Ok(lat), Ok(lon)) = (
+            lat.trim().parse::<f64>(),
+            lon.trim()
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .parse::<f64>(),
+        ) {
             if valid(lat, lon) {
                 return Some((lat, lon));
             }
@@ -333,9 +355,18 @@ mod place_tests {
     /// pin in the Atlantic.
     #[test]
     fn a_map_link_is_read_by_its_own_layout() {
-        assert_eq!(parse_place("https://www.openstreetmap.org/#map=15/51.5/-0.12"), Some((51.5, -0.12)));
-        assert_eq!(parse_place("https://www.google.com/maps/@51.5,-0.12,15z"), Some((51.5, -0.12)));
-        assert_eq!(parse_place("https://maps.google.com/?q=51.5,-0.12"), Some((51.5, -0.12)));
+        assert_eq!(
+            parse_place("https://www.openstreetmap.org/#map=15/51.5/-0.12"),
+            Some((51.5, -0.12))
+        );
+        assert_eq!(
+            parse_place("https://www.google.com/maps/@51.5,-0.12,15z"),
+            Some((51.5, -0.12))
+        );
+        assert_eq!(
+            parse_place("https://maps.google.com/?q=51.5,-0.12"),
+            Some((51.5, -0.12))
+        );
     }
 
     /// Two numbers that parse are not necessarily a place. Somewhere off the
@@ -367,8 +398,13 @@ mod place_tests {
         assert!(split_place_and_label("just some words").is_none());
 
         // A map link is a place in one word, and the name still follows it.
-        let (place, label) = split_place_and_label("https://www.openstreetmap.org/#map=15/51.5074/-0.1278 home").expect("a place");
-        assert_eq!(place, "https://www.openstreetmap.org/#map=15/51.5074/-0.1278");
+        let (place, label) =
+            split_place_and_label("https://www.openstreetmap.org/#map=15/51.5074/-0.1278 home")
+                .expect("a place");
+        assert_eq!(
+            place,
+            "https://www.openstreetmap.org/#map=15/51.5074/-0.1278"
+        );
         assert_eq!(label, "home");
     }
 }
@@ -391,9 +427,12 @@ mod tests {
     }
 
     fn codes() -> std::collections::BTreeMap<String, String> {
-        [("wave".to_string(), "mxc://x/wave".to_string()), ("cat".to_string(), "mxc://x/cat".to_string())]
-            .into_iter()
-            .collect()
+        [
+            ("wave".to_string(), "mxc://x/wave".to_string()),
+            ("cat".to_string(), "mxc://x/cat".to_string()),
+        ]
+        .into_iter()
+        .collect()
     }
 
     #[test]
@@ -401,7 +440,10 @@ mod tests {
         let got = inline_emoticons("hello :wave: there", &codes());
         assert!(got.contains("data-mx-emoticon"), "{got}");
         assert!(got.contains("mxc://x/wave"), "{got}");
-        assert!(got.starts_with("hello ") && got.ends_with(" there"), "{got}");
+        assert!(
+            got.starts_with("hello ") && got.ends_with(" there"),
+            "{got}"
+        );
         // The fallback a client with no images shows.
         assert!(got.contains("alt=\":wave:\""), "{got}");
     }
@@ -411,7 +453,10 @@ mod tests {
     #[test]
     fn an_ordinary_colon_is_left_alone() {
         assert_eq!(inline_emoticons("look: a thing", &codes()), "look: a thing");
-        assert_eq!(inline_emoticons("12:30 and :nope: too", &codes()), "12:30 and :nope: too");
+        assert_eq!(
+            inline_emoticons("12:30 and :nope: too", &codes()),
+            "12:30 and :nope: too"
+        );
         assert_eq!(inline_emoticons("nothing here", &codes()), "nothing here");
     }
 
@@ -448,9 +493,14 @@ mod tests {
             }
         });
         let stickers: Vec<String> = read_pack(&pack, "f").into_iter().map(|s| s.name).collect();
-        let emoticons: Vec<String> = read_emoticons(&pack, "f").into_iter().map(|s| s.name).collect();
+        let emoticons: Vec<String> = read_emoticons(&pack, "f")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert!(stickers.contains(&"big".to_string()) && !stickers.contains(&"small".to_string()));
-        assert!(emoticons.contains(&"small".to_string()) && !emoticons.contains(&"big".to_string()));
+        assert!(
+            emoticons.contains(&"small".to_string()) && !emoticons.contains(&"big".to_string())
+        );
         // Saying nothing means both, which is what the spec's default is.
         assert!(stickers.contains(&"both".to_string()) && emoticons.contains(&"both".to_string()));
     }
@@ -470,7 +520,10 @@ mod tests {
     #[test]
     fn a_pack_with_no_name_borrows_the_one_it_was_filed_under() {
         let content = serde_json::json!({ "images": { "a": { "url": "mxc://example.org/a" } } });
-        assert_eq!(read_pack(&content, "this room").first().unwrap().pack, "this room");
+        assert_eq!(
+            read_pack(&content, "this room").first().unwrap().pack,
+            "this room"
+        );
     }
 
     #[test]

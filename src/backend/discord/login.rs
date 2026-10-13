@@ -30,26 +30,40 @@ pub fn start_qr_login(state: AppState, login_id: String, reauth_account_id: Opti
         // ever coming back, since a bare panic in a spawned task just
         // vanishes rather than reaching the emit() below.
         let result =
-            std::panic::AssertUnwindSafe(run_qr_login(&state, &login_id, reauth_account_id)).catch_unwind().await;
+            std::panic::AssertUnwindSafe(run_qr_login(&state, &login_id, reauth_account_id))
+                .catch_unwind()
+                .await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => e.to_string(),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("discord qr login[{login_id}]: {error}");
-        state.events.emit("discordLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
+        state.events.emit(
+            "discordLoginResult",
+            json!({ "loginId": login_id, "success": false, "error": error }),
+        );
     });
 }
 
-pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_account_id: Option<String>) -> Result<()> {
+pub(super) async fn run_qr_login(
+    state: &AppState,
+    login_id: &str,
+    reauth_account_id: Option<String>,
+) -> Result<()> {
     let mut request = REMOTE_AUTH_URL.into_client_request()?;
     // The remote-auth gateway rejects the handshake outright without an
     // Origin it recognizes - confirmed in every working reference client.
-    request.headers_mut().insert("Origin", HeaderValue::from_static("https://discord.com"));
-    let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::route::websocket(&crate::net::route::pending_key("discord"), request))
-        .await
-        .map_err(|_| anyhow!("timed out connecting to Discord's remote-auth gateway"))?
-        .context("connecting to Discord's remote-auth gateway")?;
+    request
+        .headers_mut()
+        .insert("Origin", HeaderValue::from_static("https://discord.com"));
+    let (ws, _resp) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        crate::net::route::websocket(&crate::net::route::pending_key("discord"), request),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out connecting to Discord's remote-auth gateway"))?
+    .context("connecting to Discord's remote-auth gateway")?;
     let (sink, mut stream) = ws.split();
 
     // A single background task owns the sink so both the read loop below
@@ -92,7 +106,8 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     // this drop guard, including the panic case: unwinding still runs
     // destructors for values already on the stack.
     let safe_id = login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-");
-    let qr_path = crate::media_cache::transient_dir().join(format!("nobilis-discord-qr-{safe_id}.png"));
+    let qr_path =
+        crate::media_cache::transient_dir().join(format!("nobilis-discord-qr-{safe_id}.png"));
     struct RemoveOnDrop(std::path::PathBuf);
     impl Drop for RemoveOnDrop {
         fn drop(&mut self) {
@@ -102,16 +117,29 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     let _qr_cleanup = RemoveOnDrop(qr_path.clone());
 
     let hello = next_json(&mut stream).await.context("waiting for hello")?;
-    let timeout_ms = hello.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(150_000);
-    let heartbeat_interval = hello.get("heartbeat_interval").and_then(|v| v.as_u64()).unwrap_or(41_250).max(1);
+    let timeout_ms = hello
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(150_000);
+    let heartbeat_interval = hello
+        .get("heartbeat_interval")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(41_250)
+        .max(1);
 
     let hb_tx = out_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % heartbeat_interval)).await;
+        tokio::time::sleep(Duration::from_millis(
+            rand::random::<u64>() % heartbeat_interval,
+        ))
+        .await;
         let mut ticker = tokio::time::interval(Duration::from_millis(heartbeat_interval));
         loop {
             ticker.tick().await;
-            if hb_tx.send(json!({ "op": "heartbeat" }).to_string()).is_err() {
+            if hb_tx
+                .send(json!({ "op": "heartbeat" }).to_string())
+                .is_err()
+            {
                 break;
             }
         }
@@ -170,20 +198,26 @@ pub(super) async fn run_qr_login(state: &AppState, login_id: &str, reauth_accoun
     let ticket = flow;
     let resp: Value = send_write(
         anonymous_client()
-        .post("https://discord.com/api/v9/users/@me/remote-auth/login")
-        .json(&json!({ "ticket": ticket }))
-        )
+            .post("https://discord.com/api/v9/users/@me/remote-auth/login")
+            .json(&json!({ "ticket": ticket })),
+    )
     .await
-        .context("exchanging ticket for token")?
-        .json()
-        .await
-        .context("parsing token exchange response")?;
+    .context("exchanging ticket for token")?
+    .json()
+    .await
+    .context("parsing token exchange response")?;
     let encrypted_token = resp
         .get("encrypted_token")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("token exchange response missing encrypted_token (captcha challenge?)"))?;
-    let ciphertext = STANDARD.decode(encrypted_token).context("decoding encrypted_token")?;
-    let token_bytes = priv_key.decrypt(Oaep::new::<Sha256>(), &ciphertext).context("decrypting token")?;
+        .ok_or_else(|| {
+            anyhow!("token exchange response missing encrypted_token (captcha challenge?)")
+        })?;
+    let ciphertext = STANDARD
+        .decode(encrypted_token)
+        .context("decoding encrypted_token")?;
+    let token_bytes = priv_key
+        .decrypt(Oaep::new::<Sha256>(), &ciphertext)
+        .context("decrypting token")?;
     let token = String::from_utf8(token_bytes).context("token was not valid UTF-8")?;
 
     finish_login(state, login_id, token, reauth_account_id).await
@@ -236,7 +270,11 @@ pub(super) async fn finish_login(
         .json()
         .await
         .context("parsing Discord profile response")?;
-    let user_id = me.get("id").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("profile response missing id"))?.to_string();
+    let user_id = me
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("profile response missing id"))?
+        .to_string();
     let username = me
         .get("global_name")
         .and_then(|v| v.as_str())
@@ -250,7 +288,15 @@ pub(super) async fn finish_login(
         .map(|hash| format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.png"));
 
     let use_tor = crate::net::route::router().wanted(&crate::net::route::pending_key("discord"));
-    let config = DiscordAccountConfig { user_id, username, display_name: None, token, avatar_url, use_tor, strict_route: false };
+    let config = DiscordAccountConfig {
+        user_id,
+        username,
+        display_name: None,
+        token,
+        avatar_url,
+        use_tor,
+        strict_route: false,
+    };
     if let Some(expected) = reauth_account_id {
         if config.account_id() != expected {
             bail!("that is a different Discord account - re-authenticating {expected} needs the same account");
@@ -262,14 +308,22 @@ pub(super) async fn finish_login(
     // re-auth replaces the dead session rather than racing it.
     spawn(state.clone(), saved);
 
-    state.events.emit("discordLoginResult", json!({ "loginId": login_id, "success": true, "account": account }));
+    state.events.emit(
+        "discordLoginResult",
+        json!({ "loginId": login_id, "success": true, "account": account }),
+    );
     Ok(())
 }
 
 pub(super) fn write_qr_file(url: &str, path: &std::path::Path) -> Result<()> {
     let code = qrcode::QrCode::new(url.as_bytes())?;
-    let image = code.render::<image::Luma<u8>>().min_dimensions(300, 300).build();
-    image.save_with_format(path, image::ImageFormat::Png).context("encoding QR code as PNG")?;
+    let image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(300, 300)
+        .build();
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .context("encoding QR code as PNG")?;
     // Owner-only - the fingerprint it encodes is a short-lived credential
     // (whoever completes the scan-and-approve flow against it gets a login
     // ticket), same spirit as accounts.toml's 0600 permissions.
@@ -291,7 +345,10 @@ mod login_tests {
             "message": "Invalid Form Body",
             "errors": { "login": { "_errors": [{ "code": "BASE_TYPE_REQUIRED", "message": "This field is required" }] } }
         });
-        assert_eq!(form_errors(&resp).as_deref(), Some("login: This field is required"));
+        assert_eq!(
+            form_errors(&resp).as_deref(),
+            Some("login: This field is required")
+        );
     }
 
     /// Discord answers some rejections with no `errors` map at all, and an

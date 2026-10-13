@@ -109,7 +109,9 @@ impl VoiceConn {
     pub fn set_camera(&self, on: bool, quality: VideoQuality) {
         let sender = &self.camera;
         sender.on.store(on, Ordering::Relaxed);
-        let _ = sender.ws.send(WsMessage::Text(announce_camera(sender.audio_ssrc, sender.video_ssrc, on, quality).to_string()));
+        let _ = sender.ws.send(WsMessage::Text(
+            announce_camera(sender.audio_ssrc, sender.video_ssrc, on, quality).to_string(),
+        ));
     }
 
     /// Whether a frame handed in now would reach anybody: the camera is on,
@@ -138,7 +140,12 @@ impl Default for VideoQuality {
     /// Discord's own client sends a camera at 720p30 whatever the account,
     /// and 720p30 is a stream's ceiling on an account without Nitro.
     fn default() -> Self {
-        VideoQuality { width: 1280, height: 720, framerate: 30, bitrate: 2_500_000 }
+        VideoQuality {
+            width: 1280,
+            height: 720,
+            framerate: 30,
+            bitrate: 2_500_000,
+        }
     }
 }
 
@@ -211,7 +218,10 @@ impl CameraSender {
         for packet in rtp::packetise_vp8(&frame, self.video_ssrc, first, timestamp) {
             let header = rtp::header(&packet);
             let sealed = self.sealer.lock().unwrap().seal(&header, &packet.payload)?;
-            self.udp.send(&sealed).await.context("sending a camera packet")?;
+            self.udp
+                .send(&sealed)
+                .await
+                .context("sending a camera packet")?;
         }
         Ok(())
     }
@@ -221,7 +231,13 @@ fn group_ready(shared: &Shared) -> bool {
     if shared.dave_version.load(Ordering::Relaxed) == 0 {
         return true;
     }
-    shared.group.lock().unwrap().session.as_ref().is_some_and(|s| s.is_ready())
+    shared
+        .group
+        .lock()
+        .unwrap()
+        .session
+        .as_ref()
+        .is_some_and(|s| s.is_ready())
 }
 
 /// Which close codes mean "do not come back".
@@ -252,8 +268,13 @@ pub async fn connect(
     if crate::net::route::router().routed(account_id) {
         anyhow::bail!("calls and screen sharing need UDP, which Tor and SOCKS5 proxies can't carry - turn off Tor for this account to use them");
     }
-    let url = format!("wss://{}/?v={VOICE_VERSION}", handshake.endpoint.trim_end_matches(":443"));
-    let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening the voice socket")?;
+    let url = format!(
+        "wss://{}/?v={VOICE_VERSION}",
+        handshake.endpoint.trim_end_matches(":443")
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .context("opening the voice socket")?;
     let (mut write, mut read) = socket.split();
 
     write
@@ -292,12 +313,20 @@ pub async fn connect(
     while let Some(frame) = read.next().await {
         let frame = frame.context("the voice socket failed")?;
         match &frame {
-            WsMessage::Close(reason) => return Err(anyhow!("the voice server refused the connection: {}", describe_close(reason))),
+            WsMessage::Close(reason) => {
+                return Err(anyhow!(
+                    "the voice server refused the connection: {}",
+                    describe_close(reason)
+                ))
+            }
             WsMessage::Text(text) => {
-                let message: Value = serde_json::from_str(text).context("the voice server sent something odd")?;
+                let message: Value =
+                    serde_json::from_str(text).context("the voice server sent something odd")?;
                 match message["op"].as_u64() {
                     Some(8) => {
-                        let interval = message["d"]["heartbeat_interval"].as_f64().unwrap_or(41_250.0);
+                        let interval = message["d"]["heartbeat_interval"]
+                            .as_f64()
+                            .unwrap_or(41_250.0);
                         beat_every = Duration::from_millis(interval.max(500.0) as u64);
                         got_hello = true;
                     }
@@ -306,7 +335,12 @@ pub async fn connect(
                         ssrc = d["ssrc"].as_u64().unwrap_or(0) as u32;
                         address = d["ip"].as_str().unwrap_or_default().to_string();
                         port = d["port"].as_u64().unwrap_or(0) as u16;
-                        modes = d["modes"].as_array().into_iter().flatten().filter_map(|m| m.as_str().map(str::to_string)).collect();
+                        modes = d["modes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|m| m.as_str().map(str::to_string))
+                            .collect();
                         // This end's camera SSRC, set aside in the streams
                         // list rather than beside the audio one.
                         video_ssrc = d["streams"]
@@ -315,7 +349,8 @@ pub async fn connect(
                             .flatten()
                             .find(|s| s["type"].as_str() == Some("video"))
                             .and_then(|s| s["ssrc"].as_u64())
-                            .unwrap_or(ssrc.wrapping_add(1) as u64) as u32;
+                            .unwrap_or(ssrc.wrapping_add(1) as u64)
+                            as u32;
                     }
                     _ => early.push(frame.clone()),
                 }
@@ -329,12 +364,19 @@ pub async fn connect(
     if ssrc == 0 || address.is_empty() || port == 0 {
         return Err(anyhow!("the voice server never said where to send"));
     }
-    let mode = Mode::negotiate(&modes).ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
+    let mode = Mode::negotiate(&modes)
+        .ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
 
-    let udp = UdpSocket::bind("0.0.0.0:0").await.context("opening a socket")?;
+    let udp = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("opening a socket")?;
     super::streamconn::widen_receive_buffer(&udp);
-    udp.connect((address.as_str(), port)).await.context("pointing the socket at the voice server")?;
-    udp.send(&super::streamconn::discovery_request(ssrc)).await.context("asking how we are seen")?;
+    udp.connect((address.as_str(), port))
+        .await
+        .context("pointing the socket at the voice server")?;
+    udp.send(&super::streamconn::discovery_request(ssrc))
+        .await
+        .context("asking how we are seen")?;
     let mut answer = [0u8; 74];
     let length = tokio::time::timeout(Duration::from_secs(5), udp.recv(&mut answer))
         .await
@@ -367,12 +409,20 @@ pub async fn connect(
     while let Some(frame) = read.next().await {
         let frame = frame.context("the voice socket failed")?;
         if let WsMessage::Close(reason) = &frame {
-            return Err(anyhow!("the voice server closed after being told how to reach us: {}", describe_close(reason)));
+            return Err(anyhow!(
+                "the voice server closed after being told how to reach us: {}",
+                describe_close(reason)
+            ));
         }
         if let WsMessage::Text(text) = &frame {
             let message: Value = serde_json::from_str(text).unwrap_or_default();
             if message["op"].as_u64() == Some(4) {
-                key = message["d"]["secret_key"].as_array().into_iter().flatten().filter_map(|b| b.as_u64().map(|b| b as u8)).collect();
+                key = message["d"]["secret_key"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b.as_u64().map(|b| b as u8))
+                    .collect();
                 dave_version = message["d"]["dave_protocol_version"].as_u64().unwrap_or(0) as u16;
                 break;
             }
@@ -384,7 +434,10 @@ pub async fn connect(
     }
 
     let user_id: u64 = handshake.user_id.parse().context("that is not a user id")?;
-    let channel_id: u64 = handshake.channel_id.parse().context("that is not a channel id")?;
+    let channel_id: u64 = handshake
+        .channel_id
+        .parse()
+        .context("that is not a channel id")?;
     let shared = Arc::new(Shared {
         state: state.clone(),
         account: account_id.to_string(),
@@ -403,14 +456,19 @@ pub async fn connect(
     // asking to be let in.
     if let Some(package) = shared.reinit_group()? {
         write
-            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package)))
+            .send(WsMessage::Binary(super::dave::write_binary(
+                super::dave::OP_KEY_PACKAGE,
+                &package,
+            )))
             .await
             .context("sending the key package")?;
     }
     // Every camera in the call, at full quality. Without saying what it wants
     // a client can be sent nothing at all.
     write
-        .send(WsMessage::Text(json!({ "op": 15, "d": { "any": 100 } }).to_string()))
+        .send(WsMessage::Text(
+            json!({ "op": 15, "d": { "any": 100 } }).to_string(),
+        ))
         .await
         .context("asking for video")?;
 
@@ -424,8 +482,25 @@ pub async fn connect(
     let udp = Arc::new(udp);
     let sealer = Arc::new(Mutex::new(Sealer::new(mode, &key)?));
 
-    tokio::spawn(receive(shared.clone(), udp.clone(), sealer.clone(), ssrc, mode, key.clone(), stop_rx.clone()));
-    tokio::spawn(clock(shared.clone(), udp.clone(), sealer.clone(), ssrc, media.playback, media.mic, ws_tx.clone(), stop_rx.clone()));
+    tokio::spawn(receive(
+        shared.clone(),
+        udp.clone(),
+        sealer.clone(),
+        ssrc,
+        mode,
+        key.clone(),
+        stop_rx.clone(),
+    ));
+    tokio::spawn(clock(
+        shared.clone(),
+        udp.clone(),
+        sealer.clone(),
+        ssrc,
+        media.playback,
+        media.mic,
+        ws_tx.clone(),
+        stop_rx.clone(),
+    ));
     let camera = CameraSender {
         udp: udp.clone(),
         sealer,
@@ -437,13 +512,25 @@ pub async fn connect(
         on: AtomicBool::new(false),
     };
     tokio::spawn(async move {
-        let ended = socket_loop(shared.clone(), write, read, early, beat_every, ws_rx, stop_rx).await;
+        let ended = socket_loop(
+            shared.clone(),
+            write,
+            read,
+            early,
+            beat_every,
+            ws_rx,
+            stop_rx,
+        )
+        .await;
         // Whatever cameras were showing are not any more.
         shared.end_all_cameras();
         on_end(ended);
     });
 
-    Ok(Arc::new(VoiceConn { stop: stop_tx, camera }))
+    Ok(Arc::new(VoiceConn {
+        stop: stop_tx,
+        camera,
+    }))
 }
 
 fn describe_close(reason: &Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>) -> String {
@@ -506,12 +593,17 @@ impl Shared {
                         session
                             .reinit(version, self.user_id, self.channel_id, None)
                             .map_err(|e| anyhow!("could not restart DAVE: {e:?}"))?;
-                        session.create_key_package().map_err(|e| anyhow!("could not make a key package: {e:?}"))?
+                        session
+                            .create_key_package()
+                            .map_err(|e| anyhow!("could not make a key package: {e:?}"))?
                     }
                     None => {
-                        let mut session = davey::DaveSession::new(version, self.user_id, self.channel_id, None)
-                            .map_err(|e| anyhow!("could not start DAVE: {e:?}"))?;
-                        let package = session.create_key_package().map_err(|e| anyhow!("could not make a key package: {e:?}"))?;
+                        let mut session =
+                            davey::DaveSession::new(version, self.user_id, self.channel_id, None)
+                                .map_err(|e| anyhow!("could not start DAVE: {e:?}"))?;
+                        let package = session
+                            .create_key_package()
+                            .map_err(|e| anyhow!("could not make a key package: {e:?}"))?;
                         group.session = Some(session);
                         package
                     }
@@ -530,7 +622,10 @@ impl Shared {
 
     fn transition_ready(&self, transition: u16) -> WsMessage {
         let version = self.dave_version.load(Ordering::Relaxed);
-        WsMessage::Text(json!({ "op": 23, "d": { "transition_id": transition, "protocol_version": version } }).to_string())
+        WsMessage::Text(
+            json!({ "op": 23, "d": { "transition_id": transition, "protocol_version": version } })
+                .to_string(),
+        )
     }
 
     /// Takes one JSON frame from the server; returns what, if anything, has to
@@ -548,9 +643,14 @@ impl Shared {
             // Video: whose camera is on which SSRC - or, with a zero SSRC,
             // that it has been switched off.
             12 => {
-                let Some(user) = user_of(d) else { return replies };
+                let Some(user) = user_of(d) else {
+                    return replies;
+                };
                 let (audio, video) = video_ssrcs(d);
-                self.rtx.lock().unwrap().extend(super::videorx::rtx_pairs(d));
+                self.rtx
+                    .lock()
+                    .unwrap()
+                    .extend(super::videorx::rtx_pairs(d));
                 let mut owners = self.owners.lock().unwrap();
                 if let Some(audio) = audio {
                     owners.insert(audio, user);
@@ -568,7 +668,11 @@ impl Shared {
             11 => {
                 let mut group = self.group.lock().unwrap();
                 for id in d["user_ids"].as_array().into_iter().flatten() {
-                    if let Some(id) = id.as_str().and_then(|s| s.parse().ok()).or_else(|| id.as_u64()) {
+                    if let Some(id) = id
+                        .as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| id.as_u64())
+                    {
                         group.recognised.insert(id);
                     }
                 }
@@ -576,9 +680,18 @@ impl Shared {
             // Client disconnect: forget their SSRCs, their camera, and their
             // place in the group.
             13 => {
-                let Some(user) = user_of(d) else { return replies };
+                let Some(user) = user_of(d) else {
+                    return replies;
+                };
                 self.group.lock().unwrap().recognised.remove(&user);
-                let gone: Vec<u32> = self.owners.lock().unwrap().iter().filter(|(_, u)| **u == user).map(|(s, _)| *s).collect();
+                let gone: Vec<u32> = self
+                    .owners
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(_, u)| **u == user)
+                    .map(|(s, _)| *s)
+                    .collect();
                 for ssrc in &gone {
                     self.owners.lock().unwrap().remove(ssrc);
                     self.speakers.lock().unwrap().remove(ssrc);
@@ -590,7 +703,11 @@ impl Shared {
             21 => {
                 let transition = d["transition_id"].as_u64().unwrap_or(0) as u16;
                 let version = d["protocol_version"].as_u64().unwrap_or(0) as u16;
-                self.group.lock().unwrap().pending.insert(transition, version);
+                self.group
+                    .lock()
+                    .unwrap()
+                    .pending
+                    .insert(transition, version);
                 if transition == 0 {
                     self.execute_transition(transition);
                 } else if version == 0 {
@@ -605,17 +722,21 @@ impl Shared {
                 self.execute_transition(d["transition_id"].as_u64().unwrap_or(0) as u16);
             }
             // Prepare epoch: epoch 1 is a group starting again from nothing.
-            24
-                if d["epoch"].as_u64() == Some(1) => {
-                    self.dave_version.store(d["protocol_version"].as_u64().unwrap_or(0) as u16, Ordering::Relaxed);
-                    match self.reinit_group() {
-                        Ok(Some(package)) => replies.push(WsMessage::Binary(
-                            super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package),
-                        )),
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account),
+            24 if d["epoch"].as_u64() == Some(1) => {
+                self.dave_version.store(
+                    d["protocol_version"].as_u64().unwrap_or(0) as u16,
+                    Ordering::Relaxed,
+                );
+                match self.reinit_group() {
+                    Ok(Some(package)) => replies.push(WsMessage::Binary(
+                        super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package),
+                    )),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account)
                     }
                 }
+            }
             _ => {}
         }
         replies
@@ -624,7 +745,10 @@ impl Shared {
     fn execute_transition(&self, transition: u16) {
         let mut group = self.group.lock().unwrap();
         let Some(new_version) = group.pending.remove(&transition) else {
-            tracing::debug!("discord[{}]: DAVE execute for unknown transition {transition}", self.account);
+            tracing::debug!(
+                "discord[{}]: DAVE execute for unknown transition {transition}",
+                self.account
+            );
             return;
         };
         let old_version = self.dave_version.swap(new_version, Ordering::Relaxed);
@@ -639,22 +763,34 @@ impl Shared {
 
     /// Takes one binary DAVE frame from the server.
     fn take_binary(&self, bytes: &[u8]) -> Vec<WsMessage> {
-        use super::dave::{OP_ANNOUNCE_COMMIT_TRANSITION, OP_COMMIT_WELCOME, OP_EXTERNAL_SENDER, OP_PROPOSALS, OP_WELCOME};
+        use super::dave::{
+            OP_ANNOUNCE_COMMIT_TRANSITION, OP_COMMIT_WELCOME, OP_EXTERNAL_SENDER, OP_PROPOSALS,
+            OP_WELCOME,
+        };
         let mut replies = Vec::new();
-        let Some(frame) = super::dave::read_binary(bytes) else { return replies };
+        let Some(frame) = super::dave::read_binary(bytes) else {
+            return replies;
+        };
         let mut failed_transition: Option<u16> = None;
         {
             let mut group = self.group.lock().unwrap();
             let recognised: Vec<u64> = group.recognised.iter().copied().collect();
-            let Some(session) = group.session.as_mut() else { return replies };
+            let Some(session) = group.session.as_mut() else {
+                return replies;
+            };
             match frame.opcode {
                 OP_EXTERNAL_SENDER => {
                     if let Err(e) = session.set_external_sender(frame.payload) {
-                        tracing::warn!("discord[{}]: DAVE external sender refused: {e:?}", self.account);
+                        tracing::warn!(
+                            "discord[{}]: DAVE external sender refused: {e:?}",
+                            self.account
+                        );
                     }
                 }
                 OP_PROPOSALS => {
-                    let Some((kind, proposals)) = frame.payload.split_first() else { return replies };
+                    let Some((kind, proposals)) = frame.payload.split_first() else {
+                        return replies;
+                    };
                     let operation = match kind {
                         0 => davey::ProposalsOperationType::APPEND,
                         1 => davey::ProposalsOperationType::REVOKE,
@@ -666,18 +802,30 @@ impl Shared {
                             if let Some(welcome) = cw.welcome {
                                 payload.extend_from_slice(&welcome);
                             }
-                            replies.push(WsMessage::Binary(super::dave::write_binary(OP_COMMIT_WELCOME, &payload)));
+                            replies.push(WsMessage::Binary(super::dave::write_binary(
+                                OP_COMMIT_WELCOME,
+                                &payload,
+                            )));
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!("discord[{}]: DAVE proposals failed: {e:?}", self.account),
+                        Err(e) => tracing::warn!(
+                            "discord[{}]: DAVE proposals failed: {e:?}",
+                            self.account
+                        ),
                     }
                 }
                 OP_ANNOUNCE_COMMIT_TRANSITION | OP_WELCOME => {
-                    let Some((transition, message)) = split_transition(frame.payload) else { return replies };
+                    let Some((transition, message)) = split_transition(frame.payload) else {
+                        return replies;
+                    };
                     let result = if frame.opcode == OP_WELCOME {
-                        session.process_welcome(message).map_err(|e| format!("{e:?}"))
+                        session
+                            .process_welcome(message)
+                            .map_err(|e| format!("{e:?}"))
                     } else {
-                        session.process_commit(message).map_err(|e| format!("{e:?}"))
+                        session
+                            .process_commit(message)
+                            .map_err(|e| format!("{e:?}"))
                     };
                     match result {
                         Ok(()) if transition != 0 => {
@@ -687,7 +835,15 @@ impl Shared {
                         }
                         Ok(()) => {}
                         Err(e) => {
-                            tracing::warn!("discord[{}]: DAVE {} failed: {e}", self.account, if frame.opcode == OP_WELCOME { "welcome" } else { "commit" });
+                            tracing::warn!(
+                                "discord[{}]: DAVE {} failed: {e}",
+                                self.account,
+                                if frame.opcode == OP_WELCOME {
+                                    "welcome"
+                                } else {
+                                    "commit"
+                                }
+                            );
                             failed_transition = Some(transition);
                         }
                     }
@@ -699,11 +855,18 @@ impl Shared {
         // group again - which is what songbird does and what the server then
         // expects.
         if let Some(transition) = failed_transition {
-            replies.push(WsMessage::Text(json!({ "op": 31, "d": { "transition_id": transition } }).to_string()));
+            replies.push(WsMessage::Text(
+                json!({ "op": 31, "d": { "transition_id": transition } }).to_string(),
+            ));
             match self.reinit_group() {
-                Ok(Some(package)) => replies.push(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package))),
+                Ok(Some(package)) => replies.push(WsMessage::Binary(super::dave::write_binary(
+                    super::dave::OP_KEY_PACKAGE,
+                    &package,
+                ))),
                 Ok(None) => {}
-                Err(e) => tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account),
+                Err(e) => {
+                    tracing::warn!("discord[{}]: DAVE could not restart: {e:#}", self.account)
+                }
             }
         }
         replies
@@ -730,10 +893,18 @@ impl Shared {
     fn end_camera(&self, user: u64) {
         let ended: Vec<u32> = {
             let mut cameras = self.cameras.lock().unwrap();
-            let ssrcs: Vec<u32> = cameras.iter().filter(|(_, c)| c.user == user).map(|(s, _)| *s).collect();
+            let ssrcs: Vec<u32> = cameras
+                .iter()
+                .filter(|(_, c)| c.user == user)
+                .map(|(s, _)| *s)
+                .collect();
             for ssrc in &ssrcs {
                 if let Some(camera) = cameras.remove(ssrc) {
-                    tracing::info!("discord[{}]: camera from {user} ended: {:?}", self.account, camera.rx.stats);
+                    tracing::info!(
+                        "discord[{}]: camera from {user} ended: {:?}",
+                        self.account,
+                        camera.rx.stats
+                    );
                 }
             }
             ssrcs
@@ -747,7 +918,13 @@ impl Shared {
     }
 
     fn end_all_cameras(&self) {
-        let users: HashSet<u64> = self.cameras.lock().unwrap().values().map(|c| c.user).collect();
+        let users: HashSet<u64> = self
+            .cameras
+            .lock()
+            .unwrap()
+            .values()
+            .map(|c| c.user)
+            .collect();
         for user in users {
             self.end_camera(user);
         }
@@ -757,7 +934,10 @@ impl Shared {
 /// A user id as Discord writes it: a string everywhere but here, sometimes a
 /// number here.
 fn user_of(d: &Value) -> Option<u64> {
-    d["user_id"].as_str().and_then(|s| s.parse().ok()).or_else(|| d["user_id"].as_u64())
+    d["user_id"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| d["user_id"].as_u64())
 }
 
 /// The audio SSRC and every active video SSRC an `op 12` names.
@@ -765,7 +945,10 @@ fn user_of(d: &Value) -> Option<u64> {
 /// A camera switched off arrives as a video SSRC of zero, or as streams all
 /// marked inactive - both read here as "no video".
 pub fn video_ssrcs(d: &Value) -> (Option<u32>, Vec<u32>) {
-    let audio = d["audio_ssrc"].as_u64().filter(|s| *s != 0).map(|s| s as u32);
+    let audio = d["audio_ssrc"]
+        .as_u64()
+        .filter(|s| *s != 0)
+        .map(|s| s as u32);
     let mut video: Vec<u32> = Vec::new();
     let streams: Vec<&Value> = d["streams"].as_array().into_iter().flatten().collect();
     if streams.is_empty() {
@@ -801,7 +984,8 @@ fn split_transition(payload: &[u8]) -> Option<(u16, &[u8])> {
 ///
 /// Held here rather than on the connection because the window asks for it
 /// by account and the connection comes and goes with every reconnect.
-static ROUND_TRIPS: std::sync::LazyLock<Mutex<HashMap<String, u32>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static ROUND_TRIPS: std::sync::LazyLock<Mutex<HashMap<String, u32>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The last heartbeat's round trip for this account's call, if one has
 /// completed since it connected.
@@ -821,7 +1005,9 @@ impl Drop for RoundTripGuard {
 
 /// If `message` is the answer to the heartbeat sent as `sent`, how long it took.
 fn heartbeat_answer(message: &WsMessage, sent: &Option<(u32, Instant)>) -> Option<u32> {
-    let WsMessage::Text(text) = message else { return None };
+    let WsMessage::Text(text) = message else {
+        return None;
+    };
     let value: Value = serde_json::from_str(text).ok()?;
     if value["op"].as_u64() != Some(6) {
         return None;
@@ -829,18 +1015,23 @@ fn heartbeat_answer(message: &WsMessage, sent: &Option<(u32, Instant)>) -> Optio
     let (nonce, at) = (*sent)?;
     // The server echoes the nonce back; an answer to anything else (an
     // older beat, a different session) says nothing about this one.
-    (value["d"]["t"].as_u64() == Some(nonce as u64)).then(|| at.elapsed().as_millis().min(u32::MAX as u128) as u32)
+    (value["d"]["t"].as_u64() == Some(nonce as u64))
+        .then(|| at.elapsed().as_millis().min(u32::MAX as u128) as u32)
 }
 
 /// The websocket: heartbeats, the server's news, and DAVE.
 async fn socket_loop(
     shared: Arc<Shared>,
     mut write: futures::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
         WsMessage,
     >,
     mut read: futures::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
     >,
     early: Vec<WsMessage>,
     beat_every: Duration,
@@ -860,7 +1051,9 @@ async fn socket_loop(
                 shared.take_binary(bytes)
             }
             WsMessage::Text(text) => {
-                let Ok(value) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+                let Ok(value) = serde_json::from_str::<Value>(text) else {
+                    return Vec::new();
+                };
                 if let Some(seq) = value["seq"].as_u64() {
                     *seq_ack = (*seq_ack).max(seq);
                 }
@@ -962,18 +1155,34 @@ async fn receive(
         if videorx::is_rtcp(datagram) {
             if !rtcp_checked {
                 rtcp_checked = true;
-                let opens = voicecrypto::open_at(mode, &key, datagram, videorx::RTCP_CLEAR, videorx::RTCP_CLEAR).is_ok();
-                tracing::info!("discord[{}]: RTCP from the relay {} with its header in the clear", shared.account, if opens { "opens" } else { "does not open" });
+                let opens = voicecrypto::open_at(
+                    mode,
+                    &key,
+                    datagram,
+                    videorx::RTCP_CLEAR,
+                    videorx::RTCP_CLEAR,
+                )
+                .is_ok();
+                tracing::info!(
+                    "discord[{}]: RTCP from the relay {} with its header in the clear",
+                    shared.account,
+                    if opens { "opens" } else { "does not open" }
+                );
             }
             continue;
         }
-        let Some(parsed) = rtp::parse_header(datagram) else { continue };
+        let Some(parsed) = rtp::parse_header(datagram) else {
+            continue;
+        };
         let payload = match voicecrypto::open_rtp(mode, &key, datagram, &parsed) {
             Ok(payload) => payload,
             Err(_) => {
                 unopened += 1;
                 if unopened == 1 || unopened.is_multiple_of(1000) {
-                    tracing::warn!("discord[{}]: {unopened} voice packets would not open", shared.account);
+                    tracing::warn!(
+                        "discord[{}]: {unopened} voice packets would not open",
+                        shared.account
+                    );
                 }
                 continue;
             }
@@ -981,7 +1190,10 @@ async fn receive(
         // A retransmission is the packet it replaces, on the camera's SSRC.
         let (video_ssrc, sequence, payload, resent) = match parsed.payload_type {
             rtp::PAYLOAD_TYPE_OPUS => {
-                let Some(opus) = shared.open_media(parsed.ssrc, davey::MediaType::AUDIO, payload) else { continue };
+                let Some(opus) = shared.open_media(parsed.ssrc, davey::MediaType::AUDIO, payload)
+                else {
+                    continue;
+                };
                 shared
                     .speakers
                     .lock()
@@ -996,20 +1208,32 @@ async fn receive(
                 let known = shared.rtx.lock().unwrap().get(&parsed.ssrc).copied();
                 let Some(media) = known.or_else(|| {
                     let guess = parsed.ssrc.wrapping_sub(1);
-                    shared.cameras.lock().unwrap().contains_key(&guess).then_some(guess)
+                    shared
+                        .cameras
+                        .lock()
+                        .unwrap()
+                        .contains_key(&guess)
+                        .then_some(guess)
                 }) else {
                     continue;
                 };
-                let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else { continue };
+                let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else {
+                    continue;
+                };
                 (media, sequence, original, true)
             }
             _ => continue,
         };
-        let Some(user) = shared.owners.lock().unwrap().get(&video_ssrc).copied() else { continue };
+        let Some(user) = shared.owners.lock().unwrap().get(&video_ssrc).copied() else {
+            continue;
+        };
         let now = Instant::now();
         let (frames, lost) = {
             let mut cameras = shared.cameras.lock().unwrap();
-            let camera = cameras.entry(video_ssrc).or_insert_with(|| Camera { user, rx: VideoReceiver::new() });
+            let camera = cameras.entry(video_ssrc).or_insert_with(|| Camera {
+                user,
+                rx: VideoReceiver::new(),
+            });
             camera.user = user;
             let frames = camera.rx.push(
                 rtp::Packet {
@@ -1029,16 +1253,26 @@ async fn receive(
             send_rtcp(&udp, &sealer, &videorx::nack(ssrc, video_ssrc, &lost)).await;
         }
         for frame in frames {
-            let Some(picture) = shared.open_media(video_ssrc, davey::MediaType::VIDEO, frame.data.clone()) else { continue };
+            let Some(picture) =
+                shared.open_media(video_ssrc, davey::MediaType::VIDEO, frame.data.clone())
+            else {
+                continue;
+            };
             let keyframe = super::reassemble::is_keyframe(&picture);
             let (admitted, want_key, first) = {
                 let mut cameras = shared.cameras.lock().unwrap();
-                let Some(camera) = cameras.get_mut(&video_ssrc) else { continue };
+                let Some(camera) = cameras.get_mut(&video_ssrc) else {
+                    continue;
+                };
                 let first = camera.rx.stats.frames == 0;
                 let admitted = camera.rx.admit(&frame, keyframe);
                 let want_key = camera.rx.wants_keyframe(now);
                 if admitted && camera.rx.stats.frames % 900 == 0 {
-                    tracing::info!("discord[{}]: camera from {user}: {:?}", shared.account, camera.rx.stats);
+                    tracing::info!(
+                        "discord[{}]: camera from {user}: {:?}",
+                        shared.account,
+                        camera.rx.stats
+                    );
                 }
                 (admitted, want_key, first && admitted)
             };
@@ -1049,7 +1283,10 @@ async fn receive(
                 continue;
             }
             if first {
-                tracing::info!("discord[{}]: a camera from {user} is arriving", shared.account);
+                tracing::info!(
+                    "discord[{}]: a camera from {user} is arriving",
+                    shared.account
+                );
             }
             shared.state.events.emit(
                 "discordCameraFrame",
@@ -1088,19 +1325,24 @@ async fn clock(
 ) {
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut encoder = match opus2::Encoder::new(48_000, opus2::Channels::Stereo, opus2::Application::Voip) {
-        Ok(encoder) => Some(encoder),
-        Err(e) => {
-            tracing::warn!("discord[{}]: no Opus encoder, so nothing can be sent: {e:?}", shared.account);
-            None
-        }
-    };
+    let mut encoder =
+        match opus2::Encoder::new(48_000, opus2::Channels::Stereo, opus2::Application::Voip) {
+            Ok(encoder) => Some(encoder),
+            Err(e) => {
+                tracing::warn!(
+                    "discord[{}]: no Opus encoder, so nothing can be sent: {e:?}",
+                    shared.account
+                );
+                None
+            }
+        };
     if let Some(encoder) = encoder.as_mut() {
         let _ = encoder.set_bitrate(opus2::Bitrate::Bits(64_000));
     }
     let mut gate = Gate::default();
     let prefs = shared.state.voice_prefs.get();
-    let mut processor = crate::apm::CallProcessor::new(prefs.echo_cancellation, prefs.noise_suppression);
+    let mut processor =
+        crate::apm::CallProcessor::new(prefs.echo_cancellation, prefs.noise_suppression);
     let mut sequence: u16 = rand::random();
     let mut timestamp: u32 = rand::random();
     let mut next_keepalive = Instant::now();
@@ -1115,7 +1357,10 @@ async fn clock(
         // Everybody else, mixed.
         let voices: Vec<(u32, Vec<i16>)> = {
             let mut speakers = shared.speakers.lock().unwrap();
-            speakers.iter_mut().filter_map(|(ssrc, jitter)| jitter.pop().map(|pcm| (*ssrc, pcm))).collect()
+            speakers
+                .iter_mut()
+                .filter_map(|(ssrc, jitter)| jitter.pop().map(|pcm| (*ssrc, pcm)))
+                .collect()
         };
         for (ssrc, pcm) in &voices {
             shared.tracker.heard_from(*ssrc, super::voice::peak_of(pcm));
@@ -1141,7 +1386,11 @@ async fn clock(
             }
             // A soundboard sound is one more voice in the mix, at the call's
             // volume like everybody else.
-            if let Some(effect) = shared.state.voice.take_effect(&shared.account, FRAME_SAMPLES) {
+            if let Some(effect) = shared
+                .state
+                .voice
+                .take_effect(&shared.account, FRAME_SAMPLES)
+            {
                 voices.push((0, effect));
             }
             let refs: Vec<&[i16]> = voices.iter().map(|(_, pcm)| pcm.as_slice()).collect();
@@ -1159,7 +1408,11 @@ async fn clock(
         // Decoders for people who have gone quiet for good.
         if last_sweep.elapsed() > Duration::from_secs(30) {
             last_sweep = Instant::now();
-            shared.speakers.lock().unwrap().retain(|_, jitter| jitter.last_arrival.elapsed() < Duration::from_secs(60));
+            shared
+                .speakers
+                .lock()
+                .unwrap()
+                .retain(|_, jitter| jitter.last_arrival.elapsed() < Duration::from_secs(60));
         }
 
         // Us, with what the speakers played taken back out, before anything
@@ -1168,7 +1421,10 @@ async fn clock(
         if let Some(frame) = frame.as_mut() {
             processor.capture(frame);
         }
-        let peak = frame.as_ref().map(|f| f.iter().fold(0.0f32, |m, s| m.max(s.abs()))).unwrap_or(0.0);
+        let peak = frame
+            .as_ref()
+            .map(|f| f.iter().fold(0.0f32, |m, s| m.max(s.abs())))
+            .unwrap_or(0.0);
         shared.state.voice.note_sent_peak(&shared.account, peak);
         let action = gate.step(peak);
         if let Some(speaking) = action.announce {
@@ -1278,11 +1534,17 @@ impl Gate {
             self.trailing = 5;
             let announce = if self.speaking { None } else { Some(true) };
             self.speaking = true;
-            return Action { send: Out::Voice, announce };
+            return Action {
+                send: Out::Voice,
+                announce,
+            };
         }
         if self.hold > 0 {
             self.hold -= 1;
-            return Action { send: Out::Voice, announce: None };
+            return Action {
+                send: Out::Voice,
+                announce: None,
+            };
         }
         if self.trailing > 0 {
             self.trailing -= 1;
@@ -1292,9 +1554,15 @@ impl Gate {
             } else {
                 None
             };
-            return Action { send: Out::Silence, announce };
+            return Action {
+                send: Out::Silence,
+                announce,
+            };
         }
-        Action { send: Out::Nothing, announce: None }
+        Action {
+            send: Out::Nothing,
+            announce: None,
+        }
     }
 }
 
@@ -1343,7 +1611,8 @@ impl Jitter {
         // behind.
         if self.packets.len() > JITTER_MAX {
             let newest = self.newest();
-            self.packets.retain(|seq, _| (newest.wrapping_sub(*seq) as i16) < JITTER_PRIME as i16);
+            self.packets
+                .retain(|seq, _| (newest.wrapping_sub(*seq) as i16) < JITTER_PRIME as i16);
             self.next = None;
             self.started = false;
         }
@@ -1351,12 +1620,24 @@ impl Jitter {
 
     fn oldest(&self) -> u16 {
         let any = *self.packets.keys().next().unwrap_or(&0);
-        self.packets.keys().copied().fold(any, |oldest, seq| if (seq.wrapping_sub(oldest) as i16) < 0 { seq } else { oldest })
+        self.packets.keys().copied().fold(any, |oldest, seq| {
+            if (seq.wrapping_sub(oldest) as i16) < 0 {
+                seq
+            } else {
+                oldest
+            }
+        })
     }
 
     fn newest(&self) -> u16 {
         let any = *self.packets.keys().next().unwrap_or(&0);
-        self.packets.keys().copied().fold(any, |newest, seq| if (seq.wrapping_sub(newest) as i16) > 0 { seq } else { newest })
+        self.packets.keys().copied().fold(any, |newest, seq| {
+            if (seq.wrapping_sub(newest) as i16) > 0 {
+                seq
+            } else {
+                newest
+            }
+        })
     }
 
     /// The next 20ms of this speaker, or None for silence.
@@ -1401,11 +1682,12 @@ impl Jitter {
         // reads it (#251). Not a packet, or longer than this buffer: treated
         // as lost, which the decoder conceals as it does any gap. Empty is
         // our own request for exactly that.
-        let opus = if opus.is_empty() || crate::opus_packet::plausible(opus, pcm.len() / 2).is_some() {
-            opus
-        } else {
-            &[]
-        };
+        let opus =
+            if opus.is_empty() || crate::opus_packet::plausible(opus, pcm.len() / 2).is_some() {
+                opus
+            } else {
+                &[]
+            };
         let per_channel = decoder.decode(opus, &mut pcm, false).ok()?;
         pcm.truncate(per_channel * 2);
         Some(pcm)
@@ -1445,12 +1727,18 @@ mod heartbeat_tests {
         let sent = Some((77u32, Instant::now()));
         let other = WsMessage::Text(json!({ "op": 4, "d": { "t": 77 } }).to_string());
         assert_eq!(heartbeat_answer(&other, &sent), None);
-        assert_eq!(heartbeat_answer(&WsMessage::Binary(vec![1, 2, 3]), &sent), None);
+        assert_eq!(
+            heartbeat_answer(&WsMessage::Binary(vec![1, 2, 3]), &sent),
+            None
+        );
     }
 
     #[test]
     fn a_connection_that_ends_forgets_its_round_trip() {
-        ROUND_TRIPS.lock().unwrap().insert("discord:test-guard".into(), 30);
+        ROUND_TRIPS
+            .lock()
+            .unwrap()
+            .insert("discord:test-guard".into(), 30);
         assert_eq!(round_trip_ms("discord:test-guard"), Some(30));
         drop(RoundTripGuard("discord:test-guard".into()));
         assert_eq!(round_trip_ms("discord:test-guard"), None);
@@ -1517,18 +1805,48 @@ mod tests {
     #[test]
     fn the_gate_opens_on_speech_holds_then_trails_off_in_silence() {
         let mut gate = Gate::default();
-        assert_eq!(gate.step(0.0), Action { send: Out::Nothing, announce: None }, "a quiet room sends nothing");
-        assert_eq!(gate.step(0.2), Action { send: Out::Voice, announce: Some(true) });
-        assert_eq!(gate.step(0.2), Action { send: Out::Voice, announce: None }, "announced once");
+        assert_eq!(
+            gate.step(0.0),
+            Action {
+                send: Out::Nothing,
+                announce: None
+            },
+            "a quiet room sends nothing"
+        );
+        assert_eq!(
+            gate.step(0.2),
+            Action {
+                send: Out::Voice,
+                announce: Some(true)
+            }
+        );
+        assert_eq!(
+            gate.step(0.2),
+            Action {
+                send: Out::Voice,
+                announce: None
+            },
+            "announced once"
+        );
         for _ in 0..GATE_HOLD_TICKS {
-            assert_eq!(gate.step(0.0).send, Out::Voice, "the ends of words are kept");
+            assert_eq!(
+                gate.step(0.0).send,
+                Out::Voice,
+                "the ends of words are kept"
+            );
         }
         for i in 0..5 {
             let action = gate.step(0.0);
             assert_eq!(action.send, Out::Silence);
             assert_eq!(action.announce, if i == 4 { Some(false) } else { None });
         }
-        assert_eq!(gate.step(0.0), Action { send: Out::Nothing, announce: None });
+        assert_eq!(
+            gate.step(0.0),
+            Action {
+                send: Out::Nothing,
+                announce: None
+            }
+        );
     }
 
     fn opus_silence() -> Vec<u8> {
@@ -1541,7 +1859,11 @@ mod tests {
         jitter.push(11, opus_silence());
         assert!(jitter.pop().is_none(), "one packet is not enough to start");
         jitter.push(10, opus_silence());
-        assert_eq!(jitter.pop().map(|p| p.len()), Some(FRAME_SAMPLES), "starts from the earliest");
+        assert_eq!(
+            jitter.pop().map(|p| p.len()),
+            Some(FRAME_SAMPLES),
+            "starts from the earliest"
+        );
         assert_eq!(jitter.next, Some(11));
         assert!(jitter.pop().is_some());
         assert!(jitter.pop().is_none(), "and stops when they do");
@@ -1555,7 +1877,10 @@ mod tests {
         assert!(jitter.pop().is_some());
         assert_eq!(jitter.next, Some(0), "wrapped");
         jitter.push(65_534, opus_silence());
-        assert!(!jitter.packets.contains_key(&65_534), "already behind what was played");
+        assert!(
+            !jitter.packets.contains_key(&65_534),
+            "already behind what was played"
+        );
     }
 
     #[test]
@@ -1574,6 +1899,10 @@ mod tests {
         for seq in 0..(JITTER_MAX as u16 + 1) {
             jitter.push(seq, opus_silence());
         }
-        assert!(jitter.packets.len() <= JITTER_PRIME, "held {}", jitter.packets.len());
+        assert!(
+            jitter.packets.len() <= JITTER_PRIME,
+            "held {}",
+            jitter.packets.len()
+        );
     }
 }

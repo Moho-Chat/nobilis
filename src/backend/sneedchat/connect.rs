@@ -11,7 +11,8 @@ use super::*;
 /// `SneedChatAccountConfig::site_host`.
 pub const DEFAULT_ONION: &str = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion";
 
-pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 /// Spawns the background task that keeps a Sneedchat account's connection
 /// alive - the real-time equivalent of backend::discord::spawn. Called both
@@ -31,7 +32,9 @@ pub fn spawn(state: AppState, config: SneedChatAccountConfig) {
             state.runtime.remove_task_handle(&account_id);
         }
     });
-    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
+    state
+        .runtime
+        .insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 pub(super) const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
@@ -42,16 +45,27 @@ pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 /// same shape as backend::discord::run_gateway_with_retry, including "no
 /// give up permanently" - a bad password just keeps failing visibly rather
 /// than settling into a silently-stuck state.
-pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) {
+pub(super) async fn run_with_retry(
+    state: &AppState,
+    config: &SneedChatAccountConfig,
+    account_id: &str,
+) {
     let mut delay = RECONNECT_INITIAL_DELAY;
-    state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+    state
+        .runtime
+        .set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
-        let result = std::panic::AssertUnwindSafe(run(state, config, account_id)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(run(state, config, account_id))
+            .catch_unwind()
+            .await;
         let (mut detail, inside_tor) = match result {
             Ok(Ok(())) => ("connection ended".to_string(), false),
             Ok(Err(e)) => {
                 tracing::warn!("sneedchat[{account_id}]: {e:#}");
-                (format!("{e:#}"), config.use_tor && crate::net::tor::is_tor_failure(&e))
+                (
+                    format!("{e:#}"),
+                    config.use_tor && crate::net::tor::is_tor_failure(&e),
+                )
             }
             Err(_) => {
                 tracing::error!("sneedchat[{account_id}]: connection task panicked");
@@ -59,22 +73,36 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
             }
         };
         state.runtime.clear_sneedchat_senders(account_id);
-        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+        state
+            .runtime
+            .set_conn_state(state, account_id, ConnState::Connecting, None);
 
         // Signing in failed, so no room got as far as trying. Asked which
         // part is down, so each room can say - unless the forum answers, in
         // which case this was a refusal (a password, a captcha) rather than an
         // outage, and the account's own message says that better.
         let outage = match transport_for(state, config, |_| {}).await {
-            Ok(transport) => super::health::diagnose(account_id, &transport, &config.site_host()).await,
+            Ok(transport) => {
+                super::health::diagnose(account_id, &transport, &config.site_host()).await
+            }
             Err(e) => super::health::Outage::Tor(format!("Tor isn't connecting: {e:#}")),
         };
         if outage != super::health::Outage::Chat {
             let host = config.site_host();
             detail = outage.describe(&host);
             for room in &config.rooms {
-                let buffer_id = state.runtime.ensure_buffer(state, account_id, &super::rooms::room_buffer_name(&room.name), "channel").id;
-                state.runtime.set_buffer_link(state, &buffer_id, Some(outage.link(&host)));
+                let buffer_id = state
+                    .runtime
+                    .ensure_buffer(
+                        state,
+                        account_id,
+                        &super::rooms::room_buffer_name(&room.name),
+                        "channel",
+                    )
+                    .id;
+                state
+                    .runtime
+                    .set_buffer_link(state, &buffer_id, Some(outage.link(&host)));
             }
         }
 
@@ -98,16 +126,28 @@ pub(super) async fn run_with_retry(state: &AppState, config: &SneedChatAccountCo
             }
         }
 
-        let wait = state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
+        let wait = state.runtime.next_retry_delay(
+            account_id,
+            &mut delay,
+            RECONNECT_INITIAL_DELAY,
+            RECONNECT_MAX_DELAY,
+        );
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
 }
 
-pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<Transport> {
+pub(super) async fn build_transport(
+    state: &AppState,
+    config: &SneedChatAccountConfig,
+    account_id: &str,
+) -> Result<Transport> {
     let account_id = account_id.to_string();
     let state2 = state.clone();
-    transport_for(state, config, move |msg| state2.runtime.report_progress(&state2, &account_id, msg)).await
+    transport_for(state, config, move |msg| {
+        state2.runtime.report_progress(&state2, &account_id, msg)
+    })
+    .await
 }
 
 /// How this account reaches the forum.
@@ -116,19 +156,30 @@ pub(super) async fn build_transport(state: &AppState, config: &SneedChatAccountC
 /// touched at all: an account on the open internet never bootstraps it. With
 /// Tor, the daemon-wide choice between the embedded client and an external
 /// proxy applies.
-pub(super) async fn transport_for(state: &AppState, config: &SneedChatAccountConfig, on_progress: impl FnOnce(&str)) -> Result<Transport> {
+pub(super) async fn transport_for(
+    state: &AppState,
+    config: &SneedChatAccountConfig,
+    on_progress: impl FnOnce(&str),
+) -> Result<Transport> {
     let router = crate::net::route::router();
     if !config.use_tor && !router.tunnel_all() {
         return Ok(Transport::Direct);
     }
     let settings = router.settings();
     if settings.tor_mode == "proxy" {
-        let proxy = settings.proxy.as_deref().ok_or_else(|| anyhow!("the network settings name a proxy but give no address"))?;
+        let proxy = settings
+            .proxy
+            .as_deref()
+            .ok_or_else(|| anyhow!("the network settings name a proxy but give no address"))?;
         return Transport::socks_from_url(proxy);
     }
     if config.use_tor {
         // Straight to moho's own Tor client: the onion address needs no relay.
-        let client = state.tor.get_or_bootstrap(on_progress).await.context("bootstrapping Tor")?;
+        let client = state
+            .tor
+            .get_or_bootstrap(on_progress)
+            .await
+            .context("bootstrapping Tor")?;
         return Ok(Transport::Tor(client));
     }
     // Everything routed, this account on the open internet: through Tor to
@@ -196,20 +247,35 @@ pub(super) fn no_way_in(e: anyhow::Error) -> anyhow::Error {
 /// fully rebuilt from scratch (fresh transport, fresh login) if this
 /// function returns, which `run_with_retry` treats as a failure like any
 /// other.
-pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, account_id: &str) -> Result<()> {
+pub(super) async fn run(
+    state: &AppState,
+    config: &SneedChatAccountConfig,
+    account_id: &str,
+) -> Result<()> {
     let transport = build_transport(state, config, account_id).await?;
 
     let base = format!("https://{}", config.site_host());
     let session = Session::new(transport.clone(), base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
-        Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?),
+        Some(secret) => TwoFactor::Totp(
+            totp::decode_secret(secret).context("stored TOTP secret is not valid base32")?,
+        ),
         None => TwoFactor::None,
     };
-    let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
+    let creds = Credentials {
+        username: config.username.clone(),
+        password: config.password.clone(),
+    };
 
-    state.runtime.report_progress(state, account_id, "logging in...");
+    state
+        .runtime
+        .report_progress(state, account_id, "logging in...");
     restore_session(&session, config);
-    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
+    session
+        .ensure_authenticated(&creds, &two_factor)
+        .await
+        .map_err(no_way_in)
+        .context("logging in")?;
     // Reaching the site at all is what this records: whatever Tor was doing
     // before, it is working now, and the count of failures behind it is no
     // longer evidence of anything.
@@ -223,7 +289,9 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
     }
 
     state.runtime.set_own_identity(account_id, &config.username);
-    state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
+    state
+        .runtime
+        .set_conn_state(state, account_id, ConnState::Connected, None);
 
     let host = config.site_host();
     open_first_room(state, account_id, &session, &host).await;
@@ -251,7 +319,9 @@ pub(super) async fn run(state: &AppState, config: &SneedChatAccountConfig, accou
 /// just signed in. If the list cannot be read the account is left with no
 /// room for now and this is tried again on the next connection.
 async fn open_first_room(state: &AppState, account_id: &str, session: &Session, host: &str) {
-    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
+    let Some(config) = state.accounts.get_sneedchat(account_id) else {
+        return;
+    };
     if config.rooms_chosen {
         return;
     }
@@ -265,11 +335,16 @@ async fn open_first_room(state: &AppState, account_id: &str, session: &Session, 
         Ok(catalogue) => {
             publish_catalogue(state, account_id, &catalogue);
             if let Some(room) = courtesy_room(&catalogue) {
-                tracing::info!("sneedchat[{account_id}]: opening #{} for a new account", room.name);
+                tracing::info!(
+                    "sneedchat[{account_id}]: opening #{} for a new account",
+                    room.name
+                );
                 let _ = state.accounts.set_sneedchat_rooms(account_id, vec![room]);
             }
         }
-        Err(e) => tracing::warn!("sneedchat[{account_id}]: could not read the room list to open a first room: {e:#}"),
+        Err(e) => tracing::warn!(
+            "sneedchat[{account_id}]: could not read the room list to open a first room: {e:#}"
+        ),
     }
 }
 
@@ -282,20 +357,32 @@ async fn open_first_room(state: &AppState, account_id: &str, session: &Session, 
 /// events tagged with `login_id`, mirroring backend::discord::start_qr_login.
 pub fn start_login(state: AppState, login_id: String, config: SneedChatAccountConfig) {
     tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_login(&state, &login_id, &config)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(try_login(&state, &login_id, &config))
+            .catch_unwind()
+            .await;
         let error = match result {
             Ok(Ok(())) => return,
             Ok(Err(e)) => format!("{e:#}"),
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("sneedchat login[{login_id}]: {error}");
-        state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": false, "error": error }));
+        state.events.emit(
+            "sneedChatLoginResult",
+            serde_json::json!({ "loginId": login_id, "success": false, "error": error }),
+        );
     });
 }
 
-pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedChatAccountConfig) -> Result<()> {
+pub(super) async fn try_login(
+    state: &AppState,
+    login_id: &str,
+    config: &SneedChatAccountConfig,
+) -> Result<()> {
     let emit_progress = |msg: &str| {
-        state.events.emit("sneedChatLoginStatus", serde_json::json!({ "loginId": login_id, "detail": msg }));
+        state.events.emit(
+            "sneedChatLoginStatus",
+            serde_json::json!({ "loginId": login_id, "detail": msg }),
+        );
     };
 
     // Saved before anything can fail, not after everything has succeeded.
@@ -319,14 +406,23 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedCh
     let base = format!("https://{}", config.site_host());
     let session = Session::new(transport, base, DEFAULT_USER_AGENT.to_string());
     let two_factor = match &config.totp_secret {
-        Some(secret) => TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?),
+        Some(secret) => {
+            TwoFactor::Totp(totp::decode_secret(secret).context("TOTP secret is not valid base32")?)
+        }
         None => TwoFactor::None,
     };
-    let creds = Credentials { username: config.username.clone(), password: config.password.clone() };
+    let creds = Credentials {
+        username: config.username.clone(),
+        password: config.password.clone(),
+    };
 
     emit_progress("logging in...");
     restore_session(&session, config);
-    session.ensure_authenticated(&creds, &two_factor).await.map_err(no_way_in).context("logging in")?;
+    session
+        .ensure_authenticated(&creds, &two_factor)
+        .await
+        .map_err(no_way_in)
+        .context("logging in")?;
 
     let mut saved_config = config.clone();
     saved_config.cookies = session.http.jar.snapshot();
@@ -335,6 +431,9 @@ pub(super) async fn try_login(state: &AppState, login_id: &str, config: &SneedCh
     let account = crate::accounts::sneedchat_account_to_json(&saved, "connecting");
     spawn(state.clone(), saved);
 
-    state.events.emit("sneedChatLoginResult", serde_json::json!({ "loginId": login_id, "success": true, "account": account }));
+    state.events.emit(
+        "sneedChatLoginResult",
+        serde_json::json!({ "loginId": login_id, "success": true, "account": account }),
+    );
     Ok(())
 }

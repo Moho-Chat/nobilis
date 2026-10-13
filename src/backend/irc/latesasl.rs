@@ -49,7 +49,10 @@ enum Stage {
     Started(SaslMechanism),
     /// SCRAM under way: `first` waits for the server-first message, then for
     /// the server-final one.
-    Scram { scram: Box<Scram>, first: bool },
+    Scram {
+        scram: Box<Scram>,
+        first: bool,
+    },
     /// Everything sent; waiting for the verdict.
     Result,
 }
@@ -99,7 +102,12 @@ impl LateSasl {
     }
 
     /// One line from the server.
-    pub(super) fn observe(&mut self, message: &Message, config: &IrcAccountConfig, now: Instant) -> Vec<Out> {
+    pub(super) fn observe(
+        &mut self,
+        message: &Message,
+        config: &IrcAccountConfig,
+        now: Instant,
+    ) -> Vec<Out> {
         match &message.command {
             Command::CAP(_, CapSubCommand::NEW, param, suffix) => {
                 let offered = cap_list(param.as_deref(), suffix.as_deref());
@@ -112,27 +120,42 @@ impl LateSasl {
                     self.tried.clear();
                     self.offered = None;
                     self.enter(Stage::Requested, now);
-                    return vec![Out::Send(Command::CAP(None, CapSubCommand::REQ, None, Some("sasl".to_string())))];
+                    return vec![Out::Send(Command::CAP(
+                        None,
+                        CapSubCommand::REQ,
+                        None,
+                        Some("sasl".to_string()),
+                    ))];
                 }
                 Vec::new()
             }
-            Command::CAP(_, CapSubCommand::ACK, param, suffix) if matches!(self.stage, Stage::Requested) => {
+            Command::CAP(_, CapSubCommand::ACK, param, suffix)
+                if matches!(self.stage, Stage::Requested) =>
+            {
                 if !offers_sasl(cap_list(param.as_deref(), suffix.as_deref())) {
                     return Vec::new();
                 }
                 self.start(preferred_mechanism(config), now)
             }
-            Command::CAP(_, CapSubCommand::NAK, param, suffix) if matches!(self.stage, Stage::Requested) => {
+            Command::CAP(_, CapSubCommand::NAK, param, suffix)
+                if matches!(self.stage, Stage::Requested) =>
+            {
                 if !offers_sasl(cap_list(param.as_deref(), suffix.as_deref())) {
                     return Vec::new();
                 }
-                self.refuse("the server offered SASL and then declined to start it", false)
+                self.refuse(
+                    "the server offered SASL and then declined to start it",
+                    false,
+                )
             }
             // Withdrawn mid-exchange: services went away again. Nothing to
             // abort on the wire - there is nobody left to answer.
             Command::CAP(_, CapSubCommand::DEL, param, suffix) => {
-                if !matches!(self.stage, Stage::Idle) && offers_sasl(cap_list(param.as_deref(), suffix.as_deref())) {
-                    return self.refuse("the server withdrew SASL before the login finished", false);
+                if !matches!(self.stage, Stage::Idle)
+                    && offers_sasl(cap_list(param.as_deref(), suffix.as_deref()))
+                {
+                    return self
+                        .refuse("the server withdrew SASL before the login finished", false);
                 }
                 Vec::new()
             }
@@ -165,17 +188,28 @@ impl LateSasl {
     fn start(&mut self, mechanism: SaslMechanism, now: Instant) -> Vec<Out> {
         self.tried.push(mechanism);
         self.enter(Stage::Started(mechanism), now);
-        vec![Out::Send(Command::AUTHENTICATE(mechanism.name().to_string()))]
+        vec![Out::Send(Command::AUTHENTICATE(
+            mechanism.name().to_string(),
+        ))]
     }
 
     fn challenge(&mut self, payload: &str, config: &IrcAccountConfig, now: Instant) -> Vec<Out> {
-        let user = config.sasl_user.clone().unwrap_or_else(|| config.nick.clone());
+        let user = config
+            .sasl_user
+            .clone()
+            .unwrap_or_else(|| config.nick.clone());
         let pass = config.password.clone().unwrap_or_default();
         let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
         match std::mem::replace(&mut self.stage, Stage::Idle) {
             Stage::Started(mechanism) => {
                 if payload != "+" {
-                    return self.refuse(&format!("the server answered {} with something unexpected", mechanism.name()), false);
+                    return self.refuse(
+                        &format!(
+                            "the server answered {} with something unexpected",
+                            mechanism.name()
+                        ),
+                        false,
+                    );
                 }
                 let answer = match mechanism {
                     SaslMechanism::External => "+".to_string(),
@@ -183,7 +217,13 @@ impl LateSasl {
                     SaslMechanism::ScramSha256 => {
                         let scram = Scram::new(&user, &pass, &nonce());
                         let first = encode(&scram.client_first());
-                        self.enter(Stage::Scram { scram: Box::new(scram), first: true }, now);
+                        self.enter(
+                            Stage::Scram {
+                                scram: Box::new(scram),
+                                first: true,
+                            },
+                            now,
+                        );
                         return vec![Out::Send(Command::AUTHENTICATE(first))];
                     }
                 };
@@ -199,7 +239,13 @@ impl LateSasl {
                     match scram.client_final(&decoded) {
                         Ok(last) => {
                             let sent = encode(&last);
-                            self.enter(Stage::Scram { scram, first: false }, now);
+                            self.enter(
+                                Stage::Scram {
+                                    scram,
+                                    first: false,
+                                },
+                                now,
+                            );
                             vec![Out::Send(Command::AUTHENTICATE(sent))]
                         }
                         Err(e) => self.abort(&format!("{e:#}")),
@@ -241,39 +287,68 @@ impl LateSasl {
             Response::RPL_SASLSUCCESS | Response::ERR_SASLALREADY if self.active() => {
                 self.logged_in = true;
                 self.enter(Stage::Idle, now);
-                vec![Out::LoggedIn { account: self.account.clone() }]
+                vec![Out::LoggedIn {
+                    account: self.account.clone(),
+                }]
             }
             Response::RPL_SASLMECHS if self.active() => {
-                self.offered = Some(args.get(1).map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default());
+                self.offered = Some(
+                    args.get(1)
+                        .map(|list| list.split(',').map(|m| m.trim().to_string()).collect())
+                        .unwrap_or_default(),
+                );
                 Vec::new()
             }
-            Response::ERR_SASLFAIL | Response::ERR_SASLTOOLONG | Response::ERR_SASLABORT | Response::ERR_NICKLOCKED
+            Response::ERR_SASLFAIL
+            | Response::ERR_SASLTOOLONG
+            | Response::ERR_SASLABORT
+            | Response::ERR_NICKLOCKED
                 if self.active() =>
             {
                 // A 908 before this named what the server takes: the one
                 // refusal worth answering with another mechanism.
                 if let Some(offered) = self.offered.take() {
-                    let next = offered.iter().filter_map(|n| SaslMechanism::parse(n)).find(|m| !self.tried.contains(m));
+                    let next = offered
+                        .iter()
+                        .filter_map(|n| SaslMechanism::parse(n))
+                        .find(|m| !self.tried.contains(m));
                     if let Some(next) = next {
                         return self.start(next, now);
                     }
-                    return self.refuse(&format!("the server accepts {}, and this account is set up for another", offered.join(", ")), false);
+                    return self.refuse(
+                        &format!(
+                            "the server accepts {}, and this account is set up for another",
+                            offered.join(", ")
+                        ),
+                        false,
+                    );
                 }
-                let credentials = matches!(self.stage, Stage::Result) && code == Response::ERR_SASLFAIL;
+                let credentials =
+                    matches!(self.stage, Stage::Result) && code == Response::ERR_SASLFAIL;
                 let why = if credentials {
                     "the server refused the SASL username or password".to_string()
                 } else if code == Response::ERR_NICKLOCKED {
                     "services have locked this account".to_string()
                 } else {
-                    format!("the server refused the login ({})", args.last().map(String::as_str).unwrap_or("no reason given"))
+                    format!(
+                        "the server refused the login ({})",
+                        args.last().map(String::as_str).unwrap_or("no reason given")
+                    )
                 };
                 self.refuse(&why, credentials)
             }
             // A server that only takes SASL during registration.
             Response::ERR_UNKNOWNCOMMAND | Response::ERR_ALREADYREGISTRED
-                if self.active() && args.get(1).is_some_and(|c| c.eq_ignore_ascii_case("AUTHENTICATE") || code == Response::ERR_ALREADYREGISTRED) =>
+                if self.active()
+                    && args.get(1).is_some_and(|c| {
+                        c.eq_ignore_ascii_case("AUTHENTICATE")
+                            || code == Response::ERR_ALREADYREGISTRED
+                    }) =>
             {
-                self.refuse("this server only takes a SASL login while connecting", false)
+                self.refuse(
+                    "this server only takes a SASL login while connecting",
+                    false,
+                )
             }
             _ => Vec::new(),
         }
@@ -295,13 +370,17 @@ impl LateSasl {
         if credentials {
             self.given_up = true;
         }
-        vec![Out::Refused { why: why.to_string(), credentials }]
+        vec![Out::Refused {
+            why: why.to_string(),
+            credentials,
+        }]
     }
 }
 
 /// Whether a capability list names `sasl`, with or without a value.
 fn offers_sasl(caps: &str) -> bool {
-    caps.split_whitespace().any(|cap| cap.split('=').next() == Some("sasl"))
+    caps.split_whitespace()
+        .any(|cap| cap.split('=').next() == Some("sasl"))
 }
 
 #[cfg(test)]
@@ -334,15 +413,47 @@ mod tests {
     fn services_coming_back_log_the_connection_in_with_plain() {
         let (config, t) = (config(None), Instant::now());
         let mut s = LateSasl::new(false);
-        assert_eq!(sent(&s.observe(&line(":srv CAP tester NEW :sasl=PLAIN,EXTERNAL"), &config, t)), ["CAP REQ sasl"]);
-        assert_eq!(sent(&s.observe(&line(":srv CAP tester ACK :sasl"), &config, t)), ["AUTHENTICATE PLAIN"]);
+        assert_eq!(
+            sent(&s.observe(
+                &line(":srv CAP tester NEW :sasl=PLAIN,EXTERNAL"),
+                &config,
+                t
+            )),
+            ["CAP REQ sasl"]
+        );
+        assert_eq!(
+            sent(&s.observe(&line(":srv CAP tester ACK :sasl"), &config, t)),
+            ["AUTHENTICATE PLAIN"]
+        );
         let plain = base64::engine::general_purpose::STANDARD.encode("\0tester\0hunter2");
-        assert_eq!(sent(&s.observe(&line("AUTHENTICATE +"), &config, t)), [format!("AUTHENTICATE {plain}")]);
-        assert!(s.observe(&line(":srv 900 tester tester!u@h tester :You are now logged in as tester"), &config, t).is_empty());
-        let done = s.observe(&line(":srv 903 tester :SASL authentication successful"), &config, t);
-        assert_eq!(done, vec![Out::LoggedIn { account: Some("tester".to_string()) }]);
+        assert_eq!(
+            sent(&s.observe(&line("AUTHENTICATE +"), &config, t)),
+            [format!("AUTHENTICATE {plain}")]
+        );
+        assert!(s
+            .observe(
+                &line(":srv 900 tester tester!u@h tester :You are now logged in as tester"),
+                &config,
+                t
+            )
+            .is_empty());
+        let done = s.observe(
+            &line(":srv 903 tester :SASL authentication successful"),
+            &config,
+            t,
+        );
+        assert_eq!(
+            done,
+            vec![Out::LoggedIn {
+                account: Some("tester".to_string())
+            }]
+        );
         assert!(s.is_logged_in());
-        assert!(s.observe(&line(":srv CAP tester NEW :sasl"), &config, t).is_empty(), "and not again");
+        assert!(
+            s.observe(&line(":srv CAP tester NEW :sasl"), &config, t)
+                .is_empty(),
+            "and not again"
+        );
     }
 
     #[test]
@@ -358,7 +469,9 @@ mod tests {
     fn a_connection_already_logged_in_ignores_the_offer() {
         let (config, t) = (config(None), Instant::now());
         let mut s = LateSasl::new(true);
-        assert!(s.observe(&line(":srv CAP tester NEW :sasl"), &config, t).is_empty());
+        assert!(s
+            .observe(&line(":srv CAP tester NEW :sasl"), &config, t)
+            .is_empty());
     }
 
     #[test]
@@ -366,13 +479,22 @@ mod tests {
         let t = Instant::now();
         let mut off = config(None);
         off.sasl = false;
-        assert!(LateSasl::new(false).observe(&line(":srv CAP tester NEW :sasl"), &off, t).is_empty());
+        assert!(LateSasl::new(false)
+            .observe(&line(":srv CAP tester NEW :sasl"), &off, t)
+            .is_empty());
         let mut nopass = config(None);
         nopass.password = None;
-        assert!(LateSasl::new(false).observe(&line(":srv CAP tester NEW :sasl"), &nopass, t).is_empty());
+        assert!(LateSasl::new(false)
+            .observe(&line(":srv CAP tester NEW :sasl"), &nopass, t)
+            .is_empty());
         let mut clear = config(None);
         clear.ssl = false;
-        assert!(LateSasl::new(false).observe(&line(":srv CAP tester NEW :sasl"), &clear, t).is_empty(), "no password in the clear");
+        assert!(
+            LateSasl::new(false)
+                .observe(&line(":srv CAP tester NEW :sasl"), &clear, t)
+                .is_empty(),
+            "no password in the clear"
+        );
     }
 
     #[test]
@@ -382,9 +504,21 @@ mod tests {
         s.observe(&line(":srv CAP tester NEW :sasl"), &config, t);
         s.observe(&line(":srv CAP tester ACK :sasl"), &config, t);
         s.observe(&line("AUTHENTICATE +"), &config, t);
-        let out = s.observe(&line(":srv 904 tester :SASL authentication failed"), &config, t);
-        assert!(matches!(&out[..], [Out::Refused { credentials: true, .. }]));
-        assert!(s.observe(&line(":srv CAP tester NEW :sasl"), &config, t).is_empty());
+        let out = s.observe(
+            &line(":srv 904 tester :SASL authentication failed"),
+            &config,
+            t,
+        );
+        assert!(matches!(
+            &out[..],
+            [Out::Refused {
+                credentials: true,
+                ..
+            }]
+        ));
+        assert!(s
+            .observe(&line(":srv CAP tester NEW :sasl"), &config, t)
+            .is_empty());
     }
 
     #[test]
@@ -393,9 +527,22 @@ mod tests {
         let mut s = LateSasl::new(false);
         s.observe(&line(":srv CAP tester NEW :sasl"), &config, t);
         s.observe(&line(":srv CAP tester ACK :sasl"), &config, t);
-        let out = s.observe(&line(":srv 421 tester AUTHENTICATE :Unknown command"), &config, t);
-        assert!(matches!(&out[..], [Out::Refused { credentials: false, .. }]));
-        assert!(!sent(&s.observe(&line(":srv CAP tester NEW :sasl"), &config, t)).is_empty(), "may try again later");
+        let out = s.observe(
+            &line(":srv 421 tester AUTHENTICATE :Unknown command"),
+            &config,
+            t,
+        );
+        assert!(matches!(
+            &out[..],
+            [Out::Refused {
+                credentials: false,
+                ..
+            }]
+        ));
+        assert!(
+            !sent(&s.observe(&line(":srv CAP tester NEW :sasl"), &config, t)).is_empty(),
+            "may try again later"
+        );
     }
 
     #[test]
@@ -403,9 +550,25 @@ mod tests {
         let (config, t) = (config(Some("SCRAM-SHA-256")), Instant::now());
         let mut s = LateSasl::new(false);
         s.observe(&line(":srv CAP tester NEW :sasl"), &config, t);
-        assert_eq!(sent(&s.observe(&line(":srv CAP tester ACK :sasl"), &config, t)), ["AUTHENTICATE SCRAM-SHA-256"]);
-        assert!(s.observe(&line(":srv 908 tester PLAIN,EXTERNAL :are available SASL mechanisms"), &config, t).is_empty());
-        assert_eq!(sent(&s.observe(&line(":srv 904 tester :SASL authentication failed"), &config, t)), ["AUTHENTICATE PLAIN"]);
+        assert_eq!(
+            sent(&s.observe(&line(":srv CAP tester ACK :sasl"), &config, t)),
+            ["AUTHENTICATE SCRAM-SHA-256"]
+        );
+        assert!(s
+            .observe(
+                &line(":srv 908 tester PLAIN,EXTERNAL :are available SASL mechanisms"),
+                &config,
+                t
+            )
+            .is_empty());
+        assert_eq!(
+            sent(&s.observe(
+                &line(":srv 904 tester :SASL authentication failed"),
+                &config,
+                t
+            )),
+            ["AUTHENTICATE PLAIN"]
+        );
     }
 
     #[test]
@@ -417,7 +580,13 @@ mod tests {
         assert!(s.tick(t + Duration::from_secs(5)).is_empty());
         let out = s.tick(t + STEP_TIMEOUT);
         assert_eq!(sent(&out), ["AUTHENTICATE *"]);
-        assert!(matches!(out.last(), Some(Out::Refused { credentials: false, .. })));
+        assert!(matches!(
+            out.last(),
+            Some(Out::Refused {
+                credentials: false,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -426,14 +595,26 @@ mod tests {
         let mut s = LateSasl::new(false);
         s.observe(&line(":srv CAP tester NEW :sasl"), &config, t);
         let out = s.observe(&line(":srv CAP tester DEL :sasl"), &config, t);
-        assert!(matches!(&out[..], [Out::Refused { credentials: false, .. }]));
+        assert!(matches!(
+            &out[..],
+            [Out::Refused {
+                credentials: false,
+                ..
+            }]
+        ));
     }
 
     #[test]
     fn a_nickserv_login_counts_as_logged_in() {
         let (config, t) = (config(None), Instant::now());
         let mut s = LateSasl::new(false);
-        s.observe(&line(":srv 900 tester tester!u@h tester :You are now logged in as tester"), &config, t);
-        assert!(s.observe(&line(":srv CAP tester NEW :sasl"), &config, t).is_empty());
+        s.observe(
+            &line(":srv 900 tester tester!u@h tester :You are now logged in as tester"),
+            &config,
+            t,
+        );
+        assert!(s
+            .observe(&line(":srv CAP tester NEW :sasl"), &config, t)
+            .is_empty());
     }
 }

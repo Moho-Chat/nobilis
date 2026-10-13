@@ -111,7 +111,11 @@ pub struct Finished {
 /// disagree by whatever the device buffered, and the samples are what a player
 /// will actually find in the file.
 pub fn finish() -> Result<Finished> {
-    let recording = slot().lock().unwrap().take().ok_or_else(|| anyhow::anyhow!("nothing is being recorded"))?;
+    let recording = slot()
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("nothing is being recorded"))?;
     let samples = std::mem::take(&mut *recording.samples.lock().unwrap());
     if samples.is_empty() {
         bail!("the microphone produced no audio");
@@ -121,7 +125,13 @@ pub fn finish() -> Result<Finished> {
     let waveform = base64_of(&waveform_bytes);
     let bytes = oggopus::encode(&samples)?;
     let path = oggopus::write_temp(&bytes)?;
-    Ok(Finished { buffer_id: recording.buffer_id, path, duration_secs, waveform, waveform_bytes })
+    Ok(Finished {
+        buffer_id: recording.buffer_id,
+        path,
+        duration_secs,
+        waveform,
+        waveform_bytes,
+    })
 }
 
 /// Throws the recording away and closes the microphone.

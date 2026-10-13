@@ -27,8 +27,8 @@ use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -80,7 +80,9 @@ pub fn discovery_answer(packet: &[u8]) -> Result<(String, u16)> {
         anyhow::bail!("that is not a discovery answer");
     }
     let end = packet[8..72].iter().position(|b| *b == 0).unwrap_or(64);
-    let address = std::str::from_utf8(&packet[8..8 + end]).context("the address was not text")?.to_string();
+    let address = std::str::from_utf8(&packet[8..8 + end])
+        .context("the address was not text")?
+        .to_string();
     if address.is_empty() {
         anyhow::bail!("the server named no address");
     }
@@ -101,7 +103,9 @@ pub enum Role {
     /// Whose stream is being watched. Needed rather than merely useful: MLS
     /// keys every sender separately, so a frame can only be decrypted by
     /// naming who sent it.
-    Viewer { owner: u64 },
+    Viewer {
+        owner: u64,
+    },
 }
 
 /// A connection that is up, in whichever direction it runs.
@@ -192,7 +196,10 @@ impl StreamSender {
                 let mut sealer = self.sealer.lock().await;
                 sealer.seal(&header, &packet.payload)?
             };
-            self.udp.send(&sealed).await.context("sending a video packet")?;
+            self.udp
+                .send(&sealed)
+                .await
+                .context("sending a video packet")?;
         }
         Ok(())
     }
@@ -224,10 +231,16 @@ impl StreamSender {
                     return;
                 }
             };
-            let mut encoder = match opus2::Encoder::new(48_000, opus2::Channels::Stereo, opus2::Application::Audio) {
+            let mut encoder = match opus2::Encoder::new(
+                48_000,
+                opus2::Channels::Stereo,
+                opus2::Application::Audio,
+            ) {
                 Ok(encoder) => encoder,
                 Err(e) => {
-                    tracing::warn!("discord[{account_id}]: no Opus encoder for the stream's sound: {e:?}");
+                    tracing::warn!(
+                        "discord[{account_id}]: no Opus encoder for the stream's sound: {e:?}"
+                    );
                     return;
                 }
             };
@@ -237,7 +250,8 @@ impl StreamSender {
                 // microphone. Flag 1 is what a voice call sends, and a viewer
                 // does not play a stream's audio marked as that - which is
                 // exactly what the phone's own stream sends, read off the wire.
-                json!({ "op": 5, "d": { "speaking": 2, "delay": 0, "ssrc": self.audio_ssrc } }).to_string(),
+                json!({ "op": 5, "d": { "speaking": 2, "delay": 0, "ssrc": self.audio_ssrc } })
+                    .to_string(),
             ));
             tracing::info!("discord[{account_id}]: the stream is sending sound");
 
@@ -249,9 +263,13 @@ impl StreamSender {
             while self.live.load(Ordering::Relaxed) {
                 tick.tick().await;
                 timestamp = timestamp.wrapping_add(rtp::OPUS_FRAME_SAMPLES as u32);
-                let Some(pcm) = source.take(rtp::OPUS_FRAME_SAMPLES * 2) else { continue };
+                let Some(pcm) = source.take(rtp::OPUS_FRAME_SAMPLES * 2) else {
+                    continue;
+                };
                 let mut opus = vec![0u8; 1275];
-                let Ok(length) = encoder.encode_float(&pcm, &mut opus) else { continue };
+                let Ok(length) = encoder.encode_float(&pcm, &mut opus) else {
+                    continue;
+                };
                 opus.truncate(length);
                 // As for the picture: nothing until the group can read it.
                 let body = {
@@ -320,8 +338,13 @@ pub async fn connect(
     if crate::net::route::router().routed(account_id) {
         anyhow::bail!("calls and screen sharing need UDP, which Tor and SOCKS5 proxies can't carry - turn off Tor for this account to use them");
     }
-    let url = format!("wss://{}/?v={VOICE_VERSION}", endpoint.trim_end_matches(":443"));
-    let (socket, _) = tokio_tungstenite::connect_async(url.as_str()).await.context("opening the stream socket")?;
+    let url = format!(
+        "wss://{}/?v={VOICE_VERSION}",
+        endpoint.trim_end_matches(":443")
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .context("opening the stream socket")?;
     let (mut write, mut read) = socket.split();
 
     tracing::info!(
@@ -389,21 +412,30 @@ pub async fn connect(
             }
             anyhow::bail!("the stream server closed the connection: {said}");
         }
-        let WsMessage::Text(text) = frame else { continue };
-        let message: Value = serde_json::from_str(&text).context("the stream server sent something odd")?;
+        let WsMessage::Text(text) = frame else {
+            continue;
+        };
+        let message: Value =
+            serde_json::from_str(&text).context("the stream server sent something odd")?;
         // Every frame of the handshake, at a level somebody is running with.
         // Four of them, once per stream: saying them costs nothing, and not
         // saying them cost two live attempts that could report only that
         // nothing had arrived.
         saw.push(message["op"].as_u64().unwrap_or(u64::MAX));
-        tracing::info!("discord[{account_id}]: stream op {} {}", message["op"], super::gateway::brief(&message["d"]));
+        tracing::info!(
+            "discord[{account_id}]: stream op {} {}",
+            message["op"],
+            super::gateway::brief(&message["d"])
+        );
         match message["op"].as_u64() {
             // Hello. The heartbeat starts from here rather than after the
             // handshake: a voice gateway expects one from this moment, and a
             // handshake that pauses on a UDP round trip is one the server is
             // entitled to give up on.
             Some(8) => {
-                let interval = message["d"]["heartbeat_interval"].as_f64().unwrap_or(41_250.0);
+                let interval = message["d"]["heartbeat_interval"]
+                    .as_f64()
+                    .unwrap_or(41_250.0);
                 beat_every = std::time::Duration::from_millis(interval.max(500.0) as u64);
             }
             // Ready: our SSRCs, and where to send.
@@ -442,16 +474,27 @@ pub async fn connect(
         // identified as.
         return Err(anyhow!(
             "the stream server never said where to send - it sent {}",
-            if saw.is_empty() { "nothing at all".to_string() } else { format!("op(s) {saw:?}") }
+            if saw.is_empty() {
+                "nothing at all".to_string()
+            } else {
+                format!("op(s) {saw:?}")
+            }
         ));
     }
-    let mode = Mode::negotiate(&modes).ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
+    let mode = Mode::negotiate(&modes)
+        .ok_or_else(|| anyhow!("no encryption mode this client speaks: {modes:?}"))?;
 
     // The UDP session, and the round trip that says how the far side sees us.
-    let udp = UdpSocket::bind("0.0.0.0:0").await.context("opening a socket")?;
+    let udp = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("opening a socket")?;
     widen_receive_buffer(&udp);
-    udp.connect((address.as_str(), port)).await.context("pointing the socket at the stream server")?;
-    udp.send(&discovery_request(ssrc)).await.context("asking how we are seen")?;
+    udp.connect((address.as_str(), port))
+        .await
+        .context("pointing the socket at the stream server")?;
+    udp.send(&discovery_request(ssrc))
+        .await
+        .context("asking how we are seen")?;
     let mut answer = [0u8; 74];
     let read_len = tokio::time::timeout(std::time::Duration::from_secs(5), udp.recv(&mut answer))
         .await
@@ -487,9 +530,15 @@ pub async fn connect(
                 .unwrap_or_else(|| "with no reason given".to_string());
             anyhow::bail!("the stream server closed after being told how to reach us: {said}");
         }
-        let WsMessage::Text(text) = frame else { continue };
+        let WsMessage::Text(text) = frame else {
+            continue;
+        };
         let message: Value = serde_json::from_str(&text).unwrap_or_default();
-        tracing::info!("discord[{account_id}]: stream op {} {}", message["op"], super::gateway::brief(&message["d"]));
+        tracing::info!(
+            "discord[{account_id}]: stream op {} {}",
+            message["op"],
+            super::gateway::brief(&message["d"])
+        );
         if message["op"].as_u64() == Some(4) {
             key = message["d"]["secret_key"]
                 .as_array()
@@ -510,7 +559,11 @@ pub async fn connect(
     // The group this stream's media belongs to. Built from the stream's own
     // channel rather than the conversation's: a Go Live session is its own
     // group, and naming the wrong channel builds one nobody else is in.
-    let dave = Arc::new(Mutex::new(super::dave::Dave::new(dave_version, user_id, rtc_channel_id)?));
+    let dave = Arc::new(Mutex::new(super::dave::Dave::new(
+        dave_version,
+        user_id,
+        rtc_channel_id,
+    )?));
     if let Some(package) = {
         let mut held = dave.lock().await;
         match held.as_mut() {
@@ -523,7 +576,10 @@ pub async fn connect(
             package.len()
         );
         write
-            .send(WsMessage::Binary(super::dave::write_binary(super::dave::OP_KEY_PACKAGE, &package)))
+            .send(WsMessage::Binary(super::dave::write_binary(
+                super::dave::OP_KEY_PACKAGE,
+                &package,
+            )))
             .await
             .context("sending the key package")?;
     }
@@ -719,15 +775,23 @@ async fn note_senders(
     senders: &Arc<Mutex<HashMap<u32, u64>>>,
     resends: &Arc<Mutex<HashMap<u32, u32>>>,
 ) {
-    let WsMessage::Text(text) = incoming else { return };
-    let Ok(message) = serde_json::from_str::<Value>(text) else { return };
+    let WsMessage::Text(text) = incoming else {
+        return;
+    };
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return;
+    };
     if message["op"].as_u64() != Some(12) {
         return;
     }
     let d = &message["d"];
     // Discord writes ids as strings everywhere else and as numbers here, so
     // both are read rather than the one that happened to arrive first.
-    let Some(user) = d["user_id"].as_str().and_then(|s| s.parse::<u64>().ok()).or_else(|| d["user_id"].as_u64()) else {
+    let Some(user) = d["user_id"]
+        .as_str()
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| d["user_id"].as_u64())
+    else {
         return;
     };
     resends.lock().await.extend(videorx::rtx_pairs(d));
@@ -803,14 +867,17 @@ async fn watch_socket(
 
     tracing::info!("discord[{account_id}]: watching {stream_key}, owned by {owner}");
     while live.load(Ordering::Relaxed) {
-        let read = tokio::time::timeout(std::time::Duration::from_secs(30), udp.recv(&mut buffer)).await;
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(30), udp.recv(&mut buffer)).await;
         let length = match read {
             Ok(Ok(length)) => length,
             // Not an error worth ending on by itself: a paused stream sends
             // nothing, and the websocket is what says whether it is still
             // there.
             Err(_) => {
-                tracing::debug!("discord[{account_id}]: nothing on {stream_key} for thirty seconds");
+                tracing::debug!(
+                    "discord[{account_id}]: nothing on {stream_key} for thirty seconds"
+                );
                 continue;
             }
             Ok(Err(e)) => {
@@ -821,7 +888,11 @@ async fn watch_socket(
         let datagram = &buffer[..length];
         if seen < 3 {
             seen += 1;
-            let head: String = datagram.iter().take(24).map(|b| format!("{b:02x}")).collect();
+            let head: String = datagram
+                .iter()
+                .take(24)
+                .map(|b| format!("{b:02x}"))
+                .collect();
             tracing::info!(
                 "discord[{account_id}]: datagram {seen} on {stream_key}: {length} bytes, first 24: {head}"
             );
@@ -841,7 +912,9 @@ async fn watch_socket(
         // is indistinguishable, from the outside, from no stream at all.
         *types.entry(parsed.payload_type).or_insert(0u64) += 1;
         *sources.entry(parsed.ssrc).or_insert(0u64) += 1;
-        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8 && parsed.payload_type != videorx::PAYLOAD_TYPE_RTX {
+        if parsed.payload_type != rtp::PAYLOAD_TYPE_VP8
+            && parsed.payload_type != videorx::PAYLOAD_TYPE_RTX
+        {
             continue;
         }
         // Discord's own rule for where the clear header ends, the same one a
@@ -853,19 +926,22 @@ async fn watch_socket(
             unopened += 1;
             continue;
         };
-        let (video_ssrc, sequence, payload, resent) = if parsed.payload_type == videorx::PAYLOAD_TYPE_RTX {
-            let known = resends.lock().await.get(&parsed.ssrc).copied();
-            let Some(media) = known.or_else(|| {
-                let guess = parsed.ssrc.wrapping_sub(1);
-                pictures.contains_key(&guess).then_some(guess)
-            }) else {
-                continue;
+        let (video_ssrc, sequence, payload, resent) =
+            if parsed.payload_type == videorx::PAYLOAD_TYPE_RTX {
+                let known = resends.lock().await.get(&parsed.ssrc).copied();
+                let Some(media) = known.or_else(|| {
+                    let guess = parsed.ssrc.wrapping_sub(1);
+                    pictures.contains_key(&guess).then_some(guess)
+                }) else {
+                    continue;
+                };
+                let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else {
+                    continue;
+                };
+                (media, sequence, original, true)
+            } else {
+                (parsed.ssrc, parsed.sequence, payload, false)
             };
-            let Some((sequence, original)) = videorx::unwrap_rtx(&payload) else { continue };
-            (media, sequence, original, true)
-        } else {
-            (parsed.ssrc, parsed.sequence, payload, false)
-        };
         let now = std::time::Instant::now();
         let picture_rx = pictures.entry(video_ssrc).or_default();
         let whole = picture_rx.push(
@@ -888,7 +964,12 @@ async fn watch_socket(
             // Whoever the server said owns this SSRC, and the stream's owner
             // if it has not said yet - which is right for a viewer
             // connection, since it carries one person's stream.
-            let from = senders.lock().await.get(&video_ssrc).copied().unwrap_or(owner);
+            let from = senders
+                .lock()
+                .await
+                .get(&video_ssrc)
+                .copied()
+                .unwrap_or(owner);
             let picture = {
                 let mut held = dave.lock().await;
                 match held.as_mut() {
@@ -903,7 +984,9 @@ async fn watch_socket(
                 }
             };
             let keyframe = super::reassemble::is_keyframe(&picture);
-            let Some(picture_rx) = pictures.get_mut(&video_ssrc) else { continue };
+            let Some(picture_rx) = pictures.get_mut(&video_ssrc) else {
+                continue;
+            };
             let first = picture_rx.stats.frames == 0;
             let admitted = picture_rx.admit(&frame, keyframe);
             if picture_rx.wants_keyframe(now) {
@@ -937,7 +1020,10 @@ async fn watch_socket(
         }
     }
     for (source, picture_rx) in &pictures {
-        tracing::info!("discord[{account_id}]: {stream_key}: picture on {source}: {:?}", picture_rx.stats);
+        tracing::info!(
+            "discord[{account_id}]: {stream_key}: picture on {source}: {:?}",
+            picture_rx.stats
+        );
     }
     let mut by_type: Vec<_> = types.into_iter().collect();
     by_type.sort();
@@ -961,7 +1047,9 @@ async fn watch_socket(
 /// this client had lost ground it has not lost.
 fn note_sequence(incoming: &WsMessage, seq_ack: &Arc<AtomicU32>) {
     let seq = match incoming {
-        WsMessage::Binary(bytes) if bytes.len() >= 2 => u32::from(u16::from_be_bytes([bytes[0], bytes[1]])),
+        WsMessage::Binary(bytes) if bytes.len() >= 2 => {
+            u32::from(u16::from_be_bytes([bytes[0], bytes[1]]))
+        }
         WsMessage::Text(text) => match serde_json::from_str::<Value>(text) {
             Ok(message) => match message["seq"].as_u64() {
                 Some(seq) => seq as u32,
@@ -1032,7 +1120,9 @@ async fn answer_dave(
         Reply::Nothing => None,
         Reply::Binary(opcode, payload) => {
             tracing::debug!("discord[{account_id}]: DAVE answering with binary op {opcode}");
-            Some(WsMessage::Binary(super::dave::write_binary(opcode, &payload)))
+            Some(WsMessage::Binary(super::dave::write_binary(
+                opcode, &payload,
+            )))
         }
         Reply::Json(value) => {
             tracing::debug!("discord[{account_id}]: DAVE answering with {}", value["op"]);
@@ -1055,7 +1145,10 @@ mod tests {
         assert_eq!(&packet[0..2], &[0, 1], "type 1 is a request");
         assert_eq!(&packet[2..4], &[0, 70], "the length counts what follows it");
         assert_eq!(&packet[4..8], &[0xDE, 0xAD, 0xBE, 0xEF]);
-        assert!(packet[8..].iter().all(|b| *b == 0), "the rest is for the server to fill in");
+        assert!(
+            packet[8..].iter().all(|b| *b == 0),
+            "the rest is for the server to fill in"
+        );
     }
 
     /// The address is a C string in a 64-byte field. Trimming instead of

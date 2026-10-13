@@ -14,17 +14,27 @@ pub(super) const MAX_WS_REDIRECTS: usize = 3;
 /// proxy silently drops the upgrade instead of completing or rejecting it
 /// (confirmed live: omitting it just hangs forever with no error at all).
 /// Ported from sneedchat-rs's `chat/socket.rs::connect`.
-pub(super) async fn open_chat_websocket(transport: &Transport, host: &str, cookie_header: &str) -> Result<WebSocketStream<BoxStream>> {
+pub(super) async fn open_chat_websocket(
+    transport: &Transport,
+    host: &str,
+    cookie_header: &str,
+) -> Result<WebSocketStream<BoxStream>> {
     let mut url = format!("wss://{host}/chat.ws");
     let origin = format!("https://{host}");
 
     for _ in 0..=MAX_WS_REDIRECTS {
         let parsed = url::Url::parse(&url).with_context(|| format!("parsing {url}"))?;
-        let host = parsed.host_str().with_context(|| format!("{url} has no host"))?.to_string();
+        let host = parsed
+            .host_str()
+            .with_context(|| format!("{url} has no host"))?
+            .to_string();
         let tls = matches!(parsed.scheme(), "wss" | "https");
         let port = parsed.port().unwrap_or(if tls { 443 } else { 80 });
 
-        let stream = transport.connect(&host, port, tls).await.context("opening chat websocket transport")?;
+        let stream = transport
+            .connect(&host, port, tls)
+            .await
+            .context("opening chat websocket transport")?;
         let mut request = url.as_str().into_client_request()?;
         let headers = request.headers_mut();
         headers.insert("User-Agent", HeaderValue::from_str(DEFAULT_USER_AGENT)?);
@@ -33,7 +43,10 @@ pub(super) async fn open_chat_websocket(transport: &Transport, host: &str, cooki
         // completes (or rejects) the upgrade at all.
         headers.insert("Origin", HeaderValue::from_str(&origin)?);
         if !cookie_header.is_empty() {
-            headers.insert("Cookie", HeaderValue::from_str(cookie_header).context("cookie header")?);
+            headers.insert(
+                "Cookie",
+                HeaderValue::from_str(cookie_header).context("cookie header")?,
+            );
         }
 
         match tokio_tungstenite::client_async(request, stream).await {
@@ -43,7 +56,11 @@ pub(super) async fn open_chat_websocket(transport: &Transport, host: &str, cooki
                 if status.as_u16() == pow::GATE_STATUS {
                     bail!("blocked by the anti-bot gate during the chat handshake");
                 }
-                let location = resp.headers().get(hyper::header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+                let location = resp
+                    .headers()
+                    .get(hyper::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
                 match (status.is_redirection(), location) {
                     (true, Some(loc)) => {
                         url = resolve_ws_redirect(&url, &loc)?;
@@ -69,7 +86,8 @@ pub(super) fn resolve_ws_redirect(base: &str, location: &str) -> Result<String> 
         _ => None,
     };
     if let Some(s) = scheme {
-        out.set_scheme(s).map_err(|_| anyhow!("could not rewrite scheme of {joined}"))?;
+        out.set_scheme(s)
+            .map_err(|_| anyhow!("could not rewrite scheme of {joined}"))?;
     }
     Ok(out.to_string())
 }
@@ -98,12 +116,29 @@ pub(super) async fn run_room(
     // The room is on screen before it is joined, saying so, rather than
     // appearing only once its socket is up - a room that cannot connect at
     // all was otherwise simply absent, with nothing to say why.
-    let buffer_id = state.runtime.ensure_buffer(state, account_id, &room_buffer_name(&room.name), "channel").id;
-    state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
+    let buffer_id = state
+        .runtime
+        .ensure_buffer(state, account_id, &room_buffer_name(&room.name), "channel")
+        .id;
+    state.runtime.set_buffer_link(
+        state,
+        &buffer_id,
+        Some(crate::model::BufferLink::connecting()),
+    );
     let mut failures = 0u32;
     loop {
         let started = std::time::Instant::now();
-        let result = std::panic::AssertUnwindSafe(run_room_once(state, transport, session, account_id, host, room, &whisper_room)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(run_room_once(
+            state,
+            transport,
+            session,
+            account_id,
+            host,
+            room,
+            &whisper_room,
+        ))
+        .catch_unwind()
+        .await;
         // A connection that lasted a while and then dropped is a new run of
         // trouble, not the next failure in one.
         if started.elapsed() > ROOM_RECONNECT_MAX_DELAY {
@@ -114,26 +149,43 @@ pub(super) async fn run_room(
             // Once is a blip - a socket dropped after hours, the next attempt
             // a few seconds away. Saying "the chat is down" over that would
             // be wrong far more often than right.
-            state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::connecting()));
+            state.runtime.set_buffer_link(
+                state,
+                &buffer_id,
+                Some(crate::model::BufferLink::connecting()),
+            );
         } else {
             // Twice running: ask which part is down - Tor, the forum, or only
             // the chat - so the room can say so while it waits. See health.rs.
             let outage = super::health::diagnose(account_id, transport, host).await;
-            state.runtime.set_buffer_link(state, &buffer_id, Some(outage.link(host)));
+            state
+                .runtime
+                .set_buffer_link(state, &buffer_id, Some(outage.link(host)));
         }
         match result {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                tracing::warn!("sneedchat[{account_id}] room {} ({}): {e:#}", room.id, room.name);
+                tracing::warn!(
+                    "sneedchat[{account_id}] room {} ({}): {e:#}",
+                    room.id,
+                    room.name
+                );
                 // A stale session is the most likely reason one specific
                 // room starts failing while the others keep working -
                 // refresh before retrying rather than hammering the same
                 // rejected cookies every backoff cycle.
                 if let Err(re) = session.refresh(creds, two_factor).await {
-                    tracing::warn!("sneedchat[{account_id}] room {}: session refresh failed: {re:#}", room.id);
+                    tracing::warn!(
+                        "sneedchat[{account_id}] room {}: session refresh failed: {re:#}",
+                        room.id
+                    );
                 }
             }
-            Err(_) => tracing::error!("sneedchat[{account_id}] room {} ({}): task panicked", room.id, room.name),
+            Err(_) => tracing::error!(
+                "sneedchat[{account_id}] room {} ({}): task panicked",
+                room.id,
+                room.name
+            ),
         }
         // No cleanup call here - run_room_once's own RemoveSenderOnDrop
         // guard already ran (on every return path, including a panic) by
@@ -175,7 +227,9 @@ pub(super) async fn run_room_once(
     }
     let _forwarder_guard = AbortOnDrop(forwarder);
 
-    state.runtime.insert_sneedchat_sender(account_id, room.id, out_tx.clone());
+    state
+        .runtime
+        .insert_sneedchat_sender(account_id, room.id, out_tx.clone());
     struct RemoveSenderOnDrop<'a> {
         state: &'a AppState,
         account_id: &'a str,
@@ -184,23 +238,41 @@ pub(super) async fn run_room_once(
     }
     impl Drop for RemoveSenderOnDrop<'_> {
         fn drop(&mut self) {
-            self.state.runtime.remove_sneedchat_sender(self.account_id, self.room, &self.sender);
+            self.state
+                .runtime
+                .remove_sneedchat_sender(self.account_id, self.room, &self.sender);
         }
     }
-    let _sender_guard = RemoveSenderOnDrop { state, account_id, room: room.id, sender: out_tx.clone() };
+    let _sender_guard = RemoveSenderOnDrop {
+        state,
+        account_id,
+        room: room.id,
+        sender: out_tx.clone(),
+    };
 
-    out_tx.send(format!("/join {}", room.id)).map_err(|_| anyhow!("chat socket closed before joining"))?;
+    out_tx
+        .send(format!("/join {}", room.id))
+        .map_err(|_| anyhow!("chat socket closed before joining"))?;
     let buffer_name = room_buffer_name(&room.name);
     // Created eagerly rather than waiting for the first live message - a
     // quiet room would otherwise show no buffer/tab at all despite being
     // connected and joined.
-    let joined = state.runtime.ensure_buffer(state, account_id, &buffer_name, "channel");
+    let joined = state
+        .runtime
+        .ensure_buffer(state, account_id, &buffer_name, "channel");
     state.runtime.set_buffer_link(state, &joined.id, None);
     super::health::recovered(account_id);
     // The server follows a join with the room's whole roster, so anything left
     // from a previous connection would only be stale.
-    state.runtime.set_presence(&crate::model::buffer_id(account_id, &buffer_name), serde_json::json!([]));
-    tracing::info!("sneedchat[{account_id}]: joined room {} ({})", room.id, room.name);
+    state.runtime.set_presence(
+        &crate::model::buffer_id(account_id, &buffer_name),
+        serde_json::json!([]),
+    );
+    tracing::info!(
+        "sneedchat[{account_id}]: joined room {} ({})",
+        room.id,
+        room.name
+    );
 
     loop {
         // Bounded, not a bare `.await` - a Tor circuit that's gone quietly
@@ -217,12 +289,24 @@ pub(super) async fn run_room_once(
             Ok(Some(Ok(_))) => continue,
             Ok(Some(Err(e))) => bail!("websocket error: {e}"),
             Ok(None) => bail!("connection ended unexpectedly"),
-            Err(_) => bail!("no activity for {}s, assuming the connection is dead", IDLE_TIMEOUT.as_secs()),
+            Err(_) => bail!(
+                "no activity for {}s, assuming the connection is dead",
+                IDLE_TIMEOUT.as_secs()
+            ),
         };
         // Asked per frame rather than fixed at the start: the room that
         // records whispers changes when another room is opened or closed.
         let records_whispers = whisper_room.load(std::sync::atomic::Ordering::Relaxed) == room.id;
-        handle_frame(state, &session.http, host, account_id, &buffer_name, records_whispers, &frame).await?;
+        handle_frame(
+            state,
+            &session.http,
+            host,
+            account_id,
+            &buffer_name,
+            records_whispers,
+            &frame,
+        )
+        .await?;
     }
 }
 
@@ -233,11 +317,27 @@ pub(super) async fn run_room_once(
 /// stalled connection, not a quiet room.
 pub(super) const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host: &str, account_id: &str, buffer_name: &str, is_primary: bool, frame: &str) -> Result<()> {
+pub(super) async fn handle_frame(
+    state: &AppState,
+    http: &http::HttpClient,
+    host: &str,
+    account_id: &str,
+    buffer_name: &str,
+    is_primary: bool,
+    frame: &str,
+) -> Result<()> {
     let resp = protocol::ServerResponse::parse(frame);
 
     if !resp.users_joined.is_empty() || !resp.users_left.is_empty() {
-        update_roster(state, http, host, account_id, buffer_name, &resp.users_joined, &resp.users_left);
+        update_roster(
+            state,
+            http,
+            host,
+            account_id,
+            buffer_name,
+            &resp.users_joined,
+            &resp.users_left,
+        );
     }
 
     if let Some(text) = &resp.plaintext {
@@ -286,11 +386,14 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
 
     for m in &resp.messages {
         if m.is_deleted() {
-            state.runtime.delete_message(state, &buffer_id, &m.message_uuid);
+            state
+                .runtime
+                .delete_message(state, &buffer_id, &m.message_uuid);
             continue;
         }
         // The short `/attachments/...` form, written out in full so it embeds.
-        let body = expand_attachment_paths(&protocol::unescape_html(&m.message_raw), host).into_owned();
+        let body =
+            expand_attachment_paths(&protocol::unescape_html(&m.message_raw), host).into_owned();
         if body.is_empty() {
             continue;
         }
@@ -305,21 +408,49 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
         // actually stored (e.g. this is the first time we've ever seen it,
         // and it just happens to already carry prior edit history) does
         // it fall through to being recorded as an ordinary new message.
-        if m.message_edit_date > 0 && !m.message_uuid.is_empty() && state.runtime.update_message(state, &buffer_id, &m.message_uuid, &body, &[], &[]) {
+        if m.message_edit_date > 0
+            && !m.message_uuid.is_empty()
+            && state
+                .runtime
+                .update_message(state, &buffer_id, &m.message_uuid, &body, &[], &[])
+        {
             continue;
         }
         // Always attributed to the room this specific connection is
         // joined to, rather than trusting the wire's own room_id - this
         // connection should only ever see traffic for its own room anyway.
         let msg_id = (!m.message_uuid.is_empty()).then(|| m.message_uuid.clone());
-        let is_new = state.runtime.record_message(state, account_id, buffer_name, "channel", &m.author.username, &body, false, "chat", None, msg_id, false, avatar_url, Vec::new(), Vec::new(), None);
+        let is_new = state.runtime.record_message(
+            state,
+            account_id,
+            buffer_name,
+            "channel",
+            &m.author.username,
+            &body,
+            false,
+            "chat",
+            None,
+            msg_id,
+            false,
+            avatar_url,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
         // Only for messages with a real, stable id - nothing to re-target
         // a later body-patch at otherwise (see spawn_attachment_resolve) -
         // and only for ones not seen before. A reconnect replays the room's
         // recent history, and looking every attachment in it up again is a
         // request per message, over Tor, for answers already on disk.
         if is_new && !m.message_uuid.is_empty() {
-            spawn_attachment_resolve(state.clone(), http.clone(), host, buffer_id.clone(), m.message_uuid.clone(), body);
+            spawn_attachment_resolve(
+                state.clone(),
+                http.clone(),
+                host,
+                buffer_id.clone(),
+                m.message_uuid.clone(),
+                body,
+            );
         }
     }
     // Cleared unconditionally rather than only when it was set: nothing above
@@ -335,20 +466,37 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
     // again, and a room whose connection drops twice an hour would otherwise
     // fill with copies of the same announcement.
     if let Some(motd) = &resp.motd {
-        if state.runtime.take_new_sneedchat_motd(account_id, buffer_name, motd) {
+        if state
+            .runtime
+            .take_new_sneedchat_motd(account_id, buffer_name, motd)
+        {
             state.runtime.record_message(
                 // "system" rather than "topic": a topic line is filtered by the
                 // setting that hides IRC topic changes, and a room's own
                 // announcement is not an IRC topic change.
-                state, account_id, buffer_name, "channel", "", motd, false, "system", None, None, false, None,
-                Vec::new(), Vec::new(), None,
+                state,
+                account_id,
+                buffer_name,
+                "channel",
+                "",
+                motd,
+                false,
+                "system",
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
             );
         }
     }
 
     if is_primary {
         if let Some(w) = &resp.whisper {
-            let body = expand_attachment_paths(&protocol::unescape_html(&w.message_raw), host).into_owned();
+            let body = expand_attachment_paths(&protocol::unescape_html(&w.message_raw), host)
+                .into_owned();
             // The site echoes our own whisper back to us, which is worth
             // knowing rather than working around: it means a whisper we sent
             // arrives twice, once from `send_whisper` recording it locally and
@@ -367,9 +515,25 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
                     None => None,
                 };
                 let msg_id = (!w.message_uuid.is_empty()).then(|| w.message_uuid.clone());
-                for buffer in record_whisper(state, account_id, &w.author.username, &body, msg_id, avatar_url, true, None) {
+                for buffer in record_whisper(
+                    state,
+                    account_id,
+                    &w.author.username,
+                    &body,
+                    msg_id,
+                    avatar_url,
+                    true,
+                    None,
+                ) {
                     if !w.message_uuid.is_empty() {
-                        spawn_attachment_resolve(state.clone(), http.clone(), host, buffer, w.message_uuid.clone(), body.clone());
+                        spawn_attachment_resolve(
+                            state.clone(),
+                            http.clone(),
+                            host,
+                            buffer,
+                            w.message_uuid.clone(),
+                            body.clone(),
+                        );
                     }
                 }
             }
@@ -389,8 +553,14 @@ pub(super) async fn handle_frame(state: &AppState, http: &http::HttpClient, host
 /// differ only in case, which cannot happen because the site's names are
 /// unique without it.
 pub(super) fn is_own_name(state: &AppState, account_id: &str, name: &str) -> bool {
-    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return false };
-    name_matches(cfg.display_name.as_deref().unwrap_or_default(), &cfg.username, name)
+    let Some(cfg) = state.accounts.get_sneedchat(account_id) else {
+        return false;
+    };
+    name_matches(
+        cfg.display_name.as_deref().unwrap_or_default(),
+        &cfg.username,
+        name,
+    )
 }
 
 pub(super) fn name_matches(display_name: &str, username: &str, candidate: &str) -> bool {
@@ -435,7 +605,9 @@ pub(super) fn record_whisper(
     // particular and has to be visible wherever the reader is.
     only: Option<&str>,
 ) -> Vec<String> {
-    let Some(cfg) = state.accounts.get_sneedchat(account_id) else { return Vec::new() };
+    let Some(cfg) = state.accounts.get_sneedchat(account_id) else {
+        return Vec::new();
+    };
     let mut fresh = Vec::new();
     let rooms: Vec<SneedChatRoom> = match only {
         Some(buffer_name) => {

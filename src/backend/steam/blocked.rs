@@ -25,7 +25,11 @@ pub fn snapshot(roster: &Roster) -> Value {
 }
 
 pub fn held(account_id: &str) -> Value {
-    HELD.lock().unwrap().get(account_id).cloned().unwrap_or_else(|| json!([]))
+    HELD.lock()
+        .unwrap()
+        .get(account_id)
+        .cloned()
+        .unwrap_or_else(|| json!([]))
 }
 
 pub fn clear(account_id: &str) {
@@ -37,12 +41,16 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
     let now = snapshot(roster);
     {
         let mut all = HELD.lock().unwrap();
-        if all.get(account_id) == Some(&now) || (now == json!([]) && !all.contains_key(account_id)) {
+        if all.get(account_id) == Some(&now) || (now == json!([]) && !all.contains_key(account_id))
+        {
             return;
         }
         all.insert(account_id.to_string(), now.clone());
     }
-    state.events.emit("steamBlocked", json!({ "accountId": account_id, "blocked": now }));
+    state.events.emit(
+        "steamBlocked",
+        json!({ "accountId": account_id, "blocked": now }),
+    );
 }
 
 #[cfg(test)]
@@ -55,14 +63,33 @@ mod tests {
         let mut roster = Roster::default();
         roster.apply_friends_list(&ClientFriendsList {
             friends: vec![
-                FriendsListEntry { ulfriendid: Some(steamid::steamid_of(100)), efriendrelationship: Some(1) },
-                FriendsListEntry { ulfriendid: Some(steamid::steamid_of(200)), efriendrelationship: Some(3) },
-                FriendsListEntry { ulfriendid: Some(steamid::steamid_of(300)), efriendrelationship: Some(6) },
+                FriendsListEntry {
+                    ulfriendid: Some(steamid::steamid_of(100)),
+                    efriendrelationship: Some(1),
+                },
+                FriendsListEntry {
+                    ulfriendid: Some(steamid::steamid_of(200)),
+                    efriendrelationship: Some(3),
+                },
+                FriendsListEntry {
+                    ulfriendid: Some(steamid::steamid_of(300)),
+                    efriendrelationship: Some(6),
+                },
             ],
             ..Default::default()
         });
-        assert_eq!(snapshot(&roster), json!([{ "steamid": steamid::text_of(100), "name": steamid::text_of(100) }, { "steamid": steamid::text_of(300), "name": steamid::text_of(300) }]));
-        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(100)), player_name: Some("Spammer".into()), ..Default::default() }], ..Default::default() });
+        assert_eq!(
+            snapshot(&roster),
+            json!([{ "steamid": steamid::text_of(100), "name": steamid::text_of(100) }, { "steamid": steamid::text_of(300), "name": steamid::text_of(300) }])
+        );
+        roster.apply_persona(&ClientPersonaState {
+            friends: vec![PersonaFriend {
+                friendid: Some(steamid::steamid_of(100)),
+                player_name: Some("Spammer".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
         assert_eq!(snapshot(&roster)[0]["name"], "Spammer");
     }
 
@@ -73,7 +100,13 @@ mod tests {
         let mut roster = Roster::default();
         publish(&state, "steam:blocked-test", &roster);
         assert!(rx.try_recv().is_err(), "nobody blocked, nothing to say");
-        roster.apply_friends_list(&ClientFriendsList { friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(100)), efriendrelationship: Some(1) }], ..Default::default() });
+        roster.apply_friends_list(&ClientFriendsList {
+            friends: vec![FriendsListEntry {
+                ulfriendid: Some(steamid::steamid_of(100)),
+                efriendrelationship: Some(1),
+            }],
+            ..Default::default()
+        });
         publish(&state, "steam:blocked-test", &roster);
         publish(&state, "steam:blocked-test", &roster);
         let mut told = 0;

@@ -29,7 +29,13 @@ use anyhow::bail;
 /// blocking them. A server that filters them out of sync is doing the same
 /// thing from its end; this client honours the list either way, since not
 /// every homeserver does.
-pub(super) async fn fetch_ignored_users(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str, user_id: &str) {
+pub(super) async fn fetch_ignored_users(
+    state: &AppState,
+    account_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+    user_id: &str,
+) {
     let base = homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/user/{}/account_data/m.ignored_user_list",
@@ -63,20 +69,29 @@ pub fn apply_ignored_users(state: &AppState, account_id: &str, content: &Value) 
 /// The list is read back from the server first for the same reason pinning is:
 /// this is a whole-map replacement, and writing a stale copy would un-ignore
 /// whoever was added from another client since this one last looked.
-pub async fn set_ignored_user(state: &AppState, account_id: &str, user_id: &str, ignored: bool) -> Result<()> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+pub async fn set_ignored_user(
+    state: &AppState,
+    account_id: &str,
+    user_id: &str,
+    ignored: bool,
+) -> Result<()> {
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let url = format!(
         "{base}/_matrix/client/v3/user/{}/account_data/m.ignored_user_list",
         url::form_urlencoded::byte_serialize(account.user_id.as_bytes()).collect::<String>()
     );
-    let mut users: std::collections::BTreeMap<String, Value> = match http::get_json(&url, &account.access_token).await {
-        Ok(content) => content["ignored_users"]
-            .as_object()
-            .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-            .unwrap_or_default(),
-        Err(_) => Default::default(),
-    };
+    let mut users: std::collections::BTreeMap<String, Value> =
+        match http::get_json(&url, &account.access_token).await {
+            Ok(content) => content["ignored_users"]
+                .as_object()
+                .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        };
     if ignored {
         // The value is an empty object by spec - the key is the whole
         // statement.
@@ -85,22 +100,40 @@ pub async fn set_ignored_user(state: &AppState, account_id: &str, user_id: &str,
         users.remove(user_id);
     }
     let content = serde_json::json!({ "ignored_users": users });
-    http::put_json(&url, &account.access_token, content.clone()).await.context("writing the ignore list")?;
+    http::put_json(&url, &account.access_token, content.clone())
+        .await
+        .context("writing the ignore list")?;
     apply_ignored_users(state, account_id, &content);
     Ok(())
 }
 
-pub(super) async fn fetch_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) {
+pub(super) async fn fetch_push_rules(
+    state: &AppState,
+    account_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+) {
     if let Err(e) = read_push_rules(state, account_id, homeserver_url, access_token).await {
         tracing::debug!("matrix[{account_id}]: reading push rules: {e:#}");
     }
 }
 
 /// Reads the account's push rules and keeps them, saying so if it cannot.
-async fn read_push_rules(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) -> Result<Value> {
+async fn read_push_rules(
+    state: &AppState,
+    account_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+) -> Result<Value> {
     let base = homeserver_url.trim_end_matches('/');
-    let rules = http::get_json(&format!("{base}/_matrix/client/v3/pushrules/"), access_token).await?;
-    state.runtime.set_matrix_push_rules(account_id, rules.clone());
+    let rules = http::get_json(
+        &format!("{base}/_matrix/client/v3/pushrules/"),
+        access_token,
+    )
+    .await?;
+    state
+        .runtime
+        .set_matrix_push_rules(account_id, rules.clone());
     Ok(rules)
 }
 
@@ -110,9 +143,20 @@ async fn read_push_rules(state: &AppState, account_id: &str, homeserver_url: &st
 /// Muting only locally was the old behaviour and is still what the client
 /// does for services with no such idea; on Matrix the account itself can hold
 /// the answer, so it should.
-pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str, muted: bool) -> Result<()> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no known Matrix room for this buffer")?;
+pub async fn set_room_muted(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    muted: bool,
+) -> Result<()> {
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no known Matrix room for this buffer")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     let url = format!("{base}/_matrix/client/v3/pushrules/global/room/{encoded}");
@@ -122,7 +166,13 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
         // nothing"; `dont_notify` is the older word for it and servers still
         // accept both. The new one is sent, since that is what a current
         // client reading it back expects to find.
-        http::put_json(&url, &account.access_token, serde_json::json!({ "actions": [] })).await.context("muting the room")?;
+        http::put_json(
+            &url,
+            &account.access_token,
+            serde_json::json!({ "actions": [] }),
+        )
+        .await
+        .context("muting the room")?;
     } else {
         // Both kinds that can hold a mute, whichever client made it: this one
         // writes a room rule, Element an override rule named for the room. One
@@ -142,20 +192,32 @@ pub async fn set_room_muted(state: &AppState, account_id: &str, buffer_id: &str,
     // old answer, and "it worked" with the room unchanged is the worst thing
     // this could report. So the rules are read again, and the room is judged by
     // them; if they do not agree with what was asked, that is the answer.
-    let rules = read_push_rules(state, account_id, &account.homeserver_url, &account.access_token)
-        .await
-        .context("the change was sent, but the server's rules could not be read back to check it")?;
+    let rules = read_push_rules(
+        state,
+        account_id,
+        &account.homeserver_url,
+        &account.access_token,
+    )
+    .await
+    .context("the change was sent, but the server's rules could not be read back to check it")?;
     let (now_muted, _) = push_rule_verdict(&rules, &room_id, "");
     // Whatever the answer, the room is shown as the server has it.
     state.runtime.set_silenced(state, buffer_id, now_muted);
     if now_muted != muted {
         let remaining = silencing_rules(&rules, &room_id);
         if muted {
-            bail!("the server accepted the mute but does not list it - it is not muted on {}", account.homeserver_url);
+            bail!(
+                "the server accepted the mute but does not list it - it is not muted on {}",
+                account.homeserver_url
+            );
         }
         bail!(
             "the server did not take the mute off: it still lists {}",
-            if remaining.is_empty() { "a rule silencing this room".to_string() } else { remaining.join(", ") }
+            if remaining.is_empty() {
+                "a rule silencing this room".to_string()
+            } else {
+                remaining.join(", ")
+            }
         );
     }
     Ok(())
@@ -172,8 +234,16 @@ fn silencing_rules(rules: &Value, room_id: &str) -> Vec<String> {
                 .into_iter()
                 .flatten()
                 .filter(|rule| rule["rule_id"].as_str() == Some(room_id))
-                .filter(|rule| rule["enabled"].as_bool().unwrap_or(true) && silences(&rule["actions"]))
-                .map(move |_| if *kind == "room" { "a room rule for it".to_string() } else { "an override rule for it".to_string() })
+                .filter(|rule| {
+                    rule["enabled"].as_bool().unwrap_or(true) && silences(&rule["actions"])
+                })
+                .map(move |_| {
+                    if *kind == "room" {
+                        "a room rule for it".to_string()
+                    } else {
+                        "an override rule for it".to_string()
+                    }
+                })
         })
         .collect()
 }
@@ -237,7 +307,9 @@ pub(super) fn notices_are_suppressed(rules: &Value) -> bool {
 /// Both spellings: the old `dont_notify` action, and the newer form where an
 /// empty action list means the same thing.
 pub(super) fn silences(actions: &Value) -> bool {
-    let Some(actions) = actions.as_array() else { return false };
+    let Some(actions) = actions.as_array() else {
+        return false;
+    };
     actions.is_empty() || actions.iter().any(|a| a.as_str() == Some("dont_notify"))
 }
 
@@ -257,7 +329,8 @@ pub(super) fn matches_keyword(body: &str, pattern: &str) -> bool {
         }
         return true;
     }
-    body.split(|c: char| !c.is_alphanumeric()).any(|word| word == pattern)
+    body.split(|c: char| !c.is_alphanumeric())
+        .any(|word| word == pattern)
 }
 
 #[cfg(test)]
@@ -272,7 +345,13 @@ mod push_rule_tests {
             "room": [{ "rule_id": "!q:x", "actions": [] }],
             "override": [{ "rule_id": "!q:x", "actions": ["dont_notify"] }, { "rule_id": "!other:x", "actions": [] }]
         } });
-        assert_eq!(silencing_rules(&rules, "!q:x"), vec!["a room rule for it".to_string(), "an override rule for it".to_string()]);
+        assert_eq!(
+            silencing_rules(&rules, "!q:x"),
+            vec![
+                "a room rule for it".to_string(),
+                "an override rule for it".to_string()
+            ]
+        );
         assert!(silencing_rules(&rules, "!none:x").is_empty());
     }
 
@@ -297,7 +376,8 @@ mod push_rule_tests {
         assert!(push_rule_verdict(&rules, "!quiet:example.org", "anything").0);
         assert!(!push_rule_verdict(&rules, "!other:example.org", "anything").0);
         // The newer spelling of the same thing.
-        let empty = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [] }] } });
+        let empty =
+            json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [] }] } });
         assert!(push_rule_verdict(&empty, "!quiet:example.org", "x").0);
         // A rule somebody switched off says nothing.
         let off = json!({ "global": { "room": [{ "rule_id": "!quiet:example.org", "actions": [], "enabled": false }] } });

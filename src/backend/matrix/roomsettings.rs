@@ -27,8 +27,16 @@ pub const HISTORY_CHOICES: [&str; 4] = ["joined", "invited", "shared", "world_re
 /// A 404 here is the ordinary answer rather than a failure: a room that has
 /// never had its history visibility set does not carry the event, and the
 /// spec's default applies. Every other error is a real one and is reported.
-pub(super) async fn read_state_event(state: &AppState, account_id: &str, room_id: &str, event_type: &str) -> Result<Option<Value>> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+pub(super) async fn read_state_event(
+    state: &AppState,
+    account_id: &str,
+    room_id: &str,
+    event_type: &str,
+) -> Result<Option<Value>> {
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/state/{event_type}",
         account.homeserver_url.trim_end_matches('/'),
@@ -59,13 +67,25 @@ pub async fn canonical_alias(state: &AppState, account_id: &str, room_id: &str) 
         .await
         .ok()
         .flatten()
-        .and_then(|c| c["alias"].as_str().filter(|a| !a.is_empty()).map(str::to_string))
+        .and_then(|c| {
+            c["alias"]
+                .as_str()
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+        })
 }
 
 /// What a room says about who can read its past, and whether this account can
 /// change it.
-pub async fn history_visibility(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+pub async fn history_visibility(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+) -> Result<Value> {
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
     let content = read_state_event(state, account_id, &room_id, HISTORY_VISIBILITY).await?;
     // `shared` is the spec's default, and a room with no event really is
     // shared rather than unknown - saying "unset" would leave somebody
@@ -83,11 +103,19 @@ pub async fn history_visibility(state: &AppState, account_id: &str, buffer_id: &
 }
 
 /// Sets it.
-pub async fn set_history_visibility(state: &AppState, account_id: &str, buffer_id: &str, value: &str) -> Result<()> {
+pub async fn set_history_visibility(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    value: &str,
+) -> Result<()> {
     if !HISTORY_CHOICES.contains(&value) {
         anyhow::bail!("{value} is not a history visibility this client sets");
     }
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
     send::put_room_state(
         state,
         account_id,
@@ -108,9 +136,18 @@ pub async fn set_history_visibility(state: &AppState, account_id: &str, buffer_i
 /// could never make one, so the whole operation had to happen in another
 /// client.
 pub async fn room_version(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
-    let current = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
-    let facts = state.runtime.matrix_server_facts(account_id).unwrap_or_default();
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
+    let current = state
+        .runtime
+        .matrix_room_version(account_id, &room_id)
+        .unwrap_or_default();
+    let facts = state
+        .runtime
+        .matrix_server_facts(account_id)
+        .unwrap_or_default();
     let default = facts.default_room_version.clone().unwrap_or_default();
     Ok(serde_json::json!({
         "current": current,
@@ -134,18 +171,35 @@ pub async fn room_version(state: &AppState, account_id: &str, buffer_id: &str) -
 /// tombstones this one. What it cannot copy is the conversation: the old room
 /// keeps its own history and members follow the tombstone as they notice it,
 /// which is why this is worth saying out loud before it is done.
-pub async fn upgrade_room(state: &AppState, account_id: &str, buffer_id: &str, version: &str) -> Result<Value> {
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+pub async fn upgrade_room(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    version: &str,
+) -> Result<Value> {
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let url = format!(
         "{}/_matrix/client/v3/rooms/{}/upgrade",
         account.homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>()
     );
-    let answer = http::post_json(&url, Some(&account.access_token), serde_json::json!({ "new_version": version }))
-        .await
-        .context("upgrading the room")?;
-    let replacement = answer["replacement_room"].as_str().context("the server named no replacement room")?;
+    let answer = http::post_json(
+        &url,
+        Some(&account.access_token),
+        serde_json::json!({ "new_version": version }),
+    )
+    .await
+    .context("upgrading the room")?;
+    let replacement = answer["replacement_room"]
+        .as_str()
+        .context("the server named no replacement room")?;
 
     // Joined here rather than left to be noticed. The server puts the
     // upgrading account in the new room in most deployments, but the sync
@@ -163,7 +217,10 @@ mod tests {
     /// writes something else writes a setting no server will accept.
     #[test]
     fn the_choices_are_the_specs_four() {
-        assert_eq!(HISTORY_CHOICES, ["joined", "invited", "shared", "world_readable"]);
+        assert_eq!(
+            HISTORY_CHOICES,
+            ["joined", "invited", "shared", "world_readable"]
+        );
         assert!(!HISTORY_CHOICES.contains(&"world-readable"));
         assert!(!HISTORY_CHOICES.contains(&"public"));
     }
@@ -173,8 +230,12 @@ mod tests {
     /// has already turned the status into a message by the time this sees it.
     #[test]
     fn a_missing_state_event_is_not_an_error() {
-        assert!(is_not_found(&anyhow::anyhow!("M_NOT_FOUND: Event not found.")));
-        assert!(!is_not_found(&anyhow::anyhow!("M_FORBIDDEN: You are not in this room.")));
+        assert!(is_not_found(&anyhow::anyhow!(
+            "M_NOT_FOUND: Event not found."
+        )));
+        assert!(!is_not_found(&anyhow::anyhow!(
+            "M_FORBIDDEN: You are not in this room."
+        )));
         assert!(!is_not_found(&anyhow::anyhow!("request failed")));
     }
 }
@@ -203,11 +264,31 @@ struct Rule {
 }
 
 const RULES: [Rule; 5] = [
-    Rule { name: "public", allows: false, since: 1 },
-    Rule { name: "invite", allows: false, since: 1 },
-    Rule { name: "knock", allows: false, since: 7 },
-    Rule { name: "restricted", allows: true, since: 8 },
-    Rule { name: "knock_restricted", allows: true, since: 10 },
+    Rule {
+        name: "public",
+        allows: false,
+        since: 1,
+    },
+    Rule {
+        name: "invite",
+        allows: false,
+        since: 1,
+    },
+    Rule {
+        name: "knock",
+        allows: false,
+        since: 7,
+    },
+    Rule {
+        name: "restricted",
+        allows: true,
+        since: 8,
+    },
+    Rule {
+        name: "knock_restricted",
+        allows: true,
+        since: 10,
+    },
 ];
 
 /// The numeric part of a room version, where it has one.
@@ -223,11 +304,18 @@ fn version_number(version: &str) -> Option<u8> {
 /// What a room says about who may join, and what this account could change it
 /// to.
 pub async fn join_rule(state: &AppState, account_id: &str, buffer_id: &str) -> Result<Value> {
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
     let content = read_state_event(state, account_id, &room_id, JOIN_RULES).await?;
     // `invite` is the spec's default, and a room carrying no event really is
     // invite-only rather than unknown.
-    let value = content.as_ref().and_then(|c| c["join_rule"].as_str()).unwrap_or("invite").to_string();
+    let value = content
+        .as_ref()
+        .and_then(|c| c["join_rule"].as_str())
+        .unwrap_or("invite")
+        .to_string();
     // The spaces already named, so a panel can show which ones without
     // reading the state event a second time.
     let allow: Vec<String> = content
@@ -238,7 +326,10 @@ pub async fn join_rule(state: &AppState, account_id: &str, buffer_id: &str) -> R
         .filter_map(|entry| entry["room_id"].as_str().map(str::to_string))
         .collect();
 
-    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let version = state
+        .runtime
+        .matrix_room_version(account_id, &room_id)
+        .unwrap_or_default();
     let number = version_number(&version);
     let choices: Vec<Value> = RULES
         .iter()
@@ -271,12 +362,24 @@ pub async fn join_rule(state: &AppState, account_id: &str, buffer_id: &str) -> R
 /// only for the two restricted rules. Sent empty on the others rather than
 /// carried over, because an `allow` beside `invite` is a list the server
 /// ignores and a reader misreads.
-pub async fn set_join_rule(state: &AppState, account_id: &str, buffer_id: &str, value: &str, allow: &[String]) -> Result<()> {
+pub async fn set_join_rule(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    value: &str,
+    allow: &[String],
+) -> Result<()> {
     let Some(rule) = RULES.iter().find(|r| r.name == value) else {
         anyhow::bail!("{value} is not a join rule this client sets");
     };
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
-    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
+    let version = state
+        .runtime
+        .matrix_room_version(account_id, &room_id)
+        .unwrap_or_default();
     if version_number(&version).is_some_and(|n| n < rule.since) {
         anyhow::bail!(
             "this room is version {version} and \"{value}\" needs {} or newer - upgrade the room first",

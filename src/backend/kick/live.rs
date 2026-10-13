@@ -11,7 +11,12 @@ use super::*;
 ///
 /// Kick's own channel endpoint carries all of it and this backend was already
 /// calling it - the numbers were parsed away and dropped.
-pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, following: Option<bool>) {
+pub(super) fn announce_stream(
+    state: &AppState,
+    buffer_id: &str,
+    channel: &api::Channel,
+    following: Option<bool>,
+) {
     let stream = serde_json::json!({
         "bufferId": buffer_id,
         "live": channel.live.is_some(),
@@ -49,7 +54,11 @@ pub(super) async fn following_now(
 ) -> Option<bool> {
     // Nothing to ask with. This is the one honest "cannot say", and the
     // client draws it as an account that is not signed in.
-    let token = state.accounts.get_kick(account_id).and_then(|c| c.token).filter(|t| !t.is_empty())?;
+    let token = state
+        .accounts
+        .get_kick(account_id)
+        .and_then(|c| c.token)
+        .filter(|t| !t.is_empty())?;
     match api::standing(http, &token, slug).await {
         Ok(standing) => Some(standing.following),
         // A question that could not be asked is not an answer of "no idea".
@@ -72,10 +81,17 @@ pub(super) async fn following_now(
 /// from this client - the rest of what a channel says about itself changes
 /// because the streamer did something.
 pub async fn refresh_standing(state: &AppState, buffer_id: &str) {
-    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
-    let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return };
+    let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+        return;
+    };
+    let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
+        return;
+    };
     let Ok(http) = api::client() else { return };
-    let known = state.runtime.kick_stream(buffer_id).and_then(|s| s["following"].as_bool());
+    let known = state
+        .runtime
+        .kick_stream(buffer_id)
+        .and_then(|s| s["following"].as_bool());
     let following = following_now(state, &http, &buffer.account_id, &channel.slug, known).await;
     if let Some(mut stream) = state.runtime.kick_stream(buffer_id) {
         stream["following"] = serde_json::json!(following);
@@ -99,7 +115,12 @@ pub(super) const DIRECT_REFRESH: Duration = Duration::from_secs(50);
 /// Only channels this client actually has open are updated: the follow list
 /// can be longer than the buffers, and a stream state for a buffer that does
 /// not exist has nobody to tell.
-pub(super) async fn refresh_followed_live(state: &AppState, http: &reqwest::Client, account_id: &str, token: &str) {
+pub(super) async fn refresh_followed_live(
+    state: &AppState,
+    http: &reqwest::Client,
+    account_id: &str,
+    token: &str,
+) {
     let rows = match api::followed_live(http, token).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -114,9 +135,10 @@ pub(super) async fn refresh_followed_live(state: &AppState, http: &reqwest::Clie
         if state.runtime.kick_channel(&buffer_id).is_none() {
             continue;
         }
-        let mut stream = state.runtime.kick_stream(&buffer_id).unwrap_or_else(|| {
-            serde_json::json!({ "bufferId": buffer_id, "live": false })
-        });
+        let mut stream = state
+            .runtime
+            .kick_stream(&buffer_id)
+            .unwrap_or_else(|| serde_json::json!({ "bufferId": buffer_id, "live": false }));
         let before = stream.clone();
         stream["live"] = serde_json::json!(row.live);
         stream["viewers"] = serde_json::json!(row.viewers);
@@ -162,10 +184,19 @@ pub async fn refresh_stream(state: &AppState, buffer_id: &str) {
 /// The same, for a caller that has already decided the answer is stale - a
 /// stream going on or off air, or the channel somebody is looking at.
 pub async fn refresh_stream_now(state: &AppState, buffer_id: &str) {
-    let Some(channel) = state.runtime.kick_channel(buffer_id) else { return };
+    let Some(channel) = state.runtime.kick_channel(buffer_id) else {
+        return;
+    };
     let Ok(http) = api::client() else { return };
-    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
-    let known = state.runtime.kick_stream(buffer_id).and_then(|s| s["following"].as_bool());
+    let account_id = state
+        .runtime
+        .get_buffer(buffer_id)
+        .map(|b| b.account_id)
+        .unwrap_or_default();
+    let known = state
+        .runtime
+        .kick_stream(buffer_id)
+        .and_then(|s| s["following"].as_bool());
     match api::channel(&http, &channel.slug).await {
         Ok(fresh) => {
             let following = following_now(state, &http, &account_id, &channel.slug, known).await;
@@ -180,13 +211,36 @@ pub async fn refresh_stream_now(state: &AppState, buffer_id: &str) {
 /// A poll or a prediction is one thing happening over a minute or two, not a
 /// stream of events - so it gets one message that changes, the way an edited
 /// message does, and the chat around it stays readable.
-pub(super) fn live_line(state: &AppState, account_id: &str, slug: &str, msg_id: &str, what: &str, kind: &str) {
+pub(super) fn live_line(
+    state: &AppState,
+    account_id: &str,
+    slug: &str,
+    msg_id: &str,
+    what: &str,
+    kind: &str,
+) {
     let buffer_id = crate::model::buffer_id(account_id, slug);
-    if state.runtime.update_message(state, &buffer_id, msg_id, what, &[], &[]) {
+    if state
+        .runtime
+        .update_message(state, &buffer_id, msg_id, what, &[], &[])
+    {
         return;
     }
     state.runtime.record_message(
-        state, account_id, slug, "channel", slug, what, false, kind, None, Some(msg_id.to_string()),
-        false, None, Vec::new(), Vec::new(), None,
+        state,
+        account_id,
+        slug,
+        "channel",
+        slug,
+        what,
+        false,
+        kind,
+        None,
+        Some(msg_id.to_string()),
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
     );
 }

@@ -31,16 +31,16 @@
 //! As in the other backends, the submodules are re-exported flat so callers
 //! say `backend::kick::backfill` without knowing which file that is, and each
 //! opens with `use super::*` to share the imports below.
+pub mod api;
 pub mod cards;
 pub mod chat;
 pub mod live;
 pub mod pins;
 pub mod realtime;
 pub mod socket;
-pub mod watch;
 #[cfg(test)]
 pub(crate) mod testkit;
-pub mod api;
+pub mod watch;
 
 pub use cards::*;
 pub use chat::*;
@@ -112,13 +112,23 @@ impl Watched {
     fn remove(&mut self, slug: &str) -> Vec<String> {
         self.speakers.remove(slug);
         let mut names = Vec::new();
-        if let Some(room) = self.by_chatroom.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
+        if let Some(room) = self
+            .by_chatroom
+            .iter()
+            .find(|(_, s)| *s == slug)
+            .map(|(i, _)| *i)
+        {
             self.by_chatroom.remove(&room);
             names.push(format!("chatrooms.{room}.v2"));
             names.push(format!("chatrooms.{room}"));
             names.push(format!("chatroom_{room}"));
         }
-        if let Some(channel) = self.by_channel.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
+        if let Some(channel) = self
+            .by_channel
+            .iter()
+            .find(|(_, s)| *s == slug)
+            .map(|(i, _)| *i)
+        {
             self.by_channel.remove(&channel);
             names.push(format!("channel.{channel}"));
             names.push(format!("channel_{channel}"));

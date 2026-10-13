@@ -88,7 +88,12 @@ pub struct Packet {
 
 impl Packet {
     pub fn new(emsg: u32, header: Header, body: Vec<u8>) -> Self {
-        Self { emsg, protobuf: true, header, body }
+        Self {
+            emsg,
+            protobuf: true,
+            header,
+            body,
+        }
     }
 
     /// The request this answers, or `NO_JOB`.
@@ -121,9 +126,17 @@ impl Packet {
         let emsg = kind & !PROTO_MASK;
         if protobuf {
             let header_len = u32_at(bytes, 4).context("a packet with no header length")? as usize;
-            let end = 8usize.checked_add(header_len).filter(|end| *end <= bytes.len()).ok_or_else(|| anyhow!("a header longer than its packet"))?;
+            let end = 8usize
+                .checked_add(header_len)
+                .filter(|end| *end <= bytes.len())
+                .ok_or_else(|| anyhow!("a header longer than its packet"))?;
             let header = Header::decode(&bytes[8..end]).context("reading a packet header")?;
-            return Ok(Packet { emsg, protobuf, header, body: bytes[end..].to_vec() });
+            return Ok(Packet {
+                emsg,
+                protobuf,
+                header,
+                body: bytes[end..].to_vec(),
+            });
         }
         // The old layout: a one-byte header size, a two-byte version, the two
         // job ids, a canary, the account and the session - 32 bytes in all
@@ -144,7 +157,12 @@ impl Packet {
             jobid_target: Some(target),
             ..Header::default()
         };
-        Ok(Packet { emsg, protobuf, header, body: bytes[LEGACY..].to_vec() })
+        Ok(Packet {
+            emsg,
+            protobuf,
+            header,
+            body: bytes[LEGACY..].to_vec(),
+        })
     }
 }
 
@@ -177,7 +195,10 @@ pub fn unpack_multi(body: &[u8]) -> Result<Vec<Packet>> {
                 .read_to_end(&mut out)
                 .context("unzipping a batch of packets")?;
             if out.len() != expected {
-                bail!("a batch that said {expected} bytes and unzipped to {}", out.len());
+                bail!(
+                    "a batch that said {expected} bytes and unzipped to {}",
+                    out.len()
+                );
             }
             out
         }
@@ -188,7 +209,10 @@ pub fn unpack_multi(body: &[u8]) -> Result<Vec<Packet>> {
     while at < bytes.len() {
         let len = u32_at(&bytes, at).context("a batch cut off in a length")? as usize;
         at += 4;
-        let end = at.checked_add(len).filter(|end| *end <= bytes.len()).ok_or_else(|| anyhow!("a packet longer than its batch"))?;
+        let end = at
+            .checked_add(len)
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| anyhow!("a packet longer than its batch"))?;
         let packet = Packet::decode(&bytes[at..end])?;
         if packet.emsg == emsg::MULTI {
             packets.extend(unpack_multi(&packet.body)?);
@@ -214,9 +238,15 @@ pub fn pack_multi(packets: &[Packet], compress: bool) -> Vec<u8> {
     let multi = if compress {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         gz.write_all(&run).unwrap();
-        Multi { size_unzipped: Some(run.len() as u32), message_body: Some(gz.finish().unwrap()) }
+        Multi {
+            size_unzipped: Some(run.len() as u32),
+            message_body: Some(gz.finish().unwrap()),
+        }
     } else {
-        Multi { size_unzipped: None, message_body: Some(run) }
+        Multi {
+            size_unzipped: None,
+            message_body: Some(run),
+        }
     };
     multi.encode_to_vec()
 }
@@ -228,7 +258,13 @@ mod tests {
     fn packet(emsg: u32, body: &[u8]) -> Packet {
         Packet::new(
             emsg,
-            Header { steamid: Some(76561197960287930), client_sessionid: Some(7), jobid_source: Some(42), target_job_name: Some("A.B#1".into()), ..Header::default() },
+            Header {
+                steamid: Some(76561197960287930),
+                client_sessionid: Some(7),
+                jobid_source: Some(42),
+                target_job_name: Some("A.B#1".into()),
+                ..Header::default()
+            },
             body.to_vec(),
         )
     }
@@ -305,7 +341,11 @@ mod tests {
 
     #[test]
     fn a_batch_unpacks_in_order_compressed_or_not() {
-        let inside = [packet(emsg::CLIENT_FRIENDS_LIST, b"one"), packet(emsg::CLIENT_PERSONA_STATE, b"two"), packet(emsg::CLIENT_ACCOUNT_INFO, b"three")];
+        let inside = [
+            packet(emsg::CLIENT_FRIENDS_LIST, b"one"),
+            packet(emsg::CLIENT_PERSONA_STATE, b"two"),
+            packet(emsg::CLIENT_ACCOUNT_INFO, b"three"),
+        ];
         for compress in [true, false] {
             let got = unpack_multi(&pack_multi(&inside, compress)).unwrap();
             assert_eq!(got, inside, "compressed: {compress}");
@@ -319,8 +359,15 @@ mod tests {
     fn a_batch_inside_a_batch_comes_out_flat() {
         let inner = packet(emsg::CLIENT_PERSONA_STATE, b"deep");
         let wrapper = packet(emsg::MULTI, &pack_multi(std::slice::from_ref(&inner), true));
-        let got = unpack_multi(&pack_multi(&[packet(emsg::CLIENT_FRIENDS_LIST, b"first"), wrapper], false)).unwrap();
-        assert_eq!(got.iter().map(|p| p.body.clone()).collect::<Vec<_>>(), vec![b"first".to_vec(), b"deep".to_vec()]);
+        let got = unpack_multi(&pack_multi(
+            &[packet(emsg::CLIENT_FRIENDS_LIST, b"first"), wrapper],
+            false,
+        ))
+        .unwrap();
+        assert_eq!(
+            got.iter().map(|p| p.body.clone()).collect::<Vec<_>>(),
+            vec![b"first".to_vec(), b"deep".to_vec()]
+        );
     }
 
     #[test]
@@ -331,20 +378,32 @@ mod tests {
         multi.size_unzipped = Some(multi.size_unzipped.unwrap() + 5);
         assert!(unpack_multi(&multi.encode_to_vec()).is_err());
         multi.size_unzipped = Some(3);
-        assert!(unpack_multi(&multi.encode_to_vec()).is_err(), "unzips to more than it said");
+        assert!(
+            unpack_multi(&multi.encode_to_vec()).is_err(),
+            "unzips to more than it said"
+        );
         // Says it is huge.
         multi.size_unzipped = Some(u32::MAX);
         assert!(unpack_multi(&multi.encode_to_vec()).is_err());
         // Is not gzip at all.
-        let junk = Multi { size_unzipped: Some(10), message_body: Some(vec![1, 2, 3, 4]) };
+        let junk = Multi {
+            size_unzipped: Some(10),
+            message_body: Some(vec![1, 2, 3, 4]),
+        };
         assert!(unpack_multi(&junk.encode_to_vec()).is_err());
         // Packs a packet that runs past the end.
         let mut run = 100u32.to_le_bytes().to_vec();
         run.extend_from_slice(&[1, 2, 3]);
-        let short = Multi { size_unzipped: None, message_body: Some(run) };
+        let short = Multi {
+            size_unzipped: None,
+            message_body: Some(run),
+        };
         assert!(unpack_multi(&short.encode_to_vec()).is_err());
         // And a length cut off in the middle.
-        let cut = Multi { size_unzipped: None, message_body: Some(vec![1, 2]) };
+        let cut = Multi {
+            size_unzipped: None,
+            message_body: Some(vec![1, 2]),
+        };
         assert!(unpack_multi(&cut.encode_to_vec()).is_err());
     }
 }

@@ -12,7 +12,11 @@ use super::*;
 /// The dimensions in particular let a frontend reserve layout space before
 /// any bytes arrive, which is why Element's timeline doesn't reflow as
 /// images load.
-pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_path: Option<String>) -> Attachment {
+pub(super) fn build_attachment(
+    content: &Value,
+    path: Option<String>,
+    thumbnail_path: Option<String>,
+) -> Attachment {
     let info = &content["info"];
     let mimetype = info["mimetype"].as_str().map(str::to_string);
     Attachment {
@@ -28,7 +32,10 @@ pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_
         width: info["w"].as_u64().map(|v| v as u32),
         height: info["h"].as_u64().map(|v| v as u32),
         // MSC2448, still under its unstable prefix on most servers.
-        blurhash: info["xyz.amorgan.blurhash"].as_str().or_else(|| info["blurhash"].as_str()).map(str::to_string),
+        blurhash: info["xyz.amorgan.blurhash"]
+            .as_str()
+            .or_else(|| info["blurhash"].as_str())
+            .map(str::to_string),
         mimetype,
         path,
         thumbnail_path,
@@ -47,7 +54,11 @@ pub(super) fn build_attachment(content: &Value, path: Option<String>, thumbnail_
 /// has one. Preferring this for previews is what keeps a timeline from
 /// pulling full-size originals off the homeserver just to draw something
 /// small - the same reason Element requests the thumbnail endpoint.
-pub(super) async fn thumbnail_for(content: &Value, homeserver_url: &str, access_token: &str) -> Option<String> {
+pub(super) async fn thumbnail_for(
+    content: &Value,
+    homeserver_url: &str,
+    access_token: &str,
+) -> Option<String> {
     let info = &content["info"];
     // Encrypted rooms carry the thumbnail as its own EncryptedFile rather
     // than a plain mxc URI, and it needs the same decrypt path as the body.
@@ -85,7 +96,10 @@ fn worth_thumbnailing(info: &Value) -> bool {
     if let Some(size) = info["size"].as_u64() {
         return size > WORTH_IT;
     }
-    let (w, h) = (info["w"].as_u64().unwrap_or(0), info["h"].as_u64().unwrap_or(0));
+    let (w, h) = (
+        info["w"].as_u64().unwrap_or(0),
+        info["h"].as_u64().unwrap_or(0),
+    );
     w > THUMBNAIL_W || h > THUMBNAIL_H
 }
 
@@ -104,11 +118,17 @@ const THUMBNAIL_H: u64 = 600;
 /// Its own name in the cache rather than the original's, because they are
 /// different files: a thumbnail written under the original's name would be
 /// handed out later to anything that asked for the full-size picture.
-async fn cached_thumbnail_path(homeserver_url: &str, access_token: &str, mxc_uri: &str) -> Option<String> {
+async fn cached_thumbnail_path(
+    homeserver_url: &str,
+    access_token: &str,
+    mxc_uri: &str,
+) -> Option<String> {
     let rest = mxc_uri.strip_prefix("mxc://")?;
     let (server_name, media_id) = rest.split_once('/')?;
     let dir = media_cache_dir();
-    let path = dir.join(format!("{server_name}_{media_id}_thumb{THUMBNAIL_W}x{THUMBNAIL_H}"));
+    let path = dir.join(format!(
+        "{server_name}_{media_id}_thumb{THUMBNAIL_W}x{THUMBNAIL_H}"
+    ));
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Some(format!("file://{}", path.display()));
     }
@@ -119,16 +139,24 @@ async fn cached_thumbnail_path(homeserver_url: &str, access_token: &str, mxc_uri
         url::form_urlencoded::byte_serialize(server_name.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(media_id.as_bytes()).collect::<String>(),
     );
-    let fetch = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&url, access_token)).await;
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        http::get_bytes(&url, access_token),
+    )
+    .await;
     // Quiet on every failure. A server that will not thumbnail - an old one,
     // one that cannot read the format, one that has the original on cold
     // storage - is not a problem to report: the full-size picture is fetched
     // anyway and the reader sees the same image.
-    let Ok(Ok((status, bytes))) = fetch else { return None };
+    let Ok(Ok((status, bytes))) = fetch else {
+        return None;
+    };
     if !(200..300).contains(&status) || bytes.is_empty() {
         return None;
     }
-    if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &bytes).await.is_err() {
+    if tokio::fs::create_dir_all(&dir).await.is_err()
+        || tokio::fs::write(&path, &bytes).await.is_err()
+    {
         return None;
     }
     Some(format!("file://{}", path.display()))
@@ -178,11 +206,20 @@ pub(super) fn extension_for_mimetype(mimetype: &str) -> &'static str {
 /// lifetime - media_cache.rs holds the cache to a size and an age. `extension` (from extension_for_mimetype,
 /// empty string if unknown) is appended to the cache filename - see that
 /// function's own doc comment on why this can't just be left off.
-pub(crate) async fn cached_media_path(homeserver_url: &str, access_token: &str, mxc_uri: &str, extension: &str) -> Option<String> {
+pub(crate) async fn cached_media_path(
+    homeserver_url: &str,
+    access_token: &str,
+    mxc_uri: &str,
+    extension: &str,
+) -> Option<String> {
     let rest = mxc_uri.strip_prefix("mxc://")?;
     let (server_name, media_id) = rest.split_once('/')?;
     let dir = media_cache_dir();
-    let filename = if extension.is_empty() { format!("{server_name}_{media_id}") } else { format!("{server_name}_{media_id}.{extension}") };
+    let filename = if extension.is_empty() {
+        format!("{server_name}_{media_id}")
+    } else {
+        format!("{server_name}_{media_id}.{extension}")
+    };
     let path = dir.join(filename);
 
     if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -195,7 +232,11 @@ pub(crate) async fn cached_media_path(homeserver_url: &str, access_token: &str, 
         url::form_urlencoded::byte_serialize(server_name.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(media_id.as_bytes()).collect::<String>(),
     );
-    let fetch = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&url, access_token)).await;
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        http::get_bytes(&url, access_token),
+    )
+    .await;
     let (status, bytes) = match fetch {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
@@ -211,7 +252,9 @@ pub(crate) async fn cached_media_path(homeserver_url: &str, access_token: &str, 
         tracing::debug!("matrix: media fetch for {mxc_uri} returned HTTP {status}");
         return None;
     }
-    if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &bytes).await.is_err() {
+    if tokio::fs::create_dir_all(&dir).await.is_err()
+        || tokio::fs::write(&path, &bytes).await.is_err()
+    {
         return None;
     }
     Some(format!("file://{}", path.display()))
@@ -227,7 +270,12 @@ pub(crate) async fn cached_media_path(homeserver_url: &str, access_token: &str, 
 /// it - same reasoning as the unencrypted path needing to route around a
 /// plain Image having no way to send a Bearer header, plus here also no
 /// way to AES-decrypt on the fly.
-pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_token: &str, file: &Value, extension: &str) -> Option<String> {
+pub(crate) async fn cached_encrypted_media_path(
+    homeserver_url: &str,
+    access_token: &str,
+    file: &Value,
+    extension: &str,
+) -> Option<String> {
     use matrix_sdk_crypto::{AttachmentDecryptor, MediaEncryptionInfo};
     use std::io::{Cursor, Read};
 
@@ -235,7 +283,11 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
     let rest = mxc_uri.strip_prefix("mxc://")?;
     let (server_name, media_id) = rest.split_once('/')?;
     let dir = media_cache_dir();
-    let filename = if extension.is_empty() { format!("{server_name}_{media_id}") } else { format!("{server_name}_{media_id}.{extension}") };
+    let filename = if extension.is_empty() {
+        format!("{server_name}_{media_id}")
+    } else {
+        format!("{server_name}_{media_id}.{extension}")
+    };
     let path = dir.join(filename);
     // The key is in the event and nowhere else, so it is kept with the file:
     // without it, a picture that expires out of the cache could only ever be
@@ -269,7 +321,11 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
         url::form_urlencoded::byte_serialize(server_name.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(media_id.as_bytes()).collect::<String>(),
     );
-    let fetch = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&download_url, access_token)).await;
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        http::get_bytes(&download_url, access_token),
+    )
+    .await;
     let (status, ciphertext) = match fetch {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
@@ -300,7 +356,9 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
         return None;
     }
 
-    if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &plaintext).await.is_err() {
+    if tokio::fs::create_dir_all(&dir).await.is_err()
+        || tokio::fs::write(&path, &plaintext).await.is_err()
+    {
         return None;
     }
     Some(format!("file://{}", path.display()))
@@ -314,7 +372,10 @@ pub(crate) async fn cached_encrypted_media_path(homeserver_url: &str, access_tok
 /// migrate_caches_to_xdg_cache_dir, which moves any pre-existing directory
 /// here on first startup after this changed).
 pub(super) fn media_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("matrix-media")
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("matrix-media")
 }
 
 /// `m.room.message` msgtype + upload Content-Type for a local file, chosen
@@ -393,14 +454,22 @@ fn voice_waveform(content: &Value) -> Option<String> {
 /// to read back as a voice message.
 pub(super) fn mark_as_voice(content: &mut Value, duration_secs: f64, waveform: &[u8]) {
     let ms = (duration_secs * 1000.0).round() as u64;
-    let samples: Vec<u64> = waveform.iter().map(|b| (*b as f64 / 255.0 * 1024.0).round() as u64).collect();
+    let samples: Vec<u64> = waveform
+        .iter()
+        .map(|b| (*b as f64 / 255.0 * 1024.0).round() as u64)
+        .collect();
     content["info"]["duration"] = serde_json::json!(ms);
-    content["org.matrix.msc1767.audio"] = serde_json::json!({ "duration": ms, "waveform": samples });
+    content["org.matrix.msc1767.audio"] =
+        serde_json::json!({ "duration": ms, "waveform": samples });
     content["org.matrix.msc3245.voice"] = serde_json::json!({});
 }
 
 pub(super) fn file_extension(path: &str) -> (String, String) {
-    let filename = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     (filename, ext)
 }
@@ -416,9 +485,17 @@ pub(super) fn file_extension(path: &str) -> (String, String) {
 /// A server that declined to state a limit refuses nothing here - the spec
 /// allows silence, and a client that blocked every upload because it could
 /// not read a number would be worse than one that never asked.
-pub(super) async fn check_upload_size(state: &AppState, account_id: &str, path: &str) -> Result<()> {
-    let Some(facts) = state.runtime.matrix_server_facts(account_id) else { return Ok(()) };
-    let Ok(meta) = tokio::fs::metadata(path).await else { return Ok(()) };
+pub(super) async fn check_upload_size(
+    state: &AppState,
+    account_id: &str,
+    path: &str,
+) -> Result<()> {
+    let Some(facts) = state.runtime.matrix_server_facts(account_id) else {
+        return Ok(());
+    };
+    let Ok(meta) = tokio::fs::metadata(path).await else {
+        return Ok(());
+    };
     if facts.accepts_upload(meta.len()) {
         return Ok(());
     }
@@ -449,14 +526,26 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
-pub(super) async fn upload_media_message(base: &str, access_token: &str, path: &str, body: &str) -> Result<Value> {
+pub(super) async fn upload_media_message(
+    base: &str,
+    access_token: &str,
+    path: &str,
+    body: &str,
+) -> Result<Value> {
     let bytes = tokio::fs::read(path).await.context("reading attachment")?;
     let (filename, ext) = file_extension(path);
     let (msgtype, mime) = media_msgtype_and_mime(&ext);
 
-    let upload_url = format!("{base}/_matrix/media/v3/upload?filename={}", url::form_urlencoded::byte_serialize(filename.as_bytes()).collect::<String>());
-    let resp = http_client_post_bytes(&upload_url, access_token, mime, bytes).await.context("uploading media")?;
-    let content_uri = resp["content_uri"].as_str().context("upload response missing content_uri")?;
+    let upload_url = format!(
+        "{base}/_matrix/media/v3/upload?filename={}",
+        url::form_urlencoded::byte_serialize(filename.as_bytes()).collect::<String>()
+    );
+    let resp = http_client_post_bytes(&upload_url, access_token, mime, bytes)
+        .await
+        .context("uploading media")?;
+    let content_uri = resp["content_uri"]
+        .as_str()
+        .context("upload response missing content_uri")?;
 
     // "info.mimetype" matters on the *receive* side too, not just here -
     // this same content comes back through /sync as our own echo (and to
@@ -467,7 +556,9 @@ pub(super) async fn upload_media_message(base: &str, access_token: &str, path: &
     // embed detector silently never recognizes it as media (see this
     // project's own earlier "media isn't embedding" fix for the exact same
     // failure mode with media authored by *other* clients).
-    Ok(serde_json::json!({ "msgtype": msgtype, "body": if body.is_empty() { filename } else { body.to_string() }, "url": content_uri, "info": { "mimetype": mime } }))
+    Ok(
+        serde_json::json!({ "msgtype": msgtype, "body": if body.is_empty() { filename } else { body.to_string() }, "url": content_uri, "info": { "mimetype": mime } }),
+    )
 }
 
 /// Same as upload_media_message, but for an E2EE room: the file itself is
@@ -488,7 +579,12 @@ pub(super) async fn upload_media_message(base: &str, access_token: &str, path: &
 /// about the real content either way, but the real filename/mimetype
 /// (carried in this same event's `body`/`info` instead) has no reason to
 /// ever reach the server in the clear.
-pub(super) async fn upload_encrypted_media_message(base: &str, access_token: &str, path: &str, body: &str) -> Result<Value> {
+pub(super) async fn upload_encrypted_media_message(
+    base: &str,
+    access_token: &str,
+    path: &str,
+    body: &str,
+) -> Result<Value> {
     use matrix_sdk_crypto::AttachmentEncryptor;
     use std::io::{Cursor, Read};
 
@@ -499,12 +595,23 @@ pub(super) async fn upload_encrypted_media_message(base: &str, access_token: &st
     let mut cursor = Cursor::new(bytes);
     let mut encryptor = AttachmentEncryptor::new(&mut cursor);
     let mut ciphertext = Vec::new();
-    encryptor.read_to_end(&mut ciphertext).context("encrypting attachment")?;
+    encryptor
+        .read_to_end(&mut ciphertext)
+        .context("encrypting attachment")?;
     let media_info = encryptor.finish();
 
     let upload_url = format!("{base}/_matrix/media/v3/upload");
-    let resp = http_client_post_bytes(&upload_url, access_token, "application/octet-stream", ciphertext).await.context("uploading encrypted media")?;
-    let content_uri = resp["content_uri"].as_str().context("upload response missing content_uri")?;
+    let resp = http_client_post_bytes(
+        &upload_url,
+        access_token,
+        "application/octet-stream",
+        ciphertext,
+    )
+    .await
+    .context("uploading encrypted media")?;
+    let content_uri = resp["content_uri"]
+        .as_str()
+        .context("upload response missing content_uri")?;
 
     let mut file = serde_json::to_value(&media_info).context("serializing encryption info")?;
     file["url"] = serde_json::json!(content_uri);
@@ -512,10 +619,17 @@ pub(super) async fn upload_encrypted_media_message(base: &str, access_token: &st
     // See upload_media_message's own comment on why "info.mimetype" (the
     // real type - unrelated to the octet-stream Content-Type the upload
     // itself went out as) matters for the receive-side cache extension.
-    Ok(serde_json::json!({ "msgtype": msgtype, "body": if body.is_empty() { filename } else { body.to_string() }, "file": file, "info": { "mimetype": mime } }))
+    Ok(
+        serde_json::json!({ "msgtype": msgtype, "body": if body.is_empty() { filename } else { body.to_string() }, "file": file, "info": { "mimetype": mime } }),
+    )
 }
 
-pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, content_type: &str, bytes: Vec<u8>) -> Result<Value> {
+pub(super) async fn http_client_post_bytes(
+    url: &str,
+    access_token: &str,
+    content_type: &str,
+    bytes: Vec<u8>,
+) -> Result<Value> {
     let resp = http::http_client_for(access_token)
         .post(url)
         .bearer_auth(access_token)
@@ -532,7 +646,6 @@ pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, conten
     Ok(body)
 }
 
-
 /// Fetches a cached Matrix file again, after it expired or was cleared.
 ///
 /// The file's name says which media it was - `server_mediaid`, with
@@ -542,25 +655,45 @@ pub(super) async fn http_client_post_bytes(url: &str, access_token: &str, conten
 /// picture or a video: a file cached as plaintext before keys were recorded
 /// looks exactly like this, and its ciphertext written back would turn a
 /// missing picture into a broken one.
-pub(crate) async fn restore_cached(state: &AppState, path: &std::path::Path, account_hint: Option<&str>) -> Result<std::path::PathBuf> {
+pub(crate) async fn restore_cached(
+    state: &AppState,
+    path: &std::path::Path,
+    account_hint: Option<&str>,
+) -> Result<std::path::PathBuf> {
     let account = account_hint
         .and_then(|a| state.accounts.get_matrix(a))
-        .or_else(|| state.accounts.all_matrix().into_iter().find(|a| !a.access_token.is_empty()))
+        .or_else(|| {
+            state
+                .accounts
+                .all_matrix()
+                .into_iter()
+                .find(|a| !a.access_token.is_empty())
+        })
         .context("no Matrix account to fetch it with")?;
-    let (base, token) = (account.homeserver_url.as_str(), account.access_token.as_str());
-    let name = path.file_name().and_then(|n| n.to_str()).context("not a cached file")?;
+    let (base, token) = (
+        account.homeserver_url.as_str(),
+        account.access_token.as_str(),
+    );
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("not a cached file")?;
 
     if let Some(source) = crate::media_cache::source(path) {
         if source["file"].is_object() {
             let ext = source["ext"].as_str().unwrap_or("");
-            cached_encrypted_media_path(base, token, &source["file"], ext).await.context("the homeserver did not send it")?;
+            cached_encrypted_media_path(base, token, &source["file"], ext)
+                .await
+                .context("the homeserver did not send it")?;
             return Ok(path.to_path_buf());
         }
     }
 
     let (server, rest) = name.split_once('_').context("not a cached Matrix file")?;
     if let Some(id) = rest.strip_suffix(&format!("_thumb{THUMBNAIL_W}x{THUMBNAIL_H}")) {
-        cached_thumbnail_path(base, token, &format!("mxc://{server}/{id}")).await.context("the homeserver did not send it")?;
+        cached_thumbnail_path(base, token, &format!("mxc://{server}/{id}"))
+            .await
+            .context("the homeserver did not send it")?;
         return Ok(path.to_path_buf());
     }
     let id = rest.split('.').next().unwrap_or(rest);
@@ -570,9 +703,12 @@ pub(crate) async fn restore_cached(state: &AppState, path: &std::path::Path, acc
         url::form_urlencoded::byte_serialize(server.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(id.as_bytes()).collect::<String>(),
     );
-    let (status, bytes) = tokio::time::timeout(std::time::Duration::from_secs(20), http::get_bytes(&url, token))
-        .await
-        .context("the homeserver took too long")??;
+    let (status, bytes) = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        http::get_bytes(&url, token),
+    )
+    .await
+    .context("the homeserver took too long")??;
     if !(200..300).contains(&status) || bytes.is_empty() {
         anyhow::bail!("the homeserver answered HTTP {status}");
     }
@@ -605,8 +741,12 @@ mod attachment_tests {
         assert!(!worth_thumbnailing(&compressed));
 
         // With no size at all, the dimensions are the only measure there is.
-        assert!(worth_thumbnailing(&serde_json::json!({ "w": 4000, "h": 3000 })));
-        assert!(!worth_thumbnailing(&serde_json::json!({ "w": 100, "h": 100 })));
+        assert!(worth_thumbnailing(
+            &serde_json::json!({ "w": 4000, "h": 3000 })
+        ));
+        assert!(!worth_thumbnailing(
+            &serde_json::json!({ "w": 100, "h": 100 })
+        ));
         // And a sender who said nothing gets the old behaviour: one fetch.
         assert!(!worth_thumbnailing(&serde_json::json!({})));
     }
@@ -657,7 +797,11 @@ mod attachment_tests {
             ("m.file", "file"),
         ] {
             let content = serde_json::json!({ "msgtype": msgtype, "body": "x", "info": {} });
-            assert_eq!(build_attachment(&content, None, None).kind, want, "for {msgtype}");
+            assert_eq!(
+                build_attachment(&content, None, None).kind,
+                want,
+                "for {msgtype}"
+            );
         }
     }
 
@@ -705,19 +849,28 @@ mod attachment_tests {
         // serde_json::Value (not the original struct) is the point, since
         // that's genuinely what flows over the wire as this message's
         // content.file.
-        let file_over_the_wire: Value = serde_json::from_str(&file.to_string()).expect("re-parsing as if received fresh over the wire");
+        let file_over_the_wire: Value = serde_json::from_str(&file.to_string())
+            .expect("re-parsing as if received fresh over the wire");
 
         // --- cached_encrypted_media_path's half ---
         let mut encryption_info = file_over_the_wire.clone();
-        encryption_info.as_object_mut().expect("file is an object").remove("url");
-        let encryption_info: MediaEncryptionInfo = serde_json::from_value(encryption_info).expect("deserializing encryption info back out");
+        encryption_info
+            .as_object_mut()
+            .expect("file is an object")
+            .remove("url");
+        let encryption_info: MediaEncryptionInfo = serde_json::from_value(encryption_info)
+            .expect("deserializing encryption info back out");
 
         let mut ciphertext_cursor = Cursor::new(ciphertext);
-        let mut decryptor = AttachmentDecryptor::new(&mut ciphertext_cursor, encryption_info).expect("building decryptor");
+        let mut decryptor = AttachmentDecryptor::new(&mut ciphertext_cursor, encryption_info)
+            .expect("building decryptor");
         let mut decrypted = Vec::new();
         decryptor.read_to_end(&mut decrypted).expect("decrypting");
 
-        assert_eq!(decrypted, plaintext, "decrypted bytes don't match the original plaintext");
+        assert_eq!(
+            decrypted, plaintext,
+            "decrypted bytes don't match the original plaintext"
+        );
     }
 }
 
@@ -755,8 +908,14 @@ mod voice_tests {
     #[test]
     fn an_ordinary_audio_attachment_is_not_a_voice_message() {
         let mut ordinary = spoken();
-        ordinary.as_object_mut().unwrap().remove("org.matrix.msc3245.voice");
-        ordinary.as_object_mut().unwrap().remove("org.matrix.msc1767.audio");
+        ordinary
+            .as_object_mut()
+            .unwrap()
+            .remove("org.matrix.msc3245.voice");
+        ordinary
+            .as_object_mut()
+            .unwrap()
+            .remove("org.matrix.msc1767.audio");
         let att = build_attachment(&ordinary, None, None);
         assert!(!att.voice);
         assert_eq!(att.kind, "audio");
@@ -786,11 +945,17 @@ mod voice_tests {
         let waveform: Vec<u8> = vec![0, 64, 128, 255];
         mark_as_voice(&mut content, 2.5, &waveform);
 
-        assert!(content["org.matrix.msc3245.voice"].is_object(), "no marker: {content}");
+        assert!(
+            content["org.matrix.msc3245.voice"].is_object(),
+            "no marker: {content}"
+        );
         assert_eq!(content["org.matrix.msc1767.audio"]["duration"], 2500);
         assert_eq!(content["info"]["duration"], 2500);
         // Bytes on the way out, integers up to 1024 on the wire.
-        assert_eq!(content["org.matrix.msc1767.audio"]["waveform"], json!([0, 257, 514, 1024]));
+        assert_eq!(
+            content["org.matrix.msc1767.audio"]["waveform"],
+            json!([0, 257, 514, 1024])
+        );
 
         let att = build_attachment(&content, None, None);
         assert!(att.voice);
@@ -798,11 +963,14 @@ mod voice_tests {
         // And back to bytes, within the rounding two conversions cost.
         use base64::Engine;
         let back = base64::engine::general_purpose::STANDARD
-            .decode(att.waveform.expect("a waveform")) 
+            .decode(att.waveform.expect("a waveform"))
             .expect("valid base64");
         assert_eq!(back.len(), waveform.len());
         for (sent, read) in waveform.iter().zip(back.iter()) {
-            assert!((*sent as i16 - *read as i16).abs() <= 1, "{sent} came back as {read}");
+            assert!(
+                (*sent as i16 - *read as i16).abs() <= 1,
+                "{sent} came back as {read}"
+            );
         }
     }
 

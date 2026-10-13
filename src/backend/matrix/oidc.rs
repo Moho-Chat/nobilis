@@ -42,8 +42,10 @@ pub struct AuthMetadata {
 /// unstable one, which servers still serve and some serve only. Both are
 /// tried because a client that asks for only the new one calls a working
 /// homeserver password-only.
-const METADATA_PATHS: [&str; 2] =
-    ["/_matrix/client/v1/auth_metadata", "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata"];
+const METADATA_PATHS: [&str; 2] = [
+    "/_matrix/client/v1/auth_metadata",
+    "/_matrix/client/unstable/org.matrix.msc2965/auth_metadata",
+];
 
 /// Whether this homeserver delegates its accounts, and to whom.
 ///
@@ -52,7 +54,9 @@ const METADATA_PATHS: [&str; 2] =
 pub async fn auth_metadata(homeserver_url: &str) -> Result<Option<AuthMetadata>> {
     let base = homeserver_url.trim_end_matches('/');
     for path in METADATA_PATHS {
-        let Ok(v) = http::get_json_anonymous(&format!("{base}{path}")).await else { continue };
+        let Ok(v) = http::get_json_anonymous(&format!("{base}{path}")).await else {
+            continue;
+        };
         let field = |k: &str| v[k].as_str().unwrap_or_default().to_string();
         let issuer = field("issuer");
         let device = field("device_authorization_endpoint");
@@ -96,7 +100,10 @@ pub async fn register_client(metadata: &AuthMetadata) -> Result<String> {
     let resp = http::post_json_anonymous(&metadata.registration_endpoint, body)
         .await
         .context("registering with the account provider")?;
-    resp["client_id"].as_str().map(str::to_string).context("the provider issued no client id")
+    resp["client_id"]
+        .as_str()
+        .map(str::to_string)
+        .context("the provider issued no client id")
 }
 
 /// The code to show somebody, and what to poll with.
@@ -122,7 +129,11 @@ fn scope(device_id: &str) -> String {
     format!("urn:matrix:org.matrix.msc2967.client:api:* urn:matrix:org.matrix.msc2967.client:device:{device_id}")
 }
 
-pub async fn request_device_code(metadata: &AuthMetadata, client_id: &str, device_id: &str) -> Result<DeviceGrant> {
+pub async fn request_device_code(
+    metadata: &AuthMetadata,
+    client_id: &str,
+    device_id: &str,
+) -> Result<DeviceGrant> {
     let resp = http::post_form_anonymous(
         &metadata.device_authorization_endpoint,
         &[("client_id", client_id), ("scope", &scope(device_id))],
@@ -131,10 +142,21 @@ pub async fn request_device_code(metadata: &AuthMetadata, client_id: &str, devic
     .context("asking for a sign-in code")?;
 
     Ok(DeviceGrant {
-        device_code: resp["device_code"].as_str().context("no device code came back")?.to_string(),
-        user_code: resp["user_code"].as_str().context("no user code came back")?.to_string(),
-        verification_uri: resp["verification_uri"].as_str().unwrap_or_default().to_string(),
-        verification_uri_complete: resp["verification_uri_complete"].as_str().map(str::to_string),
+        device_code: resp["device_code"]
+            .as_str()
+            .context("no device code came back")?
+            .to_string(),
+        user_code: resp["user_code"]
+            .as_str()
+            .context("no user code came back")?
+            .to_string(),
+        verification_uri: resp["verification_uri"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        verification_uri_complete: resp["verification_uri_complete"]
+            .as_str()
+            .map(str::to_string),
         // Defaults from RFC 8628 where the provider does not say. Polling
         // faster than told is what earns a `slow_down`.
         interval: Duration::from_secs(resp["interval"].as_u64().unwrap_or(5).clamp(1, 60)),
@@ -154,7 +176,11 @@ pub enum Poll {
     /// Signed in. The refresh token matters as much as the access one: the
     /// access token expires in minutes on matrix.org, and an account signed
     /// in this way has no password to fall back on.
-    Approved { access_token: String, refresh_token: String, expires_in: u64 },
+    Approved {
+        access_token: String,
+        refresh_token: String,
+        expires_in: u64,
+    },
 }
 
 /// Reads one poll of the token endpoint.
@@ -167,7 +193,10 @@ pub fn classify(status: u16, body: &Value) -> Poll {
         if !token.is_empty() {
             return Poll::Approved {
                 access_token: token.to_string(),
-                refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+                refresh_token: body["refresh_token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 expires_in: body["expires_in"].as_u64().unwrap_or(0),
             };
         }
@@ -178,11 +207,17 @@ pub fn classify(status: u16, body: &Value) -> Poll {
         "expired_token" => Poll::Stopped("the sign-in code expired".to_string()),
         "access_denied" => Poll::Stopped("the sign-in was refused".to_string()),
         other if !other.is_empty() => Poll::Stopped(
-            body["error_description"].as_str().filter(|d| !d.is_empty()).unwrap_or(other).to_string(),
+            body["error_description"]
+                .as_str()
+                .filter(|d| !d.is_empty())
+                .unwrap_or(other)
+                .to_string(),
         ),
         // A status with no error code in it: report the status rather than
         // silently waiting for a provider that has stopped talking sense.
-        _ => Poll::Stopped(format!("the provider answered HTTP {status} with no explanation")),
+        _ => Poll::Stopped(format!(
+            "the provider answered HTTP {status} with no explanation"
+        )),
     }
 }
 
@@ -219,10 +254,18 @@ pub async fn poll_once(metadata: &AuthMetadata, client_id: &str, device_code: &s
 /// Returns the new pair. Providers may or may not rotate the refresh token;
 /// where the answer carries a new one it replaces the old, and where it does
 /// not the old one stays valid.
-pub async fn refresh(metadata: &AuthMetadata, client_id: &str, refresh_token: &str) -> Result<(String, String)> {
+pub async fn refresh(
+    metadata: &AuthMetadata,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<(String, String)> {
     let (status, body) = http::post_form_anonymous_raw(
         &metadata.token_endpoint,
-        &[("client_id", client_id), ("grant_type", "refresh_token"), ("refresh_token", refresh_token)],
+        &[
+            ("client_id", client_id),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ],
     )
     .await
     .context("asking for a fresh access token")?;
@@ -234,7 +277,10 @@ pub async fn refresh(metadata: &AuthMetadata, client_id: &str, refresh_token: &s
             .unwrap_or("the provider gave no reason");
         anyhow::bail!("refusing to refresh the session (HTTP {status}): {why}");
     }
-    let rotated = body["refresh_token"].as_str().filter(|t| !t.is_empty()).unwrap_or(refresh_token);
+    let rotated = body["refresh_token"]
+        .as_str()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(refresh_token);
     Ok((access.to_string(), rotated.to_string()))
 }
 
@@ -245,8 +291,14 @@ mod tests {
 
     #[test]
     fn waiting_is_not_failing() {
-        assert_eq!(classify(403, &json!({ "error": "authorization_pending" })), Poll::Pending);
-        assert_eq!(classify(400, &json!({ "error": "slow_down" })), Poll::SlowDown);
+        assert_eq!(
+            classify(403, &json!({ "error": "authorization_pending" })),
+            Poll::Pending
+        );
+        assert_eq!(
+            classify(400, &json!({ "error": "slow_down" })),
+            Poll::SlowDown
+        );
     }
 
     /// The refresh token is part of the approval, not an extra. Dropping it
@@ -254,29 +306,42 @@ mod tests {
     /// never again, with no password to fall back on.
     #[test]
     fn an_approval_carries_both_tokens() {
-        let p = classify(200, &json!({
-            "access_token": "syt_x", "token_type": "Bearer",
-            "refresh_token": "mar_y", "expires_in": 300
-        }));
-        assert_eq!(p, Poll::Approved {
-            access_token: "syt_x".to_string(),
-            refresh_token: "mar_y".to_string(),
-            expires_in: 300,
-        });
+        let p = classify(
+            200,
+            &json!({
+                "access_token": "syt_x", "token_type": "Bearer",
+                "refresh_token": "mar_y", "expires_in": 300
+            }),
+        );
+        assert_eq!(
+            p,
+            Poll::Approved {
+                access_token: "syt_x".to_string(),
+                refresh_token: "mar_y".to_string(),
+                expires_in: 300,
+            }
+        );
     }
 
     /// The two ends of the flow, which must stop it rather than spin.
     #[test]
     fn expiry_and_refusal_both_stop() {
-        assert!(matches!(classify(400, &json!({ "error": "expired_token" })), Poll::Stopped(m) if m.contains("expired")));
-        assert!(matches!(classify(400, &json!({ "error": "access_denied" })), Poll::Stopped(m) if m.contains("refused")));
+        assert!(
+            matches!(classify(400, &json!({ "error": "expired_token" })), Poll::Stopped(m) if m.contains("expired"))
+        );
+        assert!(
+            matches!(classify(400, &json!({ "error": "access_denied" })), Poll::Stopped(m) if m.contains("refused"))
+        );
     }
 
     /// An error nobody anticipated is still an end, and says what it was
     /// rather than "something went wrong".
     #[test]
     fn an_unknown_error_reports_itself() {
-        let p = classify(400, &json!({ "error": "invalid_client", "error_description": "no such client" }));
+        let p = classify(
+            400,
+            &json!({ "error": "invalid_client", "error_description": "no such client" }),
+        );
         assert!(matches!(p, Poll::Stopped(m) if m == "no such client"));
         let bare = classify(400, &json!({ "error": "invalid_grant" }));
         assert!(matches!(bare, Poll::Stopped(m) if m == "invalid_grant"));
@@ -287,7 +352,10 @@ mod tests {
     #[test]
     fn nothing_at_all_is_not_approval() {
         assert!(matches!(classify(500, &json!({})), Poll::Stopped(m) if m.contains("500")));
-        assert!(matches!(classify(200, &json!({ "access_token": "" })), Poll::Stopped(_)));
+        assert!(matches!(
+            classify(200, &json!({ "access_token": "" })),
+            Poll::Stopped(_)
+        ));
     }
 
     #[test]

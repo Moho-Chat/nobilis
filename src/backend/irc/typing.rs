@@ -23,9 +23,11 @@ pub(super) const TYPING_TTL: Duration = Duration::from_secs(6);
 /// it exists so that one person going quiet removes one name from a list
 /// rather than clearing the whole list, which is what emitting a bare "nobody
 /// is typing" would do to the other people still writing.
-pub(super) fn typers() -> &'static std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>> {
-    static TYPERS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>> =
-        std::sync::OnceLock::new();
+pub(super) fn typers(
+) -> &'static std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>> {
+    static TYPERS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, HashMap<String, std::time::Instant>>>,
+    > = std::sync::OnceLock::new();
     TYPERS.get_or_init(Default::default)
 }
 
@@ -106,14 +108,25 @@ pub fn send_typing(state: &AppState, account_id: &str, target: &str, typing: boo
 ///
 /// The same event every other backend emits for this, so the window needs to
 /// know nothing about how IRC says it.
-pub(super) fn note_typing(state: &AppState, account_id: &str, from: &str, target: &str, value: &str) {
+pub(super) fn note_typing(
+    state: &AppState,
+    account_id: &str,
+    from: &str,
+    target: &str,
+    value: &str,
+) {
     let Some(said) = TypingState::parse(value) else {
         return;
     };
     // Our own typing, reflected back by a server that echoes what we send.
     // Announcing it would put this account's own name in its own "somebody is
     // typing" line.
-    if from.eq_ignore_ascii_case(&state.runtime.irc_current_nick(account_id).unwrap_or_default()) {
+    if from.eq_ignore_ascii_case(
+        &state
+            .runtime
+            .irc_current_nick(account_id)
+            .unwrap_or_default(),
+    ) {
         return;
     }
     let buffer_name = if is_channel(target) { target } else { from };
@@ -155,11 +168,20 @@ mod typing_tests {
     fn active_adds_and_done_removes_only_that_person() {
         let now = Instant::now();
         let mut room = HashMap::new();
-        assert_eq!(fold_typing(&mut room, "ada", TypingState::Active, now), vec!["ada"]);
-        assert_eq!(fold_typing(&mut room, "grace", TypingState::Active, now), vec!["ada", "grace"]);
+        assert_eq!(
+            fold_typing(&mut room, "ada", TypingState::Active, now),
+            vec!["ada"]
+        );
+        assert_eq!(
+            fold_typing(&mut room, "grace", TypingState::Active, now),
+            vec!["ada", "grace"]
+        );
         // The whole point of keeping the set: one person stopping does not
         // clear the other.
-        assert_eq!(fold_typing(&mut room, "ada", TypingState::Done, now), vec!["grace"]);
+        assert_eq!(
+            fold_typing(&mut room, "ada", TypingState::Done, now),
+            vec!["grace"]
+        );
     }
 
     #[test]
@@ -168,7 +190,10 @@ mod typing_tests {
         let mut room = HashMap::new();
         fold_typing(&mut room, "ada", TypingState::Active, now);
         // A half-written line left in the box is still a line being written.
-        assert_eq!(fold_typing(&mut room, "ada", TypingState::Paused, now), vec!["ada"]);
+        assert_eq!(
+            fold_typing(&mut room, "ada", TypingState::Paused, now),
+            vec!["ada"]
+        );
     }
 
     #[test]

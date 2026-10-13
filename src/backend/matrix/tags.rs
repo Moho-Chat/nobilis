@@ -33,7 +33,10 @@ pub const SERVER_NOTICE: &str = "m.server_notice";
 /// Whether a room is starred, and whether it is pushed down.
 pub fn read(content: &Value) -> (bool, bool) {
     let tags = &content["tags"];
-    (tags.get(FAVOURITE).is_some(), tags.get(LOW_PRIORITY).is_some())
+    (
+        tags.get(FAVOURITE).is_some(),
+        tags.get(LOW_PRIORITY).is_some(),
+    )
 }
 
 /// Whether this is the room the homeserver itself talks in.
@@ -43,9 +46,13 @@ pub fn is_server_notices(content: &Value) -> bool {
 
 /// Applies a room's `m.tag` to the buffer it belongs to.
 pub(super) fn apply(state: &AppState, account_id: &str, room_id: &str, content: &Value) {
-    let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else { return };
+    let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else {
+        return;
+    };
     let (favourite, low_priority) = read(content);
-    state.runtime.set_buffer_tags(state, &buffer_id, favourite, low_priority);
+    state
+        .runtime
+        .set_buffer_tags(state, &buffer_id, favourite, low_priority);
     if is_server_notices(content) {
         state.runtime.set_buffer_service_room(state, &buffer_id);
     }
@@ -62,7 +69,12 @@ pub(super) fn apply(state: &AppState, account_id: &str, room_id: &str, content: 
 /// One sync rather than a request per room - a `/user/.../rooms/.../tags` for
 /// each of eighty rooms is eighty requests to learn that four of them are
 /// favourites.
-pub(super) async fn fetch(state: &AppState, account_id: &str, homeserver_url: &str, access_token: &str) -> Result<()> {
+pub(super) async fn fetch(
+    state: &AppState,
+    account_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+) -> Result<()> {
     let filter = serde_json::json!({
         // Nothing but the account data. A timeline limit of zero is not
         // something every homeserver will agree to, hence one.
@@ -75,10 +87,18 @@ pub(super) async fn fetch(state: &AppState, account_id: &str, homeserver_url: &s
         homeserver_url.trim_end_matches('/'),
         url::form_urlencoded::byte_serialize(filter.as_bytes()).collect::<String>()
     );
-    let resp = http::get_json(&url, access_token).await.context("tag sync")?;
-    let Some(joined) = resp["rooms"]["join"].as_object() else { return Ok(()) };
+    let resp = http::get_json(&url, access_token)
+        .await
+        .context("tag sync")?;
+    let Some(joined) = resp["rooms"]["join"].as_object() else {
+        return Ok(());
+    };
     for (room_id, room) in joined {
-        for event in room["account_data"]["events"].as_array().into_iter().flatten() {
+        for event in room["account_data"]["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
             if event["type"].as_str() == Some("m.tag") {
                 apply(state, account_id, room_id, &event["content"]);
             }
@@ -93,12 +113,24 @@ pub(super) async fn fetch(state: &AppState, account_id: &str, homeserver_url: &s
 /// right granularity: the tag list is shared with every other client, and
 /// replacing it whole to change one entry would drop tags this client does
 /// not understand.
-pub async fn set(state: &AppState, account_id: &str, buffer_id: &str, tag: &str, on: bool) -> Result<()> {
+pub async fn set(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    tag: &str,
+    on: bool,
+) -> Result<()> {
     if tag != FAVOURITE && tag != LOW_PRIORITY {
         anyhow::bail!("{tag} is not a tag this client sets");
     }
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
-    let room_id = state.runtime.get_matrix_room(buffer_id).context("no room for this conversation")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
+    let room_id = state
+        .runtime
+        .get_matrix_room(buffer_id)
+        .context("no room for this conversation")?;
     let url = format!(
         "{}/_matrix/client/v3/user/{}/rooms/{}/tags/{}",
         account.homeserver_url.trim_end_matches('/'),
@@ -111,9 +143,17 @@ pub async fn set(state: &AppState, account_id: &str, buffer_id: &str, tag: &str,
         // inside a band keep the recency order they already had. Sending a
         // middling one rather than none so a client that *does* sort by it
         // has something to sort by.
-        http::put_json(&url, &account.access_token, serde_json::json!({ "order": 0.5 })).await.context("adding the tag")?;
+        http::put_json(
+            &url,
+            &account.access_token,
+            serde_json::json!({ "order": 0.5 }),
+        )
+        .await
+        .context("adding the tag")?;
     } else {
-        http::delete_json(&url, &account.access_token).await.context("removing the tag")?;
+        http::delete_json(&url, &account.access_token)
+            .await
+            .context("removing the tag")?;
     }
 
     // Shown now rather than when the next sync says so. The server echoes the
@@ -125,7 +165,9 @@ pub async fn set(state: &AppState, account_id: &str, buffer_id: &str, tag: &str,
     } else {
         low_priority = on;
     }
-    state.runtime.set_buffer_tags(state, buffer_id, favourite, low_priority);
+    state
+        .runtime
+        .set_buffer_tags(state, buffer_id, favourite, low_priority);
     Ok(())
 }
 
@@ -159,7 +201,10 @@ mod tests {
     fn the_tags_are_spelled_the_way_the_spec_spells_them() {
         assert_eq!(FAVOURITE, "m.favourite");
         assert_eq!(LOW_PRIORITY, "m.lowpriority");
-        assert_eq!(read(&json!({ "tags": { "m.low_priority": {} } })), (false, false));
+        assert_eq!(
+            read(&json!({ "tags": { "m.low_priority": {} } })),
+            (false, false)
+        );
     }
 
     /// The homeserver's own room, which it marks itself. Not a sorting tag
@@ -171,7 +216,9 @@ mod tests {
         // And it is not a favourite or a low priority by being one.
         assert_eq!(read(&notices), (false, false));
 
-        assert!(!is_server_notices(&json!({ "tags": { "m.favourite": {} } })));
+        assert!(!is_server_notices(
+            &json!({ "tags": { "m.favourite": {} } })
+        ));
         assert!(!is_server_notices(&json!({})));
     }
 }

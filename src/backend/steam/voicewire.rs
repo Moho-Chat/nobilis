@@ -37,8 +37,7 @@ pub struct AnswerOneOnOneChatRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct AnswerOneOnOneChatResponse {
-}
+pub struct AnswerOneOnOneChatResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct OneOnOneChatRequestResponseNotification {
@@ -57,8 +56,7 @@ pub struct EndOneOnOneChatRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct EndOneOnOneChatResponse {
-}
+pub struct EndOneOnOneChatResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct LeaveOneOnOneChatRequest {
@@ -69,8 +67,7 @@ pub struct LeaveOneOnOneChatRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct LeaveOneOnOneChatResponse {
-}
+pub struct LeaveOneOnOneChatResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct UserJoinedVoiceChatNotification {
@@ -159,8 +156,7 @@ pub struct UpdateUserVideoStatusRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct UpdateUserVideoStatusResponse {
-}
+pub struct UpdateUserVideoStatusResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct UploadClientVoiceChatLogsRequest {
@@ -171,8 +167,7 @@ pub struct UploadClientVoiceChatLogsRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct UploadClientVoiceChatLogsResponse {
-}
+pub struct UploadClientVoiceChatLogsResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct LeaveVoiceChatRequest {
@@ -181,8 +176,7 @@ pub struct LeaveVoiceChatRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct LeaveVoiceChatResponse {
-}
+pub struct LeaveVoiceChatResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct UserLeftVoiceChatNotification {
@@ -299,8 +293,7 @@ pub struct AcknowledgeUpdatedRemoteDescriptionRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct AcknowledgeUpdatedRemoteDescriptionResponse {
-}
+pub struct AcknowledgeUpdatedRemoteDescriptionResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RoomJoinVoiceChatRequest {
@@ -325,8 +318,7 @@ pub struct RoomLeaveVoiceChatRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct RoomLeaveVoiceChatResponse {
-}
+pub struct RoomLeaveVoiceChatResponse {}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RoomNotifyShouldRejoinChatRoomVoiceChatNotification {
@@ -343,12 +335,19 @@ mod tests {
     const GOLDEN: &str = include_str!("golden/voice_golden.txt");
 
     fn unhex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     fn round_trips<M: Message + Default>(name: &str, bytes: &[u8]) {
         let decoded = M::decode(bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-        assert_eq!(decoded.encode_to_vec(), bytes, "{name} does not encode to what the reference library wrote");
+        assert_eq!(
+            decoded.encode_to_vec(),
+            bytes,
+            "{name} does not encode to what the reference library wrote"
+        );
     }
 
     #[test]
@@ -365,7 +364,45 @@ mod tests {
                     }
                 };
             }
-            cases!(RequestOneOnOneChatRequest, RequestOneOnOneChatResponse, OneOnOneChatRequestedNotification, AnswerOneOnOneChatRequest, AnswerOneOnOneChatResponse, OneOnOneChatRequestResponseNotification, EndOneOnOneChatRequest, EndOneOnOneChatResponse, LeaveOneOnOneChatRequest, LeaveOneOnOneChatResponse, UserJoinedVoiceChatNotification, UserVoiceStatusNotification, AllMembersStatusNotification, UpdateVoiceChatWebRTCDataRequest, UpdateVoiceChatWebRTCDataResponse, UpdateUserVideoStatusRequest, UpdateUserVideoStatusResponse, UploadClientVoiceChatLogsRequest, UploadClientVoiceChatLogsResponse, LeaveVoiceChatRequest, LeaveVoiceChatResponse, UserLeftVoiceChatNotification, VoiceChatEndedNotification, InitiateWebRTCConnectionRequest, InitiateWebRTCConnectionResponse, UpdateWebRTCConnectionRequest, UpdateWebRTCConnectionResponse, WebRTCSessionConnectedNotification, WebRTCUpdateRemoteDescriptionNotification, WebRTCUpdateRemoteDescriptionNotificationSsrcAccount, AcknowledgeUpdatedRemoteDescriptionRequest, AcknowledgeUpdatedRemoteDescriptionResponse, RoomJoinVoiceChatRequest, RoomJoinVoiceChatResponse, RoomLeaveVoiceChatRequest, RoomLeaveVoiceChatResponse, RoomNotifyShouldRejoinChatRoomVoiceChatNotification);
+            cases!(
+                RequestOneOnOneChatRequest,
+                RequestOneOnOneChatResponse,
+                OneOnOneChatRequestedNotification,
+                AnswerOneOnOneChatRequest,
+                AnswerOneOnOneChatResponse,
+                OneOnOneChatRequestResponseNotification,
+                EndOneOnOneChatRequest,
+                EndOneOnOneChatResponse,
+                LeaveOneOnOneChatRequest,
+                LeaveOneOnOneChatResponse,
+                UserJoinedVoiceChatNotification,
+                UserVoiceStatusNotification,
+                AllMembersStatusNotification,
+                UpdateVoiceChatWebRTCDataRequest,
+                UpdateVoiceChatWebRTCDataResponse,
+                UpdateUserVideoStatusRequest,
+                UpdateUserVideoStatusResponse,
+                UploadClientVoiceChatLogsRequest,
+                UploadClientVoiceChatLogsResponse,
+                LeaveVoiceChatRequest,
+                LeaveVoiceChatResponse,
+                UserLeftVoiceChatNotification,
+                VoiceChatEndedNotification,
+                InitiateWebRTCConnectionRequest,
+                InitiateWebRTCConnectionResponse,
+                UpdateWebRTCConnectionRequest,
+                UpdateWebRTCConnectionResponse,
+                WebRTCSessionConnectedNotification,
+                WebRTCUpdateRemoteDescriptionNotification,
+                WebRTCUpdateRemoteDescriptionNotificationSsrcAccount,
+                AcknowledgeUpdatedRemoteDescriptionRequest,
+                AcknowledgeUpdatedRemoteDescriptionResponse,
+                RoomJoinVoiceChatRequest,
+                RoomJoinVoiceChatResponse,
+                RoomLeaveVoiceChatRequest,
+                RoomLeaveVoiceChatResponse,
+                RoomNotifyShouldRejoinChatRoomVoiceChatNotification
+            );
             seen += 1;
         }
         assert_eq!(seen, 37);

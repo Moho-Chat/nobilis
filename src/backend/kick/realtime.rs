@@ -34,7 +34,14 @@ pub fn client_id() -> String {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
 }
 
 /// Where the service is. Asked, not written down: the address names a region,
@@ -44,7 +51,9 @@ pub async fn address(http: &reqwest::Client, client: &str) -> Result<String> {
         "client": { "id": client, "type": PLATFORM },
         "capabilities": { "accepted_providers": [ { "provider": "centrifugo" } ] }
     });
-    let answer = post(http, "/api/v1/realtime/connection", None, body).await.context("asking Kick where its realtime service is")?;
+    let answer = post(http, "/api/v1/realtime/connection", None, body)
+        .await
+        .context("asking Kick where its realtime service is")?;
     answer["data"]["connections"]
         .as_array()
         .into_iter()
@@ -58,12 +67,31 @@ pub async fn address(http: &reqwest::Client, client: &str) -> Result<String> {
 /// The token a connection is opened (or renewed) with. `bearer` is the signed-in
 /// account's own token where the client is one; a guest needs none.
 pub async fn token(http: &reqwest::Client, client: &str, bearer: Option<&str>) -> Result<String> {
-    let answer = post(http, "/api/v1/realtime/auth/connection", bearer, json!({ "client_id": client })).await.context("asking Kick for a realtime token")?;
-    answer["data"]["token"].as_str().map(str::to_string).context("Kick sent no realtime token")
+    let answer = post(
+        http,
+        "/api/v1/realtime/auth/connection",
+        bearer,
+        json!({ "client_id": client }),
+    )
+    .await
+    .context("asking Kick for a realtime token")?;
+    answer["data"]["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("Kick sent no realtime token")
 }
 
-async fn post(http: &reqwest::Client, path: &str, bearer: Option<&str>, body: Value) -> Result<Value> {
-    let mut request = http.post(format!("{WEB_ROOT}{path}")).header("Accept", "application/json").header("x-app-platform", PLATFORM).json(&body);
+async fn post(
+    http: &reqwest::Client,
+    path: &str,
+    bearer: Option<&str>,
+    body: Value,
+) -> Result<Value> {
+    let mut request = http
+        .post(format!("{WEB_ROOT}{path}"))
+        .header("Accept", "application/json")
+        .header("x-app-platform", PLATFORM)
+        .json(&body);
     if let Some(bearer) = bearer {
         request = request.bearer_auth(bearer);
     }
@@ -115,7 +143,11 @@ pub enum Said {
     Connected { ttl: Option<u64> },
     /// Something was published to a channel: the event it names, and its data
     /// read out of the string it arrives in.
-    Published { channel: String, event: String, data: Value },
+    Published {
+        channel: String,
+        event: String,
+        data: Value,
+    },
     /// A request was refused.
     Refused(String),
     /// The service is ending the connection.
@@ -126,7 +158,11 @@ pub enum Said {
 
 /// Reads one websocket message, which may hold several frames.
 pub fn read(text: &str) -> Vec<Said> {
-    text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|v| read_frame(&v)).collect()
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|v| read_frame(&v))
+        .collect()
 }
 
 fn read_frame(v: &Value) -> Said {
@@ -141,7 +177,11 @@ fn read_frame(v: &Value) -> Said {
         });
     }
     if let Some(connect) = v.get("connect") {
-        let ttl = connect.get("expires").and_then(|e| e.as_bool()).filter(|e| *e).and_then(|_| connect["ttl"].as_u64());
+        let ttl = connect
+            .get("expires")
+            .and_then(|e| e.as_bool())
+            .filter(|e| *e)
+            .and_then(|_| connect["ttl"].as_u64());
         return Said::Connected { ttl };
     }
     if let Some(d) = v.get("disconnect") {
@@ -160,7 +200,11 @@ fn read_frame(v: &Value) -> Said {
                     Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
                     other => other.clone(),
                 };
-                return Said::Published { channel: channel.to_string(), event: event.to_string(), data };
+                return Said::Published {
+                    channel: channel.to_string(),
+                    event: event.to_string(),
+                    data,
+                };
             }
         }
         if let Some(d) = push.get("disconnect") {
@@ -187,7 +231,10 @@ mod tests {
     fn what_a_chat_channel_sends_is_read() {
         let hello = r#"{"id":1,"connect":{"client":"c","version":"6.9.7 PRO","expires":true,"ttl":2700,"ping":25,"pong":true}}"#;
         assert_eq!(read(hello), vec![Said::Connected { ttl: Some(2700) }]);
-        assert_eq!(read(r#"{"id":1,"connect":{"client":"c","ping":25}}"#), vec![Said::Connected { ttl: None }]);
+        assert_eq!(
+            read(r#"{"id":1,"connect":{"client":"c","ping":25}}"#),
+            vec![Said::Connected { ttl: None }]
+        );
         assert_eq!(read("{}"), vec![Said::Ping]);
         assert_eq!(read(r#"{"id":2,"subscribe":{}}"#), vec![Said::Other]);
 
@@ -195,9 +242,19 @@ mod tests {
         let said = read(publication);
         assert_eq!(said.len(), 1);
         match &said[0] {
-            Said::Published { channel, event, data } => {
-                assert_eq!((channel.as_str(), event.as_str()), ("chatrooms.668.v2", "App\\Events\\ChatMessageEvent"));
-                assert_eq!((data["chatroom_id"].as_u64(), data["content"].as_str()), (Some(668), Some("hi")));
+            Said::Published {
+                channel,
+                event,
+                data,
+            } => {
+                assert_eq!(
+                    (channel.as_str(), event.as_str()),
+                    ("chatrooms.668.v2", "App\\Events\\ChatMessageEvent")
+                );
+                assert_eq!(
+                    (data["chatroom_id"].as_u64(), data["content"].as_str()),
+                    (Some(668), Some("hi"))
+                );
             }
             other => panic!("{other:?}"),
         }
@@ -206,22 +263,45 @@ mod tests {
     #[test]
     fn several_frames_in_one_message_are_all_read() {
         let both = "{}\n{\"id\":3,\"subscribe\":{}}\n\n{\"id\":4,\"error\":{\"code\":103,\"message\":\"permission denied\"}}";
-        assert_eq!(read(both), vec![Said::Ping, Said::Other, Said::Refused("permission denied (103)".into())]);
+        assert_eq!(
+            read(both),
+            vec![
+                Said::Ping,
+                Said::Other,
+                Said::Refused("permission denied (103)".into())
+            ]
+        );
     }
 
     #[test]
     fn an_ending_is_read_with_its_reason() {
-        assert_eq!(read(r#"{"disconnect":{"code":3005,"reason":"expired"}}"#), vec![Said::Disconnect("expired (3005)".into())]);
+        assert_eq!(
+            read(r#"{"disconnect":{"code":3005,"reason":"expired"}}"#),
+            vec![Said::Disconnect("expired (3005)".into())]
+        );
     }
 
     #[test]
     fn the_requests_are_what_the_service_takes() {
         let c = connect("jwt");
-        assert_eq!((c["connect"]["token"].as_str(), c["connect"]["name"].as_str()), (Some("jwt"), Some("js")));
-        assert_eq!(subscribe("chatrooms.1.v2")["subscribe"]["channel"], json!("chatrooms.1.v2"));
+        assert_eq!(
+            (
+                c["connect"]["token"].as_str(),
+                c["connect"]["name"].as_str()
+            ),
+            (Some("jwt"), Some("js"))
+        );
+        assert_eq!(
+            subscribe("chatrooms.1.v2")["subscribe"]["channel"],
+            json!("chatrooms.1.v2")
+        );
         assert_eq!(unsubscribe("x")["unsubscribe"]["channel"], json!("x"));
         assert_eq!(refresh("t")["refresh"]["token"], json!("t"));
-        assert_ne!(connect("a")["id"], connect("a")["id"], "each request has a number of its own");
+        assert_ne!(
+            connect("a")["id"],
+            connect("a")["id"],
+            "each request has a number of its own"
+        );
         assert_eq!(pong(), json!({}));
     }
 }

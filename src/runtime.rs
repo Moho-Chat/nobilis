@@ -53,8 +53,10 @@ impl VoiceFlags {
             // Either kind of mute counts. A server mute and muting yourself
             // are different in who can undo them and identical in whether
             // anything is audible, and this says whether anything is audible.
-            muted: d["self_mute"].as_bool().unwrap_or(false) || d["mute"].as_bool().unwrap_or(false),
-            deafened: d["self_deaf"].as_bool().unwrap_or(false) || d["deaf"].as_bool().unwrap_or(false),
+            muted: d["self_mute"].as_bool().unwrap_or(false)
+                || d["mute"].as_bool().unwrap_or(false),
+            deafened: d["self_deaf"].as_bool().unwrap_or(false)
+                || d["deaf"].as_bool().unwrap_or(false),
             suppressed: d["suppress"].as_bool().unwrap_or(false),
             hand_raised: d["request_to_speak_timestamp"].as_str().is_some(),
         }
@@ -195,7 +197,10 @@ impl DccState {
 
     /// Still going, so it counts against the concurrency limit.
     pub fn active(self) -> bool {
-        matches!(self, DccState::Offered | DccState::Receiving | DccState::Sending)
+        matches!(
+            self,
+            DccState::Offered | DccState::Receiving | DccState::Sending
+        )
     }
 }
 
@@ -499,7 +504,8 @@ pub struct Runtime {
     /// different questions on every service: Discord Nitro reaches every
     /// guild's emoji from anywhere, and a Kick subscription reaches that
     /// channel's emotes across the whole site.
-    emoji_catalogue: Mutex<HashMap<String, std::collections::BTreeMap<String, crate::model::EmojiSource>>>,
+    emoji_catalogue:
+        Mutex<HashMap<String, std::collections::BTreeMap<String, crate::model::EmojiSource>>>,
     /// Whether this account's subscription lets it use emoji away from where
     /// they live - Discord Nitro. Absent means no.
     emoji_unrestricted: Mutex<std::collections::HashSet<String>>,
@@ -526,10 +532,12 @@ pub struct Runtime {
     /// its own permanent websocket (see backend/sneedchat/mod.rs), so
     /// sending has to target the specific room's own socket rather than
     /// one shared per-account sender.
-    sneedchat_senders: Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
+    sneedchat_senders:
+        Mutex<HashMap<String, HashMap<u32, tokio::sync::mpsc::UnboundedSender<String>>>>,
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
-    kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
+    kick_senders:
+        Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
@@ -606,7 +614,8 @@ pub struct Runtime {
     /// this account has: a pack shared by one room is still a pack, and
     /// hiding it in every other room would be a picker that changes its mind
     /// depending on where you opened it.
-    matrix_stickers: Mutex<HashMap<String, HashMap<String, Vec<crate::backend::matrix::stickers::Sticker>>>>,
+    matrix_stickers:
+        Mutex<HashMap<String, HashMap<String, Vec<crate::backend::matrix::stickers::Sticker>>>>,
     /// Accounts whose server has answered a MONITOR - see irc_monitors.
     irc_monitor: Mutex<std::collections::HashSet<String>>,
     /// Matrix-specific: buffer id -> room id. Matrix buffer *names* are
@@ -682,7 +691,8 @@ pub struct Runtime {
     /// sync-loop task, so sendMessage/toggleReaction RPC handlers - which
     /// run on a different task - can reach it to encrypt outgoing content
     /// and share room keys (phase 4).
-    matrix_machines: Mutex<HashMap<String, std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>>>,
+    matrix_machines:
+        Mutex<HashMap<String, std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>>>,
     /// Matrix-specific: buffer ids whose room has ever received an
     /// `m.room.encryption` state event - sticky per room, per the C-S API
     /// spec (a room can't be un-encrypted once encryption is turned on).
@@ -708,7 +718,8 @@ pub struct Runtime {
     /// generated id rather than matrix-sdk-crypto's own flow_id so the
     /// frontend never needs to know that shape, same reasoning as
     /// matrixLoginStatus's loginId.
-    matrix_verifications: Mutex<HashMap<String, crate::backend::matrix::verification::ActiveVerification>>,
+    matrix_verifications:
+        Mutex<HashMap<String, crate::backend::matrix::verification::ActiveVerification>>,
     /// Matrix-specific: account ids that currently have server-side key
     /// backup enabled - a synchronous cache of what's really tracked
     /// inside each account's `BackupMachine` (async-only to query), same
@@ -772,7 +783,8 @@ pub struct Runtime {
     /// Kept by id rather than as a list because a widget is a state event:
     /// what arrives is one of them changing, and it is removed by its content
     /// being emptied rather than by anything saying it went away.
-    matrix_widgets: Mutex<HashMap<(String, String), std::collections::BTreeMap<String, serde_json::Value>>>,
+    matrix_widgets:
+        Mutex<HashMap<(String, String), std::collections::BTreeMap<String, serde_json::Value>>>,
     /// (account, room) -> the person a room is a direct message with, per the
     /// account's own `m.direct` list.
     ///
@@ -977,7 +989,11 @@ fn rename_own_mentions(body: &str, nick: &str, alias: &str) -> String {
             continue;
         }
         // An `@` already in front is part of the mention, not text around it.
-        let keep_to = if before == Some('@') { start - 1 } else { start };
+        let keep_to = if before == Some('@') {
+            start - 1
+        } else {
+            start
+        };
         out.push_str(&body[at..keep_to]);
         out.push('@');
         out.push_str(alias);
@@ -1159,11 +1175,17 @@ impl Runtime {
     /// buffer was already in flight) - the caller must pair a `true`
     /// result with a later finish_discord_history_fetch() call.
     pub fn try_start_discord_history_fetch(&self, buffer_id: &str) -> bool {
-        self.discord_history_inflight.lock().unwrap().insert(buffer_id.to_string())
+        self.discord_history_inflight
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string())
     }
 
     pub fn finish_discord_history_fetch(&self, buffer_id: &str) {
-        self.discord_history_inflight.lock().unwrap().remove(buffer_id);
+        self.discord_history_inflight
+            .lock()
+            .unwrap()
+            .remove(buffer_id);
     }
 
     pub fn list_accounts(&self, state: &AppState) -> Vec<Account> {
@@ -1183,7 +1205,10 @@ impl Runtime {
             // IRC first and only while connected, since a configured nick is
             // not the nick in use if the session landed on the alt; every
             // other service reports the identity its backend registered.
-            if let Some(nick) = self.irc_current_nick(&account.id).or_else(|| self.own_identity(&account.id)) {
+            if let Some(nick) = self
+                .irc_current_nick(&account.id)
+                .or_else(|| self.own_identity(&account.id))
+            {
                 account.current_nick = nick;
             }
             // This account's own words, not the global ones: the field this
@@ -1202,33 +1227,51 @@ impl Runtime {
             .iter()
             .map(|cfg| {
                 let id = cfg.account_id();
-                let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+                let conn = conn_states
+                    .get(&id)
+                    .map(|s| s.as_str())
+                    .unwrap_or("disconnected");
                 irc_account_to_json(cfg, conn)
             })
             .collect();
         out.extend(state.accounts.all_discord().iter().map(|cfg| {
             let id = cfg.account_id();
-            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            let conn = conn_states
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("disconnected");
             crate::accounts::discord_account_to_json(cfg, conn)
         }));
         out.extend(state.accounts.all_sneedchat().iter().map(|cfg| {
             let id = cfg.account_id();
-            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            let conn = conn_states
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("disconnected");
             crate::accounts::sneedchat_account_to_json(cfg, conn)
         }));
         out.extend(state.accounts.all_matrix().iter().map(|cfg| {
             let id = cfg.account_id();
-            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            let conn = conn_states
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("disconnected");
             crate::accounts::matrix_account_to_json(cfg, conn, self.has_matrix_backup(&id))
         }));
         out.extend(state.accounts.all_kick().iter().map(|cfg| {
             let id = cfg.account_id();
-            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            let conn = conn_states
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("disconnected");
             crate::accounts::kick_account_to_json(cfg, conn)
         }));
         out.extend(state.accounts.all_steam().iter().map(|cfg| {
             let id = cfg.account_id();
-            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            let conn = conn_states
+                .get(&id)
+                .map(|s| s.as_str())
+                .unwrap_or("disconnected");
             crate::accounts::steam_account_to_json(cfg, conn, self.own_identity(&id).as_deref())
         }));
         out
@@ -1246,7 +1289,9 @@ impl Runtime {
     /// something has gone wrong upstream, and the fallback is the kind that
     /// makes a mention in it findable rather than invisible.
     pub fn buffer_kind_of(&self, buffer_id: &str) -> String {
-        self.get_buffer(buffer_id).map(|b| b.kind).unwrap_or_else(|| "channel".to_string())
+        self.get_buffer(buffer_id)
+            .map(|b| b.kind)
+            .unwrap_or_else(|| "channel".to_string())
     }
 
     pub fn get_buffer(&self, buffer_id: &str) -> Option<Buffer> {
@@ -1257,8 +1302,18 @@ impl Runtime {
     /// backend's own position, then name, so the order is stable across
     /// restarts rather than whatever order the gateway happened to send.
     pub fn list_buffer_groups(&self) -> Vec<crate::model::BufferGroup> {
-        let mut out: Vec<_> = self.buffer_groups.lock().unwrap().values().cloned().collect();
-        out.sort_by(|a, b| a.position.cmp(&b.position).then_with(|| a.name.cmp(&b.name)));
+        let mut out: Vec<_> = self
+            .buffer_groups
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         out
     }
 
@@ -1293,7 +1348,10 @@ impl Runtime {
                 // state and the backend say that afresh.
                 buffer.link = None;
                 buffer.syncing = false;
-                buffer.last_activity_ts = state.store.last_activity(&buffer.id).unwrap_or(buffer.last_activity_ts);
+                buffer.last_activity_ts = state
+                    .store
+                    .last_activity(&buffer.id)
+                    .unwrap_or(buffer.last_activity_ts);
                 pending.insert(buffer.id.clone(), ());
                 live.entry(buffer.id.clone()).or_insert(buffer);
                 restored += 1;
@@ -1314,9 +1372,16 @@ impl Runtime {
 
     /// Marks a restored entry as seen again from its service.
     fn confirm_restored(&self, account_id: &str, id: &str, group: bool) {
-        let map = if group { &self.restored_groups } else { &self.restored_buffers };
+        let map = if group {
+            &self.restored_groups
+        } else {
+            &self.restored_buffers
+        };
         if map.lock().unwrap().remove(id).is_some() {
-            self.layout_confirmed.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
+            self.layout_confirmed
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string(), std::time::Instant::now());
         }
     }
 
@@ -1341,8 +1406,13 @@ impl Runtime {
             .collect();
         buffers.sort();
         buffers.hash(&mut h);
-        let mut groups: Vec<String> =
-            self.buffer_groups.lock().unwrap().values().map(|g| serde_json::to_string(g).unwrap_or_default()).collect();
+        let mut groups: Vec<String> = self
+            .buffer_groups
+            .lock()
+            .unwrap()
+            .values()
+            .map(|g| serde_json::to_string(g).unwrap_or_default())
+            .collect();
         groups.sort();
         groups.hash(&mut h);
         h.finish()
@@ -1351,7 +1421,13 @@ impl Runtime {
     /// Writes the layout as it stands, for the next start to put back.
     pub fn save_layout(&self, state: &AppState) {
         let buffers: Vec<Buffer> = self.buffers.lock().unwrap().values().cloned().collect();
-        let groups: Vec<crate::model::BufferGroup> = self.buffer_groups.lock().unwrap().values().cloned().collect();
+        let groups: Vec<crate::model::BufferGroup> = self
+            .buffer_groups
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
         if let Err(e) = state.store.save_layout(&buffers, &groups) {
             tracing::debug!("layout: saving it failed: {e:#}");
         }
@@ -1366,11 +1442,25 @@ impl Runtime {
     /// account's servers arrive one by one after its gateway connects. Gives
     /// up waiting after five minutes; and stops if the account drops again,
     /// since an unconfirmed entry then means nothing.
-    pub fn prune_restored_after_connect(self: &std::sync::Arc<Self>, state: &AppState, account_id: &str) {
-        let has_pending = self.restored_buffers.lock().unwrap().keys().any(|k| belongs_to(account_id, k)) || {
-            let groups = self.buffer_groups.lock().unwrap();
-            self.restored_groups.lock().unwrap().keys().any(|id| groups.get(id).is_some_and(|g| g.account_id == account_id))
-        };
+    pub fn prune_restored_after_connect(
+        self: &std::sync::Arc<Self>,
+        state: &AppState,
+        account_id: &str,
+    ) {
+        let has_pending = self
+            .restored_buffers
+            .lock()
+            .unwrap()
+            .keys()
+            .any(|k| belongs_to(account_id, k))
+            || {
+                let groups = self.buffer_groups.lock().unwrap();
+                self.restored_groups
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .any(|id| groups.get(id).is_some_and(|g| g.account_id == account_id))
+            };
         if !has_pending {
             return;
         }
@@ -1380,17 +1470,33 @@ impl Runtime {
             let started = std::time::Instant::now();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if !matches!(state.runtime.conn_state(&account_id), Some(ConnState::Connected)) {
+                if !matches!(
+                    state.runtime.conn_state(&account_id),
+                    Some(ConnState::Connected)
+                ) {
                     return;
                 }
-                let last = state.runtime.layout_confirmed.lock().unwrap().get(&account_id).copied().unwrap_or(started);
-                if last.elapsed() >= QUIET || started.elapsed() >= std::time::Duration::from_secs(300) {
+                let last = state
+                    .runtime
+                    .layout_confirmed
+                    .lock()
+                    .unwrap()
+                    .get(&account_id)
+                    .copied()
+                    .unwrap_or(started);
+                if last.elapsed() >= QUIET
+                    || started.elapsed() >= std::time::Duration::from_secs(300)
+                {
                     break;
                 }
             }
             let stale: Vec<String> = {
                 let mut pending = state.runtime.restored_buffers.lock().unwrap();
-                let ids: Vec<String> = pending.keys().filter(|k| belongs_to(&account_id, k)).cloned().collect();
+                let ids: Vec<String> = pending
+                    .keys()
+                    .filter(|k| belongs_to(&account_id, k))
+                    .cloned()
+                    .collect();
                 for id in &ids {
                     pending.remove(id);
                 }
@@ -1434,7 +1540,9 @@ impl Runtime {
             }
             groups.insert(group.id.clone(), group.clone());
         }
-        state.events.emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
+        state
+            .events
+            .emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
     }
 
     /// Lifts the "you cannot speak here yet" flag on a guild.
@@ -1456,7 +1564,9 @@ impl Runtime {
             }
         };
         if let Some(group) = updated {
-            state.events.emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
+            state
+                .events
+                .emit("bufferGroupChange", serde_json::to_value(&group).unwrap());
         }
     }
 
@@ -1474,14 +1584,19 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
     /// Drops every rail entry for an account - for when it is removed, so its
     /// guilds don't sit in the rail forever with no buffers under them.
     pub fn clear_buffer_groups_for_account(&self, account_id: &str) {
-        self.buffer_groups.lock().unwrap().retain(|_, g| g.account_id != account_id);
+        self.buffer_groups
+            .lock()
+            .unwrap()
+            .retain(|_, g| g.account_id != account_id);
     }
 
     /// Re-reads a buffer's last-activity timestamp from persisted
@@ -1503,7 +1618,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -1523,7 +1640,11 @@ impl Runtime {
     pub fn remove_buffers_for_account(&self, state: &AppState, account_id: &str) {
         let ids: Vec<String> = {
             let buffers = self.buffers.lock().unwrap();
-            buffers.values().filter(|b| b.account_id == account_id).map(|b| b.id.clone()).collect()
+            buffers
+                .values()
+                .filter(|b| b.account_id == account_id)
+                .map(|b| b.id.clone())
+                .collect()
         };
         for id in ids {
             self.remove_buffer(state, &id);
@@ -1536,7 +1657,13 @@ impl Runtime {
     /// rename: the old buffer goes and a new one arrives holding what was
     /// said. Done in that order deliberately - creating first would show the
     /// channel twice for as long as it took to remove the old one.
-    pub fn rename_irc_buffer(&self, state: &AppState, account_id: &str, old_name: &str, new_name: &str) {
+    pub fn rename_irc_buffer(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        old_name: &str,
+        new_name: &str,
+    ) {
         self.rename_buffer(state, account_id, old_name, new_name, "channel");
     }
 
@@ -1546,7 +1673,14 @@ impl Runtime {
     /// do it, from any client, at any time. The kind travels with it because
     /// it is part of what the new buffer has to be created as - a direct
     /// message that acquires a name is still a direct message.
-    pub fn rename_buffer(&self, state: &AppState, account_id: &str, old_name: &str, new_name: &str, kind: &str) {
+    pub fn rename_buffer(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        old_name: &str,
+        new_name: &str,
+        kind: &str,
+    ) {
         if old_name == new_name {
             return;
         }
@@ -1557,8 +1691,12 @@ impl Runtime {
         // every one of those.
         let carried = self.get_buffer(&old_id);
         match state.store.move_buffer(&old_id, &new_id) {
-            Ok(moved) => tracing::info!("{account_id}: \"{old_name}\" is now \"{new_name}\", {moved} messages moved"),
-            Err(e) => tracing::warn!("{account_id}: moving \"{old_name}\" to \"{new_name}\": {e:#}"),
+            Ok(moved) => tracing::info!(
+                "{account_id}: \"{old_name}\" is now \"{new_name}\", {moved} messages moved"
+            ),
+            Err(e) => {
+                tracing::warn!("{account_id}: moving \"{old_name}\" to \"{new_name}\": {e:#}")
+            }
         }
         self.remove_buffer(state, &old_id);
         self.ensure_buffer(state, account_id, new_name, kind);
@@ -1600,7 +1738,10 @@ impl Runtime {
         // offered "Joined" against a room this account had left - and left no
         // way to rejoin it from there.
         self.matrix_rooms.lock().unwrap().remove(buffer_id);
-        state.events.emit("bufferListChange", json!({ "id": buffer_id, "removed": true }));
+        state.events.emit(
+            "bufferListChange",
+            json!({ "id": buffer_id, "removed": true }),
+        );
     }
 
     /// Takes a rail entry and everything under it out of the client's view.
@@ -1621,12 +1762,21 @@ impl Runtime {
             self.remove_buffer(state, &id);
         }
         self.buffer_groups.lock().unwrap().remove(group_id);
-        state.events.emit("bufferGroupChange", json!({ "id": group_id, "removed": true }));
+        state.events.emit(
+            "bufferGroupChange",
+            json!({ "id": group_id, "removed": true }),
+        );
     }
 
     /// Creates the buffer if it doesn't already exist and emits
     /// bufferListChange; no-ops (does not re-emit) if already present.
-    pub fn ensure_buffer(&self, state: &AppState, account_id: &str, name: &str, kind: &str) -> Buffer {
+    pub fn ensure_buffer(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        name: &str,
+        kind: &str,
+    ) -> Buffer {
         let id = model::buffer_id(account_id, name);
         self.confirm_restored(account_id, &id, false);
         let mut buffers = self.buffers.lock().unwrap();
@@ -1668,7 +1818,9 @@ impl Runtime {
             forum: false,
         };
         buffers.insert(id, buffer.clone());
-        state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
         buffer
     }
 
@@ -1686,10 +1838,18 @@ impl Runtime {
     /// listing every tag a room has - and because they are mutually
     /// exclusive in practice: setting one in Element clears the other, and
     /// applying them one at a time would draw a room as both for an instant.
-    pub fn set_buffer_tags(&self, state: &AppState, buffer_id: &str, favourite: bool, low_priority: bool) {
+    pub fn set_buffer_tags(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        favourite: bool,
+        low_priority: bool,
+    ) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.favourite == favourite && buffer.low_priority == low_priority {
                 return;
             }
@@ -1697,7 +1857,9 @@ impl Runtime {
             buffer.low_priority = low_priority;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     /// Whether a room lets a link in it be unfurled.
@@ -1732,46 +1894,73 @@ impl Runtime {
     pub fn set_buffer_service_room(&self, state: &AppState, buffer_id: &str) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.service_room {
                 return;
             }
             buffer.service_room = true;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     /// What this conversation is currently filed as.
     pub fn buffer_tags(&self, buffer_id: &str) -> (bool, bool) {
-        self.buffers.lock().unwrap().get(buffer_id).map(|b| (b.favourite, b.low_priority)).unwrap_or((false, false))
+        self.buffers
+            .lock()
+            .unwrap()
+            .get(buffer_id)
+            .map(|b| (b.favourite, b.low_priority))
+            .unwrap_or((false, false))
     }
 
     pub fn set_buffer_kind(&self, state: &AppState, buffer_id: &str, kind: &str) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.kind == kind {
                 return;
             }
             buffer.kind = kind.to_string();
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn conn_state(&self, account_id: &str) -> Option<ConnState> {
         self.conn_states.lock().unwrap().get(account_id).cloned()
     }
 
-    pub fn set_conn_state(&self, state: &AppState, account_id: &str, conn: ConnState, error: Option<&str>) {
+    pub fn set_conn_state(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        conn: ConnState,
+        error: Option<&str>,
+    ) {
         if conn == ConnState::Connected {
-            state.runtime.prune_restored_after_connect(state, account_id);
+            state
+                .runtime
+                .prune_restored_after_connect(state, account_id);
         }
         if conn == ConnState::Connected {
-            self.connected_at.lock().unwrap().insert(account_id.to_string(), std::time::Instant::now());
+            self.connected_at
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string(), std::time::Instant::now());
         }
-        self.conn_states.lock().unwrap().insert(account_id.to_string(), conn.clone());
+        self.conn_states
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), conn.clone());
         let mut data = json!({ "accountId": account_id, "state": conn.as_str() });
         if let Some(e) = error {
             data["error"] = json!(e);
@@ -1799,13 +1988,20 @@ impl Runtime {
         if self.conn_states.lock().unwrap().get(account_id) != Some(&ConnState::Connecting) {
             return;
         }
-        state.events.emit("connectionState", json!({ "accountId": account_id, "state": "connecting", "detail": detail }));
+        state.events.emit(
+            "connectionState",
+            json!({ "accountId": account_id, "state": "connecting", "detail": detail }),
+        );
     }
 
     /// How long the connection that just ended had been up, if it got as far
     /// as connecting at all. Taken, not read: each ended attempt answers once.
     pub fn connection_lasted(&self, account_id: &str) -> Option<std::time::Duration> {
-        self.connected_at.lock().unwrap().remove(account_id).map(|at| at.elapsed())
+        self.connected_at
+            .lock()
+            .unwrap()
+            .remove(account_id)
+            .map(|at| at.elapsed())
     }
 
     /// The wait before the next attempt, given the last one, for a retry loop
@@ -1824,7 +2020,10 @@ impl Runtime {
         initial: std::time::Duration,
         max: std::time::Duration,
     ) -> std::time::Duration {
-        if self.connection_lasted(account_id).is_some_and(|up| up >= HELD_CONNECTION) {
+        if self
+            .connection_lasted(account_id)
+            .is_some_and(|up| up >= HELD_CONNECTION)
+        {
             *delay = initial;
         }
         let wait = *delay;
@@ -1838,11 +2037,19 @@ impl Runtime {
     /// was sent once and then sat there - saying 60s for the whole minute,
     /// and still saying it once the attempt was under way. A frontend counts
     /// down to `retryAt` (milliseconds since the epoch) itself.
-    pub fn report_retry(&self, state: &AppState, account_id: &str, reason: &str, wait: std::time::Duration) {
+    pub fn report_retry(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        reason: &str,
+        wait: std::time::Duration,
+    ) {
         if self.conn_states.lock().unwrap().get(account_id) != Some(&ConnState::Connecting) {
             return;
         }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
         let retry_at = (now + wait).as_millis() as u64;
         state.events.emit(
             "connectionState",
@@ -1851,7 +2058,10 @@ impl Runtime {
     }
 
     pub fn insert_irc_handle(&self, account_id: &str, handle: IrcHandle) {
-        self.irc_handles.lock().unwrap().insert(account_id.to_string(), handle);
+        self.irc_handles
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), handle);
     }
 
     pub fn remove_irc_handle(&self, account_id: &str) {
@@ -1859,7 +2069,10 @@ impl Runtime {
     }
 
     pub fn insert_task_handle(&self, account_id: &str, handle: tokio::task::AbortHandle) {
-        self.task_handles.lock().unwrap().insert(account_id.to_string(), handle);
+        self.task_handles
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), handle);
     }
 
     /// Records a connection attempt for this account and returns how much
@@ -1870,7 +2083,11 @@ impl Runtime {
     /// burst of rapid clicks spaces attempts out by min_interval each
     /// rather than all measuring against the same original timestamp and
     /// firing together once it elapses.
-    pub fn throttle_connect_attempt(&self, account_id: &str, min_interval: std::time::Duration) -> std::time::Duration {
+    pub fn throttle_connect_attempt(
+        &self,
+        account_id: &str,
+        min_interval: std::time::Duration,
+    ) -> std::time::Duration {
         let mut attempts = self.last_connect_attempt.lock().unwrap();
         let now = std::time::Instant::now();
         let delay = match attempts.get(account_id) {
@@ -1907,7 +2124,14 @@ impl Runtime {
         self.connect_generation.lock().unwrap().get(account_id) == Some(&generation)
     }
 
-    pub fn finish_connection(&self, state: &AppState, account_id: &str, generation: u64, new_state: ConnState, error: Option<&str>) {
+    pub fn finish_connection(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        generation: u64,
+        new_state: ConnState,
+        error: Option<&str>,
+    ) {
         if self.connect_generation.lock().unwrap().get(account_id) != Some(&generation) {
             return;
         }
@@ -1953,12 +2177,16 @@ impl Runtime {
         seen: Vec<serde_json::Value>,
         resolved: &std::collections::HashSet<String>,
     ) -> bool {
-        let room_of = |invite: &serde_json::Value| invite["roomId"].as_str().unwrap_or_default().to_string();
+        let room_of =
+            |invite: &serde_json::Value| invite["roomId"].as_str().unwrap_or_default().to_string();
         let mut all = self.matrix_invites.lock().unwrap();
         let existing = all.get(account_id).cloned().unwrap_or_default();
         let mut next: Vec<serde_json::Value> = existing
             .into_iter()
-            .filter(|invite| !resolved.contains(&room_of(invite)) && !seen.iter().any(|s| room_of(s) == room_of(invite)))
+            .filter(|invite| {
+                !resolved.contains(&room_of(invite))
+                    && !seen.iter().any(|s| room_of(s) == room_of(invite))
+            })
             .collect();
         for invite in seen {
             if !resolved.contains(&room_of(&invite)) {
@@ -1975,7 +2203,12 @@ impl Runtime {
     }
 
     pub fn matrix_invites(&self, account_id: &str) -> Vec<serde_json::Value> {
-        self.matrix_invites.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.matrix_invites
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Forcibly tears down any previous connection attempt/session for this
@@ -2009,15 +2242,26 @@ impl Runtime {
     }
 
     pub fn discord_member_window(&self, buffer_id: &str) -> Vec<serde_json::Value> {
-        self.discord_member_windows.lock().unwrap().get(buffer_id).cloned().unwrap_or_default()
+        self.discord_member_windows
+            .lock()
+            .unwrap()
+            .get(buffer_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_discord_member_window(&self, buffer_id: &str, members: Vec<serde_json::Value>) {
-        self.discord_member_windows.lock().unwrap().insert(buffer_id.to_string(), members);
+        self.discord_member_windows
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), members);
     }
 
     pub fn set_presence(&self, buffer_id: &str, members: serde_json::Value) {
-        self.presence.lock().unwrap().insert(buffer_id.to_string(), members);
+        self.presence
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), members);
     }
 
     pub fn get_presence(&self, buffer_id: &str) -> Option<serde_json::Value> {
@@ -2025,7 +2269,10 @@ impl Runtime {
     }
 
     pub fn set_discord_buffer_emojis(&self, buffer_id: &str, emojis: Vec<serde_json::Value>) {
-        self.discord_buffer_emojis.lock().unwrap().insert(buffer_id.to_string(), emojis);
+        self.discord_buffer_emojis
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), emojis);
     }
 
     /// Records one place emoji come from, replacing what was known about it.
@@ -2059,12 +2306,20 @@ impl Runtime {
     }
 
     pub fn set_discord_premium(&self, account_id: &str, premium_type: u8) {
-        self.discord_premium.lock().unwrap().insert(account_id.to_string(), premium_type);
+        self.discord_premium
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), premium_type);
     }
 
     /// The account's Nitro tier, or none where READY has not said.
     pub fn discord_premium(&self, account_id: &str) -> u8 {
-        self.discord_premium.lock().unwrap().get(account_id).copied().unwrap_or(0)
+        self.discord_premium
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn emoji_unrestricted(&self, account_id: &str) -> bool {
@@ -2072,11 +2327,19 @@ impl Runtime {
     }
 
     pub fn get_discord_buffer_emojis(&self, buffer_id: &str) -> Vec<serde_json::Value> {
-        self.discord_buffer_emojis.lock().unwrap().get(buffer_id).cloned().unwrap_or_default()
+        self.discord_buffer_emojis
+            .lock()
+            .unwrap()
+            .get(buffer_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_own_identity(&self, account_id: &str, name: &str) {
-        self.own_identity.lock().unwrap().insert(account_id.to_string(), name.to_string());
+        self.own_identity
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), name.to_string());
     }
 
     pub fn own_identity(&self, account_id: &str) -> Option<String> {
@@ -2090,7 +2353,10 @@ impl Runtime {
     /// keyed the other way round, while the field is what a frontend needs to
     /// turn a `<#id>` in a message body into the channel's name.
     pub fn set_discord_channel(&self, state: &AppState, buffer_id: &str, channel_id: &str) {
-        self.discord_channels.lock().unwrap().insert(buffer_id.to_string(), channel_id.to_string());
+        self.discord_channels
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), channel_id.to_string());
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(buffer_id) {
@@ -2105,7 +2371,9 @@ impl Runtime {
         // every reconnect, and a frontend redrawing its whole list each time
         // would flicker.
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -2117,23 +2385,49 @@ impl Runtime {
     /// GUILD_MEMBER_LIST_UPDATE identifies its list by guild and a
     /// permissions-derived id rather than by channel, so the reply cannot be
     /// matched back to a channel on its own - this remembers who asked.
-    pub fn set_discord_member_list_target(&self, account_id: &str, guild_id: &str, buffer_id: &str) {
-        self.discord_member_list_targets
-            .lock()
-            .unwrap()
-            .insert((account_id.to_string(), guild_id.to_string()), buffer_id.to_string());
+    pub fn set_discord_member_list_target(
+        &self,
+        account_id: &str,
+        guild_id: &str,
+        buffer_id: &str,
+    ) {
+        self.discord_member_list_targets.lock().unwrap().insert(
+            (account_id.to_string(), guild_id.to_string()),
+            buffer_id.to_string(),
+        );
     }
 
     pub fn discord_member_list_target(&self, account_id: &str, guild_id: &str) -> Option<String> {
-        self.discord_member_list_targets.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned()
+        self.discord_member_list_targets
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), guild_id.to_string()))
+            .cloned()
     }
 
-    pub fn set_discord_voice_channels(&self, account_id: &str, guild_id: &str, channels: Vec<VoiceChannelEntry>) {
-        self.discord_voice_channels.lock().unwrap().insert((account_id.to_string(), guild_id.to_string()), channels);
+    pub fn set_discord_voice_channels(
+        &self,
+        account_id: &str,
+        guild_id: &str,
+        channels: Vec<VoiceChannelEntry>,
+    ) {
+        self.discord_voice_channels
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), guild_id.to_string()), channels);
     }
 
-    pub fn discord_voice_channels(&self, account_id: &str, guild_id: &str) -> Vec<VoiceChannelEntry> {
-        self.discord_voice_channels.lock().unwrap().get(&(account_id.to_string(), guild_id.to_string())).cloned().unwrap_or_default()
+    pub fn discord_voice_channels(
+        &self,
+        account_id: &str,
+        guild_id: &str,
+    ) -> Vec<VoiceChannelEntry> {
+        self.discord_voice_channels
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), guild_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// What a stage is about right now, while it is live. Gone when the stage
@@ -2148,7 +2442,11 @@ impl Runtime {
     }
 
     pub fn discord_stage_topic(&self, account_id: &str, channel_id: &str) -> Option<String> {
-        self.discord_stage_topics.lock().unwrap().get(&(account_id.to_string(), channel_id.to_string())).cloned()
+        self.discord_stage_topics
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), channel_id.to_string()))
+            .cloned()
     }
 
     /// The same, carrying what they are doing in there.
@@ -2175,14 +2473,25 @@ impl Runtime {
         let key = (account_id.to_string(), user_id.to_string());
         match channel_id {
             Some(c) => states
-                .insert(key, VoicePresence { channel_id: c.to_string(), flags })
+                .insert(
+                    key,
+                    VoicePresence {
+                        channel_id: c.to_string(),
+                        flags,
+                    },
+                )
                 .map(|p| p.channel_id),
             None => states.remove(&key).map(|p| p.channel_id),
         }
     }
 
     /// Everyone currently in a voice channel, excluding `except`.
-    pub fn discord_voice_occupants(&self, account_id: &str, channel_id: &str, except: &str) -> Vec<String> {
+    pub fn discord_voice_occupants(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+        except: &str,
+    ) -> Vec<String> {
         self.discord_voice_states
             .lock()
             .unwrap()
@@ -2200,10 +2509,10 @@ impl Runtime {
         if name.is_empty() {
             return;
         }
-        self.discord_voice_names
-            .lock()
-            .unwrap()
-            .insert((account_id.to_string(), user_id.to_string()), name.to_string());
+        self.discord_voice_names.lock().unwrap().insert(
+            (account_id.to_string(), user_id.to_string()),
+            name.to_string(),
+        );
     }
 
     /// Records somebody's picture, from wherever it was seen.
@@ -2215,10 +2524,10 @@ impl Runtime {
         if url.is_empty() {
             return;
         }
-        self.discord_voice_avatars
-            .lock()
-            .unwrap()
-            .insert((account_id.to_string(), user_id.to_string()), url.to_string());
+        self.discord_voice_avatars.lock().unwrap().insert(
+            (account_id.to_string(), user_id.to_string()),
+            url.to_string(),
+        );
     }
 
     /// What this account has previously learned to call somebody.
@@ -2258,7 +2567,11 @@ impl Runtime {
         let mut list = self.dcc_transfers.lock().unwrap();
         let waiting = list
             .iter()
-            .filter(|t| t.account_id == transfer.account_id && t.from == transfer.from && t.state == DccState::Offered)
+            .filter(|t| {
+                t.account_id == transfer.account_id
+                    && t.from == transfer.from
+                    && t.state == DccState::Offered
+            })
             .count();
         if waiting >= DCC_PENDING_PER_NICK {
             return None;
@@ -2268,7 +2581,11 @@ impl Runtime {
         Some(transfer)
     }
 
-    pub fn set_irc_transport(&self, account_id: &str, transport: Option<crate::net::tor::Transport>) {
+    pub fn set_irc_transport(
+        &self,
+        account_id: &str,
+        transport: Option<crate::net::tor::Transport>,
+    ) {
         let mut map = self.irc_transports.lock().unwrap();
         match transport {
             Some(t) => {
@@ -2303,12 +2620,22 @@ impl Runtime {
     }
 
     pub fn dcc_transfer(&self, id: &str) -> Option<DccTransfer> {
-        self.dcc_transfers.lock().unwrap().iter().find(|t| t.id == id).cloned()
+        self.dcc_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.id == id)
+            .cloned()
     }
 
     /// How many are offered or running, against the concurrency limit.
     pub fn dcc_active_count(&self) -> usize {
-        self.dcc_transfers.lock().unwrap().iter().filter(|t| t.state.active()).count()
+        self.dcc_transfers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.state.active())
+            .count()
     }
 
     /// Applies `edit` to one transfer and hands back what it became.
@@ -2335,7 +2662,11 @@ impl Runtime {
         }
     }
 
-    pub fn discord_voice_roster(&self, account_id: &str, channel_id: &str) -> Vec<VoiceRosterEntry> {
+    pub fn discord_voice_roster(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+    ) -> Vec<VoiceRosterEntry> {
         let names = self.discord_voice_names.lock().unwrap();
         let avatars = self.discord_voice_avatars.lock().unwrap();
         let mut out: Vec<VoiceRosterEntry> = self
@@ -2360,12 +2691,18 @@ impl Runtime {
     }
 
     /// Which guild a voice channel belongs to, if it is one we know about.
-    pub fn discord_guild_of_voice_channel(&self, account_id: &str, channel_id: &str) -> Option<String> {
+    pub fn discord_guild_of_voice_channel(
+        &self,
+        account_id: &str,
+        channel_id: &str,
+    ) -> Option<String> {
         self.discord_voice_channels
             .lock()
             .unwrap()
             .iter()
-            .find(|((a, _), channels)| a == account_id && channels.iter().any(|c| c.id == channel_id))
+            .find(|((a, _), channels)| {
+                a == account_id && channels.iter().any(|c| c.id == channel_id)
+            })
             .map(|((_, g), _)| g.clone())
     }
 
@@ -2378,7 +2715,11 @@ impl Runtime {
     }
 
     pub fn discord_voice_self(&self, account_id: &str) -> Option<String> {
-        self.discord_voice_self.lock().unwrap().get(account_id).cloned()
+        self.discord_voice_self
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     /// Records that a conversation is ringing, or has stopped.
@@ -2388,11 +2729,20 @@ impl Runtime {
     /// carries the same ringing list, so without this a single call would
     /// re-announce itself several times and a frontend would restart its
     /// ringtone on each.
-    pub fn set_ringing(&self, buffer_id: &str, account_id: &str, channel_id: &str, ringing: bool) -> bool {
+    pub fn set_ringing(
+        &self,
+        buffer_id: &str,
+        account_id: &str,
+        channel_id: &str,
+        ringing: bool,
+    ) -> bool {
         let mut calls = self.ringing_calls.lock().unwrap();
         if ringing {
             calls
-                .insert(buffer_id.to_string(), (account_id.to_string(), channel_id.to_string()))
+                .insert(
+                    buffer_id.to_string(),
+                    (account_id.to_string(), channel_id.to_string()),
+                )
                 .is_none()
         } else {
             calls.remove(buffer_id).is_some()
@@ -2421,7 +2771,9 @@ impl Runtime {
             .lock()
             .unwrap()
             .iter()
-            .find(|(buffer_id, channel)| channel.as_str() == channel_id && buffer_id.starts_with(&prefix))
+            .find(|(buffer_id, channel)| {
+                channel.as_str() == channel_id && buffer_id.starts_with(&prefix)
+            })
             .map(|(buffer_id, _)| buffer_id.clone())
     }
 
@@ -2433,23 +2785,41 @@ impl Runtime {
     /// only handed out by the gateway at READY, and only to whoever holds the
     /// socket, so it is remembered here rather than asked for.
     pub fn set_discord_gateway_session(&self, account_id: &str, session_id: &str) {
-        self.discord_gateway_sessions.lock().unwrap().insert(account_id.to_string(), session_id.to_string());
+        self.discord_gateway_sessions
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), session_id.to_string());
     }
 
     pub fn discord_gateway_session(&self, account_id: &str) -> Option<String> {
-        self.discord_gateway_sessions.lock().unwrap().get(account_id).cloned()
+        self.discord_gateway_sessions
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     pub fn get_discord_channel(&self, buffer_id: &str) -> Option<String> {
-        self.discord_channels.lock().unwrap().get(buffer_id).cloned()
+        self.discord_channels
+            .lock()
+            .unwrap()
+            .get(buffer_id)
+            .cloned()
     }
 
     pub fn set_discord_guild(&self, buffer_id: &str, guild_id: &str) {
-        self.discord_guild_id.lock().unwrap().insert(buffer_id.to_string(), guild_id.to_string());
+        self.discord_guild_id
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), guild_id.to_string());
     }
 
     pub fn get_discord_guild(&self, buffer_id: &str) -> Option<String> {
-        self.discord_guild_id.lock().unwrap().get(buffer_id).cloned()
+        self.discord_guild_id
+            .lock()
+            .unwrap()
+            .get(buffer_id)
+            .cloned()
     }
 
     /// One account's buffers in a guild.
@@ -2478,7 +2848,9 @@ impl Runtime {
     /// channel is muted, or because the guild holding it is.
     pub fn discord_muted(&self, account_id: &str, guild_key: &str, channel_id: &str) -> bool {
         let mutes = self.discord_mutes.lock().unwrap();
-        let Some(entry) = mutes.get(&(account_id.to_string(), guild_key.to_string())) else { return false };
+        let Some(entry) = mutes.get(&(account_id.to_string(), guild_key.to_string())) else {
+            return false;
+        };
         entry.muted || entry.channels.get(channel_id).copied().unwrap_or(false)
     }
 
@@ -2499,11 +2871,19 @@ impl Runtime {
     /// Live changes after that are per-user PRESENCE_UPDATE patches via
     /// update_discord_presence below, not further full replaces.
     pub fn set_discord_friends(&self, account_id: &str, friends: Vec<serde_json::Value>) {
-        self.discord_friends.lock().unwrap().insert(account_id.to_string(), friends);
+        self.discord_friends
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), friends);
     }
 
     pub fn get_discord_friends(&self, account_id: &str) -> Vec<serde_json::Value> {
-        self.discord_friends.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.discord_friends
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Patches one friend's live status in place from a PRESENCE_UPDATE
@@ -2514,8 +2894,12 @@ impl Runtime {
     /// emitting a redundant discordPresenceUpdate event.
     pub fn update_discord_presence(&self, account_id: &str, user_id: &str, status: &str) -> bool {
         let mut friends = self.discord_friends.lock().unwrap();
-        let Some(list) = friends.get_mut(account_id) else { return false };
-        let Some(friend) = list.iter_mut().find(|f| f["userId"] == user_id) else { return false };
+        let Some(list) = friends.get_mut(account_id) else {
+            return false;
+        };
+        let Some(friend) = list.iter_mut().find(|f| f["userId"] == user_id) else {
+            return false;
+        };
         if friend["status"].as_str() == Some(status) {
             return false;
         }
@@ -2531,7 +2915,10 @@ impl Runtime {
     /// recognises the room it just asked to join - the buffer's own id is
     /// derived from a name nothing knows until the room's state arrives.
     pub fn set_matrix_room(&self, state: &AppState, buffer_id: &str, room_id: &str) {
-        self.matrix_rooms.lock().unwrap().insert(buffer_id.to_string(), room_id.to_string());
+        self.matrix_rooms
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), room_id.to_string());
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(buffer_id) {
@@ -2546,7 +2933,9 @@ impl Runtime {
         // reconnect, and a frontend redrawing its whole list each time would
         // flicker.
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -2572,32 +2961,50 @@ impl Runtime {
     /// Says whether a buffer's own connection is up, and why not when it is
     /// not - see model::BufferLink. Broadcast only when it changes, since
     /// a retry loop sets the same answer on every attempt.
-    pub fn set_buffer_link(&self, state: &AppState, buffer_id: &str, link: Option<model::BufferLink>) {
+    pub fn set_buffer_link(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        link: Option<model::BufferLink>,
+    ) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.link == link {
                 return;
             }
             buffer.link = link;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     /// Puts a warning on a conversation, or takes it off. Broadcast only when it
     /// changes, so a notice Steam says again is not announced again.
-    pub fn set_buffer_notice(&self, state: &AppState, buffer_id: &str, notice: Option<model::BufferNotice>) {
+    pub fn set_buffer_notice(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        notice: Option<model::BufferNotice>,
+    ) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.notice == notice {
                 return;
             }
             buffer.notice = notice;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn set_buffer_syncing(&self, state: &AppState, buffer_id: &str, syncing: bool) {
@@ -2612,7 +3019,9 @@ impl Runtime {
             }
         };
         if let Some(buffer) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
         }
     }
 
@@ -2630,14 +3039,22 @@ impl Runtime {
     }
 
     pub fn set_matrix_room_name(&self, account_id: &str, room_id: &str, name: &str, kind: &str) {
+        self.matrix_room_names.lock().unwrap().insert(
+            (account_id.to_string(), room_id.to_string()),
+            (name.to_string(), kind.to_string()),
+        );
+    }
+
+    pub fn get_matrix_room_name(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Option<(String, String)> {
         self.matrix_room_names
             .lock()
             .unwrap()
-            .insert((account_id.to_string(), room_id.to_string()), (name.to_string(), kind.to_string()));
-    }
-
-    pub fn get_matrix_room_name(&self, account_id: &str, room_id: &str) -> Option<(String, String)> {
-        self.matrix_room_names.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
     /// An already-known "dm"-kind room this account shares with
@@ -2660,12 +3077,26 @@ impl Runtime {
             .map(|((_, room_id), _)| room_id.clone())
     }
 
-    pub fn set_matrix_machine(&self, account_id: &str, session: std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>) {
-        self.matrix_machines.lock().unwrap().insert(account_id.to_string(), session);
+    pub fn set_matrix_machine(
+        &self,
+        account_id: &str,
+        session: std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>,
+    ) {
+        self.matrix_machines
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), session);
     }
 
-    pub fn get_matrix_machine(&self, account_id: &str) -> Option<std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>> {
-        self.matrix_machines.lock().unwrap().get(account_id).cloned()
+    pub fn get_matrix_machine(
+        &self,
+        account_id: &str,
+    ) -> Option<std::sync::Arc<crate::backend::matrix::crypto::CryptoSession>> {
+        self.matrix_machines
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     pub fn remove_matrix_machine(&self, account_id: &str) {
@@ -2684,9 +3115,16 @@ impl Runtime {
     /// whichever is true.
     pub fn set_matrix_room_encrypted(&self, state: &AppState, buffer_id: &str, is_encrypted: bool) {
         if is_encrypted {
-            self.matrix_encrypted_rooms.lock().unwrap().insert(buffer_id.to_string());
+            self.matrix_encrypted_rooms
+                .lock()
+                .unwrap()
+                .insert(buffer_id.to_string());
         }
-        let confirmed = self.matrix_encrypted_rooms.lock().unwrap().contains(buffer_id);
+        let confirmed = self
+            .matrix_encrypted_rooms
+            .lock()
+            .unwrap()
+            .contains(buffer_id);
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(buffer_id) {
@@ -2698,12 +3136,17 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
     pub fn is_matrix_room_encrypted(&self, buffer_id: &str) -> bool {
-        self.matrix_encrypted_rooms.lock().unwrap().contains(buffer_id)
+        self.matrix_encrypted_rooms
+            .lock()
+            .unwrap()
+            .contains(buffer_id)
     }
 
     /// Records a reaction event we just learned about (ours or anyone
@@ -2712,7 +3155,15 @@ impl Runtime {
     /// populates matrix_own_reactions so our own un-react (toggleReaction)
     /// can find its event id by (buffer, message, emoji) without a
     /// reverse scan.
-    pub fn record_matrix_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str, event_id: &str, is_me: bool, sender: &str) {
+    pub fn record_matrix_reaction_event(
+        &self,
+        buffer_id: &str,
+        msg_id: &str,
+        emoji: &str,
+        event_id: &str,
+        is_me: bool,
+        sender: &str,
+    ) {
         {
             let mut targets = self.matrix_reaction_targets.lock().unwrap();
             // One entry per reaction seen, and only a redaction takes one out
@@ -2721,28 +3172,64 @@ impl Runtime {
             cap_cache(&mut targets, CACHE_LIMIT);
             targets.insert(
                 event_id.to_string(),
-                ReactionEvent { buffer_id: buffer_id.to_string(), msg_id: msg_id.to_string(), emoji: emoji.to_string(), is_me, sender: sender.to_string() },
+                ReactionEvent {
+                    buffer_id: buffer_id.to_string(),
+                    msg_id: msg_id.to_string(),
+                    emoji: emoji.to_string(),
+                    is_me,
+                    sender: sender.to_string(),
+                },
             );
         }
         if is_me {
             let mut mine = self.matrix_own_reactions.lock().unwrap();
             cap_cache(&mut mine, CACHE_LIMIT);
-            mine.insert((buffer_id.to_string(), msg_id.to_string(), emoji.to_string()), event_id.to_string());
+            mine.insert(
+                (buffer_id.to_string(), msg_id.to_string(), emoji.to_string()),
+                event_id.to_string(),
+            );
         }
     }
 
-    pub fn get_matrix_own_reaction_event(&self, buffer_id: &str, msg_id: &str, emoji: &str) -> Option<String> {
-        self.matrix_own_reactions.lock().unwrap().get(&(buffer_id.to_string(), msg_id.to_string(), emoji.to_string())).cloned()
+    pub fn get_matrix_own_reaction_event(
+        &self,
+        buffer_id: &str,
+        msg_id: &str,
+        emoji: &str,
+    ) -> Option<String> {
+        self.matrix_own_reactions
+            .lock()
+            .unwrap()
+            .get(&(buffer_id.to_string(), msg_id.to_string(), emoji.to_string()))
+            .cloned()
     }
 
     /// Looks up and forgets a reaction event id in one step - a redaction
     /// only ever needs to resolve to its target once (the reaction is
     /// gone afterward either way), so removing it here also keeps these
     /// maps from growing unboundedly over a long-running buffer's life.
-    pub fn take_matrix_reaction_target(&self, event_id: &str) -> Option<(String, String, String, bool)> {
-        let target = self.matrix_reaction_targets.lock().unwrap().remove(event_id);
-        if let Some(ReactionEvent { buffer_id, msg_id, emoji, is_me: true, .. }) = &target {
-            self.matrix_own_reactions.lock().unwrap().remove(&(buffer_id.clone(), msg_id.clone(), emoji.clone()));
+    pub fn take_matrix_reaction_target(
+        &self,
+        event_id: &str,
+    ) -> Option<(String, String, String, bool)> {
+        let target = self
+            .matrix_reaction_targets
+            .lock()
+            .unwrap()
+            .remove(event_id);
+        if let Some(ReactionEvent {
+            buffer_id,
+            msg_id,
+            emoji,
+            is_me: true,
+            ..
+        }) = &target
+        {
+            self.matrix_own_reactions.lock().unwrap().remove(&(
+                buffer_id.clone(),
+                msg_id.clone(),
+                emoji.clone(),
+            ));
         }
         target.map(|r| (r.buffer_id, r.msg_id, r.emoji, r.is_me))
     }
@@ -2766,7 +3253,12 @@ impl Runtime {
     }
 
     /// What a room member is called in this room, if it is known.
-    pub fn matrix_member_name(&self, account_id: &str, room_id: &str, user_id: &str) -> Option<String> {
+    pub fn matrix_member_name(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Option<String> {
         self.matrix_room_members
             .lock()
             .unwrap()
@@ -2776,16 +3268,33 @@ impl Runtime {
             .filter(|n| !n.is_empty())
     }
 
-    pub fn insert_matrix_verification(&self, id: &str, v: crate::backend::matrix::verification::ActiveVerification) {
-        self.matrix_verifications.lock().unwrap().insert(id.to_string(), v);
+    pub fn insert_matrix_verification(
+        &self,
+        id: &str,
+        v: crate::backend::matrix::verification::ActiveVerification,
+    ) {
+        self.matrix_verifications
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), v);
     }
 
-    pub fn get_matrix_verification(&self, id: &str) -> Option<crate::backend::matrix::verification::ActiveVerification> {
+    pub fn get_matrix_verification(
+        &self,
+        id: &str,
+    ) -> Option<crate::backend::matrix::verification::ActiveVerification> {
         self.matrix_verifications.lock().unwrap().get(id).cloned()
     }
 
-    pub fn update_matrix_verification(&self, id: &str, v: crate::backend::matrix::verification::ActiveVerification) {
-        self.matrix_verifications.lock().unwrap().insert(id.to_string(), v);
+    pub fn update_matrix_verification(
+        &self,
+        id: &str,
+        v: crate::backend::matrix::verification::ActiveVerification,
+    ) {
+        self.matrix_verifications
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), v);
     }
 
     pub fn remove_matrix_verification(&self, id: &str) {
@@ -2821,19 +3330,32 @@ impl Runtime {
     }
 
     pub fn mark_matrix_backup_enabled(&self, account_id: &str) {
-        self.matrix_backup_enabled.lock().unwrap().insert(account_id.to_string());
+        self.matrix_backup_enabled
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string());
     }
 
     pub fn has_matrix_backup(&self, account_id: &str) -> bool {
-        self.matrix_backup_enabled.lock().unwrap().contains(account_id)
+        self.matrix_backup_enabled
+            .lock()
+            .unwrap()
+            .contains(account_id)
     }
 
     pub fn set_matrix_member_avatar(&self, account_id: &str, user_id: &str, avatar_url: &str) {
-        self.matrix_member_avatars.lock().unwrap().insert((account_id.to_string(), user_id.to_string()), avatar_url.to_string());
+        self.matrix_member_avatars.lock().unwrap().insert(
+            (account_id.to_string(), user_id.to_string()),
+            avatar_url.to_string(),
+        );
     }
 
     pub fn get_matrix_member_avatar(&self, account_id: &str, user_id: &str) -> Option<String> {
-        self.matrix_member_avatars.lock().unwrap().get(&(account_id.to_string(), user_id.to_string())).cloned()
+        self.matrix_member_avatars
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), user_id.to_string()))
+            .cloned()
     }
 
     /// Sets a room's resolved avatar and, if the room's buffer already
@@ -2853,12 +3375,19 @@ impl Runtime {
     }
 
     pub fn account_status_text(&self, account_id: &str) -> String {
-        self.account_status_text.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.account_status_text
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Records whether the person is away, and whether that changed.
     pub fn set_user_idle(&self, idle: bool) -> bool {
-        self.user_idle.swap(idle, std::sync::atomic::Ordering::SeqCst) != idle
+        self.user_idle
+            .swap(idle, std::sync::atomic::Ordering::SeqCst)
+            != idle
     }
 
     pub fn user_idle(&self) -> bool {
@@ -2893,25 +3422,50 @@ impl Runtime {
     }
 
     pub fn set_account_status(&self, account_id: &str, status: &str) {
-        self.account_status.lock().unwrap().insert(account_id.to_string(), status.to_string());
+        self.account_status
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), status.to_string());
     }
 
     /// Defaults to online: an account that has never been set is online, which
     /// is what connecting does regardless.
     pub fn account_status(&self, account_id: &str) -> String {
-        self.account_status.lock().unwrap().get(account_id).cloned().unwrap_or_else(|| "online".to_string())
+        self.account_status
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| "online".to_string())
     }
 
-    pub fn set_discord_gateway_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<String>) {
-        self.discord_gateway_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    pub fn set_discord_gateway_sender(
+        &self,
+        account_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        self.discord_gateway_senders
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), sender);
     }
 
     pub fn clear_discord_gateway_sender(&self, account_id: &str) {
-        self.discord_gateway_senders.lock().unwrap().remove(account_id);
+        self.discord_gateway_senders
+            .lock()
+            .unwrap()
+            .remove(account_id);
     }
 
-    pub fn discord_gateway_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
-        self.discord_gateway_senders.lock().unwrap().get(account_id).cloned()
+    pub fn discord_gateway_sender(
+        &self,
+        account_id: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.discord_gateway_senders
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     /// Records this account's roles in a guild, answering whether they
@@ -2920,7 +3474,12 @@ impl Runtime {
     /// The first sighting is not a change: it is the baseline, and treating
     /// it as one would re-read every guild on the first member update after
     /// connecting.
-    pub fn remember_discord_member(&self, guild_id: &str, user_id: &str, member: &serde_json::Value) {
+    pub fn remember_discord_member(
+        &self,
+        guild_id: &str,
+        user_id: &str,
+        member: &serde_json::Value,
+    ) {
         let mut members = self.discord_members.lock().unwrap();
         // A member window scrolled through a large guild is thousands of these,
         // each a JSON object, and every one of them stayed for the life of the
@@ -2931,22 +3490,36 @@ impl Runtime {
     }
 
     pub fn discord_member(&self, guild_id: &str, user_id: &str) -> Option<serde_json::Value> {
-        self.discord_members.lock().unwrap().get(&(guild_id.to_string(), user_id.to_string())).cloned()
+        self.discord_members
+            .lock()
+            .unwrap()
+            .get(&(guild_id.to_string(), user_id.to_string()))
+            .cloned()
     }
 
     /// Who owns a guild, which is the one permission that overrides every
     /// other: an owner may do anything in their own server, and Discord does
     /// not spell that out in any role.
     pub fn set_discord_guild_owner(&self, guild_id: &str, owner_id: &str) {
-        self.discord_guild_owners.lock().unwrap().insert(guild_id.to_string(), owner_id.to_string());
+        self.discord_guild_owners
+            .lock()
+            .unwrap()
+            .insert(guild_id.to_string(), owner_id.to_string());
     }
 
     pub fn discord_guild_owner(&self, guild_id: &str) -> Option<String> {
-        self.discord_guild_owners.lock().unwrap().get(guild_id).cloned()
+        self.discord_guild_owners
+            .lock()
+            .unwrap()
+            .get(guild_id)
+            .cloned()
     }
 
     pub fn set_discord_guild_roles(&self, guild_id: &str, roles: Vec<serde_json::Value>) {
-        self.discord_guild_roles.lock().unwrap().insert(guild_id.to_string(), roles);
+        self.discord_guild_roles
+            .lock()
+            .unwrap()
+            .insert(guild_id.to_string(), roles);
     }
 
     /// Every role a guild has, as the service described it.
@@ -2955,7 +3528,12 @@ impl Runtime {
     /// of them: what this account is allowed to do here, and which roles it
     /// could give somebody.
     pub fn discord_guild_roles(&self, guild_id: &str) -> Vec<serde_json::Value> {
-        self.discord_guild_roles.lock().unwrap().get(guild_id).cloned().unwrap_or_default()
+        self.discord_guild_roles
+            .lock()
+            .unwrap()
+            .get(guild_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Every role in a guild that can be mentioned, most senior first.
@@ -2966,7 +3544,9 @@ impl Runtime {
     /// keyword in the message, and Discord reads the keyword.
     pub fn discord_mentionable_roles(&self, guild_id: &str) -> Vec<serde_json::Value> {
         let all = self.discord_guild_roles.lock().unwrap();
-        let Some(roles) = all.get(guild_id) else { return Vec::new() };
+        let Some(roles) = all.get(guild_id) else {
+            return Vec::new();
+        };
         let mut listed: Vec<(i64, serde_json::Value)> = roles
             .iter()
             .filter(|r| r["mentionable"].as_bool().unwrap_or(false))
@@ -2993,13 +3573,25 @@ impl Runtime {
     /// which is its hierarchy, so the first is the one that matters most.
     /// `@everyone` is dropped: it is not a role anybody was given.
     pub fn discord_role_names(&self, guild_id: &str, held: &[serde_json::Value]) -> Vec<String> {
-        let held: std::collections::HashSet<&str> = held.iter().filter_map(|v| v.as_str()).collect();
+        let held: std::collections::HashSet<&str> =
+            held.iter().filter_map(|v| v.as_str()).collect();
         let all = self.discord_guild_roles.lock().unwrap();
-        let Some(roles) = all.get(guild_id) else { return Vec::new() };
+        let Some(roles) = all.get(guild_id) else {
+            return Vec::new();
+        };
         let mut named: Vec<(i64, String)> = roles
             .iter()
-            .filter(|r| r["id"].as_str().is_some_and(|id| held.contains(id) && id != guild_id))
-            .filter_map(|r| Some((r["position"].as_i64().unwrap_or(0), r["name"].as_str()?.to_string())))
+            .filter(|r| {
+                r["id"]
+                    .as_str()
+                    .is_some_and(|id| held.contains(id) && id != guild_id)
+            })
+            .filter_map(|r| {
+                Some((
+                    r["position"].as_i64().unwrap_or(0),
+                    r["name"].as_str()?.to_string(),
+                ))
+            })
             .collect();
         named.sort_by_key(|n| std::cmp::Reverse(n.0));
         named.into_iter().map(|(_, name)| name).collect()
@@ -3015,13 +3607,23 @@ impl Runtime {
         const MANAGE_MESSAGES: u64 = 1 << 13;
         let can_moderate = ADMINISTRATOR | KICK_MEMBERS | BAN_MEMBERS | MANAGE_MESSAGES;
 
-        let held: std::collections::HashSet<&str> = held.iter().filter_map(|v| v.as_str()).collect();
+        let held: std::collections::HashSet<&str> =
+            held.iter().filter_map(|v| v.as_str()).collect();
         let all = self.discord_guild_roles.lock().unwrap();
-        let Some(roles) = all.get(guild_id) else { return false };
+        let Some(roles) = all.get(guild_id) else {
+            return false;
+        };
         roles
             .iter()
             .filter(|r| r["id"].as_str().is_some_and(|id| held.contains(id)))
-            .any(|r| r["permissions"].as_str().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0) & can_moderate != 0)
+            .any(|r| {
+                r["permissions"]
+                    .as_str()
+                    .and_then(|p| p.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    & can_moderate
+                    != 0
+            })
     }
 
     pub fn set_discord_own_roles(&self, group_id: &str, roles: Vec<String>) -> bool {
@@ -3053,7 +3655,11 @@ impl Runtime {
     /// Finishes a pass, answering whether anything changed while it ran and
     /// so whether the result it just wrote may already be out of date.
     pub fn finish_guild_resync(&self, group_id: &str) -> bool {
-        self.discord_resync.lock().unwrap().remove(group_id).unwrap_or(false)
+        self.discord_resync
+            .lock()
+            .unwrap()
+            .remove(group_id)
+            .unwrap_or(false)
     }
 
     /// Records that a guild's channel list will need rebuilding once its
@@ -3086,14 +3692,18 @@ impl Runtime {
     }
 
     pub fn set_matrix_space_parent(&self, account_id: &str, child_room_id: &str, group_id: &str) {
-        self.matrix_space_parents
-            .lock()
-            .unwrap()
-            .insert((account_id.to_string(), child_room_id.to_string()), group_id.to_string());
+        self.matrix_space_parents.lock().unwrap().insert(
+            (account_id.to_string(), child_room_id.to_string()),
+            group_id.to_string(),
+        );
     }
 
     pub fn get_matrix_space_parent(&self, account_id: &str, child_room_id: &str) -> Option<String> {
-        self.matrix_space_parents.lock().unwrap().get(&(account_id.to_string(), child_room_id.to_string())).cloned()
+        self.matrix_space_parents
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), child_room_id.to_string()))
+            .cloned()
     }
 
     /// The buffer showing a Matrix room, if one has been created for it.
@@ -3114,12 +3724,23 @@ impl Runtime {
             .map(|(buffer_id, _)| buffer_id.clone())
     }
 
-    pub fn set_matrix_room_avatar(&self, state: &AppState, account_id: &str, room_id: &str, avatar_url: &str) {
-        self.matrix_room_avatars.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), avatar_url.to_string());
+    pub fn set_matrix_room_avatar(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        room_id: &str,
+        avatar_url: &str,
+    ) {
+        self.matrix_room_avatars.lock().unwrap().insert(
+            (account_id.to_string(), room_id.to_string()),
+            avatar_url.to_string(),
+        );
         // This account's buffer for the room, not whichever account's the map
         // yields first - two accounts here can be in one room, and a picture
         // set for one of them is not a picture for the other's copy of it.
-        let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) else { return };
+        let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) else {
+            return;
+        };
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(&buffer_id) {
@@ -3131,7 +3752,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -3152,7 +3775,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -3169,17 +3794,27 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
     /// The tags a forum offers its posts, as Discord described them.
     pub fn set_discord_forum_tags(&self, account_id: &str, channel_id: &str, tags: Vec<Value>) {
-        self.discord_forum_tags.lock().unwrap().insert((account_id.to_string(), channel_id.to_string()), tags);
+        self.discord_forum_tags
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), channel_id.to_string()), tags);
     }
 
     pub fn discord_forum_tags(&self, account_id: &str, channel_id: &str) -> Vec<Value> {
-        self.discord_forum_tags.lock().unwrap().get(&(account_id.to_string(), channel_id.to_string())).cloned().unwrap_or_default()
+        self.discord_forum_tags
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), channel_id.to_string()))
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Says a conversation cannot be written in, and why; `None` says it can.
@@ -3197,21 +3832,36 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
     /// A Matrix room's topic, kept against the room so a buffer made after it
     /// was read still gets it.
-    pub fn set_matrix_room_topic(&self, state: &AppState, account_id: &str, room_id: &str, topic: &str) {
-        self.matrix_room_topics.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), topic.to_string());
+    pub fn set_matrix_room_topic(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        room_id: &str,
+        topic: &str,
+    ) {
+        self.matrix_room_topics.lock().unwrap().insert(
+            (account_id.to_string(), room_id.to_string()),
+            topic.to_string(),
+        );
         if let Some(buffer_id) = self.matrix_buffer_for_room(account_id, room_id) {
             self.set_buffer_topic(state, &buffer_id, topic);
         }
     }
 
     pub fn get_matrix_room_topic(&self, account_id: &str, room_id: &str) -> Option<String> {
-        self.matrix_room_topics.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+        self.matrix_room_topics
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
     /// Files a buffer under a heading, in the order the service puts it.
@@ -3219,7 +3869,13 @@ impl Runtime {
     /// Broadcast only when something changed: guild channels are re-registered
     /// on every reconnect, and a client that redrew its whole list each time
     /// would flicker.
-    pub fn set_buffer_category(&self, state: &AppState, buffer_id: &str, category: Option<&str>, position: i64) {
+    pub fn set_buffer_category(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        category: Option<&str>,
+        position: i64,
+    ) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
             match buffers.get_mut(buffer_id) {
@@ -3232,7 +3888,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -3254,29 +3912,50 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
     pub fn get_matrix_room_avatar(&self, account_id: &str, room_id: &str) -> Option<String> {
-        self.matrix_room_avatars.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+        self.matrix_room_avatars
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
     pub fn set_matrix_power_levels(&self, account_id: &str, room_id: &str, content: Value) {
-        self.matrix_power_levels.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), content);
+        self.matrix_power_levels
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), room_id.to_string()), content);
     }
 
     pub fn set_matrix_ignored(&self, account_id: &str, users: HashSet<String>) {
-        self.matrix_ignored.lock().unwrap().insert(account_id.to_string(), users);
+        self.matrix_ignored
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), users);
     }
 
     pub fn matrix_ignored(&self, account_id: &str) -> HashSet<String> {
-        self.matrix_ignored.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.matrix_ignored
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether this account has asked never to hear from somebody.
     pub fn matrix_is_ignored(&self, account_id: &str, user_id: &str) -> bool {
-        self.matrix_ignored.lock().unwrap().get(account_id).is_some_and(|list| list.contains(user_id))
+        self.matrix_ignored
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|list| list.contains(user_id))
     }
 
     pub fn note_matrix_verification_peer(&self, account_id: &str, user_id: &str) {
@@ -3289,13 +3968,26 @@ impl Runtime {
     }
 
     pub fn matrix_verification_peers(&self, account_id: &str) -> HashSet<String> {
-        self.matrix_verification_peers.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.matrix_verification_peers
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Records a widget, or takes it down when its content was emptied.
-    pub fn set_matrix_widget(&self, account_id: &str, room_id: &str, widget_id: &str, widget: Option<serde_json::Value>) {
+    pub fn set_matrix_widget(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        widget_id: &str,
+        widget: Option<serde_json::Value>,
+    ) {
         let mut held = self.matrix_widgets.lock().unwrap();
-        let room = held.entry((account_id.to_string(), room_id.to_string())).or_default();
+        let room = held
+            .entry((account_id.to_string(), room_id.to_string()))
+            .or_default();
         match widget {
             Some(widget) => {
                 room.insert(widget_id.to_string(), widget);
@@ -3324,7 +4016,11 @@ impl Runtime {
 
     /// Who a room is a direct message with, if the account says it is one.
     pub fn matrix_direct_peer(&self, account_id: &str, room_id: &str) -> Option<String> {
-        self.matrix_directs.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+        self.matrix_directs
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
     pub fn matrix_widgets(&self, account_id: &str, room_id: &str) -> Vec<serde_json::Value> {
@@ -3337,7 +4033,10 @@ impl Runtime {
     }
 
     pub fn set_matrix_pinned(&self, account_id: &str, room_id: &str, events: Vec<String>) {
-        self.matrix_pinned.lock().unwrap().insert((account_id.to_string(), room_id.to_string()), events);
+        self.matrix_pinned
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), room_id.to_string()), events);
     }
 
     pub fn get_matrix_pinned(&self, account_id: &str, room_id: &str) -> Vec<String> {
@@ -3350,7 +4049,11 @@ impl Runtime {
     }
 
     pub fn get_matrix_power_levels(&self, account_id: &str, room_id: &str) -> Option<Value> {
-        self.matrix_power_levels.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+        self.matrix_power_levels
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
     /// Upserts a joined member's display name into a room's roster - see
@@ -3364,7 +4067,13 @@ impl Runtime {
     /// each page fetched, so it always means "older than everything already
     /// held". Set-if-absent on the sync side matters: a later sync's token
     /// points at newer history, and taking it would skip everything between.
-    pub fn set_matrix_back_token(&self, account_id: &str, room_id: &str, token: &str, only_if_absent: bool) {
+    pub fn set_matrix_back_token(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        token: &str,
+        only_if_absent: bool,
+    ) {
         let mut all = self.matrix_back_tokens.lock().unwrap();
         let key = (account_id.to_string(), room_id.to_string());
         if only_if_absent && all.contains_key(&key) {
@@ -3374,10 +4083,20 @@ impl Runtime {
     }
 
     pub fn matrix_back_token(&self, account_id: &str, room_id: &str) -> Option<String> {
-        self.matrix_back_tokens.lock().unwrap().get(&(account_id.to_string(), room_id.to_string())).cloned()
+        self.matrix_back_tokens
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), room_id.to_string()))
+            .cloned()
     }
 
-    pub fn set_matrix_member(&self, account_id: &str, room_id: &str, user_id: &str, display_name: &str) {
+    pub fn set_matrix_member(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        display_name: &str,
+    ) {
         self.matrix_room_members
             .lock()
             .unwrap()
@@ -3387,17 +4106,29 @@ impl Runtime {
     }
 
     pub fn remove_matrix_member(&self, account_id: &str, room_id: &str, user_id: &str) {
-        if let Some(members) = self.matrix_room_members.lock().unwrap().get_mut(&(account_id.to_string(), room_id.to_string())) {
+        if let Some(members) = self
+            .matrix_room_members
+            .lock()
+            .unwrap()
+            .get_mut(&(account_id.to_string(), room_id.to_string()))
+        {
             members.remove(user_id);
         }
     }
 
     pub fn set_matrix_push_rules(&self, account_id: &str, rules: serde_json::Value) {
-        self.matrix_push_rules.lock().unwrap().insert(account_id.to_string(), rules);
+        self.matrix_push_rules
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), rules);
     }
 
     pub fn matrix_push_rules(&self, account_id: &str) -> Option<serde_json::Value> {
-        self.matrix_push_rules.lock().unwrap().get(account_id).cloned()
+        self.matrix_push_rules
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     /// Notes a room this account should follow an upgrade into.
@@ -3417,7 +4148,9 @@ impl Runtime {
     /// The upgrades waiting to be followed, taken off the list.
     pub fn take_matrix_upgrades(&self, account_id: &str) -> Vec<String> {
         let mut pending = self.matrix_upgrades.lock().unwrap();
-        let (mine, theirs): (Vec<_>, Vec<_>) = pending.drain(..).partition(|(account, _)| account == account_id);
+        let (mine, theirs): (Vec<_>, Vec<_>) = pending
+            .drain(..)
+            .partition(|(account, _)| account == account_id);
         *pending = theirs;
         mine.into_iter().map(|(_, room)| room).collect()
     }
@@ -3432,7 +4165,13 @@ impl Runtime {
     /// schedule the line that reports it.
     pub fn add_irc_split(&self, account_id: &str, channel: &str, reason: &str, nick: &str) -> bool {
         let mut all = self.irc_splits.lock().unwrap();
-        let entry = all.entry((account_id.to_string(), channel.to_string(), reason.to_string())).or_default();
+        let entry = all
+            .entry((
+                account_id.to_string(),
+                channel.to_string(),
+                reason.to_string(),
+            ))
+            .or_default();
         entry.push(nick.to_string());
         entry.len() == 1
     }
@@ -3442,17 +4181,21 @@ impl Runtime {
         self.irc_splits
             .lock()
             .unwrap()
-            .remove(&(account_id.to_string(), channel.to_string(), reason.to_string()))
+            .remove(&(
+                account_id.to_string(),
+                channel.to_string(),
+                reason.to_string(),
+            ))
             .unwrap_or_default()
     }
 
     /// Starts collecting a WHOIS answer for `nick`, discarding any half-built
     /// one - a second lookup of the same person is a fresh question.
     pub fn begin_irc_whois(&self, account_id: &str, nick: &str) {
-        self.irc_whois
-            .lock()
-            .unwrap()
-            .insert((account_id.to_string(), nick.to_lowercase()), json!({ "nick": nick }));
+        self.irc_whois.lock().unwrap().insert(
+            (account_id.to_string(), nick.to_lowercase()),
+            json!({ "nick": nick }),
+        );
     }
 
     /// Adds one numeric's worth of answer. Ignored when nothing asked: a
@@ -3467,7 +4210,10 @@ impl Runtime {
 
     /// The finished answer, removed from the pile.
     pub fn take_irc_whois(&self, account_id: &str, nick: &str) -> Option<Value> {
-        self.irc_whois.lock().unwrap().remove(&(account_id.to_string(), nick.to_lowercase()))
+        self.irc_whois
+            .lock()
+            .unwrap()
+            .remove(&(account_id.to_string(), nick.to_lowercase()))
     }
 
     /// Records that somebody is away, or is back. Returns whether this
@@ -3479,13 +4225,20 @@ impl Runtime {
     /// As `set_irc_away`, with what they said when they went: `None` is back,
     /// `Some(None)` is away without a word, `Some(Some(words))` away with some.
     /// A change of words alone counts as a change, since it is drawn.
-    pub fn set_irc_away_because(&self, account_id: &str, nick: &str, away: Option<Option<String>>) -> bool {
+    pub fn set_irc_away_because(
+        &self,
+        account_id: &str,
+        nick: &str,
+        away: Option<Option<String>>,
+    ) -> bool {
         let mut all = self.irc_away.lock().unwrap();
         let held = all.entry(account_id.to_string()).or_default();
         let key = nick.to_lowercase();
         match away {
             Some(reason) => {
-                let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+                let reason = reason
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty());
                 // A reason is only known from an AWAY; learning somebody is away
                 // some other way (a WHOIS) must not forget what they said.
                 if reason.is_none() && held.contains_key(&key) {
@@ -3498,20 +4251,42 @@ impl Runtime {
     }
 
     pub fn is_irc_away(&self, account_id: &str, nick: &str) -> bool {
-        self.irc_away.lock().unwrap().get(account_id).is_some_and(|held| held.contains_key(&nick.to_lowercase()))
+        self.irc_away
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|held| held.contains_key(&nick.to_lowercase()))
     }
 
     /// What somebody who is away said when they went.
     pub fn irc_away_reason(&self, account_id: &str, nick: &str) -> Option<String> {
-        self.irc_away.lock().unwrap().get(account_id).and_then(|held| held.get(&nick.to_lowercase()).cloned().flatten())
+        self.irc_away
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .and_then(|held| held.get(&nick.to_lowercase()).cloned().flatten())
     }
 
-    pub fn sneedchat_room_catalogue(&self, account_id: &str) -> Option<Vec<crate::accounts::SneedChatRoom>> {
-        self.sneedchat_rooms.lock().unwrap().get(account_id).cloned()
+    pub fn sneedchat_room_catalogue(
+        &self,
+        account_id: &str,
+    ) -> Option<Vec<crate::accounts::SneedChatRoom>> {
+        self.sneedchat_rooms
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
-    pub fn set_sneedchat_room_catalogue(&self, account_id: &str, rooms: Vec<crate::accounts::SneedChatRoom>) {
-        self.sneedchat_rooms.lock().unwrap().insert(account_id.to_string(), rooms);
+    pub fn set_sneedchat_room_catalogue(
+        &self,
+        account_id: &str,
+        rooms: Vec<crate::accounts::SneedChatRoom>,
+    ) {
+        self.sneedchat_rooms
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), rooms);
     }
 
     /// Whether this is the first time this room has said this particular
@@ -3571,7 +4346,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -3583,9 +4360,17 @@ impl Runtime {
         self.replaying.lock().unwrap().contains(buffer_id)
     }
 
-    pub fn set_matrix_read_receipt(&self, account_id: &str, room_id: &str, user_id: &str, event_id: &str) -> bool {
+    pub fn set_matrix_read_receipt(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        event_id: &str,
+    ) -> bool {
         let mut all = self.matrix_read_receipts.lock().unwrap();
-        let room = all.entry((account_id.to_string(), room_id.to_string())).or_default();
+        let room = all
+            .entry((account_id.to_string(), room_id.to_string()))
+            .or_default();
         match room.get(user_id) {
             Some(existing) if existing == event_id => false,
             _ => {
@@ -3595,7 +4380,11 @@ impl Runtime {
         }
     }
 
-    pub fn get_matrix_read_receipts(&self, account_id: &str, room_id: &str) -> HashMap<String, String> {
+    pub fn get_matrix_read_receipts(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> HashMap<String, String> {
         self.matrix_read_receipts
             .lock()
             .unwrap()
@@ -3604,7 +4393,11 @@ impl Runtime {
             .unwrap_or_default()
     }
 
-    pub fn get_matrix_room_members(&self, account_id: &str, room_id: &str) -> HashMap<String, String> {
+    pub fn get_matrix_room_members(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> HashMap<String, String> {
         self.matrix_room_members
             .lock()
             .unwrap()
@@ -3614,11 +4407,19 @@ impl Runtime {
     }
 
     pub fn set_matrix_presence(&self, account_id: &str, user_id: &str, online: bool) {
-        self.matrix_presence.lock().unwrap().insert((account_id.to_string(), user_id.to_string()), online);
+        self.matrix_presence
+            .lock()
+            .unwrap()
+            .insert((account_id.to_string(), user_id.to_string()), online);
     }
 
     pub fn is_matrix_user_online(&self, account_id: &str, user_id: &str) -> bool {
-        self.matrix_presence.lock().unwrap().get(&(account_id.to_string(), user_id.to_string())).copied().unwrap_or(false)
+        self.matrix_presence
+            .lock()
+            .unwrap()
+            .get(&(account_id.to_string(), user_id.to_string()))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Every room (by room id) this account currently has `user_id` as a
@@ -3637,8 +4438,18 @@ impl Runtime {
             .collect()
     }
 
-    pub fn insert_sneedchat_sender(&self, account_id: &str, room: u32, sender: tokio::sync::mpsc::UnboundedSender<String>) {
-        self.sneedchat_senders.lock().unwrap().entry(account_id.to_string()).or_default().insert(room, sender);
+    pub fn insert_sneedchat_sender(
+        &self,
+        account_id: &str,
+        room: u32,
+        sender: tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
+        self.sneedchat_senders
+            .lock()
+            .unwrap()
+            .entry(account_id.to_string())
+            .or_default()
+            .insert(room, sender);
     }
 
     /// Only removes the entry if it's still exactly the sender being torn
@@ -3654,9 +4465,17 @@ impl Runtime {
     /// currently connected to this room" for no visible reason - confirmed
     /// as the actual cause of a real "can't send to #fishtank, but still
     /// receiving" report.
-    pub fn remove_sneedchat_sender(&self, account_id: &str, room: u32, sender: &tokio::sync::mpsc::UnboundedSender<String>) {
+    pub fn remove_sneedchat_sender(
+        &self,
+        account_id: &str,
+        room: u32,
+        sender: &tokio::sync::mpsc::UnboundedSender<String>,
+    ) {
         if let Some(rooms) = self.sneedchat_senders.lock().unwrap().get_mut(account_id) {
-            if rooms.get(&room).is_some_and(|current| current.same_channel(sender)) {
+            if rooms
+                .get(&room)
+                .is_some_and(|current| current.same_channel(sender))
+            {
                 rooms.remove(&room);
             }
         }
@@ -3673,7 +4492,10 @@ impl Runtime {
     /// what the emote picker should show, and whether this account may use the
     /// subscriber half of it.
     pub fn set_kick_channel(&self, buffer_id: &str, channel: KickChannel) {
-        self.kick_channels.lock().unwrap().insert(buffer_id.to_string(), channel);
+        self.kick_channels
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), channel);
     }
 
     /// Fills in a channel's emote table once it has been fetched.
@@ -3683,7 +4505,12 @@ impl Runtime {
     /// land, while the emotes are only needed when somebody opens the picker.
     /// Matched on the buffer rather than replacing it wholesale, so a channel
     /// closed while its emotes were in flight stays closed.
-    pub fn set_kick_emotes(&self, buffer_id: &str, emotes: Vec<crate::backend::kick::api::Emote>, subscribed: bool) {
+    pub fn set_kick_emotes(
+        &self,
+        buffer_id: &str,
+        emotes: Vec<crate::backend::kick::api::Emote>,
+        subscribed: bool,
+    ) {
         if let Some(channel) = self.kick_channels.lock().unwrap().get_mut(buffer_id) {
             channel.emotes = emotes;
             channel.subscribed = subscribed;
@@ -3691,7 +4518,10 @@ impl Runtime {
     }
 
     pub fn set_kick_stream(&self, buffer_id: &str, stream: serde_json::Value) {
-        self.kick_streams.lock().unwrap().insert(buffer_id.to_string(), stream);
+        self.kick_streams
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string(), stream);
     }
 
     /// Whether this channel is due a direct fetch, marking it fetched if so.
@@ -3713,12 +4543,21 @@ impl Runtime {
     /// Keyed by kind as well as conversation: a channel can have a poll and
     /// a prediction running at once, and they are two cards.
     pub fn set_live_card(&self, buffer_id: &str, kind: &str, poll: serde_json::Value) {
-        self.live_cards.lock().unwrap().insert(format!("{buffer_id}|{kind}"), poll);
+        self.live_cards
+            .lock()
+            .unwrap()
+            .insert(format!("{buffer_id}|{kind}"), poll);
     }
 
     /// Remembers a poll's question and answers, which arrive once, in the
     /// event that started it - every vote afterwards names only an answer id.
-    pub fn set_matrix_poll(&self, buffer_id: &str, poll_id: &str, question: &str, answers: &[(String, String)]) {
+    pub fn set_matrix_poll(
+        &self,
+        buffer_id: &str,
+        poll_id: &str,
+        question: &str,
+        answers: &[(String, String)],
+    ) {
         let key = (buffer_id.to_string(), poll_id.to_string());
         let mut polls = self.matrix_polls.lock().unwrap();
         // A poll seen twice - a backfill after a live one, say - keeps
@@ -3728,7 +4567,11 @@ impl Runtime {
     }
 
     pub fn matrix_poll(&self, buffer_id: &str, poll_id: &str) -> Option<MatrixPoll> {
-        self.matrix_polls.lock().unwrap().get(&(buffer_id.to_string(), poll_id.to_string())).cloned()
+        self.matrix_polls
+            .lock()
+            .unwrap()
+            .get(&(buffer_id.to_string(), poll_id.to_string()))
+            .cloned()
     }
 
     pub fn matrix_poll_ended(&self, buffer_id: &str, poll_id: &str) -> bool {
@@ -3773,7 +4616,11 @@ impl Runtime {
     }
 
     pub fn live_card(&self, buffer_id: &str, kind: &str) -> Option<serde_json::Value> {
-        self.live_cards.lock().unwrap().get(&format!("{buffer_id}|{kind}")).cloned()
+        self.live_cards
+            .lock()
+            .unwrap()
+            .get(&format!("{buffer_id}|{kind}"))
+            .cloned()
     }
 
     /// Every card running in a conversation, for a window that has just
@@ -3790,7 +4637,10 @@ impl Runtime {
     }
 
     pub fn forget_live_card(&self, buffer_id: &str, kind: &str) {
-        self.live_cards.lock().unwrap().remove(&format!("{buffer_id}|{kind}"));
+        self.live_cards
+            .lock()
+            .unwrap()
+            .remove(&format!("{buffer_id}|{kind}"));
     }
 
     pub fn kick_stream(&self, buffer_id: &str) -> Option<serde_json::Value> {
@@ -3832,14 +4682,18 @@ impl Runtime {
 
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             if buffer.channel_modes == modes {
                 return;
             }
             buffer.channel_modes = modes;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     /// Says this Kick channel is being looked at, or is no longer.
@@ -3858,7 +4712,12 @@ impl Runtime {
     }
 
     pub fn kick_watching(&self, account_id: &str) -> crate::backend::kick::watch::Watching {
-        self.kick_watching.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.kick_watching
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn set_kick_history_cursor(&self, buffer_id: &str, cursor: Option<String>) {
@@ -3871,11 +4730,21 @@ impl Runtime {
         self.kick_channels.lock().unwrap().remove(buffer_id);
     }
 
-    pub fn set_kick_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>) {
-        self.kick_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    pub fn set_kick_sender(
+        &self,
+        account_id: &str,
+        sender: tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>,
+    ) {
+        self.kick_senders
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), sender);
     }
 
-    pub fn kick_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
+    pub fn kick_sender(
+        &self,
+        account_id: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
         self.kick_senders.lock().unwrap().get(account_id).cloned()
     }
 
@@ -3883,7 +4752,14 @@ impl Runtime {
     ///
     /// Letter by letter, because that is how a MODE change arrives: a channel
     /// going moderated says `+m` and nothing about the modes it already had.
-    pub fn set_irc_channel_mode(&self, state: &AppState, account_id: &str, channel: &str, letter: char, adding: bool) {
+    pub fn set_irc_channel_mode(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        channel: &str,
+        letter: char,
+        adding: bool,
+    ) {
         // A mode that takes an argument - a key, a limit, a ban - is not part
         // of the channel's mode string in any useful sense here: `+k` without
         // the key says nothing a reader can act on, and bans have their own
@@ -3911,18 +4787,34 @@ impl Runtime {
     }
 
     /// Replaces the whole set, for the server's answer to a bare `MODE`.
-    pub fn set_irc_channel_modes(&self, state: &AppState, account_id: &str, channel: &str, modes: &str) {
+    pub fn set_irc_channel_modes(
+        &self,
+        state: &AppState,
+        account_id: &str,
+        channel: &str,
+        modes: &str,
+    ) {
         let mut letters: Vec<char> = modes.chars().filter(|c| c.is_ascii_alphabetic()).collect();
         letters.sort_unstable();
         letters.dedup();
-        self.publish_channel_modes(state, &crate::model::buffer_id(account_id, channel), &letters);
+        self.publish_channel_modes(
+            state,
+            &crate::model::buffer_id(account_id, channel),
+            &letters,
+        );
     }
 
     fn publish_channel_modes(&self, state: &AppState, buffer_id: &str, letters: &[char]) {
-        let modes = if letters.is_empty() { String::new() } else { format!("+{}", letters.iter().collect::<String>()) };
+        let modes = if letters.is_empty() {
+            String::new()
+        } else {
+            format!("+{}", letters.iter().collect::<String>())
+        };
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
-            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            let Some(buffer) = buffers.get_mut(buffer_id) else {
+                return;
+            };
             let next = (!modes.is_empty()).then_some(modes);
             if buffer.channel_modes == next {
                 return;
@@ -3930,7 +4822,9 @@ impl Runtime {
             buffer.channel_modes = next;
             buffer.clone()
         };
-        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+        state
+            .events
+            .emit("bufferListChange", serde_json::to_value(&updated).unwrap());
     }
 
     pub fn grant_irc_caps(&self, account_id: &str, caps: &str) {
@@ -3950,7 +4844,9 @@ impl Runtime {
     /// moment the line arrives and nothing is sent back.
     pub fn revoke_irc_caps(&self, account_id: &str, caps: &str) {
         let mut all = self.irc_caps.lock().unwrap();
-        let Some(granted) = all.get_mut(account_id) else { return };
+        let Some(granted) = all.get_mut(account_id) else {
+            return;
+        };
         for cap in caps.split_whitespace() {
             granted.remove(cap.split('=').next().unwrap_or(cap));
         }
@@ -3963,7 +4859,11 @@ impl Runtime {
         // picture. Only a web address is kept: a `file://` URL or a bare path
         // would have the window load a file from this computer on somebody
         // else's say-so (#247).
-        let value = if key == "avatar" { value.filter(|v| crate::model::is_web_url(v)) } else { value };
+        let value = if key == "avatar" {
+            value.filter(|v| crate::model::is_web_url(v))
+        } else {
+            value
+        };
         let mut all = self.irc_metadata.lock().unwrap();
         let people = all.entry(account_id.to_string()).or_default();
         let nick = nick.to_ascii_lowercase();
@@ -3983,7 +4883,11 @@ impl Runtime {
     }
 
     /// Everything this person has published, or nothing.
-    pub fn irc_metadata(&self, account_id: &str, nick: &str) -> crate::backend::irc::metadata::Metadata {
+    pub fn irc_metadata(
+        &self,
+        account_id: &str,
+        nick: &str,
+    ) -> crate::backend::irc::metadata::Metadata {
         self.irc_metadata
             .lock()
             .unwrap()
@@ -4005,7 +4909,10 @@ impl Runtime {
         // the answers from the last session are about people who may not be
         // there any more.
         let prefix = format!("{account_id}|");
-        self.irc_rostered.lock().unwrap().retain(|id| !id.starts_with(&prefix));
+        self.irc_rostered
+            .lock()
+            .unwrap()
+            .retain(|id| !id.starts_with(&prefix));
     }
 
     /// Whether this channel's roster still needs asking for, and marks it
@@ -4018,7 +4925,10 @@ impl Runtime {
     /// channel per connection - the roster stays current after that from the
     /// joins and parts that arrive anyway.
     pub fn irc_roster_needed(&self, buffer_id: &str) -> bool {
-        self.irc_rostered.lock().unwrap().insert(buffer_id.to_string())
+        self.irc_rostered
+            .lock()
+            .unwrap()
+            .insert(buffer_id.to_string())
     }
 
     /// Records the tokens a server advertises in RPL_ISUPPORT.
@@ -4035,7 +4945,13 @@ impl Runtime {
         for token in tokens.split_whitespace() {
             // `TOKEN=value` and a bare `TOKEN` both count; the name is the
             // part that answers "does this server do that".
-            known.insert(token.split('=').next().unwrap_or(token).to_ascii_uppercase());
+            known.insert(
+                token
+                    .split('=')
+                    .next()
+                    .unwrap_or(token)
+                    .to_ascii_uppercase(),
+            );
         }
     }
 
@@ -4045,17 +4961,35 @@ impl Runtime {
 
     pub fn set_kick_pin(&self, buffer_id: &str, pin: Option<crate::backend::kick::pins::Pin>) {
         match pin {
-            Some(pin) => self.kick_pins.lock().unwrap().insert(buffer_id.to_string(), pin),
+            Some(pin) => self
+                .kick_pins
+                .lock()
+                .unwrap()
+                .insert(buffer_id.to_string(), pin),
             None => self.kick_pins.lock().unwrap().remove(buffer_id),
         };
     }
 
-    pub fn set_matrix_server_facts(&self, account_id: &str, facts: crate::backend::matrix::server::ServerFacts) {
-        self.matrix_server_facts.lock().unwrap().insert(account_id.to_string(), facts);
+    pub fn set_matrix_server_facts(
+        &self,
+        account_id: &str,
+        facts: crate::backend::matrix::server::ServerFacts,
+    ) {
+        self.matrix_server_facts
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), facts);
     }
 
-    pub fn matrix_server_facts(&self, account_id: &str) -> Option<crate::backend::matrix::server::ServerFacts> {
-        self.matrix_server_facts.lock().unwrap().get(account_id).cloned()
+    pub fn matrix_server_facts(
+        &self,
+        account_id: &str,
+    ) -> Option<crate::backend::matrix::server::ServerFacts> {
+        self.matrix_server_facts
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     pub fn irc_has_isupport(&self, account_id: &str, token: &str) -> bool {
@@ -4067,11 +5001,18 @@ impl Runtime {
     }
 
     pub fn discord_last_interaction(&self, account_id: &str) -> Option<String> {
-        self.discord_last_interaction.lock().unwrap().get(account_id).cloned()
+        self.discord_last_interaction
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
     }
 
     pub fn set_discord_last_interaction(&self, account_id: &str, buffer_id: &str) {
-        self.discord_last_interaction.lock().unwrap().insert(account_id.to_string(), buffer_id.to_string());
+        self.discord_last_interaction
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), buffer_id.to_string());
     }
 
     /// Who made this room, as its create event said.
@@ -4088,11 +5029,18 @@ impl Runtime {
         if creators.is_empty() {
             return;
         }
-        self.matrix_room_creators.lock().unwrap().insert(format!("{account_id}|{room_id}"), creators);
+        self.matrix_room_creators
+            .lock()
+            .unwrap()
+            .insert(format!("{account_id}|{room_id}"), creators);
     }
 
     pub fn matrix_room_version(&self, account_id: &str, room_id: &str) -> Option<String> {
-        self.matrix_room_versions.lock().unwrap().get(&format!("{account_id}|{room_id}")).cloned()
+        self.matrix_room_versions
+            .lock()
+            .unwrap()
+            .get(&format!("{account_id}|{room_id}"))
+            .cloned()
     }
 
     pub fn set_matrix_room_version(&self, account_id: &str, room_id: &str, version: &str) {
@@ -4140,7 +5088,13 @@ impl Runtime {
     ///
     /// An empty pack removes the key rather than leaving an empty group in
     /// the picker: a pack somebody emptied should stop being offered.
-    pub fn set_matrix_sticker_pack(&self, account_id: &str, key: &str, fallback_name: &str, content: &serde_json::Value) {
+    pub fn set_matrix_sticker_pack(
+        &self,
+        account_id: &str,
+        key: &str,
+        fallback_name: &str,
+        content: &serde_json::Value,
+    ) {
         let stickers = crate::backend::matrix::stickers::read_pack(content, fallback_name);
         let mut all = self.matrix_stickers.lock().unwrap();
         let packs = all.entry(account_id.to_string()).or_default();
@@ -4153,16 +5107,31 @@ impl Runtime {
 
     /// This account's emoticons, by shortcode - what the send path needs to
     /// turn `:name:` into the image it stands for.
-    pub fn set_matrix_emoticons(&self, account_id: &str, by_code: std::collections::BTreeMap<String, String>) {
-        self.matrix_emoticons.lock().unwrap().insert(account_id.to_string(), by_code);
+    pub fn set_matrix_emoticons(
+        &self,
+        account_id: &str,
+        by_code: std::collections::BTreeMap<String, String>,
+    ) {
+        self.matrix_emoticons
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), by_code);
     }
 
     pub fn matrix_emoticons(&self, account_id: &str) -> std::collections::BTreeMap<String, String> {
-        self.matrix_emoticons.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+        self.matrix_emoticons
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Every sticker this account has, pack by pack.
-    pub fn matrix_stickers(&self, account_id: &str) -> Vec<crate::backend::matrix::stickers::Sticker> {
+    pub fn matrix_stickers(
+        &self,
+        account_id: &str,
+    ) -> Vec<crate::backend::matrix::stickers::Sticker> {
         self.matrix_stickers
             .lock()
             .unwrap()
@@ -4192,7 +5161,11 @@ impl Runtime {
 
     /// Whether the server granted a capability by this name.
     pub fn irc_has_cap(&self, account_id: &str, cap: &str) -> bool {
-        self.irc_caps.lock().unwrap().get(account_id).is_some_and(|caps| caps.contains(cap))
+        self.irc_caps
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .is_some_and(|caps| caps.contains(cap))
     }
 
     /// Whether this connection may be asked for history.
@@ -4209,7 +5182,10 @@ impl Runtime {
     }
 
     pub fn begin_irc_channel_list(&self, account_id: &str) {
-        self.irc_channel_lists.lock().unwrap().insert(account_id.to_string(), Vec::new());
+        self.irc_channel_lists
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), Vec::new());
     }
 
     pub fn push_irc_channel_list(&self, account_id: &str, name: &str, users: u32, topic: &str) {
@@ -4219,7 +5195,11 @@ impl Runtime {
         // A ceiling, so a network that never stops cannot grow this without end;
         // and a topic is cut to what a row can show.
         if list.len() < IRC_DIRECTORY_LIMIT {
-            list.push(IrcChannelListing { name: name.to_string(), users, topic: topic.chars().take(300).collect() });
+            list.push(IrcChannelListing {
+                name: name.to_string(),
+                users,
+                topic: topic.chars().take(300).collect(),
+            });
         }
     }
 
@@ -4232,30 +5212,54 @@ impl Runtime {
     /// only question somebody scrolling a list of forty thousand channels is
     /// actually asking.
     pub fn finish_irc_channel_list(&self, state: &AppState, account_id: &str) {
-        let mut channels = self.irc_channel_lists.lock().unwrap().remove(account_id).unwrap_or_default();
+        let mut channels = self
+            .irc_channel_lists
+            .lock()
+            .unwrap()
+            .remove(account_id)
+            .unwrap_or_default();
         channels.sort_by(|a, b| b.users.cmp(&a.users).then_with(|| a.name.cmp(&b.name)));
         let count = channels.len();
-        self.irc_channel_directory.lock().unwrap().insert(account_id.to_string(), channels);
-        state.events.emit("ircChannelList", json!({ "accountId": account_id, "count": count }));
+        self.irc_channel_directory
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), channels);
+        state.events.emit(
+            "ircChannelList",
+            json!({ "accountId": account_id, "count": count }),
+        );
     }
 
     /// The server refused the list, or said to come back later: what it said,
     /// to whoever is waiting on it.
     pub fn fail_irc_channel_list(&self, state: &AppState, account_id: &str, reason: &str) {
         self.irc_channel_lists.lock().unwrap().remove(account_id);
-        state.events.emit("ircChannelList", json!({ "accountId": account_id, "error": reason }));
+        state.events.emit(
+            "ircChannelList",
+            json!({ "accountId": account_id, "error": reason }),
+        );
     }
 
     /// A page of the last directory, those matching `query` in a name or topic,
     /// busiest first. Returns how many there are in all and how many match.
-    pub fn irc_channels(&self, account_id: &str, query: &str, limit: usize) -> (usize, usize, Vec<IrcChannelListing>) {
+    pub fn irc_channels(
+        &self,
+        account_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> (usize, usize, Vec<IrcChannelListing>) {
         let all = self.irc_channel_directory.lock().unwrap();
-        let Some(list) = all.get(account_id) else { return (0, 0, Vec::new()) };
+        let Some(list) = all.get(account_id) else {
+            return (0, 0, Vec::new());
+        };
         let q = query.trim().to_lowercase();
         let mut matching = 0;
         let mut page = Vec::new();
         for c in list {
-            if !q.is_empty() && !c.name.to_lowercase().contains(&q) && !c.topic.to_lowercase().contains(&q) {
+            if !q.is_empty()
+                && !c.name.to_lowercase().contains(&q)
+                && !c.topic.to_lowercase().contains(&q)
+            {
                 continue;
             }
             matching += 1;
@@ -4272,17 +5276,28 @@ impl Runtime {
 
     /// Registers a signed-in Steam connection.
     pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
-        self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
+        self.steam_links
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), link);
     }
 
     /// The account's connection, if it is signed in right now.
     pub fn steam_link(&self, account_id: &str) -> Option<crate::backend::steam::link::Link> {
-        self.steam_links.lock().unwrap().get(account_id).filter(|l| l.is_open()).cloned()
+        self.steam_links
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .filter(|l| l.is_open())
+            .cloned()
     }
 
     /// Remembers the friend requests an account has, as the window shows them.
     pub fn set_steam_requests(&self, account_id: &str, requests: serde_json::Value) {
-        self.steam_requests.lock().unwrap().insert(account_id.to_string(), requests);
+        self.steam_requests
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), requests);
     }
 
     /// The friend requests last remembered for the account.
@@ -4316,7 +5331,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
     }
 
@@ -4324,8 +5341,17 @@ impl Runtime {
         self.sneedchat_senders.lock().unwrap().remove(account_id);
     }
 
-    pub fn sneedchat_sender(&self, account_id: &str, room: u32) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
-        self.sneedchat_senders.lock().unwrap().get(account_id).and_then(|rooms| rooms.get(&room)).cloned()
+    pub fn sneedchat_sender(
+        &self,
+        account_id: &str,
+        room: u32,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<String>> {
+        self.sneedchat_senders
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .and_then(|rooms| rooms.get(&room))
+            .cloned()
     }
 
     /// Sends QUIT to every currently-connected account - called on
@@ -4353,7 +5379,11 @@ impl Runtime {
             .map(|h| (h.sender.clone(), h.quit_message.clone()))
             .collect();
         for (sender, message) in farewells {
-            let _ = sender.send_quit(if message.is_empty() { fallback } else { &message });
+            let _ = sender.send_quit(if message.is_empty() {
+                fallback
+            } else {
+                &message
+            });
         }
         // Steam is told it is being left rather than dropped. The links stay
         // held, so the goodbye has the rest of the shutdown to be written.
@@ -4414,7 +5444,11 @@ impl Runtime {
     }
 
     pub fn irc_sender(&self, account_id: &str) -> Option<irc::client::Sender> {
-        self.irc_handles.lock().unwrap().get(account_id).map(|h| h.sender.clone())
+        self.irc_handles
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|h| h.sender.clone())
     }
 
     /// Our own nick changed on this connection.
@@ -4425,7 +5459,11 @@ impl Runtime {
     }
 
     pub fn irc_current_nick(&self, account_id: &str) -> Option<String> {
-        self.irc_handles.lock().unwrap().get(account_id).map(|h| h.nick.clone())
+        self.irc_handles
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|h| h.nick.clone())
     }
 
     /// Records an inbound/outbound message: ensures the buffer exists,
@@ -4456,8 +5494,24 @@ impl Runtime {
         sender_id: Option<String>,
     ) -> bool {
         self.record_message_at(
-            state, account_id, buffer_name, buffer_kind, from, body, is_action, kind, reply_to,
-            msg_id_override, force_highlight, avatar_url, embeds, attachments, sender_id, None, None, None,
+            state,
+            account_id,
+            buffer_name,
+            buffer_kind,
+            from,
+            body,
+            is_action,
+            kind,
+            reply_to,
+            msg_id_override,
+            force_highlight,
+            avatar_url,
+            embeds,
+            attachments,
+            sender_id,
+            None,
+            None,
+            None,
         )
     }
 
@@ -4504,7 +5558,13 @@ impl Runtime {
                 .or_else(|| self.own_identity(account_id))
                 .unwrap_or_default();
             let is_own = !own.is_empty() && from == own;
-            if !is_own && crate::ignores::is_ignored(&state.ignores.for_account(account_id), from, sender_id.as_deref()) {
+            if !is_own
+                && crate::ignores::is_ignored(
+                    &state.ignores.for_account(account_id),
+                    from,
+                    sender_id.as_deref(),
+                )
+            {
                 return false;
             }
         }
@@ -4541,7 +5601,10 @@ impl Runtime {
         // below it reads what you asked to be called. The order is the whole
         // point: a local rename decides how a mention of you is written, and
         // never whether it was one.
-        let alias = state.accounts.display_name_override(account_id).filter(|_| !is_own);
+        let alias = state
+            .accounts
+            .display_name_override(account_id)
+            .filter(|_| !is_own);
         let renamed = match &alias {
             Some(alias) => rename_own_mentions(body, &own_nick, alias),
             None => body.to_string(),
@@ -4569,7 +5632,27 @@ impl Runtime {
         // passes its real id through here for exactly that reason.
         let msg_id = msg_id_override.unwrap_or_else(model::next_message_id);
 
-        match state.store.append_message(&buffer.id, &msg_id, from, body, ts, is_action, is_highlight, kind, reply_to.as_ref(), &[], is_own, avatar_url.as_deref(), &embeds, &attachments, sender_id.as_deref(), html.as_deref(), buffer_kind, style.as_ref().and_then(|s| s.color.as_deref()), style.as_ref().map(|s| s.badges.as_slice()).unwrap_or(&[])) {
+        match state.store.append_message(
+            &buffer.id,
+            &msg_id,
+            from,
+            body,
+            ts,
+            is_action,
+            is_highlight,
+            kind,
+            reply_to.as_ref(),
+            &[],
+            is_own,
+            avatar_url.as_deref(),
+            &embeds,
+            &attachments,
+            sender_id.as_deref(),
+            html.as_deref(),
+            buffer_kind,
+            style.as_ref().and_then(|s| s.color.as_deref()),
+            style.as_ref().map(|s| s.badges.as_slice()).unwrap_or(&[]),
+        ) {
             // Already had it, so there is nothing to announce. Sneedchat
             // replays a room's recent history whenever its connection comes
             // back, and every backend that carries real message ids can
@@ -4600,7 +5683,9 @@ impl Runtime {
             }
         };
         if let Some(b) = updated_buffer {
-            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+            state
+                .events
+                .emit("bufferListChange", serde_json::to_value(&b).unwrap());
         }
 
         let message = Message {
@@ -4628,21 +5713,38 @@ impl Runtime {
             sender_color: style.as_ref().and_then(|s| s.color.clone()),
             badges: style.map(|s| s.badges).unwrap_or_default(),
         };
-        state.events.emit("message", serde_json::to_value(&message).unwrap());
+        state
+            .events
+            .emit("message", serde_json::to_value(&message).unwrap());
 
         // A YouTube link with nothing describing it - every service but
         // Discord, which describes its own. After the line is out, never
         // holding it up.
         if message.embeds.is_empty() && kind != "system" {
-            crate::unfurl::youtube_later(state, account_id, &message.buffer_id, &message.id, &message.body);
+            crate::unfurl::youtube_later(
+                state,
+                account_id,
+                &message.buffer_id,
+                &message.id,
+                &message.body,
+            );
             // And a link to a GIF, where nothing has said what it is.
-            crate::gifs::gif_later(state, account_id, &message.buffer_id, &message.id, &message.body);
+            crate::gifs::gif_later(
+                state,
+                account_id,
+                &message.buffer_id,
+                &message.id,
+                &message.body,
+            );
         }
 
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
-        if spoken && from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
+        if spoken
+            && from != own_nick
+            && (is_dm || is_highlight)
+            && !self.is_replaying(&buffer.id)
             && !self.is_silenced(&buffer.id)
         {
             state.events.emit(
@@ -4666,7 +5768,15 @@ impl Runtime {
     /// when an "edit" (a message_edit_date bump) arrives for a uuid it
     /// never actually stored, e.g. seeing a message for the first time
     /// that already carries prior edit history.
-    pub fn update_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str, embeds: &[Embed], attachments: &[Attachment]) -> bool {
+    pub fn update_message(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        body: &str,
+        embeds: &[Embed],
+        attachments: &[Attachment],
+    ) -> bool {
         // An edit from a service that describes no links itself says nothing
         // about cards, and is not a reason to lose them: the ones the daemon
         // put on the message stay while their link is still in the text.
@@ -4680,20 +5790,36 @@ impl Runtime {
                 .map(|m| m.embeds)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|e| e.url.as_deref().is_some_and(|u| body.contains(u) || crate::unfurl::youtube_id(u).is_some_and(|id| crate::unfurl::youtube_id(body).as_deref() == Some(id.as_str()))))
+                .filter(|e| {
+                    e.url.as_deref().is_some_and(|u| {
+                        body.contains(u)
+                            || crate::unfurl::youtube_id(u).is_some_and(|id| {
+                                crate::unfurl::youtube_id(body).as_deref() == Some(id.as_str())
+                            })
+                    })
+                })
                 .collect()
         } else {
             embeds.to_vec()
         };
         let embeds = &embeds[..];
-        match state.store.update_message_body(buffer_id, msg_id, body, embeds, attachments) {
+        match state
+            .store
+            .update_message_body(buffer_id, msg_id, body, embeds, attachments)
+        {
             Ok(true) => {
                 state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": true, "editedTs": chrono::Utc::now().timestamp(), "embeds": embeds, "attachments": attachments }));
                 // A link the edit added is described like any other; one
                 // already described is not asked about again.
                 if describes_nothing {
                     if let Some(buffer) = self.get_buffer(buffer_id) {
-                        crate::unfurl::youtube_later(state, &buffer.account_id, buffer_id, msg_id, body);
+                        crate::unfurl::youtube_later(
+                            state,
+                            &buffer.account_id,
+                            buffer_id,
+                            msg_id,
+                            body,
+                        );
                         crate::gifs::gif_later(state, &buffer.account_id, buffer_id, msg_id, body);
                     }
                 }
@@ -4709,7 +5835,13 @@ impl Runtime {
 
     /// A message's cards, arriving after the message did - a link unfurled.
     /// Not an edit, in storage or in the event.
-    pub fn set_message_embeds(&self, state: &AppState, buffer_id: &str, msg_id: &str, embeds: &[Embed]) -> bool {
+    pub fn set_message_embeds(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        embeds: &[Embed],
+    ) -> bool {
         match state.store.set_message_embeds(buffer_id, msg_id, embeds) {
             Ok(true) => {
                 state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "edited": false, "embeds": embeds }));
@@ -4728,8 +5860,17 @@ impl Runtime {
     /// resolution) - doesn't set the `edited` flag either in storage or in
     /// the emitted event, so the frontend's "(edited)" label doesn't show
     /// up for something the user never touched.
-    pub fn update_message_body_only(&self, state: &AppState, buffer_id: &str, msg_id: &str, body: &str) -> bool {
-        match state.store.update_message_body_silent(buffer_id, msg_id, body) {
+    pub fn update_message_body_only(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        body: &str,
+    ) -> bool {
+        match state
+            .store
+            .update_message_body_silent(buffer_id, msg_id, body)
+        {
             Ok(true) => {
                 state.events.emit("messageUpdated", json!({ "bufferId": buffer_id, "id": msg_id, "body": body, "edited": false, "embeds": [] }));
                 true
@@ -4744,7 +5885,13 @@ impl Runtime {
 
     /// Says who wrote the message a forward brought here, once that has been
     /// looked up - the row above it says "Forwarded" until then.
-    pub fn rename_reply_preview(&self, state: &AppState, buffer_id: &str, msg_id: &str, from: &str) {
+    pub fn rename_reply_preview(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        from: &str,
+    ) {
         match state.store.rename_reply_from(buffer_id, msg_id, from) {
             Ok(true) => state.events.emit(
                 "messageReplyRenamed",
@@ -4759,7 +5906,10 @@ impl Runtime {
     /// drop it from view, same as Discord's own clients (no tombstone).
     pub fn delete_message(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
         match state.store.delete_message(buffer_id, msg_id) {
-            Ok(true) => state.events.emit("messageDeleted", json!({ "bufferId": buffer_id, "id": msg_id })),
+            Ok(true) => state.events.emit(
+                "messageDeleted",
+                json!({ "bufferId": buffer_id, "id": msg_id }),
+            ),
             Ok(false) => {}
             Err(e) => tracing::warn!("failed to delete message: {e}"),
         }
@@ -4767,11 +5917,26 @@ impl Runtime {
 
     /// One emoji's reactions, gone - Discord's REACTION_REMOVE_EMOJI, which
     /// is a moderator clearing a single reaction rather than all of them.
-    pub fn remove_reaction_entirely(&self, state: &AppState, buffer_id: &str, msg_id: &str, emoji: &str) {
-        let Ok(Some(message)) = state.store.get_message(buffer_id, msg_id) else { return };
-        let kept: Vec<_> = message.reactions.into_iter().filter(|r| r.emoji != emoji).collect();
+    pub fn remove_reaction_entirely(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        emoji: &str,
+    ) {
+        let Ok(Some(message)) = state.store.get_message(buffer_id, msg_id) else {
+            return;
+        };
+        let kept: Vec<_> = message
+            .reactions
+            .into_iter()
+            .filter(|r| r.emoji != emoji)
+            .collect();
         match state.store.set_reactions(buffer_id, msg_id, &kept) {
-            Ok(true) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": kept })),
+            Ok(true) => state.events.emit(
+                "reactionsChanged",
+                json!({ "bufferId": buffer_id, "id": msg_id, "reactions": kept }),
+            ),
             Ok(false) => {}
             Err(e) => tracing::warn!("failed to remove a reaction: {e}"),
         }
@@ -4783,7 +5948,10 @@ impl Runtime {
     /// that would have cleared them are not sent.
     pub fn clear_reactions(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
         match state.store.set_reactions(buffer_id, msg_id, &[]) {
-            Ok(true) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": [] })),
+            Ok(true) => state.events.emit(
+                "reactionsChanged",
+                json!({ "bufferId": buffer_id, "id": msg_id, "reactions": [] }),
+            ),
             Ok(false) => {}
             Err(e) => tracing::warn!("failed to clear reactions: {e}"),
         }
@@ -4797,9 +5965,23 @@ impl Runtime {
     /// Matrix can be counted this way: a Matrix reaction *is* an event with an
     /// id, while Discord sends per-user add/remove notifications carrying no
     /// id of their own and re-syncs the true counts from message snapshots.
-    pub fn matrix_reaction(&self, state: &AppState, event_id: &str, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool) {
-        match state.store.matrix_reaction_add(event_id, buffer_id, msg_id, emoji, is_me) {
-            Ok(Some(reactions)) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions })),
+    pub fn matrix_reaction(
+        &self,
+        state: &AppState,
+        event_id: &str,
+        buffer_id: &str,
+        msg_id: &str,
+        emoji: &str,
+        is_me: bool,
+    ) {
+        match state
+            .store
+            .matrix_reaction_add(event_id, buffer_id, msg_id, emoji, is_me)
+        {
+            Ok(Some(reactions)) => state.events.emit(
+                "reactionsChanged",
+                json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions }),
+            ),
             // Already counted - a replayed timeline, which is not news.
             Ok(None) => {}
             Err(e) => tracing::warn!("failed to record matrix reaction: {e}"),
@@ -4811,7 +5993,10 @@ impl Runtime {
     pub fn matrix_reaction_redacted(&self, state: &AppState, event_id: &str) -> bool {
         match state.store.matrix_reaction_remove(event_id) {
             Ok(Some((buffer_id, msg_id, reactions))) => {
-                state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions }));
+                state.events.emit(
+                    "reactionsChanged",
+                    json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions }),
+                );
                 true
             }
             Ok(None) => false,
@@ -4825,9 +6010,23 @@ impl Runtime {
     /// One reaction add/remove (Discord's REACTION_ADD/REMOVE are
     /// per-user-per-emoji events, not full snapshots) - broadcasts the
     /// message's updated full reaction list once applied.
-    pub fn update_reaction(&self, state: &AppState, buffer_id: &str, msg_id: &str, emoji: &str, is_me: bool, add: bool) {
-        match state.store.update_reaction(buffer_id, msg_id, emoji, is_me, add) {
-            Ok(Some(reactions)) => state.events.emit("reactionsChanged", json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions })),
+    pub fn update_reaction(
+        &self,
+        state: &AppState,
+        buffer_id: &str,
+        msg_id: &str,
+        emoji: &str,
+        is_me: bool,
+        add: bool,
+    ) {
+        match state
+            .store
+            .update_reaction(buffer_id, msg_id, emoji, is_me, add)
+        {
+            Ok(Some(reactions)) => state.events.emit(
+                "reactionsChanged",
+                json!({ "bufferId": buffer_id, "id": msg_id, "reactions": reactions }),
+            ),
             Ok(None) => {}
             Err(e) => tracing::warn!("failed to update reaction: {e}"),
         }
@@ -4867,31 +6066,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch dir");
         let state = AppState {
-            store: std::sync::Arc::new(crate::store::Store::open(&dir.join("scrollback.db")).expect("store")),
-            accounts: std::sync::Arc::new(crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts")),
+            store: std::sync::Arc::new(
+                crate::store::Store::open(&dir.join("scrollback.db")).expect("store"),
+            ),
+            accounts: std::sync::Arc::new(
+                crate::accounts::AccountStore::open(dir.join("accounts.toml")).expect("accounts"),
+            ),
             events: crate::events::EventBus::new(),
             runtime: std::sync::Arc::new(Runtime::new()),
             tor: std::sync::Arc::new(crate::net::tor::TorManager::new(&dir)),
             shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
             voice: std::sync::Arc::new(crate::backend::discord::voice::VoiceState::new()),
-            voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(dir.join("voice.toml"))),
-            dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(dir.join("dcc.toml"))),
-            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(dir.join("irc-sts.toml"))),
-            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(dir.join("highlights.toml"))),
-            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(dir.join("ignores.toml"))),
+            voice_prefs: std::sync::Arc::new(crate::audio::VoicePrefsStore::open(
+                dir.join("voice.toml"),
+            )),
+            dcc_prefs: std::sync::Arc::new(crate::backend::irc::dcc::DccPrefsStore::open(
+                dir.join("dcc.toml"),
+            )),
+            irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(
+                dir.join("irc-sts.toml"),
+            )),
+            highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(
+                dir.join("highlights.toml"),
+            )),
+            ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(
+                dir.join("ignores.toml"),
+            )),
         };
         let account = "irc:tester";
         state.runtime.set_own_identity(account, "Salastil");
 
         let say = |from: &str, body: &str, kind: &str| {
             state.runtime.record_message(
-                &state, account, "#room", "channel", from, body, false, kind,
-                None, None, false, None, Vec::new(), Vec::new(), None,
+                &state,
+                account,
+                "#room",
+                "channel",
+                from,
+                body,
+                false,
+                kind,
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
             );
         };
         // Exactly as backend/irc/incoming.rs writes them: the room speaking
         // about somebody, under a placeholder sender.
-        say("*", "Salastil has quit (Client closed the connection)", "part");
+        say(
+            "*",
+            "Salastil has quit (Client closed the connection)",
+            "part",
+        );
         say("*", "Salastil entered the room", "join");
         // And somebody actually talking to you.
         say("stranger", "Salastil: are you about?", "chat");
@@ -4900,7 +6130,10 @@ mod tests {
             .store
             .get_backlog(&crate::model::buffer_id(account, "#room"), 0, 10)
             .expect("backlog");
-        let flagged: Vec<(&str, bool)> = rows.iter().map(|m| (m.body.as_str(), m.is_highlight)).collect();
+        let flagged: Vec<(&str, bool)> = rows
+            .iter()
+            .map(|m| (m.body.as_str(), m.is_highlight))
+            .collect();
         assert_eq!(
             flagged,
             vec![
@@ -4919,18 +6152,31 @@ mod tests {
     #[test]
     fn a_room_belongs_to_one_account_at_a_time() {
         let runtime = Runtime::new();
-        runtime.matrix_rooms.lock().unwrap().insert("matrix:@a:x.example|Shared".into(), "!shared:x.example".into());
-        runtime.matrix_rooms.lock().unwrap().insert("matrix:@b:y.example|Shared".into(), "!shared:x.example".into());
+        runtime.matrix_rooms.lock().unwrap().insert(
+            "matrix:@a:x.example|Shared".into(),
+            "!shared:x.example".into(),
+        );
+        runtime.matrix_rooms.lock().unwrap().insert(
+            "matrix:@b:y.example|Shared".into(),
+            "!shared:x.example".into(),
+        );
 
         assert_eq!(
-            runtime.matrix_buffer_for_room("matrix:@a:x.example", "!shared:x.example").as_deref(),
+            runtime
+                .matrix_buffer_for_room("matrix:@a:x.example", "!shared:x.example")
+                .as_deref(),
             Some("matrix:@a:x.example|Shared")
         );
         assert_eq!(
-            runtime.matrix_buffer_for_room("matrix:@b:y.example", "!shared:x.example").as_deref(),
+            runtime
+                .matrix_buffer_for_room("matrix:@b:y.example", "!shared:x.example")
+                .as_deref(),
             Some("matrix:@b:y.example|Shared")
         );
-        assert_eq!(runtime.matrix_buffer_for_room("matrix:@c:z.example", "!shared:x.example"), None);
+        assert_eq!(
+            runtime.matrix_buffer_for_room("matrix:@c:z.example", "!shared:x.example"),
+            None
+        );
     }
 
     /// Which rooms count as joined, for the directory's "already in this"
@@ -4940,9 +6186,18 @@ mod tests {
     #[test]
     fn joined_rooms_are_the_ones_this_account_has_a_buffer_for() {
         let runtime = Runtime::new();
-        runtime.matrix_rooms.lock().unwrap().insert("matrix:@me:a.example|Room One".into(), "!one:a.example".into());
-        runtime.matrix_rooms.lock().unwrap().insert("matrix:@me:a.example|Room Two".into(), "!two:a.example".into());
-        runtime.matrix_rooms.lock().unwrap().insert("matrix:@other:b.example|Theirs".into(), "!three:b.example".into());
+        runtime.matrix_rooms.lock().unwrap().insert(
+            "matrix:@me:a.example|Room One".into(),
+            "!one:a.example".into(),
+        );
+        runtime.matrix_rooms.lock().unwrap().insert(
+            "matrix:@me:a.example|Room Two".into(),
+            "!two:a.example".into(),
+        );
+        runtime.matrix_rooms.lock().unwrap().insert(
+            "matrix:@other:b.example|Theirs".into(),
+            "!three:b.example".into(),
+        );
 
         let mine = runtime.matrix_joined_rooms("matrix:@me:a.example");
         assert_eq!(mine.len(), 2);
@@ -4950,7 +6205,9 @@ mod tests {
         assert!(mine.contains("!two:a.example"));
         // Somebody else's room, on this same client, is not ours.
         assert!(!mine.contains("!three:b.example"));
-        assert!(runtime.matrix_joined_rooms("matrix:@nobody:c.example").is_empty());
+        assert!(runtime
+            .matrix_joined_rooms("matrix:@nobody:c.example")
+            .is_empty());
     }
 
     /// The flag that keeps IRC's retry loop from undoing a deliberate
@@ -4960,7 +6217,10 @@ mod tests {
     #[test]
     fn connection_intent_survives_until_it_is_cleared() {
         let rt = Runtime::new();
-        assert!(!rt.wants_connected("irc:nick@example.org"), "nothing is wanted before a spawn");
+        assert!(
+            !rt.wants_connected("irc:nick@example.org"),
+            "nothing is wanted before a spawn"
+        );
 
         rt.set_wants_connected("irc:nick@example.org", true);
         assert!(rt.wants_connected("irc:nick@example.org"));
@@ -5025,7 +6285,11 @@ mod tests {
         assert!(runtime.ringing_calls().is_empty());
         runtime.set_ringing("acct|alex", "acct", "chan", true);
         runtime.set_ringing("acct|sam", "acct", "chan2", true);
-        let mut ringing: Vec<String> = runtime.ringing_calls().into_iter().map(|(b, _, _)| b).collect();
+        let mut ringing: Vec<String> = runtime
+            .ringing_calls()
+            .into_iter()
+            .map(|(b, _, _)| b)
+            .collect();
         ringing.sort();
         assert_eq!(ringing, vec!["acct|alex", "acct|sam"]);
 
@@ -5053,9 +6317,21 @@ mod directory_tests {
         rt.irc_channel_directory.lock().unwrap().insert(
             "a".into(),
             vec![
-                IrcChannelListing { name: "#busy".into(), users: 900, topic: "all about birds".into() },
-                IrcChannelListing { name: "#quiet".into(), users: 3, topic: "".into() },
-                IrcChannelListing { name: "#birdwatch".into(), users: 2, topic: "".into() },
+                IrcChannelListing {
+                    name: "#busy".into(),
+                    users: 900,
+                    topic: "all about birds".into(),
+                },
+                IrcChannelListing {
+                    name: "#quiet".into(),
+                    users: 3,
+                    topic: "".into(),
+                },
+                IrcChannelListing {
+                    name: "#birdwatch".into(),
+                    users: 2,
+                    topic: "".into(),
+                },
             ],
         );
         rt
@@ -5066,7 +6342,10 @@ mod directory_tests {
         let rt = directory();
         let (total, matching, page) = rt.irc_channels("a", "bird", 10);
         assert_eq!((total, matching), (3, 2));
-        assert_eq!(page.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["#busy", "#birdwatch"]);
+        assert_eq!(
+            page.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["#busy", "#birdwatch"]
+        );
     }
 
     #[test]
@@ -5092,12 +6371,18 @@ mod reactor_tests {
         rt.record_matrix_reaction_event("b", "m1", "👍", "$e2", false, "@bob:x");
         rt.record_matrix_reaction_event("b", "m1", "🎉", "$e3", false, "@cat:x");
         rt.record_matrix_reaction_event("b", "m2", "👍", "$e4", true, "@me:x");
-        assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@ann:x", "@bob:x"]);
+        assert_eq!(
+            rt.matrix_reactors("b", "m1", "👍"),
+            vec!["@ann:x", "@bob:x"]
+        );
         assert_eq!(rt.matrix_reactors("b", "m1", "🎉"), vec!["@cat:x"]);
         assert_eq!(rt.matrix_reactors("b", "m2", "👍"), vec!["@me:x"]);
 
         // A redaction takes that person out and leaves the others.
-        assert_eq!(rt.take_matrix_reaction_target("$e1"), Some(("b".into(), "m1".into(), "👍".into(), false)));
+        assert_eq!(
+            rt.take_matrix_reaction_target("$e1"),
+            Some(("b".into(), "m1".into(), "👍".into(), false))
+        );
         assert_eq!(rt.matrix_reactors("b", "m1", "👍"), vec!["@bob:x"]);
         assert!(rt.matrix_reactors("b", "m3", "👍").is_empty());
     }
@@ -5135,7 +6420,10 @@ mod voice_flag_tests {
 
     #[test]
     fn a_state_that_says_nothing_claims_nothing() {
-        assert_eq!(VoiceFlags::from_voice_state(&json!({})), VoiceFlags::default());
+        assert_eq!(
+            VoiceFlags::from_voice_state(&json!({})),
+            VoiceFlags::default()
+        );
     }
 }
 
@@ -5160,10 +6448,15 @@ mod guild_buffer_tests {
         let mine = runtime.discord_buffers_in_guild("discord:one", "g1");
         assert_eq!(mine.len(), 2, "got {mine:?}");
         assert!(mine.iter().all(|b| b.starts_with("discord:one|")));
-        assert_eq!(runtime.discord_buffers_in_guild("discord:two", "g1").len(), 1);
+        assert_eq!(
+            runtime.discord_buffers_in_guild("discord:two", "g1").len(),
+            1
+        );
         // And an account with nothing there is told nothing, rather than
         // being handed somebody else's.
-        assert!(runtime.discord_buffers_in_guild("discord:three", "g1").is_empty());
+        assert!(runtime
+            .discord_buffers_in_guild("discord:three", "g1")
+            .is_empty());
     }
 }
 
@@ -5184,7 +6477,11 @@ mod invite_tests {
     #[test]
     fn an_invite_survives_a_sync_that_does_not_mention_it() {
         let runtime = Runtime::new();
-        assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
+        assert!(runtime.merge_matrix_invites(
+            "matrix:@me:example.org",
+            vec![invite("!dm")],
+            &HashSet::new()
+        ));
         // The next sync says nothing about it, as every quiet sync does.
         assert!(!runtime.merge_matrix_invites("matrix:@me:example.org", vec![], &HashSet::new()));
         assert_eq!(runtime.matrix_invites("matrix:@me:example.org").len(), 1);
@@ -5196,7 +6493,11 @@ mod invite_tests {
     #[test]
     fn answering_an_invite_takes_it_down() {
         let runtime = Runtime::new();
-        runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new());
+        runtime.merge_matrix_invites(
+            "matrix:@me:example.org",
+            vec![invite("!dm")],
+            &HashSet::new(),
+        );
         let joined: HashSet<String> = ["!dm".to_string()].into_iter().collect();
         assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![], &joined));
         assert!(runtime.matrix_invites("matrix:@me:example.org").is_empty());
@@ -5207,8 +6508,16 @@ mod invite_tests {
     #[test]
     fn the_same_invite_twice_is_not_news() {
         let runtime = Runtime::new();
-        assert!(runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
-        assert!(!runtime.merge_matrix_invites("matrix:@me:example.org", vec![invite("!dm")], &HashSet::new()));
+        assert!(runtime.merge_matrix_invites(
+            "matrix:@me:example.org",
+            vec![invite("!dm")],
+            &HashSet::new()
+        ));
+        assert!(!runtime.merge_matrix_invites(
+            "matrix:@me:example.org",
+            vec![invite("!dm")],
+            &HashSet::new()
+        ));
         assert_eq!(runtime.matrix_invites("matrix:@me:example.org").len(), 1);
     }
 }
@@ -5223,7 +6532,10 @@ mod keyword_tests {
 
     #[test]
     fn a_word_on_its_own_counts() {
-        assert!(matches_keyword("has anyone tried moho yet", &words(&["moho"])));
+        assert!(matches_keyword(
+            "has anyone tried moho yet",
+            &words(&["moho"])
+        ));
         assert!(matches_keyword("moho", &words(&["moho"])));
         assert!(matches_keyword("what about moho?", &words(&["moho"])));
     }
@@ -5240,7 +6552,10 @@ mod keyword_tests {
     /// And the same word said properly later in the message still counts.
     #[test]
     fn one_bad_match_does_not_hide_a_good_one() {
-        assert!(matches_keyword("the catalogue, and also the cat", &words(&["cat"])));
+        assert!(matches_keyword(
+            "the catalogue, and also the cat",
+            &words(&["cat"])
+        ));
     }
 
     #[test]
@@ -5251,8 +6566,14 @@ mod keyword_tests {
 
     #[test]
     fn a_keyword_can_be_a_phrase() {
-        assert!(matches_keyword("is it release day yet", &words(&["release day"])));
-        assert!(!matches_keyword("release something", &words(&["release day"])));
+        assert!(matches_keyword(
+            "is it release day yet",
+            &words(&["release day"])
+        ));
+        assert!(!matches_keyword(
+            "release something",
+            &words(&["release day"])
+        ));
     }
 
     #[test]
@@ -5326,9 +6647,24 @@ mod irc_metadata_tests {
     #[test]
     fn a_nick_is_the_same_nick_in_any_case() {
         let rt = Runtime::new();
-        rt.set_irc_metadata("a", "Alice", "avatar", Some("https://example.net/a.png".into()));
-        assert_eq!(rt.irc_metadata("a", "alice").get("avatar").map(String::as_str), Some("https://example.net/a.png"));
-        assert_eq!(rt.irc_metadata("a", "ALICE").get("avatar").map(String::as_str), Some("https://example.net/a.png"));
+        rt.set_irc_metadata(
+            "a",
+            "Alice",
+            "avatar",
+            Some("https://example.net/a.png".into()),
+        );
+        assert_eq!(
+            rt.irc_metadata("a", "alice")
+                .get("avatar")
+                .map(String::as_str),
+            Some("https://example.net/a.png")
+        );
+        assert_eq!(
+            rt.irc_metadata("a", "ALICE")
+                .get("avatar")
+                .map(String::as_str),
+            Some("https://example.net/a.png")
+        );
     }
 
     /// A cleared key is somebody taking their avatar down, and has to leave
@@ -5388,7 +6724,8 @@ mod rename_tests {
 
     #[test]
     fn a_mention_pill_keeps_its_address_and_loses_its_name() {
-        let html = "<a href=\"https://matrix.to/#/@salastil:example.org\">Salastil</a> textgoeshere";
+        let html =
+            "<a href=\"https://matrix.to/#/@salastil:example.org\">Salastil</a> textgoeshere";
         assert_eq!(
             rename_own_mentions_html(html, "salastil", "You"),
             "<a href=\"https://matrix.to/#/@salastil:example.org\">@You</a> textgoeshere"
@@ -5409,7 +6746,12 @@ mod rename_tests {
 /// Only one that is online is moved: what somebody chose - idle, do not
 /// disturb, invisible - stays until they choose again. Only where the service
 /// has an idle, and not in a call.
-pub(crate) fn auto_idle_rule(away: bool, chosen: &str, service_has_idle: bool, in_call: bool) -> bool {
+pub(crate) fn auto_idle_rule(
+    away: bool,
+    chosen: &str,
+    service_has_idle: bool,
+    in_call: bool,
+) -> bool {
     away && chosen == "online" && service_has_idle && !in_call
 }
 
@@ -5450,7 +6792,10 @@ mod auto_idle_tests {
 /// either shape, so a map keyed by one of those is left alone by the same
 /// test rather than needing to be identified and skipped.
 fn belongs_to(account_id: &str, key: &str) -> bool {
-    key == account_id || (key.len() > account_id.len() && key.starts_with(account_id) && key.as_bytes()[account_id.len()] == b'|')
+    key == account_id
+        || (key.len() > account_id.len()
+            && key.starts_with(account_id)
+            && key.as_bytes()[account_id.len()] == b'|')
 }
 
 impl Runtime {
@@ -5496,44 +6841,113 @@ impl Runtime {
         }
 
         sweep!(
-            conn_states, connected_at, irc_handles, buffers,
-            buffer_groups, task_handles, last_connect_attempt,
-            restored_buffers, restored_groups, layout_confirmed,
-            connect_generation, matrix_invites, discord_resync,
-            discord_own_roles, discord_guild_roles, discord_guild_owners,
-            discord_member_windows, presence, own_identity,
-            discord_channels, discord_gateway_sessions, ringing_calls,
-            discord_guild_id, discord_buffer_emojis, emoji_catalogue,
-            kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, steam_links, steam_requests, kick_channels,
-            kick_streams, kick_stream_fetched, live_cards,
-            irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
-            discord_last_interaction, matrix_room_creators, matrix_room_versions,
-            matrix_call_members, matrix_stickers, matrix_rooms,
-            account_status, account_status_text, discord_voice_self, irc_transports,
-            discord_gateway_senders, matrix_machines, matrix_reaction_targets,
-            matrix_verifications, matrix_ignored, matrix_verification_peers,
-            matrix_push_rules, irc_away, kick_pins,
-            matrix_server_facts, irc_isupport, sneedchat_rooms,
+            conn_states,
+            connected_at,
+            irc_handles,
+            buffers,
+            buffer_groups,
+            task_handles,
+            last_connect_attempt,
+            restored_buffers,
+            restored_groups,
+            layout_confirmed,
+            connect_generation,
+            matrix_invites,
+            discord_resync,
+            discord_own_roles,
+            discord_guild_roles,
+            discord_guild_owners,
+            discord_member_windows,
+            presence,
+            own_identity,
+            discord_channels,
+            discord_gateway_sessions,
+            ringing_calls,
+            discord_guild_id,
+            discord_buffer_emojis,
+            emoji_catalogue,
+            kick_watching,
+            matrix_emoticons,
+            discord_friends,
+            sneedchat_senders,
+            kick_senders,
+            steam_links,
+            steam_requests,
+            kick_channels,
+            kick_streams,
+            kick_stream_fetched,
+            live_cards,
+            irc_channel_lists,
+            irc_channel_directory,
+            irc_caps,
+            irc_metadata,
+            discord_last_interaction,
+            matrix_room_creators,
+            matrix_room_versions,
+            matrix_call_members,
+            matrix_stickers,
+            matrix_rooms,
+            account_status,
+            account_status_text,
+            discord_voice_self,
+            irc_transports,
+            discord_gateway_senders,
+            matrix_machines,
+            matrix_reaction_targets,
+            matrix_verifications,
+            matrix_ignored,
+            matrix_verification_peers,
+            matrix_push_rules,
+            irc_away,
+            kick_pins,
+            matrix_server_facts,
+            irc_isupport,
+            sneedchat_rooms,
             discord_premium,
         );
         // Keyed by (account, something) or (buffer, something): the first
         // element carries the account either way.
         sweep_pairs!(
-            discord_members, matrix_back_tokens, matrix_polls,
-            matrix_poll_votes, matrix_room_names, matrix_space_parents,
-            discord_member_list_targets, discord_voice_channels, discord_voice_states,
-            discord_voice_names, discord_voice_avatars, discord_forum_tags, matrix_member_avatars,
-            matrix_room_avatars, matrix_room_topics, matrix_power_levels, matrix_pinned,
-            matrix_room_members, matrix_read_receipts, sneedchat_motds,
-            irc_whois, discord_mutes, matrix_presence,
-            matrix_own_reactions, irc_splits, matrix_widgets,
-            matrix_directs, discord_stage_topics,
+            discord_members,
+            matrix_back_tokens,
+            matrix_polls,
+            matrix_poll_votes,
+            matrix_room_names,
+            matrix_space_parents,
+            discord_member_list_targets,
+            discord_voice_channels,
+            discord_voice_states,
+            discord_voice_names,
+            discord_voice_avatars,
+            discord_forum_tags,
+            matrix_member_avatars,
+            matrix_room_avatars,
+            matrix_room_topics,
+            matrix_power_levels,
+            matrix_pinned,
+            matrix_room_members,
+            matrix_read_receipts,
+            sneedchat_motds,
+            irc_whois,
+            discord_mutes,
+            matrix_presence,
+            matrix_own_reactions,
+            irc_splits,
+            matrix_widgets,
+            matrix_directs,
+            discord_stage_topics,
         );
         sweep_set!(
-            discord_history_inflight, matrix_encrypted_rooms, matrix_backup_enabled,
-            emoji_unrestricted, wants_connected, discord_gated, irc_monitor, replaying,
-            silenced, irc_rostered,
+            discord_history_inflight,
+            matrix_encrypted_rooms,
+            matrix_backup_enabled,
+            emoji_unrestricted,
+            wants_connected,
+            discord_gated,
+            irc_monitor,
+            replaying,
+            silenced,
+            irc_rostered,
         );
         sweep_set_pairs!(matrix_previews_off);
     }
@@ -5566,11 +6980,18 @@ mod forget_tests {
                 // `irc_monitor`, `silenced` and others were outside the test,
                 // and outside the sweep with it.
                 let (name, ty) = line.split_once(": Mutex<")?;
-                ((ty.starts_with("HashMap<") || ty.starts_with("HashSet<") || ty.starts_with("std::collections::HashSet<")) && !name.contains(' '))
-                    .then_some(name)
+                ((ty.starts_with("HashMap<")
+                    || ty.starts_with("HashSet<")
+                    || ty.starts_with("std::collections::HashSet<"))
+                    && !name.contains(' '))
+                .then_some(name)
             })
             .collect();
-        assert!(fields.len() > 70, "found only {} maps - the parse is wrong", fields.len());
+        assert!(
+            fields.len() > 70,
+            "found only {} maps - the parse is wrong",
+            fields.len()
+        );
 
         // To the end of the function rather than a fixed number of bytes: a
         // cap is a thing to outgrow silently, and outgrowing this one would
@@ -5590,7 +7011,10 @@ mod forget_tests {
             })
         };
         let missing: Vec<&&str> = fields.iter().filter(|f| !swept(f)).collect();
-        assert!(missing.is_empty(), "these maps would survive removing an account: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "these maps would survive removing an account: {missing:?}"
+        );
     }
 
     /// The sweep itself, run: the other test reads the list, this one checks
@@ -5600,9 +7024,18 @@ mod forget_tests {
     fn away_remembers_what_was_said_and_a_change_of_words_is_a_change() {
         let rt = super::Runtime::new();
         assert!(rt.set_irc_away_because("irc:a", "Bob", Some(Some("gone fishing".into()))));
-        assert_eq!(rt.irc_away_reason("irc:a", "bob").as_deref(), Some("gone fishing"));
-        assert!(!rt.set_irc_away_because("irc:a", "bob", Some(Some("gone fishing".into()))), "the same again is nothing");
-        assert!(rt.set_irc_away_because("irc:a", "bob", Some(Some("lunch".into()))), "new words are drawn");
+        assert_eq!(
+            rt.irc_away_reason("irc:a", "bob").as_deref(),
+            Some("gone fishing")
+        );
+        assert!(
+            !rt.set_irc_away_because("irc:a", "bob", Some(Some("gone fishing".into()))),
+            "the same again is nothing"
+        );
+        assert!(
+            rt.set_irc_away_because("irc:a", "bob", Some(Some("lunch".into()))),
+            "new words are drawn"
+        );
         // Learning they are away some other way must not forget the words.
         assert!(!rt.set_irc_away("irc:a", "bob", true));
         assert_eq!(rt.irc_away_reason("irc:a", "bob").as_deref(), Some("lunch"));
@@ -5611,7 +7044,10 @@ mod forget_tests {
         assert!(rt.is_irc_away("irc:a", "amy") && rt.irc_away_reason("irc:a", "amy").is_none());
         assert!(rt.set_irc_away("irc:a", "bob", false));
         assert!(!rt.is_irc_away("irc:a", "bob"));
-        assert!(!rt.set_irc_away("irc:a", "bob", false), "back when already back is nothing");
+        assert!(
+            !rt.set_irc_away("irc:a", "bob", false),
+            "back when already back is nothing"
+        );
     }
 
     #[test]
@@ -5619,26 +7055,57 @@ mod forget_tests {
         let rt = super::Runtime::new();
         rt.set_own_identity("irc:a", "alice");
         rt.set_own_identity("irc:ab", "bob");
-        rt.matrix_rooms.lock().unwrap().insert("irc:a|#one".into(), "!one".into());
-        rt.matrix_rooms.lock().unwrap().insert("irc:ab|#one".into(), "!one".into());
+        rt.matrix_rooms
+            .lock()
+            .unwrap()
+            .insert("irc:a|#one".into(), "!one".into());
+        rt.matrix_rooms
+            .lock()
+            .unwrap()
+            .insert("irc:ab|#one".into(), "!one".into());
         rt.set_wants_connected("irc:a", true);
         rt.set_wants_connected("irc:ab", true);
         rt.silenced.lock().unwrap().insert("irc:a|#one".into());
         rt.silenced.lock().unwrap().insert("irc:ab|#one".into());
-        rt.discord_members.lock().unwrap().insert(("irc:a|#one".into(), "u".into()), serde_json::json!({}));
-        rt.set_steam_requests("irc:a", serde_json::json!({ "incoming": [1], "outgoing": [] }));
-        rt.set_steam_requests("irc:ab", serde_json::json!({ "incoming": [2], "outgoing": [] }));
+        rt.discord_members
+            .lock()
+            .unwrap()
+            .insert(("irc:a|#one".into(), "u".into()), serde_json::json!({}));
+        rt.set_steam_requests(
+            "irc:a",
+            serde_json::json!({ "incoming": [1], "outgoing": [] }),
+        );
+        rt.set_steam_requests(
+            "irc:ab",
+            serde_json::json!({ "incoming": [2], "outgoing": [] }),
+        );
 
         rt.forget_account("irc:a");
 
-        assert_eq!(rt.steam_requests("irc:a")["incoming"], serde_json::json!([]), "a forgotten account has no requests");
-        assert_eq!(rt.steam_requests("irc:ab")["incoming"], serde_json::json!([2]));
+        assert_eq!(
+            rt.steam_requests("irc:a")["incoming"],
+            serde_json::json!([]),
+            "a forgotten account has no requests"
+        );
+        assert_eq!(
+            rt.steam_requests("irc:ab")["incoming"],
+            serde_json::json!([2])
+        );
 
         assert!(rt.own_identity.lock().unwrap().get("irc:a").is_none());
-        assert!(rt.own_identity.lock().unwrap().get("irc:ab").is_some(), "a longer id that starts the same is another account");
-        assert_eq!(rt.matrix_rooms.lock().unwrap().keys().collect::<Vec<_>>(), ["irc:ab|#one"]);
+        assert!(
+            rt.own_identity.lock().unwrap().get("irc:ab").is_some(),
+            "a longer id that starts the same is another account"
+        );
+        assert_eq!(
+            rt.matrix_rooms.lock().unwrap().keys().collect::<Vec<_>>(),
+            ["irc:ab|#one"]
+        );
         assert!(rt.discord_members.lock().unwrap().is_empty());
-        assert!(!rt.wants_connected("irc:a"), "a removed account is not wanted online");
+        assert!(
+            !rt.wants_connected("irc:a"),
+            "a removed account is not wanted online"
+        );
         assert!(rt.wants_connected("irc:ab"));
         assert_eq!(rt.silenced.lock().unwrap().len(), 1);
     }
@@ -5651,18 +7118,30 @@ mod forget_tests {
 
         // The account itself, and its buffers.
         assert!(belongs_to(account, account));
-        assert!(belongs_to(account, "matrix:@salastil:matrix.salastil.com|!room:server"));
+        assert!(belongs_to(
+            account,
+            "matrix:@salastil:matrix.salastil.com|!room:server"
+        ));
         assert!(belongs_to(account, "matrix:@salastil:matrix.salastil.com|"));
 
         // A different account on the same homeserver, whose id is a prefix of
         // nothing and shares a great deal of text with this one.
         assert!(!belongs_to(account, "matrix:@someone:matrix.salastil.com"));
-        assert!(!belongs_to(account, "matrix:@someone:matrix.salastil.com|!room:server"));
+        assert!(!belongs_to(
+            account,
+            "matrix:@someone:matrix.salastil.com|!room:server"
+        ));
 
         // The dangerous one: an account id that starts with this account's id.
         // Without the separator check, removing one would empty the other.
-        assert!(!belongs_to(account, "matrix:@salastil:matrix.salastil.com.evil"));
-        assert!(!belongs_to(account, "matrix:@salastil:matrix.salastil.com.evil|!room:server"));
+        assert!(!belongs_to(
+            account,
+            "matrix:@salastil:matrix.salastil.com.evil"
+        ));
+        assert!(!belongs_to(
+            account,
+            "matrix:@salastil:matrix.salastil.com.evil|!room:server"
+        ));
 
         // And the keys that are neither: guild ids, event ids, room ids. A map
         // holding these is left alone by the same rule rather than needing to

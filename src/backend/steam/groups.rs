@@ -39,12 +39,15 @@ impl Groups {
                 self.names.remove(&id);
                 self.members.remove(&id);
             } else {
-                self.names.insert(id, group.strGroupName.clone().unwrap_or_default());
+                self.names
+                    .insert(id, group.strGroupName.clone().unwrap_or_default());
                 self.members.entry(id).or_default();
             }
         }
         for membership in &list.memberships {
-            let (Some(friend), Some(id)) = (membership.ulSteamID, membership.nGroupID) else { continue };
+            let (Some(friend), Some(id)) = (membership.ulSteamID, membership.nGroupID) else {
+                continue;
+            };
             if removal {
                 if let Some(members) = self.members.get_mut(&id) {
                     members.remove(&friend);
@@ -76,7 +79,8 @@ impl Groups {
 
     pub fn put_group(&mut self, group: i32, name: &str, friends: &[u64]) {
         self.names.insert(group, name.to_string());
-        self.members.insert(group, friends.iter().copied().collect());
+        self.members
+            .insert(group, friends.iter().copied().collect());
     }
 
     pub fn rename(&mut self, group: i32, name: &str) {
@@ -106,7 +110,11 @@ impl Groups {
 static HELD: LazyLock<Mutex<HashMap<String, Groups>>> = LazyLock::new(Default::default);
 
 pub fn held(account_id: &str) -> Groups {
-    HELD.lock().unwrap().get(account_id).cloned().unwrap_or_default()
+    HELD.lock()
+        .unwrap()
+        .get(account_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn clear(account_id: &str) {
@@ -127,7 +135,10 @@ pub fn heard(state: &AppState, account_id: &str, list: &ClientFriendsGroupsList)
 }
 
 fn tell(state: &AppState, account_id: &str, groups: &Groups) {
-    state.events.emit("steamFriendGroups", json!({ "accountId": account_id, "groups": groups.to_json() }));
+    state.events.emit(
+        "steamFriendGroups",
+        json!({ "accountId": account_id, "groups": groups.to_json() }),
+    );
 }
 
 /// What a change is, for the one call that makes it.
@@ -142,7 +153,13 @@ pub enum Change {
 
 /// Asks Steam to make a change, and keeps what it answers. Returns the number
 /// of the group made, for a creation.
-pub async fn change(state: &AppState, link: &Link, account_id: &str, own: u64, what: Change) -> Result<Option<i32>, String> {
+pub async fn change(
+    state: &AppState,
+    link: &Link,
+    account_id: &str,
+    own: u64,
+    what: Change,
+) -> Result<Option<i32>, String> {
     let refused = |code: Option<u32>| match code.unwrap_or(2) {
         1 => None,
         other => Some(super::eresult::describe(other as i32)),
@@ -151,20 +168,45 @@ pub async fn change(state: &AppState, link: &Link, account_id: &str, own: u64, w
     let mut made = None;
     match &what {
         Change::Add { group, friend } => {
-            let answer: ClientAddFriendToGroupResponse = link.ask(emsg::CLIENT_ADD_FRIEND_TO_GROUP, &ClientAddFriendToGroup { groupid: Some(*group), steamiduser: Some(*friend) }).await.map_err(asked)?;
+            let answer: ClientAddFriendToGroupResponse = link
+                .ask(
+                    emsg::CLIENT_ADD_FRIEND_TO_GROUP,
+                    &ClientAddFriendToGroup {
+                        groupid: Some(*group),
+                        steamiduser: Some(*friend),
+                    },
+                )
+                .await
+                .map_err(asked)?;
             if let Some(why) = refused(answer.eresult) {
                 return Err(why);
             }
         }
         Change::Remove { group, friend } => {
-            let answer: ClientRemoveFriendFromGroupResponse = link.ask(emsg::CLIENT_REMOVE_FRIEND_FROM_GROUP, &ClientRemoveFriendFromGroup { groupid: Some(*group), steamiduser: Some(*friend) }).await.map_err(asked)?;
+            let answer: ClientRemoveFriendFromGroupResponse = link
+                .ask(
+                    emsg::CLIENT_REMOVE_FRIEND_FROM_GROUP,
+                    &ClientRemoveFriendFromGroup {
+                        groupid: Some(*group),
+                        steamiduser: Some(*friend),
+                    },
+                )
+                .await
+                .map_err(asked)?;
             if let Some(why) = refused(answer.eresult) {
                 return Err(why);
             }
         }
         Change::Create { name, friends } => {
             let answer: ClientCreateFriendsGroupResponse = link
-                .ask(emsg::CLIENT_CREATE_FRIENDS_GROUP, &ClientCreateFriendsGroup { steamid: Some(own), groupname: Some(name.clone()), steamid_friends: friends.clone() })
+                .ask(
+                    emsg::CLIENT_CREATE_FRIENDS_GROUP,
+                    &ClientCreateFriendsGroup {
+                        steamid: Some(own),
+                        groupname: Some(name.clone()),
+                        steamid_friends: friends.clone(),
+                    },
+                )
                 .await
                 .map_err(asked)?;
             if let Some(why) = refused(answer.eresult) {
@@ -173,14 +215,32 @@ pub async fn change(state: &AppState, link: &Link, account_id: &str, own: u64, w
             made = answer.groupid;
         }
         Change::Rename { group, name } => {
-            let answer: ClientManageFriendsGroupResponse =
-                link.ask(emsg::CLIENT_MANAGE_FRIENDS_GROUP, &ClientManageFriendsGroup { groupid: Some(*group), groupname: Some(name.clone()), ..Default::default() }).await.map_err(asked)?;
+            let answer: ClientManageFriendsGroupResponse = link
+                .ask(
+                    emsg::CLIENT_MANAGE_FRIENDS_GROUP,
+                    &ClientManageFriendsGroup {
+                        groupid: Some(*group),
+                        groupname: Some(name.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(asked)?;
             if let Some(why) = refused(answer.eresult) {
                 return Err(why);
             }
         }
         Change::Delete { group } => {
-            let answer: ClientDeleteFriendsGroupResponse = link.ask(emsg::CLIENT_DELETE_FRIENDS_GROUP, &ClientDeleteFriendsGroup { steamid: Some(own), groupid: Some(*group) }).await.map_err(asked)?;
+            let answer: ClientDeleteFriendsGroupResponse = link
+                .ask(
+                    emsg::CLIENT_DELETE_FRIENDS_GROUP,
+                    &ClientDeleteFriendsGroup {
+                        steamid: Some(own),
+                        groupid: Some(*group),
+                    },
+                )
+                .await
+                .map_err(asked)?;
             if let Some(why) = refused(answer.eresult) {
                 return Err(why);
             }
@@ -209,7 +269,9 @@ pub async fn change(state: &AppState, link: &Link, account_id: &str, own: u64, w
 
 /// The friend a window names by their id as text.
 pub fn friend_of(text: &str) -> Option<u64> {
-    text.parse::<u64>().ok().filter(|id| steamid::account_of(*id).is_some())
+    text.parse::<u64>()
+        .ok()
+        .filter(|id| steamid::account_of(*id).is_some())
 }
 
 #[cfg(test)]
@@ -219,30 +281,60 @@ mod tests {
     const A: u64 = 76561197960287930;
     const B: u64 = 76561197960265729;
 
-    fn list(groups: &[(i32, &str)], members: &[(u64, i32)], incremental: bool, removal: bool) -> ClientFriendsGroupsList {
+    fn list(
+        groups: &[(i32, &str)],
+        members: &[(u64, i32)],
+        incremental: bool,
+        removal: bool,
+    ) -> ClientFriendsGroupsList {
         ClientFriendsGroupsList {
             bremoval: Some(removal),
             bincremental: Some(incremental),
-            friendGroups: groups.iter().map(|(id, name)| FriendGroup { nGroupID: Some(*id), strGroupName: Some(name.to_string()) }).collect(),
-            memberships: members.iter().map(|(f, g)| FriendGroupMembership { ulSteamID: Some(*f), nGroupID: Some(*g) }).collect(),
+            friendGroups: groups
+                .iter()
+                .map(|(id, name)| FriendGroup {
+                    nGroupID: Some(*id),
+                    strGroupName: Some(name.to_string()),
+                })
+                .collect(),
+            memberships: members
+                .iter()
+                .map(|(f, g)| FriendGroupMembership {
+                    ulSteamID: Some(*f),
+                    nGroupID: Some(*g),
+                })
+                .collect(),
         }
     }
 
     #[test]
     fn what_steam_says_is_the_groups_and_who_is_in_them() {
         let mut groups = Groups::default();
-        assert!(groups.apply(&list(&[(7, "Raiders"), (8, "Work")], &[(A, 7), (B, 7), (B, 8)], false, false)));
+        assert!(groups.apply(&list(
+            &[(7, "Raiders"), (8, "Work")],
+            &[(A, 7), (B, 7), (B, 8)],
+            false,
+            false
+        )));
         assert_eq!(
             groups.to_json(),
             json!([{ "id": 7, "name": "Raiders", "members": [B.to_string(), A.to_string()] }, { "id": 8, "name": "Work", "members": [B.to_string()] }])
         );
-        assert!(!groups.apply(&list(&[(7, "Raiders")], &[(A, 7)], true, false)), "the same said again changes nothing");
+        assert!(
+            !groups.apply(&list(&[(7, "Raiders")], &[(A, 7)], true, false)),
+            "the same said again changes nothing"
+        );
     }
 
     #[test]
     fn a_change_is_one_thing_and_a_full_list_is_everything() {
         let mut groups = Groups::default();
-        groups.apply(&list(&[(7, "Raiders"), (8, "Work")], &[(A, 7), (B, 8)], false, false));
+        groups.apply(&list(
+            &[(7, "Raiders"), (8, "Work")],
+            &[(A, 7), (B, 8)],
+            false,
+            false,
+        ));
         // Incremental: a rename, somebody moved.
         assert!(groups.apply(&list(&[(7, "Raid Team")], &[(B, 7)], true, false)));
         assert_eq!(groups.names[&7], "Raid Team");
@@ -267,23 +359,84 @@ mod tests {
         let url = serve(Box::new(|p| match p.emsg {
             emsg::CLIENT_CREATE_FRIENDS_GROUP => {
                 let ask = ClientCreateFriendsGroup::decode(p.body.as_slice()).unwrap();
-                assert_eq!((ask.steamid, ask.groupname.as_deref(), ask.steamid_friends.clone()), (Some(A), Some("Raiders"), vec![B]));
-                Some(vec![answer(&p, 1, ClientCreateFriendsGroupResponse { eresult: Some(1), groupid: Some(7) }.encode_to_vec())])
+                assert_eq!(
+                    (
+                        ask.steamid,
+                        ask.groupname.as_deref(),
+                        ask.steamid_friends.clone()
+                    ),
+                    (Some(A), Some("Raiders"), vec![B])
+                );
+                Some(vec![answer(
+                    &p,
+                    1,
+                    ClientCreateFriendsGroupResponse {
+                        eresult: Some(1),
+                        groupid: Some(7),
+                    }
+                    .encode_to_vec(),
+                )])
             }
-            emsg::CLIENT_ADD_FRIEND_TO_GROUP => Some(vec![answer(&p, 1, ClientAddFriendToGroupResponse { eresult: Some(1) }.encode_to_vec())]),
-            emsg::CLIENT_REMOVE_FRIEND_FROM_GROUP => Some(vec![answer(&p, 1, ClientRemoveFriendFromGroupResponse { eresult: Some(15) }.encode_to_vec())]),
+            emsg::CLIENT_ADD_FRIEND_TO_GROUP => Some(vec![answer(
+                &p,
+                1,
+                ClientAddFriendToGroupResponse { eresult: Some(1) }.encode_to_vec(),
+            )]),
+            emsg::CLIENT_REMOVE_FRIEND_FROM_GROUP => Some(vec![answer(
+                &p,
+                1,
+                ClientRemoveFriendFromGroupResponse { eresult: Some(15) }.encode_to_vec(),
+            )]),
             _ => Some(vec![]),
         }))
         .await;
-        let (link, _told) = link::open_with("test", &url, std::time::Duration::from_secs(5)).await.unwrap();
+        let (link, _told) = link::open_with("test", &url, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
         let account = "steam:groups-test";
-        let made = change(&state, &link, account, A, Change::Create { name: "Raiders".into(), friends: vec![B] }).await.unwrap();
+        let made = change(
+            &state,
+            &link,
+            account,
+            A,
+            Change::Create {
+                name: "Raiders".into(),
+                friends: vec![B],
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(made, Some(7));
-        assert_eq!(held(account).to_json(), json!([{ "id": 7, "name": "Raiders", "members": [B.to_string()] }]));
-        change(&state, &link, account, A, Change::Add { group: 7, friend: A }).await.unwrap();
+        assert_eq!(
+            held(account).to_json(),
+            json!([{ "id": 7, "name": "Raiders", "members": [B.to_string()] }])
+        );
+        change(
+            &state,
+            &link,
+            account,
+            A,
+            Change::Add {
+                group: 7,
+                friend: A,
+            },
+        )
+        .await
+        .unwrap();
         assert!(held(account).members[&7].contains(&A));
         // Steam refusing leaves what was held as it was, and says why.
-        assert!(change(&state, &link, account, A, Change::Remove { group: 7, friend: A }).await.is_err());
+        assert!(change(
+            &state,
+            &link,
+            account,
+            A,
+            Change::Remove {
+                group: 7,
+                friend: A
+            }
+        )
+        .await
+        .is_err());
         assert!(held(account).members[&7].contains(&A));
         clear(account);
         assert_eq!(held(account), Groups::default());

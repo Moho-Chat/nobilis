@@ -18,12 +18,16 @@ pub(super) fn avatar_cache_dir() -> std::path::PathBuf {
     if let Some(dir) = TEST_CACHE.lock().unwrap().clone() {
         return dir;
     }
-    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sneedchat-avatars")
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("sneedchat-avatars")
 }
 
 /// Where tests keep avatars instead, when one has said so.
 #[cfg(test)]
-pub(super) static TEST_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+pub(super) static TEST_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
 
 /// Evicts the oldest-written files in `dir` until it's back under
 /// `max_bytes`. Oldest-by-mtime rather than true LRU (a cache hit doesn't
@@ -34,12 +38,16 @@ pub(super) static TEST_CACHE: std::sync::Mutex<Option<std::path::PathBuf>> = std
 /// file that's never re-checked once cached, see cached_avatar_path's and
 /// resolve_attachment's own doc comments), same fix.
 pub async fn sweep_cache_dir(dir: &std::path::Path, max_bytes: u64, label: &str) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else { return };
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
 
     let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
     let mut total: u64 = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(meta) = entry.metadata().await else { continue };
+        let Ok(meta) = entry.metadata().await else {
+            continue;
+        };
         if !meta.is_file() {
             continue;
         }
@@ -96,14 +104,20 @@ pub async fn remove_retired_caches() {
     if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let Some(user_id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
-            if crate::media_cache::source(&avatar_key(&dir, user_id)).is_none() && tokio::fs::remove_file(&path).await.is_ok() {
+            let Some(user_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if crate::media_cache::source(&avatar_key(&dir, user_id)).is_none()
+                && tokio::fs::remove_file(&path).await.is_ok()
+            {
                 removed += 1;
             }
         }
     }
     if removed > 0 {
-        tracing::info!("sneedchat: removed {removed} avatar(s) cached before their source was kept");
+        tracing::info!(
+            "sneedchat: removed {removed} avatar(s) cached before their source was kept"
+        );
     }
 }
 
@@ -116,7 +130,10 @@ pub async fn remove_retired_caches() {
 /// migrate_caches_to_xdg_cache_dir moves any pre-existing `/tmp` directory
 /// here once at startup.
 pub(super) fn attachment_cache_dir() -> std::path::PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache")).join("nobilis").join("sneedchat-attachments")
+    dirs::cache_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".cache"))
+        .join("nobilis")
+        .join("sneedchat-attachments")
 }
 
 /// The file extension an image's own leading bytes call for, or None if the
@@ -146,7 +163,8 @@ pub(crate) fn sniff_image_ext(bytes: &[u8]) -> Option<&'static str> {
 /// Every extension sniff_image_ext can produce, plus the ones older caches
 /// were written with - what a lookup has to consider, since the name a
 /// cached avatar ended up under depends on what its bytes turned out to be.
-pub(super) const CACHED_AVATAR_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "mp4"];
+pub(super) const CACHED_AVATAR_EXTS: [&str; 8] =
+    ["png", "jpg", "jpeg", "gif", "webp", "avif", "heic", "mp4"];
 
 /// An existing cache entry for this user, if one is there and is what its
 /// name claims.
@@ -155,16 +173,25 @@ pub(super) const CACHED_AVATAR_EXTS: [&str; 8] = ["png", "jpg", "jpeg", "gif", "
 /// heal itself: an entry whose bytes disagree with its name is treated as
 /// absent, so it is re-fetched and rewritten under the right one. Only the
 /// first few bytes are read, so this stays cheap enough to run per message.
-pub(super) async fn cached_avatar_file(dir: &std::path::Path, user_id: &str) -> Option<std::path::PathBuf> {
+pub(super) async fn cached_avatar_file(
+    dir: &std::path::Path,
+    user_id: &str,
+) -> Option<std::path::PathBuf> {
     for ext in CACHED_AVATAR_EXTS {
         let path = dir.join(format!("{user_id}.{ext}"));
-        let Ok(mut file) = tokio::fs::File::open(&path).await else { continue };
+        let Ok(mut file) = tokio::fs::File::open(&path).await else {
+            continue;
+        };
         let mut head = [0u8; 16];
         use tokio::io::AsyncReadExt;
-        let Ok(n) = file.read(&mut head).await else { continue };
+        let Ok(n) = file.read(&mut head).await else {
+            continue;
+        };
         match sniff_image_ext(&head[..n]) {
             // "jpeg" and "jpg" are the same thing under two names.
-            Some(actual) if actual == ext || (actual == "jpg" && ext == "jpeg") => return Some(path),
+            Some(actual) if actual == ext || (actual == "jpg" && ext == "jpeg") => {
+                return Some(path)
+            }
             // Unrecognised bytes: nothing better to go on, so keep it.
             None => return Some(path),
             Some(_) => {
@@ -201,13 +228,19 @@ async fn versioned(path: &std::path::Path) -> String {
 }
 
 /// Fetches an avatar and keeps it, with the URL it came from.
-async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Option<std::path::PathBuf> {
+async fn fetch_avatar(
+    http: &http::HttpClient,
+    user_id: &str,
+    url: &str,
+) -> Option<std::path::PathBuf> {
     // Bounded rather than left open-ended: this runs inline in the room's
     // own read loop (see handle_frame), so a slow/stuck fetch (a fresh Tor
     // circuit needed for a host this session hasn't hit before, a route
     // that just hangs) would otherwise stall that entire room's message
     // processing until it resolved.
-    let Ok(fetch) = tokio::time::timeout(std::time::Duration::from_secs(15), http.get_bytes(url)).await else {
+    let Ok(fetch) =
+        tokio::time::timeout(std::time::Duration::from_secs(15), http.get_bytes(url)).await
+    else {
         tracing::debug!("sneedchat: avatar fetch for user {user_id} timed out");
         return None;
     };
@@ -255,7 +288,10 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
             return None;
         }
     }
-    crate::media_cache::record(&avatar_key(&dir, user_id), serde_json::json!({ "url": url }));
+    crate::media_cache::record(
+        &avatar_key(&dir, user_id),
+        serde_json::json!({ "url": url }),
+    );
     Some(path)
 }
 
@@ -272,11 +308,20 @@ async fn fetch_avatar(http: &http::HttpClient, user_id: &str, url: &str) -> Opti
 /// a different one is fetched. A new avatar is a new URL, so it is picked up
 /// on that person's next message, and nothing is fetched while it stays the
 /// same - no timer, no rescan.
-pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user_id: &str, raw_avatar_url: &str) -> Option<String> {
+pub(super) async fn cached_avatar_path(
+    http: &http::HttpClient,
+    host: &str,
+    user_id: &str,
+    raw_avatar_url: &str,
+) -> Option<String> {
     if raw_avatar_url.is_empty() {
         return None;
     }
-    let url = if raw_avatar_url.starts_with('/') { format!("https://{host}{raw_avatar_url}") } else { raw_avatar_url.to_string() };
+    let url = if raw_avatar_url.starts_with('/') {
+        format!("https://{host}{raw_avatar_url}")
+    } else {
+        raw_avatar_url.to_string()
+    };
 
     let dir = avatar_cache_dir();
     let cached = cached_avatar_file(&dir, user_id).await;
@@ -300,14 +345,19 @@ pub(super) async fn cached_avatar_path(http: &http::HttpClient, host: &str, user
 /// Kept for fetching a cached file again (see `restore_cached`): the session
 /// itself lives inside its connection, where nothing else can reach it, and
 /// an attachment is only served to somebody signed in.
-fn clients() -> &'static std::sync::Mutex<std::collections::HashMap<String, (http::HttpClient, String)>> {
-    static CLIENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (http::HttpClient, String)>>> =
-        std::sync::OnceLock::new();
+fn clients(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (http::HttpClient, String)>> {
+    static CLIENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (http::HttpClient, String)>>,
+    > = std::sync::OnceLock::new();
     CLIENTS.get_or_init(Default::default)
 }
 
 pub(super) fn note_client(account_id: &str, http: &http::HttpClient, host: &str) {
-    clients().lock().unwrap().insert(account_id.to_string(), (http.clone(), host.to_string()));
+    clients()
+        .lock()
+        .unwrap()
+        .insert(account_id.to_string(), (http.clone(), host.to_string()));
 }
 
 /// Fetches a cached attachment or avatar again, after it expired or was
@@ -322,24 +372,33 @@ pub async fn restore_cached(path: &std::path::Path) -> anyhow::Result<std::path:
         .next()
         .cloned()
         .context("no Sneedchat account is connected to fetch it with")?;
-    let name = path.file_name().and_then(|n| n.to_str()).context("not a cached file")?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("not a cached file")?;
     let (stem, _) = name.split_once('.').unwrap_or((name, ""));
     if !stem.bytes().all(|b| b.is_ascii_digit()) || stem.is_empty() {
         anyhow::bail!("not a cached Sneedchat file");
     }
 
     if path.parent() == Some(avatar_cache_dir().as_path()) {
-        let source = crate::media_cache::source(&avatar_key(&avatar_cache_dir(), stem)).context("where that avatar came from was not kept")?;
-        let url = source["url"].as_str().context("where that avatar came from was not kept")?;
-        return fetch_avatar(&http, stem, url).await.context("the site did not send the avatar");
+        let source = crate::media_cache::source(&avatar_key(&avatar_cache_dir(), stem))
+            .context("where that avatar came from was not kept")?;
+        let url = source["url"]
+            .as_str()
+            .context("where that avatar came from was not kept")?;
+        return fetch_avatar(&http, stem, url)
+            .await
+            .context("the site did not send the avatar");
     }
 
     // XenForo serves an attachment by its id alone; the name in front of it
     // in a link is decoration.
     let url = format!("https://{host}/attachments/{stem}/");
-    let (status, bytes) = tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&url))
-        .await
-        .context("the site took too long")??;
+    let (status, bytes) =
+        tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&url))
+            .await
+            .context("the site took too long")??;
     if !(200..300).contains(&status) || bytes.is_empty() {
         anyhow::bail!("the site answered HTTP {status} for that attachment");
     }
@@ -351,8 +410,9 @@ pub async fn restore_cached(path: &std::path::Path) -> anyhow::Result<std::path:
 /// Recognized image/video file extensions for attachment links - shares
 /// the client's own media-detection list, since this exists for the same
 /// reason: deciding whether a link is worth embedding.
-pub(super) const ATTACHMENT_EXTS: &[&str] =
-    &["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "mp4", "webm", "mov", "mkv"];
+pub(super) const ATTACHMENT_EXTS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "mp4", "webm", "mov", "mkv",
+];
 
 /// Finds the first Kiwi Farms/XenForo attachment URL in `text` - either
 /// host, clearnet or onion (see DEFAULT_ONION) - shaped like
@@ -367,19 +427,27 @@ pub(super) const ATTACHMENT_EXTS: &[&str] =
 pub(super) fn find_attachment_url(text: &str) -> Option<(&str, &str, &str)> {
     for host in [KIWIFARMS_CLEARNET_HOST, DEFAULT_ONION] {
         let marker_start = format!("https://{host}/attachments/");
-        let Some(start) = text.find(&marker_start) else { continue };
+        let Some(start) = text.find(&marker_start) else {
+            continue;
+        };
         let seg_start = start + marker_start.len();
         let rest = &text[seg_start..];
-        let seg_len = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']')).unwrap_or(rest.len());
+        let seg_len = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']'))
+            .unwrap_or(rest.len());
         let end = seg_start + seg_len;
         let segment = text[seg_start..end].trim_end_matches('/');
 
-        let Some(dot) = segment.rfind('.') else { continue };
+        let Some(dot) = segment.rfind('.') else {
+            continue;
+        };
         let (name_part, id_part) = (&segment[..dot], &segment[dot + 1..]);
         if id_part.is_empty() || !id_part.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let Some(dash) = name_part.rfind('-') else { continue };
+        let Some(dash) = name_part.rfind('-') else {
+            continue;
+        };
         let ext = &name_part[dash + 1..];
         if !ATTACHMENT_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
             continue;
@@ -415,19 +483,32 @@ pub(super) fn find_upload_url(text: &str) -> Option<(&str, String, String, Strin
         format!("https://{DEFAULT_ONION}/data/"),
         format!("http://{DEFAULT_ONION}/data/"),
     ] {
-        let Some(start) = text.find(&prefix) else { continue };
+        let Some(start) = text.find(&prefix) else {
+            continue;
+        };
         let tail_start = start + prefix.len();
         let rest = &text[tail_start..];
-        let len = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\'')).unwrap_or(rest.len());
+        let len = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\''))
+            .unwrap_or(rest.len());
         let tail = &rest[..len];
         let (path, query) = tail.split_once('?').map_or((tail, ""), |(p, q)| (p, q));
         // `attachments/<bucket>/<id>-<hash>[-alt].<ext>` or `video/<bucket>/...`.
         let mut parts = path.split('/');
-        let (Some(kind), Some(bucket), Some(file), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
-        if !matches!(kind, "attachments" | "video") || bucket.is_empty() || !bucket.bytes().all(|b| b.is_ascii_digit()) {
+        let (Some(kind), Some(bucket), Some(file), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if !matches!(kind, "attachments" | "video")
+            || bucket.is_empty()
+            || !bucket.bytes().all(|b| b.is_ascii_digit())
+        {
             continue;
         }
-        let Some((stem, ext)) = file.rsplit_once('.') else { continue };
+        let Some((stem, ext)) = file.rsplit_once('.') else {
+            continue;
+        };
         let ext = ext.to_ascii_lowercase();
         if !ATTACHMENT_EXTS.contains(&ext.as_str()) {
             continue;
@@ -436,9 +517,20 @@ pub(super) fn find_upload_url(text: &str) -> Option<(&str, String, String, Strin
         if id.is_empty() || !stem[id.len()..].starts_with('-') {
             continue;
         }
-        let matched_end = tail_start + path.len() + if query.is_empty() { 0 } else { 1 + query.len() };
-        let ask = format!("/data/{path}{}", if query.is_empty() { String::new() } else { format!("?{query}") });
-        if best.as_ref().is_none_or(|(m, ..)| start < text.find(m).unwrap_or(usize::MAX)) {
+        let matched_end =
+            tail_start + path.len() + if query.is_empty() { 0 } else { 1 + query.len() };
+        let ask = format!(
+            "/data/{path}{}",
+            if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{query}")
+            }
+        );
+        if best
+            .as_ref()
+            .is_none_or(|(m, ..)| start < text.find(m).unwrap_or(usize::MAX))
+        {
             best = Some((&text[start..matched_end], id, ext, ask));
         }
     }
@@ -471,7 +563,10 @@ fn find_resolvable(body: &str, host: &str) -> Option<Resolvable> {
                 id: id.to_string(),
                 ext: ext.to_ascii_lowercase(),
                 fetch_url: format!("https://{host}{}", &matched[at..]),
-                page_url: Some(format!("https://{KIWIFARMS_CLEARNET_HOST}{}", &matched[at..])),
+                page_url: Some(format!(
+                    "https://{KIWIFARMS_CLEARNET_HOST}{}",
+                    &matched[at..]
+                )),
             },
         ))
     });
@@ -479,7 +574,13 @@ fn find_resolvable(body: &str, host: &str) -> Option<Resolvable> {
         let fetch_host = upload_host(host);
         Some((
             body.find(matched)?,
-            Resolvable { matched: matched.to_string(), id, ext, fetch_url: format!("https://{fetch_host}{ask}"), page_url: Some(matched.to_string()) },
+            Resolvable {
+                matched: matched.to_string(),
+                id,
+                ext,
+                fetch_url: format!("https://{fetch_host}{ask}"),
+                page_url: Some(matched.to_string()),
+            },
         ))
     });
     match (page, upload) {
@@ -494,7 +595,10 @@ fn find_resolvable(body: &str, host: &str) -> Option<Resolvable> {
 /// left behind they are an empty tag, which draws as nothing and still takes a
 /// line.
 fn without_link(body: &str, link: &str) -> String {
-    body.replace(&format!("[img]{link}[/img]"), "").replace(link, "").trim().to_string()
+    body.replace(&format!("[img]{link}[/img]"), "")
+        .replace(link, "")
+        .trim()
+        .to_string()
 }
 
 /// Writes the forum's short attachment form out in full.
@@ -522,7 +626,11 @@ pub(super) fn expand_attachment_paths<'a>(body: &'a str, host: &str) -> std::bor
 /// Tor, and on the open internet the forum's uploads host, which is where its
 /// files are served from.
 fn upload_host(host: &str) -> String {
-    if host == KIWIFARMS_CLEARNET_HOST { format!("uploads.{KIWIFARMS_CLEARNET_HOST}") } else { host.to_string() }
+    if host == KIWIFARMS_CLEARNET_HOST {
+        format!("uploads.{KIWIFARMS_CLEARNET_HOST}")
+    } else {
+        host.to_string()
+    }
 }
 
 /// The forum's direct file links - `/data/attachments/...` and `/data/video/...`
@@ -561,7 +669,9 @@ fn expand_data_links<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str>
         let at = search + found;
         search = at + "/data/".len();
         let tail = &body[at..];
-        let len = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\'' | ')')).unwrap_or(tail.len());
+        let len = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | '"' | '\'' | ')'))
+            .unwrap_or(tail.len());
         let path = &tail[..len];
         // Which domain, if any, is written in front of it.
         let before = &body[..at];
@@ -569,7 +679,10 @@ fn expand_data_links<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a, str>
         let start = at - origin.map_or(0, |o| o.len());
         if origin.is_none() {
             // Bare: only standing on its own, as the short attachment form must.
-            let standing = matches!(before.chars().next_back(), None | Some(' ' | '\n' | '\t' | ']' | '(' | '>'));
+            let standing = matches!(
+                before.chars().next_back(),
+                None | Some(' ' | '\n' | '\t' | ']' | '(' | '>')
+            );
             if !standing {
                 continue;
             }
@@ -607,7 +720,9 @@ fn expand_attachment_pages<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a
         let before = body[..absolute].chars().next_back();
         let standalone = matches!(before, None | Some(' ' | '\n' | '\t' | ']' | '(' | '>'));
         let tail = &body[absolute..];
-        let len = tail.find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | ')')).unwrap_or(tail.len());
+        let len = tail
+            .find(|c: char| c.is_whitespace() || matches!(c, '<' | '[' | ']' | ')'))
+            .unwrap_or(tail.len());
         let path = &tail[..len];
         out.push_str(&rest[..at]);
         let full = format!("https://{host}{path}");
@@ -621,7 +736,11 @@ fn expand_attachment_pages<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a
         rest = &body[consumed..];
     }
     out.push_str(rest);
-    if changed { std::borrow::Cow::Owned(out) } else { std::borrow::Cow::Borrowed(body) }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    }
 }
 
 /// Fetched from the address this account reaches the forum at (`host`),
@@ -637,8 +756,24 @@ fn expand_attachment_pages<'a>(body: &'a str, host: &str) -> std::borrow::Cow<'a
 /// the "(edited)" label alone) once the local copy is ready, re-rendering
 /// the same message with a working embed a moment later instead of
 /// stalling the whole room's message processing on one slow Tor fetch.
-pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, host: &str, buffer_id: String, msg_id: String, body: String) {
-    let Some(Resolvable { matched, id, ext, fetch_url, page_url: page }) = find_resolvable(&body, host) else { return };
+pub(super) fn spawn_attachment_resolve(
+    state: AppState,
+    http: http::HttpClient,
+    host: &str,
+    buffer_id: String,
+    msg_id: String,
+    body: String,
+) {
+    let Some(Resolvable {
+        matched,
+        id,
+        ext,
+        fetch_url,
+        page_url: page,
+    }) = find_resolvable(&body, host)
+    else {
+        return;
+    };
 
     tokio::spawn(async move {
         let dir = attachment_cache_dir();
@@ -647,9 +782,16 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
         let local_url = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             Some(format!("file://{}", path.display()))
         } else {
-            match tokio::time::timeout(std::time::Duration::from_secs(30), http.get_bytes(&fetch_url)).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                http.get_bytes(&fetch_url),
+            )
+            .await
+            {
                 Ok(Ok((status, bytes))) if (200..300).contains(&status) && !bytes.is_empty() => {
-                    if tokio::fs::create_dir_all(&dir).await.is_ok() && tokio::fs::write(&path, &bytes).await.is_ok() {
+                    if tokio::fs::create_dir_all(&dir).await.is_ok()
+                        && tokio::fs::write(&path, &bytes).await.is_ok()
+                    {
                         Some(format!("file://{}", path.display()))
                     } else {
                         tracing::debug!("sneedchat: caching attachment {id} failed");
@@ -657,7 +799,9 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
                     }
                 }
                 Ok(Ok((status, _))) => {
-                    tracing::info!("sneedchat: attachment {id} ({fetch_url}) answered HTTP {status}");
+                    tracing::info!(
+                        "sneedchat: attachment {id} ({fetch_url}) answered HTTP {status}"
+                    );
                     None
                 }
                 Ok(Err(e)) => {
@@ -676,7 +820,11 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
         // (#247) - so a cached file goes where every other protocol puts one,
         // and the link it replaces leaves the text, as the old rewrite did.
         if let Some(local_url) = local_url {
-            let kind = if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") { "video" } else { "image" };
+            let kind = if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") {
+                "video"
+            } else {
+                "image"
+            };
             let attachment = crate::model::Attachment {
                 kind: kind.to_string(),
                 filename: Some(format!("{id}.{ext}")),
@@ -684,9 +832,18 @@ pub(super) fn spawn_attachment_resolve(state: AppState, http: http::HttpClient, 
                 url: page,
                 ..Default::default()
             };
-            state.runtime.update_message_body_only(&state, &buffer_id, &msg_id, &without_link(&body, &matched));
+            state.runtime.update_message_body_only(
+                &state,
+                &buffer_id,
+                &msg_id,
+                &without_link(&body, &matched),
+            );
             let attachments = vec![attachment];
-            if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &attachments) {
+            if let Err(e) =
+                state
+                    .store
+                    .update_message_attachments(&buffer_id, &msg_id, &attachments)
+            {
                 tracing::debug!("sneedchat: recording attachment {id}: {e}");
                 return;
             }
@@ -706,7 +863,10 @@ mod tests {
     fn matches_the_real_reported_url() {
         let body = "look at this https://kiwifarms.st/attachments/sam-consent-accident-webp.5648955/ what a guy";
         let (matched, id, ext) = find_attachment_url(body).expect("should match");
-        assert_eq!(matched, "https://kiwifarms.st/attachments/sam-consent-accident-webp.5648955/");
+        assert_eq!(
+            matched,
+            "https://kiwifarms.st/attachments/sam-consent-accident-webp.5648955/"
+        );
         assert_eq!(id, "5648955");
         assert_eq!(ext, "webp");
     }
@@ -718,15 +878,21 @@ mod tests {
     #[test]
     fn an_avif_attachment_is_a_picture_like_any_other() {
         let (matched, id, ext) =
-            find_attachment_url("https://kiwifarms.st/attachments/a-photo-avif.123/").expect("should match");
-        assert_eq!(matched, "https://kiwifarms.st/attachments/a-photo-avif.123/");
+            find_attachment_url("https://kiwifarms.st/attachments/a-photo-avif.123/")
+                .expect("should match");
+        assert_eq!(
+            matched,
+            "https://kiwifarms.st/attachments/a-photo-avif.123/"
+        );
         assert_eq!(id, "123");
         assert_eq!(ext, "avif");
     }
 
     #[test]
     fn matches_without_a_trailing_slash() {
-        let (matched, id, ext) = find_attachment_url("https://kiwifarms.st/attachments/foo-bar-png.42").expect("should match");
+        let (matched, id, ext) =
+            find_attachment_url("https://kiwifarms.st/attachments/foo-bar-png.42")
+                .expect("should match");
         assert_eq!(matched, "https://kiwifarms.st/attachments/foo-bar-png.42");
         assert_eq!(id, "42");
         assert_eq!(ext, "png");
@@ -735,19 +901,41 @@ mod tests {
     #[test]
     fn a_bare_attachment_path_is_given_the_host_the_account_connects_to() {
         let clear = "https://kiwifarms.st/attachments/seal-png.9609686/";
-        assert_eq!(expand_attachment_paths("/attachments/seal-png.9609686/", KIWIFARMS_CLEARNET_HOST), clear);
-        assert_eq!(expand_attachment_paths("look /attachments/seal-png.9609686/ lol", KIWIFARMS_CLEARNET_HOST), format!("look {clear} lol"));
-        assert_eq!(expand_attachment_paths("[img]/attachments/seal-png.9609686/[/img]", KIWIFARMS_CLEARNET_HOST), format!("[img]{clear}[/img]"));
+        assert_eq!(
+            expand_attachment_paths("/attachments/seal-png.9609686/", KIWIFARMS_CLEARNET_HOST),
+            clear
+        );
+        assert_eq!(
+            expand_attachment_paths(
+                "look /attachments/seal-png.9609686/ lol",
+                KIWIFARMS_CLEARNET_HOST
+            ),
+            format!("look {clear} lol")
+        );
+        assert_eq!(
+            expand_attachment_paths(
+                "[img]/attachments/seal-png.9609686/[/img]",
+                KIWIFARMS_CLEARNET_HOST
+            ),
+            format!("[img]{clear}[/img]")
+        );
         // Through Tor, the onion address instead.
         let onion = format!("https://{DEFAULT_ONION}/attachments/seal-png.9609686/");
-        assert_eq!(expand_attachment_paths("/attachments/seal-png.9609686/", DEFAULT_ONION), onion);
+        assert_eq!(
+            expand_attachment_paths("/attachments/seal-png.9609686/", DEFAULT_ONION),
+            onion
+        );
         // Without the trailing slash, as people type it too.
         assert_eq!(
             expand_attachment_paths("/attachments/seal-png.9609686", KIWIFARMS_CLEARNET_HOST),
             "https://kiwifarms.st/attachments/seal-png.9609686"
         );
         // And the result is an attachment link like any other.
-        assert!(find_attachment_url(&expand_attachment_paths("/attachments/seal-png.9609686/", DEFAULT_ONION)).is_some());
+        assert!(find_attachment_url(&expand_attachment_paths(
+            "/attachments/seal-png.9609686/",
+            DEFAULT_ONION
+        ))
+        .is_some());
     }
 
     #[test]
@@ -761,7 +949,11 @@ mod tests {
             "the /attachments/ folder",
             "nothing here",
         ] {
-            assert_eq!(expand_attachment_paths(left_alone, KIWIFARMS_CLEARNET_HOST), left_alone, "{left_alone}");
+            assert_eq!(
+                expand_attachment_paths(left_alone, KIWIFARMS_CLEARNET_HOST),
+                left_alone,
+                "{left_alone}"
+            );
         }
     }
 
@@ -776,7 +968,9 @@ mod tests {
 
     #[test]
     fn stops_at_a_bracket_or_whitespace() {
-        let (matched, ..) = find_attachment_url("[url=https://kiwifarms.st/attachments/x-webp.1/]click[/url]").expect("should match");
+        let (matched, ..) =
+            find_attachment_url("[url=https://kiwifarms.st/attachments/x-webp.1/]click[/url]")
+                .expect("should match");
         assert_eq!(matched, "https://kiwifarms.st/attachments/x-webp.1/");
     }
 
@@ -806,9 +1000,18 @@ mod tests {
         assert_eq!(sniff_image_ext(b"\x89PNG\r\n\x1a\n....."), Some("png"));
         assert_eq!(sniff_image_ext(b"\xff\xd8\xff\xe0 jfif"), Some("jpg"));
         assert_eq!(sniff_image_ext(b"GIF89a......"), Some("gif"));
-        assert_eq!(sniff_image_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("webp"));
-        assert_eq!(sniff_image_ext(b"\x00\x00\x00\x20ftypavif...."), Some("avif"));
-        assert_eq!(sniff_image_ext(b"\x00\x00\x00\x20ftypisom...."), Some("mp4"));
+        assert_eq!(
+            sniff_image_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("webp")
+        );
+        assert_eq!(
+            sniff_image_ext(b"\x00\x00\x00\x20ftypavif...."),
+            Some("avif")
+        );
+        assert_eq!(
+            sniff_image_ext(b"\x00\x00\x00\x20ftypisom...."),
+            Some("mp4")
+        );
     }
 
     #[test]
@@ -828,7 +1031,10 @@ mod tests {
         let stale = dir.join("42.jpg");
         std::fs::write(&stale, b"RIFF\x00\x00\x00\x00WEBPVP8 payload").unwrap();
 
-        assert!(cached_avatar_file(&dir, "42").await.is_none(), "kept a WebP named .jpg");
+        assert!(
+            cached_avatar_file(&dir, "42").await.is_none(),
+            "kept a WebP named .jpg"
+        );
         assert!(!stale.exists(), "left the mislabelled file behind");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -840,12 +1046,18 @@ mod tests {
         let good = dir.join("7.webp");
         std::fs::write(&good, b"RIFF\x00\x00\x00\x00WEBPVP8 payload").unwrap();
 
-        assert_eq!(cached_avatar_file(&dir, "7").await.as_deref(), Some(good.as_path()));
+        assert_eq!(
+            cached_avatar_file(&dir, "7").await.as_deref(),
+            Some(good.as_path())
+        );
         // A real JPEG under .jpg must also survive - this must not re-fetch
         // every avatar on every message.
         let jpg = dir.join("8.jpg");
         std::fs::write(&jpg, b"\xff\xd8\xff\xe0 jfif payload").unwrap();
-        assert_eq!(cached_avatar_file(&dir, "8").await.as_deref(), Some(jpg.as_path()));
+        assert_eq!(
+            cached_avatar_file(&dir, "8").await.as_deref(),
+            Some(jpg.as_path())
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -886,7 +1098,8 @@ mod tests {
     #[test]
     fn the_earliest_of_the_two_kinds_is_the_one_fetched() {
         let page = "https://kiwifarms.st/attachments/cat-png.123/";
-        let upload = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
+        let upload =
+            "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
         let r = find_resolvable(&format!("{upload} then {page}"), "kiwifarms.st").unwrap();
         assert_eq!(r.id, "9671535");
         let r = find_resolvable(&format!("{page} then {upload}"), "kiwifarms.st").unwrap();
@@ -895,46 +1108,87 @@ mod tests {
 
     #[test]
     fn it_is_asked_for_where_this_account_reaches_the_forum() {
-        let upload = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
-        assert_eq!(find_resolvable(upload, "kiwifarms.st").unwrap().fetch_url, upload, "on the open internet, its uploads host");
+        let upload =
+            "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
+        assert_eq!(
+            find_resolvable(upload, "kiwifarms.st").unwrap().fetch_url,
+            upload,
+            "on the open internet, its uploads host"
+        );
         let through_tor = find_resolvable(upload, DEFAULT_ONION).unwrap().fetch_url;
-        assert_eq!(through_tor, format!("https://{DEFAULT_ONION}/data/attachments/9671/9671535-abc-alt.avif?hash=x"), "through Tor, the onion address");
+        assert_eq!(
+            through_tor,
+            format!("https://{DEFAULT_ONION}/data/attachments/9671/9671535-abc-alt.avif?hash=x"),
+            "through Tor, the onion address"
+        );
     }
 
     #[test]
     fn the_tags_that_held_a_link_go_with_it() {
         let link = "https://uploads.kiwifarms.st/data/attachments/9671/9671535-abc-alt.avif?hash=x";
         assert_eq!(without_link(&format!("[img]{link}[/img]"), link), "");
-        assert_eq!(without_link(&format!("reminds me of him [img]{link}[/img]"), link), "reminds me of him");
+        assert_eq!(
+            without_link(&format!("reminds me of him [img]{link}[/img]"), link),
+            "reminds me of him"
+        );
         assert_eq!(without_link(&format!("look {link}"), link), "look");
     }
 
-    const UPLOAD: &str = "/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41";
+    const UPLOAD: &str =
+        "/data/attachments/9671/9671535-a2e5ae0d55aadd338162770b3fa79f97-alt.avif?hash=-d_TarFo41";
 
     #[test]
-    fn a_direct_file_link_loses_its_domain_and_is_given_the_one_this_account_reaches_the_forum_at() {
+    fn a_direct_file_link_loses_its_domain_and_is_given_the_one_this_account_reaches_the_forum_at()
+    {
         // As the chat has it: wrapped, with the uploads host.
         let theirs = format!("[img]https://uploads.kiwifarms.st{UPLOAD}[/img]");
-        assert_eq!(expand_attachment_paths(&theirs, KIWIFARMS_CLEARNET_HOST), theirs, "on the open internet it is already the right one");
+        assert_eq!(
+            expand_attachment_paths(&theirs, KIWIFARMS_CLEARNET_HOST),
+            theirs,
+            "on the open internet it is already the right one"
+        );
         // Through Tor, the onion address: the clearnet one is not asked.
-        assert_eq!(expand_attachment_paths(&theirs, DEFAULT_ONION), format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]"));
+        assert_eq!(
+            expand_attachment_paths(&theirs, DEFAULT_ONION),
+            format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]")
+        );
     }
 
     #[test]
     fn whichever_address_the_link_was_copied_with_it_comes_out_as_this_accounts_own() {
         let want_clear = format!("https://uploads.kiwifarms.st{UPLOAD}");
         let want_onion = format!("https://{DEFAULT_ONION}{UPLOAD}");
-        for origin in ["https://uploads.kiwifarms.st", "https://kiwifarms.st", "https://www.kiwifarms.st", &format!("https://{DEFAULT_ONION}"), &format!("http://{DEFAULT_ONION}")] {
+        for origin in [
+            "https://uploads.kiwifarms.st",
+            "https://kiwifarms.st",
+            "https://www.kiwifarms.st",
+            &format!("https://{DEFAULT_ONION}"),
+            &format!("http://{DEFAULT_ONION}"),
+        ] {
             let text = format!("look {origin}{UPLOAD} lol");
-            assert_eq!(expand_attachment_paths(&text, KIWIFARMS_CLEARNET_HOST), format!("look {want_clear} lol"), "{origin}");
-            assert_eq!(expand_attachment_paths(&text, DEFAULT_ONION), format!("look {want_onion} lol"), "{origin}");
+            assert_eq!(
+                expand_attachment_paths(&text, KIWIFARMS_CLEARNET_HOST),
+                format!("look {want_clear} lol"),
+                "{origin}"
+            );
+            assert_eq!(
+                expand_attachment_paths(&text, DEFAULT_ONION),
+                format!("look {want_onion} lol"),
+                "{origin}"
+            );
         }
     }
 
     #[test]
     fn typed_short_it_is_the_same() {
-        assert_eq!(expand_attachment_paths(UPLOAD, KIWIFARMS_CLEARNET_HOST), format!("https://uploads.kiwifarms.st{UPLOAD}"));
-        assert_eq!(expand_attachment_paths(&format!("[img]{UPLOAD}[/img]"), DEFAULT_ONION), format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]"));
+        assert_eq!(
+            expand_attachment_paths(UPLOAD, KIWIFARMS_CLEARNET_HOST),
+            format!("https://uploads.kiwifarms.st{UPLOAD}")
+        );
+        assert_eq!(
+            expand_attachment_paths(&format!("[img]{UPLOAD}[/img]"), DEFAULT_ONION),
+            format!("[img]https://{DEFAULT_ONION}{UPLOAD}[/img]")
+        );
         assert_eq!(
             expand_attachment_paths("/data/video/9667/9667943-6f0fa527b905c385fe7c60efee19011c.mp4?hash=pj-hdmJ9mQ", DEFAULT_ONION),
             format!("https://{DEFAULT_ONION}/data/video/9667/9667943-6f0fa527b905c385fe7c60efee19011c.mp4?hash=pj-hdmJ9mQ")
@@ -951,20 +1205,32 @@ mod tests {
             "/data/attachments/9671/9671535-abc.exe",
             "the /data/ folder",
         ] {
-            assert_eq!(expand_attachment_paths(left_alone, DEFAULT_ONION), left_alone, "{left_alone}");
+            assert_eq!(
+                expand_attachment_paths(left_alone, DEFAULT_ONION),
+                left_alone,
+                "{left_alone}"
+            );
         }
     }
 
     #[test]
     fn what_comes_out_is_something_the_resolver_fetches_through_the_account() {
-        let text = expand_attachment_paths(&format!("[img]https://uploads.kiwifarms.st{UPLOAD}[/img]"), DEFAULT_ONION).into_owned();
+        let text = expand_attachment_paths(
+            &format!("[img]https://uploads.kiwifarms.st{UPLOAD}[/img]"),
+            DEFAULT_ONION,
+        )
+        .into_owned();
         let r = find_resolvable(&text, DEFAULT_ONION).expect("fetchable");
         assert_eq!(r.id, "9671535");
         assert_eq!(r.fetch_url, format!("https://{DEFAULT_ONION}{UPLOAD}"));
         // And both kinds of link in one message are each written for the account.
         let both = expand_attachment_paths("/attachments/seal-png.9609686/ and https://uploads.kiwifarms.st/data/video/9667/9667943-abc.mp4", DEFAULT_ONION);
-        assert!(both.contains(&format!("https://{DEFAULT_ONION}/attachments/seal-png.9609686/")));
-        assert!(both.contains(&format!("https://{DEFAULT_ONION}/data/video/9667/9667943-abc.mp4")));
+        assert!(both.contains(&format!(
+            "https://{DEFAULT_ONION}/attachments/seal-png.9609686/"
+        )));
+        assert!(both.contains(&format!(
+            "https://{DEFAULT_ONION}/data/video/9667/9667943-abc.mp4"
+        )));
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -979,11 +1245,19 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, vec![b'x'; size]).unwrap();
         let when = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(when).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
     }
 
     fn names(dir: &std::path::Path) -> Vec<String> {
-        let mut found: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        let mut found: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         found.sort();
         found
     }
@@ -1009,7 +1283,11 @@ mod tests {
         aged(&dir, "old", 10, 100);
         aged(&dir, "new", 10, 1);
         sweep_cache_dir(&dir, 20, "test").await;
-        assert_eq!(names(&dir), vec!["new", "old"], "exactly at the cap is not over it");
+        assert_eq!(
+            names(&dir),
+            vec!["new", "old"],
+            "exactly at the cap is not over it"
+        );
         sweep_cache_dir(&dir, 19, "test").await;
         assert_eq!(names(&dir), vec!["new"], "one byte over costs the oldest");
         // A directory that is not there is not an error.
@@ -1042,7 +1320,10 @@ mod tests {
         std::fs::write(dir.join("1.png"), png).unwrap();
         assert_eq!(cached_avatar_file(&dir, "1").await, Some(dir.join("1.png")));
         std::fs::write(dir.join("2.jpeg"), jpg).unwrap();
-        assert_eq!(cached_avatar_file(&dir, "2").await, Some(dir.join("2.jpeg")));
+        assert_eq!(
+            cached_avatar_file(&dir, "2").await,
+            Some(dir.join("2.jpeg"))
+        );
         // Wrong: a PNG called jpg is from before sniffing, and is removed so it is fetched again.
         std::fs::write(dir.join("3.jpg"), png).unwrap();
         assert_eq!(cached_avatar_file(&dir, "3").await, None);
@@ -1062,11 +1343,22 @@ mod tests {
         let path = dir.join("1.png");
         std::fs::write(&path, b"x").unwrap();
         let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        std::fs::File::options().write(true).open(&path).unwrap().set_modified(at).unwrap();
-        assert_eq!(versioned(&path).await, format!("file://{}#1700000000", path.display()));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        assert_eq!(
+            versioned(&path).await,
+            format!("file://{}#1700000000", path.display())
+        );
         // One that is not there still has an address, and a stamp of nothing.
         let gone = dir.join("2.png");
-        assert_eq!(versioned(&gone).await, format!("file://{}#0", gone.display()));
+        assert_eq!(
+            versioned(&gone).await,
+            format!("file://{}#0", gone.display())
+        );
         assert_eq!(avatar_key(&dir, "7"), dir.join("7"));
         let _ = std::fs::remove_dir_all(&dir);
     }

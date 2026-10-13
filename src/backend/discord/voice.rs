@@ -10,12 +10,12 @@
 //! mattered: songbird never tells Discord it can receive video, so nobody's
 //! camera ever arrived. See voiceconn.rs for what replaced it.
 
+use super::voiceconn::{self, Ended, Handshake, Media, VideoQuality, VoiceConn};
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use serde_json::json;
-use super::voiceconn::{self, VideoQuality, Ended, Handshake, Media, VoiceConn};
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 /// What has been learned about a pending voice connection so far.
@@ -71,7 +71,10 @@ pub struct VoiceOptions {
 impl Default for VoiceOptions {
     fn default() -> Self {
         // The cautious pair: an empty channel, and silence.
-        Self { solo: true, transmit: false }
+        Self {
+            solo: true,
+            transmit: false,
+        }
     }
 }
 
@@ -105,7 +108,8 @@ pub struct VoiceState {
     suppressed: Mutex<std::collections::HashSet<String>>,
     /// The mute button's own state, so leaving the audience restores it
     /// rather than opening a microphone somebody had closed.
-    mic_wanted_muted: Mutex<HashMap<String, bool>>,    /// The loudest the microphone was after processing, since last asked:
+    mic_wanted_muted: Mutex<HashMap<String, bool>>,
+    /// The loudest the microphone was after processing, since last asked:
     /// what is actually sent, which `input_level` - the raw capture - is not.
     sent_peaks: Mutex<HashMap<String, f32>>,
     /// Soundboard sounds waiting to be mixed into the call, as 48kHz stereo.
@@ -165,7 +169,10 @@ impl SpeakingTracker {
     }
 
     pub(super) fn heard_from(&self, ssrc: u32, peak: f32) {
-        self.heard.lock().unwrap().insert(ssrc, (std::time::Instant::now(), peak));
+        self.heard
+            .lock()
+            .unwrap()
+            .insert(ssrc, (std::time::Instant::now(), peak));
     }
 
     /// Who is talking now, loudest first.
@@ -216,7 +223,10 @@ impl SpeakingTracker {
 /// indicator, and the mean over 20ms of speech - which is mostly the quiet
 /// parts of a waveform - reads as near-silence even when it is not.
 pub(super) fn peak_of(samples: &[i16]) -> f32 {
-    samples.iter().map(|s| (s.unsigned_abs() as f32) / 32768.0).fold(0.0, f32::max)
+    samples
+        .iter()
+        .map(|s| (s.unsigned_abs() as f32) / 32768.0)
+        .fold(0.0, f32::max)
 }
 
 #[cfg(test)]
@@ -234,7 +244,10 @@ mod speaking_tests {
     fn a_stream_nobody_has_claimed_names_nobody_on_its_own() {
         let t = SpeakingTracker::default();
         t.heard_from(1234, 0.9);
-        assert!(t.current(ALONE).is_empty(), "an unowned SSRC must not invent a speaker");
+        assert!(
+            t.current(ALONE).is_empty(),
+            "an unowned SSRC must not invent a speaker"
+        );
     }
 
     #[test]
@@ -261,7 +274,10 @@ mod speaking_tests {
         t.learn(7, "42".into());
         t.heard_from(7, 0.5);
         t.forget(7);
-        assert!(t.current(ALONE).is_empty(), "a disconnect must not leave them stuck mid-word");
+        assert!(
+            t.current(ALONE).is_empty(),
+            "a disconnect must not leave them stuck mid-word"
+        );
     }
 
     #[test]
@@ -362,13 +378,21 @@ impl VoiceState {
 
     /// Records how the next connection for this account should behave.
     pub fn set_options(&self, account_id: &str, options: VoiceOptions) {
-        self.options.lock().unwrap().insert(account_id.to_string(), options);
+        self.options
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), options);
     }
 
     /// The options in force, defaulting to the cautious pair if a session was
     /// established by something other than an explicit join.
     pub fn options(&self, account_id: &str) -> VoiceOptions {
-        self.options.lock().unwrap().get(account_id).copied().unwrap_or_default()
+        self.options
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Where this account is in voice: its guild, if any, and its channel.
@@ -388,7 +412,12 @@ impl VoiceState {
     /// connection did - it is one account in one place, sending two things -
     /// so the stream connection has to ask for it rather than start its own.
     pub fn session_id(&self, account_id: &str) -> Option<String> {
-        self.pending.lock().unwrap().get(account_id)?.session_id.clone()
+        self.pending
+            .lock()
+            .unwrap()
+            .get(account_id)?
+            .session_id
+            .clone()
     }
 
     /// Every account with a live voice connection.
@@ -402,7 +431,10 @@ impl VoiceState {
     /// mute, and a caller that believes it muted something that was never live
     /// would show the wrong thing.
     pub fn set_mic_muted(&self, account_id: &str, muted: bool) -> bool {
-        self.mic_wanted_muted.lock().unwrap().insert(account_id.to_string(), muted);
+        self.mic_wanted_muted
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), muted);
         let held = self.suppressed.lock().unwrap().contains(account_id);
         let captures = self.captures.lock().unwrap();
         match captures.get(account_id) {
@@ -418,14 +450,23 @@ impl VoiceState {
     /// far as its own microphone is concerned.
     pub fn set_suppressed(&self, account_id: &str, suppressed: bool) {
         let changed = if suppressed {
-            self.suppressed.lock().unwrap().insert(account_id.to_string())
+            self.suppressed
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string())
         } else {
             self.suppressed.lock().unwrap().remove(account_id)
         };
         if !changed {
             return;
         }
-        let wanted = self.mic_wanted_muted.lock().unwrap().get(account_id).copied().unwrap_or(false);
+        let wanted = self
+            .mic_wanted_muted
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .copied()
+            .unwrap_or(false);
         if let Some(capture) = self.captures.lock().unwrap().get(account_id) {
             capture.set_muted(wanted || suppressed);
         }
@@ -451,7 +492,11 @@ impl VoiceState {
 
     /// The loudest sent since last asked, and reset.
     pub fn take_sent_peak(&self, account_id: &str) -> f32 {
-        self.sent_peaks.lock().unwrap().insert(account_id.to_string(), 0.0).unwrap_or(0.0)
+        self.sent_peaks
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), 0.0)
+            .unwrap_or(0.0)
     }
 
     /// A soundboard sound to play into this account's call. Sounds that
@@ -484,23 +529,40 @@ impl VoiceState {
     }
 
     pub fn note_flags(&self, account_id: &str, muted: bool, deafened: bool) {
-        self.flags.lock().unwrap().insert(account_id.to_string(), (muted, deafened));
+        self.flags
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), (muted, deafened));
     }
 
     /// The microphone and output flags last announced, or the cautious pair.
     pub fn flags(&self, account_id: &str) -> (bool, bool) {
-        self.flags.lock().unwrap().get(account_id).copied().unwrap_or((true, true))
+        self.flags
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .copied()
+            .unwrap_or((true, true))
     }
 
     /// Who is talking in this account's call right now, loudest first.
     pub fn speakers(&self, account_id: &str, participants: &[String]) -> Vec<(String, f32)> {
         let speaking = self.speaking.lock().unwrap();
-        speaking.get(account_id).map(|t| t.current(participants)).unwrap_or_default()
+        speaking
+            .get(account_id)
+            .map(|t| t.current(participants))
+            .unwrap_or_default()
     }
 }
 
 /// Records the session id half of the handshake.
-pub async fn note_voice_state(state: &AppState, account_id: &str, guild_id: Option<&str>, channel_id: Option<&str>, session_id: Option<&str>) {
+pub async fn note_voice_state(
+    state: &AppState,
+    account_id: &str,
+    guild_id: Option<&str>,
+    channel_id: Option<&str>,
+    session_id: Option<&str>,
+) {
     // Leaving clears everything rather than leaving a half-handshake that a
     // later, unrelated dispatch could complete.
     if channel_id.is_none() {
@@ -520,7 +582,13 @@ pub async fn note_voice_state(state: &AppState, account_id: &str, guild_id: Opti
 }
 
 /// Records the endpoint and token half.
-pub async fn note_voice_server(state: &AppState, account_id: &str, guild_id: Option<&str>, endpoint: Option<&str>, token: Option<&str>) {
+pub async fn note_voice_server(
+    state: &AppState,
+    account_id: &str,
+    guild_id: Option<&str>,
+    endpoint: Option<&str>,
+    token: Option<&str>,
+) {
     {
         let mut pending = state.voice.pending.lock().unwrap();
         let entry = pending.entry(account_id.to_string()).or_default();
@@ -538,7 +606,9 @@ pub async fn note_voice_server(state: &AppState, account_id: &str, guild_id: Opt
 async fn try_connect(state: &AppState, account_id: &str) {
     let info = {
         let pending = state.voice.pending.lock().unwrap();
-        let Some(entry) = pending.get(account_id) else { return };
+        let Some(entry) = pending.get(account_id) else {
+            return;
+        };
         if !entry.complete() {
             return;
         }
@@ -565,10 +635,19 @@ async fn try_connect(state: &AppState, account_id: &str) {
 }
 
 async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) -> Result<()> {
-    let config = state.accounts.get_discord(account_id).context("no such Discord account")?;
+    let config = state
+        .accounts
+        .get_discord(account_id)
+        .context("no such Discord account")?;
     let handshake = Handshake {
-        server_id: info.server_id().context("no channel to connect to")?.to_string(),
-        channel_id: info.channel_id.clone().context("no channel to connect to")?,
+        server_id: info
+            .server_id()
+            .context("no channel to connect to")?
+            .to_string(),
+        channel_id: info
+            .channel_id
+            .clone()
+            .context("no channel to connect to")?,
         user_id: config.user_id.clone(),
         session_id: info.session_id.clone().context("no voice session")?,
         token: info.token.clone().context("no voice token")?,
@@ -582,14 +661,24 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
     }
 
     let tracker = Arc::new(SpeakingTracker::default());
-    state.voice.speaking.lock().unwrap().insert(account_id.to_string(), tracker.clone());
+    state
+        .voice
+        .speaking
+        .lock()
+        .unwrap()
+        .insert(account_id.to_string(), tracker.clone());
 
     let prefs = state.voice_prefs.get();
     crate::audio::set_playback_muted(prefs.deafened);
     let playback = match crate::audio::start_playback(prefs.output.as_deref()) {
         Ok(playback) => {
             let playback = Arc::new(playback);
-            state.voice.playbacks.lock().unwrap().insert(account_id.to_string(), playback.clone());
+            state
+                .voice
+                .playbacks
+                .lock()
+                .unwrap()
+                .insert(account_id.to_string(), playback.clone());
             Some(playback)
         }
         Err(e) => {
@@ -600,11 +689,24 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let mut mic = None;
     if state.voice.options(account_id).transmit {
-        state.voice.mic_wanted_muted.lock().unwrap().insert(account_id.to_string(), prefs.mic_muted || prefs.deafened);
+        state
+            .voice
+            .mic_wanted_muted
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), prefs.mic_muted || prefs.deafened);
         let held = state.voice.suppressed.lock().unwrap().contains(account_id);
-        match start_transmitting(prefs.input.as_deref(), prefs.mic_muted || prefs.deafened || held) {
+        match start_transmitting(
+            prefs.input.as_deref(),
+            prefs.mic_muted || prefs.deafened || held,
+        ) {
             Ok((capture, source)) => {
-                state.voice.captures.lock().unwrap().insert(account_id.to_string(), capture);
+                state
+                    .voice
+                    .captures
+                    .lock()
+                    .unwrap()
+                    .insert(account_id.to_string(), capture);
                 mic = Some(source);
                 tracing::info!("discord[{account_id}]: transmitting microphone audio");
             }
@@ -614,9 +716,19 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 
     let for_end = state.clone();
     let account = account_id.to_string();
-    let conn = voiceconn::connect(state, account_id, &handshake, Media { playback, tracker, mic }, move |ended| {
-        tokio::spawn(after_end(for_end, account, ended));
-    })
+    let conn = voiceconn::connect(
+        state,
+        account_id,
+        &handshake,
+        Media {
+            playback,
+            tracker,
+            mic,
+        },
+        move |ended| {
+            tokio::spawn(after_end(for_end, account, ended));
+        },
+    )
     .await
     .context("opening the voice connection")?;
 
@@ -624,7 +736,12 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
     if let Some(quality) = state.voice.cameras.lock().unwrap().get(account_id).copied() {
         conn.set_camera(true, quality);
     }
-    state.voice.conns.lock().unwrap().insert(account_id.to_string(), conn);
+    state
+        .voice
+        .conns
+        .lock()
+        .unwrap()
+        .insert(account_id.to_string(), conn);
     Ok(())
 }
 
@@ -633,14 +750,31 @@ async fn connect(state: &AppState, account_id: &str, info: &PendingHandshake) ->
 /// Two messages to two servers, both needed: the voice server is told a
 /// picture is coming on the camera SSRC, and the gateway is told
 /// `self_video`, which is what puts a tile up on everybody else's screen.
-pub fn set_camera(state: &AppState, account_id: &str, on: bool, quality: VideoQuality) -> Result<()> {
-    let conn = state.voice.conns.lock().unwrap().get(account_id).cloned().context("not in a call")?;
+pub fn set_camera(
+    state: &AppState,
+    account_id: &str,
+    on: bool,
+    quality: VideoQuality,
+) -> Result<()> {
+    let conn = state
+        .voice
+        .conns
+        .lock()
+        .unwrap()
+        .get(account_id)
+        .cloned()
+        .context("not in a call")?;
     if on {
-        state.voice.cameras.lock().unwrap().insert(account_id.to_string(), quality);
+        state
+            .voice
+            .cameras
+            .lock()
+            .unwrap()
+            .insert(account_id.to_string(), quality);
     } else {
         state.voice.cameras.lock().unwrap().remove(account_id);
-    state.voice.suppressed.lock().unwrap().remove(account_id);
-    state.voice.effects.lock().unwrap().remove(account_id);
+        state.voice.suppressed.lock().unwrap().remove(account_id);
+        state.voice.effects.lock().unwrap().remove(account_id);
     }
     conn.set_camera(on, quality);
     let (muted, deafened) = state.voice.flags(account_id);
@@ -650,12 +784,30 @@ pub fn set_camera(state: &AppState, account_id: &str, on: bool, quality: VideoQu
 
 /// Whether a camera frame handed in now would reach anybody.
 pub fn camera_ready(state: &AppState, account_id: &str) -> bool {
-    state.voice.conns.lock().unwrap().get(account_id).is_some_and(|c| c.camera_ready())
+    state
+        .voice
+        .conns
+        .lock()
+        .unwrap()
+        .get(account_id)
+        .is_some_and(|c| c.camera_ready())
 }
 
 /// One encoded camera frame from the window.
-pub async fn send_camera_frame(state: &AppState, account_id: &str, frame: &[u8], timestamp_micros: i64) -> Result<()> {
-    let conn = state.voice.conns.lock().unwrap().get(account_id).cloned().context("not in a call")?;
+pub async fn send_camera_frame(
+    state: &AppState,
+    account_id: &str,
+    frame: &[u8],
+    timestamp_micros: i64,
+) -> Result<()> {
+    let conn = state
+        .voice
+        .conns
+        .lock()
+        .unwrap()
+        .get(account_id)
+        .cloned()
+        .context("not in a call")?;
     conn.send_camera_frame(frame, timestamp_micros).await
 }
 
@@ -664,7 +816,11 @@ pub async fn send_camera_frame(state: &AppState, account_id: &str, frame: &[u8],
 /// Reconnecting opens a connection that carries this same handler, so the
 /// future contains itself; spelling out `Send` here is what lets the compiler
 /// stop following the loop.
-fn after_end(state: AppState, account: String, ended: Ended) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+fn after_end(
+    state: AppState,
+    account: String,
+    ended: Ended,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
     Box::pin(async move { connection_ended(&state, &account, ended).await })
 }
 
@@ -678,7 +834,10 @@ async fn connection_ended(state: &AppState, account_id: &str, ended: Ended) {
         Ended::Stopped => {}
         Ended::Final(reason) => {
             tracing::warn!("discord[{account_id}]: voice ended: {reason}");
-            state.events.emit("discordVoiceError", json!({ "accountId": account_id, "error": reason }));
+            state.events.emit(
+                "discordVoiceError",
+                json!({ "accountId": account_id, "error": reason }),
+            );
             teardown(state, account_id);
         }
         Ended::Retry(reason) => {
@@ -689,16 +848,27 @@ async fn connection_ended(state: &AppState, account_id: &str, ended: Ended) {
                 *attempt += 1;
                 *attempt
             };
-            let still_wanted = state.voice.pending.lock().unwrap().get(account_id).is_some_and(|p| p.complete());
+            let still_wanted = state
+                .voice
+                .pending
+                .lock()
+                .unwrap()
+                .get(account_id)
+                .is_some_and(|p| p.complete());
             if !still_wanted {
                 return;
             }
             if attempt > MAX_RETRIES {
                 tracing::warn!("discord[{account_id}]: voice dropped ({reason}); gave up after {MAX_RETRIES} attempts");
-                state.events.emit("discordVoiceError", json!({ "accountId": account_id, "error": reason }));
+                state.events.emit(
+                    "discordVoiceError",
+                    json!({ "accountId": account_id, "error": reason }),
+                );
                 return;
             }
-            tracing::info!("discord[{account_id}]: voice dropped ({reason}); reconnecting, attempt {attempt}");
+            tracing::info!(
+                "discord[{account_id}]: voice dropped ({reason}); reconnecting, attempt {attempt}"
+            );
             tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)).await;
             try_connect(state, account_id).await;
         }
@@ -712,7 +882,10 @@ fn teardown(state: &AppState, account_id: &str) {
     state.voice.conns.lock().unwrap().remove(account_id);
 }
 
-fn start_transmitting(device_id: Option<&str>, muted: bool) -> Result<(crate::audio::Capture, crate::audio::MicSource)> {
+fn start_transmitting(
+    device_id: Option<&str>,
+    muted: bool,
+) -> Result<(crate::audio::Capture, crate::audio::MicSource)> {
     let (source, sink) = crate::audio::MicSource::new();
     let capture = crate::audio::start_capture(device_id, sink)?;
     capture.set_muted(muted);
@@ -730,7 +903,6 @@ pub async fn disconnect(state: &AppState, account_id: &str) {
         tracing::info!("discord[{account_id}]: voice disconnected");
     }
 }
-
 
 #[cfg(test)]
 mod tests {

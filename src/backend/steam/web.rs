@@ -61,12 +61,20 @@ pub fn refusal(file_name: &str, size: u64) -> Option<String> {
         return Some(format!("{file_name} is empty"));
     }
     if type_of(file_name).is_none() {
-        let extension = file_name.rsplit_once('.').map(|(_, e)| e).unwrap_or(file_name);
+        let extension = file_name
+            .rsplit_once('.')
+            .map(|(_, e)| e)
+            .unwrap_or(file_name);
         let known = TYPES.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ");
-        return Some(format!("Steam does not take .{extension} files in chat - it takes {known}"));
+        return Some(format!(
+            "Steam does not take .{extension} files in chat - it takes {known}"
+        ));
     }
     if size > MAX_BYTES {
-        return Some(format!("{file_name} is over the {} MB Steam allows in chat", MAX_BYTES / 1024 / 1024));
+        return Some(format!(
+            "{file_name} is over the {} MB Steam allows in chat",
+            MAX_BYTES / 1024 / 1024
+        ));
     }
     None
 }
@@ -74,7 +82,9 @@ pub fn refusal(file_name: &str, size: u64) -> Option<String> {
 /// The picture's size in pixels, or nothing for a file that is not one the
 /// reader knows (a video) - which Steam is told as zero, as the client does.
 fn dimensions(bytes: &[u8]) -> (usize, usize) {
-    imagesize::blob_size(bytes).map(|s| (s.width, s.height)).unwrap_or((0, 0))
+    imagesize::blob_size(bytes)
+        .map(|s| (s.width, s.height))
+        .unwrap_or((0, 0))
 }
 
 /// What is shown of a failure: Steam's own words where it gave any.
@@ -122,27 +132,46 @@ fn cookies(steamid: &str, access_token: &str, session_id: &str) -> String {
 }
 
 /// A short-lived token for the website, made from the refresh token.
-pub async fn access_token(link: &Link, steamid: u64, refresh_token: &str) -> Result<String, String> {
-    let request = GenerateAccessTokenRequest { refresh_token: Some(refresh_token.to_string()), steamid: Some(steamid), renewal_type: Some(0) };
+pub async fn access_token(
+    link: &Link,
+    steamid: u64,
+    refresh_token: &str,
+) -> Result<String, String> {
+    let request = GenerateAccessTokenRequest {
+        refresh_token: Some(refresh_token.to_string()),
+        steamid: Some(steamid),
+        renewal_type: Some(0),
+    };
     let answer: GenerateAccessTokenResponse = link
         .call("Authentication.GenerateAccessTokenForApp#1", &request, true)
         .await
         .map_err(|e| format!("Steam would not give this account a web session: {e}"))?;
-    answer.access_token.filter(|t| !t.is_empty()).ok_or_else(|| "Steam gave no web session for this account".to_string())
+    answer
+        .access_token
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| "Steam gave no web session for this account".to_string())
 }
 
 /// The website as this account: a client, the cookie it signs in with, and the
 /// session id the forms repeat.
-pub(super) async fn login(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<(reqwest::Client, String, String), String> {
+pub(super) async fn login(
+    link: &Link,
+    key: &str,
+    steamid: u64,
+    refresh_token: &str,
+) -> Result<(reqwest::Client, String, String), String> {
     let router = crate::net::route::router();
     let token = access_token(link, steamid, refresh_token).await?;
     let session_id = {
         let mut rng = rand::thread_rng();
-        (0..24).map(|_| format!("{:x}", rng.gen_range(0..16))).collect::<String>()
+        (0..24)
+            .map(|_| format!("{:x}", rng.gen_range(0..16)))
+            .collect::<String>()
     };
     let cookie = cookies(&steamid.to_string(), &token, &session_id);
     let http = router.client_if("steam", router.routed(key), |b| {
-        b.timeout(std::time::Duration::from_secs(600)).user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+        b.timeout(std::time::Duration::from_secs(600))
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
     });
     Ok((http, cookie, session_id))
 }
@@ -151,23 +180,68 @@ pub(super) async fn login(link: &Link, key: &str, steamid: u64, refresh_token: &
 /// anything: the first step is a question, and nothing exists until the file is
 /// put where the answer says. For the live check.
 #[cfg(test)]
-pub async fn may_upload(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<String, String> {
+pub async fn may_upload(
+    link: &Link,
+    key: &str,
+    steamid: u64,
+    refresh_token: &str,
+) -> Result<String, String> {
     let (http, cookie, session_id) = login(link, key, steamid, refresh_token).await?;
     let form = reqwest::multipart::Form::new()
         .text("sessionid", session_id)
         .text("l", "english")
         .text("file_size", "1000")
-        .text("file_name", format!("{}_probe_check.png", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default()))
-        .text("file_sha", (0..40).map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16))).collect::<String>())
+        .text(
+            "file_name",
+            format!(
+                "{}_probe_check.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default()
+            ),
+        )
+        .text(
+            "file_sha",
+            (0..40)
+                .map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16)))
+                .collect::<String>(),
+        )
         .text("file_image_width", "10")
         .text("file_image_height", "10")
         .text("file_type", "image/png");
-    let answer = site(&http, &cookie, &format!("{SITE}/chat/beginfileupload/?l=english"), form).await?;
+    let answer = site(
+        &http,
+        &cookie,
+        &format!("{SITE}/chat/beginfileupload/?l=english"),
+        form,
+    )
+    .await?;
     let shape = answer.result.as_ref().map(|r| match r {
-        serde_json::Value::Object(o) => o.iter().map(|(k, v)| format!("{k}:{}", match v { serde_json::Value::String(_) => "string", serde_json::Value::Number(_) => "number", serde_json::Value::Bool(_) => "bool", serde_json::Value::Array(_) => "array", serde_json::Value::Object(_) => "object", serde_json::Value::Null => "null" })).collect::<Vec<_>>().join(", "),
+        serde_json::Value::Object(o) => o
+            .iter()
+            .map(|(k, v)| {
+                format!(
+                    "{k}:{}",
+                    match v {
+                        serde_json::Value::String(_) => "string",
+                        serde_json::Value::Number(_) => "number",
+                        serde_json::Value::Bool(_) => "bool",
+                        serde_json::Value::Array(_) => "array",
+                        serde_json::Value::Object(_) => "object",
+                        serde_json::Value::Null => "null",
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
         _ => "not an object".to_string(),
     });
-    Ok(format!("answer keys: {shape:?}; top-level hmac {} timestamp {}", answer.hmac.is_some(), answer.timestamp.is_some()))
+    Ok(format!(
+        "answer keys: {shape:?}; top-level hmac {} timestamp {}",
+        answer.hmac.is_some(),
+        answer.timestamp.is_some()
+    ))
 }
 
 /// Sends one file to a friend, hidden behind a spoiler if asked. Returns
@@ -185,8 +259,15 @@ pub async fn send_file(
     spoiler: bool,
     progress: Option<&Progress>,
 ) -> Result<String, String> {
-    let file_name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
-    let size = tokio::fs::metadata(path).await.map_err(|e| format!("reading {file_name}: {e}"))?.len();
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let size = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("reading {file_name}: {e}"))?
+        .len();
     if let Some(why) = refusal(&file_name, size) {
         return Err(why);
     }
@@ -196,16 +277,30 @@ pub async fn send_file(
     }
     let router = crate::net::route::router();
     if router.routed(key) {
-        router.ready_for_general().await.map_err(|e| format!("reaching Steam by the route chosen: {e:#}"))?;
+        router
+            .ready_for_general()
+            .await
+            .map_err(|e| format!("reaching Steam by the route chosen: {e:#}"))?;
     }
-    let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {file_name}: {e}"))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("reading {file_name}: {e}"))?;
     let (width, height) = dimensions(&bytes);
     // Random, as the official client sends it. Not the file's own hash, for
     // all that the field is called one: Steam refuses a second upload that
     // names a hash it has already been given, so the same picture sent twice
     // would be turned away the second time.
-    let sha = (0..40).map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16))).collect::<String>();
-    let upload_name = format!("{}_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default(), file_name);
+    let sha = (0..40)
+        .map(|_| format!("{:x}", rand::thread_rng().gen_range(0..16)))
+        .collect::<String>();
+    let upload_name = format!(
+        "{}_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default(),
+        file_name
+    );
 
     let (http, cookie, session_id) = login(link, key, steamid, refresh_token).await?;
     let begin = reqwest::multipart::Form::new()
@@ -217,23 +312,48 @@ pub async fn send_file(
         .text("file_image_width", width.to_string())
         .text("file_image_height", height.to_string())
         .text("file_type", mime.to_string());
-    let answer = site(&http, &cookie, &format!("{SITE}/chat/beginfileupload/?l=english"), begin).await?;
-    let (hmac, timestamp) = (answer.hmac.clone().unwrap_or_default(), answer.timestamp.unwrap_or_default());
-    let begun: Begun = serde_json::from_value(answer.result.clone().unwrap_or_default()).ok()
+    let answer = site(
+        &http,
+        &cookie,
+        &format!("{SITE}/chat/beginfileupload/?l=english"),
+        begin,
+    )
+    .await?;
+    let (hmac, timestamp) = (
+        answer.hmac.clone().unwrap_or_default(),
+        answer.timestamp.unwrap_or_default(),
+    );
+    let begun: Begun = serde_json::from_value(answer.result.clone().unwrap_or_default())
+        .ok()
         .filter(|b: &Begun| !b.url_host.is_empty())
-        .ok_or_else(|| "Steam would not take the file just now - it did not say where to put it".to_string())?;
+        .ok_or_else(|| {
+            "Steam would not take the file just now - it did not say where to put it".to_string()
+        })?;
 
     if let Some(p) = progress {
         p.at(Phase::Sending, bytes.len(), "steam");
     }
-    let url = format!("{}://{}{}", if begun.use_https { "https" } else { "http" }, begun.url_host, begun.url_path);
+    let url = format!(
+        "{}://{}{}",
+        if begun.use_https { "https" } else { "http" },
+        begun.url_host,
+        begun.url_path
+    );
     let mut put = http.put(&url).body(bytes);
-    for h in begun.request_headers.iter().filter(|h| !h.name.eq_ignore_ascii_case("content-length") && !h.name.eq_ignore_ascii_case("host")) {
+    for h in begun.request_headers.iter().filter(|h| {
+        !h.name.eq_ignore_ascii_case("content-length") && !h.name.eq_ignore_ascii_case("host")
+    }) {
         put = put.header(h.name.as_str(), h.value.as_str());
     }
-    let stored = put.send().await.map_err(|e| format!("sending {file_name} to Steam: {e}"))?;
+    let stored = put
+        .send()
+        .await
+        .map_err(|e| format!("sending {file_name} to Steam: {e}"))?;
     if !stored.status().is_success() {
-        return Err(format!("Steam's file server refused {file_name} ({})", stored.status()));
+        return Err(format!(
+            "Steam's file server refused {file_name} ({})",
+            stored.status()
+        ));
     }
 
     if let Some(p) = progress {
@@ -257,14 +377,30 @@ pub async fn send_file(
         .text("hmac", hmac)
         .text("friend_steamid", friend.to_string())
         .text("spoiler", if spoiler { "1" } else { "0" });
-    let done = site(&http, &cookie, &format!("{SITE}/chat/commitfileupload/"), commit).await?;
+    let done = site(
+        &http,
+        &cookie,
+        &format!("{SITE}/chat/commitfileupload/"),
+        commit,
+    )
+    .await?;
     let result = done.result.unwrap_or_default();
     // Valve's own nesting: the call succeeded, and inside it there is a second
     // verdict on whether the file did.
-    if result.get("success").and_then(|v| v.as_i64()).is_some_and(|v| v != 1) {
-        return Err(done.message.unwrap_or_else(|| "Steam did not send the file".to_string()));
+    if result
+        .get("success")
+        .and_then(|v| v.as_i64())
+        .is_some_and(|v| v != 1)
+    {
+        return Err(done
+            .message
+            .unwrap_or_else(|| "Steam did not send the file".to_string()));
     }
-    Ok(result.pointer("/details/url").and_then(|v| v.as_str()).unwrap_or_default().to_string())
+    Ok(result
+        .pointer("/details/url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string())
 }
 
 /// What a group's picture may be, as the client's own picker says.
@@ -272,25 +408,66 @@ pub const AVATAR_TYPES: &[&str] = &["jpg", "jpeg", "png", "gif"];
 
 /// Sends a picture for a chat group to the site, which keeps it and answers with what it is
 /// known by; the group is then told to use that (`SetChatRoomGroupAvatar`).
-pub async fn upload_avatar(link: &Link, key: &str, steamid: u64, refresh_token: &str, path: &str) -> Result<Vec<u8>, String> {
-    let file_name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("avatar").to_string();
-    let extension = file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+pub async fn upload_avatar(
+    link: &Link,
+    key: &str,
+    steamid: u64,
+    refresh_token: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("avatar")
+        .to_string();
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
     let mime = match extension.as_str() {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "gif" => "image/gif",
-        _ => return Err(format!("a group's picture is one of {}", AVATAR_TYPES.join(", "))),
+        _ => {
+            return Err(format!(
+                "a group's picture is one of {}",
+                AVATAR_TYPES.join(", ")
+            ))
+        }
     };
-    let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {file_name}: {e}"))?;
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("reading {file_name}: {e}"))?;
     if bytes.is_empty() {
         return Err(format!("{file_name} is empty"));
     }
     let (http, cookie, session_id) = login(link, key, steamid, refresh_token).await?;
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(mime).map_err(|e| e.to_string())?;
-    let form = reqwest::multipart::Form::new().text("sessionid", session_id).part("avatar", part);
-    let answer = site_coded(&http, &cookie, &format!("{SITE}/chat/avatarfileupload/"), form).await.map_err(|(code, said)| avatar_refusal(code, said))?;
-    let sha = answer.sha.filter(|s| s.len() == 40).ok_or("Steam took the picture and did not say what it is called")?;
-    (0..sha.len()).step_by(2).map(|i| u8::from_str_radix(&sha[i..i + 2], 16).map_err(|_| "Steam named the picture in a way that is not understood".to_string())).collect()
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(file_name)
+        .mime_str(mime)
+        .map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new()
+        .text("sessionid", session_id)
+        .part("avatar", part);
+    let answer = site_coded(
+        &http,
+        &cookie,
+        &format!("{SITE}/chat/avatarfileupload/"),
+        form,
+    )
+    .await
+    .map_err(|(code, said)| avatar_refusal(code, said))?;
+    let sha = answer
+        .sha
+        .filter(|s| s.len() == 40)
+        .ok_or("Steam took the picture and did not say what it is called")?;
+    (0..sha.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&sha[i..i + 2], 16)
+                .map_err(|_| "Steam named the picture in a way that is not understood".to_string())
+        })
+        .collect()
 }
 
 /// An answer's text. The site compresses what it likes whatever it is asked,
@@ -299,7 +476,10 @@ pub(super) fn plain(raw: &[u8]) -> String {
     use std::io::Read;
     if raw.starts_with(&[0x1f, 0x8b]) {
         let mut out = String::new();
-        if flate2::read::GzDecoder::new(raw).read_to_string(&mut out).is_ok() {
+        if flate2::read::GzDecoder::new(raw)
+            .read_to_string(&mut out)
+            .is_ok()
+        {
             return out;
         }
     }
@@ -309,7 +489,13 @@ pub(super) fn plain(raw: &[u8]) -> String {
 /// The names somebody has had, newest first, each with when Steam says they
 /// took it - in Steam's own words for the moment, which are not a date a
 /// program can rely on ("12 Oct, 2025 @ 6:03pm") and are shown as given.
-pub async fn aliases(link: &Link, key: &str, steamid: u64, refresh_token: &str, friend: u64) -> Result<Vec<(String, String)>, String> {
+pub async fn aliases(
+    link: &Link,
+    key: &str,
+    steamid: u64,
+    refresh_token: &str,
+    friend: u64,
+) -> Result<Vec<(String, String)>, String> {
     let (http, cookie, _) = login(link, key, steamid, refresh_token).await?;
     let response = http
         .get(format!("{SITE}/profiles/{friend}/ajaxaliases?l=english"))
@@ -321,31 +507,53 @@ pub async fn aliases(link: &Link, key: &str, steamid: u64, refresh_token: &str, 
     let status = response.status();
     let raw = response.bytes().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
-        return Err(explain(status, &serde_json::from_str(&plain(&raw)).unwrap_or_default()));
+        return Err(explain(
+            status,
+            &serde_json::from_str(&plain(&raw)).unwrap_or_default(),
+        ));
     }
     Ok(read_aliases(&plain(&raw)))
 }
 
 /// Reads the answer: a list of `{newname, timechanged}`.
 pub fn read_aliases(text: &str) -> Vec<(String, String)> {
-    let Ok(Value::Array(list)) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let Ok(Value::Array(list)) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
     list.iter()
         .filter_map(|entry| {
             let name = entry["newname"].as_str()?.trim();
             let when = entry["timechanged"].as_str().unwrap_or_default().trim();
-            (!name.is_empty()).then(|| (name.chars().take(64).collect(), when.chars().take(40).collect()))
+            (!name.is_empty()).then(|| {
+                (
+                    name.chars().take(64).collect(),
+                    when.chars().take(40).collect(),
+                )
+            })
         })
         .collect()
 }
 
 /// One call to the site, read as the client reads it: the body is JSON even
 /// when the status is an error, and its `message` is what to show.
-async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::multipart::Form) -> Result<Answer, String> {
-    site_coded(http, cookie, url, form).await.map_err(|(_, why)| why)
+async fn site(
+    http: &reqwest::Client,
+    cookie: &str,
+    url: &str,
+    form: reqwest::multipart::Form,
+) -> Result<Answer, String> {
+    site_coded(http, cookie, url, form)
+        .await
+        .map_err(|(_, why)| why)
 }
 
 /// The same, with the result code the site gave, for a caller that has words of its own for some.
-async fn site_coded(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::multipart::Form) -> Result<Answer, (Option<i64>, String)> {
+async fn site_coded(
+    http: &reqwest::Client,
+    cookie: &str,
+    url: &str,
+    form: reqwest::multipart::Form,
+) -> Result<Answer, (Option<i64>, String)> {
     let response = http
         .post(url)
         .header("Cookie", cookie)
@@ -359,14 +567,25 @@ async fn site_coded(http: &reqwest::Client, cookie: &str, url: &str, form: reqwe
     let text = plain(&raw);
     let answer: Answer = serde_json::from_str(&text).unwrap_or_default();
     // Never the body: it carries the signed address the file is sent to.
-    tracing::debug!("steam web: {} -> {status}, success {:?}", url.split('?').next().unwrap_or(url), answer.success);
+    tracing::debug!(
+        "steam web: {} -> {status}, success {:?}",
+        url.split('?').next().unwrap_or(url),
+        answer.success
+    );
     if !status.is_success() || answer.success.is_some_and(|s| s != 1) {
-        let why = answer.message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| match (status.as_u16(), answer.success) {
-            // The site answers in Steam's own result codes, which say why far better than the status.
-            (_, Some(code)) if code > 1 => format!("Steam refused it: {}", super::eresult::describe(code as i32)),
-            (401 | 403, _) => "Steam's website did not accept this sign-in".to_string(),
-            _ => format!("Steam's website refused it ({status})"),
-        });
+        let why = answer
+            .message
+            .clone()
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| match (status.as_u16(), answer.success) {
+                // The site answers in Steam's own result codes, which say why far better than the status.
+                (_, Some(code)) if code > 1 => format!(
+                    "Steam refused it: {}",
+                    super::eresult::describe(code as i32)
+                ),
+                (401 | 403, _) => "Steam's website did not accept this sign-in".to_string(),
+                _ => format!("Steam's website refused it ({status})"),
+            });
         return Err((answer.success, why));
     }
     Ok(answer)
@@ -379,10 +598,19 @@ pub(super) fn explain(status: reqwest::StatusCode, answer: &serde_json::Value) -
         return message.to_string();
     }
     match (status.as_u16(), answer["success"].as_i64()) {
-        (_, Some(code)) if code > 1 => format!("Steam refused it: {}", super::eresult::describe(code as i32)),
-        (401 | 403, _) => "Steam's website did not accept this sign-in; try again in a moment".to_string(),
-        (429, _) => "Steam's website is limiting how often this can be done; wait a while".to_string(),
-        (500..=599, _) => "Steam's website is having trouble just now; try again in a moment".to_string(),
+        (_, Some(code)) if code > 1 => format!(
+            "Steam refused it: {}",
+            super::eresult::describe(code as i32)
+        ),
+        (401 | 403, _) => {
+            "Steam's website did not accept this sign-in; try again in a moment".to_string()
+        }
+        (429, _) => {
+            "Steam's website is limiting how often this can be done; wait a while".to_string()
+        }
+        (500..=599, _) => {
+            "Steam's website is having trouble just now; try again in a moment".to_string()
+        }
         _ => format!("Steam's website refused it ({status})"),
     }
 }
@@ -391,13 +619,20 @@ pub(super) fn explain(status: reqwest::StatusCode, answer: &serde_json::Value) -
 /// limited account, not allowed, failed to upload, too large, not a usable picture, a server error.
 fn avatar_refusal(code: Option<i64>, said: String) -> String {
     match code {
-        Some(21) => "Steam's website says this account is not signed in; try again in a moment".to_string(),
-        Some(112) => "a limited account cannot change a group's picture; Steam asks for a purchase first".to_string(),
+        Some(21) => {
+            "Steam's website says this account is not signed in; try again in a moment".to_string()
+        }
+        Some(112) => {
+            "a limited account cannot change a group's picture; Steam asks for a purchase first"
+                .to_string()
+        }
         Some(15) => "you may not change this group's picture".to_string(),
         Some(2) => "Steam could not take the picture; try again".to_string(),
         Some(25) => "that picture is too large for Steam".to_string(),
         Some(8) => "Steam cannot use that as a picture".to_string(),
-        Some(37) => "Steam had a problem on its side taking the picture; try again in a moment".to_string(),
+        Some(37) => {
+            "Steam had a problem on its side taking the picture; try again in a moment".to_string()
+        }
         _ => said,
     }
 }
@@ -408,7 +643,9 @@ mod tests {
 
     #[test]
     fn what_the_site_refuses_is_said_by_its_own_code_and_then_by_its_status() {
-        let said = |status: u16, body: serde_json::Value| explain(reqwest::StatusCode::from_u16(status).unwrap(), &body);
+        let said = |status: u16, body: serde_json::Value| {
+            explain(reqwest::StatusCode::from_u16(status).unwrap(), &body)
+        };
         assert_eq!(said(400, serde_json::json!({ "message": "No." })), "No.");
         assert!(said(401, serde_json::json!({ "success": 112 })).contains("limited account"));
         assert!(said(401, serde_json::json!({})).contains("sign-in"));
@@ -423,12 +660,19 @@ mod tests {
         assert!(avatar_refusal(Some(25), String::new()).contains("too large"));
         assert!(avatar_refusal(Some(8), String::new()).contains("cannot use"));
         assert!(avatar_refusal(Some(15), String::new()).contains("may not"));
-        assert_eq!(avatar_refusal(Some(99), "Steam said this".into()), "Steam said this", "what Steam says of the rest is kept");
+        assert_eq!(
+            avatar_refusal(Some(99), "Steam said this".into()),
+            "Steam said this",
+            "what Steam says of the rest is kept"
+        );
     }
 
     #[test]
     fn the_types_are_the_ones_the_client_takes() {
-        for name in ["a.jpg", "a.JPEG", "a.png", "a.gif", "a.webm", "a.mpg", "a.mp4", "a.mpeg", "a.ogv", "a.webp", "a.avif"] {
+        for name in [
+            "a.jpg", "a.JPEG", "a.png", "a.gif", "a.webm", "a.mpg", "a.mp4", "a.mpeg", "a.ogv",
+            "a.webp", "a.avif",
+        ] {
             assert!(type_of(name).is_some(), "{name}");
         }
         assert_eq!(type_of("clip.MP4"), Some("video/mp4"));
@@ -456,8 +700,17 @@ mod tests {
         });
         let begun: Begun = serde_json::from_value(said).expect("what Steam sends");
         assert!(begun.use_https);
-        assert_eq!((begun.url_host.as_str(), begun.url_path.as_str(), begun.request_headers.len()), ("files.example.test", "/a/b", 1));
-        let no: Result<Begun, _> = serde_json::from_value(serde_json::json!({ "url_host": null, "url_path": null, "ugcid": null, "request_headers": [], "success": 10 }));
+        assert_eq!(
+            (
+                begun.url_host.as_str(),
+                begun.url_path.as_str(),
+                begun.request_headers.len()
+            ),
+            ("files.example.test", "/a/b", 1)
+        );
+        let no: Result<Begun, _> = serde_json::from_value(
+            serde_json::json!({ "url_host": null, "url_path": null, "ugcid": null, "request_headers": [], "success": 10 }),
+        );
         assert!(no.is_err(), "a refusal has no place to put anything");
         let plain: Begun = serde_json::from_value(serde_json::json!({ "ugcid": 5, "url_host": "h", "url_path": "/p", "use_https": false })).unwrap();
         assert!(!plain.use_https);
@@ -468,7 +721,11 @@ mod tests {
         let said = r#"[{"newname":"Gabe","timechanged":"12 Oct, 2025 @ 6:03pm"},{"newname":"  ","timechanged":"x"},{"newname":"Old Name","timechanged":"3 Mar, 2019 @ 1:00am"},{"newname":"No Time"}]"#;
         assert_eq!(
             read_aliases(said),
-            vec![("Gabe".to_string(), "12 Oct, 2025 @ 6:03pm".to_string()), ("Old Name".to_string(), "3 Mar, 2019 @ 1:00am".to_string()), ("No Time".to_string(), String::new())]
+            vec![
+                ("Gabe".to_string(), "12 Oct, 2025 @ 6:03pm".to_string()),
+                ("Old Name".to_string(), "3 Mar, 2019 @ 1:00am".to_string()),
+                ("No Time".to_string(), String::new())
+            ]
         );
         assert!(read_aliases("not json").is_empty());
         assert!(read_aliases("{}").is_empty());
@@ -476,14 +733,21 @@ mod tests {
 
     #[test]
     fn the_login_is_two_cookies() {
-        assert_eq!(cookies("7656", "tok", "abc"), "sessionid=abc; steamLoginSecure=7656%7C%7Ctok");
+        assert_eq!(
+            cookies("7656", "tok", "abc"),
+            "sessionid=abc; steamLoginSecure=7656%7C%7Ctok"
+        );
     }
 
     #[test]
     fn a_picture_has_a_size_and_anything_else_has_none() {
         let png = image::RgbaImage::new(3, 2);
         let mut bytes = Vec::new();
-        png.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png).unwrap();
+        png.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
         assert_eq!(dimensions(&bytes), (3, 2));
         assert_eq!(dimensions(b"not a picture"), (0, 0));
     }

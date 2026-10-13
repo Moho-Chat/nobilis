@@ -64,9 +64,14 @@ pub async fn negotiate(http: &reqwest::Client, token: &str, user_id: &str) -> Re
         // is presumably why the chat socket in socket.rs keeps working.
         "capabilities": { "accepted_providers": [ { "provider": "pusher" }, { "provider": "centrifugo" } ] }
     });
-    let resp = post(http, token, &format!("{WEB_ROOT}/api/v1/realtime/connection"), body)
-        .await
-        .context("asking Kick where its realtime service is")?;
+    let resp = post(
+        http,
+        token,
+        &format!("{WEB_ROOT}/api/v1/realtime/connection"),
+        body,
+    )
+    .await
+    .context("asking Kick where its realtime service is")?;
     resp["data"]["connections"]
         .as_array()
         .into_iter()
@@ -78,12 +83,24 @@ pub async fn negotiate(http: &reqwest::Client, token: &str, user_id: &str) -> Re
 }
 
 /// A token for one livestream's channel - what actually says who is watching.
-pub async fn channel_token(http: &reqwest::Client, token: &str, livestream_id: u64) -> Result<String> {
+pub async fn channel_token(
+    http: &reqwest::Client,
+    token: &str,
+    livestream_id: u64,
+) -> Result<String> {
     let body = serde_json::json!({ "channel": channel_name(livestream_id) });
-    let resp = post(http, token, &format!("{WEB_ROOT}/api/v1/realtime/auth/channel"), body)
-        .await
-        .context("asking Kick to let us watch")?;
-    resp["data"]["token"].as_str().map(str::to_string).context("Kick sent no subscription token")
+    let resp = post(
+        http,
+        token,
+        &format!("{WEB_ROOT}/api/v1/realtime/auth/channel"),
+        body,
+    )
+    .await
+    .context("asking Kick to let us watch")?;
+    resp["data"]["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("Kick sent no subscription token")
 }
 
 /// The channel watch time is counted on.
@@ -91,7 +108,12 @@ pub fn channel_name(livestream_id: u64) -> String {
     format!("private-livestream.{livestream_id}")
 }
 
-async fn post(http: &reqwest::Client, token: &str, url: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+async fn post(
+    http: &reqwest::Client,
+    token: &str,
+    url: &str,
+    body: serde_json::Value,
+) -> Result<serde_json::Value> {
     let resp = http
         .post(url)
         .header("Accept", "application/json")
@@ -167,7 +189,12 @@ pub type Watching = std::collections::BTreeMap<String, u64>;
 /// cheap to make again and the alternative is tracking which of them survived
 /// a reconnect. Backs off so a service that is down is not hammered by a
 /// client that wants points.
-pub async fn run(state: crate::state::AppState, account_id: String, user_id: String, token: String) {
+pub async fn run(
+    state: crate::state::AppState,
+    account_id: String,
+    user_id: String,
+    token: String,
+) {
     let mut backoff = std::time::Duration::from_secs(3);
     loop {
         if state.runtime.kick_watching(&account_id).is_empty() {
@@ -188,13 +215,20 @@ pub async fn run(state: crate::state::AppState, account_id: String, user_id: Str
     }
 }
 
-async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str, token: &str) -> Result<()> {
+async fn session(
+    state: &crate::state::AppState,
+    account_id: &str,
+    user_id: &str,
+    token: &str,
+) -> Result<()> {
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     let http = super::api::client()?;
     let url = negotiate(&http, token, user_id).await?;
-    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str()).await.context("connecting to Kick's realtime service")?;
+    let (mut socket, _) = crate::net::route::websocket(super::api::SHARED_KEY, url.as_str())
+        .await
+        .context("connecting to Kick's realtime service")?;
 
     let mut next_id = 1u64;
     let mut id = || {
@@ -202,7 +236,12 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
         next_id
     };
     let connection_token = super::realtime::token(&http, user_id, Some(token)).await?;
-    socket.send(Message::Text(frames::connect(id(), &connection_token).to_string())).await.context("opening the connection")?;
+    socket
+        .send(Message::Text(
+            frames::connect(id(), &connection_token).to_string(),
+        ))
+        .await
+        .context("opening the connection")?;
     // The token is good for forty-five minutes. A session that has been up for
     // thirty is ended, and the next one opens with a new one.
     let begun = std::time::Instant::now();
@@ -225,7 +264,11 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
             let channel = channel_name(*livestream);
             match channel_token(&http, token, *livestream).await {
                 Ok(jwt) => {
-                    socket.send(Message::Text(frames::subscribe(id(), &channel, &jwt).to_string())).await?;
+                    socket
+                        .send(Message::Text(
+                            frames::subscribe(id(), &channel, &jwt).to_string(),
+                        ))
+                        .await?;
                     subscribed.insert(buffer_id.clone(), *livestream);
                     tracing::info!("kick[{account_id}]: watching {channel}");
                 }
@@ -238,11 +281,22 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
         // No longer on screen. Unsubscribed rather than left running, which is
         // the whole of the scoping promise: moho claims to be watching exactly
         // what is being looked at.
-        let gone: Vec<String> = subscribed.keys().filter(|b| !wanted.contains_key(*b)).cloned().collect();
+        let gone: Vec<String> = subscribed
+            .keys()
+            .filter(|b| !wanted.contains_key(*b))
+            .cloned()
+            .collect();
         for buffer_id in gone {
             if let Some(livestream) = subscribed.remove(&buffer_id) {
-                let _ = socket.send(Message::Text(frames::unsubscribe(id(), &channel_name(livestream)).to_string())).await;
-                tracing::info!("kick[{account_id}]: stopped watching {}", channel_name(livestream));
+                let _ = socket
+                    .send(Message::Text(
+                        frames::unsubscribe(id(), &channel_name(livestream)).to_string(),
+                    ))
+                    .await;
+                tracing::info!(
+                    "kick[{account_id}]: stopped watching {}",
+                    channel_name(livestream)
+                );
             }
         }
 
@@ -255,9 +309,13 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
             Ok(Some(frame)) => match frame.context("reading from the connection")? {
                 Message::Text(text) => {
                     for line in text.lines().filter(|l| !l.trim().is_empty()) {
-                        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                            continue;
+                        };
                         if frames::is_ping(&value) {
-                            socket.send(Message::Text(frames::pong().to_string())).await?;
+                            socket
+                                .send(Message::Text(frames::pong().to_string()))
+                                .await?;
                         } else if let Some(why) = frames::error_in(&value) {
                             // Said out loud: a refused subscription is the
                             // difference between earning watch time and
@@ -307,13 +365,19 @@ mod tests {
     /// The service closes a connection that is opened with no token.
     #[test]
     fn the_connection_carries_its_token() {
-        assert_eq!(frames::connect(1, "jwt"), json!({ "id": 1, "connect": { "token": "jwt", "name": "js" } }));
+        assert_eq!(
+            frames::connect(1, "jwt"),
+            json!({ "id": 1, "connect": { "token": "jwt", "name": "js" } })
+        );
     }
 
     #[test]
     fn a_refusal_is_read_with_its_reason() {
         assert_eq!(
-            frames::error_in(&json!({ "id": 2, "error": { "code": 103, "message": "permission denied" } })).as_deref(),
+            frames::error_in(
+                &json!({ "id": 2, "error": { "code": 103, "message": "permission denied" } })
+            )
+            .as_deref(),
             Some("permission denied (103)")
         );
         assert!(frames::error_in(&json!({ "id": 2, "subscribe": {} })).is_none());

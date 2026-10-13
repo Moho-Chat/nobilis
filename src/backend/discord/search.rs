@@ -56,12 +56,23 @@ pub async fn search_messages(
     buffer_id: &str,
     filters: &SearchFilters,
 ) -> Result<Value> {
-    let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this conversation")?;
+    let cfg = state
+        .accounts
+        .get_discord(account_id)
+        .context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this conversation")?;
     let guild_id = state.runtime.get_discord_guild(buffer_id);
 
     let mut query: Vec<(String, String)> = Vec::new();
-    if let Some(content) = filters.content.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    if let Some(content) = filters
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         query.push(("content".into(), content.to_string()));
     }
     // A guild search covers every channel in it, so "in:" is a narrowing
@@ -79,7 +90,12 @@ pub async fn search_messages(
     if let Some(name) = filters.mentions.as_deref() {
         query.push(("mentions".into(), resolve_person(state, account_id, name)?));
     }
-    if let Some(has) = filters.has.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+    if let Some(has) = filters
+        .has
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
         query.push(("has".into(), has.to_lowercase()));
     }
     if let Some(before) = filters.before {
@@ -124,10 +140,11 @@ pub async fn search_messages(
     let mut results = Vec::new();
     let mut channel_names = serde_json::Map::new();
     for group in answer["messages"].as_array().cloned().unwrap_or_default() {
-        let Some(hit) = group
-            .as_array()
-            .and_then(|g| g.iter().find(|m| m["hit"].as_bool() == Some(true)).or_else(|| g.first()))
-        else {
+        let Some(hit) = group.as_array().and_then(|g| {
+            g.iter()
+                .find(|m| m["hit"].as_bool() == Some(true))
+                .or_else(|| g.first())
+        }) else {
             continue;
         };
         let channel = hit["channel_id"].as_str().unwrap_or_default();
@@ -187,14 +204,24 @@ pub(super) fn resolve_channel(state: &AppState, account_id: &str, name: &str) ->
 }
 
 /// One Discord message in the shape this client's own messages have.
-pub(super) fn message_summary(state: &AppState, buffer_id: &str, msg: &Value, cfg: &crate::accounts::DiscordAccountConfig) -> Value {
+pub(super) fn message_summary(
+    state: &AppState,
+    buffer_id: &str,
+    msg: &Value,
+    cfg: &crate::accounts::DiscordAccountConfig,
+) -> Value {
     let author = &msg["author"];
     let from = author["global_name"]
         .as_str()
         .filter(|s| !s.is_empty())
         .or_else(|| author["username"].as_str())
         .unwrap_or("unknown");
-    let body = resolve_mentions(&extract_body(msg).unwrap_or_default(), msg, &cfg.user_id, cfg.display_name.as_deref());
+    let body = resolve_mentions(
+        &extract_body(msg).unwrap_or_default(),
+        msg,
+        &cfg.user_id,
+        cfg.display_name.as_deref(),
+    );
     let ts = msg["timestamp"]
         .as_str()
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())

@@ -30,9 +30,9 @@ use super::crypto::CryptoSession;
 use super::http;
 use super::ssss;
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use matrix_sdk_crypto::store::types::DehydratedDeviceKey;
 use ruma_common::OwnedDeviceId;
-use base64::Engine as _;
 use serde_json::{json, Value};
 
 /// The pickle key is kept in secret storage as base64 text, because account
@@ -72,8 +72,14 @@ pub async fn enable(
     account_id: &str,
     unlock_with: Option<&str>,
 ) -> Result<Option<String>> {
-    let config = state.accounts.get_matrix(account_id).context("no such Matrix account")?;
-    let session = state.runtime.get_matrix_machine(account_id).context("account is not connected")?;
+    let config = state
+        .accounts
+        .get_matrix(account_id)
+        .context("no such Matrix account")?;
+    let session = state
+        .runtime
+        .get_matrix_machine(account_id)
+        .context("account is not connected")?;
     let base = config.homeserver_url.trim_end_matches('/');
     let token = &config.access_token;
     let user = &config.user_id;
@@ -85,7 +91,12 @@ pub async fn enable(
     // had been made, taking the recovery code with it into the error. What
     // was left was an account holding secret storage nobody had been told the
     // code for, which refuses every later attempt for ever.
-    if !session.machine.cross_signing_status().await.has_self_signing {
+    if !session
+        .machine
+        .cross_signing_status()
+        .await
+        .has_self_signing
+    {
         bail!("set up cross-signing on this account first - a dehydrated device is signed with its self-signing key");
     }
 
@@ -107,14 +118,23 @@ pub async fn enable(
 
     // Reuse the pickle key already in the safe where there is one, so a second
     // client enabling this does not strand the device the first uploaded.
-    let pickle_key = match ssss::read_secret(base, token, user, &key, ssss::DEHYDRATION_SECRET).await? {
-        Some(bytes) => key_from_stored(&bytes)?,
-        None => {
-            let fresh = DehydratedDeviceKey::new();
-            ssss::store_secret(base, token, user, &key, ssss::DEHYDRATION_SECRET, fresh.to_base64().as_bytes()).await?;
-            fresh
-        }
-    };
+    let pickle_key =
+        match ssss::read_secret(base, token, user, &key, ssss::DEHYDRATION_SECRET).await? {
+            Some(bytes) => key_from_stored(&bytes)?,
+            None => {
+                let fresh = DehydratedDeviceKey::new();
+                ssss::store_secret(
+                    base,
+                    token,
+                    user,
+                    &key,
+                    ssss::DEHYDRATION_SECRET,
+                    fresh.to_base64().as_bytes(),
+                )
+                .await?;
+                fresh
+            }
+        };
 
     // Cached locally as well as kept in the safe. This is what lets every
     // later connect rehydrate without asking for the recovery code again -
@@ -157,9 +177,17 @@ fn escape(raw: &str) -> String {
 }
 
 /// Creates a device and puts it on the server, replacing any already there.
-async fn upload(session: &CryptoSession, base: &str, token: &str, pickle_key: &DehydratedDeviceKey) -> Result<()> {
+async fn upload(
+    session: &CryptoSession,
+    base: &str,
+    token: &str,
+    pickle_key: &DehydratedDeviceKey,
+) -> Result<()> {
     let devices = session.machine.dehydrated_devices();
-    let device = devices.create().await.context("creating a dehydrated device")?;
+    let device = devices
+        .create()
+        .await
+        .context("creating a dehydrated device")?;
     let request = device
         .keys_for_upload(DISPLAY_NAME.to_string(), pickle_key)
         .await
@@ -176,7 +204,9 @@ async fn upload(session: &CryptoSession, base: &str, token: &str, pickle_key: &D
         "one_time_keys": request.one_time_keys,
         "fallback_keys": request.fallback_keys,
     });
-    http::put_json(&format!("{base}{BASE}"), token, body).await.context("uploading the dehydrated device")?;
+    http::put_json(&format!("{base}{BASE}"), token, body)
+        .await
+        .context("uploading the dehydrated device")?;
     Ok(())
 }
 
@@ -185,8 +215,14 @@ async fn upload(session: &CryptoSession, base: &str, token: &str, pickle_key: &D
 ///
 /// Run on connect. Quiet about an account that has none - most do not, and a
 /// line about it on every connect would be noise.
-pub async fn rehydrate_on_connect(state: &crate::state::AppState, account_id: &str, session: &CryptoSession) {
-    let Some(config) = state.accounts.get_matrix(account_id) else { return };
+pub async fn rehydrate_on_connect(
+    state: &crate::state::AppState,
+    account_id: &str,
+    session: &CryptoSession,
+) {
+    let Some(config) = state.accounts.get_matrix(account_id) else {
+        return;
+    };
     if !config.dehydration_enabled {
         return;
     }
@@ -217,7 +253,9 @@ async fn rehydrate(
         .await
         .context("reading the cached pickle key")?
     else {
-        tracing::debug!("matrix[{account_id}]: dehydration is on but this login has no pickle key yet");
+        tracing::debug!(
+            "matrix[{account_id}]: dehydration is on but this login has no pickle key yet"
+        );
         return Ok(());
     };
     let _ = (user, &ssss::DEHYDRATION_SECRET);
@@ -229,10 +267,14 @@ async fn rehydrate(
             .as_str()
             .context("the server's dehydrated device has no id")?
             .into();
-        let data = serde_json::from_value(existing["device_data"].clone()).context("unreadable dehydrated device")?;
+        let data = serde_json::from_value(existing["device_data"].clone())
+            .context("unreadable dehydrated device")?;
 
         let devices = session.machine.dehydrated_devices();
-        let rehydrated = devices.rehydrate(&pickle_key, &device_id, data).await.context("rehydrating")?;
+        let rehydrated = devices
+            .rehydrate(&pickle_key, &device_id, data)
+            .await
+            .context("rehydrating")?;
 
         // Percent-encoded, which for once is not boilerplate: a dehydrated
         // device's id is base64 and routinely contains a "/". Dropped into
@@ -245,10 +287,15 @@ async fn rehydrate(
         let mut collected = 0usize;
         loop {
             let url = match &next {
-                Some(t) => format!("{base}{BASE}/{in_path}/events?limit={EVENT_PAGE}&next_batch={}", escape(t)),
+                Some(t) => format!(
+                    "{base}{BASE}/{in_path}/events?limit={EVENT_PAGE}&next_batch={}",
+                    escape(t)
+                ),
                 None => format!("{base}{BASE}/{in_path}/events?limit={EVENT_PAGE}"),
             };
-            let page: Value = http::post_json(&url, Some(token), json!({})).await.context("reading its events")?;
+            let page: Value = http::post_json(&url, Some(token), json!({}))
+                .await
+                .context("reading its events")?;
             let events: Vec<_> = page["events"]
                 .as_array()
                 .into_iter()
@@ -270,7 +317,9 @@ async fn rehydrate(
             }
         }
         if collected > 0 {
-            tracing::info!("matrix[{account_id}]: collected {collected} event(s) from the dehydrated device");
+            tracing::info!(
+                "matrix[{account_id}]: collected {collected} event(s) from the dehydrated device"
+            );
         }
     }
 
@@ -301,9 +350,15 @@ mod tests {
 
         // And the padded spelling of the same key, since the secret is shared
         // with whatever client wrote it.
-        let padded = base64::engine::general_purpose::STANDARD
-            .encode(base64::engine::general_purpose::STANDARD_NO_PAD.decode(&written).unwrap());
-        assert_eq!(key_from_stored(padded.as_bytes()).unwrap().to_base64(), written);
+        let padded = base64::engine::general_purpose::STANDARD.encode(
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(&written)
+                .unwrap(),
+        );
+        assert_eq!(
+            key_from_stored(padded.as_bytes()).unwrap().to_base64(),
+            written
+        );
     }
 
     /// Anything that is not a key is refused rather than producing one that
@@ -318,6 +373,9 @@ mod tests {
     /// The endpoint is the one the MSC names, which is what Element talks to.
     #[test]
     fn the_endpoint_is_the_one_the_msc_names() {
-        assert_eq!(BASE, "/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device");
+        assert_eq!(
+            BASE,
+            "/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device"
+        );
     }
 }

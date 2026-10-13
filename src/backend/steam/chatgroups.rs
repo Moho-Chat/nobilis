@@ -131,32 +131,55 @@ impl Group {
     /// Whether this account holds a permission: the owner holds all; others hold
     /// what their roles (and the default one) allow. Where Steam has not said
     /// what the roles allow, the rank stands in for it.
-    fn can(&self, by_actions: impl Fn(&ChatRoleActions) -> bool, by_rank: impl Fn(i32) -> bool) -> bool {
+    fn can(
+        &self,
+        by_actions: impl Fn(&ChatRoleActions) -> bool,
+        by_rank: impl Fn(i32) -> bool,
+    ) -> bool {
         if self.my_rank == RANK_OWNER {
             return true;
         }
         if self.role_actions.is_empty() {
             return by_rank(self.my_rank);
         }
-        let mine = self.members.iter().find(|m| m.account == self.me).map(|m| m.roles.clone()).unwrap_or_default();
+        let mine = self
+            .members
+            .iter()
+            .find(|m| m.account == self.me)
+            .map(|m| m.roles.clone())
+            .unwrap_or_default();
         // Only the roles the member holds, as the Steam client reads it: the default role is
         // one of them when the member has it.
-        mine.iter().filter_map(|r| self.role_actions.get(r)).any(&by_actions)
+        mine.iter()
+            .filter_map(|r| self.role_actions.get(r))
+            .any(&by_actions)
     }
 
     /// Whether the account may speak here: a viewer or a guest reads only.
     pub fn may_speak(&self) -> bool {
-        self.can(|a| a.can_chat.unwrap_or(false), |r| r >= RANK_MEMBER || r == 0)
+        self.can(
+            |a| a.can_chat.unwrap_or(false),
+            |r| r >= RANK_MEMBER || r == 0,
+        )
     }
 
     /// Whether this account may kick, mute and ban.
     pub fn may_moderate(&self) -> bool {
-        self.can(|a| a.can_kick.unwrap_or(false) || a.can_ban.unwrap_or(false), |r| r >= RANK_MODERATOR)
+        self.can(
+            |a| a.can_kick.unwrap_or(false) || a.can_ban.unwrap_or(false),
+            |r| r >= RANK_MODERATOR,
+        )
     }
 
     /// Whether this account may change the group itself: its rooms, its name.
     pub fn may_manage(&self) -> bool {
-        self.can(|a| a.can_create_rename_delete_channel.unwrap_or(false) || a.can_change_tagline_avatar_name.unwrap_or(false), |r| r >= RANK_OFFICER)
+        self.can(
+            |a| {
+                a.can_create_rename_delete_channel.unwrap_or(false)
+                    || a.can_change_tagline_avatar_name.unwrap_or(false)
+            },
+            |r| r >= RANK_OFFICER,
+        )
     }
 
     /// Whether this account may make invite links.
@@ -166,18 +189,28 @@ impl Group {
 
     /// Whether this account may make, rename and delete roles and change what they may do.
     pub fn may_change_roles(&self) -> bool {
-        self.can(|a| a.can_change_group_roles.unwrap_or(false), |r| r >= RANK_OFFICER)
+        self.can(
+            |a| a.can_change_group_roles.unwrap_or(false),
+            |r| r >= RANK_OFFICER,
+        )
     }
 
     /// Whether this account may give roles to people and take them away. Not in a community
     /// group's chat, where ranks come from the community.
     pub fn may_assign_roles(&self) -> bool {
-        self.clan.is_none() && self.can(|a| a.can_change_user_roles.unwrap_or(false), |r| r >= RANK_OFFICER)
+        self.clan.is_none()
+            && self.can(
+                |a| a.can_change_user_roles.unwrap_or(false),
+                |r| r >= RANK_OFFICER,
+            )
     }
 
     /// Whether this account may ping everybody (`@all`, `@online`).
     pub fn may_mention_all(&self) -> bool {
-        self.can(|a| a.can_mention_all.unwrap_or(false), |r| r >= RANK_MODERATOR)
+        self.can(
+            |a| a.can_mention_all.unwrap_or(false),
+            |r| r >= RANK_MODERATOR,
+        )
     }
 
     /// Whether the notification setting says to be told of nothing, or to hide the unread
@@ -213,13 +246,31 @@ impl Group {
             .avatar_ugc_url
             .clone()
             .filter(|u| !u.is_empty())
-            .or_else(|| h.avatar_sha.as_deref().filter(|s| !s.is_empty() && s.iter().any(|b| *b != 0)).map(group_picture))
+            .or_else(|| {
+                h.avatar_sha
+                    .as_deref()
+                    .filter(|s| !s.is_empty() && s.iter().any(|b| *b != 0))
+                    .map(group_picture)
+            })
             .or(self.avatar.take());
         if !h.roles.is_empty() {
-            self.roles = h.roles.iter().filter_map(|r| Some((r.role_id?, pretty_role(r.name.as_deref().unwrap_or_default())))).collect();
+            self.roles = h
+                .roles
+                .iter()
+                .filter_map(|r| {
+                    Some((
+                        r.role_id?,
+                        pretty_role(r.name.as_deref().unwrap_or_default()),
+                    ))
+                })
+                .collect();
         }
         if !h.role_actions.is_empty() {
-            self.role_actions = h.role_actions.iter().filter_map(|a| Some((a.role_id?, a.clone()))).collect();
+            self.role_actions = h
+                .role_actions
+                .iter()
+                .filter_map(|a| Some((a.role_id?, a.clone())))
+                .collect();
         }
         if let Some(d) = h.default_role_id {
             self.default_role = d;
@@ -243,7 +294,9 @@ impl Group {
                 voice: r.voice_allowed.unwrap_or(false),
                 in_voice: r.members_in_voice.clone(),
                 sort: r.sort_order.unwrap_or(0),
-                last_message: r.time_last_message.unwrap_or_else(|| held.map_or(0, |h| h.last_message)),
+                last_message: r
+                    .time_last_message
+                    .unwrap_or_else(|| held.map_or(0, |h| h.last_message)),
                 acked: held.map_or(0, |h| h.acked),
                 last_mention: held.map_or(0, |h| h.last_mention),
             });
@@ -255,9 +308,17 @@ impl Group {
         self.members = members
             .iter()
             .filter(|m| m.state.unwrap_or(JOINED) == JOINED)
-            .filter_map(|m| Some(Member { account: m.accountid?, rank: m.rank.unwrap_or(RANK_MEMBER), roles: m.role_ids.clone(), kick_expire: m.time_kick_expire.unwrap_or(0) }))
+            .filter_map(|m| {
+                Some(Member {
+                    account: m.accountid?,
+                    rank: m.rank.unwrap_or(RANK_MEMBER),
+                    roles: m.role_ids.clone(),
+                    kick_expire: m.time_kick_expire.unwrap_or(0),
+                })
+            })
             .collect();
-        self.members.sort_by_key(|m| (std::cmp::Reverse(m.rank), m.account));
+        self.members
+            .sort_by_key(|m| (std::cmp::Reverse(m.rank), m.account));
         self.me = own;
         if let Some(me) = self.members.iter().find(|m| m.account == own) {
             self.my_rank = me.rank;
@@ -273,7 +334,18 @@ impl Group {
         if let Some(d) = s.default_chat_id {
             self.default_room = d;
         }
-        self.kicked = s.kicked.iter().filter_map(|m| Some(Member { account: m.accountid?, rank: m.rank.unwrap_or(0), roles: Vec::new(), kick_expire: m.time_kick_expire.unwrap_or(0) })).collect();
+        self.kicked = s
+            .kicked
+            .iter()
+            .filter_map(|m| {
+                Some(Member {
+                    account: m.accountid?,
+                    rank: m.rank.unwrap_or(0),
+                    roles: Vec::new(),
+                    kick_expire: m.time_kick_expire.unwrap_or(0),
+                })
+            })
+            .collect();
     }
 
     fn take_user(&mut self, u: &UserChatRoomGroupState) {
@@ -300,7 +372,9 @@ pub fn group_picture(hash: &[u8]) -> String {
 
 /// What a role is called: Steam's own default roles come as a localisation key.
 fn pretty_role(name: &str) -> String {
-    name.strip_prefix("#ChatRoomRole_").unwrap_or(name).to_string()
+    name.strip_prefix("#ChatRoomRole_")
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// A rank, said in words.
@@ -355,11 +429,17 @@ pub fn clear(account_id: &str) {
 
 /// How a request from the window tells the connection that owns the roster to
 /// put the groups on screen again: it is the roster that names the people.
-static POKES: LazyLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Notify>>>> = LazyLock::new(Default::default);
+static POKES: LazyLock<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Notify>>>> =
+    LazyLock::new(Default::default);
 
 /// What the connection of an account waits on to be told its groups changed.
 pub fn pokes(account_id: &str) -> std::sync::Arc<tokio::sync::Notify> {
-    POKES.lock().unwrap().entry(account_id.to_string()).or_default().clone()
+    POKES
+        .lock()
+        .unwrap()
+        .entry(account_id.to_string())
+        .or_default()
+        .clone()
 }
 
 fn poke(account_id: &str) {
@@ -367,7 +447,10 @@ fn poke(account_id: &str) {
 }
 
 pub fn held(account_id: &str, group: u64) -> Option<Group> {
-    HELD.lock().unwrap().get(account_id).and_then(|a| a.groups.get(&group).cloned())
+    HELD.lock()
+        .unwrap()
+        .get(account_id)
+        .and_then(|a| a.groups.get(&group).cloned())
 }
 
 /// The id of a group on the rail.
@@ -409,7 +492,11 @@ fn room_title(room: &Room) -> String {
 /// What every channel of the account is called: the group, a slash, and the
 /// room. Two groups with one name are told apart by their number, since a
 /// channel's name is also its identity.
-fn titles(groups: &BTreeMap<u64, Group>, people: &HashMap<u32, Person>, own: u32) -> HashMap<(u64, u64), String> {
+fn titles(
+    groups: &BTreeMap<u64, Group>,
+    people: &HashMap<u32, Person>,
+    own: u32,
+) -> HashMap<(u64, u64), String> {
     let mut by_name: HashMap<String, usize> = HashMap::new();
     let name_of = |g: &Group| {
         let n = friends::clean_name(&g.name);
@@ -418,7 +505,17 @@ fn titles(groups: &BTreeMap<u64, Group>, people: &HashMap<u32, Person>, own: u32
         }
         // A group with no name is a chat among friends, and is called by who is in it, as the
         // Steam client calls it: one, two or three names, then "and others".
-        let mut others: Vec<String> = g.members.iter().filter(|m| m.account != own).map(|m| people.get(&m.account).map(|p| p.name.clone()).unwrap_or_else(|| steamid::text_of(m.account))).collect();
+        let mut others: Vec<String> = g
+            .members
+            .iter()
+            .filter(|m| m.account != own)
+            .map(|m| {
+                people
+                    .get(&m.account)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| steamid::text_of(m.account))
+            })
+            .collect();
         others.truncate(4);
         match others.len() {
             0 => format!("group {}", g.id),
@@ -454,33 +551,98 @@ fn titles(groups: &BTreeMap<u64, Group>, people: &HashMap<u32, Person>, own: u32
 
 /// What the account is told about its groups and what it has read.
 pub async fn load(link: &Link, account_id: &str, own: u32) -> Result<Vec<u32>, String> {
-    let mine: GetMyChatRoomGroupsResponse = link.call("ChatRoom.GetMyChatRoomGroups#1", &GetMyChatRoomGroupsRequest {}, true).await.map_err(|e| group_refusal(&e))?;
-    let ids: Vec<u64> = mine.chat_room_groups.iter().filter_map(|p| p.group_summary.as_ref()?.chat_group_id.or(p.user_chat_group_state.as_ref()?.chat_group_id)).collect();
+    let mine: GetMyChatRoomGroupsResponse = link
+        .call(
+            "ChatRoom.GetMyChatRoomGroups#1",
+            &GetMyChatRoomGroupsRequest {},
+            true,
+        )
+        .await
+        .map_err(|e| group_refusal(&e))?;
+    let ids: Vec<u64> = mine
+        .chat_room_groups
+        .iter()
+        .filter_map(|p| {
+            p.group_summary
+                .as_ref()?
+                .chat_group_id
+                .or(p.user_chat_group_state.as_ref()?.chat_group_id)
+        })
+        .collect();
     // The groups' members come with being active in them.
     let active: SetSessionActiveGroupsResponse = if ids.is_empty() {
         SetSessionActiveGroupsResponse::default()
     } else {
-        link.call("ChatRoom.SetSessionActiveChatRoomGroups#1", &SetSessionActiveGroupsRequest { chat_group_ids: ids.clone(), chat_groups_data_requested: ids.clone(), virtualize_members_threshold: None }, true)
-            .await
-            .map_err(|e| group_refusal(&e))?
+        link.call(
+            "ChatRoom.SetSessionActiveChatRoomGroups#1",
+            &SetSessionActiveGroupsRequest {
+                chat_group_ids: ids.clone(),
+                chat_groups_data_requested: ids.clone(),
+                virtualize_members_threshold: None,
+            },
+            true,
+        )
+        .await
+        .map_err(|e| group_refusal(&e))?
     };
     let mut groups = BTreeMap::new();
     for pair in &mine.chat_room_groups {
-        let Some(summary) = &pair.group_summary else { continue };
-        let Some(id) = summary.chat_group_id else { continue };
-        let mut g = Group { id, name: summary.chat_group_name.clone().unwrap_or_default(), tagline: summary.chat_group_tagline.clone().unwrap_or_default(), owner: summary.accountid_owner.unwrap_or(0), clan: summary.clanid.filter(|c| *c != 0), my_rank: summary.rank.unwrap_or(0), default_room: summary.default_chat_id.unwrap_or(0), default_role: summary.default_role_id.unwrap_or(0), disabled: summary.disabled.unwrap_or(false), ..Default::default() };
-        g.avatar = summary.avatar_ugc_url.clone().filter(|u| !u.is_empty()).or_else(|| summary.chat_group_avatar_sha.as_deref().filter(|s| s.iter().any(|b| *b != 0)).map(group_picture));
+        let Some(summary) = &pair.group_summary else {
+            continue;
+        };
+        let Some(id) = summary.chat_group_id else {
+            continue;
+        };
+        let mut g = Group {
+            id,
+            name: summary.chat_group_name.clone().unwrap_or_default(),
+            tagline: summary.chat_group_tagline.clone().unwrap_or_default(),
+            owner: summary.accountid_owner.unwrap_or(0),
+            clan: summary.clanid.filter(|c| *c != 0),
+            my_rank: summary.rank.unwrap_or(0),
+            default_room: summary.default_chat_id.unwrap_or(0),
+            default_role: summary.default_role_id.unwrap_or(0),
+            disabled: summary.disabled.unwrap_or(false),
+            ..Default::default()
+        };
+        g.avatar = summary
+            .avatar_ugc_url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .or_else(|| {
+                summary
+                    .chat_group_avatar_sha
+                    .as_deref()
+                    .filter(|s| s.iter().any(|b| *b != 0))
+                    .map(group_picture)
+            });
         g.take_rooms(&summary.chat_rooms);
-        if let Some(full) = active.chat_states.iter().find(|s| s.header_state.as_ref().and_then(|h| h.chat_group_id) == Some(id)) {
+        if let Some(full) = active
+            .chat_states
+            .iter()
+            .find(|s| s.header_state.as_ref().and_then(|h| h.chat_group_id) == Some(id))
+        {
             g.take_state(full, own);
         }
         if let Some(user) = &pair.user_chat_group_state {
             g.take_user(user);
         }
-        g.suspicious = active.chat_group_notices.iter().filter(|n| n.chat_group_id == Some(id)).flat_map(|n| n.member_notices.iter()).filter(|n| n.notice_type == Some(super::notices::SUSPICIOUS)).filter_map(|n| n.accountid).collect();
+        g.suspicious = active
+            .chat_group_notices
+            .iter()
+            .filter(|n| n.chat_group_id == Some(id))
+            .flat_map(|n| n.member_notices.iter())
+            .filter(|n| n.notice_type == Some(super::notices::SUSPICIOUS))
+            .filter_map(|n| n.accountid)
+            .collect();
         groups.insert(id, g);
     }
-    let people: Vec<u32> = groups.values().flat_map(|g| g.members.iter().map(|m| m.account)).chain(groups.values().map(|g| g.owner)).filter(|a| *a != 0 && *a != own).collect();
+    let people: Vec<u32> = groups
+        .values()
+        .flat_map(|g| g.members.iter().map(|m| m.account))
+        .chain(groups.values().map(|g| g.owner))
+        .filter(|a| *a != 0 && *a != own)
+        .collect();
     with(account_id, |a| {
         a.groups = groups;
         a.own = own;
@@ -502,14 +664,28 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
         .filter(|b| b.account_id == account_id && is_room(b))
         .filter_map(|b| ids_of(&b).map(|(g, r)| (g, r, b.name)))
         .collect();
-    let Some((groups, titles_now, mut shown_before, own)) = with(account_id, |a| a.loaded.then(|| (a.groups.clone(), titles(&a.groups, &a.people, a.own), a.shown.clone(), a.own))) else { return };
+    let Some((groups, titles_now, mut shown_before, own)) = with(account_id, |a| {
+        a.loaded.then(|| {
+            (
+                a.groups.clone(),
+                titles(&a.groups, &a.people, a.own),
+                a.shown.clone(),
+                a.own,
+            )
+        })
+    }) else {
+        return;
+    };
     for (g, r, name) in existing {
         shown_before.entry((g, r)).or_insert(name);
     }
     let rails: Vec<String> = groups.keys().map(|g| rail_id(account_id, *g)).collect();
     // A group that is gone: it takes its channels with it.
     for buffer_group in state.runtime.list_buffer_groups() {
-        if buffer_group.account_id == account_id && buffer_group.id.contains("|steamgroup:") && !rails.contains(&buffer_group.id) {
+        if buffer_group.account_id == account_id
+            && buffer_group.id.contains("|steamgroup:")
+            && !rails.contains(&buffer_group.id)
+        {
             state.runtime.remove_buffer_group(state, &buffer_group.id);
         }
     }
@@ -518,30 +694,67 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
         let rail = rail_id(account_id, g.id);
         state.runtime.upsert_buffer_group(
             state,
-            BufferGroup { id: rail.clone(), account_id: account_id.to_string(), service: "steam".to_string(), kind: "guild".to_string(), name: friends::clean_name(&g.name), icon_url: g.avatar.clone(), position: position as i64, pending: false },
+            BufferGroup {
+                id: rail.clone(),
+                account_id: account_id.to_string(),
+                service: "steam".to_string(),
+                kind: "guild".to_string(),
+                name: friends::clean_name(&g.name),
+                icon_url: g.avatar.clone(),
+                position: position as i64,
+                pending: false,
+            },
         );
         let member_list = member_json(g, roster, own);
         for r in &g.rooms {
             // A voice-only room has nothing to read: voice is Steam's own client's.
-            let Some(name) = titles_now.get(&(g.id, r.id)).cloned() else { continue };
+            let Some(name) = titles_now.get(&(g.id, r.id)).cloned() else {
+                continue;
+            };
             if let Some(old) = shown_before.get(&(g.id, r.id)).filter(|old| **old != name) {
-                state.runtime.rename_buffer(state, account_id, old, &name, "channel");
+                state
+                    .runtime
+                    .rename_buffer(state, account_id, old, &name, "channel");
             }
-            let buffer = state.runtime.ensure_buffer(state, account_id, &name, "channel");
-            state.runtime.set_buffer_remote_id(state, &buffer.id, &remote_id(g.id, r.id));
+            let buffer = state
+                .runtime
+                .ensure_buffer(state, account_id, &name, "channel");
+            state
+                .runtime
+                .set_buffer_remote_id(state, &buffer.id, &remote_id(g.id, r.id));
             state.runtime.set_buffer_group(state, &buffer.id, &rail);
-            state.runtime.set_buffer_category(state, &buffer.id, None, i64::from(r.sort));
-            state.runtime.set_buffer_topic(state, &buffer.id, &g.tagline);
-            state.runtime.set_buffer_read_only(state, &buffer.id, (!g.may_speak()).then_some("You can read this group but not write in it."));
+            state
+                .runtime
+                .set_buffer_category(state, &buffer.id, None, i64::from(r.sort));
+            state
+                .runtime
+                .set_buffer_topic(state, &buffer.id, &g.tagline);
+            state.runtime.set_buffer_read_only(
+                state,
+                &buffer.id,
+                (!g.may_speak()).then_some("You can read this group but not write in it."),
+            );
             state.runtime.set_silenced(state, &buffer.id, g.silenced());
-            state.runtime.set_buffer_notice(state, &buffer.id, suspicious_notice(account_id, g, roster));
+            state.runtime.set_buffer_notice(
+                state,
+                &buffer.id,
+                suspicious_notice(account_id, g, roster),
+            );
             if let Some(url) = &g.avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
             }
-            let changed = with(account_id, |a| a.members.insert(buffer.id.clone(), member_list.clone()).as_ref() != Some(&member_list));
+            let changed = with(account_id, |a| {
+                a.members
+                    .insert(buffer.id.clone(), member_list.clone())
+                    .as_ref()
+                    != Some(&member_list)
+            });
             if changed {
                 state.runtime.set_presence(&buffer.id, member_list.clone());
-                state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": member_list }));
+                state.events.emit(
+                    "presenceChange",
+                    json!({ "bufferId": buffer.id, "members": member_list }),
+                );
             }
             names.insert((g.id, r.id), name);
         }
@@ -549,18 +762,27 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
     // Rooms that are gone.
     for ((g, r), old) in shown_before.iter() {
         if !names.contains_key(&(*g, *r)) {
-            state.runtime.remove_buffer(state, &crate::model::buffer_id(account_id, old));
-            with(account_id, |a| a.members.remove(&crate::model::buffer_id(account_id, old)));
+            state
+                .runtime
+                .remove_buffer(state, &crate::model::buffer_id(account_id, old));
+            with(account_id, |a| {
+                a.members.remove(&crate::model::buffer_id(account_id, old))
+            });
         }
     }
     for g in groups.values() {
         let now = voice_rooms(account_id, g.id);
-        let changed = with(account_id, |a| a.voice_told.insert(g.id, now.clone()).as_ref() != Some(&now));
+        let changed = with(account_id, |a| {
+            a.voice_told.insert(g.id, now.clone()).as_ref() != Some(&now)
+        });
         if changed {
             tell_voice_rooms(state, account_id, g.id);
         }
     }
-    let everyone: Vec<u32> = groups.values().flat_map(|g| g.members.iter().map(|m| m.account)).collect();
+    let everyone: Vec<u32> = groups
+        .values()
+        .flat_map(|g| g.members.iter().map(|m| m.account))
+        .collect();
     learn(account_id, roster, everyone);
     with(account_id, |a| a.shown = names);
 }
@@ -569,8 +791,19 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
 pub fn learn(account_id: &str, roster: &Roster, accounts: impl IntoIterator<Item = u32>) {
     with(account_id, |a| {
         for account in accounts {
-            if let Some(name) = roster.persona(account).and_then(|p| p.name.clone()).or_else(|| roster.nickname(account).map(str::to_string)) {
-                a.people.insert(account, Person { name: friends::clean_name(&name), avatar: roster.persona(account).and_then(|p| p.avatar.clone()), friend: roster.is_friend(account) });
+            if let Some(name) = roster
+                .persona(account)
+                .and_then(|p| p.name.clone())
+                .or_else(|| roster.nickname(account).map(str::to_string))
+            {
+                a.people.insert(
+                    account,
+                    Person {
+                        name: friends::clean_name(&name),
+                        avatar: roster.persona(account).and_then(|p| p.avatar.clone()),
+                        friend: roster.is_friend(account),
+                    },
+                );
             }
         }
     });
@@ -578,15 +811,33 @@ pub fn learn(account_id: &str, roster: &Roster, accounts: impl IntoIterator<Item
 
 /// What is known of somebody; their number, for a name, when nothing is.
 fn person(account_id: &str, account: u32) -> Person {
-    with(account_id, |a| a.people.get(&account).cloned()).unwrap_or_else(|| Person { name: steamid::text_of(account), avatar: None, friend: false })
+    with(account_id, |a| a.people.get(&account).cloned()).unwrap_or_else(|| Person {
+        name: steamid::text_of(account),
+        avatar: None,
+        friend: false,
+    })
 }
 
 /// The banner over a group's rooms while Steam warns of somebody in it.
-fn suspicious_notice(account_id: &str, g: &Group, roster: &Roster) -> Option<crate::model::BufferNotice> {
+fn suspicious_notice(
+    account_id: &str,
+    g: &Group,
+    roster: &Roster,
+) -> Option<crate::model::BufferNotice> {
     if g.suspicious.is_empty() {
         return None;
     }
-    let names: Vec<String> = g.suspicious.iter().map(|a| if roster.has_name(*a) { who(roster, *a) } else { person(account_id, *a).name }).collect();
+    let names: Vec<String> = g
+        .suspicious
+        .iter()
+        .map(|a| {
+            if roster.has_name(*a) {
+                who(roster, *a)
+            } else {
+                person(account_id, *a).name
+            }
+        })
+        .collect();
     let list = names.join(", ");
     Some(crate::model::BufferNotice { kind: "suspicious".to_string(), text: format!("Steam warns that {list} may not be who they appear to be. Be careful with links, offers and requests for anything - and do not give out your account details.") })
 }
@@ -594,7 +845,12 @@ fn suspicious_notice(account_id: &str, g: &Group, roster: &Roster) -> Option<cra
 /// The people in a group as the window's member list reads them: online ones
 /// with what they are playing, the owner and moderators carrying their rank.
 fn member_json(g: &Group, roster: &Roster, own: u32) -> Value {
-    let role_name = |id: u64| g.roles.iter().find(|(r, _)| *r == id).map(|(_, n)| n.clone());
+    let role_name = |id: u64| {
+        g.roles
+            .iter()
+            .find(|(r, _)| *r == id)
+            .map(|(_, n)| n.clone())
+    };
     let list: Vec<Value> = g
         .members
         .iter()
@@ -627,7 +883,12 @@ fn member_json(g: &Group, roster: &Roster, own: u32) -> Value {
 
 /// A person's name for a line of conversation.
 fn who(roster: &Roster, account: u32) -> String {
-    roster.nickname(account).map(friends::clean_name).filter(|n| !n.is_empty()).or_else(|| roster.persona(account).and_then(|p| p.name.clone())).unwrap_or_else(|| steamid::text_of(account))
+    roster
+        .nickname(account)
+        .map(friends::clean_name)
+        .filter(|n| !n.is_empty())
+        .or_else(|| roster.persona(account).and_then(|p| p.name.clone()))
+        .unwrap_or_else(|| steamid::text_of(account))
 }
 
 /// The name a room's channel is shown under, if it is one the account has.
@@ -638,11 +899,23 @@ fn channel_of(account_id: &str, group: u64, room: u64) -> Option<String> {
 /// Whether any of these people are in a group of the account's: their names and
 /// states are on screen in a member list, which has to follow.
 pub fn involves(account_id: &str, people: &[u32]) -> bool {
-    with(account_id, |a| a.loaded && a.groups.values().any(|g| g.members.iter().any(|m| people.contains(&m.account))))
+    with(account_id, |a| {
+        a.loaded
+            && a.groups
+                .values()
+                .any(|g| g.members.iter().any(|m| people.contains(&m.account)))
+    })
 }
 
 /// Somebody joined or left a room's voice chat.
-pub fn voice_changed(state: &AppState, account_id: &str, group: u64, room: u64, user: u32, joined: bool) {
+pub fn voice_changed(
+    state: &AppState,
+    account_id: &str,
+    group: u64,
+    room: u64,
+    user: u32,
+    joined: bool,
+) {
     with(account_id, |a| {
         if let Some(r) = a.groups.get_mut(&group).and_then(|g| g.room_mut(room)) {
             r.in_voice.retain(|u| *u != user);
@@ -657,7 +930,9 @@ pub fn voice_changed(state: &AppState, account_id: &str, group: u64, room: u64, 
 /// The rooms of a group that have voice, and who is in each, as the window lists them.
 pub fn voice_rooms(account_id: &str, group: u64) -> Value {
     with(account_id, |a| {
-        let Some(g) = a.groups.get(&group) else { return json!([]) };
+        let Some(g) = a.groups.get(&group) else {
+            return json!([]);
+        };
         let rooms: Vec<Value> = g
             .rooms
             .iter()
@@ -685,24 +960,62 @@ fn tell_voice_rooms(state: &AppState, account_id: &str, group: u64) {
 
 /// The accounts in groups the roster has no name for, to be asked about.
 pub fn unknown(account_id: &str, roster: &Roster) -> Vec<u32> {
-    with(account_id, |a| a.groups.values().flat_map(|g| g.members.iter().map(|m| m.account)).filter(|m| *m != a.own && !roster.has_name(*m)).collect())
+    with(account_id, |a| {
+        a.groups
+            .values()
+            .flat_map(|g| g.members.iter().map(|m| m.account))
+            .filter(|m| *m != a.own && !roster.has_name(*m))
+            .collect()
+    })
 }
 
 /// Puts a server's line in a room: someone joined, a room was renamed.
 fn say(state: &AppState, account_id: &str, name: &str, text: &str, at: u32) {
-    state.runtime.record_message_at(state, account_id, name, "channel", "*", text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None, Some(i64::from(at)).filter(|t| *t > 0), None, None);
+    state.runtime.record_message_at(
+        state,
+        account_id,
+        name,
+        "channel",
+        "*",
+        text,
+        false,
+        "system",
+        None,
+        None,
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        Some(i64::from(at)).filter(|t| *t > 0),
+        None,
+        None,
+    );
 }
 
 /// What a message from the server says, in words, as the Steam client says it: who did it is the
 /// message's sender, who it was done to is the account in it, and the "many" kinds carry a count.
-fn server_line(name_of: &dyn Fn(u32) -> String, m: &ServerMessage, text_param: &str, sender: u32) -> Option<String> {
+fn server_line(
+    name_of: &dyn Fn(u32) -> String,
+    m: &ServerMessage,
+    text_param: &str,
+    sender: u32,
+) -> Option<String> {
     let person = m.accountid_param.map(name_of).unwrap_or_default();
-    let by = if sender != 0 { name_of(sender) } else { String::new() };
+    let by = if sender != 0 {
+        name_of(sender)
+    } else {
+        String::new()
+    };
     let count = |single: &str, many: &str| match m.string_param.as_deref().unwrap_or_default() {
         "1" => single.to_string(),
         n => many.replace("{n}", n),
     };
-    let param = m.string_param.as_deref().filter(|p| !p.is_empty()).unwrap_or(text_param);
+    let param = m
+        .string_param
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .unwrap_or(text_param);
     Some(match m.message? {
         SERVER_JOINED => format!("{person} joined"),
         SERVER_JOINED_MANY => count("Someone joined", "{n} people joined"),
@@ -713,10 +1026,38 @@ fn server_line(name_of: &dyn Fn(u32) -> String, m: &ServerMessage, text_param: &
         SERVER_INVITED if by.is_empty() => format!("{person} was invited"),
         SERVER_INVITED => format!("{person} was invited by {by}"),
         SERVER_INVITED_MANY => count("Someone was invited", "{n} people were invited"),
-        SERVER_RENAMED => format!("{} renamed the room to {param}", if by.is_empty() { "somebody".to_string() } else { by }),
-        SERVER_TAGLINE if m.string_param.as_deref().unwrap_or_default().is_empty() => format!("{} removed the tagline", if by.is_empty() { "somebody".to_string() } else { by }),
-        SERVER_TAGLINE => format!("{} changed the tagline to {param}", if by.is_empty() { "somebody".to_string() } else { by }),
-        SERVER_AVATAR => format!("{} changed the group's picture", if by.is_empty() { "somebody".to_string() } else { by }),
+        SERVER_RENAMED => format!(
+            "{} renamed the room to {param}",
+            if by.is_empty() {
+                "somebody".to_string()
+            } else {
+                by
+            }
+        ),
+        SERVER_TAGLINE if m.string_param.as_deref().unwrap_or_default().is_empty() => format!(
+            "{} removed the tagline",
+            if by.is_empty() {
+                "somebody".to_string()
+            } else {
+                by
+            }
+        ),
+        SERVER_TAGLINE => format!(
+            "{} changed the tagline to {param}",
+            if by.is_empty() {
+                "somebody".to_string()
+            } else {
+                by
+            }
+        ),
+        SERVER_AVATAR => format!(
+            "{} changed the group's picture",
+            if by.is_empty() {
+                "somebody".to_string()
+            } else {
+                by
+            }
+        ),
         _ => return None,
     })
 }
@@ -725,8 +1066,15 @@ fn server_line(name_of: &dyn Fn(u32) -> String, m: &ServerMessage, text_param: &
 fn removed(state: &AppState, account_id: &str, group: u64, action: i32) {
     let name = with(account_id, |a| a.groups.remove(&group).map(|g| g.name));
     if let (Some(name), CHANGE_KICKED | CHANGE_BANNED) = (name, action) {
-        let how = if action == CHANGE_BANNED { "banned from" } else { "removed from" };
-        state.events.emit("steamGroupRemoved", json!({ "accountId": account_id, "name": name, "how": how }));
+        let how = if action == CHANGE_BANNED {
+            "banned from"
+        } else {
+            "removed from"
+        };
+        state.events.emit(
+            "steamGroupRemoved",
+            json!({ "accountId": account_id, "name": name, "how": how }),
+        );
     }
 }
 
@@ -740,7 +1088,13 @@ pub struct Heard {
 }
 
 /// One notification from the ChatRoomClient service.
-pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, body: &[u8]) -> Option<Heard> {
+pub fn heard(
+    state: &AppState,
+    account_id: &str,
+    roster: &Roster,
+    method: &str,
+    body: &[u8],
+) -> Option<Heard> {
     use prost::Message;
     let own = with(account_id, |a| a.own);
     let mut out = Heard::default();
@@ -755,10 +1109,24 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             let at = n.timestamp.unwrap_or(0);
             let sender = n.steamid_sender.and_then(steamid::account_of).unwrap_or(0);
             if let Some(server) = &n.server_message {
-                if let Some(line) = server_line(&|a| who(roster, a), server, n.chat_name.as_deref().unwrap_or_default(), sender) {
+                if let Some(line) = server_line(
+                    &|a| who(roster, a),
+                    server,
+                    n.chat_name.as_deref().unwrap_or_default(),
+                    sender,
+                ) {
                     say(state, account_id, &name, &line, at);
                 }
-                if matches!(server.message, Some(SERVER_JOINED | SERVER_PARTED | SERVER_KICKED | SERVER_JOINED_MANY | SERVER_PARTED_MANY)) {
+                if matches!(
+                    server.message,
+                    Some(
+                        SERVER_JOINED
+                            | SERVER_PARTED
+                            | SERVER_KICKED
+                            | SERVER_JOINED_MANY
+                            | SERVER_PARTED_MANY
+                    )
+                ) {
                     out.reload = true;
                 }
                 if let Some(a) = server.accountid_param.filter(|a| !roster.has_name(*a)) {
@@ -767,18 +1135,36 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
                 return Some(out);
             }
             let rendered = super::bbcode::render_message(n.message.as_deref().unwrap_or_default());
-            let text = Some(rendered.text).filter(|t| !t.trim().is_empty()).or_else(|| n.message_no_bbcode.clone().map(|t| t.trim_end().to_string()))?;
+            let text = Some(rendered.text)
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| {
+                    n.message_no_bbcode
+                        .clone()
+                        .map(|t| t.trim_end().to_string())
+                })?;
             if text.trim().is_empty() {
                 return None;
             }
             learn(account_id, roster, [sender]);
             let from_us = sender == own;
-            let mentioned = n.mentions.as_ref().is_some_and(|m| m.mention_all.unwrap_or(false) || m.mention_here.unwrap_or(false) || m.mention_accountids.contains(&own));
+            let mentioned = n.mentions.as_ref().is_some_and(|m| {
+                m.mention_all.unwrap_or(false)
+                    || m.mention_here.unwrap_or(false)
+                    || m.mention_accountids.contains(&own)
+            });
             if !roster.has_name(sender) && sender != 0 {
                 out.ask.push(sender);
             }
-            let sender_name = if from_us { state.runtime.own_identity(account_id).unwrap_or_default() } else { who(roster, sender) };
-            let shown = if from_us { text } else { super::account::filtered(account_id, roster.is_friend(sender), &text) };
+            let sender_name = if from_us {
+                state.runtime.own_identity(account_id).unwrap_or_default()
+            } else {
+                who(roster, sender)
+            };
+            let shown = if from_us {
+                text
+            } else {
+                super::account::filtered(account_id, roster.is_friend(sender), &text)
+            };
             state.runtime.record_message_at(
                 state,
                 account_id,
@@ -791,7 +1177,10 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
                 None,
                 Some(message_id(at, n.ordinal.unwrap_or(0))),
                 mentioned && !from_us,
-                roster.persona(sender).filter(|_| !from_us).and_then(|p| p.avatar.clone()),
+                roster
+                    .persona(sender)
+                    .filter(|_| !from_us)
+                    .and_then(|p| p.avatar.clone()),
                 rendered.cards,
                 Vec::new(),
                 (!from_us).then(|| steamid::text_of(sender)),
@@ -817,8 +1206,21 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
         "ChatRoomClient.NotifyMessageReaction#1" => {
             let n = ChatReactionNotice::decode(body).ok()?;
             let name = channel_of(account_id, n.chat_group_id?, n.chat_id?)?;
-            let notice = MessageReactionNotice { steamid_friend: None, server_timestamp: n.server_timestamp, ordinal: n.ordinal, reactor: n.reactor, reaction_type: n.reaction_type, reaction: n.reaction.clone(), is_add: n.is_add };
-            reactions::heard(state, &crate::model::buffer_id(account_id, &name), own, &notice);
+            let notice = MessageReactionNotice {
+                steamid_friend: None,
+                server_timestamp: n.server_timestamp,
+                ordinal: n.ordinal,
+                reactor: n.reactor,
+                reaction_type: n.reaction_type,
+                reaction: n.reaction.clone(),
+                is_add: n.is_add,
+            };
+            reactions::heard(
+                state,
+                &crate::model::buffer_id(account_id, &name),
+                own,
+                &notice,
+            );
         }
         "ChatRoomClient.NotifyMemberStateChange#1" => {
             let n = ChatMemberChange::decode(body).ok()?;
@@ -830,16 +1232,26 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
                 out.ask.push(account);
             }
             let known = with(account_id, |a| {
-                let Some(g) = a.groups.get_mut(&group) else { return false };
+                let Some(g) = a.groups.get_mut(&group) else {
+                    return false;
+                };
                 match change {
-                    CHANGE_PARTED | CHANGE_KICKED | CHANGE_BANNED => g.members.retain(|m| m.account != account),
+                    CHANGE_PARTED | CHANGE_KICKED | CHANGE_BANNED => {
+                        g.members.retain(|m| m.account != account)
+                    }
                     CHANGE_JOINED | CHANGE_RANK | CHANGE_ROLES => {
-                        let fresh = Member { account, rank: member.rank.unwrap_or(RANK_MEMBER), roles: member.role_ids.clone(), kick_expire: member.time_kick_expire.unwrap_or(0) };
+                        let fresh = Member {
+                            account,
+                            rank: member.rank.unwrap_or(RANK_MEMBER),
+                            roles: member.role_ids.clone(),
+                            kick_expire: member.time_kick_expire.unwrap_or(0),
+                        };
                         match g.members.iter_mut().find(|m| m.account == account) {
                             Some(m) => *m = fresh,
                             None => g.members.push(fresh),
                         }
-                        g.members.sort_by_key(|m| (std::cmp::Reverse(m.rank), m.account));
+                        g.members
+                            .sort_by_key(|m| (std::cmp::Reverse(m.rank), m.account));
                         if account == own {
                             g.my_rank = member.rank.unwrap_or(g.my_rank);
                         }
@@ -853,7 +1265,8 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             } else {
                 publish(state, account_id, roster);
                 // Removed from a group means it is gone from the rail.
-                if account == own && matches!(change, CHANGE_PARTED | CHANGE_KICKED | CHANGE_BANNED) {
+                if account == own && matches!(change, CHANGE_PARTED | CHANGE_KICKED | CHANGE_BANNED)
+                {
                     removed(state, account_id, group, change);
                     publish(state, account_id, roster);
                 }
@@ -863,7 +1276,12 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             let n = ChatHeaderChange::decode(body).ok()?;
             let h = n.header_state?;
             let group = h.chat_group_id?;
-            let known = with(account_id, |a| a.groups.get_mut(&group).map(|g| g.take_header(&h)).is_some());
+            let known = with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| g.take_header(&h))
+                    .is_some()
+            });
             if known {
                 publish(state, account_id, roster);
             } else {
@@ -874,13 +1292,15 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             let n = ChatRoomsChange::decode(body).ok()?;
             let group = n.chat_group_id?;
             let known = with(account_id, |a| {
-                a.groups.get_mut(&group).map(|g| {
-                    g.take_rooms(&n.chat_rooms);
-                    if let Some(d) = n.default_chat_id {
-                        g.default_room = d;
-                    }
-                })
-                .is_some()
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| {
+                        g.take_rooms(&n.chat_rooms);
+                        if let Some(d) = n.default_chat_id {
+                            g.default_room = d;
+                        }
+                    })
+                    .is_some()
             });
             if known {
                 publish(state, account_id, roster);
@@ -901,7 +1321,12 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
                 }
                 _ => {
                     if let Some(user) = &n.user_chat_group_state {
-                        let known = with(account_id, |a| a.groups.get_mut(&group).map(|g| g.take_user(user)).is_some());
+                        let known = with(account_id, |a| {
+                            a.groups
+                                .get_mut(&group)
+                                .map(|g| g.take_user(user))
+                                .is_some()
+                        });
                         if known {
                             publish(state, account_id, roster);
                         }
@@ -915,16 +1340,21 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             if n.notice_type != Some(super::notices::SUSPICIOUS) {
                 return None;
             }
-            let (group, who) = (n.chat_group_id?, n.steamid_sender.and_then(steamid::account_of)?);
+            let (group, who) = (
+                n.chat_group_id?,
+                n.steamid_sender.and_then(steamid::account_of)?,
+            );
             let known = with(account_id, |a| {
-                a.groups.get_mut(&group).map(|g| {
-                    if n.active.unwrap_or(true) {
-                        g.suspicious.insert(who);
-                    } else {
-                        g.suspicious.remove(&who);
-                    }
-                })
-                .is_some()
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| {
+                        if n.active.unwrap_or(true) {
+                            g.suspicious.insert(who);
+                        } else {
+                            g.suspicious.remove(&who);
+                        }
+                    })
+                    .is_some()
             });
             if known {
                 if !roster.has_name(who) {
@@ -941,19 +1371,34 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
             // A room's own read position, or - with no room named - the whole group's.
             let rooms: Vec<u64> = match n.chat_id.filter(|r| *r != 0) {
                 Some(room) => vec![room],
-                None => with(account_id, |a| a.groups.get(&group).map(|g| g.rooms.iter().map(|r| r.id).collect()).unwrap_or_default()),
+                None => with(account_id, |a| {
+                    a.groups
+                        .get(&group)
+                        .map(|g| g.rooms.iter().map(|r| r.id).collect())
+                        .unwrap_or_default()
+                }),
             };
             for room in rooms {
-                let Some(name) = channel_of(account_id, group, room) else { continue };
+                let Some(name) = channel_of(account_id, group, room) else {
+                    continue;
+                };
                 let buffer_id = crate::model::buffer_id(account_id, &name);
                 with(account_id, |a| {
                     if let Some(r) = a.groups.get_mut(&group).and_then(|g| g.room_mut(room)) {
                         r.acked = r.acked.max(at);
                     }
                 });
-                let newest = state.store.get_backlog(&buffer_id, 0, 1).ok().and_then(|m| m.last().map(|m| m.ts)).unwrap_or(0);
+                let newest = state
+                    .store
+                    .get_backlog(&buffer_id, 0, 1)
+                    .ok()
+                    .and_then(|m| m.last().map(|m| m.ts))
+                    .unwrap_or(0);
                 if i64::from(at) >= newest {
-                    state.events.emit("bufferRead", json!({ "accountId": account_id, "bufferId": buffer_id }));
+                    state.events.emit(
+                        "bufferRead",
+                        json!({ "accountId": account_id, "bufferId": buffer_id }),
+                    );
                 }
             }
         }
@@ -985,22 +1430,60 @@ fn read_past(m: &ChatHistoryMessage, own: u32) -> Option<Past> {
         .reactions
         .iter()
         .filter_map(|r| {
-            let emoji = reactions::token(r.reaction_type.unwrap_or(reactions::EMOTICON), r.reaction.as_deref()?)?;
-            (r.num_reactors.unwrap_or(0) > 0).then(|| crate::model::Reaction { emoji, count: i64::from(r.num_reactors.unwrap_or(0)), me: r.has_user_reacted.unwrap_or(false), animated: false })
+            let emoji = reactions::token(
+                r.reaction_type.unwrap_or(reactions::EMOTICON),
+                r.reaction.as_deref()?,
+            )?;
+            (r.num_reactors.unwrap_or(0) > 0).then(|| crate::model::Reaction {
+                emoji,
+                count: i64::from(r.num_reactors.unwrap_or(0)),
+                me: r.has_user_reacted.unwrap_or(false),
+                animated: false,
+            })
         })
         .collect();
     let _ = own;
-    Some(Past { account: m.sender.unwrap_or(0), at: m.server_timestamp.unwrap_or(0), ordinal: m.ordinal.unwrap_or(0), text: rendered.text, cards: rendered.cards, reactions, server: m.server_message.clone() })
+    Some(Past {
+        account: m.sender.unwrap_or(0),
+        at: m.server_timestamp.unwrap_or(0),
+        ordinal: m.ordinal.unwrap_or(0),
+        text: rendered.text,
+        cards: rendered.cards,
+        reactions,
+        server: m.server_message.clone(),
+    })
 }
 
 /// Asks for a page of a room, oldest first, and whether there is more before it.
-async fn fetch(link: &Link, own: u32, group: u64, room: u64, older_than: Option<(u32, u32)>) -> Result<Vec<Past>, String> {
+async fn fetch(
+    link: &Link,
+    own: u32,
+    group: u64,
+    room: u64,
+    older_than: Option<(u32, u32)>,
+) -> Result<Vec<Past>, String> {
     let (last_time, last_ordinal) = older_than.unwrap_or((u32::MAX, 0));
     let answer: ChatHistoryResponse = link
-        .call("ChatRoom.GetMessageHistory#1", &ChatHistoryRequest { chat_group_id: Some(group), chat_id: Some(room), last_time: Some(last_time), last_ordinal: Some(last_ordinal), start_time: Some(0), start_ordinal: Some(0), max_count: Some(PAGE) }, true)
+        .call(
+            "ChatRoom.GetMessageHistory#1",
+            &ChatHistoryRequest {
+                chat_group_id: Some(group),
+                chat_id: Some(room),
+                last_time: Some(last_time),
+                last_ordinal: Some(last_ordinal),
+                start_time: Some(0),
+                start_ordinal: Some(0),
+                max_count: Some(PAGE),
+            },
+            true,
+        )
         .await
         .map_err(|e| group_refusal(&e))?;
-    let mut past: Vec<Past> = answer.messages.iter().filter_map(|m| read_past(m, own)).collect();
+    let mut past: Vec<Past> = answer
+        .messages
+        .iter()
+        .filter_map(|m| read_past(m, own))
+        .collect();
     // Steam answers newest first.
     past.reverse();
     Ok(past)
@@ -1013,8 +1496,32 @@ fn store_quietly(state: &AppState, account_id: &str, name: &str, own: u32, past:
     for p in past {
         let id = message_id(p.at, p.ordinal);
         if let Some(server) = &p.server {
-            if let Some(line) = server_line(&|a| person(account_id, a).name, server, "", p.account) {
-                if matches!(state.store.append_message(&buffer_id, &id, "*", &line, i64::from(p.at), false, false, "system", None, &[], false, None, &[], &[], None, None, "channel", None, &[]), Ok(true)) {
+            if let Some(line) = server_line(&|a| person(account_id, a).name, server, "", p.account)
+            {
+                if matches!(
+                    state.store.append_message(
+                        &buffer_id,
+                        &id,
+                        "*",
+                        &line,
+                        i64::from(p.at),
+                        false,
+                        false,
+                        "system",
+                        None,
+                        &[],
+                        false,
+                        None,
+                        &[],
+                        &[],
+                        None,
+                        None,
+                        "channel",
+                        None,
+                        &[]
+                    ),
+                    Ok(true)
+                ) {
                     added += 1;
                 }
             }
@@ -1022,11 +1529,39 @@ fn store_quietly(state: &AppState, account_id: &str, name: &str, own: u32, past:
         }
         let is_own = p.account == own;
         let who = person(account_id, p.account);
-        let from = if is_own { own_name.clone() } else { who.name.clone() };
+        let from = if is_own {
+            own_name.clone()
+        } else {
+            who.name.clone()
+        };
         let sender = (!is_own).then(|| steamid::text_of(p.account));
-        let text = if is_own { p.text.clone() } else { super::account::filtered(account_id, who.friend, &p.text) };
+        let text = if is_own {
+            p.text.clone()
+        } else {
+            super::account::filtered(account_id, who.friend, &p.text)
+        };
         let avatar = who.avatar.clone().filter(|_| !is_own);
-        let stored = state.store.append_message(&buffer_id, &id, &from, &text, i64::from(p.at), false, false, "chat", None, &p.reactions, is_own, avatar.as_deref(), &p.cards, &[], sender.as_deref(), None, "channel", None, &[]);
+        let stored = state.store.append_message(
+            &buffer_id,
+            &id,
+            &from,
+            &text,
+            i64::from(p.at),
+            false,
+            false,
+            "chat",
+            None,
+            &p.reactions,
+            is_own,
+            avatar.as_deref(),
+            &p.cards,
+            &[],
+            sender.as_deref(),
+            None,
+            "channel",
+            None,
+            &[],
+        );
         if matches!(stored, Ok(true)) {
             added += 1;
         } else if !p.reactions.is_empty() {
@@ -1038,16 +1573,32 @@ fn store_quietly(state: &AppState, account_id: &str, name: &str, own: u32, past:
 
 /// The recent end of a room, or the part before what is shown: what opening or
 /// scrolling asks for. Quiet, because it is old.
-pub async fn history(state: &AppState, buffer: &Buffer, before: Option<i64>) -> Result<usize, String> {
-    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+pub async fn history(
+    state: &AppState,
+    buffer: &Buffer,
+    before: Option<i64>,
+) -> Result<usize, String> {
+    let link = state
+        .runtime
+        .steam_link(&buffer.account_id)
+        .ok_or("this Steam account is not connected")?;
     let (group, room) = ids_of(buffer).ok_or("this is not a Steam chat room")?;
     let own = with(&buffer.account_id, |a| a.own);
     let older = match before {
-        Some(b) => Some((u32::try_from(b).map_err(|_| "that is not a time Steam knows".to_string())?, u32::MAX)),
+        Some(b) => Some((
+            u32::try_from(b).map_err(|_| "that is not a time Steam knows".to_string())?,
+            u32::MAX,
+        )),
         None => None,
     };
     let past = fetch(&link, own, group, room, older).await?;
-    Ok(store_quietly(state, &buffer.account_id, &buffer.name, own, &past))
+    Ok(store_quietly(
+        state,
+        &buffer.account_id,
+        &buffer.name,
+        own,
+        &past,
+    ))
 }
 
 /// Turns `@Name` for each of these people into the tag that pings them: Steam notices a mention
@@ -1060,12 +1611,24 @@ pub fn mentionize(text: &str, people: &[(u32, String)], can_all: bool) -> String
     let mut forms: Vec<(Vec<char>, String)> = Vec::new();
     for (account, name) in people.iter().filter(|(_, n)| !n.is_empty()) {
         let shown = name.replace('[', "\\[");
-        forms.push((format!("{name}#{}", base36(*account)).chars().collect(), format!("[mention={account}]@{shown}[/mention]")));
-        forms.push((name.chars().collect(), format!("[mention={account}]@{shown}[/mention]")));
+        forms.push((
+            format!("{name}#{}", base36(*account)).chars().collect(),
+            format!("[mention={account}]@{shown}[/mention]"),
+        ));
+        forms.push((
+            name.chars().collect(),
+            format!("[mention={account}]@{shown}[/mention]"),
+        ));
     }
     if can_all {
-        forms.push((vec!['a', 'l', 'l'], "[mention=all]@all[/mention]".to_string()));
-        forms.push((vec!['o', 'n', 'l', 'i', 'n', 'e'], "[mention=here]@online[/mention]".to_string()));
+        forms.push((
+            vec!['a', 'l', 'l'],
+            "[mention=all]@all[/mention]".to_string(),
+        ));
+        forms.push((
+            vec!['o', 'n', 'l', 'i', 'n', 'e'],
+            "[mention=here]@online[/mention]".to_string(),
+        ));
     }
     forms.sort_by_key(|(f, _)| std::cmp::Reverse(f.len()));
     let chars: Vec<char> = text.chars().collect();
@@ -1076,7 +1639,14 @@ pub fn mentionize(text: &str, people: &[(u32, String)], can_all: bool) -> String
         if chars[i] == '@' && starts_word {
             let found = forms.iter().find(|(form, _)| {
                 let end = i + 1 + form.len();
-                end <= chars.len() && chars[i + 1..end].iter().zip(form).all(|(a, b)| a.to_lowercase().eq(b.to_lowercase())) && chars.get(end).is_none_or(|c| !c.is_alphanumeric() && *c != '_')
+                end <= chars.len()
+                    && chars[i + 1..end]
+                        .iter()
+                        .zip(form)
+                        .all(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+                    && chars
+                        .get(end)
+                        .is_none_or(|c| !c.is_alphanumeric() && *c != '_')
             });
             if let Some((form, tag)) = found {
                 out.push_str(tag);
@@ -1105,26 +1675,57 @@ fn base36(mut n: u32) -> String {
 
 /// Sends words to a room, and stores them.
 pub async fn send(state: &AppState, buffer: &Buffer, text: &str) -> Result<(), String> {
-    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let link = state
+        .runtime
+        .steam_link(&buffer.account_id)
+        .ok_or("this Steam account is not connected")?;
     let (group, room) = ids_of(buffer).ok_or("this is not a Steam chat room")?;
     let text = text.trim_end();
     if text.trim().is_empty() {
         return Err("there is nothing to send".to_string());
     }
     if text.chars().count() > MAX_LENGTH {
-        return Err(format!("Steam takes messages of up to {MAX_LENGTH} characters; this one is {}", text.chars().count()));
+        return Err(format!(
+            "Steam takes messages of up to {MAX_LENGTH} characters; this one is {}",
+            text.chars().count()
+        ));
     }
     // People named with an @ are pinged.
-    let people: Vec<(u32, String)> = held(&buffer.account_id, group).map(|g| g.members.iter().map(|m| (m.account, person(&buffer.account_id, m.account).name)).collect()).unwrap_or_default();
+    let people: Vec<(u32, String)> = held(&buffer.account_id, group)
+        .map(|g| {
+            g.members
+                .iter()
+                .map(|m| (m.account, person(&buffer.account_id, m.account).name))
+                .collect()
+        })
+        .unwrap_or_default();
     let can_all = held(&buffer.account_id, group).is_some_and(|g| g.may_mention_all());
     let text = mentionize(text, &people, can_all);
-    let answer: ChatSendResponse = chat::send_with_patience(&link, "ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: Some(room), message: Some(text.clone()), echo_to_sender: Some(false) }, true, true)
-        .await
-        .map_err(|why| super::explained(&buffer.account_id, why))?;
-    let said = answer.modified_message.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(&text);
+    let answer: ChatSendResponse = chat::send_with_patience(
+        &link,
+        "ChatRoom.SendChatMessage#1",
+        &ChatSendRequest {
+            chat_group_id: Some(group),
+            chat_id: Some(room),
+            message: Some(text.clone()),
+            echo_to_sender: Some(false),
+        },
+        true,
+        true,
+    )
+    .await
+    .map_err(|why| super::explained(&buffer.account_id, why))?;
+    let said = answer
+        .modified_message
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or(&text);
     let rendered = super::bbcode::render_message(said);
     let at = answer.server_timestamp.unwrap_or(0);
-    let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
+    let own = state
+        .runtime
+        .own_identity(&buffer.account_id)
+        .unwrap_or_default();
     state.runtime.record_message_at(
         state,
         &buffer.account_id,
@@ -1150,20 +1751,58 @@ pub async fn send(state: &AppState, buffer: &Buffer, text: &str) -> Result<(), S
 
 /// Says a room has been read up to its newest message.
 pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
-    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let link = state
+        .runtime
+        .steam_link(&buffer.account_id)
+        .ok_or("this Steam account is not connected")?;
     let (group, room) = ids_of(buffer).ok_or("this is not a Steam chat room")?;
-    let newest = state.store.get_backlog(&buffer.id, 0, 1).ok().and_then(|m| m.last().map(|m| m.ts)).filter(|t| *t > 0);
-    let at = newest.and_then(|t| u32::try_from(t).ok()).unwrap_or_else(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as u32);
-    link.notify("ChatRoom.AckChatMessage#1", &ChatAck { chat_group_id: Some(group), chat_id: Some(room), timestamp: Some(at) }).map_err(|e| e.to_string())
+    let newest = state
+        .store
+        .get_backlog(&buffer.id, 0, 1)
+        .ok()
+        .and_then(|m| m.last().map(|m| m.ts))
+        .filter(|t| *t > 0);
+    let at = newest
+        .and_then(|t| u32::try_from(t).ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32
+        });
+    link.notify(
+        "ChatRoom.AckChatMessage#1",
+        &ChatAck {
+            chat_group_id: Some(group),
+            chat_id: Some(room),
+            timestamp: Some(at),
+        },
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Deletes a message from a room, for everyone.
 pub async fn delete_message(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<(), String> {
-    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+    let link = state
+        .runtime
+        .steam_link(&buffer.account_id)
+        .ok_or("this Steam account is not connected")?;
     let (group, room) = ids_of(buffer).ok_or("this is not a Steam chat room")?;
-    let (at, ordinal) = reactions::parse_message_id(msg_id).ok_or("that message has no place in Steam's log")?;
+    let (at, ordinal) =
+        reactions::parse_message_id(msg_id).ok_or("that message has no place in Steam's log")?;
     let _: DeleteChatMessagesResponse = link
-        .call("ChatRoom.DeleteChatMessages#1", &DeleteChatMessagesRequest { chat_group_id: Some(group), chat_id: Some(room), messages: vec![DeleteChatMessage { server_timestamp: Some(at), ordinal: Some(ordinal) }] }, true)
+        .call(
+            "ChatRoom.DeleteChatMessages#1",
+            &DeleteChatMessagesRequest {
+                chat_group_id: Some(group),
+                chat_id: Some(room),
+                messages: vec![DeleteChatMessage {
+                    server_timestamp: Some(at),
+                    ordinal: Some(ordinal),
+                }],
+            },
+            true,
+        )
         .await
         .map_err(|e| group_refusal(&e))?;
     state.runtime.delete_message(state, &buffer.id, msg_id);
@@ -1171,17 +1810,46 @@ pub async fn delete_message(state: &AppState, buffer: &Buffer, msg_id: &str) -> 
 }
 
 /// Reacts to a message in a room, or takes the reaction back.
-pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str, add: bool) -> Result<(), String> {
-    let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
+pub async fn react(
+    state: &AppState,
+    buffer: &Buffer,
+    msg_id: &str,
+    emoji: &str,
+    add: bool,
+) -> Result<(), String> {
+    let link = state
+        .runtime
+        .steam_link(&buffer.account_id)
+        .ok_or("this Steam account is not connected")?;
     let (group, room) = ids_of(buffer).ok_or("this is not a Steam chat room")?;
-    let (kind, name) = reactions::parse_token(emoji).ok_or("Steam reactions are its own emoticons and stickers")?;
-    let (at, ordinal) = reactions::parse_message_id(msg_id).ok_or("that message has no place in Steam's log")?;
-    let reaction = if kind == reactions::EMOTICON { format!(":{name}:") } else { name };
+    let (kind, name) = reactions::parse_token(emoji)
+        .ok_or("Steam reactions are its own emoticons and stickers")?;
+    let (at, ordinal) =
+        reactions::parse_message_id(msg_id).ok_or("that message has no place in Steam's log")?;
+    let reaction = if kind == reactions::EMOTICON {
+        format!(":{name}:")
+    } else {
+        name
+    };
     let _: ChatReactionResponse = link
-        .call("ChatRoom.UpdateMessageReaction#1", &ChatReactionRequest { chat_group_id: Some(group), chat_id: Some(room), server_timestamp: Some(at), ordinal: Some(ordinal), reaction_type: Some(kind), reaction: Some(reaction), is_add: Some(add) }, true)
+        .call(
+            "ChatRoom.UpdateMessageReaction#1",
+            &ChatReactionRequest {
+                chat_group_id: Some(group),
+                chat_id: Some(room),
+                server_timestamp: Some(at),
+                ordinal: Some(ordinal),
+                reaction_type: Some(kind),
+                reaction: Some(reaction),
+                is_add: Some(add),
+            },
+            true,
+        )
         .await
         .map_err(|e| group_refusal(&e))?;
-    state.runtime.update_reaction(state, &buffer.id, msg_id, emoji, true, add);
+    state
+        .runtime
+        .update_reaction(state, &buffer.id, msg_id, emoji, true, add);
     Ok(())
 }
 
@@ -1190,12 +1858,32 @@ pub async fn react(state: &AppState, buffer: &Buffer, msg_id: &str, emoji: &str,
 /// after the account last read is announced as news; the rest is only stored.
 pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, roster: &Roster) {
     let (rooms, own) = with(account_id, |a| {
-        let rooms: Vec<(u64, u64, String, u32, u32)> = a.groups.values().filter(|g| !g.silenced()).flat_map(|g| g.rooms.iter().filter_map(|r| Some((g.id, r.id, a.shown.get(&(g.id, r.id))?.clone(), r.last_message, r.acked)))).collect();
+        let rooms: Vec<(u64, u64, String, u32, u32)> = a
+            .groups
+            .values()
+            .filter(|g| !g.silenced())
+            .flat_map(|g| {
+                g.rooms.iter().filter_map(|r| {
+                    Some((
+                        g.id,
+                        r.id,
+                        a.shown.get(&(g.id, r.id))?.clone(),
+                        r.last_message,
+                        r.acked,
+                    ))
+                })
+            })
+            .collect();
         (rooms, a.own)
     });
     for (group, room, name, last, acked) in rooms {
         let buffer_id = crate::model::buffer_id(account_id, &name);
-        let held = state.store.get_backlog(&buffer_id, 0, 1).ok().and_then(|m| m.last().map(|m| m.ts)).unwrap_or(0);
+        let held = state
+            .store
+            .get_backlog(&buffer_id, 0, 1)
+            .ok()
+            .and_then(|m| m.last().map(|m| m.ts))
+            .unwrap_or(0);
         if last == 0 || i64::from(last) <= held {
             continue;
         }
@@ -1207,7 +1895,10 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, roster: &
             }
         };
         learn(account_id, roster, past.iter().map(|p| p.account));
-        let (news, old): (Vec<Past>, Vec<Past>) = past.into_iter().filter(|p| i64::from(p.at) > held).partition(|p| p.account != own && p.server.is_none() && p.at > acked);
+        let (news, old): (Vec<Past>, Vec<Past>) = past
+            .into_iter()
+            .filter(|p| i64::from(p.at) > held)
+            .partition(|p| p.account != own && p.server.is_none() && p.at > acked);
         store_quietly(state, account_id, &name, own, &old);
         for p in &news {
             state.runtime.record_message_at(
@@ -1237,8 +1928,14 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, roster: &
 // ---- Changing things ----
 
 /// `ChatRoom.<method>#1` for a request that has no answer worth reading.
-async fn command<Q: prost::Message, A: prost::Message + Default>(link: &Link, method: &str, request: &Q) -> Result<A, String> {
-    link.call(&format!("ChatRoom.{method}#1"), request, true).await.map_err(|e| group_refusal(&e))
+async fn command<Q: prost::Message, A: prost::Message + Default>(
+    link: &Link,
+    method: &str,
+    request: &Q,
+) -> Result<A, String> {
+    link.call(&format!("ChatRoom.{method}#1"), request, true)
+        .await
+        .map_err(|e| group_refusal(&e))
 }
 
 /// Why a call about a group was refused, in the words that fit a group: the Steam client has no
@@ -1247,11 +1944,28 @@ async fn command<Q: prost::Message, A: prost::Message + Default>(link: &Link, me
 pub fn group_refusal(error: &super::link::CallError) -> String {
     use super::link::CallError;
     match error {
-        CallError::Refused(super::eresult::ACCESS_DENIED, _) => "you do not have the permission for that in this group".to_string(),
+        CallError::Refused(super::eresult::ACCESS_DENIED, _) => {
+            "you do not have the permission for that in this group".to_string()
+        }
+        // Asking about, or joining, a group one is banned from is answered with the banned code.
+        CallError::Refused(super::eresult::BANNED, _) => {
+            "you have been banned from that group".to_string()
+        }
         CallError::Refused(12, _) => "Steam does not accept that name".to_string(),
-        CallError::Refused(super::eresult::LIMIT_EXCEEDED, _) => "the group is at a limit Steam keeps (rooms, roles, invite links or members)".to_string(),
-        CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND | super::eresult::INVALID_STATE, _) => "that group, room or person is not there any more".to_string(),
-        CallError::Refused(super::eresult::LIMITED_USER_ACCOUNT | super::eresult::INSUFFICIENT_PRIVILEGE, _) => "a limited account cannot do that; Steam asks for a purchase first".to_string(),
+        CallError::Refused(super::eresult::LIMIT_EXCEEDED, _) => {
+            "the group is at a limit Steam keeps (rooms, roles, invite links or members)"
+                .to_string()
+        }
+        CallError::Refused(
+            super::eresult::NO_MATCH
+            | super::eresult::FILE_NOT_FOUND
+            | super::eresult::INVALID_STATE,
+            _,
+        ) => "that group, room or person is not there any more".to_string(),
+        CallError::Refused(
+            super::eresult::LIMITED_USER_ACCOUNT | super::eresult::INSUFFICIENT_PRIVILEGE,
+            _,
+        ) => "a limited account cannot do that; Steam asks for a purchase first".to_string(),
         other => chat::refusal(other),
     }
 }
@@ -1259,32 +1973,114 @@ pub fn group_refusal(error: &super::link::CallError) -> String {
 /// What the window can ask of a group.
 #[derive(Debug, PartialEq)]
 pub enum Action {
-    Create { name: String },
-    Join { invite: String },
-    Leave { group: u64 },
-    Rename { group: u64, name: String },
-    Tagline { group: u64, text: String },
-    CreateRoom { group: u64, name: String, voice: bool },
-    RenameRoom { group: u64, room: u64, name: String },
-    DeleteRoom { group: u64, room: u64 },
-    Kick { group: u64, who: u64, seconds: i32 },
-    Ban { group: u64, who: u64, banned: bool },
-    Mute { group: u64, who: u64, seconds: i32 },
-    InviteFriend { group: u64, who: u64 },
-    MakeInvite { group: u64, seconds: u32 },
-    RevokeInvite { group: u64, code: String },
-    Links { group: u64 },
-    Notify { group: u64, level: Option<i32>, muted: Option<bool> },
-    Bans { group: u64 },
-    Avatar { group: u64, path: String },
-    DismissNotices { group: u64 },
-    CreateRole { group: u64, name: String },
-    RenameRole { group: u64, role: u64, name: String },
-    DeleteRole { group: u64, role: u64 },
-    RoleActions { group: u64, role: u64 },
-    SetRoleActions { group: u64, role: u64, actions: ChatRoleActions },
-    GiveRole { group: u64, who: u64, role: u64 },
-    TakeRole { group: u64, who: u64, role: u64 },
+    Create {
+        name: String,
+    },
+    Join {
+        invite: String,
+    },
+    Leave {
+        group: u64,
+    },
+    Rename {
+        group: u64,
+        name: String,
+    },
+    Tagline {
+        group: u64,
+        text: String,
+    },
+    CreateRoom {
+        group: u64,
+        name: String,
+        voice: bool,
+    },
+    RenameRoom {
+        group: u64,
+        room: u64,
+        name: String,
+    },
+    DeleteRoom {
+        group: u64,
+        room: u64,
+    },
+    Kick {
+        group: u64,
+        who: u64,
+        seconds: i32,
+    },
+    Ban {
+        group: u64,
+        who: u64,
+        banned: bool,
+    },
+    Mute {
+        group: u64,
+        who: u64,
+        seconds: i32,
+    },
+    InviteFriend {
+        group: u64,
+        who: u64,
+    },
+    MakeInvite {
+        group: u64,
+        seconds: u32,
+    },
+    RevokeInvite {
+        group: u64,
+        code: String,
+    },
+    Links {
+        group: u64,
+    },
+    Notify {
+        group: u64,
+        level: Option<i32>,
+        muted: Option<bool>,
+    },
+    Bans {
+        group: u64,
+    },
+    Avatar {
+        group: u64,
+        path: String,
+    },
+    DismissNotices {
+        group: u64,
+    },
+    CreateRole {
+        group: u64,
+        name: String,
+    },
+    RenameRole {
+        group: u64,
+        role: u64,
+        name: String,
+    },
+    DeleteRole {
+        group: u64,
+        role: u64,
+    },
+    RoleActions {
+        group: u64,
+        role: u64,
+    },
+    SetRoleActions {
+        group: u64,
+        role: u64,
+        actions: ChatRoleActions,
+    },
+    GiveRole {
+        group: u64,
+        who: u64,
+        role: u64,
+    },
+    TakeRole {
+        group: u64,
+        who: u64,
+        role: u64,
+    },
 }
 
 /// The permissions of a role as the window reads and writes them: by name.
@@ -1340,26 +2136,43 @@ pub fn actions_of(role: u64, v: &Value) -> ChatRoleActions {
 pub fn invite_code_of(text: &str) -> Option<String> {
     let text = text.trim();
     let code = match text.find("/chat/") {
-        Some(at) => text[at + 6..].trim_start_matches("invite/").split(['?', '#', '/']).next()?,
+        Some(at) => text[at + 6..]
+            .trim_start_matches("invite/")
+            .split(['?', '#', '/'])
+            .next()?,
         None => text,
     };
-    (code.len() >= 4 && code.len() <= 32 && code.chars().all(|c| c.is_ascii_alphanumeric()) && (text.contains("/chat/") || !text.contains('/'))).then(|| code.to_string())
+    (code.len() >= 4
+        && code.len() <= 32
+        && code.chars().all(|c| c.is_ascii_alphanumeric())
+        && (text.contains("/chat/") || !text.contains('/')))
+    .then(|| code.to_string())
 }
 
 /// The moment `seconds` from now ends, as a time Steam reads.
 fn ends_at(seconds: i32) -> i32 {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     i32::try_from(now.saturating_add(u64::from(seconds.max(0) as u32))).unwrap_or(i32::MAX)
 }
 
 fn now_secs() -> u32 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
 }
 
 /// A time Steam gave, as a date and a clock a person reads.
 fn when(unix: u32) -> String {
     use chrono::TimeZone;
-    chrono::Local.timestamp_opt(i64::from(unix), 0).single().map(|t| t.format("%A %-d %B, %H:%M").to_string()).unwrap_or_else(|| "later".to_string())
+    chrono::Local
+        .timestamp_opt(i64::from(unix), 0)
+        .single()
+        .map(|t| t.format("%A %-d %B, %H:%M").to_string())
+        .unwrap_or_else(|| "later".to_string())
 }
 
 /// What Steam's refusal to let somebody into a group means, as the client says it: access denied
@@ -1367,9 +2180,15 @@ fn when(unix: u32) -> String {
 fn join_refusal(e: super::link::CallError) -> String {
     use super::link::CallError;
     match e {
-        CallError::Refused(super::eresult::ACCESS_DENIED, _) => "you were removed from that group for now and cannot come back yet".to_string(),
-        CallError::Refused(super::eresult::BANNED, _) => "you have been banned from that group".to_string(),
-        CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND, _) => "that invite link is no longer good".to_string(),
+        CallError::Refused(super::eresult::ACCESS_DENIED, _) => {
+            "you were removed from that group for now and cannot come back yet".to_string()
+        }
+        CallError::Refused(super::eresult::BANNED, _) => {
+            "you have been banned from that group".to_string()
+        }
+        CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND, _) => {
+            "that invite link is no longer good".to_string()
+        }
         other => group_refusal(&other),
     }
 }
@@ -1384,7 +2203,10 @@ pub async fn act(state: &AppState, account_id: &str, action: Action) -> Result<V
 }
 
 async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Value, String> {
-    let link = state.runtime.steam_link(account_id).ok_or("this Steam account is not connected")?;
+    let link = state
+        .runtime
+        .steam_link(account_id)
+        .ok_or("this Steam account is not connected")?;
     let own = with(account_id, |a| a.own);
     match action {
         Action::Create { name } => {
@@ -1392,9 +2214,20 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             if name.is_empty() {
                 return Err("a group needs a name".to_string());
             }
-            let made: CreateChatGroupResponse = command(&link, "CreateChatRoomGroup", &CreateChatGroupRequest { name: Some(name), ..Default::default() }).await?;
+            let made: CreateChatGroupResponse = command(
+                &link,
+                "CreateChatRoomGroup",
+                &CreateChatGroupRequest {
+                    name: Some(name),
+                    ..Default::default()
+                },
+            )
+            .await?;
             if let (Some(id), Some(s)) = (made.chat_group_id, &made.state) {
-                let mut g = Group { id, ..Default::default() };
+                let mut g = Group {
+                    id,
+                    ..Default::default()
+                };
                 g.take_state(s, own);
                 if let Some(u) = &made.user_chat_state {
                     g.take_user(u);
@@ -1407,19 +2240,44 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
         Action::Join { invite } => {
             let code = invite_code_of(&invite).ok_or("that is not a link to a Steam chat group")?;
             // What the link is for, so a link that is dead or a group one is banned from says so.
-            let info: GetInviteLinkInfoResponse = command(&link, "GetInviteLinkInfo", &GetInviteLinkInfoRequest { invite_code: Some(code.clone()) }).await?;
+            let info: GetInviteLinkInfoResponse = command(
+                &link,
+                "GetInviteLinkInfo",
+                &GetInviteLinkInfoRequest {
+                    invite_code: Some(code.clone()),
+                },
+            )
+            .await?;
             if info.banned.unwrap_or(false) {
                 return Err("you have been banned from that group".to_string());
             }
             if let Some(until) = info.time_kick_expire.filter(|t| *t > now_secs()) {
-                return Err(format!("you were removed from that group and cannot come back until {}", when(until)));
+                return Err(format!(
+                    "you were removed from that group and cannot come back until {}",
+                    when(until)
+                ));
             }
-            let group = info.group_summary.as_ref().and_then(|s| s.chat_group_id).ok_or("that link does not lead to a group")?;
+            let group = info
+                .group_summary
+                .as_ref()
+                .and_then(|s| s.chat_group_id)
+                .ok_or("that link does not lead to a group")?;
             let joined: JoinChatGroupResponse = link
-                .call("ChatRoom.JoinChatRoomGroup#1", &JoinChatGroupRequest { chat_group_id: Some(group), invite_code: Some(code), chat_id: info.chat_id }, true)
+                .call(
+                    "ChatRoom.JoinChatRoomGroup#1",
+                    &JoinChatGroupRequest {
+                        chat_group_id: Some(group),
+                        invite_code: Some(code),
+                        chat_id: info.chat_id,
+                    },
+                    true,
+                )
                 .await
                 .map_err(join_refusal)?;
-            let mut g = Group { id: group, ..Default::default() };
+            let mut g = Group {
+                id: group,
+                ..Default::default()
+            };
             if let Some(s) = &info.group_summary {
                 g.name = s.chat_group_name.clone().unwrap_or_default();
                 g.tagline = s.chat_group_tagline.clone().unwrap_or_default();
@@ -1436,26 +2294,76 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             Ok(json!({ "groupId": rail_id(account_id, group), "name": name }))
         }
         Action::Leave { group } => {
-            let _: LeaveChatGroupResponse = command(&link, "LeaveChatRoomGroup", &LeaveChatGroupRequest { chat_group_id: Some(group) }).await?;
+            let _: LeaveChatGroupResponse = command(
+                &link,
+                "LeaveChatRoomGroup",
+                &LeaveChatGroupRequest {
+                    chat_group_id: Some(group),
+                },
+            )
+            .await?;
             with(account_id, |a| a.groups.remove(&group));
             Ok(json!({}))
         }
         Action::Rename { group, name } => {
-            let _: RenameChatGroupResponse = command(&link, "RenameChatRoomGroup", &RenameChatGroupRequest { chat_group_id: Some(group), name: Some(name.trim().to_string()) }).await?;
-            with(account_id, |a| a.groups.get_mut(&group).map(|g| g.name = name.trim().to_string()));
+            let _: RenameChatGroupResponse = command(
+                &link,
+                "RenameChatRoomGroup",
+                &RenameChatGroupRequest {
+                    chat_group_id: Some(group),
+                    name: Some(name.trim().to_string()),
+                },
+            )
+            .await?;
+            with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| g.name = name.trim().to_string())
+            });
             Ok(json!({}))
         }
         Action::Tagline { group, text } => {
-            let _: SetTaglineResponse = command(&link, "SetChatRoomGroupTagline", &SetTaglineRequest { chat_group_id: Some(group), tagline: Some(text.clone()) }).await?;
-            with(account_id, |a| a.groups.get_mut(&group).map(|g| g.tagline = text));
+            let _: SetTaglineResponse = command(
+                &link,
+                "SetChatRoomGroupTagline",
+                &SetTaglineRequest {
+                    chat_group_id: Some(group),
+                    tagline: Some(text.clone()),
+                },
+            )
+            .await?;
+            with(account_id, |a| {
+                a.groups.get_mut(&group).map(|g| g.tagline = text)
+            });
             Ok(json!({}))
         }
         Action::CreateRoom { group, name, voice } => {
-            let made: CreateChatRoomResponse = command(&link, "CreateChatRoom", &CreateChatRoomRequest { chat_group_id: Some(group), name: Some(name.trim().to_string()), allow_voice: Some(voice) }).await?;
+            let made: CreateChatRoomResponse = command(
+                &link,
+                "CreateChatRoom",
+                &CreateChatRoomRequest {
+                    chat_group_id: Some(group),
+                    name: Some(name.trim().to_string()),
+                    allow_voice: Some(voice),
+                },
+            )
+            .await?;
             if let Some(r) = made.chat_room {
                 with(account_id, |a| {
                     if let Some(g) = a.groups.get_mut(&group) {
-                        let mut rooms: Vec<ChatRoomState> = g.rooms.iter().map(|r| ChatRoomState { chat_id: Some(r.id), chat_name: Some(r.name.clone()), voice_allowed: Some(r.voice), members_in_voice: r.in_voice.clone(), sort_order: Some(r.sort), time_last_message: Some(r.last_message), ..Default::default() }).collect();
+                        let mut rooms: Vec<ChatRoomState> = g
+                            .rooms
+                            .iter()
+                            .map(|r| ChatRoomState {
+                                chat_id: Some(r.id),
+                                chat_name: Some(r.name.clone()),
+                                voice_allowed: Some(r.voice),
+                                members_in_voice: r.in_voice.clone(),
+                                sort_order: Some(r.sort),
+                                time_last_message: Some(r.last_message),
+                                ..Default::default()
+                            })
+                            .collect();
                         rooms.push(r);
                         g.take_rooms(&rooms);
                     }
@@ -1464,48 +2372,149 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             Ok(json!({}))
         }
         Action::RenameRoom { group, room, name } => {
-            let _: RenameChatRoomResponse = command(&link, "RenameChatRoom", &RenameChatRoomRequest { chat_group_id: Some(group), chat_id: Some(room), name: Some(name.trim().to_string()) }).await?;
-            with(account_id, |a| a.groups.get_mut(&group).and_then(|g| g.room_mut(room)).map(|r| r.name = name.trim().to_string()));
+            let _: RenameChatRoomResponse = command(
+                &link,
+                "RenameChatRoom",
+                &RenameChatRoomRequest {
+                    chat_group_id: Some(group),
+                    chat_id: Some(room),
+                    name: Some(name.trim().to_string()),
+                },
+            )
+            .await?;
+            with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .and_then(|g| g.room_mut(room))
+                    .map(|r| r.name = name.trim().to_string())
+            });
             Ok(json!({}))
         }
         Action::DeleteRoom { group, room } => {
-            let _: DeleteChatRoomResponse = command(&link, "DeleteChatRoom", &DeleteChatRoomRequest { chat_group_id: Some(group), chat_id: Some(room) }).await?;
-            with(account_id, |a| a.groups.get_mut(&group).map(|g| g.rooms.retain(|r| r.id != room)));
+            let _: DeleteChatRoomResponse = command(
+                &link,
+                "DeleteChatRoom",
+                &DeleteChatRoomRequest {
+                    chat_group_id: Some(group),
+                    chat_id: Some(room),
+                },
+            )
+            .await?;
+            with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| g.rooms.retain(|r| r.id != room))
+            });
             Ok(json!({}))
         }
         // Steam takes the moment it ends, not how long it lasts: the client sends now plus an hour,
         // a day or a week.
-        Action::Kick { group, who, seconds } => {
-            let _: KickChatUserResponse = command(&link, "KickUserFromGroup", &KickChatUserRequest { chat_group_id: Some(group), steamid: Some(who), expiration: Some(ends_at(seconds)) }).await?;
+        Action::Kick {
+            group,
+            who,
+            seconds,
+        } => {
+            let _: KickChatUserResponse = command(
+                &link,
+                "KickUserFromGroup",
+                &KickChatUserRequest {
+                    chat_group_id: Some(group),
+                    steamid: Some(who),
+                    expiration: Some(ends_at(seconds)),
+                },
+            )
+            .await?;
             Ok(json!({}))
         }
         Action::Ban { group, who, banned } => {
             // Banning somebody already banned, or lifting what is not there, is answered "duplicate
             // request", which the Steam client takes as having worked.
-            let done: Result<BanChatUserResponse, _> = link.call("ChatRoom.SetUserBanState#1", &BanChatUserRequest { chat_group_id: Some(group), steamid: Some(who), ban_state: Some(banned) }, true).await;
+            let done: Result<BanChatUserResponse, _> = link
+                .call(
+                    "ChatRoom.SetUserBanState#1",
+                    &BanChatUserRequest {
+                        chat_group_id: Some(group),
+                        steamid: Some(who),
+                        ban_state: Some(banned),
+                    },
+                    true,
+                )
+                .await;
             match done {
-                Ok(_) | Err(super::link::CallError::Refused(super::eresult::DUPLICATE_REQUEST, _)) => Ok(json!({})),
+                Ok(_)
+                | Err(super::link::CallError::Refused(super::eresult::DUPLICATE_REQUEST, _)) => {
+                    Ok(json!({}))
+                }
                 Err(e) => Err(group_refusal(&e)),
             }
         }
-        Action::Mute { group, who, seconds } => {
-            let _: MuteChatUserResponse = command(&link, "MuteUserInGroup", &MuteChatUserRequest { chat_group_id: Some(group), steamid: Some(who), expiration: Some(ends_at(seconds)) }).await?;
+        Action::Mute {
+            group,
+            who,
+            seconds,
+        } => {
+            let _: MuteChatUserResponse = command(
+                &link,
+                "MuteUserInGroup",
+                &MuteChatUserRequest {
+                    chat_group_id: Some(group),
+                    steamid: Some(who),
+                    expiration: Some(ends_at(seconds)),
+                },
+            )
+            .await?;
             Ok(json!({}))
         }
         Action::InviteFriend { group, who } => {
-            let _: InviteFriendToChatGroupResponse = command(&link, "InviteFriendToChatRoomGroup", &InviteFriendToChatGroupRequest { chat_group_id: Some(group), steamid: Some(who), chat_id: None, skip_friendsui_check: None }).await?;
+            let _: InviteFriendToChatGroupResponse = command(
+                &link,
+                "InviteFriendToChatRoomGroup",
+                &InviteFriendToChatGroupRequest {
+                    chat_group_id: Some(group),
+                    steamid: Some(who),
+                    chat_id: None,
+                    skip_friendsui_check: None,
+                },
+            )
+            .await?;
             Ok(json!({}))
         }
         Action::MakeInvite { group, seconds } => {
-            let made: CreateInviteLinkResponse = command(&link, "CreateInviteLink", &CreateInviteLinkRequest { chat_group_id: Some(group), seconds_valid: Some(seconds), chat_id: None }).await?;
-            Ok(json!({ "code": made.invite_code, "link": made.invite_code.as_ref().map(|c| format!("https://s.team/chat/{c}")) }))
+            let made: CreateInviteLinkResponse = command(
+                &link,
+                "CreateInviteLink",
+                &CreateInviteLinkRequest {
+                    chat_group_id: Some(group),
+                    seconds_valid: Some(seconds),
+                    chat_id: None,
+                },
+            )
+            .await?;
+            Ok(
+                json!({ "code": made.invite_code, "link": made.invite_code.as_ref().map(|c| format!("https://s.team/chat/{c}")) }),
+            )
         }
         Action::RevokeInvite { group, code } => {
-            let _: DeleteInviteLinkResponse = command(&link, "DeleteInviteLink", &DeleteInviteLinkRequest { chat_group_id: Some(group), invite_code: Some(code) }).await?;
+            let _: DeleteInviteLinkResponse = command(
+                &link,
+                "DeleteInviteLink",
+                &DeleteInviteLinkRequest {
+                    chat_group_id: Some(group),
+                    invite_code: Some(code),
+                },
+            )
+            .await?;
             Ok(json!({}))
         }
         Action::Links { group } => {
-            let listed: GetInviteLinksResponse = command(&link, "GetInviteLinksForGroup", &GetInviteLinksRequest { chat_group_id: Some(group) }).await?;
+            let listed: GetInviteLinksResponse = command(
+                &link,
+                "GetInviteLinksForGroup",
+                &GetInviteLinksRequest {
+                    chat_group_id: Some(group),
+                },
+            )
+            .await?;
             Ok(json!({
                 "links": listed.invite_links.iter().filter_map(|l| {
                     let code = l.invite_code.clone()?;
@@ -1515,72 +2524,207 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
         }
         // A new picture: sent to the site, then the group is told what it is called.
         Action::Avatar { group, path } => {
-            let config = state.accounts.get_steam(account_id).ok_or("this Steam account is not set up")?;
-            let sha = super::web::upload_avatar(&link, account_id, config.steamid, &config.refresh_token, &path).await?;
-            let _: SetAvatarResponse = command(&link, "SetChatRoomGroupAvatar", &SetAvatarRequest { chat_group_id: Some(group), avatar_sha: Some(sha) }).await?;
+            let config = state
+                .accounts
+                .get_steam(account_id)
+                .ok_or("this Steam account is not set up")?;
+            let sha = super::web::upload_avatar(
+                &link,
+                account_id,
+                config.steamid,
+                &config.refresh_token,
+                &path,
+            )
+            .await?;
+            let _: SetAvatarResponse = command(
+                &link,
+                "SetChatRoomGroupAvatar",
+                &SetAvatarRequest {
+                    chat_group_id: Some(group),
+                    avatar_sha: Some(sha),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         // The warnings about people in the group have been seen: Steam is told, so it does not
         // raise them again, and the banner goes.
         Action::DismissNotices { group } => {
-            let senders: Vec<u32> = with(account_id, |a| a.groups.get_mut(&group).map(|g| std::mem::take(&mut g.suspicious).into_iter().collect()).unwrap_or_default());
+            let senders: Vec<u32> = with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| std::mem::take(&mut g.suspicious).into_iter().collect())
+                    .unwrap_or_default()
+            });
             for who in senders {
-                let _ = link.notify("ChatRoom.DismissChatRoomNotice#1", &DismissChatRoomNotice { chat_group_id: Some(group), steamid_sender: Some(steamid::steamid_of(who)), notice_type: Some(super::notices::SUSPICIOUS) });
+                let _ = link.notify(
+                    "ChatRoom.DismissChatRoomNotice#1",
+                    &DismissChatRoomNotice {
+                        chat_group_id: Some(group),
+                        steamid_sender: Some(steamid::steamid_of(who)),
+                        notice_type: Some(super::notices::SUSPICIOUS),
+                    },
+                );
             }
             Ok(json!({}))
         }
         Action::Bans { group } => {
-            let listed: GetBanListResponse = command(&link, "GetBanList", &GetBanListRequest { chat_group_id: Some(group) }).await?;
-            Ok(json!({ "bans": listed.bans.iter().filter_map(|b| Some(json!({ "steamid": steamid::text_of(b.accountid?), "name": person(account_id, b.accountid?).name, "when": b.time_banned, "reason": b.ban_reason }))).collect::<Vec<_>>() }))
+            let listed: GetBanListResponse = command(
+                &link,
+                "GetBanList",
+                &GetBanListRequest {
+                    chat_group_id: Some(group),
+                },
+            )
+            .await?;
+            Ok(
+                json!({ "bans": listed.bans.iter().filter_map(|b| Some(json!({ "steamid": steamid::text_of(b.accountid?), "name": person(account_id, b.accountid?).name, "when": b.time_banned, "reason": b.ban_reason }))).collect::<Vec<_>>() }),
+            )
         }
         Action::CreateRole { group, name } => {
-            let _: CreateRoleResponse = command(&link, "CreateRole", &CreateRoleRequest { chat_group_id: Some(group), name: Some(name.trim().to_string()) }).await?;
+            let _: CreateRoleResponse = command(
+                &link,
+                "CreateRole",
+                &CreateRoleRequest {
+                    chat_group_id: Some(group),
+                    name: Some(name.trim().to_string()),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         Action::RenameRole { group, role, name } => {
-            let _: RenameRoleResponse = command(&link, "RenameRole", &RenameRoleRequest { chat_group_id: Some(group), role_id: Some(role), name: Some(name.trim().to_string()) }).await?;
+            let _: RenameRoleResponse = command(
+                &link,
+                "RenameRole",
+                &RenameRoleRequest {
+                    chat_group_id: Some(group),
+                    role_id: Some(role),
+                    name: Some(name.trim().to_string()),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         Action::DeleteRole { group, role } => {
-            let _: DeleteRoleResponse = command(&link, "DeleteRole", &DeleteRoleRequest { chat_group_id: Some(group), role_id: Some(role) }).await?;
+            let _: DeleteRoleResponse = command(
+                &link,
+                "DeleteRole",
+                &DeleteRoleRequest {
+                    chat_group_id: Some(group),
+                    role_id: Some(role),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         Action::RoleActions { group, role } => {
-            let held = with(account_id, |a| a.groups.get(&group).and_then(|g| g.role_actions.get(&role).cloned()));
+            let held = with(account_id, |a| {
+                a.groups
+                    .get(&group)
+                    .and_then(|g| g.role_actions.get(&role).cloned())
+            });
             let actions = match held {
                 Some(a) => a,
                 None => {
-                    let got: GetRoleActionsResponse = command(&link, "GetRoleActions", &GetRoleActionsRequest { chat_group_id: Some(group), role_id: Some(role) }).await?;
-                    got.actions.into_iter().find(|a| a.role_id == Some(role)).unwrap_or_default()
+                    let got: GetRoleActionsResponse = command(
+                        &link,
+                        "GetRoleActions",
+                        &GetRoleActionsRequest {
+                            chat_group_id: Some(group),
+                            role_id: Some(role),
+                        },
+                    )
+                    .await?;
+                    got.actions
+                        .into_iter()
+                        .find(|a| a.role_id == Some(role))
+                        .unwrap_or_default()
                 }
             };
             Ok(actions_json(&actions))
         }
-        Action::SetRoleActions { group, role, actions } => {
-            let _: ReplaceRoleActionsResponse = command(&link, "ReplaceRoleActions", &ReplaceRoleActionsRequest { chat_group_id: Some(group), role_id: Some(role), actions: Some(actions.clone()) }).await?;
-            with(account_id, |a| a.groups.get_mut(&group).map(|g| g.role_actions.insert(role, actions)));
+        Action::SetRoleActions {
+            group,
+            role,
+            actions,
+        } => {
+            let _: ReplaceRoleActionsResponse = command(
+                &link,
+                "ReplaceRoleActions",
+                &ReplaceRoleActionsRequest {
+                    chat_group_id: Some(group),
+                    role_id: Some(role),
+                    actions: Some(actions.clone()),
+                },
+            )
+            .await?;
+            with(account_id, |a| {
+                a.groups
+                    .get_mut(&group)
+                    .map(|g| g.role_actions.insert(role, actions))
+            });
             Ok(json!({}))
         }
         Action::GiveRole { group, who, role } => {
-            let _: AddRoleToUserResponse = command(&link, "AddRoleToUser", &AddRoleToUserRequest { chat_group_id: Some(group), role_id: Some(role), steamid: Some(who) }).await?;
+            let _: AddRoleToUserResponse = command(
+                &link,
+                "AddRoleToUser",
+                &AddRoleToUserRequest {
+                    chat_group_id: Some(group),
+                    role_id: Some(role),
+                    steamid: Some(who),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         Action::TakeRole { group, who, role } => {
-            let _: DeleteRoleFromUserResponse = command(&link, "DeleteRoleFromUser", &DeleteRoleFromUserRequest { chat_group_id: Some(group), role_id: Some(role), steamid: Some(who) }).await?;
+            let _: DeleteRoleFromUserResponse = command(
+                &link,
+                "DeleteRoleFromUser",
+                &DeleteRoleFromUserRequest {
+                    chat_group_id: Some(group),
+                    role_id: Some(role),
+                    steamid: Some(who),
+                },
+            )
+            .await?;
             reread(&link, account_id, group, own).await;
             Ok(json!({}))
         }
         // How much to be told, and whether the unread marker shows - two settings. Being told of
         // everything again also puts the marker back, as the Steam client does it.
-        Action::Notify { group, level, muted } => {
-            let muted = if level == Some(NOTIFY_ALL) { Some(false) } else { muted };
-            let prefs = UserChatGroupPreferences { desktop_notification_level: level, mobile_notification_level: level, unread_indicator_muted: muted, direct_messages_allowed: None };
-            let _: SetUserPreferencesResponse = command(&link, "SetUserChatGroupPreferences", &SetUserPreferencesRequest { chat_group_id: Some(group), chat_group_preferences: Some(prefs) }).await?;
+        Action::Notify {
+            group,
+            level,
+            muted,
+        } => {
+            let muted = if level == Some(NOTIFY_ALL) {
+                Some(false)
+            } else {
+                muted
+            };
+            let prefs = UserChatGroupPreferences {
+                desktop_notification_level: level,
+                mobile_notification_level: level,
+                unread_indicator_muted: muted,
+                direct_messages_allowed: None,
+            };
+            let _: SetUserPreferencesResponse = command(
+                &link,
+                "SetUserChatGroupPreferences",
+                &SetUserPreferencesRequest {
+                    chat_group_id: Some(group),
+                    chat_group_preferences: Some(prefs),
+                },
+            )
+            .await?;
             with(account_id, |a| {
                 a.groups.get_mut(&group).map(|g| {
                     if let Some(l) = level {
@@ -1599,9 +2743,18 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
 /// Reads one group's state again, for a change whose result is too much to
 /// work out by hand: who holds which role after one is deleted.
 async fn reread(link: &Link, account_id: &str, group: u64, own: u32) {
-    let got: Result<GetChatRoomGroupStateResponse, _> = command(link, "GetChatRoomGroupState", &GetChatRoomGroupStateRequest { chat_group_id: Some(group) }).await;
+    let got: Result<GetChatRoomGroupStateResponse, _> = command(
+        link,
+        "GetChatRoomGroupState",
+        &GetChatRoomGroupStateRequest {
+            chat_group_id: Some(group),
+        },
+    )
+    .await;
     if let Ok(GetChatRoomGroupStateResponse { state: Some(s) }) = got {
-        with(account_id, |a| a.groups.get_mut(&group).map(|g| g.take_state(&s, own)));
+        with(account_id, |a| {
+            a.groups.get_mut(&group).map(|g| g.take_state(&s, own))
+        });
     }
 }
 
@@ -1609,15 +2762,30 @@ async fn reread(link: &Link, account_id: &str, group: u64, own: u32) {
 async fn keep_active(link: &Link, account_id: &str) {
     let ids: Vec<u64> = with(account_id, |a| a.groups.keys().copied().collect());
     let _: Result<SetSessionActiveGroupsResponse, _> = link
-        .call("ChatRoom.SetSessionActiveChatRoomGroups#1", &SetSessionActiveGroupsRequest { chat_group_ids: ids.clone(), chat_groups_data_requested: ids, virtualize_members_threshold: None }, true)
+        .call(
+            "ChatRoom.SetSessionActiveChatRoomGroups#1",
+            &SetSessionActiveGroupsRequest {
+                chat_group_ids: ids.clone(),
+                chat_groups_data_requested: ids,
+                virtualize_members_threshold: None,
+            },
+            true,
+        )
         .await;
 }
 
 /// The groups as the window's settings read them.
 pub fn to_json(account_id: &str, group: Option<u64>) -> Value {
     let all = HELD.lock().unwrap();
-    let Some(a) = all.get(account_id) else { return json!([]) };
-    let name = |acc: u32| a.people.get(&acc).map(|p| p.name.clone()).unwrap_or_else(|| steamid::text_of(acc));
+    let Some(a) = all.get(account_id) else {
+        return json!([]);
+    };
+    let name = |acc: u32| {
+        a.people
+            .get(&acc)
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| steamid::text_of(acc))
+    };
     Value::Array(
         a.groups
             .values()
@@ -1659,8 +2827,14 @@ mod tests {
 
     #[test]
     fn an_invite_is_found_in_a_link_and_in_a_bare_code() {
-        assert_eq!(invite_code_of("https://s.team/chat/Ga3kODnC").as_deref(), Some("Ga3kODnC"));
-        assert_eq!(invite_code_of("  https://steamcommunity.com/chat/invite/Ga3kODnC?x=1 ").as_deref(), Some("Ga3kODnC"));
+        assert_eq!(
+            invite_code_of("https://s.team/chat/Ga3kODnC").as_deref(),
+            Some("Ga3kODnC")
+        );
+        assert_eq!(
+            invite_code_of("  https://steamcommunity.com/chat/invite/Ga3kODnC?x=1 ").as_deref(),
+            Some("Ga3kODnC")
+        );
         assert_eq!(invite_code_of("Ga3kODnC").as_deref(), Some("Ga3kODnC"));
         assert_eq!(invite_code_of("https://example.com/other/Ga3kODnC"), None);
         assert_eq!(invite_code_of("hi"), None);
@@ -1669,22 +2843,66 @@ mod tests {
 
     #[test]
     fn at_a_name_pings_that_person_only_when_it_is_a_whole_name_at_the_start_of_a_word() {
-        let people = vec![(5, "Sam".to_string()), (6, "Sam Smith".to_string()), (7, "Al".to_string())];
-        assert_eq!(mentionize("hi @Sam and @sam smith!", &people, false), "hi [mention=5]@Sam[/mention] and [mention=6]@Sam Smith[/mention]!");
-        assert_eq!(mentionize("@Sammy no, mail@Al no", &people, false), "@Sammy no, mail@Al no", "a longer name or one inside a word is not them");
-        assert_eq!(mentionize("@Al", &people, false), "[mention=7]@Al[/mention]");
+        let people = vec![
+            (5, "Sam".to_string()),
+            (6, "Sam Smith".to_string()),
+            (7, "Al".to_string()),
+        ];
+        assert_eq!(
+            mentionize("hi @Sam and @sam smith!", &people, false),
+            "hi [mention=5]@Sam[/mention] and [mention=6]@Sam Smith[/mention]!"
+        );
+        assert_eq!(
+            mentionize("@Sammy no, mail@Al no", &people, false),
+            "@Sammy no, mail@Al no",
+            "a longer name or one inside a word is not them"
+        );
+        assert_eq!(
+            mentionize("@Al", &people, false),
+            "[mention=7]@Al[/mention]"
+        );
         assert_eq!(mentionize("nobody @here", &people, false), "nobody @here");
-        assert_eq!(mentionize("@all and @online", &people, true), "[mention=all]@all[/mention] and [mention=here]@online[/mention]", "everybody, for those who may");
-        assert_eq!(mentionize("@all", &people, false), "@all", "and not for those who may not");
-        assert_eq!(mentionize("@Sam#5", &people, false), "[mention=5]@Sam[/mention]", "a number after the name picks the person: 5 is 5 in base 36");
-        assert_eq!(mentionize("@Al#7", &[(7, "Al".to_string()), (43, "Al".to_string())], false), "[mention=7]@Al[/mention]");
-        assert_eq!(mentionize("@Al#17", &[(7, "Al".to_string()), (43, "Al".to_string())], false), "[mention=43]@Al[/mention]", "43 is 17 in base 36");
+        assert_eq!(
+            mentionize("@all and @online", &people, true),
+            "[mention=all]@all[/mention] and [mention=here]@online[/mention]",
+            "everybody, for those who may"
+        );
+        assert_eq!(
+            mentionize("@all", &people, false),
+            "@all",
+            "and not for those who may not"
+        );
+        assert_eq!(
+            mentionize("@Sam#5", &people, false),
+            "[mention=5]@Sam[/mention]",
+            "a number after the name picks the person: 5 is 5 in base 36"
+        );
+        assert_eq!(
+            mentionize(
+                "@Al#7",
+                &[(7, "Al".to_string()), (43, "Al".to_string())],
+                false
+            ),
+            "[mention=7]@Al[/mention]"
+        );
+        assert_eq!(
+            mentionize(
+                "@Al#17",
+                &[(7, "Al".to_string()), (43, "Al".to_string())],
+                false
+            ),
+            "[mention=43]@Al[/mention]",
+            "43 is 17 in base 36"
+        );
     }
 
     #[test]
     fn a_groups_picture_is_where_steam_serves_group_pictures() {
         let hash: Vec<u8> = (0..20).collect();
-        assert_eq!(group_picture(&hash), "https://avatars.steamstatic.com/000102030405060708090a0b0c0d0e0f10111213_256.jpg");
+        assert_eq!(
+            group_picture(&hash),
+            "https://avatars.steamstatic.com/000102030405060708090a0b0c0d0e0f10111213_256.jpg"
+        );
     }
 
     #[test]
@@ -1696,7 +2914,19 @@ mod tests {
     }
 
     fn group(id: u64, name: &str, rooms: &[(u64, &str)]) -> Group {
-        Group { id, name: name.to_string(), rooms: rooms.iter().map(|(i, n)| Room { id: *i, name: n.to_string(), ..Default::default() }).collect(), ..Default::default() }
+        Group {
+            id,
+            name: name.to_string(),
+            rooms: rooms
+                .iter()
+                .map(|(i, n)| Room {
+                    id: *i,
+                    name: n.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1709,12 +2939,20 @@ mod tests {
         assert_eq!(t[&(1, 11)], "Raiders/#loot");
         groups.insert(3, group(3, "raiders", &[(30, "")]));
         let t = titles(&groups, &HashMap::new(), 0);
-        assert_eq!(t[&(1, 10)], "Raiders (1)/#General", "two groups of one name carry their numbers");
+        assert_eq!(
+            t[&(1, 10)],
+            "Raiders (1)/#General",
+            "two groups of one name carry their numbers"
+        );
         assert_eq!(t[&(3, 30)], "raiders (3)/#General");
         groups.insert(4, group(4, "Twin", &[(40, "a"), (41, "A")]));
         let t = titles(&groups, &HashMap::new(), 0);
         assert_eq!(t[&(4, 40)], "Twin/#a");
-        assert_eq!(t[&(4, 41)], "Twin/#A (2)", "rooms of one name in one group are numbered");
+        assert_eq!(
+            t[&(4, 41)],
+            "Twin/#A (2)",
+            "rooms of one name in one group are numbered"
+        );
     }
 
     #[test]
@@ -1729,17 +2967,75 @@ mod tests {
     #[test]
     fn a_group_is_read_from_what_steam_says_of_it() {
         let state = ChatRoomGroupState {
-            header_state: Some(ChatRoomGroupHeaderState { chat_group_id: Some(7), chat_name: Some("Raiders".into()), accountid_owner: Some(5), tagline: Some("we raid".into()), roles: vec![ChatRole { role_id: Some(9), name: Some("#ChatRoomRole_Member".into()), ordinal: None }], default_role_id: Some(9), ..Default::default() }),
-            members: vec![ChatRoomMember { accountid: Some(5), state: Some(2), rank: Some(50), ..Default::default() }, ChatRoomMember { accountid: Some(6), state: Some(2), rank: Some(20), ..Default::default() }, ChatRoomMember { accountid: Some(8), state: Some(1), rank: Some(20), ..Default::default() }],
+            header_state: Some(ChatRoomGroupHeaderState {
+                chat_group_id: Some(7),
+                chat_name: Some("Raiders".into()),
+                accountid_owner: Some(5),
+                tagline: Some("we raid".into()),
+                roles: vec![ChatRole {
+                    role_id: Some(9),
+                    name: Some("#ChatRoomRole_Member".into()),
+                    ordinal: None,
+                }],
+                default_role_id: Some(9),
+                ..Default::default()
+            }),
+            members: vec![
+                ChatRoomMember {
+                    accountid: Some(5),
+                    state: Some(2),
+                    rank: Some(50),
+                    ..Default::default()
+                },
+                ChatRoomMember {
+                    accountid: Some(6),
+                    state: Some(2),
+                    rank: Some(20),
+                    ..Default::default()
+                },
+                ChatRoomMember {
+                    accountid: Some(8),
+                    state: Some(1),
+                    rank: Some(20),
+                    ..Default::default()
+                },
+            ],
             default_chat_id: Some(70),
-            chat_rooms: vec![ChatRoomState { chat_id: Some(71), chat_name: Some("b".into()), sort_order: Some(2), ..Default::default() }, ChatRoomState { chat_id: Some(70), chat_name: Some("".into()), sort_order: Some(1), ..Default::default() }],
+            chat_rooms: vec![
+                ChatRoomState {
+                    chat_id: Some(71),
+                    chat_name: Some("b".into()),
+                    sort_order: Some(2),
+                    ..Default::default()
+                },
+                ChatRoomState {
+                    chat_id: Some(70),
+                    chat_name: Some("".into()),
+                    sort_order: Some(1),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
-        let mut g = Group { id: 7, ..Default::default() };
+        let mut g = Group {
+            id: 7,
+            ..Default::default()
+        };
         g.take_state(&state, 5);
-        assert_eq!((g.name.as_str(), g.tagline.as_str(), g.owner, g.my_rank), ("Raiders", "we raid", 5, 50));
-        assert_eq!(g.members.iter().map(|m| m.account).collect::<Vec<_>>(), [5, 6], "only those who are in it, highest rank first");
-        assert_eq!(g.rooms.iter().map(|r| r.id).collect::<Vec<_>>(), [70, 71], "rooms in Steam's order");
+        assert_eq!(
+            (g.name.as_str(), g.tagline.as_str(), g.owner, g.my_rank),
+            ("Raiders", "we raid", 5, 50)
+        );
+        assert_eq!(
+            g.members.iter().map(|m| m.account).collect::<Vec<_>>(),
+            [5, 6],
+            "only those who are in it, highest rank first"
+        );
+        assert_eq!(
+            g.rooms.iter().map(|r| r.id).collect::<Vec<_>>(),
+            [70, 71],
+            "rooms in Steam's order"
+        );
         assert!(g.may_manage() && g.may_moderate() && g.may_speak());
         let mut viewer = g.clone();
         viewer.my_rank = RANK_VIEWER;
@@ -1747,9 +3043,35 @@ mod tests {
     }
 
     fn set_up(state: &AppState, account: &str) -> Roster {
-        let mut g = Group { id: 7, name: "Raiders".into(), owner: 5, ..Default::default() };
-        g.take_rooms(&[ChatRoomState { chat_id: Some(70), chat_name: Some("".into()), sort_order: Some(1), ..Default::default() }]);
-        g.take_members(&[ChatRoomMember { accountid: Some(5), state: Some(2), rank: Some(50), ..Default::default() }, ChatRoomMember { accountid: Some(6), state: Some(2), rank: Some(20), ..Default::default() }], 5);
+        let mut g = Group {
+            id: 7,
+            name: "Raiders".into(),
+            owner: 5,
+            ..Default::default()
+        };
+        g.take_rooms(&[ChatRoomState {
+            chat_id: Some(70),
+            chat_name: Some("".into()),
+            sort_order: Some(1),
+            ..Default::default()
+        }]);
+        g.take_members(
+            &[
+                ChatRoomMember {
+                    accountid: Some(5),
+                    state: Some(2),
+                    rank: Some(50),
+                    ..Default::default()
+                },
+                ChatRoomMember {
+                    accountid: Some(6),
+                    state: Some(2),
+                    rank: Some(20),
+                    ..Default::default()
+                },
+            ],
+            5,
+        );
         with(account, |a| {
             a.groups.insert(7, g);
             a.own = 5;
@@ -1759,7 +3081,13 @@ mod tests {
         Roster::default()
     }
 
-    fn notify(state: &AppState, account: &str, roster: &Roster, method: &str, body: Vec<u8>) -> Option<Heard> {
+    fn notify(
+        state: &AppState,
+        account: &str,
+        roster: &Roster,
+        method: &str,
+        body: Vec<u8>,
+    ) -> Option<Heard> {
         heard(state, account, roster, method, &body)
     }
 
@@ -1769,47 +3097,212 @@ mod tests {
         let state = crate::backend::kick::testkit::simulated_daemon("steam-groups");
         let roster = set_up(&state, "steam:groups-a");
         publish(&state, "steam:groups-a", &roster);
-        let rail = state.runtime.list_buffer_groups().into_iter().find(|g| g.id == rail_id("steam:groups-a", 7)).expect("the group is on the rail");
-        assert_eq!((rail.name.as_str(), rail.kind.as_str(), rail.service.as_str()), ("Raiders", "guild", "steam"));
-        let buffer = state.runtime.get_buffer(&crate::model::buffer_id("steam:groups-a", "Raiders/#General")).expect("its room is a channel");
-        assert_eq!((buffer.kind.as_str(), buffer.remote_id.as_deref(), buffer.group_id.as_deref()), ("channel", Some("7:70"), Some(rail.id.as_str())));
-        assert_eq!(state.runtime.get_presence(&buffer.id).unwrap().as_array().unwrap().len(), 2, "both members are listed");
+        let rail = state
+            .runtime
+            .list_buffer_groups()
+            .into_iter()
+            .find(|g| g.id == rail_id("steam:groups-a", 7))
+            .expect("the group is on the rail");
+        assert_eq!(
+            (
+                rail.name.as_str(),
+                rail.kind.as_str(),
+                rail.service.as_str()
+            ),
+            ("Raiders", "guild", "steam")
+        );
+        let buffer = state
+            .runtime
+            .get_buffer(&crate::model::buffer_id(
+                "steam:groups-a",
+                "Raiders/#General",
+            ))
+            .expect("its room is a channel");
+        assert_eq!(
+            (
+                buffer.kind.as_str(),
+                buffer.remote_id.as_deref(),
+                buffer.group_id.as_deref()
+            ),
+            ("channel", Some("7:70"), Some(rail.id.as_str()))
+        );
+        assert_eq!(
+            state
+                .runtime
+                .get_presence(&buffer.id)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "both members are listed"
+        );
 
         // Somebody speaks.
-        let said = ChatIncoming { chat_group_id: Some(7), chat_id: Some(70), steamid_sender: Some(steamid::steamid_of(6)), message: Some("hi [b]all[/b]".into()), timestamp: Some(1790000000), mentions: Some(ChatMentions { mention_accountids: vec![5], ..Default::default() }), ordinal: Some(2), ..Default::default() };
-        let out = notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyIncomingChatMessage#1", said.encode_to_vec()).unwrap();
+        let said = ChatIncoming {
+            chat_group_id: Some(7),
+            chat_id: Some(70),
+            steamid_sender: Some(steamid::steamid_of(6)),
+            message: Some("hi [b]all[/b]".into()),
+            timestamp: Some(1790000000),
+            mentions: Some(ChatMentions {
+                mention_accountids: vec![5],
+                ..Default::default()
+            }),
+            ordinal: Some(2),
+            ..Default::default()
+        };
+        let out = notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyIncomingChatMessage#1",
+            said.encode_to_vec(),
+        )
+        .unwrap();
         assert!(!out.reload, "a room we have is not a reload");
-        assert_eq!(out.ask, vec![6], "who they are is not known, so it is asked");
+        assert_eq!(
+            out.ask,
+            vec![6],
+            "who they are is not known, so it is asked"
+        );
         let log = state.store.get_backlog(&buffer.id, 0, 10).unwrap();
-        assert_eq!(log.iter().map(|m| (m.id.as_str(), m.body.as_str())).collect::<Vec<_>>(), [("1790000000:2", "hi **all**")]);
+        assert_eq!(
+            log.iter()
+                .map(|m| (m.id.as_str(), m.body.as_str()))
+                .collect::<Vec<_>>(),
+            [("1790000000:2", "hi **all**")]
+        );
         assert!(log[0].is_highlight, "named in it, so it is a mention");
 
         // The group says somebody arrived: a line, and the member list is read again.
-        let joined = ChatIncoming { chat_group_id: Some(7), chat_id: Some(70), timestamp: Some(1790000005), server_message: Some(ServerMessage { message: Some(SERVER_JOINED), string_param: None, accountid_param: Some(9) }), ..Default::default() };
-        let out = notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyIncomingChatMessage#1", joined.encode_to_vec()).unwrap();
+        let joined = ChatIncoming {
+            chat_group_id: Some(7),
+            chat_id: Some(70),
+            timestamp: Some(1790000005),
+            server_message: Some(ServerMessage {
+                message: Some(SERVER_JOINED),
+                string_param: None,
+                accountid_param: Some(9),
+            }),
+            ..Default::default()
+        };
+        let out = notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyIncomingChatMessage#1",
+            joined.encode_to_vec(),
+        )
+        .unwrap();
         assert!(out.reload && out.ask == vec![9]);
-        assert!(state.store.get_backlog(&buffer.id, 0, 10).unwrap().iter().any(|m| m.kind == "system" && m.body == "9 joined" || m.body.ends_with("joined")));
+        assert!(state
+            .store
+            .get_backlog(&buffer.id, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.kind == "system" && m.body == "9 joined" || m.body.ends_with("joined")));
 
         // A message is taken back.
-        let gone = ChatModified { chat_group_id: Some(7), chat_id: Some(70), messages: vec![ChatModifiedMessage { server_timestamp: Some(1790000000), ordinal: Some(2), deleted: Some(true) }] };
-        notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyChatMessageModified#1", gone.encode_to_vec());
-        assert!(!state.store.get_backlog(&buffer.id, 0, 10).unwrap().iter().any(|m| m.id == "1790000000:2"));
+        let gone = ChatModified {
+            chat_group_id: Some(7),
+            chat_id: Some(70),
+            messages: vec![ChatModifiedMessage {
+                server_timestamp: Some(1790000000),
+                ordinal: Some(2),
+                deleted: Some(true),
+            }],
+        };
+        notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyChatMessageModified#1",
+            gone.encode_to_vec(),
+        );
+        assert!(!state
+            .store
+            .get_backlog(&buffer.id, 0, 10)
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "1790000000:2"));
 
         // The room is renamed: the channel moves with its history.
-        let renamed = ChatRoomsChange { chat_group_id: Some(7), default_chat_id: Some(70), chat_rooms: vec![ChatRoomState { chat_id: Some(70), chat_name: Some("raids".into()), sort_order: Some(1), ..Default::default() }] };
-        notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyChatRoomGroupRoomsChange#1", renamed.encode_to_vec());
-        assert!(state.runtime.get_buffer(&crate::model::buffer_id("steam:groups-a", "Raiders/#raids")).is_some());
-        assert!(state.runtime.get_buffer(&buffer.id).is_none(), "and the old name is gone");
+        let renamed = ChatRoomsChange {
+            chat_group_id: Some(7),
+            default_chat_id: Some(70),
+            chat_rooms: vec![ChatRoomState {
+                chat_id: Some(70),
+                chat_name: Some("raids".into()),
+                sort_order: Some(1),
+                ..Default::default()
+            }],
+        };
+        notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyChatRoomGroupRoomsChange#1",
+            renamed.encode_to_vec(),
+        );
+        assert!(state
+            .runtime
+            .get_buffer(&crate::model::buffer_id("steam:groups-a", "Raiders/#raids"))
+            .is_some());
+        assert!(
+            state.runtime.get_buffer(&buffer.id).is_none(),
+            "and the old name is gone"
+        );
 
         // Somebody leaves; then we are removed, and the whole group goes.
-        let parted = ChatMemberChange { chat_group_id: Some(7), member: Some(ChatRoomMember { accountid: Some(6), ..Default::default() }), change: Some(CHANGE_PARTED) };
-        notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyMemberStateChange#1", parted.encode_to_vec());
+        let parted = ChatMemberChange {
+            chat_group_id: Some(7),
+            member: Some(ChatRoomMember {
+                accountid: Some(6),
+                ..Default::default()
+            }),
+            change: Some(CHANGE_PARTED),
+        };
+        notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyMemberStateChange#1",
+            parted.encode_to_vec(),
+        );
         assert_eq!(held("steam:groups-a", 7).unwrap().members.len(), 1);
-        let removed = ChatMemberChange { chat_group_id: Some(7), member: Some(ChatRoomMember { accountid: Some(5), ..Default::default() }), change: Some(CHANGE_KICKED) };
-        notify(&state, "steam:groups-a", &roster, "ChatRoomClient.NotifyMemberStateChange#1", removed.encode_to_vec());
+        let removed = ChatMemberChange {
+            chat_group_id: Some(7),
+            member: Some(ChatRoomMember {
+                accountid: Some(5),
+                ..Default::default()
+            }),
+            change: Some(CHANGE_KICKED),
+        };
+        notify(
+            &state,
+            "steam:groups-a",
+            &roster,
+            "ChatRoomClient.NotifyMemberStateChange#1",
+            removed.encode_to_vec(),
+        );
         assert!(held("steam:groups-a", 7).is_none());
-        assert!(state.runtime.list_buffer_groups().iter().all(|g| g.id != rail_id("steam:groups-a", 7)), "the server leaves the rail");
-        assert!(state.runtime.list_buffers().iter().all(|b| b.group_id.as_deref() != Some(&rail_id("steam:groups-a", 7))), "and its channels with it");
+        assert!(
+            state
+                .runtime
+                .list_buffer_groups()
+                .iter()
+                .all(|g| g.id != rail_id("steam:groups-a", 7)),
+            "the server leaves the rail"
+        );
+        assert!(
+            state
+                .runtime
+                .list_buffers()
+                .iter()
+                .all(|b| b.group_id.as_deref() != Some(&rail_id("steam:groups-a", 7))),
+            "and its channels with it"
+        );
         clear("steam:groups-a");
     }
 
@@ -1821,7 +3314,11 @@ mod tests {
         clear("steam:groups-b");
         // A reconnect: nothing is loaded yet, so nothing may be concluded from the list being empty.
         publish(&state, "steam:groups-b", &roster);
-        assert!(state.runtime.list_buffer_groups().iter().any(|g| g.id == rail_id("steam:groups-b", 7)));
+        assert!(state
+            .runtime
+            .list_buffer_groups()
+            .iter()
+            .any(|g| g.id == rail_id("steam:groups-b", 7)));
     }
 
     #[tokio::test]
@@ -1833,32 +3330,105 @@ mod tests {
         publish(&state, acc, &roster);
         let room = crate::model::buffer_id(acc, "Raiders/#General");
         assert!(state.runtime.get_buffer(&room).unwrap().notice.is_none());
-        let raised = ChatRoomNoticeNotification { chat_group_id: Some(7), steamid_sender: Some(steamid::steamid_of(6)), notice_type: Some(1), active: Some(true) };
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", raised.encode_to_vec());
-        let banner = state.runtime.get_buffer(&room).unwrap().notice.expect("a banner");
+        let raised = ChatRoomNoticeNotification {
+            chat_group_id: Some(7),
+            steamid_sender: Some(steamid::steamid_of(6)),
+            notice_type: Some(1),
+            active: Some(true),
+        };
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatRoomNotice#1",
+            raised.encode_to_vec(),
+        );
+        let banner = state
+            .runtime
+            .get_buffer(&room)
+            .unwrap()
+            .notice
+            .expect("a banner");
         assert_eq!(banner.kind, "suspicious");
-        assert!(banner.text.contains("may not be who they appear to be"), "{}", banner.text);
+        assert!(
+            banner.text.contains("may not be who they appear to be"),
+            "{}",
+            banner.text
+        );
         // A kind of notice this does not know says nothing.
-        let other = ChatRoomNoticeNotification { notice_type: Some(9), ..raised.clone() };
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", other.encode_to_vec());
+        let other = ChatRoomNoticeNotification {
+            notice_type: Some(9),
+            ..raised.clone()
+        };
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatRoomNotice#1",
+            other.encode_to_vec(),
+        );
         // Lifted: the banner goes.
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", ChatRoomNoticeNotification { active: Some(false), ..raised }.encode_to_vec());
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatRoomNotice#1",
+            ChatRoomNoticeNotification {
+                active: Some(false),
+                ..raised
+            }
+            .encode_to_vec(),
+        );
         assert!(state.runtime.get_buffer(&room).unwrap().notice.is_none());
         clear(acc);
     }
 
     #[test]
     fn the_server_says_who_did_what_as_the_steam_client_says_it() {
-        let name = |a: u32| match a { 5 => "Alice".to_string(), 6 => "Bob".to_string(), n => n.to_string() };
-        let m = |kind: i32, param: Option<&str>, who: Option<u32>| ServerMessage { message: Some(kind), string_param: param.map(str::to_string), accountid_param: who };
-        assert_eq!(server_line(&name, &m(SERVER_KICKED, None, Some(6)), "", 5).as_deref(), Some("Bob was removed by Alice"), "who was removed, and by whom");
-        assert_eq!(server_line(&name, &m(SERVER_JOINED, None, Some(6)), "", 0).as_deref(), Some("Bob joined"));
-        assert_eq!(server_line(&name, &m(SERVER_JOINED_MANY, Some("1"), None), "", 0).as_deref(), Some("Someone joined"), "the many kinds carry a count");
-        assert_eq!(server_line(&name, &m(SERVER_PARTED_MANY, Some("12"), None), "", 0).as_deref(), Some("12 people left"));
-        assert_eq!(server_line(&name, &m(SERVER_INVITED, None, Some(6)), "", 5).as_deref(), Some("Bob was invited by Alice"));
-        assert_eq!(server_line(&name, &m(SERVER_RENAMED, Some("raids"), None), "", 5).as_deref(), Some("Alice renamed the room to raids"));
-        assert_eq!(server_line(&name, &m(SERVER_TAGLINE, Some(""), None), "", 5).as_deref(), Some("Alice removed the tagline"));
-        assert_eq!(server_line(&name, &m(SERVER_TAGLINE, Some("hi"), None), "", 5).as_deref(), Some("Alice changed the tagline to hi"));
+        let name = |a: u32| match a {
+            5 => "Alice".to_string(),
+            6 => "Bob".to_string(),
+            n => n.to_string(),
+        };
+        let m = |kind: i32, param: Option<&str>, who: Option<u32>| ServerMessage {
+            message: Some(kind),
+            string_param: param.map(str::to_string),
+            accountid_param: who,
+        };
+        assert_eq!(
+            server_line(&name, &m(SERVER_KICKED, None, Some(6)), "", 5).as_deref(),
+            Some("Bob was removed by Alice"),
+            "who was removed, and by whom"
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_JOINED, None, Some(6)), "", 0).as_deref(),
+            Some("Bob joined")
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_JOINED_MANY, Some("1"), None), "", 0).as_deref(),
+            Some("Someone joined"),
+            "the many kinds carry a count"
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_PARTED_MANY, Some("12"), None), "", 0).as_deref(),
+            Some("12 people left")
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_INVITED, None, Some(6)), "", 5).as_deref(),
+            Some("Bob was invited by Alice")
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_RENAMED, Some("raids"), None), "", 5).as_deref(),
+            Some("Alice renamed the room to raids")
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_TAGLINE, Some(""), None), "", 5).as_deref(),
+            Some("Alice removed the tagline")
+        );
+        assert_eq!(
+            server_line(&name, &m(SERVER_TAGLINE, Some("hi"), None), "", 5).as_deref(),
+            Some("Alice changed the tagline to hi")
+        );
         assert_eq!(server_line(&name, &m(99, None, None), "", 0), None);
     }
 
@@ -1866,27 +3436,61 @@ mod tests {
     fn a_removal_or_a_mute_ends_at_a_moment_not_after_a_length() {
         let before = now_secs();
         let end = ends_at(3600) as u32;
-        assert!(end >= before + 3600 && end <= now_secs() + 3600, "an hour from now, as a time");
+        assert!(
+            end >= before + 3600 && end <= now_secs() + 3600,
+            "an hour from now, as a time"
+        );
         assert!(ends_at(0) as u32 >= before, "never in the past");
     }
 
     #[test]
-    fn what_a_member_may_do_is_what_their_own_roles_allow_and_a_community_group_has_no_role_giving() {
+    fn what_a_member_may_do_is_what_their_own_roles_allow_and_a_community_group_has_no_role_giving()
+    {
         let actions = |role: u64, f: fn(&mut ChatRoleActions)| {
-            let mut a = ChatRoleActions { role_id: Some(role), ..Default::default() };
+            let mut a = ChatRoleActions {
+                role_id: Some(role),
+                ..Default::default()
+            };
             f(&mut a);
             (role, a)
         };
-        let mut g = Group { id: 1, me: 5, default_role: 9, my_rank: RANK_MEMBER, ..Default::default() };
-        g.members = vec![Member { account: 5, rank: RANK_MEMBER, roles: vec![10], kick_expire: 0 }];
-        g.role_actions = [actions(9, |a| a.can_chat = Some(true)), actions(10, |a| a.can_kick = Some(true))].into_iter().collect();
+        let mut g = Group {
+            id: 1,
+            me: 5,
+            default_role: 9,
+            my_rank: RANK_MEMBER,
+            ..Default::default()
+        };
+        g.members = vec![Member {
+            account: 5,
+            rank: RANK_MEMBER,
+            roles: vec![10],
+            kick_expire: 0,
+        }];
+        g.role_actions = [
+            actions(9, |a| a.can_chat = Some(true)),
+            actions(10, |a| a.can_kick = Some(true)),
+        ]
+        .into_iter()
+        .collect();
         assert!(g.may_moderate(), "a role they hold allows it");
         assert!(!g.may_speak(), "the default role allows writing, but they do not hold it: only the roles a member holds count");
         g.members[0].roles = vec![9, 10];
         assert!(g.may_speak());
         assert!(!g.may_assign_roles() && !g.may_change_roles() && !g.may_mention_all());
-        g.role_actions.insert(10, ChatRoleActions { role_id: Some(10), can_change_user_roles: Some(true), can_mention_all: Some(true), ..Default::default() });
-        assert!(g.may_assign_roles() && g.may_mention_all() && !g.may_change_roles(), "giving roles and editing them are two permissions");
+        g.role_actions.insert(
+            10,
+            ChatRoleActions {
+                role_id: Some(10),
+                can_change_user_roles: Some(true),
+                can_mention_all: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(
+            g.may_assign_roles() && g.may_mention_all() && !g.may_change_roles(),
+            "giving roles and editing them are two permissions"
+        );
         g.clan = Some(3);
         assert!(!g.may_assign_roles(), "not in a community group's chat");
         g.my_rank = RANK_OWNER;
@@ -1895,60 +3499,164 @@ mod tests {
 
     #[test]
     fn how_much_to_be_told_and_whether_the_unread_marker_shows_are_two_settings() {
-        let mut g = Group { id: 1, ..Default::default() };
-        assert_eq!((g.effective_notify(), g.silenced()), (NOTIFY_ALL, false), "never set: told of everything");
+        let mut g = Group {
+            id: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            (g.effective_notify(), g.silenced()),
+            (NOTIFY_ALL, false),
+            "never set: told of everything"
+        );
         g.clan = Some(1);
-        assert_eq!(g.effective_notify(), NOTIFY_MENTION_ME, "a community group's chat is mentions by default");
+        assert_eq!(
+            g.effective_notify(),
+            NOTIFY_MENTION_ME,
+            "a community group's chat is mentions by default"
+        );
         g.clan = None;
-        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_MENTION_ME), unread_indicator_muted: Some(true), ..Default::default() });
-        assert_eq!((g.notify, g.muted, g.silenced()), (NOTIFY_MENTION_ME, true, true));
-        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_NONE), unread_indicator_muted: Some(false), ..Default::default() });
-        assert!(g.silenced(), "told of nothing is quiet whatever the marker does");
-        g.take_user(&UserChatRoomGroupState { desktop_notification_level: Some(NOTIFY_ALL), unread_indicator_muted: Some(false), ..Default::default() });
+        g.take_user(&UserChatRoomGroupState {
+            desktop_notification_level: Some(NOTIFY_MENTION_ME),
+            unread_indicator_muted: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            (g.notify, g.muted, g.silenced()),
+            (NOTIFY_MENTION_ME, true, true)
+        );
+        g.take_user(&UserChatRoomGroupState {
+            desktop_notification_level: Some(NOTIFY_NONE),
+            unread_indicator_muted: Some(false),
+            ..Default::default()
+        });
+        assert!(
+            g.silenced(),
+            "told of nothing is quiet whatever the marker does"
+        );
+        g.take_user(&UserChatRoomGroupState {
+            desktop_notification_level: Some(NOTIFY_ALL),
+            unread_indicator_muted: Some(false),
+            ..Default::default()
+        });
         assert!(!g.silenced());
     }
 
     #[test]
     fn a_group_with_no_name_is_called_by_who_is_in_it() {
-        let people: HashMap<u32, Person> = [(6, "Bob"), (7, "Cy")].into_iter().map(|(a, n)| (a, Person { name: n.to_string(), avatar: None, friend: true })).collect();
+        let people: HashMap<u32, Person> = [(6, "Bob"), (7, "Cy")]
+            .into_iter()
+            .map(|(a, n)| {
+                (
+                    a,
+                    Person {
+                        name: n.to_string(),
+                        avatar: None,
+                        friend: true,
+                    },
+                )
+            })
+            .collect();
         let mut groups = BTreeMap::new();
         let mut g = group(1, "", &[(10, "")]);
-        g.members = vec![Member { account: 5, ..Default::default() }, Member { account: 6, ..Default::default() }];
+        g.members = vec![
+            Member {
+                account: 5,
+                ..Default::default()
+            },
+            Member {
+                account: 6,
+                ..Default::default()
+            },
+        ];
         groups.insert(1, g.clone());
         assert_eq!(titles(&groups, &people, 5)[&(1, 10)], "Bob/#General");
-        g.members.push(Member { account: 7, ..Default::default() });
+        g.members.push(Member {
+            account: 7,
+            ..Default::default()
+        });
         groups.insert(1, g);
-        assert_eq!(titles(&groups, &people, 5)[&(1, 10)], "Bob and Cy/#General", "two of them");
+        assert_eq!(
+            titles(&groups, &people, 5)[&(1, 10)],
+            "Bob and Cy/#General",
+            "two of them"
+        );
     }
 
     #[tokio::test]
-    async fn being_removed_or_banned_takes_the_group_away_and_says_so_and_leaving_does_not_complain() {
+    async fn being_removed_or_banned_takes_the_group_away_and_says_so_and_leaving_does_not_complain(
+    ) {
         use prost::Message;
         let state = crate::backend::kick::testkit::simulated_daemon("steam-groups-removed");
         let acc = "steam:groups-removed";
         let roster = set_up(&state, acc);
         publish(&state, acc, &roster);
         let mut rx = state.events.subscribe();
-        let kicked = ChatUserStateChange { chat_group_id: Some(7), user_action: Some(CHANGE_KICKED), ..Default::default() };
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", kicked.encode_to_vec());
-        assert!(held(acc, 7).is_none() && state.runtime.list_buffer_groups().iter().all(|g| g.id != rail_id(acc, 7)));
-        let told = std::iter::from_fn(|| rx.try_recv().ok()).find(|e| e.name == "steamGroupRemoved").expect("the window is told").data;
-        assert_eq!((told["how"].as_str(), told["name"].as_str()), (Some("removed from"), Some("Raiders")));
+        let kicked = ChatUserStateChange {
+            chat_group_id: Some(7),
+            user_action: Some(CHANGE_KICKED),
+            ..Default::default()
+        };
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatGroupUserStateChanged#1",
+            kicked.encode_to_vec(),
+        );
+        assert!(
+            held(acc, 7).is_none()
+                && state
+                    .runtime
+                    .list_buffer_groups()
+                    .iter()
+                    .all(|g| g.id != rail_id(acc, 7))
+        );
+        let told = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|e| e.name == "steamGroupRemoved")
+            .expect("the window is told")
+            .data;
+        assert_eq!(
+            (told["how"].as_str(), told["name"].as_str()),
+            (Some("removed from"), Some("Raiders"))
+        );
         // Leaving by choice, from another client, is not something to be told of.
         let roster = set_up(&state, acc);
         publish(&state, acc, &roster);
         let mut rx = state.events.subscribe();
-        let left = ChatUserStateChange { chat_group_id: Some(7), user_action: Some(CHANGE_PARTED), ..Default::default() };
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", left.encode_to_vec());
+        let left = ChatUserStateChange {
+            chat_group_id: Some(7),
+            user_action: Some(CHANGE_PARTED),
+            ..Default::default()
+        };
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatGroupUserStateChanged#1",
+            left.encode_to_vec(),
+        );
         assert!(held(acc, 7).is_none());
         assert!(std::iter::from_fn(|| rx.try_recv().ok()).all(|e| e.name != "steamGroupRemoved"));
         // Banned says banned.
         let roster = set_up(&state, acc);
         publish(&state, acc, &roster);
         let mut rx = state.events.subscribe();
-        let banned = ChatUserStateChange { chat_group_id: Some(7), user_action: Some(CHANGE_BANNED), ..Default::default() };
-        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatGroupUserStateChanged#1", banned.encode_to_vec());
-        let told = std::iter::from_fn(|| rx.try_recv().ok()).find(|e| e.name == "steamGroupRemoved").unwrap().data;
+        let banned = ChatUserStateChange {
+            chat_group_id: Some(7),
+            user_action: Some(CHANGE_BANNED),
+            ..Default::default()
+        };
+        notify(
+            &state,
+            acc,
+            &roster,
+            "ChatRoomClient.NotifyChatGroupUserStateChanged#1",
+            banned.encode_to_vec(),
+        );
+        let told = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|e| e.name == "steamGroupRemoved")
+            .unwrap()
+            .data;
         assert_eq!(told["how"], "banned from");
         clear(acc);
     }

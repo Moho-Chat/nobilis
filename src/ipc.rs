@@ -113,7 +113,10 @@ mod imp {
                 .first_pipe_instance(true)
                 .create(&name)
                 .with_context(|| format!("creating named pipe {name}"))?;
-            Ok(Self { name, next: Some(first) })
+            Ok(Self {
+                name,
+                next: Some(first),
+            })
         }
 
         pub async fn accept(&mut self) -> Result<Conn> {
@@ -121,7 +124,10 @@ mod imp {
                 Some(s) => s,
                 None => ServerOptions::new().create(&self.name)?,
             };
-            server.connect().await.context("waiting for a client on the named pipe")?;
+            server
+                .connect()
+                .await
+                .context("waiting for a client on the named pipe")?;
             self.next = Some(
                 ServerOptions::new()
                     .create(&self.name)

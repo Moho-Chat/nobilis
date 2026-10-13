@@ -19,13 +19,27 @@ use super::*;
 /// Where it is not, the relation is still recorded without one - knowing a
 /// message belongs to a thread matters even when the thread's own first
 /// message has not been read yet.
-pub(super) fn relation_preview(state: &AppState, buffer_id: &str, content: &Value) -> Option<crate::model::ReplyPreview> {
+pub(super) fn relation_preview(
+    state: &AppState,
+    buffer_id: &str,
+    content: &Value,
+) -> Option<crate::model::ReplyPreview> {
     let thread = protocol::thread_root(content);
     let in_thread = thread.is_some();
     let target = thread.or_else(|| protocol::reply_target(content))?;
     match state.store.get_message(buffer_id, target) {
-        Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target.to_string(), from: m.from, body: m.body, thread: in_thread, forwarded: false }),
-        _ => Some(crate::model::ReplyPreview { id: target.to_string(), thread: in_thread, ..Default::default() }),
+        Ok(Some(m)) => Some(crate::model::ReplyPreview {
+            id: target.to_string(),
+            from: m.from,
+            body: m.body,
+            thread: in_thread,
+            forwarded: false,
+        }),
+        _ => Some(crate::model::ReplyPreview {
+            id: target.to_string(),
+            thread: in_thread,
+            ..Default::default()
+        }),
     }
 }
 
@@ -81,7 +95,10 @@ pub(super) async fn handle_timeline_event(
         return;
     }
     let from = if sender == own_user_id {
-        state.runtime.own_identity(account_id).unwrap_or_else(|| protocol::short_sender(event))
+        state
+            .runtime
+            .own_identity(account_id)
+            .unwrap_or_else(|| protocol::short_sender(event))
     } else {
         protocol::short_sender(event)
     };
@@ -89,7 +106,9 @@ pub(super) async fn handle_timeline_event(
     // reference, even for an event that turns out to be encrypted -
     // never the decrypted inner event's own id (Megolm-encrypted content
     // has none of its own; the outer id is authoritative either way).
-    let Some(event_id) = protocol::event_id(event) else { return };
+    let Some(event_id) = protocol::event_id(event) else {
+        return;
+    };
 
     // For an encrypted event, decryption reveals the *real* type (a
     // reaction can be encrypted too, not just messages) - so the
@@ -99,11 +118,16 @@ pub(super) async fn handle_timeline_event(
     // an encrypted message can answer: in a plain room there is no device
     // claim to judge, so there is nothing to say rather than something bad.
     let mut sender_verified: Option<bool> = None;
-    let (effective_type, mut content, undecryptable): (String, Value, bool) = if outer_type == protocol::EVENT_ROOM_ENCRYPTED {
+    let (effective_type, mut content, undecryptable): (String, Value, bool) = if outer_type
+        == protocol::EVENT_ROOM_ENCRYPTED
+    {
         match decrypt_event(session, event, room_id).await {
             Ok((decrypted, verified)) => {
                 sender_verified = Some(verified);
-                let t = decrypted["type"].as_str().unwrap_or(protocol::EVENT_ROOM_MESSAGE).to_string();
+                let t = decrypted["type"]
+                    .as_str()
+                    .unwrap_or(protocol::EVENT_ROOM_MESSAGE)
+                    .to_string();
                 (t, decrypted["content"].clone(), false)
             }
             Err(e) => {
@@ -119,8 +143,20 @@ pub(super) async fn handle_timeline_event(
                 // for, so the placeholder is a state rather than a verdict:
                 // see `relock`. Before this it was permanent, and a restored
                 // backup fixed nothing that was already displayed.
-                tracing::debug!("matrix[{account_id}]: failed to decrypt event {event_id} in {room_id}: {e:#}");
-                relock::note_locked(session, homeserver_url, access_token, account_id, buffer_id, room_id, event_id, event).await;
+                tracing::debug!(
+                    "matrix[{account_id}]: failed to decrypt event {event_id} in {room_id}: {e:#}"
+                );
+                relock::note_locked(
+                    session,
+                    homeserver_url,
+                    access_token,
+                    account_id,
+                    buffer_id,
+                    room_id,
+                    event_id,
+                    event,
+                )
+                .await;
                 (protocol::EVENT_ROOM_MESSAGE.to_string(), Value::Null, true)
             }
         }
@@ -129,13 +165,24 @@ pub(super) async fn handle_timeline_event(
     };
 
     if effective_type == protocol::EVENT_REACTION {
-        let Some((target_event, emoji)) = protocol::reaction_target(&content) else { return };
+        let Some((target_event, emoji)) = protocol::reaction_target(&content) else {
+            return;
+        };
         let is_me = sender == own_user_id;
-        state.runtime.record_matrix_reaction_event(buffer_id, target_event, emoji, event_id, is_me, sender);
+        state.runtime.record_matrix_reaction_event(
+            buffer_id,
+            target_event,
+            emoji,
+            event_id,
+            is_me,
+            sender,
+        );
         // By event id, so a replayed timeline counts for nothing. An initial
         // sync hands back the recent timeline again on every reconnect, and
         // this used to add each of those reactions a second time.
-        state.runtime.matrix_reaction(state, event_id, buffer_id, target_event, emoji, is_me);
+        state
+            .runtime
+            .matrix_reaction(state, event_id, buffer_id, target_event, emoji, is_me);
         return;
     }
 
@@ -147,7 +194,9 @@ pub(super) async fn handle_timeline_event(
         || content["msgtype"].as_str() == Some("m.key.verification.request")
     {
         if sender != own_user_id {
-            state.runtime.note_matrix_verification_peer(account_id, sender);
+            state
+                .runtime
+                .note_matrix_verification_peer(account_id, sender);
         }
         let mut event = event.clone();
         // The decrypted content where there was any, so an encrypted room's
@@ -169,7 +218,15 @@ pub(super) async fn handle_timeline_event(
     // media is the client's - it has a WebRTC stack and this daemon does not.
     // See calls::handle.
     if effective_type.starts_with("m.call.") {
-        calls::handle(state, account_id, buffer_id, own_user_id, &effective_type, sender, &content);
+        calls::handle(
+            state,
+            account_id,
+            buffer_id,
+            own_user_id,
+            &effective_type,
+            sender,
+            &content,
+        );
         return;
     }
 
@@ -177,7 +234,16 @@ pub(super) async fn handle_timeline_event(
     // decryption like everything else, because a poll in an encrypted room
     // arrives as ciphertext the same way a message does.
     if polls::is_poll_event(&effective_type)
-        && polls::handle(state, account_id, buffer_id, own_user_id, &effective_type, event_id, sender, &content)
+        && polls::handle(
+            state,
+            account_id,
+            buffer_id,
+            own_user_id,
+            &effective_type,
+            event_id,
+            sender,
+            &content,
+        )
     {
         return;
     }
@@ -188,7 +254,9 @@ pub(super) async fn handle_timeline_event(
     // is instead of dropping it for having the wrong envelope.
     if effective_type == protocol::EVENT_STICKER {
         if let Some(object) = content.as_object_mut() {
-            object.entry("msgtype").or_insert_with(|| Value::from("m.image"));
+            object
+                .entry("msgtype")
+                .or_insert_with(|| Value::from("m.image"));
         }
     } else if effective_type != protocol::EVENT_ROOM_MESSAGE {
         return;
@@ -204,7 +272,9 @@ pub(super) async fn handle_timeline_event(
         }
         let (new_body, _) = protocol::message_body(protocol::edit_new_content(&content));
         if !new_body.is_empty() {
-            state.runtime.update_message(state, buffer_id, target_event, &new_body, &[], &[]);
+            state
+                .runtime
+                .update_message(state, buffer_id, target_event, &new_body, &[], &[]);
         }
         return;
     }
@@ -222,12 +292,20 @@ pub(super) async fn handle_timeline_event(
     } else if let Some(mxc) = protocol::media_mxc_uri(&content) {
         let ext = extension_for_mimetype(content["info"]["mimetype"].as_str().unwrap_or(""));
         let path = cached_media_path(homeserver_url, access_token, mxc, ext).await;
-        attachments.push(build_attachment(&content, path, thumbnail_for(&content, homeserver_url, access_token).await));
+        attachments.push(build_attachment(
+            &content,
+            path,
+            thumbnail_for(&content, homeserver_url, access_token).await,
+        ));
         (protocol::message_body(&content).0, false)
     } else if let Some(file) = protocol::encrypted_media_file(&content) {
         let ext = extension_for_mimetype(content["info"]["mimetype"].as_str().unwrap_or(""));
         let path = cached_encrypted_media_path(homeserver_url, access_token, file, ext).await;
-        attachments.push(build_attachment(&content, path, thumbnail_for(&content, homeserver_url, access_token).await));
+        attachments.push(build_attachment(
+            &content,
+            path,
+            thumbnail_for(&content, homeserver_url, access_token).await,
+        ));
         (protocol::message_body(&content).0, false)
     } else if let Some(place) = protocol::location_of(&content) {
         // A place, as the one thing a chat client can honestly do with one:
@@ -282,7 +360,8 @@ pub(super) async fn handle_timeline_event(
     // rule says so - which is the state every homeserver ships. Without
     // this, a bridge relaying a room full of somebody's name would light up
     // the mentions inbox with traffic no person wrote.
-    let mentioned = (mentioned || keyword) && !(notices_quiet && protocol::message_kind(&content) == "notice");
+    let mentioned =
+        (mentioned || keyword) && !(notices_quiet && protocol::message_kind(&content) == "notice");
 
     if reply_to.is_some() {
         // The raw body Matrix sends for a reply includes a quoted `> `
@@ -390,7 +469,11 @@ pub(super) fn handle_redaction(state: &AppState, buffer_id: &str, target_event: 
 }
 
 /// The plaintext, and whether the device that sent it has been verified.
-pub(super) async fn decrypt_event(session: &crypto::CryptoSession, event: &Value, room_id: &str) -> Result<(Value, bool)> {
+pub(super) async fn decrypt_event(
+    session: &crypto::CryptoSession,
+    event: &Value,
+    room_id: &str,
+) -> Result<(Value, bool)> {
     let room_id = ruma_common::RoomId::parse(room_id).context("invalid room id")?;
     crypto::decrypt_room_event_with_trust(session, event, &room_id).await
 }
@@ -412,7 +495,11 @@ pub(super) async fn store_thread_event(
         match session {
             // The trust half is for the timeline, where a message is drawn
             // beside a name; here only the plaintext matters.
-            Some(session) => match decrypt_event(session, event, room_id).await.ok().map(|(plain, _)| plain) {
+            Some(session) => match decrypt_event(session, event, room_id)
+                .await
+                .ok()
+                .map(|(plain, _)| plain)
+            {
                 Some(plain) => {
                     decrypted = plain;
                     &decrypted
@@ -431,13 +518,18 @@ pub(super) async fn store_thread_event(
     if protocol::edit_target(content).is_some() {
         return;
     }
-    let Some(event_id) = protocol::event_id(event) else { return };
+    let Some(event_id) = protocol::event_id(event) else {
+        return;
+    };
     let (body, is_action) = protocol::message_body(content);
     if body.is_empty() {
         return;
     }
     let sender_mxid = protocol::sender(event);
-    let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
+    let ts = event["origin_server_ts"]
+        .as_i64()
+        .map(|ms| ms / 1000)
+        .unwrap_or(0);
     let reply_to = relation_preview(state, buffer_id, content);
     let _ = state.store.append_message(
         buffer_id,
@@ -451,7 +543,10 @@ pub(super) async fn store_thread_event(
         reply_to.as_ref(),
         &[],
         sender_mxid == own_user_id,
-        state.runtime.get_matrix_member_avatar(account_id, sender_mxid).as_deref(),
+        state
+            .runtime
+            .get_matrix_member_avatar(account_id, sender_mxid)
+            .as_deref(),
         &[],
         &[],
         Some(sender_mxid),
@@ -486,7 +581,10 @@ pub(super) async fn store_history_event(
     let decrypted;
     let event = if protocol::event_type(event) == "m.room.encrypted" {
         let plain = match session {
-            Some(session) => decrypt_event(session, event, room_id).await.ok().map(|(plain, _)| plain),
+            Some(session) => decrypt_event(session, event, room_id)
+                .await
+                .ok()
+                .map(|(plain, _)| plain),
             None => None,
         };
         match plain {
@@ -502,7 +600,9 @@ pub(super) async fn store_history_event(
     if protocol::event_type(event) != "m.room.message" {
         return false;
     }
-    let Some(event_id) = protocol::event_id(event) else { return false };
+    let Some(event_id) = protocol::event_id(event) else {
+        return false;
+    };
     let content = &event["content"];
     // An edit carries the replacement rather than a message of its own.
     if protocol::edit_target(content).is_some() {
@@ -519,14 +619,33 @@ pub(super) async fn store_history_event(
     // Real send time, unlike live messages before server-time existed
     // elsewhere: history dated to the moment it was fetched would put
     // years-old conversation at today.
-    let ts = event["origin_server_ts"].as_i64().map(|ms| ms / 1000).unwrap_or(0);
-    let avatar = state.runtime.get_matrix_member_avatar(account_id, sender_mxid);
+    let ts = event["origin_server_ts"]
+        .as_i64()
+        .map(|ms| ms / 1000)
+        .unwrap_or(0);
+    let avatar = state
+        .runtime
+        .get_matrix_member_avatar(account_id, sender_mxid);
     // History carries its relations like anything else - without this a
     // thread read back from the server arrived as loose messages.
     let reply_to = relation_preview(state, buffer_id, content);
     if let Err(e) = state.store.append_message(
-        buffer_id, event_id, &from, &body, ts, is_action, false, protocol::message_kind(content), reply_to.as_ref(), &[], is_own,
-        avatar.as_deref(), &[], &[], Some(sender_mxid), html.as_deref(),
+        buffer_id,
+        event_id,
+        &from,
+        &body,
+        ts,
+        is_action,
+        false,
+        protocol::message_kind(content),
+        reply_to.as_ref(),
+        &[],
+        is_own,
+        avatar.as_deref(),
+        &[],
+        &[],
+        Some(sender_mxid),
+        html.as_deref(),
         &state.runtime.buffer_kind_of(buffer_id),
         // Matrix has no per-sender colour or badges of its own.
         None,
@@ -541,7 +660,11 @@ pub(super) async fn store_history_event(
 /// An event as text, decrypted where it needs to be and where this session
 /// can. Shared by the thread list and the pinned list, which both read events
 /// the sync loop never handed to a buffer.
-pub(super) async fn read_event(session: &Option<std::sync::Arc<crypto::CryptoSession>>, room: Option<&ruma_common::RoomId>, event: &Value) -> Value {
+pub(super) async fn read_event(
+    session: &Option<std::sync::Arc<crypto::CryptoSession>>,
+    room: Option<&ruma_common::RoomId>,
+    event: &Value,
+) -> Value {
     if event["type"].as_str() != Some("m.room.encrypted") {
         return event.clone();
     }

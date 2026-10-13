@@ -50,7 +50,8 @@ const POLL_EVERY: Duration = Duration::from_secs(1);
 
 /// The digits each waiting sign-in has been told, by login id.
 fn check_codes() -> &'static Mutex<HashMap<String, tokio::sync::oneshot::Sender<u8>>> {
-    static CODES: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<u8>>>> = OnceLock::new();
+    static CODES: OnceLock<Mutex<HashMap<String, tokio::sync::oneshot::Sender<u8>>>> =
+        OnceLock::new();
     CODES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -58,7 +59,9 @@ fn check_codes() -> &'static Mutex<HashMap<String, tokio::sync::oneshot::Sender<
 /// events tagged with `login_id`, like the other ways in.
 pub fn start_qr_login(state: AppState, login_id: String, homeserver_url: String) {
     tokio::spawn(async move {
-        let result = std::panic::AssertUnwindSafe(try_qr_login(&state, &login_id, &homeserver_url)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(try_qr_login(&state, &login_id, &homeserver_url))
+            .catch_unwind()
+            .await;
         check_codes().lock().unwrap().remove(&login_id);
         let error = match result {
             Ok(Ok(())) => return,
@@ -66,7 +69,10 @@ pub fn start_qr_login(state: AppState, login_id: String, homeserver_url: String)
             Err(_) => "internal error (see nobilis logs)".to_string(),
         };
         tracing::warn!("matrix qr login[{login_id}]: {error}");
-        state.events.emit("matrixLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
+        state.events.emit(
+            "matrixLoginResult",
+            json!({ "loginId": login_id, "success": false, "error": error }),
+        );
     });
 }
 
@@ -74,19 +80,26 @@ pub fn start_qr_login(state: AppState, login_id: String, homeserver_url: String)
 pub fn confirm_check_code(login_id: &str, code: u8) -> Result<()> {
     let waiting = check_codes().lock().unwrap().remove(login_id);
     match waiting {
-        Some(sender) => sender.send(code).map_err(|_| anyhow::anyhow!("that sign-in is no longer waiting for a code")),
+        Some(sender) => sender
+            .send(code)
+            .map_err(|_| anyhow::anyhow!("that sign-in is no longer waiting for a code")),
         None => bail!("that sign-in is not waiting for a code"),
     }
 }
 
 async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) -> Result<()> {
-    let status = |detail: &str| state.events.emit("matrixLoginStatus", json!({ "loginId": login_id, "detail": detail }));
+    let status = |detail: &str| {
+        state.events.emit(
+            "matrixLoginStatus",
+            json!({ "loginId": login_id, "detail": detail }),
+        )
+    };
 
     status("finding the server...");
     let homeserver_url = http::resolve_homeserver(homeserver_url).await?;
-    oidc::auth_metadata(&homeserver_url)
-        .await?
-        .context("this homeserver holds its own accounts, so it cannot sign in by QR code - use a password")?;
+    oidc::auth_metadata(&homeserver_url).await?.context(
+        "this homeserver holds its own accounts, so it cannot sign in by QR code - use a password",
+    )?;
 
     // 2. The code, made again whenever its mailbox expires - Synapse keeps
     // an untouched one for a minute - until it is scanned or the person has
@@ -102,18 +115,30 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
             bail!("the code was not scanned in time");
         }
         let mut mailbox = Mailbox::open(&homeserver_url).await?;
-        let qr = QrCodeData::new_msc4108(ecies.public_key(), url::Url::parse(&mailbox.url)?, Msc4108IntentData::Login);
+        let qr = QrCodeData::new_msc4108(
+            ecies.public_key(),
+            url::Url::parse(&mailbox.url)?,
+            Msc4108IntentData::Login,
+        );
         // A new file each time, so the window draws the new code rather than
         // a cached copy of the old one.
         shown += 1;
         let _ = std::fs::remove_file(&path);
-        let path_now = path.with_file_name(format!("{}-{shown}.png", path.file_stem().and_then(|s| s.to_str()).unwrap_or("qr")));
+        let path_now = path.with_file_name(format!(
+            "{}-{shown}.png",
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("qr")
+        ));
         write_qr(&qr.to_bytes(), &path_now)?;
-        state.events.emit("matrixQrCode", json!({ "loginId": login_id, "qrPath": path_now.display().to_string() }));
+        state.events.emit(
+            "matrixQrCode",
+            json!({ "loginId": login_id, "qrPath": path_now.display().to_string() }),
+        );
         if shown == 1 {
             tracing::info!("matrix qr login[{login_id}]: showing a code for {homeserver_url}");
         }
-        let waited = mailbox.receive_or_expire(give_up.saturating_duration_since(tokio::time::Instant::now())).await;
+        let waited = mailbox
+            .receive_or_expire(give_up.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
         let _ = std::fs::remove_file(&path_now);
         match waited {
             Ok(Some(opening)) => break (mailbox, opening),
@@ -123,18 +148,29 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     };
 
     // 3. The phone's opening message, and our answer.
-    let initial = InitialMessage::decode(&opening).context("the scanning device sent something that is not a QR sign-in")?;
-    let inbound = ecies.establish_inbound_channel(&initial).context("opening the secure channel")?;
+    let initial = InitialMessage::decode(&opening)
+        .context("the scanning device sent something that is not a QR sign-in")?;
+    let inbound = ecies
+        .establish_inbound_channel(&initial)
+        .context("opening the secure channel")?;
     if inbound.message != LOGIN_INITIATE.as_bytes() {
         bail!("the scanning device did not start a sign-in");
     }
-    let mut channel = Channel { mailbox, ecies: inbound.ecies };
+    let mut channel = Channel {
+        mailbox,
+        ecies: inbound.ecies,
+    };
     channel.send_text(LOGIN_OK).await?;
 
     // 4. The two digits.
     let (tx, rx) = tokio::sync::oneshot::channel();
-    check_codes().lock().unwrap().insert(login_id.to_string(), tx);
-    state.events.emit("matrixQrCheckCode", json!({ "loginId": login_id }));
+    check_codes()
+        .lock()
+        .unwrap()
+        .insert(login_id.to_string(), tx);
+    state
+        .events
+        .emit("matrixQrCheckCode", json!({ "loginId": login_id }));
     status("enter the two digits your phone shows...");
     let typed = tokio::time::timeout(STEP_WAIT, rx)
         .await
@@ -143,7 +179,12 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     // The original MSC4108 rendering, which is the one this ECIES channel
     // speaks: a leading zero allowed. (MSC4388's HPKE channel forbids one;
     // vodozemac now asks which is meant.)
-    if typed != channel.ecies.check_code().to_digit(DigitMode::AllowLeadingZero) {
+    if typed
+        != channel
+            .ecies
+            .check_code()
+            .to_digit(DigitMode::AllowLeadingZero)
+    {
         let _ = channel.send_json(failure("user_cancelled")).await;
         bail!("those digits do not match the ones on your phone - start again, and check you scanned this screen");
     }
@@ -152,10 +193,18 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     status("waiting for your phone...");
     let protocols = channel.receive_json(STEP_WAIT).await?;
     if protocols["type"] != "m.login.protocols" {
-        let _ = channel.send_json(failure("unexpected_message_received")).await;
-        bail!("your phone sent {} where it should have named the server", protocols["type"]);
+        let _ = channel
+            .send_json(failure("unexpected_message_received"))
+            .await;
+        bail!(
+            "your phone sent {} where it should have named the server",
+            protocols["type"]
+        );
     }
-    if !protocols["protocols"].as_array().is_some_and(|p| p.iter().any(|p| p == "device_authorization_grant")) {
+    if !protocols["protocols"]
+        .as_array()
+        .is_some_and(|p| p.iter().any(|p| p == "device_authorization_grant"))
+    {
         let _ = channel.send_json(failure("unsupported_protocol")).await;
         bail!("your phone offers no sign-in method moho supports");
     }
@@ -163,7 +212,9 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
         Some(named) if !named.is_empty() => http::resolve_homeserver(named).await?,
         _ => homeserver_url,
     };
-    let metadata = oidc::auth_metadata(&homeserver_url).await?.context("your account's server does not use OIDC accounts")?;
+    let metadata = oidc::auth_metadata(&homeserver_url)
+        .await?
+        .context("your account's server does not use OIDC accounts")?;
     let client_id = oidc::register_client(&metadata).await?;
     // The device id is the new account's identity key, as the protocol
     // requires; the same account becomes this device's crypto identity.
@@ -184,9 +235,14 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     let accepted = channel.receive_json(STEP_WAIT).await?;
     match accepted["type"].as_str() {
         Some("m.login.protocol_accepted") => {}
-        Some("m.login.failure") => bail!("your phone refused the sign-in ({})", accepted["reason"].as_str().unwrap_or("no reason given")),
+        Some("m.login.failure") => bail!(
+            "your phone refused the sign-in ({})",
+            accepted["reason"].as_str().unwrap_or("no reason given")
+        ),
         other => {
-            let _ = channel.send_json(failure("unexpected_message_received")).await;
+            let _ = channel
+                .send_json(failure("unexpected_message_received"))
+                .await;
             bail!("your phone sent {other:?} where it should have accepted the sign-in");
         }
     }
@@ -206,19 +262,36 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
             oidc::Poll::Stopped(why) => {
                 let refused = why.contains("refused");
                 let _ = channel
-                    .send_json(if refused { json!({ "type": "m.login.declined" }) } else { failure("authorization_expired") })
+                    .send_json(if refused {
+                        json!({ "type": "m.login.declined" })
+                    } else {
+                        failure("authorization_expired")
+                    })
                     .await;
                 bail!("{why}");
             }
-            oidc::Poll::Approved { access_token, refresh_token, .. } => break (access_token, refresh_token),
+            oidc::Poll::Approved {
+                access_token,
+                refresh_token,
+                ..
+            } => break (access_token, refresh_token),
         }
     };
 
     status("signing in...");
-    let whoami = http::get_json(&format!("{}/_matrix/client/v3/account/whoami", homeserver_url.trim_end_matches('/')), &access_token)
-        .await
-        .context("asking the homeserver who this token belongs to")?;
-    let user_id = whoami["user_id"].as_str().context("the homeserver did not say who this is")?.to_string();
+    let whoami = http::get_json(
+        &format!(
+            "{}/_matrix/client/v3/account/whoami",
+            homeserver_url.trim_end_matches('/')
+        ),
+        &access_token,
+    )
+    .await
+    .context("asking the homeserver who this token belongs to")?;
+    let user_id = whoami["user_id"]
+        .as_str()
+        .context("the homeserver did not say who this is")?
+        .to_string();
     if whoami["device_id"].as_str().is_some_and(|d| d != device_id) {
         let _ = channel.send_json(failure("device_not_found")).await;
         bail!("the homeserver gave this sign-in a different device than the one asked for");
@@ -238,18 +311,25 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     .await;
 
     // 6. The secrets.
-    channel.send_json(json!({ "type": "m.login.success" })).await?;
+    channel
+        .send_json(json!({ "type": "m.login.success" }))
+        .await?;
     status("receiving your encryption keys...");
     let secrets = match channel.receive_json(STEP_WAIT).await {
-        Ok(message) if message["type"] == "m.login.secrets" => match serde_json::from_value::<SecretsBundle>(message) {
-            Ok(bundle) => Some(bundle),
-            Err(e) => {
-                tracing::warn!("matrix qr login[{login_id}]: the secrets did not parse: {e}");
-                None
+        Ok(message) if message["type"] == "m.login.secrets" => {
+            match serde_json::from_value::<SecretsBundle>(message) {
+                Ok(bundle) => Some(bundle),
+                Err(e) => {
+                    tracing::warn!("matrix qr login[{login_id}]: the secrets did not parse: {e}");
+                    None
+                }
             }
-        },
+        }
         Ok(other) => {
-            tracing::warn!("matrix qr login[{login_id}]: no secrets came - got {}", other["type"]);
+            tracing::warn!(
+                "matrix qr login[{login_id}]: no secrets came - got {}",
+                other["type"]
+            );
             None
         }
         Err(e) => {
@@ -278,7 +358,8 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
         rtc_focus_url: None,
     };
     let account_id = config.account_id();
-    let ruma_user = ruma_common::UserId::parse(&user_id).context("the homeserver named an invalid user")?;
+    let ruma_user =
+        ruma_common::UserId::parse(&user_id).context("the homeserver named an invalid user")?;
     crypto::CryptoSession::create_with_account(
         &sync::config_dir(),
         &account_id,
@@ -292,23 +373,39 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
     let saved = state.accounts.add_matrix(config)?;
     let account_json = crate::accounts::matrix_account_to_json(&saved, "connecting", false);
     spawn(state.clone(), saved);
-    state.events.emit("matrixLoginResult", json!({ "loginId": login_id, "success": true, "account": account_json }));
+    state.events.emit(
+        "matrixLoginResult",
+        json!({ "loginId": login_id, "success": true, "account": account_json }),
+    );
     tracing::info!(
         "matrix qr login[{login_id}]: signed in as {user_id}, {}",
-        if secrets.is_some() { "verified, with the account's keys" } else { "without the account's keys" }
+        if secrets.is_some() {
+            "verified, with the account's keys"
+        } else {
+            "without the account's keys"
+        }
     );
 
     // The history the backup holds, once the account's session is up.
-    let backup_key = secrets.as_ref().and_then(|s| s.backup.as_ref()).map(|b| match b {
-        matrix_sdk_crypto::types::BackupSecrets::MegolmBackupV1Curve25519AesSha2(b) => b.key.to_base58(),
-    });
+    let backup_key = secrets
+        .as_ref()
+        .and_then(|s| s.backup.as_ref())
+        .map(|b| match b {
+            matrix_sdk_crypto::types::BackupSecrets::MegolmBackupV1Curve25519AesSha2(b) => {
+                b.key.to_base58()
+            }
+        });
     if let Some(key) = backup_key {
         let state = state.clone();
         tokio::spawn(async move {
             for _ in 0..60 {
                 if state.runtime.get_matrix_machine(&account_id).is_some() {
                     match backup::restore_from_recovery_key(&state, &account_id, &key).await {
-                        Ok(summary) => tracing::info!("matrix qr login: restored {} of {} backed-up keys", summary.imported_keys, summary.total_keys),
+                        Ok(summary) => tracing::info!(
+                            "matrix qr login: restored {} of {} backed-up keys",
+                            summary.imported_keys,
+                            summary.total_keys
+                        ),
                         Err(e) => tracing::warn!("matrix qr login: restoring the backup: {e:#}"),
                     }
                     return;
@@ -324,9 +421,14 @@ async fn try_qr_login(state: &AppState, login_id: &str, homeserver_url: &str) ->
 /// not a guarantee - the mailbox itself is what proves it - but a server
 /// that does not make the claim certainly cannot.
 pub async fn advertises_qr(homeserver_url: &str) -> bool {
-    let url = format!("{}/_matrix/client/versions", homeserver_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/_matrix/client/versions",
+        homeserver_url.trim_end_matches('/')
+    );
     match http::get_json_anonymous(&url).await {
-        Ok(versions) => versions["unstable_features"]["org.matrix.msc4108"].as_bool().unwrap_or(false),
+        Ok(versions) => versions["unstable_features"]["org.matrix.msc4108"]
+            .as_bool()
+            .unwrap_or(false),
         Err(_) => false,
     }
 }
@@ -336,15 +438,23 @@ fn failure(reason: &str) -> Value {
 }
 
 fn qr_path(login_id: &str) -> std::path::PathBuf {
-    crate::media_cache::transient_dir().join(format!("moho-matrix-qr-{}.png", login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")))
+    crate::media_cache::transient_dir().join(format!(
+        "moho-matrix-qr-{}.png",
+        login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+    ))
 }
 
 /// The code as an image. Binary data in the QR code's byte mode, which is
 /// what the scanning side reads.
 fn write_qr(bytes: &[u8], path: &std::path::Path) -> Result<()> {
     let code = qrcode::QrCode::new(bytes)?;
-    let image = code.render::<image::Luma<u8>>().min_dimensions(300, 300).build();
-    image.save_with_format(path, image::ImageFormat::Png).context("encoding the QR code as PNG")?;
+    let image = code
+        .render::<image::Luma<u8>>()
+        .min_dimensions(300, 300)
+        .build();
+    image
+        .save_with_format(path, image::ImageFormat::Png)
+        .context("encoding the QR code as PNG")?;
     // The code is a credential for as long as it is shown.
     let _ = crate::secure::restrict_file_to_owner(path);
     Ok(())
@@ -361,7 +471,10 @@ struct Mailbox {
 impl Mailbox {
     async fn open(homeserver_url: &str) -> Result<Self> {
         let client = http::anonymous_client();
-        let endpoint = format!("{}/_matrix/client/unstable/org.matrix.msc4108/rendezvous", homeserver_url.trim_end_matches('/'));
+        let endpoint = format!(
+            "{}/_matrix/client/unstable/org.matrix.msc4108/rendezvous",
+            homeserver_url.trim_end_matches('/')
+        );
         let resp = client
             .post(&endpoint)
             .header(reqwest::header::CONTENT_TYPE, "text/plain")
@@ -379,9 +492,13 @@ impl Mailbox {
         if !status.is_success() {
             bail!("the homeserver refused a sign-in mailbox: HTTP {status}");
         }
-        let etag = header(&resp, reqwest::header::ETAG).context("the mailbox came without an ETag")?;
+        let etag =
+            header(&resp, reqwest::header::ETAG).context("the mailbox came without an ETag")?;
         let body: Value = resp.json().await.context("reading the mailbox's address")?;
-        let url = body["url"].as_str().context("the homeserver gave no mailbox address")?.to_string();
+        let url = body["url"]
+            .as_str()
+            .context("the homeserver gave no mailbox address")?
+            .to_string();
         Ok(Self { client, url, etag })
     }
 
@@ -440,15 +557,22 @@ impl Mailbox {
             .await
             .context("writing to the sign-in mailbox")?;
         if !resp.status().is_success() {
-            bail!("the sign-in mailbox refused a message: HTTP {}", resp.status());
+            bail!(
+                "the sign-in mailbox refused a message: HTTP {}",
+                resp.status()
+            );
         }
-        self.etag = header(&resp, reqwest::header::ETAG).context("the mailbox answered without an ETag")?;
+        self.etag =
+            header(&resp, reqwest::header::ETAG).context("the mailbox answered without an ETag")?;
         Ok(())
     }
 }
 
 fn header(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> Option<String> {
-    resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// The mailbox, with everything sealed for the other device.
@@ -470,7 +594,10 @@ impl Channel {
     async fn receive_json(&mut self, within: Duration) -> Result<Value> {
         let sealed = self.mailbox.receive(within).await?;
         let message = Message::decode(&sealed).context("a sign-in message that is not sealed")?;
-        let plain = self.ecies.decrypt(&message).context("a sign-in message that would not open")?;
+        let plain = self
+            .ecies
+            .decrypt(&message)
+            .context("a sign-in message that would not open")?;
         serde_json::from_slice(&plain).context("a sign-in message that is not JSON")
     }
 }
@@ -484,8 +611,15 @@ mod tests {
     #[test]
     fn the_code_carries_the_mailbox_and_the_key() {
         let ecies = Ecies::new();
-        let mailbox = url::Url::parse("https://matrix.example/_matrix/client/unstable/org.matrix.msc4108/rendezvous/abc").unwrap();
-        let qr = QrCodeData::new_msc4108(ecies.public_key(), mailbox.clone(), Msc4108IntentData::Login);
+        let mailbox = url::Url::parse(
+            "https://matrix.example/_matrix/client/unstable/org.matrix.msc4108/rendezvous/abc",
+        )
+        .unwrap();
+        let qr = QrCodeData::new_msc4108(
+            ecies.public_key(),
+            mailbox.clone(),
+            Msc4108IntentData::Login,
+        );
         let read = QrCodeData::from_bytes(&qr.to_bytes()).expect("the code reads back");
         assert_eq!(read.public_key(), ecies.public_key());
         assert_eq!(read.intent(), QrCodeIntent::Login);
@@ -497,14 +631,30 @@ mod tests {
     fn the_channel_opens_and_both_ends_show_the_same_digits() {
         let moho = Ecies::new();
         let moho_key = moho.public_key();
-        let phone = Ecies::new().establish_outbound_channel(moho_key, LOGIN_INITIATE.as_bytes()).unwrap();
-        let inbound = moho.establish_inbound_channel(&InitialMessage::decode(&phone.message.encode()).unwrap()).unwrap();
+        let phone = Ecies::new()
+            .establish_outbound_channel(moho_key, LOGIN_INITIATE.as_bytes())
+            .unwrap();
+        let inbound = moho
+            .establish_inbound_channel(&InitialMessage::decode(&phone.message.encode()).unwrap())
+            .unwrap();
         assert_eq!(inbound.message, LOGIN_INITIATE.as_bytes());
-        assert_eq!(inbound.ecies.check_code().to_digit(DigitMode::AllowLeadingZero), phone.ecies.check_code().to_digit(DigitMode::AllowLeadingZero));
+        assert_eq!(
+            inbound
+                .ecies
+                .check_code()
+                .to_digit(DigitMode::AllowLeadingZero),
+            phone
+                .ecies
+                .check_code()
+                .to_digit(DigitMode::AllowLeadingZero)
+        );
 
         let (mut moho, mut phone) = (inbound.ecies, phone.ecies);
         let sealed = moho.encrypt(LOGIN_OK.as_bytes()).encode();
-        assert_eq!(phone.decrypt(&Message::decode(&sealed).unwrap()).unwrap(), LOGIN_OK.as_bytes());
+        assert_eq!(
+            phone.decrypt(&Message::decode(&sealed).unwrap()).unwrap(),
+            LOGIN_OK.as_bytes()
+        );
     }
 
     /// The secrets message is the bundle with a `type` beside it.

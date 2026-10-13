@@ -112,7 +112,12 @@ pub fn send_status(link: &Link, status: &str, by_user: bool) -> Result<(), CallE
 /// Changes how a signed-in account is showing. Whether it could: an account
 /// that is not connected has nothing to tell, and keeps the choice for the
 /// next time it is.
-pub fn apply_status(state: &crate::state::AppState, account_id: &str, status: &str, by_user: bool) -> bool {
+pub fn apply_status(
+    state: &crate::state::AppState,
+    account_id: &str,
+    status: &str,
+    by_user: bool,
+) -> bool {
     match state.runtime.steam_link(account_id) {
         Some(link) => send_status(&link, status, by_user).is_ok(),
         None => false,
@@ -131,11 +136,20 @@ mod tests {
         assert_eq!(words(BUSY, None).as_deref(), Some("custom:Busy"));
         assert_eq!(words(AWAY, None).as_deref(), Some("custom:Away"));
         assert_eq!(words(SNOOZE, None).as_deref(), Some("custom:Snoozing"));
-        assert_eq!(words(LOOKING_TO_TRADE, None).as_deref(), Some("custom:Looking to trade"));
-        assert_eq!(words(LOOKING_TO_PLAY, None).as_deref(), Some("custom:Looking to play"));
+        assert_eq!(
+            words(LOOKING_TO_TRADE, None).as_deref(),
+            Some("custom:Looking to trade")
+        );
+        assert_eq!(
+            words(LOOKING_TO_PLAY, None).as_deref(),
+            Some("custom:Looking to play")
+        );
         // A game outranks the state, is named bare - the gamepad says what it is
         // - and an empty name is no game.
-        assert_eq!(words(ONLINE, Some("Counter-Strike 2")).as_deref(), Some("game:Counter-Strike 2"));
+        assert_eq!(
+            words(ONLINE, Some("Counter-Strike 2")).as_deref(),
+            Some("game:Counter-Strike 2")
+        );
         assert_eq!(words(BUSY, Some("Dota 2")).as_deref(), Some("game:Dota 2"));
         assert_eq!(words(ONLINE, Some("")), None);
         // Somebody offline is not playing anything, whatever was last said.
@@ -151,7 +165,11 @@ mod tests {
         assert_eq!(client_of(ONLINE, 256 | 1, false), Some("Web"));
         assert_eq!(client_of(AWAY, 1024, false), Some("Big Picture"));
         assert_eq!(client_of(ONLINE, 2048 | 512, false), Some("VR"));
-        assert_eq!(client_of(ONLINE, 512, true), Some("Steam Deck"), "a Deck is a Deck whatever else is set");
+        assert_eq!(
+            client_of(ONLINE, 512, true),
+            Some("Steam Deck"),
+            "a Deck is a Deck whatever else is set"
+        );
         assert_eq!(client_of(0, 512, false), None);
         assert_eq!(client_of(INVISIBLE, 0, false), None);
     }
@@ -161,7 +179,11 @@ mod tests {
         assert_eq!(persona_state_for("online"), 1);
         assert_eq!(persona_state_for("idle"), 3, "idle is Steam's Away");
         assert_eq!(persona_state_for("invisible"), 7);
-        assert_eq!(persona_state_for("dnd"), 1, "do not disturb is local; Steam still sees an online person");
+        assert_eq!(
+            persona_state_for("dnd"),
+            1,
+            "do not disturb is local; Steam still sees an online person"
+        );
         assert_eq!(persona_state_for("nonsense"), 1);
     }
 
@@ -175,7 +197,11 @@ mod tests {
         assert_eq!(status_of(5), "online");
         assert_eq!(status_of(6), "online");
         assert_eq!(status_of(7), "offline");
-        assert_eq!(status_of(99), "offline", "a state from a newer Steam is not a guess in the direction that shows");
+        assert_eq!(
+            status_of(99),
+            "offline",
+            "a state from a newer Steam is not a guess in the direction that shows"
+        );
     }
 
     #[test]
@@ -200,7 +226,10 @@ mod tests {
         })
         .await;
         let (link, _told) = link::open("steam:test", &url).await.unwrap();
-        link.set_identity(link::Identity { steamid: 76561197960287930, session: 3 });
+        link.set_identity(link::Identity {
+            steamid: 76561197960287930,
+            session: 3,
+        });
         send_status(&link, "invisible", true).unwrap();
         send_status(&link, "idle", false).unwrap();
         for _ in 0..100 {
@@ -213,10 +242,21 @@ mod tests {
         assert_eq!(seen.len(), 2);
         assert!(seen.iter().all(|p| p.emsg == emsg::CLIENT_CHANGE_STATUS));
         let first = ClientChangeStatus::decode(seen[0].body.as_slice()).unwrap();
-        assert_eq!((first.persona_state, first.persona_set_by_user), (Some(INVISIBLE), Some(true)));
+        assert_eq!(
+            (first.persona_state, first.persona_set_by_user),
+            (Some(INVISIBLE), Some(true))
+        );
         let second = ClientChangeStatus::decode(seen[1].body.as_slice()).unwrap();
-        assert_eq!((second.persona_state, second.persona_set_by_user), (Some(AWAY), Some(false)), "stepping away is not a choice");
-        assert_eq!(seen[0].header.steamid, Some(76561197960287930), "as the account");
+        assert_eq!(
+            (second.persona_state, second.persona_set_by_user),
+            (Some(AWAY), Some(false)),
+            "stepping away is not a choice"
+        );
+        assert_eq!(
+            seen[0].header.steamid,
+            Some(76561197960287930),
+            "as the account"
+        );
     }
 
     #[test]

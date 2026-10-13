@@ -94,7 +94,11 @@ pub struct Account {
     /// Shown as idle because the person has stepped away, and not because they
     /// said so: `status` then reads idle while what they chose is online, and
     /// coming back puts it right without anyone touching it.
-    #[serde(rename = "autoIdle", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "autoIdle",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub auto_idle: bool,
     #[serde(rename = "displayName")]
     pub display_name: String,
@@ -209,7 +213,8 @@ pub struct SneedChatRoomInfo {
 /// other scheme is not a URL to pass on.
 pub fn is_web_url(url: &str) -> bool {
     let lower = url.trim_start().to_ascii_lowercase();
-    (lower.starts_with("https://") || lower.starts_with("http://")) && !url.chars().any(char::is_control)
+    (lower.starts_with("https://") || lower.starts_with("http://"))
+        && !url.chars().any(char::is_control)
 }
 
 /// Why a buffer is not receiving, when the account itself is fine.
@@ -234,11 +239,19 @@ pub struct BufferLink {
 
 impl BufferLink {
     pub fn connecting() -> Self {
-        Self { state: "connecting".to_string(), detail: None, cause: None }
+        Self {
+            state: "connecting".to_string(),
+            detail: None,
+            cause: None,
+        }
     }
 
     pub fn down(cause: &str, detail: impl Into<String>) -> Self {
-        Self { state: "down".to_string(), detail: Some(detail.into()), cause: Some(cause.to_string()) }
+        Self {
+            state: "down".to_string(),
+            detail: Some(detail.into()),
+            cause: Some(cause.to_string()),
+        }
     }
 }
 
@@ -341,7 +354,11 @@ pub struct Buffer {
     /// two are not the same offer: this one was made somewhere else and
     /// cannot be undone from here, and a client that drew them identically
     /// would put an un-mute in front of somebody that does nothing.
-    #[serde(rename = "serverMuted", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "serverMuted",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub server_muted: bool,
     /// Starred on the account itself: Matrix's `m.favourite` tag today.
     ///
@@ -350,12 +367,20 @@ pub struct Buffer {
     /// did here, while this was very likely done in another client and is
     /// what they expect to find when they open this one. Both raise a
     /// conversation to the top of the list.
-    #[serde(rename = "favourite", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "favourite",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub favourite: bool,
     /// The other end of the same idea: `m.lowpriority`, a room the account
     /// has pushed to the bottom of its list. Not muted - it still says when
     /// somebody speaks, it simply stops competing for the top of the rail.
-    #[serde(rename = "lowPriority", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "lowPriority",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub low_priority: bool,
     /// This conversation is the service itself talking to the account.
     ///
@@ -368,7 +393,11 @@ pub struct Buffer {
     ///
     /// Not Matrix-only as an idea - Discord's system messages are the same
     /// thing - so it is named for what it is rather than after the tag.
-    #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(
+        rename = "serviceRoom",
+        default,
+        skip_serializing_if = "std::ops::Not::not"
+    )]
     pub service_room: bool,
     /// What the conversation says it is for: an IRC channel's topic, a Matrix
     /// room's, a Discord channel's. Absent when there is none.
@@ -535,7 +564,11 @@ pub struct Embed {
     pub author: Option<String>,
     /// The colour the service draws that name in, as `#rrggbb` - Kick lets
     /// everybody pick one, and a gift card in somebody's own colour is theirs.
-    #[serde(default, rename = "authorColor", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "authorColor",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub author_color: Option<String>,
     /// The labelled lines a bot puts under the description: "Status - Open".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -920,7 +953,10 @@ impl MemberRank {
     /// Whether this rank can act on other people. Voice is the right to
     /// speak in a moderated channel, not the right to moderate one.
     pub fn can_moderate(self) -> bool {
-        matches!(self, MemberRank::Founder | MemberRank::Op | MemberRank::HalfOp)
+        matches!(
+            self,
+            MemberRank::Founder | MemberRank::Op | MemberRank::HalfOp
+        )
     }
 }
 
@@ -956,19 +992,28 @@ mod tests {
         assert!(keys.contains(&"durationSecs"), "got {keys:?}");
         assert!(keys.contains(&"waveform"), "got {keys:?}");
         assert!(keys.contains(&"voice"), "got {keys:?}");
-        assert!(!keys.iter().any(|k| k.contains('_')), "snake_case leaked: {keys:?}");
+        assert!(
+            !keys.iter().any(|k| k.contains('_')),
+            "snake_case leaked: {keys:?}"
+        );
     }
 
     /// Absent fields are omitted rather than sent as null, so a frontend can
     /// treat presence as meaning "known".
     #[test]
     fn empty_attachment_fields_are_omitted() {
-        let a = Attachment { kind: "file".into(), ..Default::default() };
+        let a = Attachment {
+            kind: "file".into(),
+            ..Default::default()
+        };
         let v = serde_json::to_value(&a).unwrap();
         // `voice` included: false is the ordinary case for every attachment
         // there has ever been, and sending it on all of them would be a flag
         // on the wire that means nothing.
-        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["kind"]);
+        assert_eq!(
+            v.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["kind"]
+        );
     }
 
     fn a_buffer() -> Buffer {
@@ -1003,7 +1048,10 @@ mod tests {
     /// is precisely the symptom this field exists to fix.
     #[test]
     fn a_buffers_channel_id_goes_out_as_remote_id() {
-        let b = Buffer { remote_id: Some("1393001234568164748".into()), ..a_buffer() };
+        let b = Buffer {
+            remote_id: Some("1393001234568164748".into()),
+            ..a_buffer()
+        };
         let v = serde_json::to_value(&b).unwrap();
         assert_eq!(v["remoteId"], "1393001234568164748");
     }
@@ -1033,8 +1081,17 @@ mod tests {
 pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
-        "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:"),
+        "idle" => {
+            account_id.starts_with("discord:")
+                || !(account_id.starts_with("matrix:")
+                    || account_id.starts_with("kick:")
+                    || account_id.starts_with("sneedchat:"))
+        }
+        "invisible" => {
+            account_id.starts_with("discord:")
+                || account_id.starts_with("matrix:")
+                || account_id.starts_with("steam:")
+        }
         _ => false,
     }
 }
@@ -1074,8 +1131,14 @@ mod status_tests {
     #[test]
     fn kick_and_sneedchat_have_nothing_but_do_not_disturb_is_still_a_switch() {
         for account in ["kick:me", "sneedchat:me"] {
-            assert!(status_supported(account, "online") && status_supported(account, "dnd"), "{account}");
-            assert!(!status_supported(account, "idle") && !status_supported(account, "invisible"), "{account}");
+            assert!(
+                status_supported(account, "online") && status_supported(account, "dnd"),
+                "{account}"
+            );
+            assert!(
+                !status_supported(account, "idle") && !status_supported(account, "invisible"),
+                "{account}"
+            );
         }
     }
 }

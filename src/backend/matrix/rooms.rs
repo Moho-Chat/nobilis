@@ -29,7 +29,12 @@ pub struct RoomInfo {
 /// have three people in it and a two-person room need not be one. The count
 /// stays as the fallback for an account whose list has not been read yet, or
 /// one that has never had a DM written to it by any client.
-pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], direct_peer: Option<&str>) -> RoomInfo {
+pub fn derive_room_info(
+    room_id: &str,
+    own_user_id: &str,
+    events: &[&Value],
+    direct_peer: Option<&str>,
+) -> RoomInfo {
     // A direct message this account started, whose other person has been
     // invited and not yet joined. The account's own `m.direct` list often does
     // not have it - a client other than this one may have created the room,
@@ -43,7 +48,10 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
     let invited_peer: Option<&str> = events
         .iter()
         .filter(|e| e["type"].as_str() == Some("m.room.member"))
-        .filter(|e| e["content"]["membership"].as_str() == Some("invite") && e["content"]["is_direct"].as_bool() == Some(true))
+        .filter(|e| {
+            e["content"]["membership"].as_str() == Some("invite")
+                && e["content"]["is_direct"].as_bool() == Some(true)
+        })
         .filter_map(|e| e["state_key"].as_str())
         .find(|who| *who != own_user_id);
     let direct_peer = direct_peer.or(invited_peer);
@@ -75,7 +83,10 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
                 // would leave the conversation labelled with a room id until
                 // they did.
                 if direct_peer.is_some() && event["state_key"].as_str() == direct_peer {
-                    if let Some(display) = event["content"]["displayname"].as_str().filter(|s| !s.is_empty()) {
+                    if let Some(display) = event["content"]["displayname"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                    {
                         peer_name = Some(display.to_string());
                     }
                 }
@@ -83,7 +94,10 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
                     joined_count += 1;
                     let sender = event["sender"].as_str().unwrap_or("");
                     if sender != own_user_id {
-                        let display = event["content"]["displayname"].as_str().filter(|s| !s.is_empty()).unwrap_or(sender);
+                        let display = event["content"]["displayname"]
+                            .as_str()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(sender);
                         other_member_name = Some(display.to_string());
                     }
                 }
@@ -96,7 +110,12 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
     // name and still files it with the conversations, and the kind is what
     // decides where it goes in the rail - so the name and the kind are
     // decided separately rather than one falling out of the other.
-    let kind = if direct_peer.is_some() || (room_name.is_none() && canonical_alias.is_none() && joined_count == 2 && other_member_name.is_some()) {
+    let kind = if direct_peer.is_some()
+        || (room_name.is_none()
+            && canonical_alias.is_none()
+            && joined_count == 2
+            && other_member_name.is_some())
+    {
         "dm"
     } else {
         "channel"
@@ -137,11 +156,16 @@ pub fn derive_room_info(room_id: &str, own_user_id: &str, events: &[&Value], dir
             }
         });
 
-    RoomInfo { name, kind: kind.to_string() }
+    RoomInfo {
+        name,
+        kind: kind.to_string(),
+    }
 }
 
 pub fn is_encrypted(events: &[&Value]) -> bool {
-    events.iter().any(|e| e["type"].as_str() == Some("m.room.encryption"))
+    events
+        .iter()
+        .any(|e| e["type"].as_str() == Some("m.room.encryption"))
 }
 
 /// Whether this room is a Space rather than somewhere you talk.
@@ -219,7 +243,10 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
                 // and anyone can invite anyone, so a `file://` or a bare path
                 // here would be a stranger choosing a file on this computer
                 // for the window to load (#247).
-                if let Some(u) = event["content"]["url"].as_str().filter(|u| u.starts_with("mxc://")) {
+                if let Some(u) = event["content"]["url"]
+                    .as_str()
+                    .filter(|u| u.starts_with("mxc://"))
+                {
                     avatar = Some(u.to_string());
                 }
             }
@@ -228,11 +255,11 @@ pub fn invite_summary(room_id: &str, own_user_id: &str, events: &[&Value]) -> se
             // list, so the state_key has to be checked.
             "m.room.member"
                 if event["state_key"].as_str() == Some(own_user_id)
-                    && event["content"]["membership"].as_str() == Some("invite")
-                => {
-                    inviter = event["sender"].as_str().map(str::to_string);
-                    is_direct = event["content"]["is_direct"].as_bool().unwrap_or(false);
-                }
+                    && event["content"]["membership"].as_str() == Some("invite") =>
+            {
+                inviter = event["sender"].as_str().map(str::to_string);
+                is_direct = event["content"]["is_direct"].as_bool().unwrap_or(false);
+            }
             _ => {}
         }
     }
@@ -285,11 +312,19 @@ mod space_tests {
     /// carried alongside it.
     #[test]
     fn an_unnamed_invite_falls_back_through_alias_to_the_id() {
-        let aliased = vec![json!({ "type": "m.room.canonical_alias", "content": { "alias": "#books:poa.st" } })];
-        assert_eq!(invite_summary("!abc:poa.st", "@me:poa.st", &refs(&aliased))["name"], "#books:poa.st");
+        let aliased = vec![
+            json!({ "type": "m.room.canonical_alias", "content": { "alias": "#books:poa.st" } }),
+        ];
+        assert_eq!(
+            invite_summary("!abc:poa.st", "@me:poa.st", &refs(&aliased))["name"],
+            "#books:poa.st"
+        );
 
         let bare: Vec<Value> = vec![];
-        assert_eq!(invite_summary("!abc:poa.st", "@me:poa.st", &refs(&bare))["name"], "!abc:poa.st");
+        assert_eq!(
+            invite_summary("!abc:poa.st", "@me:poa.st", &refs(&bare))["name"],
+            "!abc:poa.st"
+        );
     }
 
     /// A direct-message invite says so, so it can be shown as a person
@@ -316,10 +351,18 @@ mod space_tests {
     /// small.
     #[test]
     fn the_account_says_which_rooms_are_direct_messages() {
-        let two = vec![member("@me:poa.st", "me", "join"), member("@anna:poa.st", "Anna", "join")];
+        let two = vec![
+            member("@me:poa.st", "me", "join"),
+            member("@anna:poa.st", "Anna", "join"),
+        ];
 
         // Listed: a DM, named after the person, whatever else is in it.
-        let listed = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&two), Some("@anna:poa.st"));
+        let listed = derive_room_info(
+            "!dm:poa.st",
+            "@me:poa.st",
+            &refs(&two),
+            Some("@anna:poa.st"),
+        );
         assert_eq!(listed.kind, "dm");
         assert_eq!(listed.name, "Anna");
 
@@ -330,7 +373,12 @@ mod space_tests {
             member("@anna:poa.st", "Anna", "join"),
             member("@bob:poa.st", "Bob", "join"),
         ];
-        let crowded = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&three), Some("@anna:poa.st"));
+        let crowded = derive_room_info(
+            "!dm:poa.st",
+            "@me:poa.st",
+            &refs(&three),
+            Some("@anna:poa.st"),
+        );
         assert_eq!(crowded.kind, "dm");
         assert_eq!(crowded.name, "Anna");
 
@@ -351,7 +399,12 @@ mod space_tests {
             member("@me:poa.st", "me", "join"),
             member("@anna:poa.st", "Anna", "join"),
         ];
-        let got = derive_room_info("!dm:poa.st", "@me:poa.st", &refs(&events), Some("@anna:poa.st"));
+        let got = derive_room_info(
+            "!dm:poa.st",
+            "@me:poa.st",
+            &refs(&events),
+            Some("@anna:poa.st"),
+        );
         assert_eq!(got.name, "Holiday plans");
         assert_eq!(got.kind, "dm");
 
@@ -366,15 +419,30 @@ mod space_tests {
     /// room id until they did - which on an unanswered invitation is for ever.
     #[test]
     fn a_direct_message_is_named_before_the_other_person_arrives() {
-        let events = vec![member("@me:poa.st", "me", "join"), member("@anna:poa.st", "Anna", "invite")];
-        let got = derive_room_info("!new:poa.st", "@me:poa.st", &refs(&events), Some("@anna:poa.st"));
+        let events = vec![
+            member("@me:poa.st", "me", "join"),
+            member("@anna:poa.st", "Anna", "invite"),
+        ];
+        let got = derive_room_info(
+            "!new:poa.st",
+            "@me:poa.st",
+            &refs(&events),
+            Some("@anna:poa.st"),
+        );
         assert_eq!(got.kind, "dm");
         assert_eq!(got.name, "Anna");
 
         // With no display name anywhere, the mxid - a worse name than a
         // display name and a far better one than a room id.
-        let nameless = vec![json!({ "type": "m.room.member", "state_key": "@anna:poa.st", "content": { "membership": "invite" } })];
-        let got = derive_room_info("!new:poa.st", "@me:poa.st", &refs(&nameless), Some("@anna:poa.st"));
+        let nameless = vec![
+            json!({ "type": "m.room.member", "state_key": "@anna:poa.st", "content": { "membership": "invite" } }),
+        ];
+        let got = derive_room_info(
+            "!new:poa.st",
+            "@me:poa.st",
+            &refs(&nameless),
+            Some("@anna:poa.st"),
+        );
         assert_eq!(got.name, "@anna:poa.st");
     }
 
@@ -413,7 +481,12 @@ mod space_tests {
     fn a_room_with_nothing_to_name_it_after_is_called_empty() {
         let events: Vec<Value> = vec![];
         let refs: Vec<&Value> = events.iter().collect();
-        let info = derive_room_info("!BaHfUc5E49KE2GLZWkdt:matrix.org", "@me:matrix.org", &refs, None);
+        let info = derive_room_info(
+            "!BaHfUc5E49KE2GLZWkdt:matrix.org",
+            "@me:matrix.org",
+            &refs,
+            None,
+        );
         assert!(info.name.starts_with("Empty room ("), "got {}", info.name);
         // The id is kept, shortened, because the name is the buffer's key and
         // two empty rooms must not collapse into one conversation.
@@ -427,9 +500,13 @@ mod space_tests {
     /// anything that was namable.
     #[test]
     fn a_named_room_is_untouched_by_the_empty_fallback() {
-        let events = [json!({ "type": "m.room.name", "state_key": "", "content": { "name": "real name" } })];
+        let events =
+            [json!({ "type": "m.room.name", "state_key": "", "content": { "name": "real name" } })];
         let refs: Vec<&Value> = events.iter().collect();
-        assert_eq!(derive_room_info("!x:matrix.org", "@me:matrix.org", &refs, None).name, "real name");
+        assert_eq!(
+            derive_room_info("!x:matrix.org", "@me:matrix.org", &refs, None).name,
+            "real name"
+        );
     }
 
     #[test]
@@ -439,7 +516,10 @@ mod space_tests {
             json!({ "type": "m.space.child", "state_key": "!b:example.org", "content": { "via": ["example.org"] } }),
             json!({ "type": "m.room.name", "state_key": "", "content": { "name": "not a child" } }),
         ];
-        assert_eq!(space_children(&refs(&events)), vec!["!a:example.org", "!b:example.org"]);
+        assert_eq!(
+            space_children(&refs(&events)),
+            vec!["!a:example.org", "!b:example.org"]
+        );
     }
 
     #[test]
@@ -455,8 +535,12 @@ mod space_tests {
 
     #[test]
     fn the_avatar_is_read_as_an_mxc_uri() {
-        let events = vec![json!({ "type": "m.room.avatar", "content": { "url": "mxc://example.org/abc" } })];
-        assert_eq!(room_avatar_mxc(&refs(&events)).as_deref(), Some("mxc://example.org/abc"));
+        let events =
+            vec![json!({ "type": "m.room.avatar", "content": { "url": "mxc://example.org/abc" } })];
+        assert_eq!(
+            room_avatar_mxc(&refs(&events)).as_deref(),
+            Some("mxc://example.org/abc")
+        );
         assert_eq!(room_avatar_mxc(&[]), None);
     }
 

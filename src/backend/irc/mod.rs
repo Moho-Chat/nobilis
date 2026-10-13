@@ -25,19 +25,19 @@
 //! say `backend::irc::send_message` without knowing which file that is, and
 //! each file opens with `use super::*` to share the import list below.
 pub mod connect;
+pub mod dcc;
 pub mod drafts;
 pub mod history;
 pub mod incoming;
-pub mod presence;
-pub mod who;
-pub mod send;
-pub mod typing;
-pub mod dcc;
-pub mod nickserv;
-pub mod metadata;
-pub mod sts;
-pub mod sasl;
 pub mod latesasl;
+pub mod metadata;
+pub mod nickserv;
+pub mod presence;
+pub mod sasl;
+pub mod send;
+pub mod sts;
+pub mod typing;
+pub mod who;
 
 pub use connect::*;
 pub use history::*;
@@ -45,13 +45,12 @@ pub use history::*;
 // are wanted by the files beside it.
 use incoming::*;
 pub use presence::*;
+pub use sasl::*;
 pub use send::*;
 pub use typing::*;
-pub use sasl::*;
 
 use crate::accounts::IrcAccountConfig;
 use crate::model::MemberRank;
-use nickserv::NickservWait;
 use crate::runtime::{ConnState, IrcHandle};
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Result};
@@ -59,6 +58,7 @@ use futures::prelude::*;
 use irc::client::prelude::*;
 use irc::client::ClientStream;
 use irc::proto::CapSubCommand;
+use nickserv::NickservWait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::time::Duration;

@@ -22,7 +22,13 @@ pub const LITERAL_BRACKET: &str = "[\u{200b}";
 /// What a tag becomes, given what was inside it already read. A card Steam
 /// describes goes in `cards` as well as being words.
 fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) -> String {
-    let wrapped = |mark: &str| if inner.trim().is_empty() { inner.to_string() } else { format!("{mark}{inner}{mark}") };
+    let wrapped = |mark: &str| {
+        if inner.trim().is_empty() {
+            inner.to_string()
+        } else {
+            format!("{mark}{inner}{mark}")
+        }
+    };
     match tag {
         "b" | "h1" | "h2" | "h3" | "h4" | "h5" => wrapped("**"),
         "i" => wrapped("*"),
@@ -37,7 +43,10 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         }
         // Steam writes extra attributes after the address (`fromclient=1`), which
         // are not part of it.
-        "url" => match attr.and_then(|a| a.split_whitespace().next()).filter(|u| is_web(u)) {
+        "url" => match attr
+            .and_then(|a| a.split_whitespace().next())
+            .filter(|u| is_web(u))
+        {
             Some(url) if inner.trim().is_empty() || inner.trim() == url => url.to_string(),
             Some(url) => format!("[{}]({url})", inner.replace(']', "\\]")),
             // `[url]address[/url]`: the address is what was written.
@@ -47,36 +56,68 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         // Named by its `type`, with nothing inside: `[sticker type="Nyan GLaDOS"
         // limit="0"][/sticker]`. A name inside is read too.
         "sticker" => {
-            let named = attr.and_then(|a| attribute(a, "type")).filter(|n| !n.is_empty()).unwrap_or(inner.trim());
-            if super::emoticons::valid_sticker(named) { format!("[steam:sticker:{named}]") } else { inner.to_string() }
+            let named = attr
+                .and_then(|a| attribute(a, "type"))
+                .filter(|n| !n.is_empty())
+                .unwrap_or(inner.trim());
+            if super::emoticons::valid_sticker(named) {
+                format!("[steam:sticker:{named}]")
+            } else {
+                inner.to_string()
+            }
         }
         // A web page Steam's client has looked at and is describing: `[og url="..."
         // title="..." desc="..."]words[/og]`. The words are a link; the description
         // is a card, drawn as any other link's is.
         "og" => match attr.and_then(|a| attribute(a, "url")).filter(|u| is_web(u)) {
             Some(url) => {
-                let field = |name: &str| attr.and_then(|a| attribute(a, name)).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+                let field = |name: &str| {
+                    attr.and_then(|a| attribute(a, name))
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                };
                 let image_url = field("img").filter(|i| is_web(i));
-                cards.push(Embed { url: Some(url.to_string()), title: field("title"), description: field("desc"), provider: host_of(url), image_url, ..Default::default() });
+                cards.push(Embed {
+                    url: Some(url.to_string()),
+                    title: field("title"),
+                    description: field("desc"),
+                    provider: host_of(url),
+                    image_url,
+                    ..Default::default()
+                });
                 let words = inner.trim();
-                if words.is_empty() || words == url { url.to_string() } else { format!("[{}]({url})", words.replace(']', "\\]")) }
+                if words.is_empty() || words == url {
+                    url.to_string()
+                } else {
+                    format!("[{}]({url})", words.replace(']', "\\]"))
+                }
             }
             None => inner.to_string(),
         },
         // What Steam writes for a file sent through its website: the address
         // as an attribute, and again as a link inside, which is not read. A
         // marker the window draws as the picture or video it names.
-        "img" | "video" | "looping_media" if attr.and_then(|a| attribute(a, "src")).is_some_and(is_web) => {
+        "img" | "video" | "looping_media"
+            if attr.and_then(|a| attribute(a, "src")).is_some_and(is_web) =>
+        {
             let kind = if tag == "img" { "image" } else { "video" };
-            format!("\n[steam:{kind}:{}]\n", attr.and_then(|a| attribute(a, "src")).unwrap_or_default())
+            format!(
+                "\n[steam:{kind}:{}]\n",
+                attr.and_then(|a| attribute(a, "src")).unwrap_or_default()
+            )
         }
         // A picture is its address, which is what the link previews read.
         "img" | "docimg" => format!("\n{}\n", inner.trim()),
         "p" => format!("{inner}\n"),
         // Tags that only lay out or colour: what is inside is the message.
-        "center" | "c" | "color" | "bgcolor" | "size" | "smalltext" | "list" | "olist" | "dynamiclink" | "doclink" | "expand" | "table" | "tr" | "td" | "th" => inner.to_string(),
+        "center" | "c" | "color" | "bgcolor" | "size" | "smalltext" | "list" | "olist"
+        | "dynamiclink" | "doclink" | "expand" | "table" | "tr" | "td" | "th" => inner.to_string(),
         // A person named in a group: the words are the name, with its @.
         "mention" => inner.to_string(),
+        // What Steam's own servers wrap a store address in (`[steamstore app="220"]`):
+        // the address is the message, and the window makes a card of it as of any link.
+        "steamstore" => inner.to_string(),
         // Effects are an animation over the window, with nothing to say.
         "roomeffect" => String::new(),
         _ => inner.to_string(),
@@ -86,15 +127,63 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
 /// The site an address is on, without a leading `www.`: what a card says it is from.
 fn host_of(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
-    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?.split(':').next()?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?;
     let host = host.strip_prefix("www.").unwrap_or(host);
     (!host.is_empty()).then(|| host.to_string())
 }
 
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
-    "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention",
+    "b",
+    "i",
+    "u",
+    "strike",
+    "s",
+    "spoiler",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "quote",
+    "pullquote",
+    "url",
+    "emoticon",
+    "sticker",
+    "img",
+    "docimg",
+    "p",
+    "center",
+    "c",
+    "color",
+    "bgcolor",
+    "size",
+    "video",
+    "looping_media",
+    "og",
+    "smalltext",
+    "list",
+    "olist",
+    "dynamiclink",
+    "doclink",
+    "expand",
+    "table",
+    "tr",
+    "td",
+    "th",
+    "roomeffect",
+    "code",
+    "noparse",
+    "hr",
+    "*",
+    "mention",
+    "steamstore",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.
@@ -122,7 +211,8 @@ fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
 
 fn is_web(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    (lower.starts_with("http://") || lower.starts_with("https://")) && !url.contains(char::is_whitespace)
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && !url.contains(char::is_whitespace)
 }
 
 /// The stand-in for a picture: an emoticon or a sticker by name. A name is
@@ -130,7 +220,12 @@ fn is_web(url: &str) -> bool {
 /// dropped; anything else is not a picture's name.
 fn picture(kind: &str, name: &str) -> Option<String> {
     let name = name.trim().trim_matches(':');
-    (!name.is_empty() && name.len() <= 64 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')).then(|| format!("[steam:{kind}:{name}]"))
+    (!name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then(|| format!("[steam:{kind}:{name}]"))
 }
 
 /// A tag read at the start of `s`: its name, its `=value` or attributes, whether it closes, and how
@@ -155,7 +250,9 @@ fn read_tag(s: &str) -> Option<Tag<'_>> {
         Some(i) => (true, i),
         None => (false, inside),
     };
-    let name_len = inside.find(|c: char| !(c.is_ascii_alphanumeric() || c == '*')).unwrap_or(inside.len());
+    let name_len = inside
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '*'))
+        .unwrap_or(inside.len());
     let name = inside[..name_len].to_ascii_lowercase();
     if name.is_empty() || !KNOWN.contains(&name.as_str()) {
         return None;
@@ -168,7 +265,12 @@ fn read_tag(s: &str) -> Option<Tag<'_>> {
         Some(c) if c.is_whitespace() => Some(after.trim()),
         Some(_) => return None,
     };
-    Some(Tag { name, attr, closing, len: end + 2 })
+    Some(Tag {
+        name,
+        attr,
+        closing,
+        len: end + 2,
+    })
 }
 
 /// The text of a message as moho draws it, and the cards Steam described in it.
@@ -243,7 +345,12 @@ fn convert(bbcode: &str, cards: &mut Vec<Embed>) -> String {
                     i += tag.len;
                     continue;
                 } else if !tag.closing && !RAW.contains(&tag.name.as_str()) {
-                    stack.push(Open { tag: tag.name, attr: tag.attr.map(str::to_string), literal: rest[..tag.len].to_string(), out: String::new() });
+                    stack.push(Open {
+                        tag: tag.name,
+                        attr: tag.attr.map(str::to_string),
+                        literal: rest[..tag.len].to_string(),
+                        out: String::new(),
+                    });
                     i += tag.len;
                     continue;
                 } else if tag.closing {
@@ -290,7 +397,11 @@ fn code(inner: &str) -> String {
         format!("\n{fence}\n{}\n{fence}\n", inner.trim_matches('\n'))
     } else {
         let fence = "`".repeat(longest + 1);
-        let pad = if inner.starts_with('`') || inner.ends_with('`') { " " } else { "" };
+        let pad = if inner.starts_with('`') || inner.ends_with('`') {
+            " "
+        } else {
+            ""
+        };
         format!("{fence}{pad}{inner}{pad}{fence}")
     }
 }
@@ -301,9 +412,16 @@ mod tests {
 
     #[test]
     fn the_inline_formats_become_the_marks_the_window_draws() {
-        assert_eq!(to_markup("[b]bold[/b] and [i]italic[/i] and [u]under[/u] and [strike]struck[/strike]"), "**bold** and *italic* and [u]under[/u] and ~~struck~~");
+        assert_eq!(
+            to_markup("[b]bold[/b] and [i]italic[/i] and [u]under[/u] and [strike]struck[/strike]"),
+            "**bold** and *italic* and [u]under[/u] and ~~struck~~"
+        );
         assert_eq!(to_markup("a [spoiler]secret[/spoiler] b"), "a ||secret|| b");
-        assert_eq!(to_markup("[B]shouted[/B]"), "**shouted**", "tags are not case sensitive");
+        assert_eq!(
+            to_markup("[B]shouted[/B]"),
+            "**shouted**",
+            "tags are not case sensitive"
+        );
         assert_eq!(to_markup("[h1]Title[/h1]"), "**Title**");
     }
 
@@ -316,27 +434,82 @@ mod tests {
 
     #[test]
     fn links_are_markdown_links_or_the_address_itself() {
-        assert_eq!(to_markup("[url=https://example.com/a?b=1]the site[/url]"), "[the site](https://example.com/a?b=1)");
-        assert_eq!(to_markup("see [url]https://example.com[/url] now"), "see https://example.com now");
-        assert_eq!(to_markup("[url=https://example.com][/url]"), "https://example.com");
+        assert_eq!(
+            to_markup("[url=https://example.com/a?b=1]the site[/url]"),
+            "[the site](https://example.com/a?b=1)"
+        );
+        assert_eq!(
+            to_markup("see [url]https://example.com[/url] now"),
+            "see https://example.com now"
+        );
+        assert_eq!(
+            to_markup("[url=https://example.com][/url]"),
+            "https://example.com"
+        );
         // Not a web address, so not a link: what was said is shown.
         assert_eq!(to_markup("[url=javascript:alert(1)]click[/url]"), "click");
         // Steam's own writing of a link, with its extra attribute; the address is the first word.
-        assert_eq!(to_markup("[url=https://example.com/x fromclient=1]a link[/url]"), "[a link](https://example.com/x)");
-        assert_eq!(to_markup("see [url=https://example.com/x fromclient=1]https://example.com/x[/url]!"), "see https://example.com/x!", "a link that is its own label is just the address");
-        assert_eq!(to_markup("[url=\"https://example.com\"]quoted[/url]"), "[quoted](https://example.com)");
-        assert_eq!(to_markup("[url=https://e.com]a ] b[/url]"), "[a \\] b](https://e.com)", "a bracket in the label cannot end it early");
+        assert_eq!(
+            to_markup("[url=https://example.com/x fromclient=1]a link[/url]"),
+            "[a link](https://example.com/x)"
+        );
+        assert_eq!(
+            to_markup("see [url=https://example.com/x fromclient=1]https://example.com/x[/url]!"),
+            "see https://example.com/x!",
+            "a link that is its own label is just the address"
+        );
+        assert_eq!(
+            to_markup("[url=\"https://example.com\"]quoted[/url]"),
+            "[quoted](https://example.com)"
+        );
+        assert_eq!(
+            to_markup("[url=https://e.com]a ] b[/url]"),
+            "[a \\] b](https://e.com)",
+            "a bracket in the label cannot end it early"
+        );
+    }
+
+    #[test]
+    fn a_store_address_wrapped_by_steam_is_the_address() {
+        assert_eq!(
+            to_markup(
+                "see [steamstore app=\"220\"]https://store.steampowered.com/app/220/[/steamstore]"
+            ),
+            "see https://store.steampowered.com/app/220/"
+        );
     }
 
     #[test]
     fn emoticons_and_stickers_are_named_pictures() {
-        assert_eq!(to_markup("hi [emoticon]steamhappy[/emoticon]!"), "hi [steam:emote:steamhappy]!");
-        assert_eq!(to_markup("[emoticon]:steamhappy:[/emoticon]"), "[steam:emote:steamhappy]", "colons are not part of the name");
-        assert_eq!(to_markup("[sticker type=\"Nyan GLaDOS\" limit=\"0\"][/sticker]"), "[steam:sticker:Nyan GLaDOS]", "as Steam writes one: named by its type");
-        assert_eq!(to_markup("[sticker type=\"Keyboard Headcrab\" limit=\"0\"][/sticker]"), "[steam:sticker:Keyboard Headcrab]");
-        assert_eq!(to_markup("a [sticker type=\"Cats\" limit=\"1\"]CatSurprise[/sticker] b"), "a [steam:sticker:Cats] b", "the type is the name");
+        assert_eq!(
+            to_markup("hi [emoticon]steamhappy[/emoticon]!"),
+            "hi [steam:emote:steamhappy]!"
+        );
+        assert_eq!(
+            to_markup("[emoticon]:steamhappy:[/emoticon]"),
+            "[steam:emote:steamhappy]",
+            "colons are not part of the name"
+        );
+        assert_eq!(
+            to_markup("[sticker type=\"Nyan GLaDOS\" limit=\"0\"][/sticker]"),
+            "[steam:sticker:Nyan GLaDOS]",
+            "as Steam writes one: named by its type"
+        );
+        assert_eq!(
+            to_markup("[sticker type=\"Keyboard Headcrab\" limit=\"0\"][/sticker]"),
+            "[steam:sticker:Keyboard Headcrab]"
+        );
+        assert_eq!(
+            to_markup("a [sticker type=\"Cats\" limit=\"1\"]CatSurprise[/sticker] b"),
+            "a [steam:sticker:Cats] b",
+            "the type is the name"
+        );
         assert_eq!(to_markup("[sticker][/sticker]"), "", "no name, no sticker");
-        assert_eq!(to_markup("[sticker]CatSurprise[/sticker]"), "[steam:sticker:CatSurprise]", "or the name inside");
+        assert_eq!(
+            to_markup("[sticker]CatSurprise[/sticker]"),
+            "[steam:sticker:CatSurprise]",
+            "or the name inside"
+        );
         // Anything that is not a name is not a picture, and is shown as it was.
         assert_eq!(to_markup("[emoticon]a b[/emoticon]"), "a b");
         assert_eq!(to_markup("[emoticon]x]y[/emoticon]"), "x]y");
@@ -345,15 +518,30 @@ mod tests {
 
     #[test]
     fn quotes_are_lines_of_their_own() {
-        assert_eq!(to_markup("before [quote]one\ntwo[/quote] after"), "before \n> one\n> two\n after");
-        assert_eq!(to_markup("[quote=somebody]said this[/quote]"), "> said this");
+        assert_eq!(
+            to_markup("before [quote]one\ntwo[/quote] after"),
+            "before \n> one\n> two\n after"
+        );
+        assert_eq!(
+            to_markup("[quote=somebody]said this[/quote]"),
+            "> said this"
+        );
     }
 
     #[test]
     fn code_and_noparse_are_not_read() {
-        assert_eq!(to_markup("a [code][b]not bold[/b][/code] b"), "a `[b]not bold[/b]` b");
-        assert_eq!(to_markup("[noparse][b]literally[/b][/noparse]"), "[b]literally[/b]");
-        assert_eq!(to_markup("[code]line one\nline two[/code]"), "```\nline one\nline two\n```");
+        assert_eq!(
+            to_markup("a [code][b]not bold[/b][/code] b"),
+            "a `[b]not bold[/b]` b"
+        );
+        assert_eq!(
+            to_markup("[noparse][b]literally[/b][/noparse]"),
+            "[b]literally[/b]"
+        );
+        assert_eq!(
+            to_markup("[code]line one\nline two[/code]"),
+            "```\nline one\nline two\n```"
+        );
         // A backtick inside code cannot end it: the fence is longer than any run.
         assert_eq!(to_markup("[code]a `tick` b[/code]"), "``a `tick` b``");
         // An unclosed code is text, and what follows is still read.
@@ -362,44 +550,96 @@ mod tests {
 
     #[test]
     fn what_cannot_be_read_is_shown_as_it_was_written() {
-        assert_eq!(to_markup("[nosuchtag]x[/nosuchtag]"), "[nosuchtag]x[/nosuchtag]");
+        assert_eq!(
+            to_markup("[nosuchtag]x[/nosuchtag]"),
+            "[nosuchtag]x[/nosuchtag]"
+        );
         assert_eq!(to_markup("[b]never closed"), "[b]never closed");
-        assert_eq!(to_markup("closed [/b] with nothing open"), "closed [/b] with nothing open");
-        assert_eq!(to_markup("[b]wrong [i]order[/b] here[/i]"), "**wrong [i]order** here[/i]", "closing an outer tag closes what was left open inside it");
-        assert_eq!(to_markup("a [ lone bracket and [b"), "a [ lone bracket and [b");
+        assert_eq!(
+            to_markup("closed [/b] with nothing open"),
+            "closed [/b] with nothing open"
+        );
+        assert_eq!(
+            to_markup("[b]wrong [i]order[/b] here[/i]"),
+            "**wrong [i]order** here[/i]",
+            "closing an outer tag closes what was left open inside it"
+        );
+        assert_eq!(
+            to_markup("a [ lone bracket and [b"),
+            "a [ lone bracket and [b"
+        );
         assert_eq!(to_markup(""), "");
     }
 
     #[test]
     fn an_escaped_bracket_is_a_bracket_somebody_typed() {
-        assert_eq!(to_markup("not \\[b]bold\\[/b]"), "not [\u{200b}b]bold[\u{200b}/b]", "a bracket the window will not take for a tag");
-        assert_eq!(to_markup("\\[emoticon]x\\[/emoticon]"), "[\u{200b}emoticon]x[\u{200b}/emoticon]");
-        assert_eq!(to_markup("\\[steam:emote:x]"), "[\u{200b}steam:emote:x]", "nor for a picture");
+        assert_eq!(
+            to_markup("not \\[b]bold\\[/b]"),
+            "not [\u{200b}b]bold[\u{200b}/b]",
+            "a bracket the window will not take for a tag"
+        );
+        assert_eq!(
+            to_markup("\\[emoticon]x\\[/emoticon]"),
+            "[\u{200b}emoticon]x[\u{200b}/emoticon]"
+        );
+        assert_eq!(
+            to_markup("\\[steam:emote:x]"),
+            "[\u{200b}steam:emote:x]",
+            "nor for a picture"
+        );
     }
 
     #[test]
     fn lists_effects_and_layout_do_not_get_in_the_way() {
         assert_eq!(to_markup("[list][*]one[*]two[/list]"), "• one\n• two");
-        assert_eq!(to_markup("[color=red]coloured[/color] [size=5]big[/size]"), "coloured big");
-        assert_eq!(to_markup("[roomeffect]fireworks[/roomeffect]hello"), "hello");
+        assert_eq!(
+            to_markup("[color=red]coloured[/color] [size=5]big[/size]"),
+            "coloured big"
+        );
+        assert_eq!(
+            to_markup("[roomeffect]fireworks[/roomeffect]hello"),
+            "hello"
+        );
         assert_eq!(to_markup("a[hr]b"), "a\nb");
-        assert_eq!(to_markup("[img]https://example.com/a.png[/img]"), "https://example.com/a.png");
+        assert_eq!(
+            to_markup("[img]https://example.com/a.png[/img]"),
+            "https://example.com/a.png"
+        );
         let ugc = "https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/";
         let video = "https://cdn.steamusercontent.com/ugc/9279387166147417773/0642C6E9889E1C2419DD7F85743538C67DD8CA36/";
         // As Steam writes them: the address unquoted, long, and again inside as a link.
         let picture = format!("[img src={ugc} thumbnail_src={ugc} srcset=\"\" width=479 height=450][url={ugc}]{ugc}[/url][/img]");
         assert_eq!(to_markup(&picture), format!("[steam:image:{ugc}]"));
-        let clip = format!("[video src={video} type=video/webm steamvideo=true][url={video}]{video}[/url][/video]");
+        let clip = format!(
+            "[video src={video} type=video/webm steamvideo=true][url={video}]{video}[/url][/video]"
+        );
         assert_eq!(to_markup(&clip), format!("[steam:video:{video}]"));
-        assert_eq!(to_markup(&format!("[spoiler]{clip}[/spoiler]")), format!("||\n[steam:video:{video}]\n||"), "hidden, as the sender chose");
-        assert_eq!(to_markup(&format!("look {picture} nice")), format!("look \n[steam:image:{ugc}]\n nice"));
-        assert_eq!(to_markup("[img src=\"https://x.test/a.png\" width=\"9\"][/img]"), "[steam:image:https://x.test/a.png]", "quoted too");
+        assert_eq!(
+            to_markup(&format!("[spoiler]{clip}[/spoiler]")),
+            format!("||\n[steam:video:{video}]\n||"),
+            "hidden, as the sender chose"
+        );
+        assert_eq!(
+            to_markup(&format!("look {picture} nice")),
+            format!("look \n[steam:image:{ugc}]\n nice")
+        );
+        assert_eq!(
+            to_markup("[img src=\"https://x.test/a.png\" width=\"9\"][/img]"),
+            "[steam:image:https://x.test/a.png]",
+            "quoted too"
+        );
     }
 
     #[test]
     fn plain_text_passes_through_untouched_including_what_is_not_ascii() {
-        assert_eq!(to_markup("héllo wörld 日本語 😀 [not a tag"), "héllo wörld 日本語 😀 [not a tag");
-        assert_eq!(to_markup("2 < 3 && <b>html</b> is text"), "2 < 3 && <b>html</b> is text");
+        assert_eq!(
+            to_markup("héllo wörld 日本語 😀 [not a tag"),
+            "héllo wörld 日本語 😀 [not a tag"
+        );
+        assert_eq!(
+            to_markup("2 < 3 && <b>html</b> is text"),
+            "2 < 3 && <b>html</b> is text"
+        );
     }
 
     #[test]
@@ -418,31 +658,67 @@ mod tests {
         // As the official client sends one.
         let sent = "[og url=\"http://x.salastil.com\" title=\"Home\" desc=\"A privacy-focused Twitter/X frontend\"]x.salastil.com[/og]";
         let rendered = render_message(sent);
-        assert_eq!(rendered.text, "[x.salastil.com](http://x.salastil.com)", "a link, on the words that were shown");
+        assert_eq!(
+            rendered.text, "[x.salastil.com](http://x.salastil.com)",
+            "a link, on the words that were shown"
+        );
         assert_eq!(rendered.cards.len(), 1);
         let card = &rendered.cards[0];
         assert_eq!(
-            (card.url.as_deref(), card.title.as_deref(), card.description.as_deref(), card.provider.as_deref()),
-            (Some("http://x.salastil.com"), Some("Home"), Some("A privacy-focused Twitter/X frontend"), Some("x.salastil.com"))
+            (
+                card.url.as_deref(),
+                card.title.as_deref(),
+                card.description.as_deref(),
+                card.provider.as_deref()
+            ),
+            (
+                Some("http://x.salastil.com"),
+                Some("Home"),
+                Some("A privacy-focused Twitter/X frontend"),
+                Some("x.salastil.com")
+            )
         );
         // The words, with others around them; a repeat of the address; no description.
         let more = render_message("see [og url=\"https://www.example.com/a?b=1\" title=\"T\"]https://www.example.com/a?b=1[/og] ok");
         assert_eq!(more.text, "see https://www.example.com/a?b=1 ok");
-        assert_eq!((more.cards[0].provider.as_deref(), more.cards[0].description.as_deref()), (Some("example.com"), None), "no leading www, and no description invented");
+        assert_eq!(
+            (
+                more.cards[0].provider.as_deref(),
+                more.cards[0].description.as_deref()
+            ),
+            (Some("example.com"), None),
+            "no leading www, and no description invented"
+        );
         // A picture on the card, where the page has one.
         let pictured = render_message("[og url=\"https://x.test/p\" img=\"https://community.steamstatic.com/chat/image/abc/share_image\" title=\"T\" desc=\"D\"]https://x.test/p[/og]");
-        assert_eq!(pictured.cards[0].image_url.as_deref(), Some("https://community.steamstatic.com/chat/image/abc/share_image"));
+        assert_eq!(
+            pictured.cards[0].image_url.as_deref(),
+            Some("https://community.steamstatic.com/chat/image/abc/share_image")
+        );
         assert_eq!(pictured.text, "https://x.test/p");
         // Not a web address: nothing to make a card of.
-        assert!(render_message("[og url=\"javascript:alert(1)\" title=\"x\"]words[/og]").cards.is_empty());
+        assert!(
+            render_message("[og url=\"javascript:alert(1)\" title=\"x\"]words[/og]")
+                .cards
+                .is_empty()
+        );
         assert_eq!(to_markup("[og title=\"x\"]just words[/og]"), "just words");
         assert!(render_message("plain https://example.com").cards.is_empty());
     }
 
     #[test]
     fn a_link_keeps_its_address_and_its_words() {
-        assert_eq!(to_markup("[url=http://salastil.com]salastil.com[/url]"), "[salastil.com](http://salastil.com)");
-        assert_eq!(to_markup("[url=https://salastil.com]https://salastil.com[/url]"), "https://salastil.com");
-        assert_eq!(to_markup("[url=https://example.com/a fromclient=1]look[/url]"), "[look](https://example.com/a)");
+        assert_eq!(
+            to_markup("[url=http://salastil.com]salastil.com[/url]"),
+            "[salastil.com](http://salastil.com)"
+        );
+        assert_eq!(
+            to_markup("[url=https://salastil.com]https://salastil.com[/url]"),
+            "https://salastil.com"
+        );
+        assert_eq!(
+            to_markup("[url=https://example.com/a fromclient=1]look[/url]"),
+            "[look](https://example.com/a)"
+        );
     }
 }

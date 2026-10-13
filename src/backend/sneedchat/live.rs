@@ -47,7 +47,10 @@ impl Drop for LiveGuard {
         let mut all = registry().lock().unwrap();
         // Only if it is still this connection's: a newer one may already
         // have taken the account over, and its rooms are not ours to stop.
-        if all.get(&self.account_id).is_some_and(|current| Arc::ptr_eq(current, &self.live)) {
+        if all
+            .get(&self.account_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.live))
+        {
             all.remove(&self.account_id);
         }
         drop(all);
@@ -59,7 +62,13 @@ impl Drop for LiveGuard {
 
 /// Registers a freshly signed-in account. Its rooms are started by
 /// `sync_rooms`, which the caller runs next.
-pub(super) fn install(account_id: &str, transport: Transport, session: Session, host: String, config: &SneedChatAccountConfig) -> LiveGuard {
+pub(super) fn install(
+    account_id: &str,
+    transport: Transport,
+    session: Session,
+    host: String,
+    config: &SneedChatAccountConfig,
+) -> LiveGuard {
     let live = Arc::new(Live {
         transport,
         session,
@@ -70,8 +79,14 @@ pub(super) fn install(account_id: &str, transport: Transport, session: Session, 
         whisper_room: Arc::new(AtomicU32::new(0)),
         rooms: Mutex::new(HashMap::new()),
     });
-    registry().lock().unwrap().insert(account_id.to_string(), live.clone());
-    LiveGuard { account_id: account_id.to_string(), live }
+    registry()
+        .lock()
+        .unwrap()
+        .insert(account_id.to_string(), live.clone());
+    LiveGuard {
+        account_id: account_id.to_string(),
+        live,
+    }
 }
 
 /// Brings an account's running rooms into line with its configured ones:
@@ -83,8 +98,12 @@ pub(super) fn install(account_id: &str, transport: Transport, session: Session, 
 /// to remove a room's buffer knows no message from it can arrive afterwards
 /// and bring the buffer back.
 pub fn sync_rooms(state: &AppState, account_id: &str) {
-    let Some(live) = registry().lock().unwrap().get(account_id).cloned() else { return };
-    let Some(config) = state.accounts.get_sneedchat(account_id) else { return };
+    let Some(live) = registry().lock().unwrap().get(account_id).cloned() else {
+        return;
+    };
+    let Some(config) = state.accounts.get_sneedchat(account_id) else {
+        return;
+    };
     let wanted = config.rooms;
 
     let mut running = live.rooms.lock().unwrap();
@@ -95,7 +114,8 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
         }
         keep
     });
-    live.whisper_room.store(wanted.first().map(|r| r.id).unwrap_or(0), Ordering::Relaxed);
+    live.whisper_room
+        .store(wanted.first().map(|r| r.id).unwrap_or(0), Ordering::Relaxed);
     for room in wanted {
         if running.contains_key(&room.id) {
             continue;
@@ -103,7 +123,10 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
         let (state, live2, account_id) = (state.clone(), live.clone(), account_id.to_string());
         let id = room.id;
         let task = tokio::spawn(async move {
-            let creds = Credentials { username: live2.username.clone(), password: live2.password.clone() };
+            let creds = Credentials {
+                username: live2.username.clone(),
+                password: live2.password.clone(),
+            };
             let two_factor = match &live2.totp_secret {
                 Some(secret) => match totp::decode_secret(secret) {
                     Ok(bytes) => TwoFactor::Totp(bytes),
@@ -111,7 +134,18 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
                 },
                 None => TwoFactor::None,
             };
-            run_room(&state, &live2.transport, &live2.session, &creds, &two_factor, &account_id, &live2.host, &room, live2.whisper_room.clone()).await;
+            run_room(
+                &state,
+                &live2.transport,
+                &live2.session,
+                &creds,
+                &two_factor,
+                &account_id,
+                &live2.host,
+                &room,
+                live2.whisper_room.clone(),
+            )
+            .await;
         });
         running.insert(id, task.abort_handle());
     }
@@ -123,12 +157,19 @@ pub fn sync_rooms(state: &AppState, account_id: &str) {
 /// Answers false for a buffer that is not one of the account's rooms - a
 /// whisper conversation - which has nothing to leave.
 pub fn leave_room(state: &AppState, account_id: &str, buffer_name: &str) -> Result<bool> {
-    let config = state.accounts.get_sneedchat(account_id).ok_or_else(|| anyhow!("no such account"))?;
+    let config = state
+        .accounts
+        .get_sneedchat(account_id)
+        .ok_or_else(|| anyhow!("no such account"))?;
     let name = room_name_of(buffer_name);
     if !config.rooms.iter().any(|r| r.name == name) {
         return Ok(false);
     }
-    let remaining: Vec<SneedChatRoom> = config.rooms.into_iter().filter(|r| r.name != name).collect();
+    let remaining: Vec<SneedChatRoom> = config
+        .rooms
+        .into_iter()
+        .filter(|r| r.name != name)
+        .collect();
     state.accounts.set_sneedchat_rooms(account_id, remaining)?;
     sync_rooms(state, account_id);
     forget_room(state, account_id, buffer_name);
@@ -138,8 +179,15 @@ pub fn leave_room(state: &AppState, account_id: &str, buffer_name: &str) -> Resu
 /// Sets an account's rooms outright - the Join page's list - opening and
 /// closing what changed, and deleting what was closed along with its history.
 pub fn set_rooms(state: &AppState, account_id: &str, rooms: Vec<SneedChatRoom>) -> Result<bool> {
-    let Some(before) = state.accounts.get_sneedchat(account_id) else { return Ok(false) };
-    let closed: Vec<SneedChatRoom> = before.rooms.iter().filter(|old| !rooms.iter().any(|r| r.id == old.id)).cloned().collect();
+    let Some(before) = state.accounts.get_sneedchat(account_id) else {
+        return Ok(false);
+    };
+    let closed: Vec<SneedChatRoom> = before
+        .rooms
+        .iter()
+        .filter(|old| !rooms.iter().any(|r| r.id == old.id))
+        .cloned()
+        .collect();
     if !state.accounts.set_sneedchat_rooms(account_id, rooms)? {
         return Ok(false);
     }
@@ -185,14 +233,20 @@ fn forget_room(state: &AppState, account_id: &str, buffer_name: &str) {
 /// fetched for them and written into the body as a `file://` link (see
 /// `spawn_attachment_resolve`). Only files inside `cache`: a body is text from
 /// the site, and nothing in it decides what gets deleted outside the cache.
-pub(super) fn cached_files_named_in(bodies: &[String], cache: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(super) fn cached_files_named_in(
+    bodies: &[String],
+    cache: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
     let prefix = format!("file://{}/", cache.display());
     let mut found = Vec::new();
     for body in bodies {
         let mut rest = body.as_str();
         while let Some(at) = rest.find(&prefix) {
             let tail = &rest[at + prefix.len()..];
-            let name: String = tail.chars().take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).collect();
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                .collect();
             if !name.is_empty() && !name.starts_with('.') {
                 let path = cache.join(&name);
                 if !found.contains(&path) {
@@ -213,12 +267,19 @@ mod tests {
     fn only_files_inside_the_cache_are_named() {
         let cache = std::path::Path::new("/home/u/.cache/nobilis/sneedchat-attachments");
         let bodies = vec![
-            format!("look file://{}/9609686.png and again file://{}/9609686.png", cache.display(), cache.display()),
+            format!(
+                "look file://{}/9609686.png and again file://{}/9609686.png",
+                cache.display(),
+                cache.display()
+            ),
             format!("[img]file://{}/42.webp[/img]", cache.display()),
             "file:///etc/passwd and file://somewhere/else.png".to_string(),
             format!("file://{}/../../secret", cache.display()),
         ];
         let found = cached_files_named_in(&bodies, cache);
-        assert_eq!(found, vec![cache.join("9609686.png"), cache.join("42.webp")]);
+        assert_eq!(
+            found,
+            vec![cache.join("9609686.png"), cache.join("42.webp")]
+        );
     }
 }

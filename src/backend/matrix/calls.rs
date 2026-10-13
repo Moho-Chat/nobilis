@@ -24,8 +24,8 @@
 
 use serde_json::{json, Value};
 
-use anyhow::Context;
 use crate::state::AppState;
+use anyhow::Context;
 
 /// Events a client has to see to be one end of a call.
 ///
@@ -51,7 +51,9 @@ pub fn handle(
     // Which of this account's devices sent it. A call answered on a phone is
     // answered by the same user, and without this the desktop cannot tell
     // "somebody else took it" from its own echo.
-    let device = content["party_id"].as_str().or_else(|| content["device_id"].as_str());
+    let device = content["party_id"]
+        .as_str()
+        .or_else(|| content["device_id"].as_str());
 
     state.events.emit(
         "matrixCall",
@@ -121,7 +123,12 @@ pub async fn turn_servers(state: &AppState, account_id: &str) -> anyhow::Result<
         .get_matrix(account_id)
         .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let base = account.homeserver_url.trim_end_matches('/');
-    let mut answer = match super::http::get_json(&format!("{base}/_matrix/client/v3/voip/turnServer"), &account.access_token).await {
+    let mut answer = match super::http::get_json(
+        &format!("{base}/_matrix/client/v3/voip/turnServer"),
+        &account.access_token,
+    )
+    .await
+    {
         Ok(answer) => answer,
         // A server with no relay configured answers 404, and that is not an
         // error: it means "there is no relay", which a client can still make
@@ -176,7 +183,9 @@ pub const TRANSPORT_MESH: &str = "moho.mesh";
 /// the MSC3757 versions restrict it properly and take the bare form.
 pub fn membership_state_key(user_id: &str, device_id: &str, room_version: &str) -> String {
     let key = format!("{user_id}_{device_id}_m.call");
-    if room_version.starts_with("org.matrix.msc3757") || room_version.starts_with("org.matrix.msc3779") {
+    if room_version.starts_with("org.matrix.msc3757")
+        || room_version.starts_with("org.matrix.msc3779")
+    {
         key
     } else {
         format!("_{key}")
@@ -200,13 +209,19 @@ pub async fn set_membership(
     // The media server this end is on, where it is on one.
     focus: Option<Value>,
 ) -> anyhow::Result<()> {
-    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let room_id = state
         .runtime
         .get_matrix_room(buffer_id)
         .ok_or_else(|| anyhow::anyhow!("no known Matrix room for this buffer"))?;
     let now = chrono::Utc::now().timestamp_millis();
-    let version = state.runtime.matrix_room_version(account_id, &room_id).unwrap_or_default();
+    let version = state
+        .runtime
+        .matrix_room_version(account_id, &room_id)
+        .unwrap_or_default();
     let state_key = membership_state_key(&account.user_id, device_id, &version);
 
     // One event per device, so leaving on the desktop does not take the phone
@@ -251,7 +266,15 @@ pub async fn set_membership(
         json!({})
     };
 
-    let result = super::put_room_state(state, account_id, &room_id, EVENT_MEMBER, &state_key, content).await;
+    let result = super::put_room_state(
+        state,
+        account_id,
+        &room_id,
+        EVENT_MEMBER,
+        &state_key,
+        content,
+    )
+    .await;
     if let Err(e) = &result {
         // The refusal that has an explanation worth giving.
         if e.to_string().contains("M_FORBIDDEN") {
@@ -275,7 +298,9 @@ pub async fn set_membership(
 /// room could not be reconfigured would be worse than a call only some people
 /// can join.
 async fn allow_everybody_to_join(state: &AppState, account_id: &str, room_id: &str) {
-    let Some(account) = state.accounts.get_matrix(account_id) else { return };
+    let Some(account) = state.accounts.get_matrix(account_id) else {
+        return;
+    };
     let base = account.homeserver_url.trim_end_matches('/');
     let encoded = url::form_urlencoded::byte_serialize(room_id.as_bytes()).collect::<String>();
     // Read from the server, not from the cache.
@@ -293,7 +318,9 @@ async fn allow_everybody_to_join(state: &AppState, account_id: &str, room_id: &s
     )
     .await
     else {
-        tracing::debug!("matrix[{account_id}]: cannot read {room_id}'s permissions, leaving them alone");
+        tracing::debug!(
+            "matrix[{account_id}]: cannot read {room_id}'s permissions, leaving them alone"
+        );
         return;
     };
     // Nothing to change, and nothing that could go wrong by not trying.
@@ -334,10 +361,17 @@ pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Va
     }
     // The MSC4143 shape.
     if let Some(member) = content.get("member").and_then(|m| m.as_object()) {
-        let device = member.get("device_id").and_then(|d| d.as_str()).unwrap_or_default();
+        let device = member
+            .get("device_id")
+            .and_then(|d| d.as_str())
+            .unwrap_or_default();
         let transports: Vec<String> = content["transports"]["published"]
             .as_array()
-            .map(|list| list.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|t| t["type"].as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         return Some(json!({
             "user_id": member.get("user_id").and_then(|u| u.as_str()).unwrap_or(user_id),
@@ -360,8 +394,14 @@ pub fn read_membership(user_id: &str, content: &Value, now_ms: i64) -> Option<Va
     if expires_ts <= now_ms {
         return None;
     }
-    let foci = content["foci_preferred"].as_array().cloned().unwrap_or_default();
-    let transports: Vec<String> = foci.iter().filter_map(|t| t["type"].as_str().map(String::from)).collect();
+    let foci = content["foci_preferred"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let transports: Vec<String> = foci
+        .iter()
+        .filter_map(|t| t["type"].as_str().map(String::from))
+        .collect();
     Some(json!({
         "user_id": user_id,
         "membership": {
@@ -391,14 +431,24 @@ pub fn handle_key_event(state: &AppState, account_id: &str, event: &Value) {
         return;
     }
     let content = &event["content"];
-    let Some(room_id) = content["room_id"].as_str() else { return };
-    let Some(key) = content["keys"]["key"].as_str() else { return };
-    let Some(sender) = event["sender"].as_str() else { return };
+    let Some(room_id) = content["room_id"].as_str() else {
+        return;
+    };
+    let Some(key) = content["keys"]["key"].as_str() else {
+        return;
+    };
+    let Some(sender) = event["sender"].as_str() else {
+        return;
+    };
     // Whose device it is. Claimed by the sender rather than proven, which is
     // what Element does too - the Olm session is what proves the account, and
     // the device id only says which of their devices to draw it against.
-    let device = content["member"]["claimed_device_id"].as_str().unwrap_or_default();
-    let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else { return };
+    let device = content["member"]["claimed_device_id"]
+        .as_str()
+        .unwrap_or_default();
+    let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) else {
+        return;
+    };
     state.events.emit(
         "matrixCallKey",
         json!({
@@ -424,12 +474,18 @@ pub async fn send_key(
     key: &str,
     index: i64,
 ) -> anyhow::Result<usize> {
-    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let room_id = state
         .runtime
         .get_matrix_room(buffer_id)
         .ok_or_else(|| anyhow::anyhow!("no known Matrix room for this buffer"))?;
-    let session = state.runtime.get_matrix_machine(account_id).ok_or_else(|| anyhow::anyhow!("this account has no encryption set up"))?;
+    let session = state
+        .runtime
+        .get_matrix_machine(account_id)
+        .ok_or_else(|| anyhow::anyhow!("this account has no encryption set up"))?;
 
     let now = chrono::Utc::now().timestamp_millis();
     let targets: Vec<(ruma_common::OwnedUserId, String)> = state
@@ -444,7 +500,10 @@ pub async fn send_key(
             if user == account.user_id && device == account.device_id {
                 return None;
             }
-            Some((ruma_common::OwnedUserId::try_from(user).ok()?, device.to_string()))
+            Some((
+                ruma_common::OwnedUserId::try_from(user).ok()?,
+                device.to_string(),
+            ))
         })
         .collect();
 
@@ -459,7 +518,13 @@ pub async fn send_key(
         "sent_ts": now,
     });
     session
-        .send_to_device_encrypted(&account.homeserver_url, &account.access_token, EVENT_KEYS, &content, &targets)
+        .send_to_device_encrypted(
+            &account.homeserver_url,
+            &account.access_token,
+            EVENT_KEYS,
+            &content,
+            &targets,
+        )
         .await
 }
 
@@ -481,15 +546,28 @@ pub async fn find_focus(state: &AppState, account_id: &str, room_id: &str) -> Op
         return Some(Value::Object(focus.clone()));
     }
     let account = state.accounts.get_matrix(account_id)?;
-    if let Some(url) = account.rtc_focus_url.as_deref().filter(|u| !u.trim().is_empty()) {
+    if let Some(url) = account
+        .rtc_focus_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+    {
         return Some(json!({ "type": "livekit", "livekit_service_url": url.trim() }));
     }
     // The homeserver's own answer. Fetched rather than remembered: it changes
     // when somebody sets a server up for calls, which is exactly when a
     // client that cached "none" would be wrong.
     let base = account.homeserver_url.trim_end_matches('/');
-    let host = base.split("://").nth(1).unwrap_or(base).split('/').next().unwrap_or(base);
-    let well_known = super::http::get_json(&format!("https://{host}/.well-known/matrix/client"), "").await.ok()?;
+    let host = base
+        .split("://")
+        .nth(1)
+        .unwrap_or(base)
+        .split('/')
+        .next()
+        .unwrap_or(base);
+    let well_known =
+        super::http::get_json(&format!("https://{host}/.well-known/matrix/client"), "")
+            .await
+            .ok()?;
     well_known["org.matrix.msc4143.rtc_foci"]
         .as_array()?
         .iter()
@@ -504,8 +582,16 @@ pub async fn find_focus(state: &AppState, account_id: &str, room_id: &str) -> Op
 /// homeserver saying "this really is who they claim to be" in a form a third
 /// party can verify by asking the homeserver back. That is exchanged for a
 /// LiveKit URL and a JWT good for one room.
-pub async fn rtc_token(state: &AppState, account_id: &str, room_id: &str, focus: &Value) -> anyhow::Result<Value> {
-    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+pub async fn rtc_token(
+    state: &AppState,
+    account_id: &str,
+    room_id: &str,
+    focus: &Value,
+) -> anyhow::Result<Value> {
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let base = account.homeserver_url.trim_end_matches('/');
     let openid = super::http::post_json(
         &format!(
@@ -581,7 +667,10 @@ pub const SLOT_ROOM_CALL: &str = "m.call#ROOM";
 /// These are single-use in practice: the service redeems the token against the
 /// homeserver, and a token already redeemed will not verify again.
 async fn openid_again(state: &AppState, account_id: &str) -> anyhow::Result<Value> {
-    let account = state.accounts.get_matrix(account_id).ok_or_else(|| anyhow::anyhow!("account not connected"))?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .ok_or_else(|| anyhow::anyhow!("account not connected"))?;
     let base = account.homeserver_url.trim_end_matches('/');
     super::http::post_json(
         &format!(
@@ -622,7 +711,12 @@ mod member_tests {
 
     #[test]
     fn elements_own_membership_is_read() {
-        let read = read_membership("@them:example.org", &element_membership(1_000, 4_000), 2_000).unwrap();
+        let read = read_membership(
+            "@them:example.org",
+            &element_membership(1_000, 4_000),
+            2_000,
+        )
+        .unwrap();
         assert_eq!(read["user_id"], "@them:example.org");
         assert_eq!(read["membership"]["device_id"], "ELEMENTDEV");
         // created_ts + expires, because `expires` is a duration rather than a
@@ -634,17 +728,27 @@ mod member_tests {
     #[test]
     fn a_membership_past_its_stamp_is_not_a_participant() {
         // Created long ago and short-lived: somebody whose client died.
-        assert!(read_membership("@them:example.org", &element_membership(1_000, 500), 9_000).is_none());
+        assert!(
+            read_membership("@them:example.org", &element_membership(1_000, 500), 9_000).is_none()
+        );
         // And an emptied event, which is how leaving is spelled.
         assert!(read_membership("@them:example.org", &json!({}), 1_000).is_none());
     }
 
     #[test]
     fn a_membership_carries_the_media_server_it_is_on() {
-        let read = read_membership("@them:example.org", &element_membership(1_000, 9_000), 2_000).unwrap();
+        let read = read_membership(
+            "@them:example.org",
+            &element_membership(1_000, 9_000),
+            2_000,
+        )
+        .unwrap();
         // Everybody in a call has to be where the media already is, so this
         // is what a client joining afterwards connects to.
-        assert_eq!(read["focus"]["livekit_service_url"], "https://livekit-jwt.call.matrix.org");
+        assert_eq!(
+            read["focus"]["livekit_service_url"],
+            "https://livekit-jwt.call.matrix.org"
+        );
         let mesh = json!({ "application": "m.call", "device_id": "D", "created_ts": 1_000, "expires": 9_000,
                            "foci_preferred": [{ "type": "moho.mesh" }] });
         assert!(read_membership("@a:example.org", &mesh, 2_000).unwrap()["focus"].is_null());

@@ -31,7 +31,9 @@ pub fn is_channel(target: &str) -> bool {
 pub(super) fn notice_is_administrative(prefix: Option<&Prefix>, body: &str) -> bool {
     // The server itself, which is not somebody you can reply to. Its prefix
     // is a bare hostname with no nick attached.
-    let Some(Prefix::Nickname(nick, _, host)) = prefix else { return true };
+    let Some(Prefix::Nickname(nick, _, host)) = prefix else {
+        return true;
+    };
     // A reply to a CTCP query - VERSION, PING, TIME - which travels as a
     // notice but is protocol chatter rather than anything anybody said.
     if body.starts_with('\u{1}') {
@@ -110,9 +112,15 @@ pub(super) async fn handle_message(
         let host = userhost_of(prefix.as_ref());
         let mut touched: Vec<String> = Vec::new();
         for (channel, members) in channels.iter_mut() {
-            let Some(who) = members.get_mut(&from) else { continue };
+            let Some(who) = members.get_mut(&from) else {
+                continue;
+            };
             let before = who.clone();
-            who.learn(host.as_deref(), tagged_account.as_deref(), tagged_bot.then_some(true));
+            who.learn(
+                host.as_deref(),
+                tagged_account.as_deref(),
+                tagged_bot.then_some(true),
+            );
             if *who != before {
                 touched.push(channel.clone());
             }
@@ -145,7 +153,10 @@ pub(super) async fn handle_message(
 
     match msg.command {
         Command::PRIVMSG(target, body) => {
-            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            let own = state
+                .runtime
+                .irc_current_nick(account_id)
+                .unwrap_or_else(|| own_nick.to_string());
             let (buffer_name, kind) = if is_channel(&target) {
                 (target.clone(), "channel")
             } else if from.eq_ignore_ascii_case(&own) {
@@ -164,9 +175,47 @@ pub(super) async fn handle_message(
                 return;
             }
             if let Some(action_body) = strip_action(&body) {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, action_body, true, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+                state.runtime.record_message_at(
+                    state,
+                    account_id,
+                    &buffer_name,
+                    kind,
+                    &from,
+                    action_body,
+                    true,
+                    "chat",
+                    None,
+                    msg_id,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    sent_at,
+                    None,
+                    None,
+                );
             } else {
-                state.runtime.record_message_at(state, account_id, &buffer_name, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+                state.runtime.record_message_at(
+                    state,
+                    account_id,
+                    &buffer_name,
+                    kind,
+                    &from,
+                    &body,
+                    false,
+                    "chat",
+                    None,
+                    msg_id,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    sent_at,
+                    None,
+                    None,
+                );
             }
         }
 
@@ -188,10 +237,45 @@ pub(super) async fn handle_message(
                 wait.notice(&from, &body);
             }
             if is_channel(&target) {
-                state.runtime.record_message(state, account_id, &target, "channel", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    &target,
+                    "channel",
+                    &from,
+                    &body,
+                    false,
+                    "chat",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             } else if notice_is_administrative(prefix.as_ref(), &body) {
-                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", &from, &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                let host = account_id
+                    .split_once('@')
+                    .map(|(_, h)| h)
+                    .unwrap_or(account_id);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    host,
+                    "server",
+                    &from,
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             } else {
                 // Somebody talking, so it goes where talking goes - opening the
                 // conversation if there is not one yet. An XDCC bot answers a
@@ -199,7 +283,26 @@ pub(super) async fn handle_message(
                 // are in its queue, why it refused. In the server tab those sit
                 // a long way from the request they answer, and the conversation
                 // that asked shows nothing but your own message.
-                state.runtime.record_message_at(state, account_id, &from, "dm", &from, &body, false, "chat", None, None, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+                state.runtime.record_message_at(
+                    state,
+                    account_id,
+                    &from,
+                    "dm",
+                    &from,
+                    &body,
+                    false,
+                    "chat",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    sent_at,
+                    None,
+                    None,
+                );
             }
         }
 
@@ -210,9 +313,15 @@ pub(super) async fn handle_message(
             // and the hostmask is on every line's prefix whether or not any
             // capability was granted - so somebody arriving is known as soon
             // as they arrive rather than after a WHOIS.
-            who.learn(userhost_of(prefix.as_ref()).as_deref(), account.as_deref(), None);
+            who.learn(
+                userhost_of(prefix.as_ref()).as_deref(),
+                account.as_deref(),
+                None,
+            );
             if from == own_nick {
-                let joined = state.runtime.ensure_buffer(state, account_id, &channel, "channel");
+                let joined = state
+                    .runtime
+                    .ensure_buffer(state, account_id, &channel, "channel");
                 state.runtime.set_buffer_link(state, &joined.id, None);
                 // What was said before we arrived. Asked for on join rather
                 // than on connect, because a channel nobody opens is a request
@@ -242,7 +351,23 @@ pub(super) async fn handle_message(
             }
             if from != own_nick {
                 let line = format!("{from} entered the room");
-                state.runtime.record_message(state, account_id, &channel, "channel", "*", &line, false, "join", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    &channel,
+                    "channel",
+                    "*",
+                    &line,
+                    false,
+                    "join",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
             emit_presence(state, account_id, &channel, members);
         }
@@ -258,7 +383,23 @@ pub(super) async fn handle_message(
                     Some(why) => format!("{from} left the room ({why})"),
                     None => format!("{from} left the room"),
                 };
-                state.runtime.record_message(state, account_id, &channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    &channel,
+                    "channel",
+                    "*",
+                    &line,
+                    false,
+                    "part",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
                 emit_presence(state, account_id, &channel, members);
             }
         }
@@ -289,9 +430,30 @@ pub(super) async fn handle_message(
                         Mode::Plus(mode, None) | Mode::Minus(mode, None) => {
                             let adding = matches!(m, Mode::Plus(_, None));
                             let letter = mode_letter(mode);
-                            state.runtime.set_irc_channel_mode(state, account_id, &channel, letter, adding);
-                            let body = format!("{from} sets {}{letter} on {channel}", if adding { "+" } else { "-" });
-                            state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                            state
+                                .runtime
+                                .set_irc_channel_mode(state, account_id, &channel, letter, adding);
+                            let body = format!(
+                                "{from} sets {}{letter} on {channel}",
+                                if adding { "+" } else { "-" }
+                            );
+                            state.runtime.record_message(
+                                state,
+                                account_id,
+                                &channel,
+                                "channel",
+                                "*",
+                                &body,
+                                false,
+                                "system",
+                                None,
+                                None,
+                                false,
+                                None,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                            );
                             continue;
                         }
                         _ => continue,
@@ -299,21 +461,60 @@ pub(super) async fn handle_message(
                     // A ban or an exception carries a mask, not a nick, so it
                     // re-ranks nobody - but it is the channel changing and is
                     // worth saying out loud.
-                    if matches!(mode, ChannelMode::Ban | ChannelMode::Exception | ChannelMode::InviteException) {
+                    if matches!(
+                        mode,
+                        ChannelMode::Ban | ChannelMode::Exception | ChannelMode::InviteException
+                    ) {
                         let body = format!(
                             "{from} {} {} {target}",
                             if granting { "adds" } else { "removes" },
                             mode_word(mode),
                         );
-                        state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                        state.runtime.record_message(
+                            state,
+                            account_id,
+                            &channel,
+                            "channel",
+                            "*",
+                            &body,
+                            false,
+                            "system",
+                            None,
+                            None,
+                            false,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        );
                         continue;
                     }
-                    let Some(rank) = rank_from_mode(mode) else { continue };
-                    let Some(slot) = members.get_mut(target.as_str()) else { continue };
+                    let Some(rank) = rank_from_mode(mode) else {
+                        continue;
+                    };
+                    let Some(slot) = members.get_mut(target.as_str()) else {
+                        continue;
+                    };
                     slot.rank = if granting { rank } else { MemberRank::None };
                     changed = true;
                     let body = rank_change_line(&from, granting, rank, target);
-                    state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                    state.runtime.record_message(
+                        state,
+                        account_id,
+                        &channel,
+                        "channel",
+                        "*",
+                        &body,
+                        false,
+                        "system",
+                        None,
+                        None,
+                        false,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    );
                 }
                 if changed {
                     emit_presence(state, account_id, &channel, members);
@@ -331,12 +532,31 @@ pub(super) async fn handle_message(
                 // Said in the server buffer rather than the channel: the
                 // channel buffer is about to be removed, so anything written
                 // there goes to something nobody can open.
-                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
+                let host = account_id
+                    .split_once('@')
+                    .map(|(_, h)| h)
+                    .unwrap_or(account_id);
                 let body = match reason {
                     Some(r) => format!("Kicked from {channel} by {from} ({r})"),
                     None => format!("Kicked from {channel} by {from}"),
                 };
-                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    host,
+                    "server",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
                 let buffer_id = crate::model::buffer_id(account_id, &channel);
                 state.runtime.remove_buffer(state, &buffer_id);
                 channels.remove(&channel);
@@ -346,7 +566,23 @@ pub(super) async fn handle_message(
                     Some(r) => format!("{target} was kicked by {from} ({r})"),
                     None => format!("{target} was kicked by {from}"),
                 };
-                state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    &channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
                 emit_presence(state, account_id, &channel, members);
             }
         }
@@ -365,8 +601,16 @@ pub(super) async fn handle_message(
                 }
                 match &split {
                     Some(reason) => {
-                        if state.runtime.add_irc_split(account_id, channel, reason, &from) {
-                            schedule_split_report(state.clone(), account_id.to_string(), channel.clone(), reason.clone());
+                        if state
+                            .runtime
+                            .add_irc_split(account_id, channel, reason, &from)
+                        {
+                            schedule_split_report(
+                                state.clone(),
+                                account_id.to_string(),
+                                channel.clone(),
+                                reason.clone(),
+                            );
                         }
                     }
                     None => {
@@ -375,7 +619,23 @@ pub(super) async fn handle_message(
                         } else {
                             format!("{from} has quit ({reason})")
                         };
-                        state.runtime.record_message(state, account_id, channel, "channel", "*", &line, false, "part", None, None, false, None, Vec::new(), Vec::new(), None);
+                        state.runtime.record_message(
+                            state,
+                            account_id,
+                            channel,
+                            "channel",
+                            "*",
+                            &line,
+                            false,
+                            "part",
+                            None,
+                            None,
+                            false,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        );
                     }
                 }
                 emit_presence(state, account_id, channel, members);
@@ -385,7 +645,10 @@ pub(super) async fn handle_message(
         Command::NICK(new_nick) => {
             // Ours: the handle carries the current nick, and everything that
             // asks "is this me" reads it.
-            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            let own = state
+                .runtime
+                .irc_current_nick(account_id)
+                .unwrap_or_else(|| own_nick.to_string());
             if from.eq_ignore_ascii_case(&own) {
                 state.runtime.set_irc_current_nick(account_id, &new_nick);
             }
@@ -395,7 +658,23 @@ pub(super) async fn handle_message(
                 if let Some(who) = members.remove(&from) {
                     members.insert(new_nick.clone(), who);
                     let line = format!("{from} is now known as {new_nick}");
-                    state.runtime.record_message(state, account_id, channel, "channel", "*", &line, false, "nick", None, None, false, None, Vec::new(), Vec::new(), None);
+                    state.runtime.record_message(
+                        state,
+                        account_id,
+                        channel,
+                        "channel",
+                        "*",
+                        &line,
+                        false,
+                        "nick",
+                        None,
+                        None,
+                        false,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                    );
                     emit_presence(state, account_id, channel, members);
                 }
             }
@@ -408,50 +687,80 @@ pub(super) async fn handle_message(
         // complete. A numeric for somebody nothing asked about is dropped,
         // so another client sharing this connection cannot open a window
         // here.
-        Command::Response(Response::RPL_WHOISUSER, args) | Command::Response(Response::RPL_WHOWASUSER, args) => {
+        Command::Response(Response::RPL_WHOISUSER, args)
+        | Command::Response(Response::RPL_WHOWASUSER, args) => {
             // args: [me, nick, user, host, "*", :real name]
             if let Some(nick) = args.get(1) {
-                state.runtime.add_irc_whois_field(account_id, nick, "nick", json!(nick));
+                state
+                    .runtime
+                    .add_irc_whois_field(account_id, nick, "nick", json!(nick));
                 if let (Some(user), Some(host)) = (args.get(2), args.get(3)) {
-                    state.runtime.add_irc_whois_field(account_id, nick, "mask", json!(format!("{nick}!{user}@{host}")));
+                    state.runtime.add_irc_whois_field(
+                        account_id,
+                        nick,
+                        "mask",
+                        json!(format!("{nick}!{user}@{host}")),
+                    );
                 }
                 if let Some(real) = args.last() {
-                    state.runtime.add_irc_whois_field(account_id, nick, "realName", json!(real));
+                    state
+                        .runtime
+                        .add_irc_whois_field(account_id, nick, "realName", json!(real));
                 }
             }
         }
         Command::Response(Response::RPL_WHOISSERVER, args) => {
             if let (Some(nick), Some(server)) = (args.get(1), args.get(2)) {
                 let info = args.get(3).cloned().unwrap_or_default();
-                state.runtime.add_irc_whois_field(account_id, nick, "server", json!(format!("{server} ({info})")));
+                state.runtime.add_irc_whois_field(
+                    account_id,
+                    nick,
+                    "server",
+                    json!(format!("{server} ({info})")),
+                );
             }
         }
         Command::Response(Response::RPL_WHOISOPERATOR, args) => {
             if let Some(nick) = args.get(1) {
-                state.runtime.add_irc_whois_field(account_id, nick, "operator", json!(args.last().cloned().unwrap_or_default()));
+                state.runtime.add_irc_whois_field(
+                    account_id,
+                    nick,
+                    "operator",
+                    json!(args.last().cloned().unwrap_or_default()),
+                );
             }
         }
         Command::Response(Response::RPL_WHOISIDLE, args) => {
             // args: [me, nick, idle seconds, signon unix time, :info]
             if let Some(nick) = args.get(1) {
                 if let Some(idle) = args.get(2).and_then(|v| v.parse::<i64>().ok()) {
-                    state.runtime.add_irc_whois_field(account_id, nick, "idleSeconds", json!(idle));
+                    state
+                        .runtime
+                        .add_irc_whois_field(account_id, nick, "idleSeconds", json!(idle));
                 }
                 if let Some(signon) = args.get(3).and_then(|v| v.parse::<i64>().ok()) {
-                    state.runtime.add_irc_whois_field(account_id, nick, "signOnTs", json!(signon));
+                    state
+                        .runtime
+                        .add_irc_whois_field(account_id, nick, "signOnTs", json!(signon));
                 }
             }
         }
         Command::Response(Response::RPL_WHOISCHANNELS, args) => {
             if let (Some(nick), Some(list)) = (args.get(1), args.last()) {
                 let channels: Vec<&str> = list.split_whitespace().collect();
-                state.runtime.add_irc_whois_field(account_id, nick, "channels", json!(channels));
+                state
+                    .runtime
+                    .add_irc_whois_field(account_id, nick, "channels", json!(channels));
             }
         }
-        Command::Response(Response::RPL_ENDOFWHOIS, args) | Command::Response(Response::RPL_ENDOFWHOWAS, args) => {
+        Command::Response(Response::RPL_ENDOFWHOIS, args)
+        | Command::Response(Response::RPL_ENDOFWHOWAS, args) => {
             if let Some(nick) = args.get(1) {
                 if let Some(whois) = state.runtime.take_irc_whois(account_id, nick) {
-                    crate::profile::emit(state, irc_profile(state, account_id, nick, whois, channels));
+                    crate::profile::emit(
+                        state,
+                        irc_profile(state, account_id, nick, whois, channels),
+                    );
                 }
             }
         }
@@ -465,7 +774,9 @@ pub(super) async fn handle_message(
         Command::Response(Response::RPL_AWAY, args) => {
             if let Some(nick) = args.get(1) {
                 let reason = args.last().cloned().unwrap_or_default();
-                state.runtime.add_irc_whois_field(account_id, nick, "away", json!(reason));
+                state
+                    .runtime
+                    .add_irc_whois_field(account_id, nick, "away", json!(reason));
                 if state.runtime.set_irc_away(account_id, nick, true) {
                     refresh_rosters_containing(state, account_id, nick, channels);
                 }
@@ -473,23 +784,47 @@ pub(super) async fn handle_message(
         }
         // The server's own confirmation, which is what gets shown - rather
         // than /away claiming success the moment it is typed.
-        Command::Response(Response::RPL_NOWAWAY, args) | Command::Response(Response::RPL_UNAWAY, args) => {
+        Command::Response(Response::RPL_NOWAWAY, args)
+        | Command::Response(Response::RPL_UNAWAY, args) => {
             let text = args.last().cloned().unwrap_or_default();
-            let now_away = text.to_lowercase().contains("marked as being away") && !text.to_lowercase().contains("no longer");
+            let now_away = text.to_lowercase().contains("marked as being away")
+                && !text.to_lowercase().contains("no longer");
             if let Some(own) = state.runtime.irc_current_nick(account_id) {
                 if state.runtime.set_irc_away(account_id, &own, now_away) {
                     refresh_rosters_containing(state, account_id, &own, channels);
                 }
             }
-            let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-            state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            let host = account_id
+                .split_once('@')
+                .map(|(_, h)| h)
+                .unwrap_or(account_id);
+            state.runtime.record_message(
+                state,
+                account_id,
+                host,
+                "server",
+                "*",
+                &text,
+                false,
+                "system",
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
         }
 
         // Somebody else going away or coming back, live - the `away-notify`
         // capability. Without it away state is only ever known about people
         // who have just been WHOISed or messaged.
         Command::AWAY(reason) => {
-            if state.runtime.set_irc_away_because(account_id, &from, reason.clone().map(Some)) {
+            if state
+                .runtime
+                .set_irc_away_because(account_id, &from, reason.clone().map(Some))
+            {
                 refresh_rosters_containing(state, account_id, &from, channels);
             }
         }
@@ -498,7 +833,12 @@ pub(super) async fn handle_message(
         // The watch list, answered by the server rather than polled for.
         Command::Response(code @ (Response::RPL_MONONLINE | Response::RPL_MONOFFLINE), args) => {
             let targets = args.last().map(String::as_str).unwrap_or("");
-            apply_monitor(state, account_id, targets, matches!(code, Response::RPL_MONONLINE));
+            apply_monitor(
+                state,
+                account_id,
+                targets,
+                matches!(code, Response::RPL_MONONLINE),
+            );
         }
 
         Command::Response(Response::RPL_ISON, args) => {
@@ -521,11 +861,11 @@ pub(super) async fn handle_message(
         // something just sent, so it also corrects the stored presence.
         Command::Response(Response::ERR_NOSUCHNICK, args) => {
             if let Some(nick) = args.get(1) {
-                let existing = state
-                    .runtime
-                    .list_buffers()
-                    .into_iter()
-                    .find(|b| b.account_id == account_id && b.kind == "dm" && b.name.eq_ignore_ascii_case(nick));
+                let existing = state.runtime.list_buffers().into_iter().find(|b| {
+                    b.account_id == account_id
+                        && b.kind == "dm"
+                        && b.name.eq_ignore_ascii_case(nick)
+                });
                 if let Some(buffer) = existing {
                     let members = json!([{
                         "nick": nick,
@@ -535,7 +875,10 @@ pub(super) async fn handle_message(
                         "status": "offline",
                     }]);
                     state.runtime.set_presence(&buffer.id, members.clone());
-                    state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": members }));
+                    state.events.emit(
+                        "presenceChange",
+                        json!({ "bufferId": buffer.id, "members": members }),
+                    );
                     state.events.emit(
                         "deliveryFailed",
                         json!({
@@ -588,23 +931,67 @@ pub(super) async fn handle_message(
         Command::Response(Response::RPL_TOPIC, args) => {
             if let (Some(channel), Some(topic)) = (args.get(1), args.get(2)) {
                 let body = format!("Topic for {channel}: {topic}");
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
-                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), topic);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "topic",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
+                state.runtime.set_buffer_topic(
+                    state,
+                    &crate::model::buffer_id(account_id, channel),
+                    topic,
+                );
             }
         }
 
         // No topic set: the channel has none to show.
         Command::Response(Response::RPL_NOTOPIC, args) => {
             if let Some(channel) = args.get(1) {
-                state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, channel), "");
+                state.runtime.set_buffer_topic(
+                    state,
+                    &crate::model::buffer_id(account_id, channel),
+                    "",
+                );
             }
         }
 
         // A live topic change while we're in the channel.
         Command::TOPIC(channel, Some(topic)) => {
             let body = format!("{from} changed the topic to: {topic}");
-            state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "topic", None, None, false, None, Vec::new(), Vec::new(), None);
-            state.runtime.set_buffer_topic(state, &crate::model::buffer_id(account_id, &channel), &topic);
+            state.runtime.record_message(
+                state,
+                account_id,
+                &channel,
+                "channel",
+                "*",
+                &body,
+                false,
+                "topic",
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
+            state.runtime.set_buffer_topic(
+                state,
+                &crate::model::buffer_id(account_id, &channel),
+                &topic,
+            );
         }
 
         // Connection banner (001-005), LUSERS (251-255, 265-266), and MOTD
@@ -620,11 +1007,32 @@ pub(super) async fn handle_message(
             // here and nowhere else - it is the one ratified IRCv3 extension
             // with no capability of its own to negotiate.
             if code == Response::RPL_ISUPPORT && args.len() > 2 {
-                state.runtime.note_irc_isupport(account_id, &args[1..args.len() - 1].join(" "));
+                state
+                    .runtime
+                    .note_irc_isupport(account_id, &args[1..args.len() - 1].join(" "));
             }
             if let Some(text) = banner_text(code, &args) {
-                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                let host = account_id
+                    .split_once('@')
+                    .map(|(_, h)| h)
+                    .unwrap_or(account_id);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    host,
+                    "server",
+                    "*",
+                    &text,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
 
@@ -642,7 +1050,10 @@ pub(super) async fn handle_message(
             tracing::debug!("irc[{account_id}]: capabilities granted: {caps}");
             // Not `sasl`: holding it says nothing about being logged in, and
             // the late login in latesasl.rs is what follows it up.
-            let caps: Vec<&str> = caps.split_whitespace().filter(|c| c.split('=').next() != Some("sasl")).collect();
+            let caps: Vec<&str> = caps
+                .split_whitespace()
+                .filter(|c| c.split('=').next() != Some("sasl"))
+                .collect();
             state.runtime.grant_irc_caps(account_id, &caps.join(" "));
         }
 
@@ -665,8 +1076,16 @@ pub(super) async fn handle_message(
             if wanted.is_empty() {
                 return;
             }
-            tracing::debug!("irc[{account_id}]: newly offered, requesting: {}", wanted.join(" "));
-            let _ = sender.send(Command::CAP(None, CapSubCommand::REQ, None, Some(wanted.join(" "))));
+            tracing::debug!(
+                "irc[{account_id}]: newly offered, requesting: {}",
+                wanted.join(" ")
+            );
+            let _ = sender.send(Command::CAP(
+                None,
+                CapSubCommand::REQ,
+                None,
+                Some(wanted.join(" ")),
+            ));
         }
 
         // Something was taken away.
@@ -692,7 +1111,9 @@ pub(super) async fn handle_message(
         Command::BATCH(ref tag, ref sub, ref params) => {
             let kind = sub.as_ref().map(|s| s.to_str().to_string());
             let param = params.as_ref().and_then(|p| p.first().cloned());
-            let Some((opening, reference)) = drafts::read_batch_tag(tag) else { return };
+            let Some((opening, reference)) = drafts::read_batch_tag(tag) else {
+                return;
+            };
             let key = (account_id.to_string(), reference);
             if opening {
                 // Case-insensitively: the crate parses the type through an
@@ -701,22 +1122,33 @@ pub(super) async fn handle_message(
                 // exactly meant the batch was never opened, every piece fell
                 // through as an ordinary message, and the reassembly below
                 // had nothing to reassemble.
-                if kind.as_deref().is_some_and(|k| k.eq_ignore_ascii_case("draft/multiline")) {
+                if kind
+                    .as_deref()
+                    .is_some_and(|k| k.eq_ignore_ascii_case("draft/multiline"))
+                {
                     if let Some(target) = param {
-                        drafts::open_batches()
-                            .lock()
-                            .unwrap()
-                            .insert(key, drafts::Assembling { target, pieces: Vec::new() });
+                        drafts::open_batches().lock().unwrap().insert(
+                            key,
+                            drafts::Assembling {
+                                target,
+                                pieces: Vec::new(),
+                            },
+                        );
                     }
                 }
                 return;
             }
-            let Some(batch) = drafts::open_batches().lock().unwrap().remove(&key) else { return };
+            let Some(batch) = drafts::open_batches().lock().unwrap().remove(&key) else {
+                return;
+            };
             if batch.pieces.is_empty() {
                 return;
             }
             let body = batch.finish();
-            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            let own = state
+                .runtime
+                .irc_current_nick(account_id)
+                .unwrap_or_else(|| own_nick.to_string());
             let kind = buffer_kind_hint(&batch.target);
             // Whose conversation it belongs in, by the same rule a single
             // PRIVMSG follows: a channel is itself, and a direct message is
@@ -726,16 +1158,45 @@ pub(super) async fn handle_message(
             } else {
                 from.clone()
             };
-            state.runtime.record_message_at(state, account_id, &buffer, kind, &from, &body, false, "chat", None, msg_id, false, None, Vec::new(), Vec::new(), None, sent_at, None, None);
+            state.runtime.record_message_at(
+                state,
+                account_id,
+                &buffer,
+                kind,
+                &from,
+                &body,
+                false,
+                "chat",
+                None,
+                msg_id,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                sent_at,
+                None,
+                None,
+            );
         }
 
         // A message somebody took back. IRC never had this; every other
         // service here always did, which is why the entry existed in the menu
         // and did nothing on this one.
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("REDACT") => {
-            let (Some(target), Some(msg_id)) = (args.first(), args.get(1)) else { return };
-            let buffer = if is_channel(target) { target.clone() } else { from.clone() };
-            state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &buffer), msg_id);
+            let (Some(target), Some(msg_id)) = (args.first(), args.get(1)) else {
+                return;
+            };
+            let buffer = if is_channel(target) {
+                target.clone()
+            } else {
+                from.clone()
+            };
+            state.runtime.delete_message(
+                state,
+                &crate::model::buffer_id(account_id, &buffer),
+                msg_id,
+            );
         }
 
         // Where this conversation has been read up to, according to the
@@ -743,7 +1204,9 @@ pub(super) async fn handle_message(
         // this account last looked at it.
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("MARKREAD") => {
             if let Some((target, at)) = drafts::read_marker(args) {
-                state.runtime.note_irc_read_marker(state, account_id, &target, at);
+                state
+                    .runtime
+                    .note_irc_read_marker(state, account_id, &target, at);
             }
         }
 
@@ -751,7 +1214,9 @@ pub(super) async fn handle_message(
         // one channel and joining another, and the conversation is split in
         // two with the history stranded in a room nobody is in.
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("RENAME") => {
-            let (Some(old_name), Some(new_name)) = (args.first(), args.get(1)) else { return };
+            let (Some(old_name), Some(new_name)) = (args.first(), args.get(1)) else {
+                return;
+            };
             if let Some(members) = channels.remove(old_name.as_str()) {
                 channels.insert(new_name.clone(), members);
             }
@@ -759,13 +1224,31 @@ pub(super) async fn handle_message(
             // than a rename: the old one goes and the new one arrives
             // carrying what was said. Ordered that way round on purpose -
             // creating first would briefly show the channel twice.
-            state.runtime.rename_irc_buffer(state, account_id, old_name, new_name);
+            state
+                .runtime
+                .rename_irc_buffer(state, account_id, old_name, new_name);
             let reason = args.get(2).map(String::as_str).filter(|r| !r.is_empty());
             let line = match reason {
                 Some(why) => format!("{old_name} is now called {new_name} ({why})"),
                 None => format!("{old_name} is now called {new_name}"),
             };
-            state.runtime.record_message(state, account_id, new_name, "channel", "*", &line, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+            state.runtime.record_message(
+                state,
+                account_id,
+                new_name,
+                "channel",
+                "*",
+                &line,
+                false,
+                "system",
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
             if let Some(members) = channels.get(new_name.as_str()) {
                 emit_presence(state, account_id, new_name, members);
             }
@@ -783,7 +1266,9 @@ pub(super) async fn handle_message(
         // below by the same parser.
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("METADATA") => {
             if let Some((target, key, value)) = metadata::parse_keyvalue(args) {
-                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+                state
+                    .runtime
+                    .set_irc_metadata(account_id, &target, &key, value);
             }
         }
 
@@ -794,8 +1279,12 @@ pub(super) async fn handle_message(
         // where it is known to be there, rather than guessed at in the
         // parser.
         Command::Raw(ref cmd, ref args) if cmd == "761" => {
-            if let Some((target, key, value)) = metadata::parse_keyvalue(args.get(1..).unwrap_or(&[])) {
-                state.runtime.set_irc_metadata(account_id, &target, &key, value);
+            if let Some((target, key, value)) =
+                metadata::parse_keyvalue(args.get(1..).unwrap_or(&[]))
+            {
+                state
+                    .runtime
+                    .set_irc_metadata(account_id, &target, &key, value);
             }
         }
 
@@ -805,7 +1294,23 @@ pub(super) async fn handle_message(
                 let body = format!("{from} is now {name}");
                 for (channel, members) in channels.iter() {
                     if members.contains_key(&from) {
-                        state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "nick", None, None, false, None, Vec::new(), Vec::new(), None);
+                        state.runtime.record_message(
+                            state,
+                            account_id,
+                            channel,
+                            "channel",
+                            "*",
+                            &body,
+                            false,
+                            "nick",
+                            None,
+                            None,
+                            false,
+                            None,
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        );
                     }
                 }
             }
@@ -839,20 +1344,54 @@ pub(super) async fn handle_message(
             // two are about something somebody just tried to do.
             let kind = if weight == "NOTE" { "system" } else { "error" };
             let host = server_buffer(account_id);
-            state.runtime.record_message(state, account_id, host, "server", "*", &body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
+            state.runtime.record_message(
+                state,
+                account_id,
+                host,
+                "server",
+                "*",
+                &body,
+                false,
+                kind,
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
         }
 
         // What modes a channel currently has, in answer to a bare /mode.
         Command::Response(Response::RPL_CHANNELMODEIS, args) => {
             if let Some(channel) = args.get(1) {
                 let modes = args.get(2).map(String::as_str).unwrap_or("");
-                state.runtime.set_irc_channel_modes(state, account_id, channel, modes);
+                state
+                    .runtime
+                    .set_irc_channel_modes(state, account_id, channel, modes);
                 let body = if modes.trim_matches('+').is_empty() {
                     format!("{channel} has no modes set")
                 } else {
                     format!("{channel} is {modes}")
                 };
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
 
@@ -860,7 +1399,10 @@ pub(super) async fn handle_message(
         // Rendered in the channel rather than gathered into a panel: a ban
         // list is short, it is read once, and it belongs beside the channel
         // it governs.
-        Command::Response(code @ (Response::RPL_BANLIST | Response::RPL_EXCEPTLIST | Response::RPL_INVITELIST), args) => {
+        Command::Response(
+            code @ (Response::RPL_BANLIST | Response::RPL_EXCEPTLIST | Response::RPL_INVITELIST),
+            args,
+        ) => {
             if let (Some(channel), Some(mask)) = (args.get(1), args.get(2)) {
                 let kind = match code {
                     Response::RPL_BANLIST => "banned",
@@ -868,14 +1410,49 @@ pub(super) async fn handle_message(
                     _ => "invite exception",
                 };
                 // Who set it and when, where the server says.
-                let by = args.get(3).map(|who| format!(" by {who}")).unwrap_or_default();
+                let by = args
+                    .get(3)
+                    .map(|who| format!(" by {who}"))
+                    .unwrap_or_default();
                 let body = format!("{kind}: {mask}{by}");
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
         Command::Response(Response::RPL_ENDOFBANLIST, args) => {
             if let Some(channel) = args.get(1) {
-                state.runtime.record_message(state, account_id, channel, "channel", "*", "end of ban list", false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    "end of ban list",
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
 
@@ -889,14 +1466,49 @@ pub(super) async fn handle_message(
         // is not a line addressed to them, which is the same rule quit and
         // part lines follow.
         Command::INVITE(ref who, ref channel) => {
-            let own = state.runtime.irc_current_nick(account_id).unwrap_or_else(|| own_nick.to_string());
+            let own = state
+                .runtime
+                .irc_current_nick(account_id)
+                .unwrap_or_else(|| own_nick.to_string());
             if who.eq_ignore_ascii_case(&own) {
                 let host = server_buffer(account_id);
                 let body = format!("{from} invites you to {channel}");
-                state.runtime.record_message(state, account_id, host, "server", "*", &body, false, "system", None, None, true, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    host,
+                    "server",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    true,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             } else if channels.contains_key(channel.as_str()) {
                 let body = format!("{from} invited {who} to {channel}");
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
         // Confirmation that ours went out.
@@ -905,33 +1517,82 @@ pub(super) async fn handle_message(
                 // The server answers with the pair either way round depending
                 // on how old it is, and both readings say the same thing.
                 let body = format!("invited {nick} to {channel}");
-                state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    channel,
+                    "channel",
+                    "*",
+                    &body,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
         }
 
         // The channel directory, gathered rather than printed: a network's
         // list runs to tens of thousands of entries, which is something to
         // search rather than a wall of chat.
-        Command::Response(Response::RPL_LISTSTART, _) => state.runtime.begin_irc_channel_list(account_id),
+        Command::Response(Response::RPL_LISTSTART, _) => {
+            state.runtime.begin_irc_channel_list(account_id)
+        }
         Command::Response(Response::RPL_LIST, args) => {
             if let Some(channel) = args.get(1) {
                 let users = args.get(2).and_then(|u| u.parse::<u32>().ok()).unwrap_or(0);
                 let topic = args.get(3).cloned().unwrap_or_default();
-                state.runtime.push_irc_channel_list(account_id, channel, users, &topic);
+                state
+                    .runtime
+                    .push_irc_channel_list(account_id, channel, users, &topic);
             }
         }
-        Command::Response(Response::RPL_LISTEND, _) => state.runtime.finish_irc_channel_list(state, account_id),
+        Command::Response(Response::RPL_LISTEND, _) => {
+            state.runtime.finish_irc_channel_list(state, account_id)
+        }
         // "Try again later": the answer a busy network gives instead of a list,
         // and the one thing that told nobody anything.
         Command::Response(Response::RPL_TRYAGAIN, args) => {
             let reason = args.last().cloned().unwrap_or_default();
-            state.runtime.fail_irc_channel_list(state, account_id, if reason.is_empty() { "the network says to try again later" } else { &reason });
+            state.runtime.fail_irc_channel_list(
+                state,
+                account_id,
+                if reason.is_empty() {
+                    "the network says to try again later"
+                } else {
+                    &reason
+                },
+            );
         }
 
         Command::Response(code, args) if is_channel_error(code) => {
             if let Some(text) = channel_error_text(&args) {
-                let host = account_id.split_once('@').map(|(_, h)| h).unwrap_or(account_id);
-                state.runtime.record_message(state, account_id, host, "server", "*", &text, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
+                let host = account_id
+                    .split_once('@')
+                    .map(|(_, h)| h)
+                    .unwrap_or(account_id);
+                state.runtime.record_message(
+                    state,
+                    account_id,
+                    host,
+                    "server",
+                    "*",
+                    &text,
+                    false,
+                    "system",
+                    None,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                );
             }
             // A join the server refused leaves the channel on screen and not
             // joined - after a reconnect, a ban or a +i set while away. Said
@@ -939,7 +1600,14 @@ pub(super) async fn handle_message(
             if is_join_refusal(code) {
                 if let (Some(channel), Some(reason)) = (args.get(1), args.last()) {
                     let buffer_id = crate::model::buffer_id(account_id, channel);
-                    state.runtime.set_buffer_link(state, &buffer_id, Some(crate::model::BufferLink::down("refused", format!("Not in {channel}: {reason}"))));
+                    state.runtime.set_buffer_link(
+                        state,
+                        &buffer_id,
+                        Some(crate::model::BufferLink::down(
+                            "refused",
+                            format!("Not in {channel}: {reason}"),
+                        )),
+                    );
                 }
             }
         }
@@ -949,7 +1617,11 @@ pub(super) async fn handle_message(
         // one this cares about is `+typing`.
         Command::Raw(ref cmd, ref args) if cmd.eq_ignore_ascii_case("TAGMSG") => {
             if let (Some(target), Some(tags)) = (args.first(), msg.tags.as_ref()) {
-                if let Some(value) = tags.iter().find(|t| t.0 == "+typing").and_then(|t| t.1.as_deref()) {
+                if let Some(value) = tags
+                    .iter()
+                    .find(|t| t.0 == "+typing")
+                    .and_then(|t| t.1.as_deref())
+                {
                     note_typing(state, account_id, &from, target, value);
                 }
             }
@@ -965,7 +1637,10 @@ pub(super) async fn handle_message(
 pub(super) fn is_join_refusal(code: Response) -> bool {
     matches!(
         code,
-        Response::ERR_CHANNELISFULL | Response::ERR_INVITEONLYCHAN | Response::ERR_BANNEDFROMCHAN | Response::ERR_BADCHANNELKEY
+        Response::ERR_CHANNELISFULL
+            | Response::ERR_INVITEONLYCHAN
+            | Response::ERR_BANNEDFROMCHAN
+            | Response::ERR_BADCHANNELKEY
     )
 }
 
@@ -1020,7 +1695,12 @@ pub(super) fn rank_word(rank: MemberRank) -> &'static str {
 }
 
 /// The line for somebody being given a rank or losing one.
-pub(super) fn rank_change_line(from: &str, granting: bool, rank: MemberRank, target: &str) -> String {
+pub(super) fn rank_change_line(
+    from: &str,
+    granting: bool,
+    rank: MemberRank,
+    target: &str,
+) -> String {
     format!(
         "{from} {} {} {} {target}",
         if granting { "gives" } else { "takes" },
@@ -1053,7 +1733,9 @@ pub(super) fn message_id(msg: &Message) -> Option<String> {
 /// wants a non-empty name; `bot` wants only to know the tag was there.
 pub(super) fn message_tag<'a>(msg: &'a Message, name: &str) -> Option<&'a str> {
     let tags = msg.tags.as_ref()?;
-    tags.iter().find(|tag| tag.0 == name).map(|tag| tag.1.as_deref().unwrap_or(""))
+    tags.iter()
+        .find(|tag| tag.0 == name)
+        .map(|tag| tag.1.as_deref().unwrap_or(""))
 }
 
 pub(super) fn server_time(msg: &Message) -> Option<i64> {
@@ -1076,8 +1758,12 @@ pub(super) fn note_seen(
     seen: Option<who::Seen>,
 ) {
     let Some(seen) = seen else { return };
-    state.runtime.set_irc_away(account_id, &seen.nick, seen.away);
-    let Some(members) = channels.get_mut(&seen.channel) else { return };
+    state
+        .runtime
+        .set_irc_away(account_id, &seen.nick, seen.away);
+    let Some(members) = channels.get_mut(&seen.channel) else {
+        return;
+    };
     let entry = members.entry(seen.nick.clone()).or_default();
     entry.learn(Some(&seen.host), seen.account.as_deref(), Some(seen.bot));
     emit_presence(state, account_id, &seen.channel, members);
@@ -1088,7 +1774,10 @@ pub(super) fn note_seen(
 /// An IRC account id is `nick@host` and the server tab is named for the host,
 /// which is a fact this file was repeating inline everywhere it needed one.
 pub(super) fn server_buffer(account_id: &str) -> &str {
-    account_id.split_once('@').map(|(_, host)| host).unwrap_or(account_id)
+    account_id
+        .split_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(account_id)
 }
 
 /// The `user@host` off a line's prefix.
@@ -1130,7 +1819,11 @@ pub(super) fn parse_prefixed_nick(raw: &str) -> (MemberRank, &str) {
 }
 
 pub(super) fn buffer_kind_hint(target: &str) -> &'static str {
-    if is_channel(target) { "channel" } else { "dm" }
+    if is_channel(target) {
+        "channel"
+    } else {
+        "dm"
+    }
 }
 
 #[cfg(test)]
@@ -1144,7 +1837,10 @@ mod tests {
     #[test]
     fn the_server_and_its_services_stay_in_the_server_tab() {
         // The server itself, whose prefix carries no nick at all.
-        assert!(notice_is_administrative(Some(&Prefix::ServerName("irc.example.net".into())), "*** Looking up your hostname"));
+        assert!(notice_is_administrative(
+            Some(&Prefix::ServerName("irc.example.net".into())),
+            "*** Looking up your hostname"
+        ));
         // And a notice with no prefix, which is the same thing.
         assert!(notice_is_administrative(None, "anything"));
 
@@ -1158,7 +1854,10 @@ mod tests {
             // Named like a person, but on a services host.
             ("Alis", "services.libera.chat"),
         ] {
-            assert!(notice_is_administrative(Some(&person(nick, host)), "hello"), "{nick} should be a service");
+            assert!(
+                notice_is_administrative(Some(&person(nick, host)), "hello"),
+                "{nick} should be a service"
+            );
         }
     }
 
@@ -1174,7 +1873,10 @@ mod tests {
             // Ends in "server", not "serv" - a real word, not a service.
             ("Observer", "example.com"),
         ] {
-            assert!(!notice_is_administrative(Some(&person(nick, host)), "** Sending you pack #5"), "{nick} should get a DM");
+            assert!(
+                !notice_is_administrative(Some(&person(nick, host)), "** Sending you pack #5"),
+                "{nick} should get a DM"
+            );
         }
     }
 
@@ -1183,7 +1885,10 @@ mod tests {
         // VERSION and PING answers come back as notices. They are protocol
         // chatter, and opening a window full of control characters for them
         // would be worse than not showing them at all.
-        assert!(notice_is_administrative(Some(&person("someone", "example.com")), "\u{1}VERSION HexChat 2.16\u{1}"));
+        assert!(notice_is_administrative(
+            Some(&person("someone", "example.com")),
+            "\u{1}VERSION HexChat 2.16\u{1}"
+        ));
     }
 
     /// multi-prefix lists every rank a person holds, highest first. Reading
@@ -1210,7 +1915,9 @@ mod tests {
 
         // No tag at all is the ordinary case on a server without the
         // capability, and must fall back rather than resolve to the epoch.
-        let bare = ":bob!b@h PRIVMSG #chan :hi".parse::<irc::proto::Message>().unwrap();
+        let bare = ":bob!b@h PRIVMSG #chan :hi"
+            .parse::<irc::proto::Message>()
+            .unwrap();
         assert_eq!(server_time(&bare), None);
     }
 
@@ -1220,13 +1927,33 @@ mod tests {
     fn only_person_modes_carry_a_rank() {
         assert_eq!(rank_from_mode(&ChannelMode::Oper), Some(MemberRank::Op));
         assert_eq!(rank_from_mode(&ChannelMode::Voice), Some(MemberRank::Voice));
-        assert_eq!(rank_from_mode(&ChannelMode::Halfop), Some(MemberRank::HalfOp));
-        assert_eq!(rank_from_mode(&ChannelMode::Founder), Some(MemberRank::Founder));
+        assert_eq!(
+            rank_from_mode(&ChannelMode::Halfop),
+            Some(MemberRank::HalfOp)
+        );
+        assert_eq!(
+            rank_from_mode(&ChannelMode::Founder),
+            Some(MemberRank::Founder)
+        );
         // +a outranks op and the member model has no separate step for it.
-        assert_eq!(rank_from_mode(&ChannelMode::Admin), Some(MemberRank::Founder));
+        assert_eq!(
+            rank_from_mode(&ChannelMode::Admin),
+            Some(MemberRank::Founder)
+        );
 
-        for mode in [ChannelMode::Ban, ChannelMode::Moderated, ChannelMode::InviteOnly, ChannelMode::Key, ChannelMode::Limit, ChannelMode::Secret] {
-            assert_eq!(rank_from_mode(&mode), None, "{mode:?} is about the channel, not a person in it");
+        for mode in [
+            ChannelMode::Ban,
+            ChannelMode::Moderated,
+            ChannelMode::InviteOnly,
+            ChannelMode::Key,
+            ChannelMode::Limit,
+            ChannelMode::Secret,
+        ] {
+            assert_eq!(
+                rank_from_mode(&mode),
+                None,
+                "{mode:?} is about the channel, not a person in it"
+            );
         }
     }
 
@@ -1234,8 +1961,14 @@ mod tests {
     /// words are used for granting and for taking away.
     #[test]
     fn a_rank_change_reads_as_a_sentence() {
-        assert_eq!(rank_change_line("bob", true, MemberRank::Op, "carol"), "bob gives operator status to carol");
-        assert_eq!(rank_change_line("bob", false, MemberRank::Voice, "carol"), "bob takes voice from carol");
+        assert_eq!(
+            rank_change_line("bob", true, MemberRank::Op, "carol"),
+            "bob gives operator status to carol"
+        );
+        assert_eq!(
+            rank_change_line("bob", false, MemberRank::Voice, "carol"),
+            "bob takes voice from carol"
+        );
     }
 
     #[test]
@@ -1276,5 +2009,4 @@ mod tests {
         assert_eq!(entry.split_once('!'), None);
         assert_eq!(entry, "bob");
     }
-
 }

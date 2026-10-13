@@ -108,7 +108,11 @@ mod tests {
         assert_eq!(w["creator"], "@a:b");
         assert_eq!(w["openable"], true);
 
-        let named = read("w2", &json!({ "type": "m.custom", "url": "https://x/y", "name": "Rota" })).unwrap();
+        let named = read(
+            "w2",
+            &json!({ "type": "m.custom", "url": "https://x/y", "name": "Rota" }),
+        )
+        .unwrap();
         assert_eq!(named["name"], "Rota");
     }
 
@@ -126,11 +130,18 @@ mod tests {
     /// and saying it does is offering a broken link.
     #[test]
     fn a_url_is_only_openable_when_every_variable_can_be_filled() {
-        let ours = read("w", &json!({ "url": "https://x/?room=$matrix_room_id&me=$matrix_user_id" })).unwrap();
+        let ours = read(
+            "w",
+            &json!({ "url": "https://x/?room=$matrix_room_id&me=$matrix_user_id" }),
+        )
+        .unwrap();
         assert_eq!(ours["openable"], true);
 
         let theirs = read("w", &json!({ "url": "https://x/?t=$matrix_display_name" })).unwrap();
-        assert_eq!(theirs["openable"], false, "a variable we cannot fill must not be called openable");
+        assert_eq!(
+            theirs["openable"], false,
+            "a variable we cannot fill must not be called openable"
+        );
     }
 
     /// The path a widget actually takes: a state event is read, kept by id,
@@ -144,8 +155,14 @@ mod tests {
         let (account, room) = ("matrix:@salastil:poa.st", "!abc:poa.st");
 
         for (id, content) in [
-            ("b_pad", json!({ "type": "etherpad", "url": "https://pad/x", "name": "Notes" })),
-            ("a_call", json!({ "type": "jitsi", "url": "https://jitsi/y" })),
+            (
+                "b_pad",
+                json!({ "type": "etherpad", "url": "https://pad/x", "name": "Notes" }),
+            ),
+            (
+                "a_call",
+                json!({ "type": "jitsi", "url": "https://jitsi/y" }),
+            ),
         ] {
             runtime.set_matrix_widget(account, room, id, read(id, &content));
         }
@@ -157,7 +174,15 @@ mod tests {
         assert_eq!(wall[1]["name"], "Notes");
 
         // Changed in place rather than added twice.
-        runtime.set_matrix_widget(account, room, "b_pad", read("b_pad", &json!({ "type": "etherpad", "url": "https://pad/x", "name": "Minutes" })));
+        runtime.set_matrix_widget(
+            account,
+            room,
+            "b_pad",
+            read(
+                "b_pad",
+                &json!({ "type": "etherpad", "url": "https://pad/x", "name": "Minutes" }),
+            ),
+        );
         let wall = runtime.matrix_widgets(account, room);
         assert_eq!(wall.len(), 2);
         assert_eq!(wall[1]["name"], "Minutes");

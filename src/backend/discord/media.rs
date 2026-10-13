@@ -13,8 +13,16 @@ use super::*;
 /// moment it arrives, not after its picture has been fetched. The stored
 /// message is updated once the copies exist, and the change is broadcast so
 /// anything already showing that message picks them up.
-pub fn cache_thumbnails(state: AppState, buffer_id: String, msg_id: String, attachments: Vec<Attachment>) {
-    if !attachments.iter().any(|a| a.kind == "image" && a.thumbnail_path.is_none()) {
+pub fn cache_thumbnails(
+    state: AppState,
+    buffer_id: String,
+    msg_id: String,
+    attachments: Vec<Attachment>,
+) {
+    if !attachments
+        .iter()
+        .any(|a| a.kind == "image" && a.thumbnail_path.is_none())
+    {
         return;
     }
     tokio::spawn(async move {
@@ -24,8 +32,13 @@ pub fn cache_thumbnails(state: AppState, buffer_id: String, msg_id: String, atta
             if att.kind != "image" || att.thumbnail_path.is_some() {
                 continue;
             }
-            let Some(url) = att.url.as_deref() else { continue };
-            let Some(src) = thumbnail_source(url, att.width.unwrap_or(0), att.height.unwrap_or(0)) else { continue };
+            let Some(url) = att.url.as_deref() else {
+                continue;
+            };
+            let Some(src) = thumbnail_source(url, att.width.unwrap_or(0), att.height.unwrap_or(0))
+            else {
+                continue;
+            };
             if let Some(path) = fetch_thumbnail(&src, url).await {
                 att.thumbnail_path = Some(path);
                 any = true;
@@ -36,7 +49,10 @@ pub fn cache_thumbnails(state: AppState, buffer_id: String, msg_id: String, atta
         }
         // Not an edit: the message text is untouched, only where its preview
         // can be found locally.
-        if let Err(e) = state.store.update_message_attachments(&buffer_id, &msg_id, &updated) {
+        if let Err(e) = state
+            .store
+            .update_message_attachments(&buffer_id, &msg_id, &updated)
+        {
             tracing::debug!("discord: recording thumbnails: {e}");
             return;
         }
@@ -61,10 +77,13 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
     }
     tokio::fs::create_dir_all(&dir).await.ok()?;
 
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), anonymous_client().get(src).send())
-        .await
-        .ok()?
-        .ok()?;
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        anonymous_client().get(src).send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -80,9 +99,11 @@ pub(super) async fn fetch_thumbnail(src: &str, cache_key: &str) -> Option<String
 /// endpoint. What arrives while one runs is queued for it rather than dropped:
 /// dropping was what left a page scrolled to mid-sweep with dead links for
 /// good, because nothing would ask for it again.
-pub(super) fn resigning() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
-    static IN_FLIGHT: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> =
-        std::sync::OnceLock::new();
+pub(super) fn resigning(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<String>>> {
+    static IN_FLIGHT: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    > = std::sync::OnceLock::new();
     IN_FLIGHT.get_or_init(Default::default)
 }
 
@@ -103,7 +124,11 @@ pub(super) const MAX_RESIGN_FETCHES: usize = 3;
 ///
 /// Runs in the background: the buffer opens immediately showing cached
 /// previews, and re-signed links arrive as messageUpdated events.
-pub fn resign_stale_attachments(state: AppState, buffer_id: String, messages: &[crate::model::Message]) {
+pub fn resign_stale_attachments(
+    state: AppState,
+    buffer_id: String,
+    messages: &[crate::model::Message],
+) {
     resign_messages(state, buffer_id, stale_message_ids(messages));
 }
 
@@ -204,13 +229,20 @@ const STICKER_LINE: &str = "sent a sticker: ";
 /// A link without its signature, which is what stays the same when Discord
 /// signs it again - and on either of its two hosts.
 fn unsigned(url: &str) -> String {
-    url.split('?').next().unwrap_or(url).replace("media.discordapp.net", "cdn.discordapp.com")
+    url.split('?')
+        .next()
+        .unwrap_or(url)
+        .replace("media.discordapp.net", "cdn.discordapp.com")
 }
 
 /// The text with the links that are really these attachments taken out, and
 /// whatever else it said left exactly as stored.
 pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> String {
-    let own: Vec<String> = attachments.iter().filter_map(|a| a.url.as_deref()).map(unsigned).collect();
+    let own: Vec<String> = attachments
+        .iter()
+        .filter_map(|a| a.url.as_deref())
+        .map(unsigned)
+        .collect();
     // The names of the Lottie stickers it carries, whose old stand-in line
     // goes now that they can be drawn.
     let stickers: Vec<String> = attachments
@@ -221,7 +253,11 @@ pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> 
         .collect();
     let kept: Vec<String> = body
         .lines()
-        .filter(|line| !line.strip_prefix(STICKER_LINE).is_some_and(|name| stickers.iter().any(|s| s == name)))
+        .filter(|line| {
+            !line
+                .strip_prefix(STICKER_LINE)
+                .is_some_and(|name| stickers.iter().any(|s| s == name))
+        })
         .filter_map(|line| {
             let left = line
                 .split(' ')
@@ -236,13 +272,28 @@ pub(super) fn strip_attachment_links(body: &str, attachments: &[Attachment]) -> 
     kept.join("\n").trim().to_string()
 }
 
-pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec<String>) -> Result<()> {
-    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
-    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel")?;
+pub(super) async fn run_resign(
+    state: &AppState,
+    buffer_id: &str,
+    mut stale: Vec<String>,
+) -> Result<()> {
+    let buffer = state
+        .runtime
+        .get_buffer(buffer_id)
+        .context("no such buffer")?;
+    let config = state
+        .accounts
+        .get_discord(&buffer.account_id)
+        .context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel")?;
 
     for _ in 0..MAX_RESIGN_FETCHES {
-        let Some(anchor) = stale.first().cloned() else { break };
+        let Some(anchor) = stale.first().cloned() else {
+            break;
+        };
         // `around` centres the page on the message, so one fetch covers what
         // sits either side of it - usually the rest of the same screenful.
         let resp = http_client_for(&config.token)
@@ -262,27 +313,43 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
 
         let mut handled = 0usize;
         for message in &page {
-            let Some(id) = message["id"].as_str() else { continue };
+            let Some(id) = message["id"].as_str() else {
+                continue;
+            };
             if !stale.iter().any(|s| s == id) {
                 continue;
             }
-            let attachments = merge_cached_thumbnails(state, buffer_id, id, extract_attachments(message));
+            let attachments =
+                merge_cached_thumbnails(state, buffer_id, id, extract_attachments(message));
             if attachments.is_empty() {
                 continue;
             }
             // Stored in the old shape: the links come out of the text as the
             // list goes in, or the picture would show twice - once as itself
             // and once as a dead link under it.
-            let old = state.store.get_message(buffer_id, id).ok().flatten().filter(stored_in_old_shape);
+            let old = state
+                .store
+                .get_message(buffer_id, id)
+                .ok()
+                .flatten()
+                .filter(stored_in_old_shape);
             if let Some(old) = old {
                 let body = strip_attachment_links(&old.body, &attachments);
-                if state.store.repair_message_media(buffer_id, id, &body, &attachments).unwrap_or(false) {
+                if state
+                    .store
+                    .repair_message_media(buffer_id, id, &body, &attachments)
+                    .unwrap_or(false)
+                {
                     state.events.emit(
                         "messageUpdated",
                         json!({ "bufferId": buffer_id, "id": id, "edited": false, "body": body, "attachments": attachments.clone() }),
                     );
                 }
-            } else if state.store.update_message_attachments(buffer_id, id, &attachments).unwrap_or(false) {
+            } else if state
+                .store
+                .update_message_attachments(buffer_id, id, &attachments)
+                .unwrap_or(false)
+            {
                 state.events.emit(
                     "messageUpdated",
                     json!({ "bufferId": buffer_id, "id": id, "edited": false, "attachments": attachments.clone() }),
@@ -291,11 +358,17 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
             // The link is valid again right now, and this message reached a
             // re-sign because its preview was needed - so take one while it can
             // still be fetched, and the next expiry has something to show.
-            cache_thumbnails(state.clone(), buffer_id.to_string(), id.to_string(), attachments);
+            cache_thumbnails(
+                state.clone(),
+                buffer_id.to_string(),
+                id.to_string(),
+                attachments,
+            );
             handled += 1;
         }
 
-        let covered: std::collections::HashSet<&str> = page.iter().filter_map(|m| m["id"].as_str()).collect();
+        let covered: std::collections::HashSet<&str> =
+            page.iter().filter_map(|m| m["id"].as_str()).collect();
         // Drop everything this page spanned, not just what it re-signed - a
         // message inside the returned range that came back without
         // attachments was deleted or edited, and asking again won't change
@@ -349,10 +422,23 @@ pub(super) fn merge_cached_thumbnails(
 ///
 /// `around` rather than fetching the message by id directly: the single
 /// message endpoint is bot-only, while `around` is what a user client uses.
-pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: &str) -> Result<Vec<Attachment>> {
-    let buffer = state.runtime.get_buffer(buffer_id).context("no such buffer")?;
-    let config = state.accounts.get_discord(&buffer.account_id).context("account not connected")?;
-    let channel_id = state.runtime.get_discord_channel(buffer_id).context("no known Discord channel for this buffer")?;
+pub async fn refresh_attachments(
+    state: &AppState,
+    buffer_id: &str,
+    message_id: &str,
+) -> Result<Vec<Attachment>> {
+    let buffer = state
+        .runtime
+        .get_buffer(buffer_id)
+        .context("no such buffer")?;
+    let config = state
+        .accounts
+        .get_discord(&buffer.account_id)
+        .context("account not connected")?;
+    let channel_id = state
+        .runtime
+        .get_discord_channel(buffer_id)
+        .context("no known Discord channel for this buffer")?;
 
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -364,7 +450,10 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     if !resp.status().is_success() {
         bail!("Discord refused the request ({})", resp.status());
     }
-    let messages: Vec<Value> = resp.json().await.context("parsing the re-fetched message")?;
+    let messages: Vec<Value> = resp
+        .json()
+        .await
+        .context("parsing the re-fetched message")?;
     let message = messages
         .iter()
         .find(|m| m["id"].as_str() == Some(message_id))
@@ -376,14 +465,21 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
     }
     let attachments = merge_cached_thumbnails(state, buffer_id, message_id, attachments);
 
-    state.store.update_message_attachments(buffer_id, message_id, &attachments)?;
+    state
+        .store
+        .update_message_attachments(buffer_id, message_id, &attachments)?;
     state.events.emit(
         "messageUpdated",
         json!({ "bufferId": buffer_id, "id": message_id, "edited": false, "attachments": attachments.clone() }),
     );
     // Same reasoning as the batch sweep: capture a preview while this link is
     // freshly signed, so the next expiry is not another round-trip.
-    cache_thumbnails(state.clone(), buffer_id.to_string(), message_id.to_string(), attachments.clone());
+    cache_thumbnails(
+        state.clone(),
+        buffer_id.to_string(),
+        message_id.to_string(),
+        attachments.clone(),
+    );
     Ok(attachments)
 }
 
@@ -401,7 +497,10 @@ pub(super) fn guild_icon_cache_dir() -> std::path::PathBuf {
 pub(super) async fn cached_guild_icon(guild_id: &str, icon_hash: Option<&str>) -> Option<String> {
     let hash = icon_hash?;
     let path = guild_icon_cache_dir().join(format!("{guild_id}-{hash}.png"));
-    tokio::fs::try_exists(&path).await.unwrap_or(false).then(|| format!("file://{}", path.display()))
+    tokio::fs::try_exists(&path)
+        .await
+        .unwrap_or(false)
+        .then(|| format!("file://{}", path.display()))
 }
 
 /// Fetches a guild's icon in the background and re-registers the rail entry
@@ -417,7 +516,15 @@ pub(super) async fn cached_guild_icon(guild_id: &str, icon_hash: Option<&str>) -
 /// it was set correctly on connect and wiped moments later by the icon
 /// arriving.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn cache_guild_icon(state: AppState, account_id: String, guild_id: String, name: String, icon_hash: Option<String>, position: i64, pending: bool) {
+pub(super) fn cache_guild_icon(
+    state: AppState,
+    account_id: String,
+    guild_id: String,
+    name: String,
+    icon_hash: Option<String>,
+    position: i64,
+    pending: bool,
+) {
     let Some(hash) = icon_hash else { return };
     tokio::spawn(async move {
         let dir = guild_icon_cache_dir();
@@ -427,16 +534,28 @@ pub(super) fn cache_guild_icon(state: AppState, account_id: String, guild_id: St
             // for .png yields a still frame of the same thing, which is what a
             // rail wants anyway.
             let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128");
-            let Ok(Ok(resp)) = tokio::time::timeout(std::time::Duration::from_secs(20), http_client_for(&account_id).get(&url).send()).await else {
+            let Ok(Ok(resp)) = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                http_client_for(&account_id).get(&url).send(),
+            )
+            .await
+            else {
                 tracing::debug!("discord: guild icon fetch for {guild_id} timed out");
                 return;
             };
             if !resp.status().is_success() {
-                tracing::debug!("discord: guild icon for {guild_id} returned HTTP {}", resp.status());
+                tracing::debug!(
+                    "discord: guild icon for {guild_id} returned HTTP {}",
+                    resp.status()
+                );
                 return;
             }
-            let Ok(bytes) = resp.bytes().await else { return };
-            if tokio::fs::create_dir_all(&dir).await.is_err() || tokio::fs::write(&path, &bytes).await.is_err() {
+            let Ok(bytes) = resp.bytes().await else {
+                return;
+            };
+            if tokio::fs::create_dir_all(&dir).await.is_err()
+                || tokio::fs::write(&path, &bytes).await.is_err()
+            {
                 return;
             }
         }
@@ -508,7 +627,9 @@ pub async fn retire_still_thumbnails() {
         return;
     }
     if cleared > 0 {
-        tracing::info!("discord: retired {cleared} still thumbnail(s); they will be taken again animated");
+        tracing::info!(
+            "discord: retired {cleared} still thumbnail(s); they will be taken again animated"
+        );
     }
 }
 
@@ -521,10 +642,16 @@ pub(super) const THUMBNAIL_WIDTH: u32 = 480;
 /// which is the same trick its own clients use for previews. Returns None for
 /// anything that isn't a Discord-hosted image, so nothing else gets proxied.
 pub(super) fn thumbnail_source(url: &str, width: u32, height: u32) -> Option<String> {
-    if !url.starts_with("https://cdn.discordapp.com/") && !url.starts_with("https://media.discordapp.net/") {
+    if !url.starts_with("https://cdn.discordapp.com/")
+        && !url.starts_with("https://media.discordapp.net/")
+    {
         return None;
     }
-    let proxied = url.replacen("https://cdn.discordapp.com/", "https://media.discordapp.net/", 1);
+    let proxied = url.replacen(
+        "https://cdn.discordapp.com/",
+        "https://media.discordapp.net/",
+        1,
+    );
     // Preserve the aspect ratio: asking for a square would letterbox it.
     let (w, h) = if width == 0 || height == 0 {
         (THUMBNAIL_WIDTH, THUMBNAIL_WIDTH)
@@ -561,8 +688,12 @@ pub(super) fn attachment_expired(url: &str) -> bool {
 const EXPIRY_MARGIN_SECS: u64 = 600;
 
 fn expires_within(url: &str, margin: u64) -> bool {
-    let Some(ex) = url.split(['?', '&']).find_map(|p| p.strip_prefix("ex=")) else { return false };
-    let Ok(expiry) = u64::from_str_radix(ex, 16) else { return false };
+    let Some(ex) = url.split(['?', '&']).find_map(|p| p.strip_prefix("ex=")) else {
+        return false;
+    };
+    let Ok(expiry) = u64::from_str_radix(ex, 16) else {
+        return false;
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -576,7 +707,12 @@ fn expires_within(url: &str, margin: u64) -> bool {
 /// which picture it was. Its link may have expired as well - Discord's do, in
 /// a day - in which case the message is re-fetched for a freshly signed one
 /// first, as a lapsed link already is.
-pub async fn restore_thumbnail(state: &AppState, path: &std::path::Path, buffer_id: &str, message_id: &str) -> Result<std::path::PathBuf> {
+pub async fn restore_thumbnail(
+    state: &AppState,
+    path: &std::path::Path,
+    buffer_id: &str,
+    message_id: &str,
+) -> Result<std::path::PathBuf> {
     let wanted = format!("file://{}", path.display());
     let find = |attachments: &[Attachment]| {
         attachments
@@ -584,31 +720,47 @@ pub async fn restore_thumbnail(state: &AppState, path: &std::path::Path, buffer_
             .find(|a| a.thumbnail_path.as_deref() == Some(wanted.as_str()))
             .and_then(|a| Some((a.url.clone()?, a.width.unwrap_or(0), a.height.unwrap_or(0))))
     };
-    let message = state.store.get_message(buffer_id, message_id)?.context("that message is not stored here")?;
-    let (url, width, height) = find(&message.attachments).context("that message has no such picture")?;
-    let src = thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
+    let message = state
+        .store
+        .get_message(buffer_id, message_id)?
+        .context("that message is not stored here")?;
+    let (url, width, height) =
+        find(&message.attachments).context("that message has no such picture")?;
+    let src =
+        thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
     if fetch_thumbnail(&src, &url).await.is_some() {
         return Ok(path.to_path_buf());
     }
     let fresh = refresh_attachments(state, buffer_id, message_id).await?;
     let (url, width, height) = find(&fresh).context("that message no longer has the picture")?;
-    let src = thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
-    fetch_thumbnail(&src, &url).await.context("Discord did not send the picture")?;
+    let src =
+        thumbnail_source(&url, width, height).context("that picture is not on Discord's CDN")?;
+    fetch_thumbnail(&src, &url)
+        .await
+        .context("Discord did not send the picture")?;
     Ok(path.to_path_buf())
 }
 
 /// Fetches a cached server icon again. Its name is the server and the icon's
 /// hash, which is the whole of its CDN address.
 pub async fn restore_guild_icon(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let name = path.file_stem().and_then(|n| n.to_str()).context("not a cached icon")?;
+    let name = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .context("not a cached icon")?;
     let (guild_id, hash) = name.split_once('-').context("not a cached icon")?;
-    if !guild_id.bytes().all(|b| b.is_ascii_digit()) || !hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+    if !guild_id.bytes().all(|b| b.is_ascii_digit())
+        || !hash.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
         bail!("not a cached icon");
     }
     let url = format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128");
-    let resp = tokio::time::timeout(std::time::Duration::from_secs(20), anonymous_client().get(&url).send())
-        .await
-        .context("Discord took too long")??;
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        anonymous_client().get(&url).send(),
+    )
+    .await
+    .context("Discord took too long")??;
     if !resp.status().is_success() {
         bail!("Discord answered {} for that icon", resp.status());
     }
@@ -675,7 +827,11 @@ mod tests {
     #[test]
     fn stale_ids_come_back_newest_first() {
         // Snowflakes: longer is newer, and equal lengths sort lexically.
-        let page = vec![msg("100", &[PAST]), msg("1000", &[PAST]), msg("300", &[PAST])];
+        let page = vec![
+            msg("100", &[PAST]),
+            msg("1000", &[PAST]),
+            msg("300", &[PAST]),
+        ];
         assert_eq!(stale_message_ids(&page), vec!["1000", "300", "100"]);
     }
 
@@ -707,8 +863,13 @@ mod tests {
     /// gone blank on screen.
     #[test]
     fn a_link_about_to_lapse_counts_as_lapsed() {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let link = |at: u64| format!("https://cdn.discordapp.com/attachments/1/2/a.png?ex={at:x}&is=1&hm=2");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let link = |at: u64| {
+            format!("https://cdn.discordapp.com/attachments/1/2/a.png?ex={at:x}&is=1&hm=2")
+        };
         assert!(attachment_expired(&link(now + 120)));
         assert!(!attachment_expired(&link(now + 3600)));
     }
@@ -718,7 +879,9 @@ mod tests {
     #[test]
     fn old_attachment_links_come_out_of_the_text() {
         let own = Attachment {
-            url: Some("https://cdn.discordapp.com/attachments/1/2/shot.png?ex=aa&is=bb&hm=cc".into()),
+            url: Some(
+                "https://cdn.discordapp.com/attachments/1/2/shot.png?ex=aa&is=bb&hm=cc".into(),
+            ),
             ..Default::default()
         };
         let body = "look at this\nhttps://cdn.discordapp.com/attachments/1/2/shot.png?ex=11&is=22&hm=33\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1";
@@ -727,15 +890,31 @@ mod tests {
             "look at this\nand https://cdn.discordapp.com/attachments/9/9/other.png?ex=1"
         );
         // The media host is the same file.
-        assert_eq!(strip_attachment_links("https://media.discordapp.net/attachments/1/2/shot.png", &[own]), "");
+        assert_eq!(
+            strip_attachment_links(
+                "https://media.discordapp.net/attachments/1/2/shot.png",
+                &[own]
+            ),
+            ""
+        );
     }
 
     #[test]
     fn a_sticker_stand_in_goes_once_the_sticker_can_be_drawn() {
-        let sticker = Attachment { kind: "lottie".into(), filename: Some("wave.json".into()), ..Default::default() };
-        assert_eq!(strip_attachment_links("sent a sticker: wave", std::slice::from_ref(&sticker)), "");
+        let sticker = Attachment {
+            kind: "lottie".into(),
+            filename: Some("wave.json".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            strip_attachment_links("sent a sticker: wave", std::slice::from_ref(&sticker)),
+            ""
+        );
         // Somebody else's sticker named in passing stays.
-        assert_eq!(strip_attachment_links("sent a sticker: dance", &[sticker]), "sent a sticker: dance");
+        assert_eq!(
+            strip_attachment_links("sent a sticker: dance", &[sticker]),
+            "sent a sticker: dance"
+        );
     }
 
     #[test]
@@ -757,8 +936,12 @@ mod tests {
 
     #[test]
     fn builds_a_proxied_thumbnail_preserving_aspect_ratio() {
-        let src = thumbnail_source("https://cdn.discordapp.com/attachments/1/2/a.png?ex=1", 1000, 500)
-            .expect("should proxy a Discord link");
+        let src = thumbnail_source(
+            "https://cdn.discordapp.com/attachments/1/2/a.png?ex=1",
+            1000,
+            500,
+        )
+        .expect("should proxy a Discord link");
         // Resizing goes through the media proxy, not the raw CDN host.
         assert!(src.starts_with("https://media.discordapp.net/"), "{src}");
         assert!(src.contains("width=480"), "{src}");
@@ -772,7 +955,12 @@ mod tests {
 
     #[test]
     fn taller_than_wide_is_bounded_by_height() {
-        let src = thumbnail_source("https://media.discordapp.net/attachments/1/2/a.png", 500, 1000).unwrap();
+        let src = thumbnail_source(
+            "https://media.discordapp.net/attachments/1/2/a.png",
+            500,
+            1000,
+        )
+        .unwrap();
         assert!(src.contains("width=240"), "{src}");
         assert!(src.contains("height=480"), "{src}");
     }

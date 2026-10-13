@@ -55,7 +55,11 @@ fn embedded() -> String {
 
 impl Default for NetSettings {
     fn default() -> Self {
-        Self { tor_mode: embedded(), proxy: None, tunnel_all: false }
+        Self {
+            tor_mode: embedded(),
+            proxy: None,
+            tunnel_all: false,
+        }
     }
 }
 
@@ -80,8 +84,13 @@ pub fn router() -> &'static Arc<Router> {
     {
         // Tests run no startup: they get a router that routes nothing.
         ROUTER.get_or_init(|| {
-            let dir = std::env::temp_dir().join(format!("nobilis-test-router-{}", std::process::id()));
-            Arc::new(Router::open(dir.join("net.toml"), Arc::new(TorManager::new(&dir)), None))
+            let dir =
+                std::env::temp_dir().join(format!("nobilis-test-router-{}", std::process::id()));
+            Arc::new(Router::open(
+                dir.join("net.toml"),
+                Arc::new(TorManager::new(&dir)),
+                None,
+            ))
         })
     }
     #[cfg(not(test))]
@@ -128,7 +137,8 @@ impl Router {
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        std::fs::write(&self.path, toml::to_string_pretty(&next)?).context("saving the network settings")?;
+        std::fs::write(&self.path, toml::to_string_pretty(&next)?)
+            .context("saving the network settings")?;
         *self.socks.lock().unwrap() = None;
         self.clients.lock().unwrap().clear();
         if let Some((_, task)) = self.relay.lock().await.take() {
@@ -148,13 +158,25 @@ impl Router {
     /// Whether `key` itself asked to be routed, apart from everything being
     /// routed. What an account being created inherits from its add form.
     pub fn wanted(&self, key: &str) -> bool {
-        self.wants.lock().unwrap().get(key).copied().unwrap_or(false)
+        self.wants
+            .lock()
+            .unwrap()
+            .get(key)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Whether connections under `key` are routed: the key asked to be, or
     /// everything is.
     pub fn routed(&self, key: &str) -> bool {
-        self.settings.lock().unwrap().tunnel_all || self.wants.lock().unwrap().get(key).copied().unwrap_or(false)
+        self.settings.lock().unwrap().tunnel_all
+            || self
+                .wants
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(false)
     }
 
     /// Whether requests that belong to no account are routed: uploads to a
@@ -166,7 +188,13 @@ impl Router {
     /// whose. Going the safer way costs speed; going the other way could put
     /// a routed account's upload on its owner's real address.
     pub fn general_routed(&self) -> bool {
-        self.tunnel_all() || self.wants.lock().unwrap().iter().any(|(key, routed)| *routed && !key.ends_with(":pending"))
+        self.tunnel_all()
+            || self
+                .wants
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(key, routed)| *routed && !key.ends_with(":pending"))
     }
 
     /// Makes the route ready if requests that belong to no account are
@@ -196,7 +224,10 @@ impl Router {
         } else {
             // Bootstrapped before the relay is offered, so the first thing
             // through it does not wait out a cold start on its own clock.
-            self.tor.get_or_bootstrap(on_progress).await.context("starting Tor")?;
+            self.tor
+                .get_or_bootstrap(on_progress)
+                .await
+                .context("starting Tor")?;
             let mut relay = self.relay.lock().await;
             let port = match relay.as_ref() {
                 Some((port, _)) => *port,
@@ -259,7 +290,10 @@ impl Router {
                 Ok(p) => builder = builder.proxy(p),
                 // Should not happen - the address was built here - but if it
                 // did, a client with no proxy would leave directly.
-                Err(_) => builder = builder.proxy(reqwest::Proxy::all(NOWHERE).expect("a fixed address parses")),
+                Err(_) => {
+                    builder =
+                        builder.proxy(reqwest::Proxy::all(NOWHERE).expect("a fixed address parses"))
+                }
             }
         } else {
             // No proxy from the environment either: whether this is routed is
@@ -272,7 +306,10 @@ impl Router {
         // right for that moment - but cached, every later caller got it too,
         // long after Tor was up.
         if proxy.as_deref() != Some(NOWHERE) {
-            self.clients.lock().unwrap().insert(cache_key, client.clone());
+            self.clients
+                .lock()
+                .unwrap()
+                .insert(cache_key, client.clone());
         }
         client
     }
@@ -281,7 +318,9 @@ impl Router {
     /// when it is routed. For what is not plain HTTP: websockets.
     pub async fn connect(&self, key: &str, host: &str, port: u16) -> Result<TcpOrSocks> {
         if !self.routed(key) {
-            let stream = TcpStream::connect((host, port)).await.with_context(|| format!("connecting to {host}:{port}"))?;
+            let stream = TcpStream::connect((host, port))
+                .await
+                .with_context(|| format!("connecting to {host}:{port}"))?;
             return Ok(TcpOrSocks::Tcp(stream));
         }
         let (ph, pp) = self.ready(|_| {}).await?;
@@ -300,7 +339,11 @@ pub enum TcpOrSocks {
 }
 
 impl tokio::io::AsyncRead for TcpOrSocks {
-    fn poll_read(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             TcpOrSocks::Tcp(s) => std::pin::Pin::new(s).poll_read(cx, buf),
             TcpOrSocks::Socks(s) => std::pin::Pin::new(s).poll_read(cx, buf),
@@ -309,19 +352,29 @@ impl tokio::io::AsyncRead for TcpOrSocks {
 }
 
 impl tokio::io::AsyncWrite for TcpOrSocks {
-    fn poll_write(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
         match self.get_mut() {
             TcpOrSocks::Tcp(s) => std::pin::Pin::new(s).poll_write(cx, buf),
             TcpOrSocks::Socks(s) => std::pin::Pin::new(s).poll_write(cx, buf),
         }
     }
-    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             TcpOrSocks::Tcp(s) => std::pin::Pin::new(s).poll_flush(cx),
             TcpOrSocks::Socks(s) => std::pin::Pin::new(s).poll_flush(cx),
         }
     }
-    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
         match self.get_mut() {
             TcpOrSocks::Tcp(s) => std::pin::Pin::new(s).poll_shutdown(cx),
             TcpOrSocks::Socks(s) => std::pin::Pin::new(s).poll_shutdown(cx),
@@ -340,13 +393,20 @@ pub async fn websocket<R>(
 where
     R: tokio_tungstenite::tungstenite::client::IntoClientRequest + Unpin,
 {
-    let request = request.into_client_request().context("building the websocket request")?;
+    let request = request
+        .into_client_request()
+        .context("building the websocket request")?;
     let uri = request.uri().clone();
-    let host = uri.host().ok_or_else(|| anyhow!("a websocket address with no host"))?.to_string();
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow!("a websocket address with no host"))?
+        .to_string();
     let tls = uri.scheme_str() == Some("wss");
     let port = uri.port_u16().unwrap_or(if tls { 443 } else { 80 });
     let stream = router().connect(key, &host, port).await?;
-    tokio_tungstenite::client_async_tls(request, stream).await.context("opening the websocket")
+    tokio_tungstenite::client_async_tls(request, stream)
+        .await
+        .context("opening the websocket")
 }
 
 /// The key for a service's requests made before there is an account - the
@@ -362,12 +422,23 @@ fn parse_socks(url: &str) -> Result<(String, u16)> {
     if url.is_empty() {
         bail!("no proxy address is set - enter one like socks5h://127.0.0.1:9050");
     }
-    let with_scheme = if url.contains("://") { url.to_string() } else { format!("socks5h://{url}") };
-    let parsed = url::Url::parse(&with_scheme).with_context(|| format!("reading the proxy address {url}"))?;
+    let with_scheme = if url.contains("://") {
+        url.to_string()
+    } else {
+        format!("socks5h://{url}")
+    };
+    let parsed = url::Url::parse(&with_scheme)
+        .with_context(|| format!("reading the proxy address {url}"))?;
     if !matches!(parsed.scheme(), "socks5" | "socks5h") {
-        bail!("the proxy has to be SOCKS5 (socks5h://host:port), not {}", parsed.scheme());
+        bail!(
+            "the proxy has to be SOCKS5 (socks5h://host:port), not {}",
+            parsed.scheme()
+        );
     }
-    let host = parsed.host_str().ok_or_else(|| anyhow!("the proxy address has no host"))?.to_string();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("the proxy address has no host"))?
+        .to_string();
     Ok((host, parsed.port().unwrap_or(9050)))
 }
 
@@ -375,12 +446,16 @@ fn parse_socks(url: &str) -> Result<(String, u16)> {
 /// own Tor. No authentication, because Chromium cannot send any; reachable
 /// only from this machine.
 async fn start_relay(tor: Arc<TorManager>) -> Result<(u16, tokio::task::JoinHandle<()>)> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.context("opening the Tor relay")?;
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("opening the Tor relay")?;
     let port = listener.local_addr()?.port();
     tracing::info!("net: Tor relay listening on 127.0.0.1:{port}");
     let task = tokio::spawn(async move {
         loop {
-            let Ok((client, _)) = listener.accept().await else { continue };
+            let Ok((client, _)) = listener.accept().await else {
+                continue;
+            };
             let tor = tor.clone();
             tokio::spawn(async move {
                 if let Err(e) = relay_one(client, tor).await {
@@ -409,7 +484,9 @@ async fn relay_one(mut client: TcpStream, tor: Arc<TorManager>) -> Result<()> {
 }
 
 /// The server half of a SOCKS5 greeting and CONNECT, as far as the address.
-async fn socks_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(stream: &mut S) -> Result<(String, u16)> {
+async fn socks_handshake<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
+) -> Result<(String, u16)> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).await?;
     if head[0] != 5 {
@@ -478,7 +555,11 @@ mod tests {
         let r = router_at("closed");
         r.mark("discord:1", true);
         assert_eq!(r.proxy_for("discord:1").as_deref(), Some(NOWHERE));
-        assert_eq!(r.proxy_for("discord:2"), None, "only the account that asked");
+        assert_eq!(
+            r.proxy_for("discord:2"),
+            None,
+            "only the account that asked"
+        );
     }
 
     /// A client made before the route is ready goes nowhere - and must not
@@ -489,28 +570,59 @@ mod tests {
     fn a_client_that_goes_nowhere_is_not_kept() {
         let r = router_at("early");
         r.client_if("svc", true, |b| b);
-        assert!(r.clients.lock().unwrap().is_empty(), "the nowhere client was cached");
+        assert!(
+            r.clients.lock().unwrap().is_empty(),
+            "the nowhere client was cached"
+        );
         *r.socks.lock().unwrap() = Some(("127.0.0.1".into(), 9150));
         r.client_if("svc", true, |b| b);
-        assert_eq!(r.clients.lock().unwrap().len(), 1, "a client with a real route is kept");
+        assert_eq!(
+            r.clients.lock().unwrap().len(),
+            1,
+            "a client with a real route is kept"
+        );
     }
 
     #[tokio::test]
     async fn tunnelling_everything_routes_every_key_and_a_proxy_is_used_as_given() {
         let r = router_at("all");
-        r.set_settings(NetSettings { tor_mode: "proxy".into(), proxy: Some("socks5h://127.0.0.1:9150".into()), tunnel_all: true })
-            .await
-            .unwrap();
+        r.set_settings(NetSettings {
+            tor_mode: "proxy".into(),
+            proxy: Some("socks5h://127.0.0.1:9150".into()),
+            tunnel_all: true,
+        })
+        .await
+        .unwrap();
         assert!(r.routed("anything"));
-        assert_eq!(r.ready(|_| {}).await.unwrap(), ("127.0.0.1".to_string(), 9150));
-        assert_eq!(r.proxy_for("matrix:@a:b").as_deref(), Some("socks5h://127.0.0.1:9150"));
+        assert_eq!(
+            r.ready(|_| {}).await.unwrap(),
+            ("127.0.0.1".to_string(), 9150)
+        );
+        assert_eq!(
+            r.proxy_for("matrix:@a:b").as_deref(),
+            Some("socks5h://127.0.0.1:9150")
+        );
     }
 
     #[tokio::test]
     async fn a_proxy_mode_without_an_address_is_refused() {
         let r = router_at("bad");
-        assert!(r.set_settings(NetSettings { tor_mode: "proxy".into(), proxy: None, tunnel_all: false }).await.is_err());
-        assert!(r.set_settings(NetSettings { tor_mode: "proxy".into(), proxy: Some("http://x:1".into()), tunnel_all: false }).await.is_err());
+        assert!(r
+            .set_settings(NetSettings {
+                tor_mode: "proxy".into(),
+                proxy: None,
+                tunnel_all: false
+            })
+            .await
+            .is_err());
+        assert!(r
+            .set_settings(NetSettings {
+                tor_mode: "proxy".into(),
+                proxy: Some("http://x:1".into()),
+                tunnel_all: false
+            })
+            .await
+            .is_err());
     }
 
     #[test]
@@ -519,9 +631,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let tor = Arc::new(TorManager::new(&dir));
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let wanted = NetSettings { tor_mode: "embedded".into(), proxy: None, tunnel_all: true };
-        rt.block_on(Router::open(dir.join("net.toml"), tor.clone(), None).set_settings(wanted.clone())).unwrap();
-        assert_eq!(Router::open(dir.join("net.toml"), tor, None).settings(), wanted);
+        let wanted = NetSettings {
+            tor_mode: "embedded".into(),
+            proxy: None,
+            tunnel_all: true,
+        };
+        rt.block_on(
+            Router::open(dir.join("net.toml"), tor.clone(), None).set_settings(wanted.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            Router::open(dir.join("net.toml"), tor, None).settings(),
+            wanted
+        );
     }
 
     #[tokio::test]
@@ -536,6 +658,9 @@ mod tests {
         req.extend_from_slice(b"example.com");
         req.extend_from_slice(&443u16.to_be_bytes());
         a.write_all(&req).await.unwrap();
-        assert_eq!(server.await.unwrap().unwrap(), ("example.com".to_string(), 443));
+        assert_eq!(
+            server.await.unwrap().unwrap(),
+            ("example.com".to_string(), 443)
+        );
     }
 }

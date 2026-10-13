@@ -138,7 +138,10 @@ fn span<'a>(text: &'a str, marker: &str, tag: &str) -> Option<(String, &'a str)>
     if inner.starts_with(char::is_whitespace) || inner.ends_with(char::is_whitespace) {
         return None;
     }
-    Some((format!("<{tag}>{}</{tag}>", inline(inner)), &after[end + marker.len()..]))
+    Some((
+        format!("<{tag}>{}</{tag}>", inline(inner)),
+        &after[end + marker.len()..],
+    ))
 }
 
 #[cfg(test)]
@@ -155,27 +158,45 @@ mod tests {
 
     #[test]
     fn emphasis_becomes_tags() {
-        assert_eq!(to_html("**bold**").as_deref(), Some("<strong>bold</strong>"));
+        assert_eq!(
+            to_html("**bold**").as_deref(),
+            Some("<strong>bold</strong>")
+        );
         assert_eq!(to_html("*it*").as_deref(), Some("<em>it</em>"));
         assert_eq!(to_html("_it_").as_deref(), Some("<em>it</em>"));
         assert_eq!(to_html("~~no~~").as_deref(), Some("<del>no</del>"));
-        assert_eq!(to_html("a **b** c").as_deref(), Some("a <strong>b</strong> c"));
+        assert_eq!(
+            to_html("a **b** c").as_deref(),
+            Some("a <strong>b</strong> c")
+        );
     }
 
     /// The input is somebody's text and the output goes to other people's
     /// clients, so a tag typed into the box must arrive as characters.
     #[test]
     fn typed_markup_is_escaped_not_honoured() {
-        assert_eq!(to_html("**<b>hi</b>**").as_deref(), Some("<strong>&lt;b&gt;hi&lt;/b&gt;</strong>"));
-        assert_eq!(to_html("`<script>`").as_deref(), Some("<code>&lt;script&gt;</code>"));
+        assert_eq!(
+            to_html("**<b>hi</b>**").as_deref(),
+            Some("<strong>&lt;b&gt;hi&lt;/b&gt;</strong>")
+        );
+        assert_eq!(
+            to_html("`<script>`").as_deref(),
+            Some("<code>&lt;script&gt;</code>")
+        );
     }
 
     #[test]
     fn code_is_left_exactly_as_typed() {
         assert_eq!(to_html("`a*b*c`").as_deref(), Some("<code>a*b*c</code>"));
-        assert_eq!(to_html("```\na*b*\n```").as_deref(), Some("<pre><code>a*b*</code></pre>"));
+        assert_eq!(
+            to_html("```\na*b*\n```").as_deref(),
+            Some("<pre><code>a*b*</code></pre>")
+        );
         // A language on the fence is not part of the code.
-        assert_eq!(to_html("```rust\nlet x = 1;\n```").as_deref(), Some("<pre><code>let x = 1;</code></pre>"));
+        assert_eq!(
+            to_html("```rust\nlet x = 1;\n```").as_deref(),
+            Some("<pre><code>let x = 1;</code></pre>")
+        );
     }
 
     /// A stray marker is a character somebody typed, not the start of
@@ -192,6 +213,9 @@ mod tests {
 
     #[test]
     fn line_breaks_survive_alongside_formatting() {
-        assert_eq!(to_html("**a**\nb").as_deref(), Some("<strong>a</strong><br/>b"));
+        assert_eq!(
+            to_html("**a**\nb").as_deref(),
+            Some("<strong>a</strong><br/>b")
+        );
     }
 }

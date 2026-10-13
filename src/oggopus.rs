@@ -115,7 +115,9 @@ pub fn waveform(samples: &[f32], buckets: usize) -> Vec<u8> {
     (0..buckets)
         .map(|i| {
             let from = (i as f64 * step) as usize;
-            let to = (((i + 1) as f64 * step) as usize).max(from + 1).min(samples.len());
+            let to = (((i + 1) as f64 * step) as usize)
+                .max(from + 1)
+                .min(samples.len());
             let peak = samples[from..to].iter().fold(0.0f32, |m, s| m.max(s.abs()));
             (peak.clamp(0.0, 1.0) * 255.0).round() as u8
         })
@@ -128,7 +130,11 @@ pub fn waveform(samples: &[f32], buckets: usize) -> Vec<u8> {
 /// stream with a broken sequence, which is a confusing thing to debug.
 fn rand_serial() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(1) | 1
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(1)
+        | 1
 }
 
 /// The Ogg framing itself.
@@ -140,7 +146,11 @@ struct Ogg {
 
 impl Ogg {
     fn new(serial: u32) -> Self {
-        Self { out: Vec::new(), serial, sequence: 0 }
+        Self {
+            out: Vec::new(),
+            serial,
+            sequence: 0,
+        }
     }
 
     /// One page carrying whole packets.
@@ -166,7 +176,13 @@ impl Ogg {
         let mut header = Vec::with_capacity(27 + segments.len());
         header.extend_from_slice(b"OggS");
         header.push(0); // stream structure version
-        header.push(if first { 0x02 } else if last { 0x04 } else { 0x00 });
+        header.push(if first {
+            0x02
+        } else if last {
+            0x04
+        } else {
+            0x00
+        });
         header.extend_from_slice(&granule.to_le_bytes());
         header.extend_from_slice(&self.serial.to_le_bytes());
         header.extend_from_slice(&self.sequence.to_le_bytes());
@@ -200,7 +216,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= (byte as u32) << 24;
         for _ in 0..8 {
-            crc = if crc & 0x8000_0000 != 0 { (crc << 1) ^ 0x04C1_1DB7 } else { crc << 1 };
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
         }
     }
     crc
@@ -239,7 +259,9 @@ mod tests {
     /// length of and a person can listen to if this ever needs debugging.
     fn tone(seconds: f64) -> Vec<f32> {
         let n = (RATE as f64 * seconds) as usize;
-        (0..n).map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.5).collect()
+        (0..n)
+            .map(|i| (i as f32 * 440.0 * std::f32::consts::TAU / RATE as f32).sin() * 0.5)
+            .collect()
     }
 
     #[test]
@@ -248,7 +270,10 @@ mod tests {
         assert_eq!(&bytes[0..4], b"OggS", "not an Ogg stream");
         // The identification header is the first packet of the first page.
         assert_eq!(&bytes[28..36], b"OpusHead");
-        assert!(bytes.windows(8).any(|w| w == b"OpusTags"), "the comment header is required");
+        assert!(
+            bytes.windows(8).any(|w| w == b"OpusTags"),
+            "the comment header is required"
+        );
     }
 
     /// The checksum is the detail most likely to be wrong and least likely to
@@ -277,7 +302,15 @@ mod tests {
         let bytes = encode(&tone(2.0)).expect("encoding");
         let path = write_temp(&bytes).expect("writing");
         let out = std::process::Command::new("ffprobe")
-            .args(["-v", "error", "-show_entries", "format=format_name,duration:stream=codec_name,channels,sample_rate", "-of", "default=nw=1", "-i"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name,duration:stream=codec_name,channels,sample_rate",
+                "-of",
+                "default=nw=1",
+                "-i",
+            ])
             .arg(&path)
             .output()
             .expect("running ffprobe");
@@ -295,7 +328,10 @@ mod tests {
             .find_map(|l| l.strip_prefix("duration="))
             .and_then(|v| v.parse().ok())
             .expect("a duration");
-        assert!((duration - 2.0).abs() < 0.05, "ffprobe reads {duration}s, not 2s");
+        assert!(
+            (duration - 2.0).abs() < 0.05,
+            "ffprobe reads {duration}s, not 2s"
+        );
         let _ = std::fs::remove_file(path);
     }
 

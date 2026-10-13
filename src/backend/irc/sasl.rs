@@ -140,7 +140,8 @@ impl Scram {
         }
         let nonce = nonce.ok_or_else(|| anyhow!("server's SCRAM reply carried no nonce"))?;
         let salt = salt.ok_or_else(|| anyhow!("server's SCRAM reply carried no salt"))?;
-        let iterations = iterations.ok_or_else(|| anyhow!("server's SCRAM reply carried no iteration count"))?;
+        let iterations =
+            iterations.ok_or_else(|| anyhow!("server's SCRAM reply carried no iteration count"))?;
         // The server chooses this, and a server choosing 1 would be asking for
         // a password that is barely stretched at all.
         if iterations < 4096 {
@@ -148,7 +149,11 @@ impl Scram {
         }
         // Our nonce must be a prefix of the combined one, or the server is not
         // answering the message we sent.
-        let ours = self.client_first_bare.rsplit_once("r=").map(|(_, n)| n).unwrap_or_default();
+        let ours = self
+            .client_first_bare
+            .rsplit_once("r=")
+            .map(|(_, n)| n)
+            .unwrap_or_default();
         if !nonce.starts_with(ours) {
             bail!("server's SCRAM nonce does not extend ours");
         }
@@ -159,7 +164,10 @@ impl Scram {
         let salted = pbkdf2_sha256(self.password.as_bytes(), &salt, iterations);
         let client_key = hmac_sha256(&salted, b"Client Key");
         let stored_key: [u8; HASH] = Sha256::digest(client_key).into();
-        let auth_message = format!("{},{server_first},{client_final_bare}", self.client_first_bare);
+        let auth_message = format!(
+            "{},{server_first},{client_final_bare}",
+            self.client_first_bare
+        );
         let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
 
         let mut proof = client_key;
@@ -178,8 +186,13 @@ impl Scram {
     /// server also knew the password. Skipping it leaves the exchange no
     /// better than PLAIN against a server that has been replaced.
     pub fn verify(&self, server_final: &str) -> Result<()> {
-        let salted = self.salted_password.ok_or_else(|| anyhow!("SCRAM finished out of order"))?;
-        let auth_message = self.auth_message.as_ref().ok_or_else(|| anyhow!("SCRAM finished out of order"))?;
+        let salted = self
+            .salted_password
+            .ok_or_else(|| anyhow!("SCRAM finished out of order"))?;
+        let auth_message = self
+            .auth_message
+            .as_ref()
+            .ok_or_else(|| anyhow!("SCRAM finished out of order"))?;
 
         for field in server_final.split(',') {
             match field.split_once('=') {
@@ -208,7 +221,9 @@ pub fn nonce() -> String {
     use rand::Rng;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let mut rng = rand::thread_rng();
-    (0..24).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+    (0..24)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
 }
 
 #[cfg(test)]
@@ -233,7 +248,10 @@ mod tests {
         );
         // Test case 6 - a key longer than the block, which is hashed first.
         assert_eq!(
-            hex(&hmac_sha256(&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            hex(&hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }
@@ -251,7 +269,9 @@ mod tests {
             "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
         );
 
-        scram.verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").unwrap();
+        scram
+            .verify("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .unwrap();
     }
 
     #[test]
@@ -261,21 +281,27 @@ mod tests {
             .client_final("r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
             .unwrap();
         // One byte different from the real signature.
-        let err = scram.verify("v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=").unwrap_err();
+        let err = scram
+            .verify("v=7rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
+            .unwrap_err();
         assert!(err.to_string().contains("could not prove"), "{err}");
     }
 
     #[test]
     fn refuses_a_nonce_that_is_not_ours_extended() {
         let mut scram = Scram::new("user", "pencil", "ourOwnNonce");
-        let err = scram.client_final("r=somebodyElsesNonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096").unwrap_err();
+        let err = scram
+            .client_final("r=somebodyElsesNonce,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096")
+            .unwrap_err();
         assert!(err.to_string().contains("does not extend ours"), "{err}");
     }
 
     #[test]
     fn refuses_an_iteration_count_that_stretches_nothing() {
         let mut scram = Scram::new("user", "pencil", "n");
-        let err = scram.client_final("r=n2,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1").unwrap_err();
+        let err = scram
+            .client_final("r=n2,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1")
+            .unwrap_err();
         assert!(err.to_string().contains("too few"), "{err}");
     }
 
@@ -314,7 +340,13 @@ mod tests {
 /// error and stays one. That is a wrong password, and quietly carrying on
 /// unauthenticated is how somebody ends up sitting in a channel under an
 /// unregistered nick believing they are identified.
-pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sender: &Sender, stream: &mut ClientStream, config: &IrcAccountConfig) -> Result<bool> {
+pub(super) async fn register_with_sasl(
+    state: &AppState,
+    account_id: &str,
+    sender: &Sender,
+    stream: &mut ClientStream,
+    config: &IrcAccountConfig,
+) -> Result<bool> {
     // SASL PLAIN is the password with base64 wrapped round it - an encoding,
     // not a cipher. On a cleartext link it is the password in the clear to
     // anything on the path, which is worse than NickServ only in that the
@@ -327,7 +359,9 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
         );
     }
 
-    state.runtime.report_progress(state, account_id, "Requesting SASL capability...");
+    state
+        .runtime
+        .report_progress(state, account_id, "Requesting SASL capability...");
     sender.send_cap_req(&[Capability::Sasl])?;
     // NAK and the timeout mean the same thing here - this server has no SASL -
     // and both are answered by registering normally. Watching for NAK as well
@@ -344,7 +378,11 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
     .is_some_and(|m| matches!(&m.command, Command::CAP(_, CapSubCommand::ACK, _, _)));
 
     if !offered {
-        state.runtime.report_progress(state, account_id, "Server has no SASL; registering normally...");
+        state.runtime.report_progress(
+            state,
+            account_id,
+            "Server has no SASL; registering normally...",
+        );
         end_cap_and_register(state, sender, stream, config).await?;
         return Ok(false);
     }
@@ -380,7 +418,11 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
                 state.runtime.report_progress(
                     state,
                     account_id,
-                    &format!("Server refused {}; trying {}...", tried.last().unwrap().name(), next.unwrap().name()),
+                    &format!(
+                        "Server refused {}; trying {}...",
+                        tried.last().unwrap().name(),
+                        next.unwrap().name()
+                    ),
                 );
             }
         }
@@ -403,10 +445,18 @@ pub(super) async fn register_with_sasl(state: &AppState, account_id: &str, sende
 /// say why. So SCRAM is there for whoever names it, and the 908 fallback picks
 /// it up automatically on servers that do advertise properly.
 pub(super) fn preferred_mechanism(config: &IrcAccountConfig) -> SaslMechanism {
-    if let Some(named) = config.sasl_mechanism.as_deref().and_then(SaslMechanism::parse) {
+    if let Some(named) = config
+        .sasl_mechanism
+        .as_deref()
+        .and_then(SaslMechanism::parse)
+    {
         return named;
     }
-    if config.sasl_cert_path.as_deref().is_some_and(|p| !p.is_empty()) {
+    if config
+        .sasl_cert_path
+        .as_deref()
+        .is_some_and(|p| !p.is_empty())
+    {
         return SaslMechanism::External;
     }
     SaslMechanism::Plain
@@ -463,10 +513,19 @@ pub(super) async fn attempt_sasl(
     config: &IrcAccountConfig,
     mechanism: SaslMechanism,
 ) -> std::result::Result<(), SaslRefusal> {
-    state.runtime.report_progress(state, account_id, &format!("Starting SASL {}...", mechanism.name()));
-    sender.send(Command::AUTHENTICATE(mechanism.name().to_string())).map_err(anyhow::Error::from)?;
+    state.runtime.report_progress(
+        state,
+        account_id,
+        &format!("Starting SASL {}...", mechanism.name()),
+    );
+    sender
+        .send(Command::AUTHENTICATE(mechanism.name().to_string()))
+        .map_err(anyhow::Error::from)?;
 
-    let user = config.sasl_user.clone().unwrap_or_else(|| config.nick.clone());
+    let user = config
+        .sasl_user
+        .clone()
+        .unwrap_or_else(|| config.nick.clone());
     let pass = config.password.clone().unwrap_or_default();
 
     match mechanism {
@@ -478,18 +537,25 @@ pub(super) async fn attempt_sasl(
         }
         SaslMechanism::Plain => {
             expect_challenge(stream, "+").await?;
-            let payload = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
+            let payload =
+                base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
             sender.send_sasl(payload).map_err(anyhow::Error::from)?;
         }
         SaslMechanism::ScramSha256 => {
-            let mut scram = crate::backend::irc::sasl::Scram::new(&user, &pass, &crate::backend::irc::sasl::nonce());
+            let mut scram = crate::backend::irc::sasl::Scram::new(
+                &user,
+                &pass,
+                &crate::backend::irc::sasl::nonce(),
+            );
             expect_challenge(stream, "+").await?;
             sender
                 .send_sasl(base64::engine::general_purpose::STANDARD.encode(scram.client_first()))
                 .map_err(anyhow::Error::from)?;
 
             let server_first = read_challenge(stream).await?;
-            let client_final = scram.client_final(&server_first).map_err(SaslRefusal::Fatal)?;
+            let client_final = scram
+                .client_final(&server_first)
+                .map_err(SaslRefusal::Fatal)?;
             sender
                 .send_sasl(base64::engine::general_purpose::STANDARD.encode(client_final))
                 .map_err(anyhow::Error::from)?;
@@ -521,7 +587,9 @@ pub(super) async fn attempt_sasl(
         // The server listing what it does take, which is the one refusal
         // worth answering with a different mechanism.
         Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
-            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+            args.last()
+                .map(|list| list.split(',').map(|m| m.trim().to_string()).collect())
+                .unwrap_or_default(),
         )),
         _ => Err(SaslRefusal::Fatal(anyhow!(
             "SASL {} was refused - check the SASL username and password for this account",
@@ -531,10 +599,15 @@ pub(super) async fn attempt_sasl(
 }
 
 /// Waits for the server's `AUTHENTICATE` and insists it is what was expected.
-pub(super) async fn expect_challenge(stream: &mut ClientStream, wanted: &str) -> std::result::Result<(), SaslRefusal> {
+pub(super) async fn expect_challenge(
+    stream: &mut ClientStream,
+    wanted: &str,
+) -> std::result::Result<(), SaslRefusal> {
     let got = read_challenge(stream).await?;
     if got != wanted {
-        return Err(SaslRefusal::Fatal(anyhow!("server answered AUTHENTICATE with {got:?} rather than {wanted:?}")));
+        return Err(SaslRefusal::Fatal(anyhow!(
+            "server answered AUTHENTICATE with {got:?} rather than {wanted:?}"
+        )));
     }
     Ok(())
 }
@@ -544,7 +617,9 @@ pub(super) async fn expect_challenge(stream: &mut ClientStream, wanted: &str) ->
 /// A bare `+` means "nothing", and is passed through as itself rather than
 /// decoded - it is not base64 for an empty string, it is the protocol's way of
 /// writing one.
-pub(super) async fn read_challenge(stream: &mut ClientStream) -> std::result::Result<String, SaslRefusal> {
+pub(super) async fn read_challenge(
+    stream: &mut ClientStream,
+) -> std::result::Result<String, SaslRefusal> {
     let message = wait_for(stream, |m| {
         matches!(
             &m.command,
@@ -559,9 +634,13 @@ pub(super) async fn read_challenge(stream: &mut ClientStream) -> std::result::Re
     match &message.command {
         Command::AUTHENTICATE(payload) => decode_challenge(payload).map_err(SaslRefusal::Fatal),
         Command::Response(Response::RPL_SASLMECHS, args) => Err(SaslRefusal::TryAnother(
-            args.last().map(|list| list.split(',').map(|m| m.trim().to_string()).collect()).unwrap_or_default(),
+            args.last()
+                .map(|list| list.split(',').map(|m| m.trim().to_string()).collect())
+                .unwrap_or_default(),
         )),
-        _ => Err(SaslRefusal::Fatal(anyhow!("SASL was refused before it finished"))),
+        _ => Err(SaslRefusal::Fatal(anyhow!(
+            "SASL was refused before it finished"
+        ))),
     }
 }
 

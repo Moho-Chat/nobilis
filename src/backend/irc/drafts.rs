@@ -107,26 +107,42 @@ pub(super) fn split_for_wire(body: &str, limit: usize) -> Vec<String> {
 /// receiver joins them without the newline that would otherwise separate them,
 /// while the first piece of each line the person wrote does not, so their
 /// line breaks arrive as line breaks.
-pub(super) fn send_multiline(sender: &Sender, target: &str, pieces: &[(String, bool)]) -> Result<()> {
+pub(super) fn send_multiline(
+    sender: &Sender,
+    target: &str,
+    pieces: &[(String, bool)],
+) -> Result<()> {
     // A reference this client picked, unique for as long as the batch is
     // open. The clock is enough: batches do not overlap here, because a send
     // completes before the next one starts.
     let reference = format!(
         "ml{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() % 100_000
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            % 100_000
     );
     sender.send(Command::BATCH(
         format!("+{reference}"),
-        Some(irc::proto::BatchSubCommand::CUSTOM("draft/multiline".to_string())),
+        Some(irc::proto::BatchSubCommand::CUSTOM(
+            "draft/multiline".to_string(),
+        )),
         Some(vec![target.to_string()]),
     ))?;
     for (piece, joins_previous) in pieces {
         let mut line = Message::new(None, "PRIVMSG", vec![target, piece])?;
-        let mut tags = vec![irc::proto::message::Tag("batch".to_string(), Some(reference.clone()))];
+        let mut tags = vec![irc::proto::message::Tag(
+            "batch".to_string(),
+            Some(reference.clone()),
+        )];
         // Only a piece that continues a line joins it; the first piece of each
         // line the person wrote starts a new one, which is the newline.
         if *joins_previous {
-            tags.push(irc::proto::message::Tag("draft/multiline-concat".to_string(), None));
+            tags.push(irc::proto::message::Tag(
+                "draft/multiline-concat".to_string(),
+                None,
+            ));
         }
         line.tags = Some(tags);
         sender.send(line)?;
@@ -173,7 +189,8 @@ impl Assembling {
 /// is: the dispatch that sees the pieces has no place to keep state of its own,
 /// and a reference is unique for as long as the batch is open.
 pub(super) fn open_batches() -> &'static std::sync::Mutex<HashMap<(String, String), Assembling>> {
-    static OPEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), Assembling>>> = std::sync::OnceLock::new();
+    static OPEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(String, String), Assembling>>> =
+        std::sync::OnceLock::new();
     OPEN.get_or_init(Default::default)
 }
 
@@ -216,7 +233,10 @@ pub fn mark_read(sender: &Sender, target: &str, at: i64) -> Result<()> {
         .unwrap_or_else(chrono::Utc::now)
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
-    sender.send(Command::Raw("MARKREAD".to_string(), vec![target.to_string(), format!("timestamp={stamp}")]))?;
+    sender.send(Command::Raw(
+        "MARKREAD".to_string(),
+        vec![target.to_string(), format!("timestamp={stamp}")],
+    ))?;
     Ok(())
 }
 
@@ -230,7 +250,9 @@ pub(super) fn read_marker(args: &[String]) -> Option<(String, i64)> {
     let target = args.first()?.clone();
     let value = args.get(1)?;
     let stamp = value.strip_prefix("timestamp=")?;
-    let at = chrono::DateTime::parse_from_rfc3339(stamp).ok()?.timestamp();
+    let at = chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()?
+        .timestamp();
     Some((target, at))
 }
 
@@ -243,7 +265,11 @@ mod tests {
         let plan = plan_lines("first\nsecond\r\nthird");
         assert_eq!(
             plan,
-            vec![("first".to_string(), false), ("second".to_string(), false), ("third".to_string(), false)]
+            vec![
+                ("first".to_string(), false),
+                ("second".to_string(), false),
+                ("third".to_string(), false)
+            ]
         );
         // A line too long for the wire is cut; only its later pieces continue it.
         let long = format!("{} tail", "word ".repeat(120));
@@ -251,18 +277,27 @@ mod tests {
         assert_eq!(plan[0], ("short".to_string(), false));
         assert!(plan.len() > 2, "{plan:?}");
         assert!(!plan[1].1, "a line's first piece starts it");
-        assert!(plan[2..].iter().all(|(_, joins)| *joins), "its later pieces continue it");
+        assert!(
+            plan[2..].iter().all(|(_, joins)| *joins),
+            "its later pieces continue it"
+        );
     }
 
     #[test]
     fn blank_lines_and_trailing_space_are_dropped() {
-        assert_eq!(plan_lines("one\n\n\ntwo  \n"), vec![("one".to_string(), false), ("two".to_string(), false)]);
+        assert_eq!(
+            plan_lines("one\n\n\ntwo  \n"),
+            vec![("one".to_string(), false), ("two".to_string(), false)]
+        );
         assert!(plan_lines("\n \n").is_empty());
     }
 
     #[test]
     fn one_line_is_one_piece_as_it_was() {
-        assert_eq!(plan_lines("just this"), vec![("just this".to_string(), false)]);
+        assert_eq!(
+            plan_lines("just this"),
+            vec![("just this".to_string(), false)]
+        );
     }
 
     /// The limit is in bytes and the text is in characters, which is the
@@ -293,7 +328,13 @@ mod tests {
         for piece in &pieces {
             // Whole words, with the separator kept on the end of the piece
             // it was cut from rather than thrown away.
-            assert!(piece.trim_end().split(' ').all(|w| w == "word" || w == "tail"), "got {piece:?}");
+            assert!(
+                piece
+                    .trim_end()
+                    .split(' ')
+                    .all(|w| w == "word" || w == "tail"),
+                "got {piece:?}"
+            );
         }
     }
 
@@ -310,7 +351,12 @@ mod tests {
             "nospacesatallinthiswholeverylongmessage".repeat(20),
         ] {
             let pieces = split_for_wire(&body, 100);
-            assert_eq!(pieces.concat(), body, "{} pieces did not rejoin", pieces.len());
+            assert_eq!(
+                pieces.concat(),
+                body,
+                "{} pieces did not rejoin",
+                pieces.len()
+            );
         }
     }
 
@@ -342,7 +388,10 @@ mod tests {
 
         // The first piece never gets a newline in front of it, whatever it
         // says about itself.
-        let one = Assembling { target: "#chat".into(), pieces: vec![("only".into(), true)] };
+        let one = Assembling {
+            target: "#chat".into(),
+            pieces: vec![("only".into(), true)],
+        };
         assert_eq!(one.finish(), "only");
     }
 
@@ -360,7 +409,10 @@ mod tests {
     /// A time, and the two things that are not one.
     #[test]
     fn a_read_marker_is_a_time_or_it_is_nothing() {
-        let args = ["#chat".to_string(), "timestamp=2026-09-10T12:00:00.000Z".to_string()];
+        let args = [
+            "#chat".to_string(),
+            "timestamp=2026-09-10T12:00:00.000Z".to_string(),
+        ];
         let (target, at) = read_marker(&args).expect("a marker");
         assert_eq!(target, "#chat");
         assert!(at > 1_700_000_000);

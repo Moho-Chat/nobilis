@@ -50,8 +50,12 @@ impl GifLink {
 /// a sentence or a bracket round it.
 fn address_at(text: &str, start: usize) -> String {
     let rest = &text[start..];
-    let end = rest.find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '[' | ']' | '"' | '\'')).unwrap_or(rest.len());
-    rest[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')']).to_string()
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '[' | ']' | '"' | '\''))
+        .unwrap_or(rest.len());
+    rest[..end]
+        .trim_end_matches(['.', ',', ';', ':', '!', '?', ')'])
+        .to_string()
 }
 
 /// Where a page of a given site is, anywhere in `text`: the earliest link of
@@ -64,13 +68,19 @@ pub fn find_link(text: &str) -> Option<GifLink> {
         }
     };
 
-    for scheme_host in ["https://tenor.com/", "https://www.tenor.com/", "http://tenor.com/"] {
+    for scheme_host in [
+        "https://tenor.com/",
+        "https://www.tenor.com/",
+        "http://tenor.com/",
+    ] {
         if let Some(at) = text.find(scheme_host) {
             let url = address_at(text, at);
             // `/view/` after an optional locale: `/de/view/`, `/en-GB/view/`.
             let path = &url[scheme_host.len()..];
             let after_locale = match path.split_once('/') {
-                Some((first, rest)) if first.len() <= 5 && first != "view" && !rest.is_empty() => rest,
+                Some((first, rest)) if first.len() <= 5 && first != "view" && !rest.is_empty() => {
+                    rest
+                }
                 _ => path,
             };
             if after_locale.starts_with("view/") && after_locale.len() > "view/".len() {
@@ -79,10 +89,17 @@ pub fn find_link(text: &str) -> Option<GifLink> {
         }
     }
 
-    for scheme_host in ["https://giphy.com/gifs/", "https://www.giphy.com/gifs/", "https://giphy.com/embed/"] {
+    for scheme_host in [
+        "https://giphy.com/gifs/",
+        "https://www.giphy.com/gifs/",
+        "https://giphy.com/embed/",
+    ] {
         if let Some(at) = text.find(scheme_host) {
             let url = address_at(text, at);
-            let tail = url[scheme_host.len()..].split(['?', '#', '/']).next().unwrap_or("");
+            let tail = url[scheme_host.len()..]
+                .split(['?', '#', '/'])
+                .next()
+                .unwrap_or("");
             // `slug-with-hyphens-AbC123`: the id is what follows the last hyphen.
             let id = tail.rsplit('-').next().unwrap_or("").to_string();
             if id.len() >= 6 && id.chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -103,7 +120,10 @@ fn meta_content(html: &str, property: &str) -> Option<String> {
         let end = html[start..].find('>').map_or(html.len(), |e| start + e);
         let tag = &html[start..end];
         if tag.contains(&needle_double) || tag.contains(&needle_single) {
-            let content = tag.find("content=\"").map(|c| (c + 9, '"')).or_else(|| tag.find("content='").map(|c| (c + 9, '\'')))?;
+            let content = tag
+                .find("content=\"")
+                .map(|c| (c + 9, '"'))
+                .or_else(|| tag.find("content='").map(|c| (c + 9, '\'')))?;
             let value = &tag[content.0..];
             let value = &value[..value.find(content.1)?];
             return Some(value.replace("&amp;", "&"));
@@ -118,7 +138,8 @@ fn meta_content(html: &str, property: &str) -> Option<String> {
 /// The video is preferred to the image: it is a fraction of the size, and the
 /// window plays one as it plays any inline video, looped and silent.
 fn from_tenor_page(html: &str, url: &str) -> Option<Embed> {
-    let video = meta_content(html, "og:video").or_else(|| meta_content(html, "og:video:secure_url"));
+    let video =
+        meta_content(html, "og:video").or_else(|| meta_content(html, "og:video:secure_url"));
     let kind = if video.is_some() { "video" } else { "image" };
     let media = video.or_else(|| meta_content(html, "og:image"))?;
     // Only from Tenor's own media hosts: a page cannot make this say "go and
@@ -126,7 +147,11 @@ fn from_tenor_page(html: &str, url: &str) -> Option<Embed> {
     if !is_tenor_media(&media) {
         return None;
     }
-    let size = |p: &str| meta_content(html, p).and_then(|v| v.parse::<u32>().ok()).filter(|&n| n > 0);
+    let size = |p: &str| {
+        meta_content(html, p)
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+    };
     Some(Embed {
         kind: Some("gif".to_string()),
         url: Some(url.to_string()),
@@ -140,7 +165,10 @@ fn from_tenor_page(html: &str, url: &str) -> Option<Embed> {
 }
 
 fn is_tenor_media(url: &str) -> bool {
-    let host = url.strip_prefix("https://").and_then(|rest| rest.split('/').next()).unwrap_or("");
+    let host = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or("");
     host == "tenor.com" || host.ends_with(".tenor.com")
 }
 
@@ -158,7 +186,8 @@ fn from_giphy_id(url: &str, id: &str) -> Embed {
 
 /// Pages already looked at, and ones that said nothing. Bounded crudely: all it
 /// saves is a repeat request.
-static KNOWN: LazyLock<Mutex<HashMap<String, Option<Embed>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static KNOWN: LazyLock<Mutex<HashMap<String, Option<Embed>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 const KNOWN_LIMIT: usize = 512;
 
 /// A backlog full of links is read two at a time, not all at once.
@@ -175,10 +204,16 @@ pub fn gif_later(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &s
         return;
     }
     let Some(link) = find_link(body) else { return };
-    let (state, account_id, buffer_id, msg_id) =
-        (state.clone(), account_id.to_string(), buffer_id.to_string(), msg_id.to_string());
+    let (state, account_id, buffer_id, msg_id) = (
+        state.clone(),
+        account_id.to_string(),
+        buffer_id.to_string(),
+        msg_id.to_string(),
+    );
     tokio::spawn(async move {
-        let Some(embed) = describe(&state, &account_id, &link).await else { return };
+        let Some(embed) = describe(&state, &account_id, &link).await else {
+            return;
+        };
         crate::unfurl::add_embed(&state, &buffer_id, &msg_id, embed);
     });
 }
@@ -198,12 +233,19 @@ async fn describe(state: &AppState, account_id: &str, link: &GifLink) -> Option<
 
     let router = crate::net::route::router();
     let routed = router.tunnel_all()
-        || state.accounts.route_level_of(account_id).is_some_and(|level| level != "clearnet");
+        || state
+            .accounts
+            .route_level_of(account_id)
+            .is_some_and(|level| level != "clearnet");
     if routed && router.ready(|_| {}).await.is_err() {
         // No route. Not remembered: the next message may find one.
         return None;
     }
-    let client = router.client_if("unfurl", routed, |builder| builder.timeout(TIMEOUT).user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"))));
+    let client = router.client_if("unfurl", routed, |builder| {
+        builder
+            .timeout(TIMEOUT)
+            .user_agent(concat!("moho/", env!("CARGO_PKG_VERSION")))
+    });
 
     let response = client.get(link.url()).send().await.ok()?;
     let status = response.status();
@@ -243,14 +285,24 @@ mod tests {
         let text = "look at this https://tenor.com/view/rickroll-roll-rick-never-gonna-give-you-up-gif-22954713, so good";
         assert_eq!(
             find_link(text),
-            Some(GifLink::Tenor { url: "https://tenor.com/view/rickroll-roll-rick-never-gonna-give-you-up-gif-22954713".to_string() })
+            Some(GifLink::Tenor {
+                url:
+                    "https://tenor.com/view/rickroll-roll-rick-never-gonna-give-you-up-gif-22954713"
+                        .to_string()
+            })
         );
     }
 
     #[test]
     fn a_tenor_page_may_carry_a_locale() {
-        assert!(matches!(find_link("https://tenor.com/de/view/x-gif-1"), Some(GifLink::Tenor { .. })));
-        assert!(matches!(find_link("https://tenor.com/en-GB/view/x-gif-1"), Some(GifLink::Tenor { .. })));
+        assert!(matches!(
+            find_link("https://tenor.com/de/view/x-gif-1"),
+            Some(GifLink::Tenor { .. })
+        ));
+        assert!(matches!(
+            find_link("https://tenor.com/en-GB/view/x-gif-1"),
+            Some(GifLink::Tenor { .. })
+        ));
     }
 
     #[test]
@@ -263,12 +315,24 @@ mod tests {
     #[test]
     fn a_giphy_page_is_known_by_its_id_alone() {
         let link = find_link("https://giphy.com/gifs/cat-vibing-music-Z7wFi5b2VEAr6").unwrap();
-        assert_eq!(link, GifLink::Giphy { url: "https://giphy.com/gifs/cat-vibing-music-Z7wFi5b2VEAr6".to_string(), id: "Z7wFi5b2VEAr6".to_string() });
+        assert_eq!(
+            link,
+            GifLink::Giphy {
+                url: "https://giphy.com/gifs/cat-vibing-music-Z7wFi5b2VEAr6".to_string(),
+                id: "Z7wFi5b2VEAr6".to_string()
+            }
+        );
         let embed = from_giphy_id("https://giphy.com/gifs/x-Z7wFi5b2VEAr6", "Z7wFi5b2VEAr6");
-        assert_eq!(embed.media_url.as_deref(), Some("https://media.giphy.com/media/Z7wFi5b2VEAr6/giphy.mp4"));
+        assert_eq!(
+            embed.media_url.as_deref(),
+            Some("https://media.giphy.com/media/Z7wFi5b2VEAr6/giphy.mp4")
+        );
         assert_eq!(embed.kind.as_deref(), Some("gif"));
         // A bare id, with no slug.
-        assert!(matches!(find_link("https://giphy.com/gifs/Z7wFi5b2VEAr6"), Some(GifLink::Giphy { .. })));
+        assert!(matches!(
+            find_link("https://giphy.com/gifs/Z7wFi5b2VEAr6"),
+            Some(GifLink::Giphy { .. })
+        ));
         assert_eq!(find_link("https://giphy.com/gifs/"), None);
     }
 
@@ -291,7 +355,10 @@ mod tests {
     #[test]
     fn a_tenor_page_gives_its_video_and_its_size() {
         let e = from_tenor_page(PAGE, "https://tenor.com/view/x-gif-1").unwrap();
-        assert_eq!(e.media_url.as_deref(), Some("https://media.tenor.com/x8v1oNUOmg4AAAPo/rickroll-roll.mp4?a=1&b=2"));
+        assert_eq!(
+            e.media_url.as_deref(),
+            Some("https://media.tenor.com/x8v1oNUOmg4AAAPo/rickroll-roll.mp4?a=1&b=2")
+        );
         assert_eq!((e.width, e.height), (Some(640), Some(480)));
         assert_eq!(e.provider.as_deref(), Some("Tenor"));
         assert_eq!(e.media_kind.as_deref(), Some("video"));
@@ -301,7 +368,10 @@ mod tests {
     fn with_no_video_the_picture_stands_in() {
         let page = r#"<meta property="og:image" content="https://media1.tenor.com/m/a/b.gif">"#;
         let e = from_tenor_page(page, "https://tenor.com/view/x-gif-1").unwrap();
-        assert_eq!(e.media_url.as_deref(), Some("https://media1.tenor.com/m/a/b.gif"));
+        assert_eq!(
+            e.media_url.as_deref(),
+            Some("https://media1.tenor.com/m/a/b.gif")
+        );
         assert_eq!(e.media_kind.as_deref(), Some("image"));
     }
 
@@ -316,8 +386,13 @@ mod tests {
 
     #[test]
     fn a_link_says_what_it_is_for() {
-        let tenor = GifLink::Tenor { url: "https://tenor.com/view/x-gif-1".into() };
-        let giphy = GifLink::Giphy { url: "https://giphy.com/gifs/x-abc".into(), id: "abc".into() };
+        let tenor = GifLink::Tenor {
+            url: "https://tenor.com/view/x-gif-1".into(),
+        };
+        let giphy = GifLink::Giphy {
+            url: "https://giphy.com/gifs/x-abc".into(),
+            id: "abc".into(),
+        };
         assert_eq!(tenor.url(), "https://tenor.com/view/x-gif-1");
         assert_eq!(giphy.url(), "https://giphy.com/gifs/x-abc");
     }
@@ -326,9 +401,18 @@ mod tests {
     fn a_locale_is_skipped_only_when_it_is_one() {
         let url = |locale: &str| format!("https://tenor.com/{locale}/view/cat-gif-9");
         assert!(find_link(&url("de")).is_some());
-        assert!(find_link(&url("en-GB")).is_some(), "five characters is the longest");
-        assert!(find_link(&url("en-GBxx")).is_none(), "seven is not a locale");
-        assert!(find_link("https://tenor.com/view/cat-gif-9").is_some(), "and none is fine");
+        assert!(
+            find_link(&url("en-GB")).is_some(),
+            "five characters is the longest"
+        );
+        assert!(
+            find_link(&url("en-GBxx")).is_none(),
+            "seven is not a locale"
+        );
+        assert!(
+            find_link("https://tenor.com/view/cat-gif-9").is_some(),
+            "and none is fine"
+        );
         assert!(find_link("https://tenor.com/de/").is_none());
     }
 
@@ -339,7 +423,10 @@ mod tests {
         let e = from_tenor_page(html, "https://tenor.com/view/cat-gif-9").unwrap();
         assert_eq!(e.kind.as_deref(), Some("gif"));
         assert_eq!(e.url.as_deref(), Some("https://tenor.com/view/cat-gif-9"));
-        assert_eq!(e.media_url.as_deref(), Some("https://media.tenor.com/abc/cat.mp4?a=1&b=2"));
+        assert_eq!(
+            e.media_url.as_deref(),
+            Some("https://media.tenor.com/abc/cat.mp4?a=1&b=2")
+        );
         assert_eq!(e.media_kind.as_deref(), Some("video"));
         assert_eq!((e.width, e.height), (Some(480), Some(270)));
         assert_eq!(e.provider.as_deref(), Some("Tenor"));
@@ -356,21 +443,40 @@ mod tests {
 
     #[test]
     fn a_page_cannot_point_the_window_at_somewhere_else() {
-        let from = |media: &str| from_tenor_page(&format!(r#"<meta property="og:video" content="{media}">"#), "https://tenor.com/view/x-gif-1");
+        let from = |media: &str| {
+            from_tenor_page(
+                &format!(r#"<meta property="og:video" content="{media}">"#),
+                "https://tenor.com/view/x-gif-1",
+            )
+        };
         assert!(from("https://media.tenor.com/a.mp4").is_some());
         assert!(from("https://tenor.com/a.mp4").is_some());
         assert!(from("https://evil.example/a.mp4").is_none());
-        assert!(from("https://notenor.com/a.mp4").is_none(), "a host that only ends the same way");
-        assert!(from("http://media.tenor.com/a.mp4").is_none(), "and only over https");
-        assert!(from_tenor_page("<html>nothing</html>", "https://tenor.com/view/x-gif-1").is_none());
+        assert!(
+            from("https://notenor.com/a.mp4").is_none(),
+            "a host that only ends the same way"
+        );
+        assert!(
+            from("http://media.tenor.com/a.mp4").is_none(),
+            "and only over https"
+        );
+        assert!(
+            from_tenor_page("<html>nothing</html>", "https://tenor.com/view/x-gif-1").is_none()
+        );
     }
 
     #[test]
     fn a_giphy_gif_is_made_of_its_id() {
         let e = from_giphy_id("https://giphy.com/gifs/dog-Z7wFi5b2VEAr6", "Z7wFi5b2VEAr6");
         assert_eq!(e.kind.as_deref(), Some("gif"));
-        assert_eq!(e.url.as_deref(), Some("https://giphy.com/gifs/dog-Z7wFi5b2VEAr6"));
-        assert_eq!(e.media_url.as_deref(), Some("https://media.giphy.com/media/Z7wFi5b2VEAr6/giphy.mp4"));
+        assert_eq!(
+            e.url.as_deref(),
+            Some("https://giphy.com/gifs/dog-Z7wFi5b2VEAr6")
+        );
+        assert_eq!(
+            e.media_url.as_deref(),
+            Some("https://media.giphy.com/media/Z7wFi5b2VEAr6/giphy.mp4")
+        );
         assert_eq!(e.media_kind.as_deref(), Some("video"));
         assert_eq!(e.provider.as_deref(), Some("Giphy"));
     }
@@ -381,8 +487,13 @@ mod tests {
         remember("https://tenor.com/view/remember-b", Some(Embed::default()));
         {
             let known = KNOWN.lock().unwrap();
-            assert!(known.contains_key("https://tenor.com/view/remember-a"), "a page that said nothing is remembered too");
-            assert!(known.get("https://tenor.com/view/remember-b").is_some_and(|e| e.is_some()));
+            assert!(
+                known.contains_key("https://tenor.com/view/remember-a"),
+                "a page that said nothing is remembered too"
+            );
+            assert!(known
+                .get("https://tenor.com/view/remember-b")
+                .is_some_and(|e| e.is_some()));
         }
 
         // And until the table is full: past the limit it starts again rather
@@ -393,6 +504,9 @@ mod tests {
         }
         let known = KNOWN.lock().unwrap();
         assert!(known.len() <= KNOWN_LIMIT, "{} remembered", known.len());
-        assert!(known.contains_key(&format!("https://tenor.com/view/fill-{}", KNOWN_LIMIT + 4)), "the newest is kept");
+        assert!(
+            known.contains_key(&format!("https://tenor.com/view/fill-{}", KNOWN_LIMIT + 4)),
+            "the newest is kept"
+        );
     }
 }

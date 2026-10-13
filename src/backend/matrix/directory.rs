@@ -28,7 +28,10 @@ pub async fn search_messages(
     term: &str,
     limit: u32,
 ) -> Result<Value> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let mut filter = serde_json::Map::new();
     filter.insert("limit".into(), Value::from(limit.clamp(1, 100)));
@@ -53,17 +56,28 @@ pub async fn search_messages(
         }
     });
 
-    let resp = http::post_json(&format!("{base}/_matrix/client/v3/search"), Some(&account.access_token), body)
-        .await
-        .context("searching the server")?;
-    let events = resp["search_categories"]["room_events"]["results"].as_array().cloned().unwrap_or_default();
+    let resp = http::post_json(
+        &format!("{base}/_matrix/client/v3/search"),
+        Some(&account.access_token),
+        body,
+    )
+    .await
+    .context("searching the server")?;
+    let events = resp["search_categories"]["room_events"]["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     let mut results = Vec::new();
     let mut room_names = serde_json::Map::new();
     for hit in events {
         let event = &hit["result"];
-        let Some(event_id) = event["event_id"].as_str() else { continue };
-        let Some(room) = event["room_id"].as_str() else { continue };
+        let Some(event_id) = event["event_id"].as_str() else {
+            continue;
+        };
+        let Some(room) = event["room_id"].as_str() else {
+            continue;
+        };
         let sender = event["sender"].as_str().unwrap_or_default();
         // The display name the server sent alongside the hit, where it did.
         let profile = hit["context"]["profile_info"][sender]["displayname"].as_str();
@@ -71,7 +85,10 @@ pub async fn search_messages(
         if body.is_empty() {
             continue;
         }
-        let buffer_id = state.runtime.matrix_buffer_for_room(account_id, room).unwrap_or_default();
+        let buffer_id = state
+            .runtime
+            .matrix_buffer_for_room(account_id, room)
+            .unwrap_or_default();
         if !buffer_id.is_empty() {
             if let Some((name, _kind)) = state.runtime.get_matrix_room_name(account_id, room) {
                 room_names.insert(buffer_id.clone(), Value::from(name));
@@ -147,7 +164,10 @@ pub async fn search_public_rooms(
     since: &serde_json::Map<String, Value>,
     limit: u32,
 ) -> Result<Value> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/').to_string();
     let token = account.access_token.clone();
 
@@ -163,8 +183,17 @@ pub async fn search_public_rooms(
     let requests = targets.iter().map(|server| {
         let base = base.clone();
         let token = token.clone();
-        let since = since.get(server).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        async move { (server.clone(), directory_page(&base, &token, server, query, &since, limit).await) }
+        let since = since
+            .get(server)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        async move {
+            (
+                server.clone(),
+                directory_page(&base, &token, server, query, &since, limit).await,
+            )
+        }
     });
     let answers = futures::future::join_all(requests).await;
 
@@ -173,7 +202,13 @@ pub async fn search_public_rooms(
     // as the absence of the parameter - but it very much has one to a reader,
     // and a list of servers with a blank in it says less than nothing.
     let own_server = account.user_id.rsplit(':').next().unwrap_or("").to_string();
-    let named = |server: &str| if server.is_empty() { own_server.clone() } else { server.to_string() };
+    let named = |server: &str| {
+        if server.is_empty() {
+            own_server.clone()
+        } else {
+            server.to_string()
+        }
+    };
 
     let mut rooms: Vec<Value> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -245,19 +280,30 @@ pub async fn search_public_rooms(
         // server had already listed were dropped. That is the honest number:
         // a server whose whole page was rooms somebody else had listed added
         // nothing to what is on screen, however many it returned.
-        answered.push(serde_json::json!({ "server": named(&server), "rooms": rooms.len() - before }));
+        answered
+            .push(serde_json::json!({ "server": named(&server), "rooms": rooms.len() - before }));
     }
 
     // Busiest first, across all of them. Each server returns its own list in
     // its own order, so concatenating without this would sort by which server
     // happened to answer rather than by anything about the rooms.
-    rooms.sort_by(|a, b| b["members"].as_i64().unwrap_or(0).cmp(&a["members"].as_i64().unwrap_or(0)));
+    rooms.sort_by(|a, b| {
+        b["members"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["members"].as_i64().unwrap_or(0))
+    });
 
     // By name, which does not change. Sorting by what each contributed put
     // them in a different order after every search, so a switch somebody was
     // reaching for moved as they reached - and the count beside it is what
     // says which gave the most anyway.
-    answered.sort_by(|a, b| a["server"].as_str().unwrap_or("").cmp(b["server"].as_str().unwrap_or("")));
+    answered.sort_by(|a, b| {
+        a["server"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["server"].as_str().unwrap_or(""))
+    });
 
     Ok(serde_json::json!({
         "rooms": rooms,
@@ -270,7 +316,14 @@ pub async fn search_public_rooms(
 }
 
 /// One homeserver's directory page, or an error that only costs that server.
-pub(super) async fn directory_page(base: &str, token: &str, server: &str, query: &str, since: &str, limit: u32) -> Result<Value> {
+pub(super) async fn directory_page(
+    base: &str,
+    token: &str,
+    server: &str,
+    query: &str,
+    since: &str,
+    limit: u32,
+) -> Result<Value> {
     let mut url = format!("{base}/_matrix/client/v3/publicRooms");
     if !server.is_empty() {
         url.push_str("?server=");
@@ -286,7 +339,9 @@ pub(super) async fn directory_page(base: &str, token: &str, server: &str, query:
     // POST rather than GET: only the POST form takes a search term at all, and
     // the GET form's absence of one is why a directory browser without this
     // could only ever show the first page of the whole server.
-    http::post_json(&url, Some(token), body).await.context("searching the room directory")
+    http::post_json(&url, Some(token), body)
+        .await
+        .context("searching the room directory")
 }
 
 /// Which homeservers to ask: ours, the ones this account has rooms on, and
@@ -313,12 +368,29 @@ pub(super) async fn directory_targets(
     // built, because those appear over the first minute of a session: a
     // search run before a room's buffer existed silently left that room's
     // homeserver out, and the results looked like the server had nothing.
-    let mut from_rooms: Vec<String> = state.runtime.matrix_joined_rooms(account_id).into_iter().collect();
-    if let Ok(resp) = http::get_json(&format!("{base}/_matrix/client/v3/joined_rooms"), access_token).await {
-        from_rooms.extend(resp["joined_rooms"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(str::to_string)));
+    let mut from_rooms: Vec<String> = state
+        .runtime
+        .matrix_joined_rooms(account_id)
+        .into_iter()
+        .collect();
+    if let Ok(resp) = http::get_json(
+        &format!("{base}/_matrix/client/v3/joined_rooms"),
+        access_token,
+    )
+    .await
+    {
+        from_rooms.extend(
+            resp["joined_rooms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string)),
+        );
     }
 
-    let named = from_rooms.iter().filter_map(|id| server_of_room(id).map(str::to_string));
+    let named = from_rooms
+        .iter()
+        .filter_map(|id| server_of_room(id).map(str::to_string));
     for server in named.chain(extra.iter().map(|s| server_name(s))) {
         if !server.is_empty() && seen.insert(server.clone()) {
             targets.push(server);
@@ -347,23 +419,50 @@ pub(super) async fn directory_targets(
 /// Nothing here is searched until somebody adds it. Fifteen extra requests to
 /// other people's servers on every keystroke is not something to do by default.
 pub const SUGGESTED_DIRECTORIES: &[(&str, &str)] = &[
-    ("tchncs.de", "The broadest general-purpose directory: languages, privacy, hobby groups"),
-    ("unredacted.org", "Language learning and exchange, Russian-language communities"),
+    (
+        "tchncs.de",
+        "The broadest general-purpose directory: languages, privacy, hobby groups",
+    ),
+    (
+        "unredacted.org",
+        "Language learning and exchange, Russian-language communities",
+    ),
     ("sibnsk.net", "Russian-language communities"),
     ("pub.solar", "Ukrainian-language news and communities"),
-    ("utwente.io", "Dutch, Ukrainian and Arabic-language communities"),
-    ("rollenspiel.chat", "German tabletop and pen-and-paper role-playing"),
-    ("glasgow.social", "A city: Glasgow, and its clubs and gaming"),
+    (
+        "utwente.io",
+        "Dutch, Ukrainian and Arabic-language communities",
+    ),
+    (
+        "rollenspiel.chat",
+        "German tabletop and pen-and-paper role-playing",
+    ),
+    (
+        "glasgow.social",
+        "A city: Glasgow, and its clubs and gaming",
+    ),
     ("chagai.website", "A city: Bern, meetups and games nights"),
     ("dod.ngo", "German-speaking regulars' tables and meetups"),
-    ("4d2.org", "A general community: coffee shop, stickers, clients"),
+    (
+        "4d2.org",
+        "A general community: coffee shop, stickers, clients",
+    ),
     ("mailstation.de", "Book talk, calibre and reading"),
-    ("explodie.org", "World news feeds and a small community space"),
+    (
+        "explodie.org",
+        "World news feeds and a small community space",
+    ),
     ("xonotic.org", "A single game's community"),
-    ("dithered.space", "Touhou, retro computing, a small hobby server"),
+    (
+        "dithered.space",
+        "Touhou, retro computing, a small hobby server",
+    ),
     ("fosdem.org", "A conference: talks, hallway chat, events"),
     ("hackint.org", "Hackers' congress and event channels"),
-    ("poa.st", "Political discussion, and the Japanese and Portuguese-speaking threads"),
+    (
+        "poa.st",
+        "Political discussion, and the Japanese and Portuguese-speaking threads",
+    ),
 ];
 
 /// [`SUGGESTED_DIRECTORIES`] as a client can show it.
@@ -395,7 +494,9 @@ pub(super) fn server_of_room(room_id: &str) -> Option<&str> {
     // anything that would be sent as ?server= and be nonsense there.
     let plausible = !server.is_empty()
         && server.contains('.')
-        && server.chars().all(|c| c.is_ascii_alphanumeric() || "-._:[]".contains(c));
+        && server
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-._:[]".contains(c));
     plausible.then_some(server)
 }
 
@@ -403,7 +504,12 @@ pub(super) fn server_of_room(room_id: &str) -> Option<&str> {
 /// URL: this names a server in the Matrix sense, and one typed with a scheme
 /// would be rejected by ours.
 pub(super) fn server_name(typed: &str) -> String {
-    typed.trim().trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string()
+    typed
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string()
 }
 
 /// What a space contains, asked of the server rather than inferred from sync.
@@ -425,7 +531,10 @@ pub async fn space_hierarchy(
     from: &str,
     limit: u32,
 ) -> Result<Value> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
     let base = account.homeserver_url.trim_end_matches('/');
     let mut url = format!(
         "{base}/_matrix/client/v1/rooms/{}/hierarchy?limit={limit}",
@@ -435,7 +544,9 @@ pub async fn space_hierarchy(
         url.push_str("&from=");
         url.push_str(&url::form_urlencoded::byte_serialize(from.as_bytes()).collect::<String>());
     }
-    let resp = http::get_json(&url, &account.access_token).await.context("reading the space")?;
+    let resp = http::get_json(&url, &account.access_token)
+        .await
+        .context("reading the space")?;
 
     let joined = state.runtime.matrix_joined_rooms(account_id);
 
@@ -451,7 +562,9 @@ pub async fn space_hierarchy(
             if child["type"].as_str() != Some("m.space.child") {
                 continue;
             }
-            let Some(target) = child["state_key"].as_str() else { continue };
+            let Some(target) = child["state_key"].as_str() else {
+                continue;
+            };
             if let Some(via) = child["content"]["via"].as_array() {
                 if !via.is_empty() {
                     via_for.insert(target.to_string(), Value::Array(via.clone()));
@@ -509,7 +622,11 @@ mod directory_tests {
     fn every_suggested_directory_is_a_bare_hostname_listed_once() {
         let mut seen = std::collections::HashSet::new();
         for &(server, about) in SUGGESTED_DIRECTORIES {
-            assert_eq!(server_name(server), server, "{server} is not written the way it is asked for");
+            assert_eq!(
+                server_name(server),
+                server,
+                "{server} is not written the way it is asked for"
+            );
             assert!(server.contains('.') && !server.contains('/'), "{server}");
             assert!(!about.is_empty(), "{server} says nothing about itself");
             assert!(seen.insert(server), "{server} is listed twice");
@@ -519,12 +636,18 @@ mod directory_tests {
     #[test]
     fn a_room_id_only_names_a_server_when_it_has_one() {
         assert_eq!(server_of_room("!abc:matrix.org"), Some("matrix.org"));
-        assert_eq!(server_of_room("!phpQp7HD_h1IuRlU61Vop1-1RL5GxApK3Foo8E6KHxM"), None);
+        assert_eq!(
+            server_of_room("!phpQp7HD_h1IuRlU61Vop1-1RL5GxApK3Foo8E6KHxM"),
+            None
+        );
         assert_eq!(server_of_room("!abc:"), None);
         // A hostname has a dot in it; "localhost" is not something to go
         // asking a public directory of.
         assert_eq!(server_of_room("!abc:localhost"), None);
-        assert_eq!(server_of_room("!abc:matrix.example.com:8448"), Some("matrix.example.com:8448"));
+        assert_eq!(
+            server_of_room("!abc:matrix.example.com:8448"),
+            Some("matrix.example.com:8448")
+        );
     }
 
     #[test]

@@ -45,7 +45,9 @@ pub struct StsAdvert {
 pub fn parse_sts(value: &str) -> StsAdvert {
     let mut out = StsAdvert::default();
     for part in value.split(',') {
-        let Some((key, val)) = part.split_once('=') else { continue };
+        let Some((key, val)) = part.split_once('=') else {
+            continue;
+        };
         match key.trim() {
             "duration" => out.duration = val.trim().parse().ok(),
             "port" => out.port = val.trim().parse().ok(),
@@ -89,7 +91,10 @@ pub struct StsStore {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl StsStore {
@@ -101,7 +106,10 @@ impl StsStore {
             // No policies is a working configuration, and the worst it costs
             // is one connection made the way the account was configured.
             .unwrap_or_default();
-        Self { path, inner: Mutex::new(inner) }
+        Self {
+            path,
+            inner: Mutex::new(inner),
+        }
     }
 
     /// This host's policy, if it has one that has not run out.
@@ -111,7 +119,12 @@ impl StsStore {
     /// in lowercase - the two are one network, and an STS that could be
     /// stepped around by changing capitalisation would not be worth having.
     pub fn policy(&self, host: &str) -> Option<StsPolicy> {
-        let policy = *self.inner.lock().unwrap().hosts.get(&host.to_ascii_lowercase())?;
+        let policy = *self
+            .inner
+            .lock()
+            .unwrap()
+            .hosts
+            .get(&host.to_ascii_lowercase())?;
         (policy.expires_at > now_secs()).then_some(policy)
     }
 
@@ -122,7 +135,13 @@ impl StsStore {
             if duration == 0 {
                 prefs.hosts.remove(&key);
             } else {
-                prefs.hosts.insert(key, StsPolicy { port, expires_at: now_secs().saturating_add(duration) });
+                prefs.hosts.insert(
+                    key,
+                    StsPolicy {
+                        port,
+                        expires_at: now_secs().saturating_add(duration),
+                    },
+                );
             }
         });
     }
@@ -152,15 +171,33 @@ mod tests {
 
     #[test]
     fn reads_both_parameters_in_either_order() {
-        assert_eq!(parse_sts("duration=2592000,port=6697"), StsAdvert { duration: Some(2592000), port: Some(6697) });
-        assert_eq!(parse_sts("port=6697,duration=300"), StsAdvert { duration: Some(300), port: Some(6697) });
+        assert_eq!(
+            parse_sts("duration=2592000,port=6697"),
+            StsAdvert {
+                duration: Some(2592000),
+                port: Some(6697)
+            }
+        );
+        assert_eq!(
+            parse_sts("port=6697,duration=300"),
+            StsAdvert {
+                duration: Some(300),
+                port: Some(6697)
+            }
+        );
     }
 
     /// A key this does not know does not make the rest unreadable - the spec
     /// is allowed to grow one.
     #[test]
     fn an_unknown_parameter_is_stepped_over() {
-        assert_eq!(parse_sts("preload,duration=60,something=else"), StsAdvert { duration: Some(60), port: None });
+        assert_eq!(
+            parse_sts("preload,duration=60,something=else"),
+            StsAdvert {
+                duration: Some(60),
+                port: None
+            }
+        );
     }
 
     /// Zero is a real value, not a missing one: it is how a network withdraws
@@ -173,7 +210,13 @@ mod tests {
     #[test]
     fn finds_sts_among_other_capabilities() {
         let caps = "server-time sts=duration=60,port=6697 away-notify";
-        assert_eq!(sts_from_caps(caps), Some(StsAdvert { duration: Some(60), port: Some(6697) }));
+        assert_eq!(
+            sts_from_caps(caps),
+            Some(StsAdvert {
+                duration: Some(60),
+                port: Some(6697)
+            })
+        );
         assert_eq!(sts_from_caps("server-time away-notify"), None);
         // A bare `sts` says nothing actionable.
         assert_eq!(sts_from_caps("server-time sts away-notify"), None);
@@ -212,7 +255,13 @@ mod tests {
         let (s, dir) = store("expired");
         s.remember("irc.example.net", 6697, 3600);
         // Reach in and age it rather than sleeping.
-        s.inner.lock().unwrap().hosts.get_mut("irc.example.net").unwrap().expires_at = 1;
+        s.inner
+            .lock()
+            .unwrap()
+            .hosts
+            .get_mut("irc.example.net")
+            .unwrap()
+            .expires_at = 1;
         assert!(s.policy("irc.example.net").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -223,7 +272,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("irc-sts.toml");
         StsStore::open(path.clone()).remember("irc.example.net", 6697, 3600);
-        assert_eq!(StsStore::open(path).policy("irc.example.net").map(|p| p.port), Some(6697));
+        assert_eq!(
+            StsStore::open(path)
+                .policy("irc.example.net")
+                .map(|p| p.port),
+            Some(6697)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

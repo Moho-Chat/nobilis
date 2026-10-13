@@ -35,7 +35,10 @@ pub enum Transport {
     /// or Tor Browser (127.0.0.1:9150). Hostnames are resolved by the proxy
     /// itself (`socks5h` semantics), required for `.onion` and to avoid
     /// leaking DNS queries.
-    Socks { host: String, port: u16 },
+    Socks {
+        host: String,
+        port: u16,
+    },
     Direct,
 }
 
@@ -115,7 +118,10 @@ impl TorManager {
     /// fresh bootstrap is in flight - a caller already past this point
     /// (client cached from an earlier call) never sees it, which is the
     /// common case after the first account connects.
-    pub async fn get_or_bootstrap(&self, on_progress: impl FnOnce(&str)) -> Result<Arc<TorClient<PreferredRuntime>>> {
+    pub async fn get_or_bootstrap(
+        &self,
+        on_progress: impl FnOnce(&str),
+    ) -> Result<Arc<TorClient<PreferredRuntime>>> {
         // A cheap fast-path check first so `on_progress` is never called
         // once the client is already up.
         if let Some(result) = self.client.read().await.as_ref() {
@@ -129,7 +135,9 @@ impl TorManager {
             return result.clone().map_err(anyhow::Error::msg);
         }
         on_progress("Bootstrapping Tor circuit (this can take up to a minute the first time)...");
-        let result = bootstrap(&self.cache_dir, &self.state_dir).await.map_err(|e| format!("{e:#}"));
+        let result = bootstrap(&self.cache_dir, &self.state_dir)
+            .await
+            .map_err(|e| format!("{e:#}"));
         *guard = Some(result.clone());
         result.map_err(anyhow::Error::msg)
     }
@@ -167,7 +175,9 @@ impl TorManager {
     pub async fn stumbled(&self) -> Recovery {
         let mut trouble = self.trouble.lock().await;
         trouble.in_a_row += 1;
-        let can_wipe = trouble.last_wipe.is_none_or(|at| at.elapsed() > WIPE_COOLDOWN);
+        let can_wipe = trouble
+            .last_wipe
+            .is_none_or(|at| at.elapsed() > WIPE_COOLDOWN);
 
         if trouble.in_a_row >= STUMBLES_BEFORE_FROM_SCRATCH && can_wipe {
             trouble.in_a_row = 0;
@@ -190,7 +200,9 @@ impl TorManager {
 
         if trouble.in_a_row == STUMBLES_BEFORE_NEW_CLIENT {
             self.restart().await;
-            tracing::warn!("Tor has failed {STUMBLES_BEFORE_NEW_CLIENT} times running; rebuilding the client");
+            tracing::warn!(
+                "Tor has failed {STUMBLES_BEFORE_NEW_CLIENT} times running; rebuilding the client"
+            );
             return Recovery::NewClient;
         }
 
@@ -206,16 +218,27 @@ impl TorManager {
 /// straight out has nothing of the sort in it - which is exactly the
 /// distinction, since throwing away Arti's directories helps only the first.
 pub fn is_tor_failure(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.downcast_ref::<arti_client::Error>().is_some())
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<arti_client::Error>().is_some())
 }
 
-async fn bootstrap(cache_dir: &std::path::Path, state_dir: &std::path::Path) -> Result<Arc<TorClient<PreferredRuntime>>> {
+async fn bootstrap(
+    cache_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> Result<Arc<TorClient<PreferredRuntime>>> {
     let mut cfg = TorClientConfig::builder();
     cfg.storage()
-        .cache_dir(arti_client::config::CfgPath::new_literal(cache_dir.to_path_buf()))
-        .state_dir(arti_client::config::CfgPath::new_literal(state_dir.to_path_buf()));
+        .cache_dir(arti_client::config::CfgPath::new_literal(
+            cache_dir.to_path_buf(),
+        ))
+        .state_dir(arti_client::config::CfgPath::new_literal(
+            state_dir.to_path_buf(),
+        ));
     let cfg = cfg.build().context("building Tor client config")?;
-    TorClient::create_bootstrapped(cfg).await.context("bootstrapping Tor")
+    TorClient::create_bootstrapped(cfg)
+        .await
+        .context("bootstrapping Tor")
 }
 
 impl Transport {
@@ -226,7 +249,10 @@ impl Transport {
             "socks5" | "socks5h" => {}
             other => bail!("unsupported proxy scheme {other:?}; expected socks5 or socks5h"),
         }
-        let host = parsed.host_str().context("proxy URL has no host")?.to_string();
+        let host = parsed
+            .host_str()
+            .context("proxy URL has no host")?
+            .to_string();
         let port = parsed.port().unwrap_or(9050);
         Ok(Transport::Socks { host, port })
     }
@@ -235,7 +261,10 @@ impl Transport {
     pub async fn connect(&self, host: &str, port: u16, tls: bool) -> Result<BoxStream> {
         let stream: BoxStream = match self {
             Transport::Tor(client) => {
-                let s = client.connect((host, port)).await.with_context(|| format!("Tor connect to {host}:{port}"))?;
+                let s = client
+                    .connect((host, port))
+                    .await
+                    .with_context(|| format!("Tor connect to {host}:{port}"))?;
                 Box::new(s)
             }
             Transport::Socks { host: ph, port: pp } => {
@@ -248,7 +277,9 @@ impl Transport {
                 if host.ends_with(".onion") {
                     bail!("cannot reach a .onion address without Tor");
                 }
-                let s = TcpStream::connect((host, port)).await.with_context(|| format!("TCP connect to {host}:{port}"))?;
+                let s = TcpStream::connect((host, port))
+                    .await
+                    .with_context(|| format!("TCP connect to {host}:{port}"))?;
                 Box::new(s)
             }
         };
@@ -257,8 +288,12 @@ impl Transport {
             return Ok(stream);
         }
         let connector = TlsConnector::from(tls_config()?);
-        let name = ServerName::try_from(host.to_string()).with_context(|| format!("invalid TLS server name {host}"))?;
-        let s = connector.connect(name, stream).await.with_context(|| format!("TLS handshake with {host}"))?;
+        let name = ServerName::try_from(host.to_string())
+            .with_context(|| format!("invalid TLS server name {host}"))?;
+        let s = connector
+            .connect(name, stream)
+            .await
+            .with_context(|| format!("TLS handshake with {host}"))?;
         Ok(Box::new(s))
     }
 
@@ -279,8 +314,12 @@ fn tls_config() -> Result<Arc<ClientConfig>> {
     if let Some(c) = CFG.get() {
         return Ok(Arc::clone(c));
     }
-    let roots = RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-    let cfg = ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    let cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     let cfg = Arc::new(cfg);
     let _ = CFG.set(Arc::clone(&cfg));
     Ok(cfg)
@@ -322,7 +361,11 @@ mod tests {
         for _ in 0..2 {
             assert_eq!(manager.stumbled().await, Recovery::Waited);
         }
-        assert_eq!(manager.stumbled().await, Recovery::Waited, "wiped twice inside the cooldown");
+        assert_eq!(
+            manager.stumbled().await,
+            Recovery::Waited,
+            "wiped twice inside the cooldown"
+        );
 
         // A connection that works clears the slate behind it.
         manager.note_success().await;
@@ -348,7 +391,10 @@ mod tests {
             .get_or_bootstrap(|msg| println!("progress: {msg}"))
             .await
             .expect("Tor bootstrap failed");
-        println!("Tor bootstrapped, {} client refs", Arc::strong_count(&client));
+        println!(
+            "Tor bootstrapped, {} client refs",
+            Arc::strong_count(&client)
+        );
 
         let transport = Transport::Tor(client);
         let host = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion";

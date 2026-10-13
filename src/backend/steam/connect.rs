@@ -61,7 +61,8 @@ fn decode_nickname_changed(body: &[u8]) -> Option<(u32, Option<String>)> {
 }
 
 /// How long after the friends list to read what was missed.
-pub(super) static CATCH_UP_AFTER_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(4000);
+pub(super) static CATCH_UP_AFTER_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(4000);
 /// How many times a catch-up that found conversations not yet named is tried again.
 const CATCH_UP_RETRIES: u32 = 4;
 /// The most that reading what was missed may hold up the connection for.
@@ -83,7 +84,12 @@ pub enum Ending {
 /// What Steam said to a sign-in.
 #[derive(Debug, PartialEq)]
 pub enum Logon {
-    Welcome { heartbeat: Duration, steamid: u64, session: i32, account_flags: u32 },
+    Welcome {
+        heartbeat: Duration,
+        steamid: u64,
+        session: i32,
+        account_flags: u32,
+    },
     Refused(Ending),
     /// This server cannot take it; another may.
     TryAnother(String),
@@ -91,7 +97,8 @@ pub enum Logon {
 
 /// Reads the answer to a sign-in.
 pub fn read_logon(packet: &Packet) -> Result<Logon> {
-    let response = ClientLogonResponse::decode(packet.body.as_slice()).context("reading the sign-in reply")?;
+    let response =
+        ClientLogonResponse::decode(packet.body.as_slice()).context("reading the sign-in reply")?;
     let code = response.eresult.unwrap_or(eresult::FAIL);
     if code == eresult::OK {
         let heartbeat = response.heartbeat_seconds.filter(|s| *s > 0).unwrap_or(27);
@@ -99,14 +106,23 @@ pub fn read_logon(packet: &Packet) -> Result<Logon> {
             // A heartbeat sooner than every five seconds is a server asking to
             // be flooded; an hour is one that would have us dropped.
             heartbeat: Duration::from_secs(heartbeat.clamp(5, 300) as u64),
-            steamid: packet.header.steamid.or(response.client_supplied_steamid).unwrap_or_default(),
+            steamid: packet
+                .header
+                .steamid
+                .or(response.client_supplied_steamid)
+                .unwrap_or_default(),
             session: packet.header.client_sessionid.unwrap_or_default(),
             account_flags: response.account_flags.unwrap_or(0),
         });
     }
     Ok(match code {
-        c if eresult::is_rate_limit(c) => Logon::Refused(Ending::Later(RATE_LIMIT_WAIT, eresult::describe(c))),
-        c if eresult::means_sign_in_again(c) => Logon::Refused(Ending::Stop(format!("{}. Sign in to Steam again from Accounts.", eresult::describe(c)))),
+        c if eresult::is_rate_limit(c) => {
+            Logon::Refused(Ending::Later(RATE_LIMIT_WAIT, eresult::describe(c)))
+        }
+        c if eresult::means_sign_in_again(c) => Logon::Refused(Ending::Stop(format!(
+            "{}. Sign in to Steam again from Accounts.",
+            eresult::describe(c)
+        ))),
         c if eresult::is_final(c) => Logon::Refused(Ending::Stop(eresult::describe(c))),
         // Whatever else is something a server did, or did not, and another may do better.
         c => Logon::TryAnother(eresult::describe(c)),
@@ -124,7 +140,9 @@ pub fn logon_message(config: &SteamAccountConfig, language: &str) -> ClientLogon
         should_remember_password: Some(true),
         // Where the machine is on its own network is nothing Steam needs to
         // be told; the field exists and asks to be filled.
-        obfuscated_private_ip: Some(IpAddress { ip: Some(ip_address::Ip::V4(0)) }),
+        obfuscated_private_ip: Some(IpAddress {
+            ip: Some(ip_address::Ip::V4(0)),
+        }),
         chat_mode: Some(2),
         account_name: Some(config.username.clone()),
         machine_name: Some(auth::device_name()),
@@ -153,22 +171,33 @@ pub fn spawn(state: AppState, config: SteamAccountConfig) {
             state.runtime.remove_task_handle(&account_id);
         }
     });
-    state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
+    state
+        .runtime
+        .insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
 async fn run_with_retry(state: &AppState, config: &SteamAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
-    state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+    state
+        .runtime
+        .set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         // The account as it is now, not as it was when this task began: a
         // reconnect after the token was replaced has to use the new one.
         let current = state.accounts.get_steam(account_id);
         let config = current.as_ref().unwrap_or(config);
-        let result = std::panic::AssertUnwindSafe(run(state, config, account_id)).catch_unwind().await;
+        let result = std::panic::AssertUnwindSafe(run(state, config, account_id))
+            .catch_unwind()
+            .await;
         let (detail, wait) = match result {
             Ok(Ok(Ending::Stop(why))) => {
                 tracing::info!("steam[{account_id}]: stopped: {why}");
-                state.runtime.set_conn_state(state, account_id, ConnState::Disconnected, Some(&why));
+                state.runtime.set_conn_state(
+                    state,
+                    account_id,
+                    ConnState::Disconnected,
+                    Some(&why),
+                );
                 return;
             }
             Ok(Ok(Ending::Later(wait, why))) => (why, Some(wait)),
@@ -182,9 +211,21 @@ async fn run_with_retry(state: &AppState, config: &SteamAccountConfig, account_i
                 ("internal error (see nobilis logs)".to_string(), None)
             }
         };
-        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
-        let wait = wait.unwrap_or_else(|| state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY));
-        tracing::info!("steam[{account_id}]: not connected ({detail}); trying again in {}s", wait.as_secs());
+        state
+            .runtime
+            .set_conn_state(state, account_id, ConnState::Connecting, None);
+        let wait = wait.unwrap_or_else(|| {
+            state.runtime.next_retry_delay(
+                account_id,
+                &mut delay,
+                RECONNECT_INITIAL_DELAY,
+                RECONNECT_MAX_DELAY,
+            )
+        });
+        tracing::info!(
+            "steam[{account_id}]: not connected ({detail}); trying again in {}s",
+            wait.as_secs()
+        );
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
@@ -193,17 +234,28 @@ async fn run_with_retry(state: &AppState, config: &SteamAccountConfig, account_i
 /// One go at being connected: pick servers until one answers, then stay on it.
 async fn run(state: &AppState, config: &SteamAccountConfig, account_id: &str) -> Result<Ending> {
     if config.refresh_token.is_empty() {
-        return Ok(Ending::Stop("this account is not signed in to Steam; sign in from Accounts".to_string()));
+        return Ok(Ending::Stop(
+            "this account is not signed in to Steam; sign in from Accounts".to_string(),
+        ));
     }
     let router = crate::net::route::router();
     if router.routed(account_id) {
-        router.ready(|msg| state.runtime.report_progress(state, account_id, msg)).await.context("starting Tor or reaching the proxy")?;
+        router
+            .ready(|msg| state.runtime.report_progress(state, account_id, msg))
+            .await
+            .context("starting Tor or reaching the proxy")?;
     }
-    state.runtime.report_progress(state, account_id, "asking Steam for a server");
+    state
+        .runtime
+        .report_progress(state, account_id, "asking Steam for a server");
     let servers = cm::discover(account_id, 0).await?;
     let mut last: Option<anyhow::Error> = None;
     for server in servers.into_iter().take(4) {
-        state.runtime.report_progress(state, account_id, &format!("connecting to {}", server.endpoint));
+        state.runtime.report_progress(
+            state,
+            account_id,
+            &format!("connecting to {}", server.endpoint),
+        );
         match session(state, config, account_id, &server.url()).await {
             Ok(Outcome::Ended(ending)) => return Ok(ending),
             Ok(Outcome::Unreached(why)) => {
@@ -242,35 +294,65 @@ impl Drop for Registered<'_> {
 }
 
 /// Signs in on one server and stays until it ends.
-pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: &str, url: &str) -> Result<Outcome> {
+pub async fn session(
+    state: &AppState,
+    config: &SteamAccountConfig,
+    account_id: &str,
+    url: &str,
+) -> Result<Outcome> {
     let began = std::time::Instant::now();
     let (link, mut told) = match link::open(account_id, url).await {
         Ok(opened) => opened,
         Err(e) => return Ok(Outcome::Unreached(format!("{e:#}"))),
     };
 
-    link.set_identity(Identity { steamid: config.steamid, session: 0 });
-    link.send(emsg::CLIENT_HELLO, &ClientHello { protocol_version: Some(PROTOCOL_VERSION) })?;
-    state.runtime.report_progress(state, account_id, "signing in");
+    link.set_identity(Identity {
+        steamid: config.steamid,
+        session: 0,
+    });
+    link.send(
+        emsg::CLIENT_HELLO,
+        &ClientHello {
+            protocol_version: Some(PROTOCOL_VERSION),
+        },
+    )?;
+    state
+        .runtime
+        .report_progress(state, account_id, "signing in");
     link.send(emsg::CLIENT_LOGON, &logon_message(config, "english"))?;
 
     let reply = loop {
         match tokio::time::timeout(LOGON_TIMEOUT, told.recv()).await {
-            Err(_) => return Ok(Outcome::Unreached("Steam did not answer the sign-in".to_string())),
-            Ok(None) => return Ok(Outcome::Unreached("the connection ended before Steam answered".to_string())),
+            Err(_) => {
+                return Ok(Outcome::Unreached(
+                    "Steam did not answer the sign-in".to_string(),
+                ))
+            }
+            Ok(None) => {
+                return Ok(Outcome::Unreached(
+                    "the connection ended before Steam answered".to_string(),
+                ))
+            }
             Ok(Some(p)) if p.emsg == emsg::CLIENT_LOG_ON_RESPONSE => break p,
             // Anything else this early is not what is being waited for.
             Ok(Some(_)) => continue,
         }
     };
     let (heartbeat, steamid, session, account_flags) = match read_logon(&reply)? {
-        Logon::Welcome { heartbeat, steamid, session, account_flags } => (heartbeat, steamid, session, account_flags),
+        Logon::Welcome {
+            heartbeat,
+            steamid,
+            session,
+            account_flags,
+        } => (heartbeat, steamid, session, account_flags),
         Logon::Refused(ending) => return Ok(Outcome::Ended(ending)),
         Logon::TryAnother(why) => return Ok(Outcome::Unreached(why)),
     };
     link.set_identity(Identity { steamid, session });
     if config.steamid != steamid && steamid != 0 {
-        let _ = state.accounts.mutate_steam(account_id, |a| a.steamid = steamid);
+        let _ = state
+            .accounts
+            .mutate_steam(account_id, |a| a.steamid = steamid);
     }
 
     state.runtime.set_steam_link(account_id, link.clone());
@@ -279,10 +361,18 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
     if state.runtime.own_identity(account_id).is_none() {
         state.runtime.set_own_identity(account_id, &config.username);
     }
-    state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
+    state
+        .runtime
+        .set_conn_state(state, account_id, ConnState::Connected, None);
     // What the account is and what Steam holds back from it, and keeping its
     // sign-in alive: asked in the background, so nothing waits for either.
-    tokio::spawn(super::account::load(state.clone(), link.clone(), account_id.to_string(), steamid, account_flags));
+    tokio::spawn(super::account::load(
+        state.clone(),
+        link.clone(),
+        account_id.to_string(),
+        steamid,
+        account_flags,
+    ));
     {
         let (state, link, config) = (state.clone(), link.clone(), config.clone());
         tokio::spawn(async move { super::account::renew_if_due(&state, &link, &config).await });
@@ -310,7 +400,10 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
     }
     .run(&mut told, heartbeat)
     .await;
-    tracing::info!("steam[{account_id}]: the session lasted {}s and ended: {ending:?}", began.elapsed().as_secs());
+    tracing::info!(
+        "steam[{account_id}]: the session lasted {}s and ended: {ending:?}",
+        began.elapsed().as_secs()
+    );
     Ok(Outcome::Ended(ending))
 }
 
@@ -348,7 +441,11 @@ struct AppNames {
 impl AppNames {
     fn new() -> Self {
         let (to, heard) = tokio::sync::mpsc::unbounded_channel();
-        Self { asked: Default::default(), heard, to }
+        Self {
+            asked: Default::default(),
+            heard,
+            to,
+        }
     }
 }
 
@@ -367,12 +464,20 @@ impl Drive<'_> {
         }
     }
 
-    async fn run(mut self, told: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>, heartbeat: Duration) -> Ending {
+    async fn run(
+        mut self,
+        told: &mut tokio::sync::mpsc::UnboundedReceiver<Packet>,
+        heartbeat: Duration,
+    ) -> Ending {
         self.shown.adopt(self.state, self.account_id);
         // The warnings still waiting to be seen from before this was started.
         super::notices::restore(self.state, self.account_id);
         // What can be put in a message, for the picker; it arrives when it arrives.
-        tokio::spawn(super::emoticons::load(self.state.clone(), self.link.clone(), self.account_id.to_string()));
+        tokio::spawn(super::emoticons::load(
+            self.state.clone(),
+            self.link.clone(),
+            self.account_id.to_string(),
+        ));
         // What the account keeps about its friends - nicknames and the like -
         // is asked for in the background and taken in when it arrives, so that
         // a Steam slow to answer holds nothing up.
@@ -490,9 +595,13 @@ impl Drive<'_> {
                     // change to one: their names and states are not in it.
                     // Whoever has asked to be a friend is asked about too, so the
                     // request can say who it is from.
-                    let known = |a: &u32| self.roster.is_friend(*a) || self.roster.asked_us().contains(a);
+                    let known =
+                        |a: &u32| self.roster.is_friend(*a) || self.roster.asked_us().contains(a);
                     let ask: Vec<u32> = if list.bincremental.unwrap_or(false) {
-                        changed.into_iter().filter(|a| known(a) || self.roster.blocked().contains(a)).collect()
+                        changed
+                            .into_iter()
+                            .filter(|a| known(a) || self.roster.blocked().contains(a))
+                            .collect()
                     } else {
                         let mut all = self.roster.friends();
                         all.extend(self.roster.asked_us());
@@ -516,8 +625,15 @@ impl Drive<'_> {
             emsg::CLIENT_PERSONA_STATE => {
                 if let Ok(update) = ClientPersonaState::decode(packet.body.as_slice()) {
                     let changed = self.roster.apply_persona(&update);
-                    if changed.iter().any(|a| self.roster.asked_us().contains(a) || self.roster.asked_by_us().contains(a)) {
-                        friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
+                    if changed.iter().any(|a| {
+                        self.roster.asked_us().contains(a) || self.roster.asked_by_us().contains(a)
+                    }) {
+                        friendship::publish(
+                            self.state,
+                            self.account_id,
+                            &self.roster,
+                            &mut self.asked,
+                        );
                     }
                     if let Some(name) = self.roster.persona(self.own).and_then(|p| p.name.clone()) {
                         self.state.runtime.set_own_identity(self.account_id, &name);
@@ -543,27 +659,68 @@ impl Drive<'_> {
                 }
             }
             emsg::CLIENT_ACCOUNT_INFO => {
-                if let Some(name) = ClientAccountInfo::decode(packet.body.as_slice()).ok().and_then(|i| i.persona_name).filter(|n| !n.is_empty()) {
+                if let Some(name) = ClientAccountInfo::decode(packet.body.as_slice())
+                    .ok()
+                    .and_then(|i| i.persona_name)
+                    .filter(|n| !n.is_empty())
+                {
                     self.state.runtime.set_own_identity(self.account_id, &name);
                 }
             }
             emsg::CLIENT_LOGGED_OFF => {
-                let code = ClientLoggedOff::decode(packet.body.as_slice()).ok().and_then(|m| m.eresult).unwrap_or(eresult::FAIL);
-                tracing::info!("steam[{}]: Steam signed this session out: {} ({code})", self.account_id, eresult::describe(code));
+                let code = ClientLoggedOff::decode(packet.body.as_slice())
+                    .ok()
+                    .and_then(|m| m.eresult)
+                    .unwrap_or(eresult::FAIL);
+                tracing::info!(
+                    "steam[{}]: Steam signed this session out: {} ({code})",
+                    self.account_id,
+                    eresult::describe(code)
+                );
                 return Some(match code {
-                    c if eresult::means_sign_in_again(c) => Ending::Stop(format!("{}. Sign in to Steam again from Accounts.", eresult::describe(c))),
+                    c if eresult::means_sign_in_again(c) => Ending::Stop(format!(
+                        "{}. Sign in to Steam again from Accounts.",
+                        eresult::describe(c)
+                    )),
                     c if eresult::is_final(c) => Ending::Stop(eresult::describe(c)),
                     _ => Ending::Closed,
                 });
             }
-            emsg::SERVICE_METHOD | emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet.header.target_job_name.as_deref() {
+            emsg::SERVICE_METHOD | emsg::SERVICE_METHOD_SEND_TO_CLIENT => match packet
+                .header
+                .target_job_name
+                .as_deref()
+            {
                 Some("FriendMessagesClient.IncomingMessage#1") => {
-                    tracing::debug!("steam[{}]: an incoming message notification: {:?}", self.account_id, FriendMessagesIncoming::decode(packet.body.as_slice()).ok());
-                    if let Some(typing) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().as_ref().and_then(chat::read_typing) {
+                    tracing::debug!(
+                        "steam[{}]: an incoming message notification: {:?}",
+                        self.account_id,
+                        FriendMessagesIncoming::decode(packet.body.as_slice()).ok()
+                    );
+                    if let Some(typing) = FriendMessagesIncoming::decode(packet.body.as_slice())
+                        .ok()
+                        .as_ref()
+                        .and_then(chat::read_typing)
+                    {
                         self.friend_is_typing(typing);
-                    } else if let Some(incoming) = FriendMessagesIncoming::decode(packet.body.as_slice()).ok().and_then(|n| chat::read_incoming(&n)) {
-                        let own_name = self.state.runtime.own_identity(self.account_id).unwrap_or_default();
-                        let (_, stranger) = chat::record_incoming(self.state, self.account_id, &mut self.roster, &mut self.shown, &own_name, &incoming);
+                    } else if let Some(incoming) =
+                        FriendMessagesIncoming::decode(packet.body.as_slice())
+                            .ok()
+                            .and_then(|n| chat::read_incoming(&n))
+                    {
+                        let own_name = self
+                            .state
+                            .runtime
+                            .own_identity(self.account_id)
+                            .unwrap_or_default();
+                        let (_, stranger) = chat::record_incoming(
+                            self.state,
+                            self.account_id,
+                            &mut self.roster,
+                            &mut self.shown,
+                            &own_name,
+                            &incoming,
+                        );
                         if stranger {
                             self.ask_about(&[incoming.account]);
                         }
@@ -571,9 +728,16 @@ impl Drive<'_> {
                 }
                 // What the account keeps about a friend changed, here or elsewhere.
                 Some("PlayerClient.NotifyPerFriendPreferencesChanged#1") => {
-                    if let Ok(changed) = PerFriendPreferencesChanged::decode(packet.body.as_slice()) {
-                        if let Some(prefs) = changed.preferences.filter(|p| p.accountid.is_some() || changed.accountid.is_some()) {
-                            let prefs = PerFriendPreferences { accountid: prefs.accountid.or(changed.accountid), ..prefs };
+                    if let Ok(changed) = PerFriendPreferencesChanged::decode(packet.body.as_slice())
+                    {
+                        if let Some(prefs) = changed
+                            .preferences
+                            .filter(|p| p.accountid.is_some() || changed.accountid.is_some())
+                        {
+                            let prefs = PerFriendPreferences {
+                                accountid: prefs.accountid.or(changed.accountid),
+                                ..prefs
+                            };
                             if self.roster.set_preferences(&prefs) {
                                 self.shown.publish(self.state, &self.roster);
                             }
@@ -582,7 +746,13 @@ impl Drive<'_> {
                     }
                 }
                 Some("PlayerClient.NotifyFriendNicknameChanged#1") => {
-                    if let Some(account) = packet.body.as_slice().first().and(Some(&packet.body)).and_then(|b| decode_nickname_changed(b)) {
+                    if let Some(account) = packet
+                        .body
+                        .as_slice()
+                        .first()
+                        .and(Some(&packet.body))
+                        .and_then(|b| decode_nickname_changed(b))
+                    {
                         if self.roster.set_nickname(account.0, account.1.as_deref()) {
                             self.shown.publish(self.state, &self.roster);
                         }
@@ -591,7 +761,11 @@ impl Drive<'_> {
                 // Steam flagging a conversation as suspicious.
                 Some("FriendMessagesClient.SessionNotice#1") => {
                     if let Ok(notice) = SessionNoticeNotification::decode(packet.body.as_slice()) {
-                        if let Some(name) = notice.steamid_friend.and_then(steamid::account_of).and_then(|f| self.shown.name_of(f)) {
+                        if let Some(name) = notice
+                            .steamid_friend
+                            .and_then(steamid::account_of)
+                            .and_then(|f| self.shown.name_of(f))
+                        {
                             super::notices::heard(self.state, self.account_id, name, &notice);
                         }
                     }
@@ -599,8 +773,17 @@ impl Drive<'_> {
                 // Somebody reacted to a message, or took it back.
                 Some("FriendMessagesClient.MessageReaction#1") => {
                     if let Ok(notice) = MessageReactionNotice::decode(packet.body.as_slice()) {
-                        if let Some(name) = notice.steamid_friend.and_then(steamid::account_of).and_then(|f| self.shown.name_of(f)) {
-                            super::reactions::heard(self.state, &crate::model::buffer_id(self.account_id, name), self.own, &notice);
+                        if let Some(name) = notice
+                            .steamid_friend
+                            .and_then(steamid::account_of)
+                            .and_then(|f| self.shown.name_of(f))
+                        {
+                            super::reactions::heard(
+                                self.state,
+                                &crate::model::buffer_id(self.account_id, name),
+                                self.own,
+                                &notice,
+                            );
                         }
                     }
                 }
@@ -610,18 +793,59 @@ impl Drive<'_> {
                         self.read_elsewhere(&ack);
                     }
                 }
-                Some(method) if method.starts_with("VoiceChatClient.") || method.starts_with("WebRTCClientNotifications.") || method == "ChatRoomClient.NotifyShouldRejoinChatRoomVoiceChat#1" => {
+                Some(method)
+                    if method.starts_with("VoiceChatClient.")
+                        || method.starts_with("WebRTCClientNotifications.")
+                        || method == "ChatRoomClient.NotifyShouldRejoinChatRoomVoiceChat#1" =>
+                {
                     super::voice::heard(self.state, self.account_id, method, &packet.body);
                 }
                 Some(method) if method.starts_with("ChatRoomClient.") => {
-                    if let Some(heard) = super::chatgroups::heard(self.state, self.account_id, &self.roster, method, &packet.body) {
+                    if std::env::var_os("MOHO_STEAM_TRACE").is_some() {
+                        let what = match method {
+                            "ChatRoomClient.NotifyChatRoomNotice#1" => format!(
+                                "{:?}",
+                                super::proto::ChatRoomNoticeNotification::decode(
+                                    packet.body.as_slice()
+                                )
+                                .ok()
+                            ),
+                            "ChatRoomClient.NotifyChatGroupUserStateChanged#1" => format!(
+                                "action {:?}",
+                                super::proto::ChatUserStateChange::decode(packet.body.as_slice())
+                                    .ok()
+                                    .map(|n| n.user_action)
+                            ),
+                            "ChatRoomClient.NotifyMemberStateChange#1" => format!(
+                                "{:?}",
+                                super::proto::ChatMemberChange::decode(packet.body.as_slice())
+                                    .ok()
+                                    .map(|n| (
+                                        n.change,
+                                        n.member.map(|m| (m.accountid, m.rank, m.role_ids))
+                                    ))
+                            ),
+                            _ => String::new(),
+                        };
+                        eprintln!("TRACE {} {method} {what}", self.account_id);
+                    }
+                    if let Some(heard) = super::chatgroups::heard(
+                        self.state,
+                        self.account_id,
+                        &self.roster,
+                        method,
+                        &packet.body,
+                    ) {
                         self.ask_about(&heard.ask);
                         if heard.reload {
                             self.load_groups();
                         }
                     }
                 }
-                other => tracing::info!("steam[{}]: a notification this client does not use: {other:?}", self.account_id),
+                other => tracing::info!(
+                    "steam[{}]: a notification this client does not use: {other:?}",
+                    self.account_id
+                ),
             },
             other => tracing::debug!("steam[{}]: message {other}", self.account_id),
         }
@@ -646,7 +870,9 @@ impl Drive<'_> {
     /// anybody can send one of these, and a stranger typing should not put a
     /// conversation on screen before they have said anything.
     fn friend_is_typing(&self, friend: u32) {
-        let Some(name) = self.shown.name_of(friend) else { return };
+        let Some(name) = self.shown.name_of(friend) else {
+            return;
+        };
         self.state.events.emit(
             "typing",
             serde_json::json!({
@@ -661,12 +887,25 @@ impl Drive<'_> {
     /// A conversation was read on another client: it is read here too, if what
     /// was read is everything this log holds.
     fn read_elsewhere(&self, ack: &AckMessage) {
-        let Some(friend) = ack.steamid_partner.and_then(steamid::account_of) else { return };
-        let Some(name) = self.shown.name_of(friend) else { return };
+        let Some(friend) = ack.steamid_partner.and_then(steamid::account_of) else {
+            return;
+        };
+        let Some(name) = self.shown.name_of(friend) else {
+            return;
+        };
         let buffer_id = crate::model::buffer_id(self.account_id, name);
-        let newest = self.state.store.get_backlog(&buffer_id, 0, 1).ok().and_then(|m| m.last().map(|m| m.ts)).unwrap_or(0);
+        let newest = self
+            .state
+            .store
+            .get_backlog(&buffer_id, 0, 1)
+            .ok()
+            .and_then(|m| m.last().map(|m| m.ts))
+            .unwrap_or(0);
         if i64::from(ack.timestamp.unwrap_or(0)) >= newest {
-            self.state.events.emit("bufferRead", serde_json::json!({ "accountId": self.account_id, "bufferId": buffer_id }));
+            self.state.events.emit(
+                "bufferRead",
+                serde_json::json!({ "accountId": self.account_id, "bufferId": buffer_id }),
+            );
         }
     }
 
@@ -674,7 +913,10 @@ impl Drive<'_> {
         for chunk in accounts.chunks(ASK_ABOUT_AT_A_TIME) {
             let _ = self.link.send(
                 emsg::CLIENT_REQUEST_FRIEND_DATA,
-                &ClientRequestFriendData { persona_state_requested: Some(PERSONA_FIELDS), friends: chunk.iter().map(|a| steamid::steamid_of(*a)).collect() },
+                &ClientRequestFriendData {
+                    persona_state_requested: Some(PERSONA_FIELDS),
+                    friends: chunk.iter().map(|a| steamid::steamid_of(*a)).collect(),
+                },
             );
         }
     }
@@ -694,14 +936,30 @@ mod tests {
     const STRANGER: u32 = 200;
 
     fn config() -> SteamAccountConfig {
-        SteamAccountConfig { username: "tester".into(), steamid: ME, refresh_token: "the-refresh-token".into(), session: "chat".into(), ..Default::default() }
+        SteamAccountConfig {
+            username: "tester".into(),
+            steamid: ME,
+            refresh_token: "the-refresh-token".into(),
+            session: "chat".into(),
+            ..Default::default()
+        }
     }
 
     fn reply_logon(code: i32, heartbeat: i32) -> Packet {
         Packet::new(
             emsg::CLIENT_LOG_ON_RESPONSE,
-            Header { steamid: Some(ME), client_sessionid: Some(4242), eresult: Some(code), ..Header::default() },
-            ClientLogonResponse { eresult: Some(code), heartbeat_seconds: Some(heartbeat), ..Default::default() }.encode_to_vec(),
+            Header {
+                steamid: Some(ME),
+                client_sessionid: Some(4242),
+                eresult: Some(code),
+                ..Header::default()
+            },
+            ClientLogonResponse {
+                eresult: Some(code),
+                heartbeat_seconds: Some(heartbeat),
+                ..Default::default()
+            }
+            .encode_to_vec(),
         )
     }
 
@@ -716,7 +974,10 @@ mod tests {
     fn incoming_as(kind: u32, from: u32, text: &str, ts: u32, ordinal: u32, echo: bool) -> Packet {
         Packet::new(
             kind,
-            Header { target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()), ..Header::default() },
+            Header {
+                target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()),
+                ..Header::default()
+            },
             FriendMessagesIncoming {
                 steamid_friend: Some(steamid::steamid_of(from)),
                 chat_entry_type: Some(1),
@@ -740,14 +1001,27 @@ mod tests {
                 emsg::CLIENT_LOGON => Some(vec![reply_logon(code, 5)]),
                 emsg::CLIENT_CHANGE_STATUS if code == 1 => {
                     let inside = [
-                        tell_packet(emsg::CLIENT_ACCOUNT_INFO, ClientAccountInfo { persona_name: Some("Me Myself".into()), ..Default::default() }.encode_to_vec()),
+                        tell_packet(
+                            emsg::CLIENT_ACCOUNT_INFO,
+                            ClientAccountInfo {
+                                persona_name: Some("Me Myself".into()),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        ),
                         tell_packet(
                             emsg::CLIENT_FRIENDS_LIST,
                             ClientFriendsList {
                                 bincremental: Some(false),
                                 friends: vec![
-                                    FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) },
-                                    FriendsListEntry { ulfriendid: Some(steamid::steamid_of(900)), efriendrelationship: Some(2) },
+                                    FriendsListEntry {
+                                        ulfriendid: Some(steamid::steamid_of(FRIEND)),
+                                        efriendrelationship: Some(3),
+                                    },
+                                    FriendsListEntry {
+                                        ulfriendid: Some(steamid::steamid_of(900)),
+                                        efriendrelationship: Some(2),
+                                    },
                                 ],
                                 ..Default::default()
                             }
@@ -756,13 +1030,22 @@ mod tests {
                         tell_packet(
                             emsg::CLIENT_PERSONA_STATE,
                             ClientPersonaState {
-                                friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), avatar_hash: Some(vec![1; 20]), ..Default::default() }],
+                                friends: vec![PersonaFriend {
+                                    friendid: Some(steamid::steamid_of(FRIEND)),
+                                    player_name: Some("Gabe".into()),
+                                    persona_state: Some(1),
+                                    avatar_hash: Some(vec![1; 20]),
+                                    ..Default::default()
+                                }],
                                 ..Default::default()
                             }
                             .encode_to_vec(),
                         ),
                     ];
-                    Some(vec![tell_packet(emsg::MULTI, wire::pack_multi(&inside, true)), incoming(FRIEND, "hello there", 1790000000, 0, false)])
+                    Some(vec![
+                        tell_packet(emsg::MULTI, wire::pack_multi(&inside, true)),
+                        incoming(FRIEND, "hello there", 1790000000, 0, false),
+                    ])
                 }
                 _ => Some(Vec::new()),
             }
@@ -794,44 +1077,123 @@ mod tests {
         state.accounts.add_steam(config()).unwrap();
         let task = start(&state, url);
 
-        let history = || state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
-        eventually("the friend's message arrives in their conversation", || history().len() == 1).await;
+        let history = || {
+            state
+                .store
+                .get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10)
+                .unwrap()
+        };
+        eventually("the friend's message arrives in their conversation", || {
+            history().len() == 1
+        })
+        .await;
 
         // What the window sees.
-        let buffer = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).expect("a conversation for Gabe");
+        let buffer = state
+            .runtime
+            .get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe"))
+            .expect("a conversation for Gabe");
         assert_eq!(buffer.kind, "dm");
         assert_eq!(buffer.remote_id.as_deref(), Some("76561197960265828"));
         assert!(buffer.avatar_url.is_some());
-        assert!(state.runtime.list_buffers().iter().filter(|b| b.account_id == ACCOUNT).count() == 1, "the pending request is not a conversation");
+        assert!(
+            state
+                .runtime
+                .list_buffers()
+                .iter()
+                .filter(|b| b.account_id == ACCOUNT)
+                .count()
+                == 1,
+            "the pending request is not a conversation"
+        );
         assert_eq!(history()[0].body, "hello there");
-        assert_eq!(state.runtime.own_identity(ACCOUNT).as_deref(), Some("Me Myself"), "what Steam calls the account");
-        assert!(state.runtime.steam_link(ACCOUNT).is_some(), "reachable for sending while connected");
+        assert_eq!(
+            state.runtime.own_identity(ACCOUNT).as_deref(),
+            Some("Me Myself"),
+            "what Steam calls the account"
+        );
+        assert!(
+            state.runtime.steam_link(ACCOUNT).is_some(),
+            "reachable for sending while connected"
+        );
         let presence = state.runtime.list_accounts(&state);
-        assert!(presence.iter().any(|a| a.id == ACCOUNT && a.state == "connected" && a.display_name == "Me Myself"), "{presence:?}");
+        assert!(
+            presence.iter().any(|a| a.id == ACCOUNT
+                && a.state == "connected"
+                && a.display_name == "Me Myself"),
+            "{presence:?}"
+        );
 
         // What was said to Steam, in order - once it has asked about the friends,
         // which follows the list and is not the same moment as their message.
-        eventually("the account to ask who its friends are", || seen.lock().unwrap().iter().any(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA)).await;
+        eventually("the account to ask who its friends are", || {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA)
+        })
+        .await;
         let seen = seen.lock().unwrap().clone();
         let kinds: Vec<u32> = seen.iter().map(|p| p.emsg).collect();
         // Hello, then the sign-in; what follows includes the status, but the account's
         // emoticons and preferences are asked for in the background and may be in between.
         assert_eq!(kinds[..2], [emsg::CLIENT_HELLO, emsg::CLIENT_LOGON]);
         assert!(kinds.contains(&emsg::CLIENT_CHANGE_STATUS), "{kinds:?}");
-        assert!(kinds.contains(&emsg::CLIENT_REQUEST_FRIEND_DATA), "asked who the friends are: {kinds:?}");
-        assert_eq!(ClientHello::decode(seen[0].body.as_slice()).unwrap().protocol_version, Some(65581));
+        assert!(
+            kinds.contains(&emsg::CLIENT_REQUEST_FRIEND_DATA),
+            "asked who the friends are: {kinds:?}"
+        );
+        assert_eq!(
+            ClientHello::decode(seen[0].body.as_slice())
+                .unwrap()
+                .protocol_version,
+            Some(65581)
+        );
         let logon = ClientLogon::decode(seen[1].body.as_slice()).unwrap();
         assert_eq!(logon.account_name.as_deref(), Some("tester"));
-        assert_eq!(logon.access_token.as_deref(), Some("the-refresh-token"), "the token, and never a password");
-        assert_eq!((logon.protocol_version, logon.chat_mode), (Some(65581), Some(2)));
-        assert_eq!(seen[1].header.steamid, Some(ME), "as the account being signed in");
-        let status = ClientChangeStatus::decode(seen.iter().find(|p| p.emsg == emsg::CLIENT_CHANGE_STATUS).unwrap().body.as_slice()).unwrap();
-        assert_eq!((status.persona_state, status.persona_set_by_user), (Some(1), Some(true)), "online, since nothing else was chosen");
-        let ask = seen.iter().find(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA).unwrap();
-        assert_eq!(ask.header.client_sessionid, Some(4242), "with the session Steam gave");
+        assert_eq!(
+            logon.access_token.as_deref(),
+            Some("the-refresh-token"),
+            "the token, and never a password"
+        );
+        assert_eq!(
+            (logon.protocol_version, logon.chat_mode),
+            (Some(65581), Some(2))
+        );
+        assert_eq!(
+            seen[1].header.steamid,
+            Some(ME),
+            "as the account being signed in"
+        );
+        let status = ClientChangeStatus::decode(
+            seen.iter()
+                .find(|p| p.emsg == emsg::CLIENT_CHANGE_STATUS)
+                .unwrap()
+                .body
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            (status.persona_state, status.persona_set_by_user),
+            (Some(1), Some(true)),
+            "online, since nothing else was chosen"
+        );
+        let ask = seen
+            .iter()
+            .find(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA)
+            .unwrap();
+        assert_eq!(
+            ask.header.client_sessionid,
+            Some(4242),
+            "with the session Steam gave"
+        );
         let ask = ClientRequestFriendData::decode(ask.body.as_slice()).unwrap();
         assert_eq!(ask.friends, vec![steamid::steamid_of(FRIEND), steamid::steamid_of(900)], "the friends, and the person who has asked to be one, so the request can say who it is from");
-        assert_eq!(state.runtime.steam_requests(ACCOUNT)["incoming"][0]["steamid"], steamid::text_of(900), "and the request is there for the window to show");
+        assert_eq!(
+            state.runtime.steam_requests(ACCOUNT)["incoming"][0]["steamid"],
+            steamid::text_of(900),
+            "and the request is there for the window to show"
+        );
         assert_eq!(ask.persona_state_requested, Some(PERSONA_FIELDS));
 
         task.abort();
@@ -847,8 +1209,18 @@ mod tests {
         }))
         .await;
         let outcome = start(&state, url).await.unwrap().unwrap();
-        assert!(matches!(outcome, Outcome::Ended(Ending::Closed)), "{}", match outcome { Outcome::Ended(e) => format!("{e:?}"), Outcome::Unreached(w) => w });
-        assert!(state.runtime.steam_link(ACCOUNT).is_none(), "nothing left to send on");
+        assert!(
+            matches!(outcome, Outcome::Ended(Ending::Closed)),
+            "{}",
+            match outcome {
+                Outcome::Ended(e) => format!("{e:?}"),
+                Outcome::Unreached(w) => w,
+            }
+        );
+        assert!(
+            state.runtime.steam_link(ACCOUNT).is_none(),
+            "nothing left to send on"
+        );
     }
 
     #[tokio::test]
@@ -865,10 +1237,40 @@ mod tests {
                     emsg::CLIENT_CHANGE_STATUS if !told => {
                         told = true;
                         Some(vec![
-                            tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
-                            tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                            tell_packet(
+                                emsg::CLIENT_FRIENDS_LIST,
+                                ClientFriendsList {
+                                    bincremental: Some(false),
+                                    friends: vec![FriendsListEntry {
+                                        ulfriendid: Some(steamid::steamid_of(FRIEND)),
+                                        efriendrelationship: Some(3),
+                                    }],
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            ),
+                            tell_packet(
+                                emsg::CLIENT_PERSONA_STATE,
+                                ClientPersonaState {
+                                    friends: vec![PersonaFriend {
+                                        friendid: Some(steamid::steamid_of(FRIEND)),
+                                        player_name: Some("Gabe".into()),
+                                        persona_state: Some(1),
+                                        ..Default::default()
+                                    }],
+                                    ..Default::default()
+                                }
+                                .encode_to_vec(),
+                            ),
                             incoming(STRANGER, "do I know you", 1790000001, 0, false),
-                            incoming_as(emsg::SERVICE_METHOD_SEND_TO_CLIENT, FRIEND, "sent from my phone", 1790000002, 0, true),
+                            incoming_as(
+                                emsg::SERVICE_METHOD_SEND_TO_CLIENT,
+                                FRIEND,
+                                "sent from my phone",
+                                1790000002,
+                                0,
+                                true,
+                            ),
                             // The same message again, as a replay would send it.
                             incoming(FRIEND, "sent from my phone", 1790000002, 0, true),
                         ])
@@ -881,44 +1283,114 @@ mod tests {
         let task = start(&state, url);
         let stranger_name = steamid::text_of(STRANGER);
         let stranger_buffer = crate::model::buffer_id(ACCOUNT, &stranger_name);
-        eventually("the stranger is heard", || state.store.get_backlog(&stranger_buffer, 0, 10).map(|m| m.len()).unwrap_or(0) == 1).await;
+        eventually("the stranger is heard", || {
+            state
+                .store
+                .get_backlog(&stranger_buffer, 0, 10)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                == 1
+        })
+        .await;
         let gabe = crate::model::buffer_id(ACCOUNT, "Gabe");
-        eventually("the message from the phone", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 1).await;
+        eventually("the message from the phone", || {
+            state
+                .store
+                .get_backlog(&gabe, 0, 10)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                == 1
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let mine = state.store.get_backlog(&gabe, 0, 10).unwrap();
         assert_eq!(mine.len(), 1, "the replay is one message");
         assert!(mine[0].is_own, "sent by this account from somewhere else");
 
         // And the stranger was asked after, so they get a name.
-        let asked: Vec<Vec<u64>> = seen.lock().unwrap().iter().filter(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA).map(|p| ClientRequestFriendData::decode(p.body.as_slice()).unwrap().friends).collect();
-        assert!(asked.iter().any(|f| f == &vec![steamid::steamid_of(STRANGER)]), "{asked:?}");
+        let asked: Vec<Vec<u64>> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.emsg == emsg::CLIENT_REQUEST_FRIEND_DATA)
+            .map(|p| {
+                ClientRequestFriendData::decode(p.body.as_slice())
+                    .unwrap()
+                    .friends
+            })
+            .collect();
+        assert!(
+            asked
+                .iter()
+                .any(|f| f == &vec![steamid::steamid_of(STRANGER)]),
+            "{asked:?}"
+        );
         task.abort();
     }
 
     fn typing(from: u32) -> Packet {
         Packet::new(
             emsg::SERVICE_METHOD,
-            Header { target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()), ..Header::default() },
-            FriendMessagesIncoming { steamid_friend: Some(steamid::steamid_of(from)), chat_entry_type: Some(2), ..Default::default() }.encode_to_vec(),
+            Header {
+                target_job_name: Some("FriendMessagesClient.IncomingMessage#1".into()),
+                ..Header::default()
+            },
+            FriendMessagesIncoming {
+                steamid_friend: Some(steamid::steamid_of(from)),
+                chat_entry_type: Some(2),
+                ..Default::default()
+            }
+            .encode_to_vec(),
         )
     }
 
     fn read_echo(friend: u32, at: u32) -> Packet {
         Packet::new(
             emsg::SERVICE_METHOD,
-            Header { target_job_name: Some("FriendMessagesClient.NotifyAckMessageEcho#1".into()), ..Header::default() },
-            AckMessage { steamid_partner: Some(steamid::steamid_of(friend)), timestamp: Some(at) }.encode_to_vec(),
+            Header {
+                target_job_name: Some("FriendMessagesClient.NotifyAckMessageEcho#1".into()),
+                ..Header::default()
+            },
+            AckMessage {
+                steamid_partner: Some(steamid::steamid_of(friend)),
+                timestamp: Some(at),
+            }
+            .encode_to_vec(),
         )
     }
 
     #[tokio::test]
-    async fn a_friend_typing_and_a_conversation_read_elsewhere_are_heard_and_only_when_they_mean_something() {
+    async fn a_friend_typing_and_a_conversation_read_elsewhere_are_heard_and_only_when_they_mean_something(
+    ) {
         let state = simulated_daemon("steam-connect-typing");
         let url = serve(Box::new(move |p| match p.emsg {
             emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
             emsg::CLIENT_CHANGE_STATUS => Some(vec![
-                tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
-                tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                tell_packet(
+                    emsg::CLIENT_FRIENDS_LIST,
+                    ClientFriendsList {
+                        bincremental: Some(false),
+                        friends: vec![FriendsListEntry {
+                            ulfriendid: Some(steamid::steamid_of(FRIEND)),
+                            efriendrelationship: Some(3),
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
+                tell_packet(
+                    emsg::CLIENT_PERSONA_STATE,
+                    ClientPersonaState {
+                        friends: vec![PersonaFriend {
+                            friendid: Some(steamid::steamid_of(FRIEND)),
+                            player_name: Some("Gabe".into()),
+                            persona_state: Some(1),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
                 typing(FRIEND),
                 // A stranger typing is not a reason to open a conversation.
                 typing(STRANGER),
@@ -935,7 +1407,15 @@ mod tests {
         let mut rx = state.events.subscribe();
         let task = start(&state, url);
         let gabe = crate::model::buffer_id(ACCOUNT, "Gabe");
-        eventually("the friend's message", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 1).await;
+        eventually("the friend's message", || {
+            state
+                .store
+                .get_backlog(&gabe, 0, 10)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                == 1
+        })
+        .await;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let (mut typed, mut read) = (vec![], vec![]);
@@ -946,12 +1426,33 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(typed.len(), 1, "the friend, and not the stranger: {typed:?}");
-        assert_eq!((typed[0]["bufferId"].as_str(), typed[0]["nicks"][0].as_str()), (Some(gabe.as_str()), Some("Gabe")));
-        assert_eq!(read.len(), 1, "only the echo that reached the newest message");
+        assert_eq!(
+            typed.len(),
+            1,
+            "the friend, and not the stranger: {typed:?}"
+        );
+        assert_eq!(
+            (typed[0]["bufferId"].as_str(), typed[0]["nicks"][0].as_str()),
+            (Some(gabe.as_str()), Some("Gabe"))
+        );
+        assert_eq!(
+            read.len(),
+            1,
+            "only the echo that reached the newest message"
+        );
         assert_eq!(read[0]["bufferId"].as_str(), Some(gabe.as_str()));
-        assert_eq!(state.store.get_backlog(&gabe, 0, 10).unwrap().len(), 1, "typing is not a message");
-        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, &steamid::text_of(STRANGER))).is_none());
+        assert_eq!(
+            state.store.get_backlog(&gabe, 0, 10).unwrap().len(),
+            1,
+            "typing is not a message"
+        );
+        assert!(state
+            .runtime
+            .get_buffer(&crate::model::buffer_id(
+                ACCOUNT,
+                &steamid::text_of(STRANGER)
+            ))
+            .is_none());
         task.abort();
     }
 
@@ -961,18 +1462,63 @@ mod tests {
         let url = serve(Box::new(move |p| match p.emsg {
             emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
             emsg::CLIENT_CHANGE_STATUS => Some(vec![
-                tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
-                tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                tell_packet(
+                    emsg::CLIENT_FRIENDS_LIST,
+                    ClientFriendsList {
+                        bincremental: Some(false),
+                        friends: vec![FriendsListEntry {
+                            ulfriendid: Some(steamid::steamid_of(FRIEND)),
+                            efriendrelationship: Some(3),
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
+                tell_packet(
+                    emsg::CLIENT_PERSONA_STATE,
+                    ClientPersonaState {
+                        friends: vec![PersonaFriend {
+                            friendid: Some(steamid::steamid_of(FRIEND)),
+                            player_name: Some("Gabe".into()),
+                            persona_state: Some(1),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
             ]),
             emsg::SERVICE_METHOD_CALL_FROM_CLIENT => {
                 let method = p.header.target_job_name.clone().unwrap_or_default();
                 let body = if method.contains("GetActiveMessageSessions") {
-                    GetActiveSessionsResponse { message_sessions: vec![MessageSession { accountid_friend: Some(FRIEND), last_message: Some(300), last_view: Some(100), unread_message_count: Some(2), notices: vec![] }], timestamp: Some(1) }.encode_to_vec()
+                    GetActiveSessionsResponse {
+                        message_sessions: vec![MessageSession {
+                            accountid_friend: Some(FRIEND),
+                            last_message: Some(300),
+                            last_view: Some(100),
+                            unread_message_count: Some(2),
+                            notices: vec![],
+                        }],
+                        timestamp: Some(1),
+                    }
+                    .encode_to_vec()
                 } else {
                     GetRecentMessagesResponse {
                         messages: vec![
-                            PastMessage { accountid: Some(FRIEND), timestamp: Some(300), message: Some("second".into()), ordinal: Some(0), reactions: vec![] },
-                            PastMessage { accountid: Some(FRIEND), timestamp: Some(250), message: Some("first".into()), ordinal: Some(0), reactions: vec![] },
+                            PastMessage {
+                                accountid: Some(FRIEND),
+                                timestamp: Some(300),
+                                message: Some("second".into()),
+                                ordinal: Some(0),
+                                reactions: vec![],
+                            },
+                            PastMessage {
+                                accountid: Some(FRIEND),
+                                timestamp: Some(250),
+                                message: Some("first".into()),
+                                ordinal: Some(0),
+                                reactions: vec![],
+                            },
                         ],
                         more_available: Some(false),
                     }
@@ -989,12 +1535,41 @@ mod tests {
         let gabe = crate::model::buffer_id(ACCOUNT, "Gabe");
         let mut rx = state.events.subscribe();
         let task = start(&state, url);
-        eventually("the conversation to exist", || state.runtime.get_buffer(&gabe).is_some()).await;
+        eventually("the conversation to exist", || {
+            state.runtime.get_buffer(&gabe).is_some()
+        })
+        .await;
         let buffer = state.runtime.get_buffer(&gabe).unwrap();
-        crate::backend::steam::history::store_quietly(&state, &buffer, 22202, &[crate::backend::steam::history::Past { account: FRIEND, timestamp: 90, ordinal: 0, text: "before".into(), reactions: vec![], embeds: vec![] }]);
+        crate::backend::steam::history::store_quietly(
+            &state,
+            &buffer,
+            22202,
+            &[crate::backend::steam::history::Past {
+                account: FRIEND,
+                timestamp: 90,
+                ordinal: 0,
+                text: "before".into(),
+                reactions: vec![],
+                embeds: vec![],
+            }],
+        );
 
-        eventually("what was missed", || state.store.get_backlog(&gabe, 0, 10).map(|m| m.len()).unwrap_or(0) == 3).await;
-        let texts: Vec<String> = state.store.get_backlog(&gabe, 0, 10).unwrap().into_iter().map(|m| m.body).collect();
+        eventually("what was missed", || {
+            state
+                .store
+                .get_backlog(&gabe, 0, 10)
+                .map(|m| m.len())
+                .unwrap_or(0)
+                == 3
+        })
+        .await;
+        let texts: Vec<String> = state
+            .store
+            .get_backlog(&gabe, 0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
         assert_eq!(texts, ["before", "first", "second"]);
         let mut news = vec![];
         while let Ok(e) = rx.try_recv() {
@@ -1002,7 +1577,10 @@ mod tests {
                 news.push(e.data["body"].as_str().unwrap_or_default().to_string());
             }
         }
-        assert!(news.contains(&"first".to_string()) && news.contains(&"second".to_string()), "unread, so announced: {news:?}");
+        assert!(
+            news.contains(&"first".to_string()) && news.contains(&"second".to_string()),
+            "unread, so announced: {news:?}"
+        );
         task.abort();
     }
 
@@ -1011,8 +1589,16 @@ mod tests {
         let state = simulated_daemon("steam-connect-nickname");
         let renamed = Packet::new(
             emsg::SERVICE_METHOD,
-            Header { target_job_name: Some("PlayerClient.NotifyFriendNicknameChanged#1".into()), ..Header::default() },
-            FriendNicknameChanged { accountid: Some(FRIEND), nickname: Some("Pal".into()), is_echo_to_self: Some(false) }.encode_to_vec(),
+            Header {
+                target_job_name: Some("PlayerClient.NotifyFriendNicknameChanged#1".into()),
+                ..Header::default()
+            },
+            FriendNicknameChanged {
+                accountid: Some(FRIEND),
+                nickname: Some("Pal".into()),
+                is_echo_to_self: Some(false),
+            }
+            .encode_to_vec(),
         );
         let mut told = false;
         let url = serve(Box::new(move |p| match p.emsg {
@@ -1020,15 +1606,50 @@ mod tests {
             emsg::CLIENT_CHANGE_STATUS if !told => {
                 told = true;
                 Some(vec![
-                    tell_packet(emsg::CLIENT_FRIENDS_LIST, ClientFriendsList { bincremental: Some(false), friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(FRIEND)), efriendrelationship: Some(3) }], ..Default::default() }.encode_to_vec()),
-                    tell_packet(emsg::CLIENT_PERSONA_STATE, ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(FRIEND)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() }.encode_to_vec()),
+                    tell_packet(
+                        emsg::CLIENT_FRIENDS_LIST,
+                        ClientFriendsList {
+                            bincremental: Some(false),
+                            friends: vec![FriendsListEntry {
+                                ulfriendid: Some(steamid::steamid_of(FRIEND)),
+                                efriendrelationship: Some(3),
+                            }],
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    ),
+                    tell_packet(
+                        emsg::CLIENT_PERSONA_STATE,
+                        ClientPersonaState {
+                            friends: vec![PersonaFriend {
+                                friendid: Some(steamid::steamid_of(FRIEND)),
+                                player_name: Some("Gabe".into()),
+                                persona_state: Some(1),
+                                ..Default::default()
+                            }],
+                            ..Default::default()
+                        }
+                        .encode_to_vec(),
+                    ),
                 ])
             }
-            emsg::SERVICE_METHOD_CALL_FROM_CLIENT if p.header.target_job_name.as_deref() == Some("Player.GetPerFriendPreferences#1") => Some(vec![answer(
-                &p,
-                1,
-                GetPerFriendPreferencesResponse { preferences: vec![PerFriendPreferences { accountid: Some(FRIEND), nickname: Some("Buddy".into()), ..Default::default() }] }.encode_to_vec(),
-            )]),
+            emsg::SERVICE_METHOD_CALL_FROM_CLIENT
+                if p.header.target_job_name.as_deref()
+                    == Some("Player.GetPerFriendPreferences#1") =>
+            {
+                Some(vec![answer(
+                    &p,
+                    1,
+                    GetPerFriendPreferencesResponse {
+                        preferences: vec![PerFriendPreferences {
+                            accountid: Some(FRIEND),
+                            nickname: Some("Buddy".into()),
+                            ..Default::default()
+                        }],
+                    }
+                    .encode_to_vec(),
+                )])
+            }
             // Somebody changes it on the phone, once the account has asked about its friends.
             emsg::CLIENT_REQUEST_FRIEND_DATA => Some(vec![renamed.clone()]),
             _ => Some(Vec::new()),
@@ -1036,19 +1657,55 @@ mod tests {
         .await;
         state.accounts.add_steam(config()).unwrap();
         let task = start(&state, url);
-        eventually("the friend, called what the account calls them", || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Buddy")).is_some() || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal")).is_some()).await;
+        eventually("the friend, called what the account calls them", || {
+            state
+                .runtime
+                .get_buffer(&crate::model::buffer_id(ACCOUNT, "Buddy"))
+                .is_some()
+                || state
+                    .runtime
+                    .get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal"))
+                    .is_some()
+        })
+        .await;
         // Then what it is changed to.
-        eventually("the change made elsewhere", || state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal")).is_some()).await;
-        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).is_none(), "never by their own name once the account has one for them");
+        eventually("the change made elsewhere", || {
+            state
+                .runtime
+                .get_buffer(&crate::model::buffer_id(ACCOUNT, "Pal"))
+                .is_some()
+        })
+        .await;
+        assert!(
+            state
+                .runtime
+                .get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe"))
+                .is_none(),
+            "never by their own name once the account has one for them"
+        );
         task.abort();
     }
 
     #[test]
     fn steams_heartbeat_interval_is_kept_to_something_sensible() {
         let welcomed = read_logon(&reply_logon(1, 1)).unwrap();
-        assert_eq!(welcomed, Logon::Welcome { heartbeat: Duration::from_secs(5), steamid: ME, session: 4242, account_flags: 0 }, "never faster than every five seconds");
-        assert!(matches!(read_logon(&reply_logon(1, 99999)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(300)));
-        assert!(matches!(read_logon(&reply_logon(1, 0)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(27)), "no interval means the usual one");
+        assert_eq!(
+            welcomed,
+            Logon::Welcome {
+                heartbeat: Duration::from_secs(5),
+                steamid: ME,
+                session: 4242,
+                account_flags: 0
+            },
+            "never faster than every five seconds"
+        );
+        assert!(
+            matches!(read_logon(&reply_logon(1, 99999)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(300))
+        );
+        assert!(
+            matches!(read_logon(&reply_logon(1, 0)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(27)),
+            "no interval means the usual one"
+        );
     }
 
     /// The loop itself, with an interval short enough to watch: Steam drops a
@@ -1068,8 +1725,24 @@ mod tests {
         })
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
-        link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None, apps: AppNames::new(), groups_wanted: None };
+        link.set_identity(Identity {
+            steamid: ME,
+            session: 1,
+        });
+        let drive = Drive {
+            state: &state,
+            account_id: ACCOUNT,
+            link: &link,
+            own: 22202,
+            roster: Roster::default(),
+            shown: Conversations::new(ACCOUNT),
+            asked: Default::default(),
+            catch_up_at: None,
+            catch_up_tries: 0,
+            prefs_wanted: None,
+            apps: AppNames::new(),
+            groups_wanted: None,
+        };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {
@@ -1089,21 +1762,47 @@ mod tests {
     async fn a_server_that_refuses_the_sign_in_is_classified_by_what_it_said() {
         let refuse = |code| read_logon(&reply_logon(code, 5)).unwrap();
         // Wrong or revoked: only a new sign-in helps, and the person is told how.
-        for code in [eresult::INVALID_PASSWORD, eresult::REVOKED, eresult::EXPIRED, eresult::ACCOUNT_LOGON_DENIED] {
-            assert!(matches!(refuse(code), Logon::Refused(Ending::Stop(why)) if why.contains("Sign in to Steam again")), "{code}");
+        for code in [
+            eresult::INVALID_PASSWORD,
+            eresult::REVOKED,
+            eresult::EXPIRED,
+            eresult::ACCOUNT_LOGON_DENIED,
+        ] {
+            assert!(
+                matches!(refuse(code), Logon::Refused(Ending::Stop(why)) if why.contains("Sign in to Steam again")),
+                "{code}"
+            );
         }
         // Signed in elsewhere: stop, and do not fight for the account.
-        assert!(matches!(refuse(eresult::LOGGED_IN_ELSEWHERE), Logon::Refused(Ending::Stop(why)) if why.contains("somewhere else")));
+        assert!(
+            matches!(refuse(eresult::LOGGED_IN_ELSEWHERE), Logon::Refused(Ending::Stop(why)) if why.contains("somewhere else"))
+        );
         // Suspended, banned: stop.
-        assert!(matches!(refuse(eresult::BANNED), Logon::Refused(Ending::Stop(_))));
+        assert!(matches!(
+            refuse(eresult::BANNED),
+            Logon::Refused(Ending::Stop(_))
+        ));
         // Too often: wait minutes, not seconds.
-        assert!(matches!(refuse(eresult::RATE_LIMIT_EXCEEDED), Logon::Refused(Ending::Later(wait, _)) if wait >= Duration::from_secs(60)));
+        assert!(
+            matches!(refuse(eresult::RATE_LIMIT_EXCEEDED), Logon::Refused(Ending::Later(wait, _)) if wait >= Duration::from_secs(60))
+        );
         // The server's trouble, not the account's: another may do.
-        for code in [eresult::SERVICE_UNAVAILABLE, eresult::TRY_ANOTHER_CM, eresult::BUSY, eresult::NO_CONNECTION, 9999] {
+        for code in [
+            eresult::SERVICE_UNAVAILABLE,
+            eresult::TRY_ANOTHER_CM,
+            eresult::BUSY,
+            eresult::NO_CONNECTION,
+            9999,
+        ] {
             assert!(matches!(refuse(code), Logon::TryAnother(_)), "{code}");
         }
         // A reply that is not one.
-        assert!(read_logon(&Packet::new(emsg::CLIENT_LOG_ON_RESPONSE, Header::default(), vec![0xff, 0xff])).is_err());
+        assert!(read_logon(&Packet::new(
+            emsg::CLIENT_LOG_ON_RESPONSE,
+            Header::default(),
+            vec![0xff, 0xff]
+        ))
+        .is_err());
     }
 
     #[tokio::test]
@@ -1117,16 +1816,30 @@ mod tests {
         let outcome = start(&state, url).await.unwrap().unwrap();
         assert!(matches!(outcome, Outcome::Ended(Ending::Stop(_))));
         assert!(state.runtime.steam_link(ACCOUNT).is_none());
-        assert!(!state.runtime.list_accounts(&state).iter().any(|a| a.id == ACCOUNT && a.state == "connected"));
+        assert!(!state
+            .runtime
+            .list_accounts(&state)
+            .iter()
+            .any(|a| a.id == ACCOUNT && a.state == "connected"));
     }
 
     #[tokio::test]
     async fn being_signed_out_by_steam_is_reported_as_what_it_was() {
-        for (code, stops) in [(eresult::LOGGED_IN_ELSEWHERE, true), (eresult::REVOKED, true), (eresult::SERVICE_UNAVAILABLE, false)] {
+        for (code, stops) in [
+            (eresult::LOGGED_IN_ELSEWHERE, true),
+            (eresult::REVOKED, true),
+            (eresult::SERVICE_UNAVAILABLE, false),
+        ] {
             let state = simulated_daemon("steam-connect-loggedoff");
             let url = serve(Box::new(move |p| match p.emsg {
                 emsg::CLIENT_LOGON => Some(vec![reply_logon(1, 5)]),
-                emsg::CLIENT_CHANGE_STATUS => Some(vec![tell_packet(emsg::CLIENT_LOGGED_OFF, ClientLoggedOff { eresult: Some(code) }.encode_to_vec())]),
+                emsg::CLIENT_CHANGE_STATUS => Some(vec![tell_packet(
+                    emsg::CLIENT_LOGGED_OFF,
+                    ClientLoggedOff {
+                        eresult: Some(code),
+                    }
+                    .encode_to_vec(),
+                )]),
                 _ => Some(Vec::new()),
             }))
             .await;
@@ -1134,7 +1847,13 @@ mod tests {
             match outcome {
                 Outcome::Ended(Ending::Stop(_)) => assert!(stops, "{code}"),
                 Outcome::Ended(Ending::Closed) => assert!(!stops, "{code}"),
-                other => panic!("{code}: {}", match other { Outcome::Ended(e) => format!("{e:?}"), Outcome::Unreached(w) => w }),
+                other => panic!(
+                    "{code}: {}",
+                    match other {
+                        Outcome::Ended(e) => format!("{e:?}"),
+                        Outcome::Unreached(w) => w,
+                    }
+                ),
             }
         }
     }
@@ -1147,8 +1866,13 @@ mod tests {
         let url = serve(Box::new(|_| None)).await;
         let outcome = start(&state, url).await.unwrap().unwrap();
         assert!(matches!(outcome, Outcome::Unreached(why) if why.contains("ended")));
-        let outcome = session(&state, &config(), ACCOUNT, "ws://127.0.0.1:1").await.unwrap();
-        assert!(matches!(outcome, Outcome::Unreached(_)), "nothing listening is a server not reached, not a failure of the account");
+        let outcome = session(&state, &config(), ACCOUNT, "ws://127.0.0.1:1")
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, Outcome::Unreached(_)),
+            "nothing listening is a server not reached, not a failure of the account"
+        );
     }
 
     #[test]
@@ -1158,7 +1882,14 @@ mod tests {
         assert_eq!(logon.account_name.as_deref(), Some("tester"));
         assert_eq!(logon.client_language.as_deref(), Some("english"));
         assert_eq!(logon.client_os_type, Some(auth::os_type()));
-        assert_eq!(logon.supports_rate_limit_response, Some(true), "so a limit is said, not a dropped connection");
-        assert!(logon.machine_name.as_deref().is_some_and(|n| n.starts_with("moho")));
+        assert_eq!(
+            logon.supports_rate_limit_response,
+            Some(true),
+            "so a limit is said, not a dropped connection"
+        );
+        assert!(logon
+            .machine_name
+            .as_deref()
+            .is_some_and(|n| n.starts_with("moho")));
     }
 }

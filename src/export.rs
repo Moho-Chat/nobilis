@@ -61,15 +61,31 @@ fn http_client() -> reqwest::Client {
 pub fn safe_name(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let trimmed = cleaned.trim_matches(['-', '.']).to_string();
-    let trimmed = if trimmed.is_empty() { "conversation".to_string() } else { trimmed };
+    let trimmed = if trimmed.is_empty() {
+        "conversation".to_string()
+    } else {
+        trimmed
+    };
     // Windows will not have these whatever the extension, and an export folder
     // is meant to survive being copied onto a memory stick.
-    const RESERVED: [&str; 9] = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "LPT1", "LPT2", "LPT3"];
+    const RESERVED: [&str; 9] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "LPT1", "LPT2", "LPT3",
+    ];
     let upper = trimmed.to_ascii_uppercase();
-    let safe = if RESERVED.contains(&upper.as_str()) { format!("{trimmed}-") } else { trimmed };
+    let safe = if RESERVED.contains(&upper.as_str()) {
+        format!("{trimmed}-")
+    } else {
+        trimmed
+    };
     safe.chars().take(80).collect()
 }
 
@@ -131,28 +147,33 @@ pub fn begin(
     std::fs::write(&p.body, "").with_context(|| format!("making {}", p.body.display()))?;
 
     let id = format!("export-{}", crate::model::next_message_id());
-    state.runtime.push_dcc_transfer(crate::runtime::DccTransfer {
-        id: id.clone(),
-        account_id: account_id.to_string(),
-        outgoing: false,
-        from: title.to_string(),
-        file_name: root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        raw_name: buffer_id.to_string(),
-        // Unknown until the range has been walked. The panel reads a zero size
-        // as "no total yet" and shows what has been done instead of a
-        // percentage of nothing.
-        size: 0,
-        received: 0,
-        rate: 0,
-        state: crate::runtime::DccState::Receiving,
-        path: Some(root.to_string_lossy().into_owned()),
-        error: None,
-        kind: crate::runtime::TransferKind::Export,
-        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        offer: None,
-        started_at: crate::backend::irc::dcc::now_seconds(),
-    });
+    state
+        .runtime
+        .push_dcc_transfer(crate::runtime::DccTransfer {
+            id: id.clone(),
+            account_id: account_id.to_string(),
+            outgoing: false,
+            from: title.to_string(),
+            file_name: root
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            raw_name: buffer_id.to_string(),
+            // Unknown until the range has been walked. The panel reads a zero size
+            // as "no total yet" and shows what has been done instead of a
+            // percentage of nothing.
+            size: 0,
+            received: 0,
+            rate: 0,
+            state: crate::runtime::DccState::Receiving,
+            path: Some(root.to_string_lossy().into_owned()),
+            error: None,
+            kind: crate::runtime::TransferKind::Export,
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            offer: None,
+            started_at: crate::backend::irc::dcc::now_seconds(),
+        });
     if let Some(t) = state.runtime.dcc_transfer(&id) {
         crate::backend::irc::dcc::announce(state, &t);
     }
@@ -166,7 +187,9 @@ pub fn begin(
 /// to say - the folder is left where it is, since a half-finished export is
 /// sometimes what somebody wanted when they pressed cancel.
 pub fn status(state: &AppState, id: &str) -> Result<serde_json::Value> {
-    let Some(t) = state.runtime.dcc_transfer(id) else { bail!("no such export") };
+    let Some(t) = state.runtime.dcc_transfer(id) else {
+        bail!("no such export")
+    };
     Ok(serde_json::json!({
         "cancelled": t.cancel.load(Ordering::Relaxed),
         "paused": t.paused.load(Ordering::Relaxed),
@@ -181,14 +204,20 @@ pub fn status(state: &AppState, id: &str) -> Result<serde_json::Value> {
 /// than holding it all in memory because a year of a busy channel is not
 /// something to keep twice.
 pub fn append(state: &AppState, id: &str, html: &str, done: u64, total: u64) -> Result<()> {
-    let Some(t) = state.runtime.dcc_transfer(id) else { bail!("no such export") };
+    let Some(t) = state.runtime.dcc_transfer(id) else {
+        bail!("no such export")
+    };
     if t.cancel.load(Ordering::Relaxed) {
         bail!("export cancelled");
     }
     let p = paths(Path::new(t.path.as_deref().unwrap_or_default()));
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new().append(true).open(&p.body).with_context(|| format!("writing {}", p.body.display()))?;
-    f.write_all(html.as_bytes()).context("writing a page of the export")?;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&p.body)
+        .with_context(|| format!("writing {}", p.body.display()))?;
+    f.write_all(html.as_bytes())
+        .context("writing a page of the export")?;
 
     if let Some(t) = state.runtime.update_dcc(id, |t| {
         t.received = done;
@@ -205,7 +234,9 @@ pub fn append(state: &AppState, id: &str, html: &str, done: u64, total: u64) -> 
 /// fetch worked, and the original URL where it did not. A picture that cannot
 /// be had should leave a page that still reads, not a broken export.
 pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_json::Value> {
-    let Some(t) = state.runtime.dcc_transfer(id) else { bail!("no such export") };
+    let Some(t) = state.runtime.dcc_transfer(id) else {
+        bail!("no such export")
+    };
     if t.cancel.load(Ordering::Relaxed) {
         bail!("export cancelled");
     }
@@ -250,8 +281,14 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
     // would treat it as already fetched forever after - a broken picture that
     // never repairs itself.
     let part = dest.with_extension(format!("{ext}.part"));
-    if crate::net::route::router().ready_for_general().await.is_err() {
-        return Ok(serde_json::json!({ "path": url, "skipped": "Tor or the proxy was not reachable" }));
+    if crate::net::route::router()
+        .ready_for_general()
+        .await
+        .is_err()
+    {
+        return Ok(
+            serde_json::json!({ "path": url, "skipped": "Tor or the proxy was not reachable" }),
+        );
     }
     let mut response = match http_client().get(url).send().await {
         Ok(r) if r.status().is_success() => r,
@@ -266,7 +303,9 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
     };
 
     use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::File::create(&part).await.with_context(|| format!("writing {}", part.display()))?;
+    let mut file = tokio::fs::File::create(&part)
+        .await
+        .with_context(|| format!("writing {}", part.display()))?;
     let mut written: u64 = 0;
     loop {
         // Checked as it goes rather than only between files: with no cap, one
@@ -279,7 +318,9 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
         }
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                file.write_all(&chunk).await.with_context(|| format!("writing {}", part.display()))?;
+                file.write_all(&chunk)
+                    .await
+                    .with_context(|| format!("writing {}", part.display()))?;
                 written += chunk.len() as u64;
             }
             Ok(None) => break,
@@ -289,19 +330,30 @@ pub async fn fetch_media(state: &AppState, id: &str, url: &str) -> Result<serde_
                 tracing::debug!("export: {url} stopped early after {written} bytes: {e}");
                 drop(file);
                 let _ = tokio::fs::remove_file(&part).await;
-                return Ok(serde_json::json!({ "path": url, "skipped": "the download stopped early" }));
+                return Ok(
+                    serde_json::json!({ "path": url, "skipped": "the download stopped early" }),
+                );
             }
         }
     }
     file.flush().await.ok();
     drop(file);
-    tokio::fs::rename(&part, &dest).await.with_context(|| format!("renaming {}", part.display()))?;
+    tokio::fs::rename(&part, &dest)
+        .await
+        .with_context(|| format!("renaming {}", part.display()))?;
     Ok(serde_json::json!({ "path": relative, "bytes": written }))
 }
 
 /// Seals it: wraps the accumulated body in a page and writes `index.html`.
-pub fn finish(state: &AppState, id: &str, title: &str, subtitle: &str) -> Result<serde_json::Value> {
-    let Some(t) = state.runtime.dcc_transfer(id) else { bail!("no such export") };
+pub fn finish(
+    state: &AppState,
+    id: &str,
+    title: &str,
+    subtitle: &str,
+) -> Result<serde_json::Value> {
+    let Some(t) = state.runtime.dcc_transfer(id) else {
+        bail!("no such export")
+    };
     let p = paths(Path::new(t.path.as_deref().unwrap_or_default()));
     let body = std::fs::read_to_string(&p.body).unwrap_or_default();
     let page = page(title, subtitle, &body);
@@ -329,10 +381,16 @@ pub fn fail(state: &AppState, id: &str, why: &str) {
 
 /// Puts one down or picks it back up.
 pub fn set_paused(state: &AppState, id: &str, paused: bool) -> Result<()> {
-    let Some(t) = state.runtime.dcc_transfer(id) else { bail!("no such export") };
+    let Some(t) = state.runtime.dcc_transfer(id) else {
+        bail!("no such export")
+    };
     t.paused.store(paused, Ordering::Relaxed);
     if let Some(t) = state.runtime.update_dcc(id, |t| {
-        t.state = if paused { crate::runtime::DccState::Paused } else { crate::runtime::DccState::Receiving };
+        t.state = if paused {
+            crate::runtime::DccState::Paused
+        } else {
+            crate::runtime::DccState::Receiving
+        };
     }) {
         crate::backend::irc::dcc::announce(state, &t);
     }

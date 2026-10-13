@@ -32,11 +32,22 @@ use serde_json::Value;
 /// already-cached avatar is a cheap no-op (cached_media_path checks
 /// try_exists first), and re-storing identical power_levels/avatar
 /// content is harmless.
-pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &str, homeserver_url: &str, access_token: &str, events: &[&Value]) {
+pub async fn process_state_events(
+    state: &AppState,
+    account_id: &str,
+    room_id: &str,
+    homeserver_url: &str,
+    access_token: &str,
+    events: &[&Value],
+) {
     for event in events {
         match event["type"].as_str().unwrap_or("") {
             "m.room.power_levels" => {
-                state.runtime.set_matrix_power_levels(account_id, room_id, event["content"].clone());
+                state.runtime.set_matrix_power_levels(
+                    account_id,
+                    room_id,
+                    event["content"].clone(),
+                );
             }
             // What the room has told everyone to read first. Ids only: the
             // messages themselves are looked up when somebody asks to see
@@ -52,9 +63,13 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // how one is taken down: a widget is removed by replacing it
             // with `{}`, because state events cannot be deleted.
             "im.vector.modular.widgets" | "m.widget" => {
-                let Some(id) = event["state_key"].as_str().filter(|s| !s.is_empty()) else { continue };
+                let Some(id) = event["state_key"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
                 let widget = widgets::read(id, &event["content"]);
-                state.runtime.set_matrix_widget(account_id, room_id, id, widget);
+                state
+                    .runtime
+                    .set_matrix_widget(account_id, room_id, id, widget);
                 if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
                     state.events.emit(
                         "matrixWidgets",
@@ -69,9 +84,15 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             "m.room.pinned_events" => {
                 let pinned: Vec<String> = event["content"]["pinned"]
                     .as_array()
-                    .map(|ids| ids.iter().filter_map(|id| id.as_str().map(|s| s.to_string())).collect())
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
-                state.runtime.set_matrix_pinned(account_id, room_id, pinned.clone());
+                state
+                    .runtime
+                    .set_matrix_pinned(account_id, room_id, pinned.clone());
                 if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
                     state.events.emit(
                         "pinnedMessages",
@@ -84,7 +105,9 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // user's own or has to be prefixed to be allowed at all.
             "m.room.create" => {
                 if let Some(version) = event["content"]["room_version"].as_str() {
-                    state.runtime.set_matrix_room_version(account_id, room_id, version);
+                    state
+                        .runtime
+                        .set_matrix_room_version(account_id, room_id, version);
                 }
                 // And who owns it, which from room version 12 is recorded
                 // here rather than in the power levels.
@@ -97,7 +120,10 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // Who is in this room's call. A state event per person, and the
             // one thing a client needs to know before it can join one: a
             // group call has no invitation, only people already in it.
-            "org.matrix.msc3401.call.member" | "org.matrix.msc4143.rtc.member" | "m.rtc.member" | "m.call.member" => {
+            "org.matrix.msc3401.call.member"
+            | "org.matrix.msc4143.rtc.member"
+            | "m.rtc.member"
+            | "m.call.member" => {
                 // The state key carries the device as well as the person, and
                 // may be prefixed to get past a room that reserves `@` keys -
                 // so who this is about comes out of the key rather than being
@@ -109,7 +135,9 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                     &event["content"],
                     chrono::Utc::now().timestamp_millis(),
                 );
-                let everybody = state.runtime.set_matrix_call_membership(account_id, room_id, key, live);
+                let everybody = state
+                    .runtime
+                    .set_matrix_call_membership(account_id, room_id, key, live);
                 if let Some(buffer_id) = state.runtime.matrix_buffer_for_room(account_id, room_id) {
                     state.events.emit(
                         "matrixCallMembers",
@@ -125,19 +153,29 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // decision, made for everybody in it, so it outranks an account
             // that has said nothing - see Runtime::matrix_previews_allowed.
             previews::ROOM_SETTING => {
-                state.runtime.set_matrix_previews_off(account_id, room_id, previews::disabled_by(&event["content"]));
+                state.runtime.set_matrix_previews_off(
+                    account_id,
+                    room_id,
+                    previews::disabled_by(&event["content"]),
+                );
             }
             // What the room is for. The structured form (MSC3765) says it in
             // several formats and the plain one is always there as well, so the
             // plain one is read; an empty or missing topic clears it.
             "m.room.topic" => {
                 let topic = event["content"]["topic"].as_str().unwrap_or_default();
-                state.runtime.set_matrix_room_topic(state, account_id, room_id, topic);
+                state
+                    .runtime
+                    .set_matrix_room_topic(state, account_id, room_id, topic);
             }
             "m.room.avatar" => {
                 if let Some(mxc) = event["content"]["url"].as_str() {
-                    if let Some(path) = cached_media_path(homeserver_url, access_token, mxc, "").await {
-                        state.runtime.set_matrix_room_avatar(state, account_id, room_id, &path);
+                    if let Some(path) =
+                        cached_media_path(homeserver_url, access_token, mxc, "").await
+                    {
+                        state
+                            .runtime
+                            .set_matrix_room_avatar(state, account_id, room_id, &path);
                     }
                 }
             }
@@ -151,15 +189,37 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
             // The old room keeps its buffer, holding its history, with a line
             // saying where the conversation went.
             "m.room.tombstone" => {
-                let Some(successor) = event["content"]["replacement_room"].as_str() else { continue };
-                if state.runtime.matrix_buffer_for_room(account_id, successor).is_some() {
+                let Some(successor) = event["content"]["replacement_room"].as_str() else {
+                    continue;
+                };
+                if state
+                    .runtime
+                    .matrix_buffer_for_room(account_id, successor)
+                    .is_some()
+                {
                     continue;
                 }
-                let why = event["content"]["body"].as_str().unwrap_or("This room has been replaced");
-                if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, room_id) {
+                let why = event["content"]["body"]
+                    .as_str()
+                    .unwrap_or("This room has been replaced");
+                if let Some((name, kind)) = state.runtime.get_matrix_room_name(account_id, room_id)
+                {
                     state.runtime.record_message(
-                        state, account_id, &name, &kind, "*", why, false, "system", None, None, false, None,
-                        Vec::new(), Vec::new(), None,
+                        state,
+                        account_id,
+                        &name,
+                        &kind,
+                        "*",
+                        why,
+                        false,
+                        "system",
+                        None,
+                        None,
+                        false,
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                        None,
                     );
                 }
                 // Noted rather than joined here: the join registers the new
@@ -176,10 +236,16 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                 // they're gone. The roster entry itself, unlike the avatar,
                 // is removed outright on anything but "join" - a userlist
                 // should never show someone who isn't actually in the room.
-                let Some(user_id) = event["state_key"].as_str() else { continue };
+                let Some(user_id) = event["state_key"].as_str() else {
+                    continue;
+                };
                 if let Some(mxc) = event["content"]["avatar_url"].as_str() {
-                    if let Some(path) = cached_media_path(homeserver_url, access_token, mxc, "").await {
-                        state.runtime.set_matrix_member_avatar(account_id, user_id, &path);
+                    if let Some(path) =
+                        cached_media_path(homeserver_url, access_token, mxc, "").await
+                    {
+                        state
+                            .runtime
+                            .set_matrix_member_avatar(account_id, user_id, &path);
                     }
                 }
                 if event["content"]["membership"].as_str() == Some("join") {
@@ -187,10 +253,17 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
                     // a sender with no displayname set - the full mxid, not
                     // a parsed localpart (no such helper exists elsewhere
                     // in this backend, so this doesn't invent one either).
-                    let display_name = event["content"]["displayname"].as_str().filter(|s| !s.is_empty()).unwrap_or(user_id);
-                    state.runtime.set_matrix_member(account_id, room_id, user_id, display_name);
+                    let display_name = event["content"]["displayname"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(user_id);
+                    state
+                        .runtime
+                        .set_matrix_member(account_id, room_id, user_id, display_name);
                 } else {
-                    state.runtime.remove_matrix_member(account_id, room_id, user_id);
+                    state
+                        .runtime
+                        .remove_matrix_member(account_id, room_id, user_id);
                 }
             }
             _ => {}
@@ -206,16 +279,24 @@ pub async fn process_state_events(state: &AppState, account_id: &str, room_id: &
 /// name has already been derived, so this only guards against
 /// out-of-order calls, not an expected case.
 pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, own_user_id: &str) {
-    let Some((name, _kind)) = state.runtime.get_matrix_room_name(account_id, room_id) else { return };
+    let Some((name, _kind)) = state.runtime.get_matrix_room_name(account_id, room_id) else {
+        return;
+    };
     let buffer_id = model::buffer_id(account_id, &name);
 
     let members = state.runtime.get_matrix_room_members(account_id, room_id);
-    let power_levels = state.runtime.get_matrix_power_levels(account_id, room_id).unwrap_or_else(|| serde_json::json!({}));
+    let power_levels = state
+        .runtime
+        .get_matrix_power_levels(account_id, room_id)
+        .unwrap_or_else(|| serde_json::json!({}));
     // Who made the room, and under which version - because from version 12
     // the owner holds no power-level entry at all and would otherwise be
     // drawn in the member list as an ordinary member.
     let creators = state.runtime.matrix_room_creators(account_id, room_id);
-    let room_version = state.runtime.matrix_room_version(account_id, room_id).unwrap_or_default();
+    let room_version = state
+        .runtime
+        .matrix_room_version(account_id, room_id)
+        .unwrap_or_default();
 
     let member_list: Vec<Value> = members
         .iter()
@@ -243,7 +324,10 @@ pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, o
 
     let member_list = serde_json::json!(member_list);
     state.runtime.set_presence(&buffer_id, member_list.clone());
-    state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": member_list }));
+    state.events.emit(
+        "presenceChange",
+        serde_json::json!({ "bufferId": buffer_id, "members": member_list }),
+    );
 }
 
 /// Membership-change chat announcements ("X joined the room", "X was
@@ -259,13 +343,37 @@ pub fn emit_matrix_presence(state: &AppState, account_id: &str, room_id: &str, o
 /// decides whether to render" convention every other message-kind filter
 /// (IRC's join/part/topic/mode toggles) already uses; the client's Matrix
 /// settings panel carries the actual on/off toggles.
-pub fn announce_membership_changes(state: &AppState, account_id: &str, buffer_name: &str, buffer_kind: &str, events: &[&Value]) {
+pub fn announce_membership_changes(
+    state: &AppState,
+    account_id: &str,
+    buffer_name: &str,
+    buffer_kind: &str,
+    events: &[&Value],
+) {
     for event in events {
         if event["type"].as_str() != Some("m.room.member") {
             continue;
         }
-        let Some((kind, body)) = classify_membership_change(event) else { continue };
-        state.runtime.record_message(state, account_id, buffer_name, buffer_kind, "*", &body, false, kind, None, None, false, None, Vec::new(), Vec::new(), None);
+        let Some((kind, body)) = classify_membership_change(event) else {
+            continue;
+        };
+        state.runtime.record_message(
+            state,
+            account_id,
+            buffer_name,
+            buffer_kind,
+            "*",
+            &body,
+            false,
+            kind,
+            None,
+            None,
+            false,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+        );
     }
 }
 
@@ -278,17 +386,29 @@ pub fn announce_membership_changes(state: &AppState, account_id: &str, buffer_na
 /// displayname/avatar change).
 fn classify_membership_change(event: &Value) -> Option<(&'static str, String)> {
     let membership = event["content"]["membership"].as_str().unwrap_or("");
-    let prev_membership = event["unsigned"]["prev_content"]["membership"].as_str().unwrap_or("");
+    let prev_membership = event["unsigned"]["prev_content"]["membership"]
+        .as_str()
+        .unwrap_or("");
     let target = event["state_key"].as_str().unwrap_or("");
     let sender = event["sender"].as_str().unwrap_or("");
-    let display_name = event["content"]["displayname"].as_str().filter(|s| !s.is_empty()).unwrap_or(target);
+    let display_name = event["content"]["displayname"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(target);
     let actor = protocol::mxid_localpart(sender);
     let reason = event["content"]["reason"].as_str();
 
     match membership {
-        "join" if prev_membership != "join" => Some(("matrixJoin", format!("{display_name} joined the room"))),
-        "invite" => Some(("matrixInvite", format!("{display_name} was invited by {actor}"))),
-        "leave" if prev_membership == "join" && sender == target => Some(("matrixQuit", format!("{display_name} left the room"))),
+        "join" if prev_membership != "join" => {
+            Some(("matrixJoin", format!("{display_name} joined the room")))
+        }
+        "invite" => Some((
+            "matrixInvite",
+            format!("{display_name} was invited by {actor}"),
+        )),
+        "leave" if prev_membership == "join" && sender == target => {
+            Some(("matrixQuit", format!("{display_name} left the room")))
+        }
         "leave" if prev_membership == "join" => {
             let mut body = format!("{display_name} was kicked by {actor}");
             if let Some(r) = reason {
@@ -311,7 +431,14 @@ fn classify_membership_change(event: &Value) -> Option<(&'static str, String)> {
 mod tests {
     use super::*;
 
-    fn member_event(sender: &str, target: &str, membership: &str, prev_membership: Option<&str>, displayname: Option<&str>, reason: Option<&str>) -> Value {
+    fn member_event(
+        sender: &str,
+        target: &str,
+        membership: &str,
+        prev_membership: Option<&str>,
+        displayname: Option<&str>,
+        reason: Option<&str>,
+    ) -> Value {
         let mut content = serde_json::json!({ "membership": membership });
         if let Some(d) = displayname {
             content["displayname"] = serde_json::json!(d);
@@ -333,38 +460,98 @@ mod tests {
 
     #[test]
     fn a_fresh_join_announces() {
-        let event = member_event("@alice:example.org", "@alice:example.org", "join", Some("invite"), Some("Alice"), None);
-        assert_eq!(classify_membership_change(&event), Some(("matrixJoin", "Alice joined the room".to_string())));
+        let event = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            Some("invite"),
+            Some("Alice"),
+            None,
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some(("matrixJoin", "Alice joined the room".to_string()))
+        );
     }
 
     #[test]
     fn a_profile_update_while_still_joined_does_not_announce() {
-        let event = member_event("@alice:example.org", "@alice:example.org", "join", Some("join"), Some("Alice"), None);
+        let event = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "join",
+            Some("join"),
+            Some("Alice"),
+            None,
+        );
         assert_eq!(classify_membership_change(&event), None);
     }
 
     #[test]
     fn an_invite_announces_with_the_inviter() {
-        let event = member_event("@bob:example.org", "@carol:example.org", "invite", None, Some("Carol"), None);
-        assert_eq!(classify_membership_change(&event), Some(("matrixInvite", "Carol was invited by bob".to_string())));
+        let event = member_event(
+            "@bob:example.org",
+            "@carol:example.org",
+            "invite",
+            None,
+            Some("Carol"),
+            None,
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some(("matrixInvite", "Carol was invited by bob".to_string()))
+        );
     }
 
     #[test]
     fn a_self_leave_is_a_quit_not_a_kick() {
-        let event = member_event("@alice:example.org", "@alice:example.org", "leave", Some("join"), Some("Alice"), None);
-        assert_eq!(classify_membership_change(&event), Some(("matrixQuit", "Alice left the room".to_string())));
+        let event = member_event(
+            "@alice:example.org",
+            "@alice:example.org",
+            "leave",
+            Some("join"),
+            Some("Alice"),
+            None,
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some(("matrixQuit", "Alice left the room".to_string()))
+        );
     }
 
     #[test]
     fn a_leave_by_someone_else_is_a_kick_with_reason() {
-        let event = member_event("@mod:example.org", "@alice:example.org", "leave", Some("join"), Some("Alice"), Some("spamming"));
-        assert_eq!(classify_membership_change(&event), Some(("matrixKick", "Alice was kicked by mod: spamming".to_string())));
+        let event = member_event(
+            "@mod:example.org",
+            "@alice:example.org",
+            "leave",
+            Some("join"),
+            Some("Alice"),
+            Some("spamming"),
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some((
+                "matrixKick",
+                "Alice was kicked by mod: spamming".to_string()
+            ))
+        );
     }
 
     #[test]
     fn a_ban_announces_as_a_kick_kind_with_reason() {
-        let event = member_event("@mod:example.org", "@alice:example.org", "ban", Some("join"), Some("Alice"), Some("rule 3"));
-        assert_eq!(classify_membership_change(&event), Some(("matrixKick", "Alice was banned by mod: rule 3".to_string())));
+        let event = member_event(
+            "@mod:example.org",
+            "@alice:example.org",
+            "ban",
+            Some("join"),
+            Some("Alice"),
+            Some("rule 3"),
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some(("matrixKick", "Alice was banned by mod: rule 3".to_string()))
+        );
     }
 
     #[test]
@@ -375,13 +562,33 @@ mod tests {
         // with prev_membership "invite", not "join". Nobody who was
         // actually *in* the room got removed, so this correctly isn't a
         // "kick" announcement at all.
-        let event = member_event("@mod:example.org", "@alice:example.org", "leave", Some("invite"), Some("Alice"), Some("changed my mind"));
+        let event = member_event(
+            "@mod:example.org",
+            "@alice:example.org",
+            "leave",
+            Some("invite"),
+            Some("Alice"),
+            Some("changed my mind"),
+        );
         assert_eq!(classify_membership_change(&event), None);
     }
 
     #[test]
     fn no_displayname_falls_back_to_the_bare_mxid() {
-        let event = member_event("@alice:example.org", "@dave:example.org", "join", Some("invite"), None, None);
-        assert_eq!(classify_membership_change(&event), Some(("matrixJoin", "@dave:example.org joined the room".to_string())));
+        let event = member_event(
+            "@alice:example.org",
+            "@dave:example.org",
+            "join",
+            Some("invite"),
+            None,
+            None,
+        );
+        assert_eq!(
+            classify_membership_change(&event),
+            Some((
+                "matrixJoin",
+                "@dave:example.org joined the room".to_string()
+            ))
+        );
     }
 }

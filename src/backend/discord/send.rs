@@ -30,7 +30,8 @@ pub(super) fn put_reply(payload: &mut Value, reply_to_id: Option<&str>, ping_aut
     if let Some(reference) = reply_reference(reply_to_id) {
         payload["message_reference"] = reference;
         if !ping_author {
-            payload["allowed_mentions"] = json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
+            payload["allowed_mentions"] =
+                json!({ "parse": ["users", "roles", "everyone"], "replied_user": false });
         }
     }
 }
@@ -51,11 +52,17 @@ pub(super) fn put_reply(payload: &mut Value, reply_to_id: Option<&str>, ping_aut
 /// `@everyone` and `@here` are left exactly as typed. They are Discord's own
 /// keywords, not names, and rewriting them would be inventing an id for
 /// something that has none.
-pub(super) fn resolve_outgoing_mentions(body: &str, mut candidates: Vec<(String, String)>) -> String {
+pub(super) fn resolve_outgoing_mentions(
+    body: &str,
+    mut candidates: Vec<(String, String)>,
+) -> String {
     candidates.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
     let mut out = body.to_string();
     for (name, id) in candidates {
-        if name.is_empty() || name.eq_ignore_ascii_case("everyone") || name.eq_ignore_ascii_case("here") {
+        if name.is_empty()
+            || name.eq_ignore_ascii_case("everyone")
+            || name.eq_ignore_ascii_case("here")
+        {
             continue;
         }
         out = replace_mention(&out, &name, &id);
@@ -77,11 +84,14 @@ pub(super) fn replace_mention(body: &str, name: &str, id: &str) -> String {
     while let Some(found) = lower_body[cursor..].find(&needle) {
         let start = cursor + found;
         let end = start + needle.len();
-        let before_ok = start == 0 || body[..start].chars().next_back().is_some_and(|c| c.is_whitespace() || c == '(');
-        let after_ok = body[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| c.is_whitespace() || matches!(c, ',' | '.' | '!' | '?' | ':' | ';' | ')' | '\''));
+        let before_ok = start == 0
+            || body[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace() || c == '(');
+        let after_ok = body[end..].chars().next().is_none_or(|c| {
+            c.is_whitespace() || matches!(c, ',' | '.' | '!' | '?' | ':' | ';' | ')' | '\'')
+        });
         out.push_str(&body[cursor..start]);
         if before_ok && after_ok {
             // A role id arrives with its own "&" already on it, which is
@@ -113,17 +123,29 @@ mod mention_tests {
     /// and notifying nobody.
     #[test]
     fn a_typed_name_becomes_the_id_discord_pings_on() {
-        assert_eq!(resolve_outgoing_mentions("@alice hello", people()), "<@3> hello");
-        assert_eq!(resolve_outgoing_mentions("hello @alice", people()), "hello <@3>");
+        assert_eq!(
+            resolve_outgoing_mentions("@alice hello", people()),
+            "<@3> hello"
+        );
+        assert_eq!(
+            resolve_outgoing_mentions("hello @alice", people()),
+            "hello <@3>"
+        );
         assert_eq!(resolve_outgoing_mentions("(@alice)", people()), "(<@3>)");
-        assert_eq!(resolve_outgoing_mentions("@alice, hello", people()), "<@3>, hello");
+        assert_eq!(
+            resolve_outgoing_mentions("@alice, hello", people()),
+            "<@3>, hello"
+        );
     }
 
     /// Display names overlap. Longest first, or "@Sam Vimes" becomes a ping
     /// for Sam followed by the loose word "Vimes".
     #[test]
     fn the_longer_name_wins() {
-        assert_eq!(resolve_outgoing_mentions("@Sam Vimes hi", people()), "<@2> hi");
+        assert_eq!(
+            resolve_outgoing_mentions("@Sam Vimes hi", people()),
+            "<@2> hi"
+        );
         assert_eq!(resolve_outgoing_mentions("@Sam hi", people()), "<@1> hi");
     }
 
@@ -131,9 +153,15 @@ mod mention_tests {
     fn case_does_not_matter_but_word_boundaries_do() {
         assert_eq!(resolve_outgoing_mentions("@ALICE hi", people()), "<@3> hi");
         // Inside a word: an address, not a mention.
-        assert_eq!(resolve_outgoing_mentions("mail@alice.example", people()), "mail@alice.example");
+        assert_eq!(
+            resolve_outgoing_mentions("mail@alice.example", people()),
+            "mail@alice.example"
+        );
         // A longer name that merely starts with a known one.
-        assert_eq!(resolve_outgoing_mentions("@alicent hi", people()), "@alicent hi");
+        assert_eq!(
+            resolve_outgoing_mentions("@alicent hi", people()),
+            "@alicent hi"
+        );
     }
 
     /// Discord's own keywords are not names and have no id to become.
@@ -142,8 +170,14 @@ mod mention_tests {
         let mut roster = people();
         roster.push(("everyone".into(), "9".into()));
         roster.push(("here".into(), "10".into()));
-        assert_eq!(resolve_outgoing_mentions("@everyone look", roster.clone()), "@everyone look");
-        assert_eq!(resolve_outgoing_mentions("@here look", roster), "@here look");
+        assert_eq!(
+            resolve_outgoing_mentions("@everyone look", roster.clone()),
+            "@everyone look"
+        );
+        assert_eq!(
+            resolve_outgoing_mentions("@here look", roster),
+            "@here look"
+        );
     }
 
     /// Roles are tagged the same way, with an ampersand in the id - which is
@@ -151,12 +185,18 @@ mod mention_tests {
     #[test]
     fn a_role_becomes_a_role_mention() {
         let roster = vec![("Gaymer Word User".to_string(), "&42".to_string())];
-        assert_eq!(resolve_outgoing_mentions("@Gaymer Word User look", roster), "<@&42> look");
+        assert_eq!(
+            resolve_outgoing_mentions("@Gaymer Word User look", roster),
+            "<@&42> look"
+        );
     }
 
     #[test]
     fn text_with_no_mentions_is_untouched() {
-        assert_eq!(resolve_outgoing_mentions("just talking", people()), "just talking");
+        assert_eq!(
+            resolve_outgoing_mentions("just talking", people()),
+            "just talking"
+        );
         assert_eq!(resolve_outgoing_mentions("", people()), "");
     }
 }
@@ -167,7 +207,11 @@ mod mention_tests {
 /// The roster is what a person is looking at when they type a name, so it is
 /// the authority; the wider cache catches somebody who has left the visible
 /// window but is still in the conversation.
-pub(super) fn mention_candidates(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<(String, String)> {
+pub(super) fn mention_candidates(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+) -> Vec<(String, String)> {
     let mut candidates: Vec<(String, String)> = Vec::new();
     if let Some(members) = state.runtime.get_presence(buffer_id) {
         for member in members.as_array().into_iter().flatten() {
@@ -242,28 +286,43 @@ pub async fn forward_message(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}", discord_error_text(status, &text, "forwarding that message"));
+        bail!(
+            "{}",
+            discord_error_text(status, &text, "forwarding that message")
+        );
     }
     Ok(())
 }
 
-pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: &str, reply_to_id: Option<&str>, reply_ping: bool) -> Result<()> {
+pub async fn send_message(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    body: &str,
+    reply_to_id: Option<&str>,
+    reply_ping: bool,
+) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
-    let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    let account_id = state
+        .runtime
+        .get_buffer(buffer_id)
+        .map(|b| b.account_id)
+        .unwrap_or_default();
+    let content =
+        resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
     let resp = send_write(
         http_client_for(token)
-        .post(format!("{API_BASE}/channels/{channel_id}/messages"))
-        .header("Authorization", token)
-        .json(&payload)
-        )
+            .post(format!("{API_BASE}/channels/{channel_id}/messages"))
+            .header("Authorization", token)
+            .json(&payload),
+    )
     .await
-        .context("sending Discord message")?;
+    .context("sending Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -298,14 +357,20 @@ impl Meter {
 
     fn add(&self, n: usize) {
         use std::sync::atomic::Ordering;
-        let Some(progress) = &self.progress else { return };
+        let Some(progress) = &self.progress else {
+            return;
+        };
         let sent = self.sent.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
         let mut last = self.last.lock().unwrap();
         if sent >= self.total {
             // Everything is out; what is left is Discord's answer.
             if last.1 != self.total {
                 *last = (std::time::Instant::now(), self.total);
-                progress.at(crate::upload::Phase::Waiting, self.total as usize, Self::HOST);
+                progress.at(
+                    crate::upload::Phase::Waiting,
+                    self.total as usize,
+                    Self::HOST,
+                );
             }
         } else if last.0.elapsed() >= self.gap && sent - last.1 >= self.total / 200 {
             // Often enough to look like movement, not so often that a fast
@@ -318,16 +383,25 @@ impl Meter {
 
 /// A file as one part of the upload, read from disk as it is sent and counted
 /// by `meter` as it goes.
-fn counted_part(path: &str, name: &str, len: u64, meter: std::sync::Arc<Meter>) -> Result<reqwest::multipart::Part> {
+fn counted_part(
+    path: &str,
+    name: &str,
+    len: u64,
+    meter: std::sync::Arc<Meter>,
+) -> Result<reqwest::multipart::Part> {
     let file = std::fs::File::open(path).with_context(|| format!("reading {path}"))?;
-    let stream = tokio_util::io::ReaderStream::with_capacity(tokio::fs::File::from_std(file), 64 * 1024);
+    let stream =
+        tokio_util::io::ReaderStream::with_capacity(tokio::fs::File::from_std(file), 64 * 1024);
     let counted = futures::StreamExt::map(stream, move |chunk| {
         if let Ok(bytes) = &chunk {
             meter.add(bytes.len());
         }
         chunk
     });
-    Ok(reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(counted), len).file_name(name.to_string()))
+    Ok(
+        reqwest::multipart::Part::stream_with_length(reqwest::Body::wrap_stream(counted), len)
+            .file_name(name.to_string()),
+    )
 }
 
 /// The name a file goes up under. Discord hides an attachment behind a
@@ -379,16 +453,27 @@ pub async fn send_attachments(
     let mut files = Vec::with_capacity(attachments.len());
     let mut total = 0u64;
     for (path, spoiler) in attachments {
-        let len = tokio::fs::metadata(path).await.with_context(|| format!("reading {path}"))?.len();
-        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let len = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("reading {path}"))?
+            .len();
+        let name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
         let name = upload_name(name, *spoiler);
         total += len;
         files.push((path.clone(), name, len));
     }
     // A caption is a message like any other, so a name typed in one is a
     // mention like any other.
-    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
-    let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    let account_id = state
+        .runtime
+        .get_buffer(buffer_id)
+        .map(|b| b.account_id)
+        .unwrap_or_default();
+    let content =
+        resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
     if let Some(p) = progress {
@@ -409,9 +494,15 @@ pub async fn send_attachments(
         });
         let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
         for (i, (path, name, len)) in files.iter().enumerate() {
-            form = form.part(format!("files[{i}]"), counted_part(path, name, *len, meter.clone())?);
+            form = form.part(
+                format!("files[{i}]"),
+                counted_part(path, name, *len, meter.clone())?,
+            );
         }
-        Ok(client.post(&url).header("Authorization", token).multipart(form))
+        Ok(client
+            .post(&url)
+            .header("Authorization", token)
+            .multipart(form))
     })
     .await
     .context("uploading Discord attachment")?;
@@ -503,20 +594,28 @@ mod reply_tests {
         let mut ping = json!({ "content": "hi" });
         put_reply(&mut ping, Some("42"), true);
         assert_eq!(ping["message_reference"]["message_id"], "42");
-        assert!(ping.get("allowed_mentions").is_none(), "Discord's own default stands");
+        assert!(
+            ping.get("allowed_mentions").is_none(),
+            "Discord's own default stands"
+        );
 
         let mut quiet = json!({ "content": "hi" });
         put_reply(&mut quiet, Some("42"), false);
         assert_eq!(quiet["allowed_mentions"]["replied_user"], false);
         // Whatever else the message mentions is still allowed.
-        assert_eq!(quiet["allowed_mentions"]["parse"], json!(["users", "roles", "everyone"]));
+        assert_eq!(
+            quiet["allowed_mentions"]["parse"],
+            json!(["users", "roles", "everyone"])
+        );
     }
 
     #[test]
     fn a_message_that_answers_nothing_has_neither() {
         let mut plain = json!({ "content": "hi" });
         put_reply(&mut plain, None, false);
-        assert!(plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none());
+        assert!(
+            plain.get("message_reference").is_none() && plain.get("allowed_mentions").is_none()
+        );
     }
 }
 
@@ -545,7 +644,8 @@ mod upload_tests {
 
     #[tokio::test]
     async fn several_files_make_one_counted_request() {
-        let dir = std::env::temp_dir().join(format!("nobilis-multi-{}", crate::model::next_message_id()));
+        let dir =
+            std::env::temp_dir().join(format!("nobilis-multi-{}", crate::model::next_message_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let first = vec![b'a'; 700_000];
         let second = vec![b'b'; 500_000];
@@ -582,7 +682,10 @@ mod upload_tests {
                     break;
                 }
             }
-            socket.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
             seen
         });
 
@@ -592,23 +695,55 @@ mod upload_tests {
         let meter = std::sync::Arc::new(Meter {
             sent: std::sync::atomic::AtomicU64::new(0),
             total,
-            last: std::sync::Mutex::new((std::time::Instant::now() - std::time::Duration::from_secs(1), 0)),
+            last: std::sync::Mutex::new((
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+                0,
+            )),
             progress: Some(crate::upload::Progress::new(bus, "up-1")),
             gap: std::time::Duration::ZERO,
         });
         let form = reqwest::multipart::Form::new()
             .text("payload_json", "{}")
-            .part("files[0]", counted_part(dir.join("one.png").to_str().unwrap(), "one.png", first.len() as u64, meter.clone()).unwrap())
-            .part("files[1]", counted_part(dir.join("two.png").to_str().unwrap(), "two.png", second.len() as u64, meter.clone()).unwrap());
-        let resp = reqwest::Client::new().post(format!("http://{addr}/")).multipart(form).send().await.unwrap();
+            .part(
+                "files[0]",
+                counted_part(
+                    dir.join("one.png").to_str().unwrap(),
+                    "one.png",
+                    first.len() as u64,
+                    meter.clone(),
+                )
+                .unwrap(),
+            )
+            .part(
+                "files[1]",
+                counted_part(
+                    dir.join("two.png").to_str().unwrap(),
+                    "two.png",
+                    second.len() as u64,
+                    meter.clone(),
+                )
+                .unwrap(),
+            );
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/"))
+            .multipart(form)
+            .send()
+            .await
+            .unwrap();
         assert!(resp.status().is_success());
 
         let seen = server.await.unwrap();
         let text = String::from_utf8_lossy(&seen);
         assert!(text.contains("name=\"files[0]\"") && text.contains("filename=\"one.png\""));
         assert!(text.contains("name=\"files[1]\"") && text.contains("filename=\"two.png\""));
-        assert!(seen.windows(1000).any(|w| w.iter().all(|&b| b == b'a')), "the first file's bytes arrived");
-        assert!(seen.windows(1000).any(|w| w.iter().all(|&b| b == b'b')), "the second file's bytes arrived");
+        assert!(
+            seen.windows(1000).any(|w| w.iter().all(|&b| b == b'a')),
+            "the first file's bytes arrived"
+        );
+        assert!(
+            seen.windows(1000).any(|w| w.iter().all(|&b| b == b'b')),
+            "the second file's bytes arrived"
+        );
 
         // Reported as it went: counts that only rise, then the wait for the answer.
         let mut counts = Vec::new();
@@ -620,9 +755,18 @@ mod upload_tests {
                 counts.push(sent);
             }
         }
-        assert!(counts.len() >= 3, "progress was reported along the way: {counts:?}");
-        assert!(counts.windows(2).all(|w| w[0] <= w[1]), "counts only rise: {counts:?}");
-        assert!(counts.iter().all(|&c| c < total), "the last of it is the wait, not more sending: {counts:?}");
+        assert!(
+            counts.len() >= 3,
+            "progress was reported along the way: {counts:?}"
+        );
+        assert!(
+            counts.windows(2).all(|w| w[0] <= w[1]),
+            "counts only rise: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|&c| c < total),
+            "the last of it is the wait, not more sending: {counts:?}"
+        );
         assert_eq!(last_phase, "waiting");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -655,13 +799,16 @@ mod live_probe {
         let samples: Vec<f32> = (0..crate::oggopus::RATE * 2)
             .map(|i| {
                 let t = i as f32 / crate::oggopus::RATE as f32;
-                (t * 440.0 * std::f32::consts::TAU).sin() * (t * std::f32::consts::PI / 2.0).sin() * 0.4
+                (t * 440.0 * std::f32::consts::TAU).sin()
+                    * (t * std::f32::consts::PI / 2.0).sin()
+                    * 0.4
             })
             .collect();
         let duration = crate::oggopus::duration_secs(&samples);
         let waveform = {
             use base64::Engine;
-            base64::engine::general_purpose::STANDARD.encode(crate::oggopus::waveform(&samples, 256))
+            base64::engine::general_purpose::STANDARD
+                .encode(crate::oggopus::waveform(&samples, 256))
         };
         let bytes = crate::oggopus::encode(&samples).expect("encoding");
         println!("{} bytes of ogg, {duration:.2}s", bytes.len());
@@ -695,15 +842,25 @@ mod live_probe {
 
         // The answer is the message Discord stored, so this is its own
         // verification: the flag it kept, and what it did with the metadata.
-        println!("flags={} attachments={}", body["flags"], serde_json::to_string_pretty(&body["attachments"]).unwrap());
+        println!(
+            "flags={} attachments={}",
+            body["flags"],
+            serde_json::to_string_pretty(&body["attachments"]).unwrap()
+        );
         assert_eq!(
             body["flags"].as_u64().unwrap_or(0) & IS_VOICE_MESSAGE,
             IS_VOICE_MESSAGE,
             "stored without the voice-message flag, so it is a sound file: {body}"
         );
         let att = &body["attachments"][0];
-        assert!(att["duration_secs"].as_f64().is_some(), "no duration came back: {att}");
-        assert!(att["waveform"].as_str().is_some(), "no waveform came back: {att}");
+        assert!(
+            att["duration_secs"].as_f64().is_some(),
+            "no duration came back: {att}"
+        );
+        assert!(
+            att["waveform"].as_str().is_some(),
+            "no waveform came back: {att}"
+        );
     }
 }
 
@@ -725,7 +882,10 @@ mod receive_probe {
         let channel = std::env::var("MOHO_DISCORD_CHANNEL").expect("MOHO_DISCORD_CHANNEL");
 
         let messages: serde_json::Value = super::http_client_for(&token)
-            .get(format!("{}/channels/{channel}/messages?limit=10", super::API_BASE))
+            .get(format!(
+                "{}/channels/{channel}/messages?limit=10",
+                super::API_BASE
+            ))
             .header("Authorization", &token)
             .send()
             .await
@@ -742,7 +902,9 @@ mod receive_probe {
             .expect("no voice message in the last ten - send one first");
 
         let attachments = crate::backend::discord::messages::extract_attachments(spoken);
-        let att = attachments.first().expect("a voice message has an attachment");
+        let att = attachments
+            .first()
+            .expect("a voice message has an attachment");
         println!(
             "kind={} voice={} duration={:?} waveform={} bytes",
             att.kind,
@@ -750,8 +912,14 @@ mod receive_probe {
             att.duration_secs,
             att.waveform.as_deref().map(str::len).unwrap_or(0)
         );
-        assert!(att.voice, "the parser did not read the flag off a real message");
-        assert!(att.duration_secs.unwrap_or(0.0) > 0.0, "no length came through");
+        assert!(
+            att.voice,
+            "the parser did not read the flag off a real message"
+        );
+        assert!(
+            att.duration_secs.unwrap_or(0.0) > 0.0,
+            "no length came through"
+        );
         assert!(att.waveform.is_some(), "no waveform came through");
         assert_eq!(att.kind, "audio");
     }
@@ -760,19 +928,27 @@ mod receive_probe {
 /// PATCH .../messages/{id} - editing your own message. Discord scopes
 /// this to the message author (enforced server-side; there's no separate
 /// permission check needed here).
-pub async fn edit_message(state: &AppState, buffer_id: &str, token: &str, msg_id: &str, body: &str) -> Result<()> {
+pub async fn edit_message(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    msg_id: &str,
+    body: &str,
+) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
         http_client_for(token)
-        .patch(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
-        .header("Authorization", token)
-        .json(&json!({ "content": body }))
-        )
+            .patch(format!(
+                "{API_BASE}/channels/{channel_id}/messages/{msg_id}"
+            ))
+            .header("Authorization", token)
+            .json(&json!({ "content": body })),
+    )
     .await
-        .context("editing Discord message")?;
+    .context("editing Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -797,12 +973,12 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     send_write(
         http_client_for(token)
-        .post(format!("{API_BASE}/channels/{channel_id}/typing"))
-        .header("Authorization", token)
-        .header("Content-Length", "0")
-        )
+            .post(format!("{API_BASE}/channels/{channel_id}/typing"))
+            .header("Authorization", token)
+            .header("Content-Length", "0"),
+    )
     .await
-        .context("sending a Discord typing notice")?;
+    .context("sending a Discord typing notice")?;
     Ok(())
 }
 
@@ -823,15 +999,19 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
+    let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else {
+        return Ok(());
+    };
     let resp = send_write(
         http_client_for(token)
-        .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
-        .header("Authorization", token)
-        .json(&json!({ "token": serde_json::Value::Null }))
-        )
+            .post(format!(
+                "{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"
+            ))
+            .header("Authorization", token)
+            .json(&json!({ "token": serde_json::Value::Null })),
+    )
     .await
-        .context("acking Discord read state")?;
+    .context("acking Discord read state")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -840,18 +1020,25 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
     Ok(())
 }
 
-pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_id: &str) -> Result<()> {
+pub async fn delete_message(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    msg_id: &str,
+) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let resp = send_write(
         http_client_for(token)
-        .delete(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}"))
-        .header("Authorization", token)
-        )
+            .delete(format!(
+                "{API_BASE}/channels/{channel_id}/messages/{msg_id}"
+            ))
+            .header("Authorization", token),
+    )
     .await
-        .context("deleting Discord message")?;
+    .context("deleting Discord message")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -868,7 +1055,11 @@ pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_
 /// unwrapped here rather than changing the stored shape everywhere else.
 /// A plain Unicode emoji (no wrapper) passes through unchanged.
 pub(super) fn reaction_path_segment(emoji: &str) -> &str {
-    emoji.strip_prefix("<:").or_else(|| emoji.strip_prefix("<a:")).and_then(|s| s.strip_suffix('>')).unwrap_or(emoji)
+    emoji
+        .strip_prefix("<:")
+        .or_else(|| emoji.strip_prefix("<a:"))
+        .and_then(|s| s.strip_suffix('>'))
+        .unwrap_or(emoji)
 }
 
 /// PUT/DELETE .../messages/{id}/reactions/{emoji}/@me - adding or
@@ -878,17 +1069,38 @@ pub(super) fn reaction_path_segment(emoji: &str) -> &str {
 /// the emoji segment - raw Unicode bytes for a standard emoji, a `:`
 /// inside a custom one - gets properly percent-encoded rather than
 /// landing in the URL unescaped.
-pub async fn toggle_reaction(state: &AppState, buffer_id: &str, token: &str, msg_id: &str, emoji: &str, add: bool) -> Result<()> {
+pub async fn toggle_reaction(
+    state: &AppState,
+    buffer_id: &str,
+    token: &str,
+    msg_id: &str,
+    emoji: &str,
+    add: bool,
+) -> Result<()> {
     let channel_id = state
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let mut url = url::Url::parse(&format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/reactions")).context("building reaction URL")?;
-    url.path_segments_mut().map_err(|_| anyhow!("reaction URL cannot be a base"))?.push(reaction_path_segment(emoji)).push("@me");
+    let mut url = url::Url::parse(&format!(
+        "{API_BASE}/channels/{channel_id}/messages/{msg_id}/reactions"
+    ))
+    .context("building reaction URL")?;
+    url.path_segments_mut()
+        .map_err(|_| anyhow!("reaction URL cannot be a base"))?
+        .push(reaction_path_segment(emoji))
+        .push("@me");
 
     let client = http_client_for(token);
-    let req = if add { client.put(url) } else { client.delete(url) };
-    let resp = req.header("Authorization", token).send().await.context("toggling Discord reaction")?;
+    let req = if add {
+        client.put(url)
+    } else {
+        client.delete(url)
+    };
+    let resp = req
+        .header("Authorization", token)
+        .send()
+        .await
+        .context("toggling Discord reaction")?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -909,8 +1121,14 @@ fn refusal_text(status: reqwest::StatusCode, text: &str) -> String {
     match parsed["code"].as_u64() {
         // 200000 a message, 200001 a forum post's title.
         Some(200_000) | Some(200_001) => {
-            let what = if parsed["code"].as_u64() == Some(200_001) { "title" } else { "message" };
-            let said = parsed["message"].as_str().filter(|m| !m.is_empty() && !m.contains("blocked by AutoMod"));
+            let what = if parsed["code"].as_u64() == Some(200_001) {
+                "title"
+            } else {
+                "message"
+            };
+            let said = parsed["message"]
+                .as_str()
+                .filter(|m| !m.is_empty() && !m.contains("blocked by AutoMod"));
             match said {
                 Some(reason) => format!("AutoMod in this server blocked the {what}: {reason}"),
                 None => format!("AutoMod in this server blocked the {what}"),
@@ -941,9 +1159,13 @@ mod refusal_tests {
     #[test]
     fn an_automod_block_is_said_as_one() {
         let body = r#"{"message": "Message was blocked by AutoMod", "code": 200000}"#;
-        assert_eq!(refusal_text(reqwest::StatusCode::BAD_REQUEST, body), "AutoMod in this server blocked the message");
+        assert_eq!(
+            refusal_text(reqwest::StatusCode::BAD_REQUEST, body),
+            "AutoMod in this server blocked the message"
+        );
         let other = r#"{"message": "Missing Permissions", "code": 50013}"#;
-        assert!(refusal_text(reqwest::StatusCode::FORBIDDEN, other).starts_with("Discord API error 403"));
+        assert!(refusal_text(reqwest::StatusCode::FORBIDDEN, other)
+            .starts_with("Discord API error 403"));
         assert_eq!(describe_seconds(600), "10 minutes");
         assert_eq!(describe_seconds(3600), "1 hour");
         assert_eq!(describe_seconds(45), "45 seconds");

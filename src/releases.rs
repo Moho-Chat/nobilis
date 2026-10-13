@@ -38,7 +38,9 @@ pub fn newest(listed: &serde_json::Value) -> Option<Release> {
     listed
         .as_array()?
         .iter()
-        .filter(|r| !r["draft"].as_bool().unwrap_or(true) && !r["prerelease"].as_bool().unwrap_or(true))
+        .filter(|r| {
+            !r["draft"].as_bool().unwrap_or(true) && !r["prerelease"].as_bool().unwrap_or(true)
+        })
         .filter_map(|r| {
             let tag = r["tag_name"].as_str()?;
             let version = parse_version(tag)?;
@@ -46,7 +48,11 @@ pub fn newest(listed: &serde_json::Value) -> Option<Release> {
                 version,
                 Release {
                     version: tag.trim_start_matches('v').to_string(),
-                    name: r["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(tag).to_string(),
+                    name: r["name"]
+                        .as_str()
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or(tag)
+                        .to_string(),
                     url: r["html_url"].as_str()?.to_string(),
                     published_at: r["published_at"].as_str().unwrap_or_default().to_string(),
                 },
@@ -59,28 +65,44 @@ pub fn newest(listed: &serde_json::Value) -> Option<Release> {
 /// The newest real release of `repo` ("owner/name") on GitHub, or None when it
 /// has none yet.
 pub async fn latest(repo: &str) -> Result<Option<Release>> {
-    let valid = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b));
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    };
     match repo.split_once('/') {
         Some((owner, name)) if valid(owner) && valid(name) && !name.contains('/') => {}
         _ => bail!("\"{repo}\" is not a GitHub repository"),
     }
     let router = crate::net::route::router();
-    router.ready_for_general().await.context("starting Tor or reaching the proxy")?;
+    router
+        .ready_for_general()
+        .await
+        .context("starting Tor or reaching the proxy")?;
     let client = router.client_if("releases", router.general_routed(), |builder| {
         builder
             .user_agent(concat!("nobilis/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(20))
     });
     let response = client
-        .get(format!("https://api.github.com/repos/{repo}/releases?per_page=30"))
+        .get(format!(
+            "https://api.github.com/repos/{repo}/releases?per_page=30"
+        ))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
         .context("asking GitHub for releases")?;
     if !response.status().is_success() {
-        bail!("GitHub answered {} for {repo}'s releases", response.status());
+        bail!(
+            "GitHub answered {} for {repo}'s releases",
+            response.status()
+        );
     }
-    let listed: serde_json::Value = response.json().await.context("reading GitHub's list of releases")?;
+    let listed: serde_json::Value = response
+        .json()
+        .await
+        .context("reading GitHub's list of releases")?;
     Ok(newest(&listed))
 }
 

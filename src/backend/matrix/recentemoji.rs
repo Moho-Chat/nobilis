@@ -67,12 +67,20 @@ pub fn used(content: &Value, emoji: &str) -> Value {
 
 /// Reads the account's list.
 pub async fn list(state: &AppState, account_id: &str) -> Result<Vec<String>> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
-    let content = ssss::read_account_data(&account.homeserver_url, &account.access_token, &account.user_id, EVENT)
-        .await
-        // An account that has never picked one has no event, which is an
-        // empty list rather than a failure.
-        .unwrap_or_else(|| serde_json::json!({}));
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
+    let content = ssss::read_account_data(
+        &account.homeserver_url,
+        &account.access_token,
+        &account.user_id,
+        EVENT,
+    )
+    .await
+    // An account that has never picked one has no event, which is an
+    // empty list rather than a failure.
+    .unwrap_or_else(|| serde_json::json!({}));
     Ok(read(&content))
 }
 
@@ -83,14 +91,28 @@ pub async fn list(state: &AppState, account_id: &str) -> Result<Vec<String>> {
 /// it: the event is replaced whole and another client may have written it
 /// since.
 pub async fn record(state: &AppState, account_id: &str, emoji: &str) -> Result<Vec<String>> {
-    let account = state.accounts.get_matrix(account_id).context("account not connected")?;
-    let existing = ssss::read_account_data(&account.homeserver_url, &account.access_token, &account.user_id, EVENT)
-        .await
-        .unwrap_or_else(|| serde_json::json!({}));
+    let account = state
+        .accounts
+        .get_matrix(account_id)
+        .context("account not connected")?;
+    let existing = ssss::read_account_data(
+        &account.homeserver_url,
+        &account.access_token,
+        &account.user_id,
+        EVENT,
+    )
+    .await
+    .unwrap_or_else(|| serde_json::json!({}));
     let updated = used(&existing, emoji);
-    ssss::write_account_data(&account.homeserver_url, &account.access_token, &account.user_id, EVENT, updated.clone())
-        .await
-        .context("recording the emoji")?;
+    ssss::write_account_data(
+        &account.homeserver_url,
+        &account.access_token,
+        &account.user_id,
+        EVENT,
+        updated.clone(),
+    )
+    .await
+    .context("recording the emoji")?;
     Ok(read(&updated))
 }
 
@@ -118,7 +140,10 @@ mod tests {
     fn using_one_again_moves_it_up_and_keeps_its_count() {
         let before = json!({ "recent_emoji": [["a", 12], ["b", 3], ["c", 1]] });
         let after = used(&before, "b");
-        assert_eq!(after["recent_emoji"], json!([["b", 4], ["a", 12], ["c", 1]]));
+        assert_eq!(
+            after["recent_emoji"],
+            json!([["b", 4], ["a", 12], ["c", 1]])
+        );
 
         // A new one starts at one and goes to the front.
         let fresh = used(&after, "d");

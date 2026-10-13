@@ -27,7 +27,9 @@ pub const POLL_END: [&str; 2] = ["m.poll.end", "org.matrix.msc3381.poll.end"];
 
 /// Whether an event type is any of the poll ones.
 pub fn is_poll_event(event_type: &str) -> bool {
-    POLL_START.contains(&event_type) || POLL_RESPONSE.contains(&event_type) || POLL_END.contains(&event_type)
+    POLL_START.contains(&event_type)
+        || POLL_RESPONSE.contains(&event_type)
+        || POLL_END.contains(&event_type)
 }
 
 /// Reads whichever spelling of a text block this event used.
@@ -46,7 +48,11 @@ fn text_of(value: &Value) -> Option<String> {
     value
         .get("m.text")
         .and_then(|v| v.as_array())
-        .and_then(|items| items.iter().find_map(|i| i.get("body").and_then(|b| b.as_str())))
+        .and_then(|items| {
+            items
+                .iter()
+                .find_map(|i| i.get("body").and_then(|b| b.as_str()))
+        })
         .map(|s| s.to_string())
 }
 
@@ -56,7 +62,10 @@ pub fn parse_start(content: &Value) -> Option<(String, Vec<(String, String)>)> {
         .iter()
         .find_map(|key| content.get(*key))
         .unwrap_or(content);
-    let question = poll.get("question").and_then(text_of).or_else(|| text_of(content))?;
+    let question = poll
+        .get("question")
+        .and_then(text_of)
+        .or_else(|| text_of(content))?;
     let answers = poll.get("answers")?.as_array()?;
     let options: Vec<(String, String)> = answers
         .iter()
@@ -82,7 +91,9 @@ pub fn parse_start(content: &Value) -> Option<(String, Vec<(String, String)>)> {
 
 /// Which poll a vote or an end belongs to.
 pub fn related_poll(content: &Value) -> Option<String> {
-    content["m.relates_to"]["event_id"].as_str().map(|s| s.to_string())
+    content["m.relates_to"]["event_id"]
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// The answer somebody picked. One answer, because this client offers one:
@@ -92,10 +103,15 @@ pub fn parse_response(content: &Value) -> Option<String> {
         // `continue`, not `?`: the whole point of the loop is that an event
         // carries one spelling or the other, and giving up on the first
         // missing key would only ever read the stable one.
-        let Some(block) = content.get(key) else { continue };
+        let Some(block) = content.get(key) else {
+            continue;
+        };
         // Stable puts the ids in a list at the key; unstable wraps them in an
         // object under `answers`.
-        let list = block.as_array().cloned().or_else(|| block.get("answers").and_then(|a| a.as_array()).cloned());
+        let list = block
+            .as_array()
+            .cloned()
+            .or_else(|| block.get("answers").and_then(|a| a.as_array()).cloned());
         if let Some(list) = list {
             if let Some(first) = list.first().and_then(|v| v.as_str()) {
                 return Some(first.to_string());
@@ -159,8 +175,12 @@ pub fn handle(
     content: &Value,
 ) -> bool {
     if POLL_START.contains(&event_type) {
-        let Some((question, answers)) = parse_start(content) else { return true };
-        state.runtime.set_matrix_poll(buffer_id, event_id, &question, &answers);
+        let Some((question, answers)) = parse_start(content) else {
+            return true;
+        };
+        state
+            .runtime
+            .set_matrix_poll(buffer_id, event_id, &question, &answers);
         announce(state, account_id, buffer_id, event_id, own_user_id);
         return true;
     }
@@ -172,7 +192,9 @@ pub fn handle(
         // A vote after the poll ended does not count, which is the server's
         // rule and this client's too.
         if !state.runtime.matrix_poll_ended(buffer_id, &poll_id) {
-            state.runtime.set_matrix_poll_vote(buffer_id, &poll_id, sender, &answer);
+            state
+                .runtime
+                .set_matrix_poll_vote(buffer_id, &poll_id, sender, &answer);
             announce(state, account_id, buffer_id, &poll_id, own_user_id);
         }
         return true;
@@ -190,15 +212,37 @@ pub fn handle(
 }
 
 /// Draws the poll again after a change made here rather than received.
-pub fn republish(state: &AppState, account_id: &str, buffer_id: &str, poll_id: &str, own_user_id: &str) {
+pub fn republish(
+    state: &AppState,
+    account_id: &str,
+    buffer_id: &str,
+    poll_id: &str,
+    own_user_id: &str,
+) {
     announce(state, account_id, buffer_id, poll_id, own_user_id);
 }
 
 /// Draws the current state of one poll and sends it to the client.
-fn announce(state: &AppState, _account_id: &str, buffer_id: &str, poll_id: &str, own_user_id: &str) {
-    let Some((question, answers, ended)) = state.runtime.matrix_poll(buffer_id, poll_id) else { return };
+fn announce(
+    state: &AppState,
+    _account_id: &str,
+    buffer_id: &str,
+    poll_id: &str,
+    own_user_id: &str,
+) {
+    let Some((question, answers, ended)) = state.runtime.matrix_poll(buffer_id, poll_id) else {
+        return;
+    };
     let votes = state.runtime.matrix_poll_votes(buffer_id, poll_id);
-    let card = card(buffer_id, poll_id, &question, &answers, &votes, own_user_id, ended);
+    let card = card(
+        buffer_id,
+        poll_id,
+        &question,
+        &answers,
+        &votes,
+        own_user_id,
+        ended,
+    );
     state.runtime.set_live_card(buffer_id, "poll", card.clone());
     // Written down as well as shown, so the room's past polls are readable
     // from the history panel the same way a Kick channel's are - and so a
@@ -207,7 +251,11 @@ fn announce(state: &AppState, _account_id: &str, buffer_id: &str, poll_id: &str,
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    if let Err(e) = state.store.record_live_card(buffer_id, "poll", poll_id, &question, &card.to_string(), ts) {
+    if let Err(e) =
+        state
+            .store
+            .record_live_card(buffer_id, "poll", poll_id, &question, &card.to_string(), ts)
+    {
         tracing::debug!("matrix: keeping the poll: {e:#}");
     }
     state.events.emit(
@@ -235,7 +283,10 @@ mod tests {
         });
         let (question, answers) = parse_start(&stable).expect("stable poll");
         assert_eq!(question, "Where for lunch?");
-        assert_eq!(answers, vec![("a".into(), "Pub".into()), ("b".into(), "Chippy".into())]);
+        assert_eq!(
+            answers,
+            vec![("a".into(), "Pub".into()), ("b".into(), "Chippy".into())]
+        );
 
         let unstable = serde_json::json!({
             "org.matrix.msc3381.poll.start": {
@@ -253,11 +304,13 @@ mod tests {
 
     #[test]
     fn reads_a_vote_however_it_was_written() {
-        let stable = serde_json::json!({ "m.selections": ["b"], "m.relates_to": { "event_id": "$poll" } });
+        let stable =
+            serde_json::json!({ "m.selections": ["b"], "m.relates_to": { "event_id": "$poll" } });
         assert_eq!(parse_response(&stable).as_deref(), Some("b"));
         assert_eq!(related_poll(&stable).as_deref(), Some("$poll"));
 
-        let unstable = serde_json::json!({ "org.matrix.msc3381.poll.response": { "answers": ["a"] } });
+        let unstable =
+            serde_json::json!({ "org.matrix.msc3381.poll.response": { "answers": ["a"] } });
         assert_eq!(parse_response(&unstable).as_deref(), Some("a"));
 
         // Nothing to read is not an answer of "".
@@ -268,13 +321,24 @@ mod tests {
     /// this account has voted at all.
     #[test]
     fn counts_one_vote_each() {
-        let answers = vec![("a".to_string(), "Pub".to_string()), ("b".to_string(), "Chippy".to_string())];
+        let answers = vec![
+            ("a".to_string(), "Pub".to_string()),
+            ("b".to_string(), "Chippy".to_string()),
+        ];
         let mut votes = std::collections::HashMap::new();
         votes.insert("@alice:example.org".to_string(), "a".to_string());
         votes.insert("@bob:example.org".to_string(), "a".to_string());
         // Bob changes his mind, which replaces rather than adds.
         votes.insert("@bob:example.org".to_string(), "b".to_string());
-        let card = card("buf", "$poll", "Where for lunch?", &answers, &votes, "@alice:example.org", false);
+        let card = card(
+            "buf",
+            "$poll",
+            "Where for lunch?",
+            &answers,
+            &votes,
+            "@alice:example.org",
+            false,
+        );
         assert_eq!(card["options"][0]["votes"], 1);
         assert_eq!(card["options"][1]["votes"], 1);
         assert_eq!(card["hasVoted"], true);
@@ -285,7 +349,18 @@ mod tests {
         assert_eq!(ended["open"], false);
     }
 
-    fn card_ended(answers: &[(String, String)], votes: &std::collections::HashMap<String, String>) -> Value {
-        card("buf", "$poll", "Where for lunch?", answers, votes, "@nobody:example.org", true)
+    fn card_ended(
+        answers: &[(String, String)],
+        votes: &std::collections::HashMap<String, String>,
+    ) -> Value {
+        card(
+            "buf",
+            "$poll",
+            "Where for lunch?",
+            answers,
+            votes,
+            "@nobody:example.org",
+            true,
+        )
     }
 }

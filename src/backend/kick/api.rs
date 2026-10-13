@@ -44,8 +44,11 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// particular, and a request that cannot say whose it is goes the safer way.
 pub fn client() -> Result<reqwest::Client> {
     let router = crate::net::route::router();
-    let routed = router.routed(SHARED_KEY) || router.routed(&crate::net::route::pending_key("kick"));
-    Ok(router.client_if("kick", routed, |builder| builder.user_agent(USER_AGENT).timeout(TIMEOUT)))
+    let routed =
+        router.routed(SHARED_KEY) || router.routed(&crate::net::route::pending_key("kick"));
+    Ok(router.client_if("kick", routed, |builder| {
+        builder.user_agent(USER_AGENT).timeout(TIMEOUT)
+    }))
 }
 
 /// Marked while any Kick account is routed; what Kick's connections are
@@ -187,7 +190,11 @@ const PACED_RETRIES: usize = 3;
 
 /// How long Kick asked us to wait, where it said.
 fn retry_after(res: &reqwest::Response) -> Option<Duration> {
-    let said = res.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let said = res
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
     let seconds: u64 = said.trim().parse().ok()?;
     // Capped: a client that obeys a ten-minute Retry-After during startup has
     // hung, as far as anybody watching it can tell. The floor is the
@@ -204,7 +211,8 @@ fn retry_after(res: &reqwest::Response) -> Option<Duration> {
 /// its own clock, so fifty channels refused together came back together and
 /// were refused together again - a reconnect drew hundreds of them.
 fn not_before() -> &'static std::sync::Mutex<Option<tokio::time::Instant>> {
-    static NOT_BEFORE: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> = std::sync::OnceLock::new();
+    static NOT_BEFORE: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
     NOT_BEFORE.get_or_init(Default::default)
 }
 
@@ -229,7 +237,8 @@ const SPACING: Duration = Duration::from_millis(250);
 
 /// When the next paced request may go out.
 fn next_slot() -> &'static std::sync::Mutex<Option<tokio::time::Instant>> {
-    static NEXT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> = std::sync::OnceLock::new();
+    static NEXT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::time::Instant>>> =
+        std::sync::OnceLock::new();
     NEXT.get_or_init(Default::default)
 }
 
@@ -266,7 +275,10 @@ async fn take_turn(priority: Priority) {
 
 /// Sends a request once Kick is willing to hear it, and when told to slow
 /// down, makes every request wait - not just this one - before asking again.
-async fn paced(request: reqwest::RequestBuilder, priority: Priority) -> reqwest::Result<reqwest::Response> {
+async fn paced(
+    request: reqwest::RequestBuilder,
+    priority: Priority,
+) -> reqwest::Result<reqwest::Response> {
     // Counted while waiting, and uncounted however this ends - a lookup
     // dropped part-way (its connection closing) would otherwise leave the
     // background queue standing aside for good.
@@ -283,11 +295,16 @@ async fn paced(request: reqwest::RequestBuilder, priority: Priority) -> reqwest:
     paced_inner(request, priority).await
 }
 
-async fn paced_inner(request: reqwest::RequestBuilder, priority: Priority) -> reqwest::Result<reqwest::Response> {
+async fn paced_inner(
+    request: reqwest::RequestBuilder,
+    priority: Priority,
+) -> reqwest::Result<reqwest::Response> {
     let mut attempt = 0;
     loop {
         take_turn(priority).await;
-        let Some(this) = request.try_clone() else { return request.send().await };
+        let Some(this) = request.try_clone() else {
+            return request.send().await;
+        };
         let res = this.send().await?;
         if res.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt >= PACED_RETRIES {
             return Ok(res);
@@ -326,7 +343,12 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     // starting up rather than a failure. Answered by waiting: a channel
     // dropped here is a channel missing from the list until the next
     // restart, which is a far worse outcome than a slower connect.
-    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Chat).await.context("asking Kick about that channel")?;
+    let res = paced(
+        http.get(&url).header("Accept", "application/json"),
+        Priority::Chat,
+    )
+    .await
+    .context("asking Kick about that channel")?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         // Kick's own answer, not just the status: a 404 page from something in
         // between is not Kick saying the channel is gone, and this one leads
@@ -340,7 +362,10 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     if !res.status().is_success() {
         bail!("Kick answered {} for {slug}", res.status());
     }
-    let json: ChannelJson = res.json().await.context("reading Kick's answer about that channel")?;
+    let json: ChannelJson = res
+        .json()
+        .await
+        .context("reading Kick's answer about that channel")?;
     // `livestream` is null when the channel is offline, which is the honest
     // answer and the one the header draws as "offline" rather than as a blank.
     let live = json.livestream.filter(|l| l.is_live).map(|l| Live {
@@ -354,7 +379,11 @@ pub async fn channel(http: &reqwest::Client, slug: &str) -> Result<Channel> {
     Ok(Channel {
         id: json.id,
         chatroom_id: json.chatroom.id,
-        username: json.user.as_ref().and_then(|u| u.username.clone()).unwrap_or_else(|| json.slug.clone()),
+        username: json
+            .user
+            .as_ref()
+            .and_then(|u| u.username.clone())
+            .unwrap_or_else(|| json.slug.clone()),
         avatar_url: json.user.and_then(|u| u.profile_pic),
         subscribers_only: json.chatroom.subscribers_mode,
         followers_only: json.chatroom.followers_mode,
@@ -382,7 +411,9 @@ pub fn parse_kick_datetime(text: &str) -> Option<i64> {
     } else {
         format!("{}Z", text.replacen(' ', "T", 1))
     };
-    chrono::DateTime::parse_from_rfc3339(&iso).ok().map(|dt| dt.timestamp())
+    chrono::DateTime::parse_from_rfc3339(&iso)
+        .ok()
+        .map(|dt| dt.timestamp())
 }
 
 #[cfg(test)]
@@ -395,7 +426,10 @@ mod live_tests {
     fn reads_the_start_time_kick_actually_sends() {
         assert_eq!(parse_kick_datetime("2026-09-03 19:57:50"), Some(1788465470));
         // And the one it writes the ordinary way, which predictions use.
-        assert_eq!(parse_kick_datetime("2026-09-04T17:45:16Z"), Some(1788543916));
+        assert_eq!(
+            parse_kick_datetime("2026-09-04T17:45:16Z"),
+            Some(1788543916)
+        );
         assert_eq!(parse_kick_datetime("not a time"), None);
     }
 
@@ -443,7 +477,11 @@ pub fn normalise_slug(raw: &str) -> String {
     s = s.split(['/', '?', '#']).next().unwrap_or("");
     s = s.strip_prefix('@').unwrap_or(s);
     let s = s.trim().to_lowercase();
-    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return String::new();
     }
     s
@@ -502,7 +540,12 @@ pub fn emote_url(id: &str) -> String {
 /// headings, and a message can carry any of them.
 pub async fn emotes(http: &reqwest::Client, slug: &str) -> Result<Vec<Emote>> {
     let url = format!("{API_ROOT}/emotes/{slug}");
-    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Background).await.context("fetching the channel's emotes")?;
+    let res = paced(
+        http.get(&url).header("Accept", "application/json"),
+        Priority::Background,
+    )
+    .await
+    .context("fetching the channel's emotes")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for {slug}'s emotes", res.status());
     }
@@ -548,7 +591,11 @@ pub async fn emotes(http: &reqwest::Client, slug: &str) -> Result<Vec<Emote>> {
 /// the four call sites.
 pub fn bare_token(raw: &str) -> String {
     let t = raw.trim();
-    let t = if t.len() > 7 && t[..7].eq_ignore_ascii_case("bearer ") { &t[7..] } else { t };
+    let t = if t.len() > 7 && t[..7].eq_ignore_ascii_case("bearer ") {
+        &t[7..]
+    } else {
+        t
+    };
     t.trim().to_string()
 }
 
@@ -763,7 +810,10 @@ fn live_rows(body: &serde_json::Value) -> Vec<FollowedLive> {
         if slug.is_empty() {
             continue;
         }
-        let live = item.get("is_live").and_then(|v| v.as_bool()).unwrap_or(false);
+        let live = item
+            .get("is_live")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let text = |key: &str| {
             item.get(key)
                 .and_then(|v| v.as_str())
@@ -806,7 +856,9 @@ fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
@@ -930,12 +982,20 @@ pub async fn history(
     if let Some(cursor) = cursor {
         url.push_str(&format!("?cursor={}", urlencode(cursor)));
     }
-    let res = paced(http.get(&url).header("Accept", "application/json"), Priority::Background).await.context("fetching the channel's history")?;
+    let res = paced(
+        http.get(&url).header("Accept", "application/json"),
+        Priority::Background,
+    )
+    .await
+    .context("fetching the channel's history")?;
     if !res.status().is_success() {
         bail!("Kick answered {} for that channel's history", res.status());
     }
     let envelope: HistoryEnvelope = res.json().await.context("reading the channel's history")?;
-    let page = envelope.data.unwrap_or(HistoryPage { messages: Vec::new(), cursor: None });
+    let page = envelope.data.unwrap_or(HistoryPage {
+        messages: Vec::new(),
+        cursor: None,
+    });
     // Kick has sent this as a number and as a string; both mean the same
     // thing to the next request.
     let cursor = match page.cursor {
@@ -977,7 +1037,12 @@ struct MeJson {
 /// popup asks: the day they started following, their badges here, and whether
 /// they are currently banned. Unauthenticated it answers the public half,
 /// which is why this takes an optional token rather than requiring one.
-pub async fn channel_user(http: &reqwest::Client, token: Option<&str>, slug: &str, username: &str) -> Result<serde_json::Value> {
+pub async fn channel_user(
+    http: &reqwest::Client,
+    token: Option<&str>,
+    slug: &str,
+    username: &str,
+) -> Result<serde_json::Value> {
     let encoded = url::form_urlencoded::byte_serialize(username.as_bytes()).collect::<String>();
     let mut request = http
         .get(format!("{API_ROOT}/api/v2/channels/{slug}/users/{encoded}"))
@@ -999,19 +1064,34 @@ pub async fn channel_user(http: &reqwest::Client, token: Option<&str>, slug: &st
 /// worth having in a chat client: it is what decides whether a channel is in
 /// the list this account syncs, so doing it here keeps that list somewhere a
 /// person can edit it.
-pub async fn set_following(http: &reqwest::Client, token: &str, slug: &str, follow: bool) -> Result<()> {
+pub async fn set_following(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    follow: bool,
+) -> Result<()> {
     let slug = normalise_slug(slug);
     if slug.is_empty() {
         bail!("that is not a Kick handle");
     }
     let url = format!("{API_ROOT}/api/v2/channels/{slug}/follow");
-    let request = if follow { http.post(&url) } else { http.delete(&url) };
+    let request = if follow {
+        http.post(&url)
+    } else {
+        http.delete(&url)
+    };
     let res = request
         .header("Accept", "application/json")
         .bearer_auth(token)
         .send()
         .await
-        .with_context(|| if follow { format!("following {slug}") } else { format!("unfollowing {slug}") })?;
+        .with_context(|| {
+            if follow {
+                format!("following {slug}")
+            } else {
+                format!("unfollowing {slug}")
+            }
+        })?;
 
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
@@ -1030,14 +1110,22 @@ pub async fn set_following(http: &reqwest::Client, token: &str, slug: &str, foll
 }
 
 pub async fn standing(http: &reqwest::Client, token: &str, slug: &str) -> Result<Standing> {
-    let res = paced(http.get(format!("{API_ROOT}/api/v2/channels/{slug}/me")).header("Accept", "application/json").bearer_auth(token), Priority::Background)
-        .await
-        .context("asking Kick about this account's standing in the channel")?;
+    let res = paced(
+        http.get(format!("{API_ROOT}/api/v2/channels/{slug}/me"))
+            .header("Accept", "application/json")
+            .bearer_auth(token),
+        Priority::Background,
+    )
+    .await
+    .context("asking Kick about this account's standing in the channel")?;
     if res.status() == reqwest::StatusCode::UNAUTHORIZED {
         bail!("Kick no longer accepts this sign-in - sign in again from Accounts");
     }
     if !res.status().is_success() {
-        bail!("Kick answered {} about this account's standing", res.status());
+        bail!(
+            "Kick answered {} about this account's standing",
+            res.status()
+        );
     }
     let me: MeJson = res.json().await.context("reading Kick's answer")?;
     Ok(Standing {
@@ -1075,21 +1163,42 @@ pub async fn ban(
     minutes: Option<u32>,
 ) -> Result<()> {
     let body = match minutes {
-        Some(duration) => serde_json::json!({ "banned_username": username, "duration": duration, "permanent": false }),
+        Some(duration) => {
+            serde_json::json!({ "banned_username": username, "duration": duration, "permanent": false })
+        }
         None => serde_json::json!({ "banned_username": username, "permanent": true }),
     };
-    moderate(http, token, reqwest::Method::POST, &format!("/api/v2/channels/{slug}/bans"), Some(body)).await
+    moderate(
+        http,
+        token,
+        reqwest::Method::POST,
+        &format!("/api/v2/channels/{slug}/bans"),
+        Some(body),
+    )
+    .await
 }
 
 pub async fn unban(http: &reqwest::Client, token: &str, slug: &str, username: &str) -> Result<()> {
-    moderate(http, token, reqwest::Method::DELETE, &format!("/api/v2/channels/{slug}/bans/{username}"), None).await
+    moderate(
+        http,
+        token,
+        reqwest::Method::DELETE,
+        &format!("/api/v2/channels/{slug}/bans/{username}"),
+        None,
+    )
+    .await
 }
 
 /// Takes one message down.
 ///
 /// Keyed by the chatroom rather than the channel, which is the same split the
 /// websocket uses: messages belong to the room, bans belong to the channel.
-pub async fn delete_message(http: &reqwest::Client, token: &str, chatroom_id: u64, message_id: &str) -> Result<()> {
+pub async fn delete_message(
+    http: &reqwest::Client,
+    token: &str,
+    chatroom_id: u64,
+    message_id: &str,
+) -> Result<()> {
     moderate(
         http,
         token,
@@ -1119,7 +1228,14 @@ pub async fn set_chat_mode(
         "slow_mode": slow_seconds.is_some(),
         "message_interval": slow_seconds.unwrap_or(0),
     });
-    moderate(http, token, reqwest::Method::PUT, &format!("/api/v2/channels/{slug}/chatroom"), Some(body)).await
+    moderate(
+        http,
+        token,
+        reqwest::Method::PUT,
+        &format!("/api/v2/channels/{slug}/chatroom"),
+        Some(body),
+    )
+    .await
 }
 
 /// One moderation request, with the CSRF token and Kick's own refusal.
@@ -1153,13 +1269,17 @@ async fn moderate(
         .json::<serde_json::Value>()
         .await
         .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .filter(|s| !s.is_empty());
     match detail {
         Some(message) => Err(anyhow!("{message}")),
-        None if status == reqwest::StatusCode::FORBIDDEN => {
-            Err(anyhow!("Kick refused - this account is not a moderator of that channel"))
-        }
+        None if status == reqwest::StatusCode::FORBIDDEN => Err(anyhow!(
+            "Kick refused - this account is not a moderator of that channel"
+        )),
         None => Err(anyhow!("Kick refused ({status})")),
     }
 }
@@ -1219,7 +1339,11 @@ pub async fn send_message(
         .json::<serde_json::Value>()
         .await
         .ok()
-        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_string))
+        .and_then(|v| {
+            v.get("message")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)
+        })
         .filter(|s| !s.is_empty());
     // Whatever went wrong, a refusal is a reason to stop trusting the CSRF
     // token: it costs one request to replace and a stale one fails every send
@@ -1232,12 +1356,12 @@ pub async fn send_message(
         // told to slow down is not being logged out, and telling somebody to
         // sign in again - which is what this used to say - sends them to
         // re-authorise an account that was never deauthorised.
-        None if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
-            Err(anyhow!("Kick is rate-limiting this account - wait a moment and send it again"))
-        }
-        None if status == reqwest::StatusCode::UNAUTHORIZED => {
-            Err(anyhow!("Kick no longer accepts this sign-in - sign in again from Accounts"))
-        }
+        None if status == reqwest::StatusCode::TOO_MANY_REQUESTS => Err(anyhow!(
+            "Kick is rate-limiting this account - wait a moment and send it again"
+        )),
+        None if status == reqwest::StatusCode::UNAUTHORIZED => Err(anyhow!(
+            "Kick no longer accepts this sign-in - sign in again from Accounts"
+        )),
         None => Err(anyhow!("Kick refused the message ({status})")),
     }
 }
@@ -1252,7 +1376,8 @@ pub async fn send_message(
 const XSRF_TTL: Duration = Duration::from_secs(600);
 
 /// The last CSRF token seen for a session, and when.
-static XSRF_CACHE: std::sync::Mutex<Option<(String, String, std::time::Instant)>> = std::sync::Mutex::new(None);
+static XSRF_CACHE: std::sync::Mutex<Option<(String, String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
 
 /// Throws the cached token away, so the next send goes and gets a fresh one.
 ///
@@ -1274,7 +1399,8 @@ async fn xsrf_token(http: &reqwest::Client, token: &str) -> Option<String> {
         }
     }
     let fresh = fetch_xsrf_token(http, token).await?;
-    *XSRF_CACHE.lock().unwrap() = Some((token.to_string(), fresh.clone(), std::time::Instant::now()));
+    *XSRF_CACHE.lock().unwrap() =
+        Some((token.to_string(), fresh.clone(), std::time::Instant::now()));
     Some(fresh)
 }
 
@@ -1283,7 +1409,12 @@ async fn fetch_xsrf_token(http: &reqwest::Client, token: &str) -> Option<String>
     // straight off the response rather than through a cookie jar - the session
     // itself travels as a bearer header, so a jar would exist for this one
     // value and hold a credential for the rest of the process's life.
-    let res = http.get(format!("{API_ROOT}/api/v1/user")).bearer_auth(token).send().await.ok()?;
+    let res = http
+        .get(format!("{API_ROOT}/api/v1/user"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
     let cookie = res
         .headers()
         .get_all(reqwest::header::SET_COOKIE)
@@ -1378,11 +1509,15 @@ mod tests {
             r#"{"status":{"code":400,"message":"User has already voted","error":true},"data":null}"#,
         )
         .expect("parse");
-        assert_eq!(refused.complaint(), Some((400, "User has already voted".to_string())));
+        assert_eq!(
+            refused.complaint(),
+            Some((400, "User has already voted".to_string()))
+        );
 
-        let empty: PollEnvelope =
-            serde_json::from_str(r#"{"status":{"code":404,"message":"Poll not found","error":true},"data":null}"#)
-                .expect("parse");
+        let empty: PollEnvelope = serde_json::from_str(
+            r#"{"status":{"code":404,"message":"Poll not found","error":true},"data":null}"#,
+        )
+        .expect("parse");
         assert_eq!(empty.complaint().map(|(code, _)| code), Some(404));
 
         let fine: PollEnvelope = serde_json::from_str(
@@ -1426,7 +1561,16 @@ mod tests {
         // escaped: a "handle" containing a slash or a space is somebody
         // pasting the wrong thing, and guessing at what they meant is how a
         // client ends up requesting a path it was never given.
-        for input in ["", "  ", "@", "https://kick.com/", "not a handle", "x;y", "../admin", "a b"] {
+        for input in [
+            "",
+            "  ",
+            "@",
+            "https://kick.com/",
+            "not a handle",
+            "x;y",
+            "../admin",
+            "a b",
+        ] {
             assert_eq!(normalise_slug(input), "", "for {input:?}");
         }
     }
@@ -1470,11 +1614,23 @@ mod tests {
 
     #[test]
     fn finds_where_the_next_page_starts() {
-        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": "abc" })).as_deref(), Some("abc"));
-        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": 20 })).as_deref(), Some("20"));
-        assert_eq!(next_cursor(&serde_json::json!({ "next_cursor": "abc" })).as_deref(), Some("abc"));
+        assert_eq!(
+            next_cursor(&serde_json::json!({ "nextCursor": "abc" })).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            next_cursor(&serde_json::json!({ "nextCursor": 20 })).as_deref(),
+            Some("20")
+        );
+        assert_eq!(
+            next_cursor(&serde_json::json!({ "next_cursor": "abc" })).as_deref(),
+            Some("abc")
+        );
         // The end of the list, in each of the ways it is said.
-        assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": null })), None);
+        assert_eq!(
+            next_cursor(&serde_json::json!({ "nextCursor": null })),
+            None
+        );
         assert_eq!(next_cursor(&serde_json::json!({ "nextCursor": "" })), None);
         assert_eq!(next_cursor(&serde_json::json!({ "channels": [] })), None);
     }
@@ -1578,7 +1734,11 @@ impl PollEnvelope {
     fn complaint(&self) -> Option<(u32, String)> {
         let status = self.status.as_ref().filter(|s| s.error)?;
         let said = status.message.trim();
-        let words = if said.is_empty() { "Kick would not do that".to_string() } else { said.to_string() };
+        let words = if said.is_empty() {
+            "Kick would not do that".to_string()
+        } else {
+            said.to_string()
+        };
         Some((status.code, words))
     }
 }
@@ -1604,11 +1764,17 @@ pub async fn poll(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Re
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         req = req.bearer_auth(token);
     }
-    let res = req.send().await.context("asking Kick about this channel's poll")?;
+    let res = req
+        .send()
+        .await
+        .context("asking Kick about this channel's poll")?;
     if !res.status().is_success() {
         bail!("Kick answered {} about this channel's poll", res.status());
     }
-    let body: PollEnvelope = res.json().await.context("reading Kick's answer about the poll")?;
+    let body: PollEnvelope = res
+        .json()
+        .await
+        .context("reading Kick's answer about the poll")?;
     match body.complaint() {
         // "Poll not found" is the ordinary answer for a channel with nothing
         // running, and not a failure to report.
@@ -1618,7 +1784,12 @@ pub async fn poll(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Re
 }
 
 /// Votes for one option, and reads back the poll that vote landed in.
-pub async fn vote_poll(http: &reqwest::Client, token: &str, slug: &str, option_id: i64) -> Result<Poll> {
+pub async fn vote_poll(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    option_id: i64,
+) -> Result<Poll> {
     let res = http
         .post(format!("{API_ROOT}/api/v2/channels/{slug}/polls/vote"))
         .header("Accept", "application/json")
@@ -1633,7 +1804,10 @@ pub async fn vote_poll(http: &reqwest::Client, token: &str, slug: &str, option_i
     if !res.status().is_success() {
         bail!("Kick would not take that vote ({})", res.status());
     }
-    let body: PollEnvelope = res.json().await.context("reading Kick's answer to the vote")?;
+    let body: PollEnvelope = res
+        .json()
+        .await
+        .context("reading Kick's answer to the vote")?;
     if let Some((_, said)) = body.complaint() {
         bail!("{said}");
     }
@@ -1652,7 +1826,9 @@ pub async fn delete_poll(http: &reqwest::Client, token: &str, slug: &str) -> Res
         .send()
         .await
         .context("asking Kick to end the poll")?;
-    if res.status() == reqwest::StatusCode::UNAUTHORIZED || res.status() == reqwest::StatusCode::FORBIDDEN {
+    if res.status() == reqwest::StatusCode::UNAUTHORIZED
+        || res.status() == reqwest::StatusCode::FORBIDDEN
+    {
         bail!("only the streamer and their moderators can end a poll");
     }
     if !res.status().is_success() {
@@ -1740,8 +1916,16 @@ pub async fn prediction_latest(
     token: Option<&str>,
     slug: &str,
 ) -> Result<Option<(Prediction, Option<PredictionVote>)>> {
-    let body = prediction_call(http, token, &format!("/api/v2/channels/{slug}/predictions/latest"), None).await?;
-    Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
+    let body = prediction_call(
+        http,
+        token,
+        &format!("/api/v2/channels/{slug}/predictions/latest"),
+        None,
+    )
+    .await?;
+    Ok(body
+        .data
+        .and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
 }
 
 /// Puts points on an outcome.
@@ -1767,7 +1951,9 @@ pub async fn vote_prediction(
         Some(payload),
     )
     .await?;
-    Ok(body.data.and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
+    Ok(body
+        .data
+        .and_then(|d| d.prediction.map(|p| (p, d.user_vote))))
 }
 
 /// What a channel currently has pinned above its chat.
@@ -1781,7 +1967,11 @@ pub async fn vote_prediction(
 /// The response is handed back raw. Kick documents none of this and the
 /// wrapping has moved before; `pins::read` looks for the message at every
 /// depth it has been seen at rather than committing this signature to one.
-pub async fn pinned_message(http: &reqwest::Client, token: Option<&str>, slug: &str) -> Result<serde_json::Value> {
+pub async fn pinned_message(
+    http: &reqwest::Client,
+    token: Option<&str>,
+    slug: &str,
+) -> Result<serde_json::Value> {
     let mut req = http
         .get(format!("{API_ROOT}/api/v2/channels/{slug}/pinned-message"))
         .header("Accept", "application/json");
@@ -1792,7 +1982,9 @@ pub async fn pinned_message(http: &reqwest::Client, token: Option<&str>, slug: &
     if !res.status().is_success() {
         bail!("Kick answered {} about the pinned message", res.status());
     }
-    res.json().await.context("reading Kick's answer about the pinned message")
+    res.json()
+        .await
+        .context("reading Kick's answer about the pinned message")
 }
 
 /// The smallest bet Kick accepts, which its own form enforces.
@@ -1817,7 +2009,9 @@ pub async fn own_user_id(http: &reqwest::Client, token: &str) -> Result<u64> {
         bail!("Kick answered {} about this account", res.status());
     }
     let body: serde_json::Value = res.json().await.context("reading Kick's answer")?;
-    body["id"].as_u64().context("Kick named no id for this account")
+    body["id"]
+        .as_u64()
+        .context("Kick named no id for this account")
 }
 
 /// This account's channel points in a channel, which is what a bet spends.
@@ -1832,7 +2026,10 @@ pub async fn points(http: &reqwest::Client, token: &str, slug: &str) -> Result<i
     if !res.status().is_success() {
         bail!("Kick answered {} about this account's points", res.status());
     }
-    let body: PointsEnvelope = res.json().await.context("reading Kick's answer about points")?;
+    let body: PointsEnvelope = res
+        .json()
+        .await
+        .context("reading Kick's answer about points")?;
     Ok(body.data.map(|d| d.points as i64).unwrap_or_default())
 }
 
@@ -1853,7 +2050,10 @@ async fn prediction_call(
     if let Some(token) = token.filter(|t| !t.is_empty()) {
         req = req.bearer_auth(token);
     }
-    let res = req.send().await.context("asking Kick about the prediction")?;
+    let res = req
+        .send()
+        .await
+        .context("asking Kick about the prediction")?;
     let status = res.status();
     if status == reqwest::StatusCode::UNAUTHORIZED {
         bail!("sign in to Kick from Accounts to bet on predictions");
@@ -1863,7 +2063,10 @@ async fn prediction_call(
     if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(PredictionEnvelope { data: None });
     }
-    let text = res.text().await.context("reading Kick's answer about the prediction")?;
+    let text = res
+        .text()
+        .await
+        .context("reading Kick's answer about the prediction")?;
     if !status.is_success() {
         // Kick words these well - "not enough points", "prediction is locked"
         // - and its own words beat a status code every time.
@@ -1940,9 +2143,15 @@ pub async fn rewards(http: &reqwest::Client, slug: &str) -> Result<Vec<Reward>> 
         .await
         .context("asking Kick what this channel offers")?;
     if !res.status().is_success() {
-        bail!("Kick answered {} about this channel's rewards", res.status());
+        bail!(
+            "Kick answered {} about this channel's rewards",
+            res.status()
+        );
     }
-    let body: RewardsEnvelope = res.json().await.context("reading Kick's answer about rewards")?;
+    let body: RewardsEnvelope = res
+        .json()
+        .await
+        .context("reading Kick's answer about rewards")?;
     Ok(body
         .data
         .into_iter()
@@ -2008,7 +2217,9 @@ mod pacing_tests {
         let count = seen.clone();
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 let n = count.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 1024];
@@ -2054,8 +2265,15 @@ mod pacing_tests {
             t.await.unwrap();
         }
         background.await.unwrap();
-        assert!(started.elapsed() >= SPACING * 2, "three lookups, at least two gaps");
-        assert_eq!(order.lock().unwrap().last(), Some(&99), "background went after the chat lookups");
+        assert!(
+            started.elapsed() >= SPACING * 2,
+            "three lookups, at least two gaps"
+        );
+        assert_eq!(
+            order.lock().unwrap().last(),
+            Some(&99),
+            "background went after the chat lookups"
+        );
     }
 
     /// One refusal holds back every request, not just the one refused - and
@@ -2068,16 +2286,27 @@ mod pacing_tests {
 
         let first = paced(http.get(&url), Priority::Chat).await.unwrap();
         assert_eq!(first.status(), 200, "asked again after the wait");
-        assert!(started.elapsed() >= Duration::from_secs(1), "waited as long as Retry-After said");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "waited as long as Retry-After said"
+        );
 
         // A second caller arriving while the pause is still in force waits it
         // out too, instead of being refused on its own.
-        *not_before().lock().unwrap() = Some(tokio::time::Instant::now() + Duration::from_millis(400));
+        *not_before().lock().unwrap() =
+            Some(tokio::time::Instant::now() + Duration::from_millis(400));
         let before = tokio::time::Instant::now();
         let second = paced(http.get(&url), Priority::Chat).await.unwrap();
         assert_eq!(second.status(), 200);
-        assert!(before.elapsed() >= Duration::from_millis(400), "the shared pause held it back");
-        assert_eq!(seen.load(Ordering::SeqCst), 3, "one refusal, then one request each");
+        assert!(
+            before.elapsed() >= Duration::from_millis(400),
+            "the shared pause held it back"
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            3,
+            "one refusal, then one request each"
+        );
     }
 }
 
@@ -2091,7 +2320,11 @@ mod redeem_guard_tests {
     fn a_transaction_id_is_a_ulid() {
         let id = transaction_id();
         assert_eq!(id.len(), 26, "{id}");
-        assert!(id.bytes().all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)), "{id}");
+        assert!(
+            id.bytes()
+                .all(|c| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&c)),
+            "{id}"
+        );
         // No I, L, O or U - that is the point of Crockford's alphabet.
         assert!(!id.bytes().any(|c| b"ILOU".contains(&c)), "{id}");
     }
@@ -2150,9 +2383,16 @@ pub fn transaction_id() -> String {
 /// the half that says *why* - not enough points, the reward is paused,
 /// already redeemed too recently - and a generic failure would send somebody
 /// looking for a reason this already has.
-pub async fn redeem(http: &reqwest::Client, token: &str, slug: &str, reward_id: &str) -> Result<()> {
+pub async fn redeem(
+    http: &reqwest::Client,
+    token: &str,
+    slug: &str,
+    reward_id: &str,
+) -> Result<()> {
     let res = http
-        .post(format!("{API_ROOT}/api/v2/channels/{slug}/rewards/{reward_id}/redeem"))
+        .post(format!(
+            "{API_ROOT}/api/v2/channels/{slug}/rewards/{reward_id}/redeem"
+        ))
         .header("Accept", "application/json")
         .bearer_auth(token)
         .json(&serde_json::json!({ "transaction_id": transaction_id() }))
