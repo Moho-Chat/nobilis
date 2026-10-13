@@ -3491,3 +3491,63 @@ async fn a_picture_is_sent_into_a_group_plain_and_as_a_spoiler() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// A sticker sent into a room of a group by an account that owns some. Sends one real message in the
+/// group `MOHO_TEST_GROUP` (78995476 by default), and nothing else.
+#[tokio::test]
+#[ignore = "needs a real Steam account that owns a sticker and a group it is in; sends one real message"]
+async fn a_sticker_is_sent_into_a_group() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-group-sticker");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || {
+        state.runtime.conn_state(&id) == Some(ConnState::Connected)
+    })
+    .await;
+    within(30, "the emoticon and sticker lists", || {
+        state.runtime.emoji_catalogue(&id).len() == 2
+    })
+    .await;
+    let owned: Vec<String> = state
+        .runtime
+        .emoji_catalogue(&id)
+        .iter()
+        .filter(|s| s.id == super::emoticons::STICKERS)
+        .flat_map(|s| s.emoji.iter().map(|e| e.name.clone()))
+        .collect();
+    println!("STICKER owned {} {:?}", owned.len(), owned.iter().take(5).collect::<Vec<_>>());
+    let name = owned
+        .iter()
+        .find(|n| n.as_str() == "Keyboard Headcrab")
+        .or(owned.first())
+        .cloned()
+        .expect("a sticker the account owns");
+    let group = std::env::var("MOHO_TEST_GROUP").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(78995476);
+    let mut room = None;
+    for _ in 0..60 {
+        room = state
+            .runtime
+            .list_buffers()
+            .into_iter()
+            .filter(|b| b.account_id == id && b.name.ends_with("/#General"))
+            .find(|b| super::chatgroups::ids_of(b).map(|(g, _)| g) == Some(group));
+        if room.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let room = room.expect("the group's General room");
+    println!("STICKER sending {name:?} into {}", room.name);
+    println!("STICKER sent -> {:?}", super::send_message(&state, &room, &format!("/sticker {name}")).await);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for m in state.store.get_backlog(&room.id, 0, 100).unwrap_or_default().iter().rev().take(2) {
+        println!("STICKER in the log: {:?} from {:?}: {:?}", m.id, m.from, m.body);
+    }
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
