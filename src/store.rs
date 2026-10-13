@@ -650,6 +650,8 @@ impl Store {
             "UPDATE OR IGNORE messages SET buffer_id = ?2 WHERE buffer_id = ?1",
             params![old_id, new_id],
         )?;
+        // A warning on the conversation goes with it.
+        conn.execute("UPDATE OR IGNORE buffer_notices SET buffer_id = ?2 WHERE buffer_id = ?1", params![old_id, new_id])?;
         Ok(moved)
     }
 

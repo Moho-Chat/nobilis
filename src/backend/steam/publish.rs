@@ -91,6 +91,8 @@ impl Conversations {
                 state.runtime.rename_buffer(state, &self.account_id, &old, &name, "dm");
             }
             let buffer = state.runtime.ensure_buffer(state, &self.account_id, &name, "dm");
+            // Made new, or renamed from its number: a warning on it comes back.
+            super::notices::restore_buffer(state, &self.account_id, &buffer.id);
             state.runtime.set_buffer_remote_id(state, &buffer.id, &steamid::text_of(account));
             if let Some(url) = &avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
@@ -199,6 +201,26 @@ mod tests {
         fresh.apply_persona(&update(vec![who(22202, "Gabriel", 1)]));
         shown.publish(&state, &fresh);
         assert_eq!(shown.name_of(22202), Some("Gabriel"));
+    }
+
+    #[test]
+    fn a_warning_survives_the_conversation_being_renamed_from_its_number() {
+        let state = simulated_daemon("steam-publish-warning-rename");
+        // As the last run left it: known by its number, with a warning said in it.
+        let number = steamid::text_of(22202);
+        state.runtime.record_message_at(&state, ACCOUNT, &number, "dm", "Steam", "Steam warns that this person may not be who they appear to be.", false, "system", None, Some(crate::backend::steam::notices::notice_id(22202, 1)), false, None, vec![], vec![], None, None, None, None);
+        let mut shown = Conversations::new(ACCOUNT);
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&friends(&[22202]));
+        shown.adopt(&state, ACCOUNT);
+        shown.publish(&state, &roster);
+        crate::backend::steam::notices::restore(&state, ACCOUNT);
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, &number)).unwrap().notice.is_some());
+        // Steam says who it is: the conversation becomes Gabe, and the banner is on it.
+        roster.apply_persona(&update(vec![who(22202, "Gabe", 1)]));
+        shown.publish(&state, &roster);
+        let gabe = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).expect("renamed");
+        assert!(gabe.notice.is_some(), "the banner is still up on the renamed conversation");
     }
 
     #[test]

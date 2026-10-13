@@ -63,8 +63,22 @@ pub fn notice_id(friend: u32, notice_type: i32) -> String {
 /// not seen would otherwise be gone with the restart. A warning that was said in
 /// the log before anything recorded it is one nobody dismissed, and is shown.
 pub fn restore(state: &AppState, account_id: &str) {
+    show_pending(state, account_id, None);
+}
+
+/// The same for one conversation, for the moment it is made or renamed: a
+/// conversation known by its number at the start is renamed when Steam says
+/// what it is called, and the new one has nothing on it until this is said again.
+pub fn restore_buffer(state: &AppState, account_id: &str, buffer_id: &str) {
+    show_pending(state, account_id, Some(buffer_id));
+}
+
+fn show_pending(state: &AppState, account_id: &str, only: Option<&str>) {
     let Ok(held) = state.store.account_notices(account_id) else { return };
     for (buffer, id, recorded) in held {
+        if only.is_some_and(|only| only != buffer) {
+            continue;
+        }
         let kind = id.rsplit(':').next().and_then(|t| t.parse::<i32>().ok()).unwrap_or(SUSPICIOUS);
         let Some(text) = words(kind) else { continue };
         match recorded.as_deref() {
