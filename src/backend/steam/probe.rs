@@ -584,3 +584,24 @@ async fn steam_says_whether_an_account_may_upload() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Prints the newest messages of a conversation as Steam holds them, tags and
+/// all, for finding out how it writes something nothing has described.
+#[tokio::test]
+#[ignore = "needs a real Steam account and its friend; sends nothing"]
+async fn the_newest_messages_as_steam_writes_them() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam::history=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-raw");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 8).await;
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

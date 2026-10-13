@@ -42,6 +42,13 @@ fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
         },
         "emoticon" => picture("emote", inner).unwrap_or_else(|| inner.to_string()),
         "sticker" => picture("sticker", inner).unwrap_or_else(|| inner.to_string()),
+        // What Steam writes for a file sent through its website: the address
+        // as an attribute, and again as a link inside, which is not read. A
+        // marker the window draws as the picture or video it names.
+        "img" | "video" | "looping_media" if attr.and_then(|a| attribute(a, "src")).is_some_and(is_web) => {
+            let kind = if tag == "img" { "image" } else { "video" };
+            format!("\n[steam:{kind}:{}]\n", attr.and_then(|a| attribute(a, "src")).unwrap_or_default())
+        }
         // A picture is its address, which is what the link previews read.
         "img" | "docimg" => format!("\n{}\n", inner.trim()),
         "p" => format!("{inner}\n"),
@@ -80,17 +87,6 @@ fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
         from = start + 1;
     }
     None
-}
-
-/// A picture or video written with its address as an attribute - what Steam
-/// makes of a file sent through its website - read as that address on a line
-/// of its own, which is what the link previews read.
-fn media_address(tag: &Tag<'_>) -> Option<String> {
-    matches!(tag.name.as_str(), "img" | "video" | "looping_media")
-        .then(|| tag.attr.and_then(|a| attribute(a, "src")))
-        .flatten()
-        .filter(|u| is_web(u))
-        .map(str::to_string)
 }
 
 fn is_web(url: &str) -> bool {
@@ -197,20 +193,6 @@ pub fn to_markup(bbcode: &str) -> String {
                 } else if !tag.closing && tag.name == "*" {
                     out!().push_str("\n• ");
                     i += tag.len;
-                    continue;
-                } else if let (false, Some(address)) = (tag.closing, media_address(&tag)) {
-                    out!().push_str(&format!("\n{address}\n"));
-                    i += tag.len;
-                    // Steam writes the address again after the tag, as the
-                    // text the tag stands in for.
-                    if bytes[i..].starts_with(address.as_str()) {
-                        i += address.len();
-                    }
-                    // Its own close, if it was written with one, says nothing more.
-                    let close = format!("[/{}]", tag.name);
-                    if bytes[i..].to_ascii_lowercase().starts_with(&close) {
-                        i += close.len();
-                    }
                     continue;
                 } else if !tag.closing && !RAW.contains(&tag.name.as_str()) {
                     stack.push(Open { tag: tag.name, attr: tag.attr.map(str::to_string), literal: rest[..tag.len].to_string(), out: String::new() });
@@ -350,14 +332,16 @@ mod tests {
         assert_eq!(to_markup("[roomeffect]fireworks[/roomeffect]hello"), "hello");
         assert_eq!(to_markup("a[hr]b"), "a\nb");
         assert_eq!(to_markup("[img]https://example.com/a.png[/img]"), "https://example.com/a.png");
-        assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" height=\"64\"][/img]"), "https://x.test/ugc/1/");
-        assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" /]"), "https://x.test/ugc/1/", "with no close at all");
-        assert_eq!(to_markup("[spoiler][img src=\"https://x.test/ugc/1/\"][/img][/spoiler]"), "||\nhttps://x.test/ugc/1/\n||");
-        let sent = "[img src=https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/ thumbnail_src=https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/ srcset=\"\" width=479 height=450]https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/";
-        assert_eq!(to_markup(sent), "https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/", "as Steam wrote a real one: unquoted, long, and its address again after it");
-        assert_eq!(to_markup(&format!("{sent}[/img]")), to_markup(sent));
-        assert_eq!(to_markup(&format!("[spoiler]{sent}[/spoiler]")), format!("||\n{}\n||", to_markup(sent)));
-        assert_eq!(to_markup("[video src=\"https://x.test/v.webm\" controls=\"1\"][/video]"), "https://x.test/v.webm");
+        let ugc = "https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/";
+        let video = "https://cdn.steamusercontent.com/ugc/9279387166147417773/0642C6E9889E1C2419DD7F85743538C67DD8CA36/";
+        // As Steam writes them: the address unquoted, long, and again inside as a link.
+        let picture = format!("[img src={ugc} thumbnail_src={ugc} srcset=\"\" width=479 height=450][url={ugc}]{ugc}[/url][/img]");
+        assert_eq!(to_markup(&picture), format!("[steam:image:{ugc}]"));
+        let clip = format!("[video src={video} type=video/webm steamvideo=true][url={video}]{video}[/url][/video]");
+        assert_eq!(to_markup(&clip), format!("[steam:video:{video}]"));
+        assert_eq!(to_markup(&format!("[spoiler]{clip}[/spoiler]")), format!("||\n[steam:video:{video}]\n||"), "hidden, as the sender chose");
+        assert_eq!(to_markup(&format!("look {picture} nice")), format!("look \n[steam:image:{ugc}]\n nice"));
+        assert_eq!(to_markup("[img src=\"https://x.test/a.png\" width=\"9\"][/img]"), "[steam:image:https://x.test/a.png]", "quoted too");
     }
 
     #[test]
