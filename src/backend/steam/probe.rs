@@ -666,3 +666,55 @@ async fn links_are_stored_by_steam_as_these() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Our own presence against real Steam, through the same calls the window makes:
+/// the account is set Online, Idle, Invisible and Online, then moved to idle
+/// and back by the idle detection. Prints a marker at each step, so another
+/// session can be watched for what it sees. Nothing is sent to anyone.
+#[tokio::test]
+#[ignore = "needs a real Steam account; changes only its presence; takes a minute"]
+async fn our_presence_is_set_and_idle_detection_moves_it() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-presence");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let subscriptions: crate::rpc::Subscriptions = Default::default();
+    let call = |method: &'static str, params: serde_json::Value| {
+        let (state, subscriptions) = (state.clone(), &subscriptions);
+        async move { crate::rpc::methods::dispatch(&state, method, &params, subscriptions).await }
+    };
+    let wait = std::env::var("MOHO_STEP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(10u64);
+    let stamp = |what: &str| println!("STEP {} {what}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() % 86400);
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    for status in ["online", "idle", "invisible", "online"] {
+        stamp(&format!("set {status}"));
+        let (result, error) = call("setAccountStatus", serde_json::json!({ "accountId": id, "status": status })).await;
+        println!("  -> {result:?} {error:?}");
+        tokio::time::sleep(Duration::from_secs(wait)).await;
+    }
+    stamp("idle detection: the person has been away");
+    let (result, error) = call("setUserIdle", serde_json::json!({ "idle": true })).await;
+    println!("  -> {result:?} {error:?}");
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    stamp("idle detection: the person is back");
+    let (result, error) = call("setUserIdle", serde_json::json!({ "idle": false })).await;
+    println!("  -> {result:?} {error:?}");
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    // And a status chosen by the person is not moved by being away.
+    stamp("set invisible, then away: should stay invisible");
+    let _ = call("setAccountStatus", serde_json::json!({ "accountId": id, "status": "invisible" })).await;
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    let _ = call("setUserIdle", serde_json::json!({ "idle": true })).await;
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    let _ = call("setUserIdle", serde_json::json!({ "idle": false })).await;
+    let _ = call("setAccountStatus", serde_json::json!({ "accountId": id, "status": "online" })).await;
+    stamp("back online; done");
+    tokio::time::sleep(Duration::from_secs(wait)).await;
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
