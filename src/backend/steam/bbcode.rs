@@ -74,7 +74,7 @@ fn attribute<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
         if boundary {
             return Some(match value.strip_prefix('"') {
                 Some(quoted) => quoted.split('"').next().unwrap_or_default(),
-                None => value.split(|c: char| c.is_whitespace() || c == '/' || c == ']').next().unwrap_or_default(),
+                None => value.split_whitespace().next().unwrap_or_default(),
             });
         }
         from = start + 1;
@@ -118,7 +118,9 @@ struct Tag<'a> {
 fn read_tag(s: &str) -> Option<Tag<'_>> {
     let rest = s.strip_prefix('[')?;
     let end = rest.find(']')?;
-    if end > 200 {
+    // Long enough for a picture's tag, which carries its address twice and
+    // its size.
+    if end > 1000 {
         return None;
     }
     let inside = &rest[..end];
@@ -199,6 +201,11 @@ pub fn to_markup(bbcode: &str) -> String {
                 } else if let (false, Some(address)) = (tag.closing, media_address(&tag)) {
                     out!().push_str(&format!("\n{address}\n"));
                     i += tag.len;
+                    // Steam writes the address again after the tag, as the
+                    // text the tag stands in for.
+                    if bytes[i..].starts_with(address.as_str()) {
+                        i += address.len();
+                    }
                     // Its own close, if it was written with one, says nothing more.
                     let close = format!("[/{}]", tag.name);
                     if bytes[i..].to_ascii_lowercase().starts_with(&close) {
@@ -346,6 +353,10 @@ mod tests {
         assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" height=\"64\"][/img]"), "https://x.test/ugc/1/");
         assert_eq!(to_markup("[img src=\"https://x.test/ugc/1/\" width=\"96\" /]"), "https://x.test/ugc/1/", "with no close at all");
         assert_eq!(to_markup("[spoiler][img src=\"https://x.test/ugc/1/\"][/img][/spoiler]"), "||\nhttps://x.test/ugc/1/\n||");
+        let sent = "[img src=https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/ thumbnail_src=https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/ srcset=\"\" width=479 height=450]https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/";
+        assert_eq!(to_markup(sent), "https://images.steamusercontent.com/ugc/1269778906054997137/522C3130A7C6AE1FC52CB49820609316A34ECD01/", "as Steam wrote a real one: unquoted, long, and its address again after it");
+        assert_eq!(to_markup(&format!("{sent}[/img]")), to_markup(sent));
+        assert_eq!(to_markup(&format!("[spoiler]{sent}[/spoiler]")), format!("||\n{}\n||", to_markup(sent)));
         assert_eq!(to_markup("[video src=\"https://x.test/v.webm\" controls=\"1\"][/video]"), "https://x.test/v.webm");
     }
 
