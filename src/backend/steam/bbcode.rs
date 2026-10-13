@@ -56,7 +56,8 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         "og" => match attr.and_then(|a| attribute(a, "url")).filter(|u| is_web(u)) {
             Some(url) => {
                 let field = |name: &str| attr.and_then(|a| attribute(a, name)).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
-                cards.push(Embed { url: Some(url.to_string()), title: field("title"), description: field("desc"), provider: host_of(url), ..Default::default() });
+                let image_url = field("img").filter(|i| is_web(i));
+                cards.push(Embed { url: Some(url.to_string()), title: field("title"), description: field("desc"), provider: host_of(url), image_url, ..Default::default() });
                 let words = inner.trim();
                 if words.is_empty() || words == url { url.to_string() } else { format!("[{}]({url})", words.replace(']', "\\]")) }
             }
@@ -426,6 +427,10 @@ mod tests {
         let more = render_message("see [og url=\"https://www.example.com/a?b=1\" title=\"T\"]https://www.example.com/a?b=1[/og] ok");
         assert_eq!(more.text, "see https://www.example.com/a?b=1 ok");
         assert_eq!((more.cards[0].provider.as_deref(), more.cards[0].description.as_deref()), (Some("example.com"), None), "no leading www, and no description invented");
+        // A picture on the card, where the page has one.
+        let pictured = render_message("[og url=\"https://x.test/p\" img=\"https://community.steamstatic.com/chat/image/abc/share_image\" title=\"T\" desc=\"D\"]https://x.test/p[/og]");
+        assert_eq!(pictured.cards[0].image_url.as_deref(), Some("https://community.steamstatic.com/chat/image/abc/share_image"));
+        assert_eq!(pictured.text, "https://x.test/p");
         // Not a web address: nothing to make a card of.
         assert!(render_message("[og url=\"javascript:alert(1)\" title=\"x\"]words[/og]").cards.is_empty());
         assert_eq!(to_markup("[og title=\"x\"]just words[/og]"), "just words");

@@ -91,7 +91,7 @@ pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body:
         Some(sent.id),
         false,
         None,
-        Vec::new(),
+        sent.embeds,
         Vec::new(),
         None,
         Some(i64::from(sent.timestamp)).filter(|t| *t > 0),

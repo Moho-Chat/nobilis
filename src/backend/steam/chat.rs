@@ -157,7 +157,8 @@ pub async fn send(link: &Link, recipient: &str, text: &str) -> Result<Sent, Stri
     // What Steam stored, which is the text with its emoticons found: ":steamhappy:"
     // comes back as a tag, and the log should hold what the other side will see.
     let said = response.modified_message.as_deref().filter(|m| !m.trim().is_empty()).unwrap_or(text);
-    Ok(Sent { id: message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp, shown: super::bbcode::to_markup(said) })
+    let rendered = super::bbcode::render_message(said);
+    Ok(Sent { id: message_id(timestamp, response.ordinal.unwrap_or_default()), timestamp, shown: rendered.text, embeds: rendered.cards })
 }
 
 /// A message that Steam took.
@@ -169,6 +170,9 @@ pub struct Sent {
     pub timestamp: u32,
     /// What to put in the log: the message as moho draws it.
     pub shown: String,
+    /// The cards Steam made of any links in it, which the sender's own copy
+    /// holds as the other side's does.
+    pub embeds: Vec<crate::model::Embed>,
 }
 
 /// What a typing notice is, in `chat_entry_type`.
@@ -430,6 +434,22 @@ mod tests {
         assert_eq!(body.message.as_deref(), Some("hi [b]there[/b] :steamhappy:"), "trailing space is dropped; the tags are sent as they came");
         assert_eq!((body.chat_entry_type, body.contains_bbcode), (Some(1), Some(true)));
         assert_eq!(body.client_message_id.as_deref().map(str::len), Some(16));
+    }
+
+    #[tokio::test]
+    async fn a_link_sent_keeps_the_card_steam_made_of_it() {
+        let url = serve(Box::new(|req| {
+            let stored = "[og url=\"https://x.test/p\" img=\"https://community.steamstatic.com/chat/image/a/share_image\" title=\"A page\" desc=\"About it\"]https://x.test/p[/og]";
+            Some(vec![answer(&req, 1, FriendMessagesSendResponse { modified_message: Some(stored.into()), server_timestamp: Some(1790000004), ordinal: Some(0), message_without_bb_code: None }.encode_to_vec())])
+        }))
+        .await;
+        let (link, _told) = link::open("steam:test", &url).await.unwrap();
+        link.set_identity(link::Identity { steamid: 76561197960287930, session: 4 });
+        let sent = send(&link, "76561197960265729", "https://x.test/p").await.unwrap();
+        assert_eq!(sent.shown, "https://x.test/p", "the words are what was sent");
+        assert_eq!(sent.embeds.len(), 1, "and the card is the sender's too");
+        assert_eq!((sent.embeds[0].title.as_deref(), sent.embeds[0].description.as_deref()), (Some("A page"), Some("About it")));
+        assert!(sent.embeds[0].image_url.is_some());
     }
 
     #[tokio::test]

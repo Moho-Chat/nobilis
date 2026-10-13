@@ -655,13 +655,11 @@ async fn links_are_stored_by_steam_as_these() {
     within(60, "the friend", || state.runtime.list_buffers().iter().any(|b| b.account_id == id && b.remote_id.as_deref() == Some(&receiver.steamid.to_string()))).await;
     let link = state.runtime.steam_link(&id).unwrap();
     for text in [
-        "https://salastil.com",
-        "look: http://x.salastil.com/path?a=1&b=2 and www.example.com too",
         "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
-        "no scheme: x.salastil.com",
+        "https://x.salastil.com/nico_avchd/status/2109815235469082675#m",
     ] {
         println!("SENT {text:?} -> {:?}", super::chat::send(&link, &receiver.steamid.to_string(), text).await.map(|s| s.shown));
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        tokio::time::sleep(Duration::from_secs(20)).await;
     }
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
