@@ -124,7 +124,7 @@ CASES = {
         refresh_tokens=[dict(token_id=5, token_description="phone", platform_type=3)], requesting_token=5)),
     "RevokeRefreshTokenRequest": (auth.CAuthentication_RefreshToken_Revoke_Request, dict(token_id=2**40 + 3, steamid=ID)),
     "RevokeRefreshTokenResponse": (auth.CAuthentication_RefreshToken_Revoke_Response, dict()),
-    "ChatRoomState": (chat.CChatRoomState, dict(chat_id=8589934593, chat_name='s2', voice_allowed=True, time_last_message=12, sort_order=13, last_message='s7', accountid_last_message=15)),
+    "ChatRoomState": (chat.CChatRoomState, dict(chat_id=8589934593, chat_name='s2', voice_allowed=True, members_in_voice=[7, 9], time_last_message=12, sort_order=13, last_message='s7', accountid_last_message=15)),
     "ChatRoomMember": (chat.CChatRoomMember, dict(accountid=8, state=2, rank=20, time_kick_expire=13, role_ids=[8589934599, 8589934600])),
     "ChatRole": (chat.CChatRole, dict(role_id=8589934593, name='s2', ordinal=10)),
     "ChatRoomGroupHeaderState": (chat.CChatRoomGroupHeaderState, dict(chat_group_id=8589934593, chat_name='s2', clanid=20, accountid_owner=21, tagline='s15', avatar_sha=b'\x01\x02\x03', default_role_id=8589934609, roles=[dict(role_id=8589934593, name='s2', ordinal=10)], role_actions=[dict(role_id=8589934593, can_chat=True)], avatar_ugc_url='s25', disabled=True)),

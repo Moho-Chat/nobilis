@@ -1048,7 +1048,7 @@ async fn a_chat_group_is_made_used_and_left() {
         println!("E2E delete {:?}", groups::delete_message(&state, &buffer, &first.id).await);
     }
 
-    println!("E2E room {:?}", groups::act(&state, &id, Action::CreateRoom { group, name: "second".into() }).await);
+    println!("E2E room {:?}", groups::act(&state, &id, Action::CreateRoom { group, name: "second".into(), voice: false }).await);
     within(10, "the second room's channel", || channels(&state).iter().any(|n| n == "moho e2e/#second")).await;
     let second = groups::held(&id, group).unwrap().rooms.iter().find(|r| r.name == "second").map(|r| r.id).unwrap();
     println!("E2E rename room {:?}", groups::act(&state, &id, Action::RenameRoom { group, room: second, name: "third".into() }).await);
@@ -1084,6 +1084,33 @@ async fn a_chat_group_is_made_used_and_left() {
     println!("E2E leave {:?}", groups::act(&state, &id, Action::Leave { group }).await);
     within(10, "the group's channels to go", || !channels(&state).iter().any(|n| n.starts_with("moho e2e"))).await;
     println!("E2E at the end: channels {:?}, rail groups {:?}", channels(&state), state.runtime.list_buffer_groups().into_iter().filter(|g| g.account_id == id).count());
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// Steam's voice signalling against real Steam: an offer made by a real Chromium is sent
+/// through `WebRTCClient.InitiateWebRTCConnection`, and what answers is printed. No audio is
+/// connected - that takes a browser - so nothing joins any chat. Throwaway account only.
+#[tokio::test]
+#[ignore = "needs a real Steam account and an offer in ~/.local/share/moho-dev/voice-offer.json"]
+async fn a_webrtc_offer_is_answered_by_steam() {
+    use super::voicewire::*;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-voice");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let offer = std::fs::read_to_string(format!("{}/.local/share/moho-dev/voice-offer.json", std::env::var("HOME").unwrap())).unwrap();
+    let answer: Result<InitiateWebRTCConnectionResponse, _> = link
+        .call("WebRTCClient.InitiateWebRTCConnection#1", &InitiateWebRTCConnectionRequest { sdp: Some(offer), browser_name: Some("Chrome".into()), browser_version: Some("152.0.7977.130".into()) }, true)
+        .await;
+    println!("VOICE answer {answer:#?}");
+    tokio::time::sleep(Duration::from_secs(4)).await;
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
     }

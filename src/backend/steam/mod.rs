@@ -53,6 +53,8 @@ pub mod publish;
 pub mod reactions;
 pub mod steamid;
 pub mod web;
+pub mod voice;
+pub mod voicewire;
 pub mod wire;
 
 pub use connect::spawn;

@@ -1032,6 +1032,8 @@ pub struct ChatRoomState {
     pub last_message: Option<String>,
     #[prost(uint32, optional, tag = "8")]
     pub accountid_last_message: Option<u32>,
+    #[prost(uint32, repeated, packed = "false", tag = "4")]
+    pub members_in_voice: Vec<u32>,
 }
 
 #[derive(Clone, PartialEq, Message)]

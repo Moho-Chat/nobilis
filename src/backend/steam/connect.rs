@@ -613,6 +613,9 @@ impl Drive<'_> {
                         self.read_elsewhere(&ack);
                     }
                 }
+                Some(method) if method.starts_with("VoiceChatClient.") || method.starts_with("WebRTCClientNotifications.") || method == "ChatRoomClient.NotifyShouldRejoinChatRoomVoiceChat#1" => {
+                    super::voice::heard(self.state, self.account_id, method, &packet.body);
+                }
                 Some(method) if method.starts_with("ChatRoomClient.") => {
                     if let Some(heard) = super::chatgroups::heard(self.state, self.account_id, &self.roster, method, &packet.body) {
                         self.ask_about(&heard.ask);

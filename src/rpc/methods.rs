@@ -4255,6 +4255,19 @@ pub async fn dispatch(
             None => (None, Some("steamChatGroups requires \"accountId\"".to_string())),
             Some(account_id) => (Some(backend::steam::chatgroups::to_json(account_id, p_str_opt(params, "groupId").and_then(|g| g.parse().ok()))), None),
         },
+        // Who is in the voice rooms of a Steam group.
+        "steamVoiceRooms" => match (p_str_opt(params, "accountId"), p_str_opt(params, "groupId").and_then(|g| g.parse().ok())) {
+            (Some(account_id), Some(group)) => (Some(backend::steam::chatgroups::voice_rooms(account_id, group)), None),
+            _ => (None, Some("steamVoiceRooms requires \"accountId\" and \"groupId\"".to_string())),
+        },
+        // One call of Steam's voice signalling: see backend/steam/voice.rs.
+        "steamVoice" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamVoice requires \"accountId\"".to_string())),
+            Some(account_id) => match backend::steam::voice::act(state, account_id, params).await {
+                Ok(done) => (Some(done), None),
+                Err(e) => (None, Some(e)),
+            },
+        },
         "steamChatGroupAction" => {
             use backend::steam::chatgroups::Action;
             let (Some(account_id), Some(what)) = (p_str_opt(params, "accountId"), p_str_opt(params, "action")) else {
@@ -4269,7 +4282,7 @@ pub async fn dispatch(
                 ("leave", Some(group)) => Action::Leave { group },
                 ("rename", Some(group)) => Action::Rename { group, name: text("name") },
                 ("tagline", Some(group)) => Action::Tagline { group, text: text("text") },
-                ("createRoom", Some(group)) => Action::CreateRoom { group, name: text("name") },
+                ("createRoom", Some(group)) => Action::CreateRoom { group, name: text("name"), voice: p_bool(params, "voice", false) },
                 ("renameRoom", Some(group)) => match number("roomId") {
                     Some(room) => Action::RenameRoom { group, room, name: text("name") },
                     None => return (None, Some("renameRoom needs \"roomId\"".to_string())),

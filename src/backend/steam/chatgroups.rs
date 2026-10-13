@@ -80,6 +80,8 @@ pub struct Room {
     pub id: u64,
     pub name: String,
     pub voice: bool,
+    /// Who is in this room's voice chat now, by account number.
+    pub in_voice: Vec<u32>,
     pub sort: u32,
     /// The second of its newest message, as Steam last said.
     pub last_message: u32,
@@ -191,11 +193,17 @@ impl Group {
         let old: HashMap<u64, Room> = self.rooms.drain(..).map(|r| (r.id, r)).collect();
         for r in rooms {
             let Some(id) = r.chat_id else { continue };
+            // A room can be named twice at once - by a notification and by the answer to the
+            // call that made it - and is one room.
+            if self.rooms.iter().any(|x| x.id == id) {
+                self.rooms.retain(|x| x.id != id);
+            }
             let held = old.get(&id);
             self.rooms.push(Room {
                 id,
                 name: r.chat_name.clone().unwrap_or_default(),
                 voice: r.voice_allowed.unwrap_or(false),
+                in_voice: r.members_in_voice.clone(),
                 sort: r.sort_order.unwrap_or(0),
                 last_message: r.time_last_message.unwrap_or_else(|| held.map_or(0, |h| h.last_message)),
                 acked: held.map_or(0, |h| h.acked),
@@ -280,6 +288,8 @@ struct Account {
     /// Who people are, as last seen, for what is read when the roster is not to hand.
     people: HashMap<u32, Person>,
     own: u32,
+    /// What the window was last told of each group's voice rooms.
+    voice_told: HashMap<u64, Value>,
     /// Whether Steam has said what the groups are yet: before it has, an empty
     /// list means nothing, and acting on it would remove every channel.
     loaded: bool,
@@ -481,6 +491,13 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
             with(account_id, |a| a.members.remove(&crate::model::buffer_id(account_id, old)));
         }
     }
+    for g in groups.values() {
+        let now = voice_rooms(account_id, g.id);
+        let changed = with(account_id, |a| a.voice_told.insert(g.id, now.clone()).as_ref() != Some(&now));
+        if changed {
+            tell_voice_rooms(state, account_id, g.id);
+        }
+    }
     let everyone: Vec<u32> = groups.values().flat_map(|g| g.members.iter().map(|m| m.account)).collect();
     learn(account_id, roster, everyone);
     with(account_id, |a| a.shown = names);
@@ -550,6 +567,48 @@ fn channel_of(account_id: &str, group: u64, room: u64) -> Option<String> {
 /// states are on screen in a member list, which has to follow.
 pub fn involves(account_id: &str, people: &[u32]) -> bool {
     with(account_id, |a| a.loaded && a.groups.values().any(|g| g.members.iter().any(|m| people.contains(&m.account))))
+}
+
+/// Somebody joined or left a room's voice chat.
+pub fn voice_changed(state: &AppState, account_id: &str, group: u64, room: u64, user: u32, joined: bool) {
+    with(account_id, |a| {
+        if let Some(r) = a.groups.get_mut(&group).and_then(|g| g.room_mut(room)) {
+            r.in_voice.retain(|u| *u != user);
+            if joined {
+                r.in_voice.push(user);
+            }
+        }
+    });
+    tell_voice_rooms(state, account_id, group);
+}
+
+/// The rooms of a group that have voice, and who is in each, as the window lists them.
+pub fn voice_rooms(account_id: &str, group: u64) -> Value {
+    with(account_id, |a| {
+        let Some(g) = a.groups.get(&group) else { return json!([]) };
+        let rooms: Vec<Value> = g
+            .rooms
+            .iter()
+            .filter(|r| r.voice)
+            .map(|r| {
+                json!({
+                    "roomId": r.id.to_string(),
+                    "bufferId": a.shown.get(&(g.id, r.id)).map(|n| crate::model::buffer_id(account_id, n)),
+                    "name": room_title(r),
+                    "members": r.in_voice.iter().map(|m| {
+                        let p = a.people.get(m);
+                        json!({ "userId": steamid::text_of(*m), "nick": p.map(|p| p.name.clone()).unwrap_or_else(|| steamid::text_of(*m)), "avatarUrl": p.and_then(|p| p.avatar.clone()), "isSelf": *m == a.own })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        Value::Array(rooms)
+    })
+}
+
+/// Tells the window who is in a group's voice rooms.
+fn tell_voice_rooms(state: &AppState, account_id: &str, group: u64) {
+    state.events.emit("steamVoiceRooms", json!({ "accountId": account_id, "groupId": group.to_string(), "rooms": voice_rooms(account_id, group) }));
 }
 
 /// The accounts in groups the roster has no name for, to be asked about.
@@ -1038,7 +1097,7 @@ pub enum Action {
     Leave { group: u64 },
     Rename { group: u64, name: String },
     Tagline { group: u64, text: String },
-    CreateRoom { group: u64, name: String },
+    CreateRoom { group: u64, name: String, voice: bool },
     RenameRoom { group: u64, room: u64, name: String },
     DeleteRoom { group: u64, room: u64 },
     Kick { group: u64, who: u64, seconds: i32 },
@@ -1188,12 +1247,12 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
             with(account_id, |a| a.groups.get_mut(&group).map(|g| g.tagline = text));
             Ok(json!({}))
         }
-        Action::CreateRoom { group, name } => {
-            let made: CreateChatRoomResponse = command(&link, "CreateChatRoom", &CreateChatRoomRequest { chat_group_id: Some(group), name: Some(name.trim().to_string()), allow_voice: Some(false) }).await?;
+        Action::CreateRoom { group, name, voice } => {
+            let made: CreateChatRoomResponse = command(&link, "CreateChatRoom", &CreateChatRoomRequest { chat_group_id: Some(group), name: Some(name.trim().to_string()), allow_voice: Some(voice) }).await?;
             if let Some(r) = made.chat_room {
                 with(account_id, |a| {
                     if let Some(g) = a.groups.get_mut(&group) {
-                        let mut rooms: Vec<ChatRoomState> = g.rooms.iter().map(|r| ChatRoomState { chat_id: Some(r.id), chat_name: Some(r.name.clone()), voice_allowed: Some(r.voice), sort_order: Some(r.sort), time_last_message: Some(r.last_message), ..Default::default() }).collect();
+                        let mut rooms: Vec<ChatRoomState> = g.rooms.iter().map(|r| ChatRoomState { chat_id: Some(r.id), chat_name: Some(r.name.clone()), voice_allowed: Some(r.voice), members_in_voice: r.in_voice.clone(), sort_order: Some(r.sort), time_last_message: Some(r.last_message), ..Default::default() }).collect();
                         rooms.push(r);
                         g.take_rooms(&rooms);
                     }
@@ -1343,7 +1402,7 @@ pub fn to_json(account_id: &str, group: Option<u64>) -> Value {
                     "permissions": PERMISSIONS.iter().map(|(k, d)| json!({ "key": k, "label": d })).collect::<Vec<_>>(),
                     "muted": g.muted,
                     "notify": g.notify,
-                    "rooms": g.rooms.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name, "voice": r.voice })).collect::<Vec<_>>(),
+                    "rooms": g.rooms.iter().map(|r| json!({ "id": r.id.to_string(), "name": r.name, "voice": r.voice, "inVoice": r.in_voice.iter().map(|a| steamid::text_of(*a)).collect::<Vec<_>>() })).collect::<Vec<_>>(),
                     "roles": g.roles.iter().map(|(id, n)| json!({ "id": id.to_string(), "name": n })).collect::<Vec<_>>(),
                     "members": g.members.iter().map(|m| json!({ "steamid": steamid::text_of(m.account), "name": name(m.account), "rank": m.rank, "rankWord": rank_word(m.rank), "roles": m.roles.iter().map(|r| r.to_string()).collect::<Vec<_>>() })).collect::<Vec<_>>(),
                     "kicked": g.kicked.iter().map(|m| json!({ "steamid": steamid::text_of(m.account), "name": name(m.account) })).collect::<Vec<_>>(),
