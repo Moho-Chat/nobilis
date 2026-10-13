@@ -489,7 +489,7 @@ pub struct Reaction {
 /// Discord's own client does, and re-renders it live if a later edit
 /// changes it (a webhook can restyle an existing embed - status-bridge
 /// bots commonly do this to signal connected/degraded/down).
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Embed {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -556,7 +556,7 @@ pub struct Embed {
 }
 
 /// A link with its words.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct EmbedLink {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -564,7 +564,7 @@ pub struct EmbedLink {
 }
 
 /// One of an embed's labelled lines.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct EmbedField {
     pub name: String,
     pub value: String,

@@ -599,7 +599,7 @@ async fn the_newest_messages_as_steam_writes_them() {
     connect::spawn(state.clone(), sender.clone());
     within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
     let link = state.runtime.steam_link(&id).unwrap();
-    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 14).await;
+    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 6).await;
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
     }
@@ -633,6 +633,36 @@ async fn a_session_stays_connected() {
         }
     }
     println!("lost the connection {lost} time(s) in {secs}s; now {last:?}");
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// How Steam stores a link a person sends: as written, or made into a link tag,
+/// or a card. One message to the friend for each, from the sender alone.
+#[tokio::test]
+#[ignore = "needs a real Steam account and its friend; sends a few real messages"]
+async fn links_are_stored_by_steam_as_these() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam::chat=debug").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-links");
+    let (sender, receiver) = (account("SENDER"), account("RECEIVER"));
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    within(60, "the friend", || state.runtime.list_buffers().iter().any(|b| b.account_id == id && b.remote_id.as_deref() == Some(&receiver.steamid.to_string()))).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    for text in [
+        "https://salastil.com",
+        "look: http://x.salastil.com/path?a=1&b=2 and www.example.com too",
+        "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency_demonstration_1.png",
+        "no scheme: x.salastil.com",
+    ] {
+        println!("SENT {text:?} -> {:?}", super::chat::send(&link, &receiver.steamid.to_string(), text).await.map(|s| s.shown));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
     }

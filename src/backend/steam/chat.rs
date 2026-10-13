@@ -44,6 +44,8 @@ pub struct Incoming {
     pub id: String,
     /// Sent by us, from another of our sessions.
     pub from_us: bool,
+    /// The web pages Steam's client described in it, which are cards.
+    pub embeds: Vec<crate::model::Embed>,
 }
 
 /// Reads a notification, or says it is not a message to show.
@@ -54,7 +56,9 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
     let account = n.steamid_friend.and_then(steamid::account_of)?;
     // The message as Steam formatted it, read into what moho draws; the plain
     // copy only if that leaves nothing, which is a message made of tags alone.
-    let text = Some(super::bbcode::to_markup(n.message.as_deref().unwrap_or_default()))
+    let rendered = super::bbcode::render_message(n.message.as_deref().unwrap_or_default());
+    let embeds = rendered.cards;
+    let text = Some(rendered.text)
         .filter(|t| !t.trim().is_empty())
         .or_else(|| n.message_no_bbcode.as_deref().map(|t| t.trim_end().to_string()))
         .unwrap_or_default();
@@ -62,7 +66,7 @@ pub fn read_incoming(n: &FriendMessagesIncoming) -> Option<Incoming> {
         return None;
     }
     let timestamp = n.rtime32_server_timestamp.unwrap_or_default();
-    Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false) })
+    Some(Incoming { account, text, timestamp, id: message_id(timestamp, n.ordinal.unwrap_or_default()), from_us: n.local_echo.unwrap_or(false), embeds })
 }
 
 /// Who is typing to us, from a notification that says so.
@@ -97,7 +101,7 @@ pub fn record_incoming(state: &AppState, account_id: &str, roster: &mut Roster, 
         Some(incoming.id.clone()),
         false,
         roster.persona(incoming.account).filter(|_| !incoming.from_us).and_then(|p| p.avatar.clone()),
-        Vec::new(),
+        incoming.embeds.clone(),
         Vec::new(),
         (!incoming.from_us).then(|| steamid::text_of(incoming.account)),
         Some(i64::from(incoming.timestamp)).filter(|t| *t > 0),
@@ -322,6 +326,25 @@ mod tests {
         let mut echo = notice(22202, "sent from my phone", 5, 0);
         echo.local_echo = Some(true);
         assert!(read_incoming(&echo).unwrap().from_us);
+    }
+
+    #[test]
+    fn a_page_steam_described_arrives_as_a_message_with_a_card() {
+        let state = simulated_daemon("steam-chat-card");
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&ClientFriendsList {
+            friends: vec![FriendsListEntry { ulfriendid: Some(steamid::steamid_of(22202)), efriendrelationship: Some(REL_FRIEND) }],
+            ..Default::default()
+        });
+        roster.apply_persona(&ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), player_name: Some("Gabe".into()), persona_state: Some(1), ..Default::default() }], ..Default::default() });
+        let mut shown = Conversations::new(ACCOUNT);
+        let raw = "[og url=\"http://x.salastil.com\" title=\"Home\" desc=\"A privacy-focused Twitter/X frontend\"]x.salastil.com[/og]";
+        let incoming = read_incoming(&notice(22202, raw, 1790000100, 0)).unwrap();
+        assert_eq!(incoming.text, "[x.salastil.com](http://x.salastil.com)");
+        assert!(record_incoming(&state, ACCOUNT, &mut roster, &mut shown, "Me", &incoming).0);
+        let history = state.store.get_backlog(&crate::model::buffer_id(ACCOUNT, "Gabe"), 0, 10).unwrap();
+        let card = &history[0].embeds[0];
+        assert_eq!((card.url.as_deref(), card.title.as_deref(), card.provider.as_deref()), (Some("http://x.salastil.com"), Some("Home"), Some("x.salastil.com")));
     }
 
     #[test]

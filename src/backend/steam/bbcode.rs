@@ -13,12 +13,15 @@
 //! already treat as untrusted, and nothing is lost for being misread - what is
 //! unreadable is shown as it was written.
 
+use crate::model::Embed;
+
 /// A bracket that is only a bracket: followed by a zero-width space, which is
 /// what stops anything downstream taking `[b]` for formatting.
 pub const LITERAL_BRACKET: &str = "[\u{200b}";
 
-/// What a tag becomes, given what was inside it already read.
-fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
+/// What a tag becomes, given what was inside it already read. A card Steam
+/// describes goes in `cards` as well as being words.
+fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) -> String {
     let wrapped = |mark: &str| if inner.trim().is_empty() { inner.to_string() } else { format!("{mark}{inner}{mark}") };
     match tag {
         "b" | "h1" | "h2" | "h3" | "h4" | "h5" => wrapped("**"),
@@ -47,6 +50,18 @@ fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
             let named = attr.and_then(|a| attribute(a, "type")).filter(|n| !n.is_empty()).unwrap_or(inner.trim());
             if super::emoticons::valid_sticker(named) { format!("[steam:sticker:{named}]") } else { inner.to_string() }
         }
+        // A web page Steam's client has looked at and is describing: `[og url="..."
+        // title="..." desc="..."]words[/og]`. The words are a link; the description
+        // is a card, drawn as any other link's is.
+        "og" => match attr.and_then(|a| attribute(a, "url")).filter(|u| is_web(u)) {
+            Some(url) => {
+                let field = |name: &str| attr.and_then(|a| attribute(a, name)).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
+                cards.push(Embed { url: Some(url.to_string()), title: field("title"), description: field("desc"), provider: host_of(url), ..Default::default() });
+                let words = inner.trim();
+                if words.is_empty() || words == url { url.to_string() } else { format!("[{}]({url})", words.replace(']', "\\]")) }
+            }
+            None => inner.to_string(),
+        },
         // What Steam writes for a file sent through its website: the address
         // as an attribute, and again as a link inside, which is not read. A
         // marker the window draws as the picture or video it names.
@@ -65,10 +80,18 @@ fn render(tag: &str, attr: Option<&str>, inner: &str) -> String {
     }
 }
 
+/// The site an address is on, without a leading `www.`: what a card says it is from.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?.rsplit('@').next()?.split(':').next()?;
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    (!host.is_empty()).then(|| host.to_string())
+}
+
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
     "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "video", "looping_media", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*",
+    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.
@@ -145,8 +168,25 @@ fn read_tag(s: &str) -> Option<Tag<'_>> {
     Some(Tag { name, attr, closing, len: end + 2 })
 }
 
+/// The text of a message as moho draws it, and the cards Steam described in it.
+pub struct Rendered {
+    pub text: String,
+    pub cards: Vec<Embed>,
+}
+
 /// The text of a message as moho draws it.
 pub fn to_markup(bbcode: &str) -> String {
+    render_message(bbcode).text
+}
+
+/// A message read into what moho draws, with its cards.
+pub fn render_message(bbcode: &str) -> Rendered {
+    let mut cards = Vec::new();
+    let text = convert(bbcode, &mut cards);
+    Rendered { text, cards }
+}
+
+fn convert(bbcode: &str, cards: &mut Vec<Embed>) -> String {
     struct Open {
         tag: String,
         attr: Option<String>,
@@ -213,7 +253,7 @@ pub fn to_markup(bbcode: &str) -> String {
                             out!().push_str(&text);
                         }
                         let f = stack.pop().unwrap();
-                        let drawn = render(&f.tag, f.attr.as_deref(), &f.out);
+                        let drawn = render(&f.tag, f.attr.as_deref(), &f.out, cards);
                         out!().push_str(&drawn);
                         i += tag.len;
                         continue;
@@ -368,5 +408,34 @@ mod tests {
         let _ = to_markup(&unclosed);
         let brackets = format!("{}{}", "[".repeat(10000), "]".repeat(10000));
         assert_eq!(to_markup(&brackets).len(), 20000);
+    }
+
+    #[test]
+    fn a_page_steam_describes_is_words_and_a_card() {
+        // As the official client sends one.
+        let sent = "[og url=\"http://x.salastil.com\" title=\"Home\" desc=\"A privacy-focused Twitter/X frontend\"]x.salastil.com[/og]";
+        let rendered = render_message(sent);
+        assert_eq!(rendered.text, "[x.salastil.com](http://x.salastil.com)", "a link, on the words that were shown");
+        assert_eq!(rendered.cards.len(), 1);
+        let card = &rendered.cards[0];
+        assert_eq!(
+            (card.url.as_deref(), card.title.as_deref(), card.description.as_deref(), card.provider.as_deref()),
+            (Some("http://x.salastil.com"), Some("Home"), Some("A privacy-focused Twitter/X frontend"), Some("x.salastil.com"))
+        );
+        // The words, with others around them; a repeat of the address; no description.
+        let more = render_message("see [og url=\"https://www.example.com/a?b=1\" title=\"T\"]https://www.example.com/a?b=1[/og] ok");
+        assert_eq!(more.text, "see https://www.example.com/a?b=1 ok");
+        assert_eq!((more.cards[0].provider.as_deref(), more.cards[0].description.as_deref()), (Some("example.com"), None), "no leading www, and no description invented");
+        // Not a web address: nothing to make a card of.
+        assert!(render_message("[og url=\"javascript:alert(1)\" title=\"x\"]words[/og]").cards.is_empty());
+        assert_eq!(to_markup("[og title=\"x\"]just words[/og]"), "just words");
+        assert!(render_message("plain https://example.com").cards.is_empty());
+    }
+
+    #[test]
+    fn a_link_keeps_its_address_and_its_words() {
+        assert_eq!(to_markup("[url=http://salastil.com]salastil.com[/url]"), "[salastil.com](http://salastil.com)");
+        assert_eq!(to_markup("[url=https://salastil.com]https://salastil.com[/url]"), "https://salastil.com");
+        assert_eq!(to_markup("[url=https://example.com/a fromclient=1]look[/url]"), "[look](https://example.com/a)");
     }
 }
