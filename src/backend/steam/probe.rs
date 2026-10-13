@@ -1062,6 +1062,12 @@ async fn a_chat_group_is_made_used_and_left() {
     if let Some(code) = made.ok().and_then(|v| v["code"].as_str().map(str::to_string)) {
         println!("E2E revoke {:?}", groups::act(&state, &id, Action::RevokeInvite { group, code }).await);
     }
+    let picture = format!("{}/.local/share/moho-dev/avatar.png", std::env::var("HOME").unwrap());
+    println!("E2E avatar before {:?}", groups::held(&id, group).and_then(|g| g.avatar));
+    println!("E2E avatar {:?}", groups::act(&state, &id, Action::Avatar { group, path: picture }).await);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    println!("E2E avatar after {:?}; rail icon {:?}", groups::held(&id, group).and_then(|g| g.avatar), state.runtime.list_buffer_groups().into_iter().find(|g| g.id == rail).and_then(|g| g.icon_url));
+    println!("E2E dismiss notices {:?}", groups::act(&state, &id, Action::DismissNotices { group }).await);
     println!("E2E bans {:?}", groups::act(&state, &id, Action::Bans { group }).await);
     println!("E2E create role {:?}", groups::act(&state, &id, Action::CreateRole { group, name: "Raiders".into() }).await);
     let role = groups::held(&id, group).unwrap().roles.iter().find(|(_, n)| n == "Raiders").map(|(r, _)| *r);

@@ -4312,6 +4312,8 @@ pub async fn dispatch(
                 ("links", Some(group)) => Action::Links { group },
                 ("notify", Some(group)) => Action::Notify { group, level: p_i64(params, "level", 2) as i32 },
                 ("bans", Some(group)) => Action::Bans { group },
+                ("avatar", Some(group)) => Action::Avatar { group, path: text("path") },
+                ("dismissNotices", Some(group)) => Action::DismissNotices { group },
                 ("createRole", Some(group)) => Action::CreateRole { group, name: text("name") },
                 ("renameRole", Some(group)) => match number("roleId") {
                     Some(role) => Action::RenameRole { group, role, name: text("name") },
@@ -4371,6 +4373,13 @@ pub async fn dispatch(
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {
                 return (None, Some("steamDismissNotice requires a known \"bufferId\"".to_string()));
             };
+            // A room of a group: the warning is about somebody in the group.
+            if let Some((group, _)) = backend::steam::chatgroups::ids_of(&buffer).filter(|_| backend::steam::chatgroups::is_room(&buffer)) {
+                return match backend::steam::chatgroups::act(state, &buffer.account_id, backend::steam::chatgroups::Action::DismissNotices { group }).await {
+                    Ok(_) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let friend = buffer.remote_id.as_deref().and_then(|id| id.parse::<u64>().ok());
             // The banner goes whether or not Steam can be told just now: it was
             // seen. Steam is told so that it is not raised again.

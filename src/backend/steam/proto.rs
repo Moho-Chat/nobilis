@@ -1223,6 +1223,8 @@ pub struct SetSessionActiveGroupsResponse {
     pub chat_states: Vec<ChatRoomGroupState>,
     #[prost(uint64, repeated, packed = "false", tag = "2")]
     pub virtualize_members_chat_group_ids: Vec<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub chat_group_notices: Vec<ChatRoomGroupMemberNotices>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1896,6 +1898,56 @@ pub struct GetBanListResponse {
     pub bans: Vec<BanInfo>,
 }
 
+#[derive(Clone, PartialEq, Message)]
+pub struct SetAvatarRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(bytes = "vec", optional, tag = "2")]
+    pub avatar_sha: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetAvatarResponse {
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomNoticeNotification {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid_sender: Option<u64>,
+    #[prost(int32, optional, tag = "3")]
+    pub notice_type: Option<i32>,
+    #[prost(bool, optional, tag = "4")]
+    pub active: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DismissChatRoomNotice {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid_sender: Option<u64>,
+    #[prost(int32, optional, tag = "3")]
+    pub notice_type: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomMemberNotice {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(int32, optional, tag = "2")]
+    pub notice_type: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomGroupMemberNotices {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(message, repeated, tag = "2")]
+    pub member_notices: Vec<ChatRoomMemberNotice>,
+}
+
 /// Everything an account may put in a message beyond words.
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientEmoticonList {
@@ -2203,6 +2255,7 @@ mod tests {
                 ChatReactionRequest, ChatReactionResponse, ChatReactionNotice,
                 InviteFriendToChatGroupRequest, InviteFriendToChatGroupResponse,
                 ChatRoleActions, SetTaglineRequest, SetTaglineResponse, UserChatGroupPreferences, SetUserPreferencesRequest, SetUserPreferencesResponse, CreateRoleRequest, CreateRoleResponse, RenameRoleRequest, RenameRoleResponse, DeleteRoleRequest, DeleteRoleResponse, GetRoleActionsRequest, GetRoleActionsResponse, ReplaceRoleActionsRequest, ReplaceRoleActionsResponse, AddRoleToUserRequest, AddRoleToUserResponse, DeleteRoleFromUserRequest, DeleteRoleFromUserResponse, GetBanListRequest, BanInfo, GetBanListResponse,
+        SetAvatarRequest, SetAvatarResponse, ChatRoomNoticeNotification, DismissChatRoomNotice, ChatRoomMemberNotice, ChatRoomGroupMemberNotices,
         FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
                 ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
                 ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
@@ -2210,7 +2263,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 196, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 202, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

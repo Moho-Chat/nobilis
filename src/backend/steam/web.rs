@@ -85,6 +85,8 @@ struct Answer {
     hmac: Option<String>,
     timestamp: Option<i64>,
     result: Option<serde_json::Value>,
+    /// What an avatar upload is known by afterwards.
+    sha: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -265,6 +267,32 @@ pub async fn send_file(
     Ok(result.pointer("/details/url").and_then(|v| v.as_str()).unwrap_or_default().to_string())
 }
 
+/// What a group's picture may be, as the client's own picker says.
+pub const AVATAR_TYPES: &[&str] = &["jpg", "jpeg", "png", "gif"];
+
+/// Sends a picture for a chat group to the site, which keeps it and answers with what it is
+/// known by; the group is then told to use that (`SetChatRoomGroupAvatar`).
+pub async fn upload_avatar(link: &Link, key: &str, steamid: u64, refresh_token: &str, path: &str) -> Result<Vec<u8>, String> {
+    let file_name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("avatar").to_string();
+    let extension = file_name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let mime = match extension.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        _ => return Err(format!("a group's picture is one of {}", AVATAR_TYPES.join(", "))),
+    };
+    let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {file_name}: {e}"))?;
+    if bytes.is_empty() {
+        return Err(format!("{file_name} is empty"));
+    }
+    let (http, cookie, session_id) = login(link, key, steamid, refresh_token).await?;
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str(mime).map_err(|e| e.to_string())?;
+    let form = reqwest::multipart::Form::new().text("sessionid", session_id).part("avatar", part);
+    let answer = site(&http, &cookie, &format!("{SITE}/chat/avatarfileupload/"), form).await?;
+    let sha = answer.sha.filter(|s| s.len() == 40).ok_or("Steam took the picture and did not say what it is called")?;
+    (0..sha.len()).step_by(2).map(|i| u8::from_str_radix(&sha[i..i + 2], 16).map_err(|_| "Steam named the picture in a way that is not understood".to_string())).collect()
+}
+
 /// An answer's text. The site compresses what it likes whatever it is asked,
 /// and a refusal's reason is in the body, so it is unpacked here.
 pub(super) fn plain(raw: &[u8]) -> String {
@@ -327,8 +355,10 @@ async fn site(http: &reqwest::Client, cookie: &str, url: &str, form: reqwest::mu
     // Never the body: it carries the signed address the file is sent to.
     tracing::debug!("steam web: {} -> {status}, success {:?}", url.split('?').next().unwrap_or(url), answer.success);
     if !status.is_success() || answer.success.is_some_and(|s| s != 1) {
-        return Err(answer.message.filter(|m| !m.is_empty()).unwrap_or_else(|| match status.as_u16() {
-            401 | 403 => "Steam's website did not accept this sign-in".to_string(),
+        return Err(answer.message.filter(|m| !m.is_empty()).unwrap_or_else(|| match (status.as_u16(), answer.success) {
+            // The site answers in Steam's own result codes, which say why far better than the status.
+            (_, Some(code)) if code > 1 => format!("Steam refused it: {}", super::eresult::describe(code as i32)),
+            (401 | 403, _) => "Steam's website did not accept this sign-in".to_string(),
             _ => format!("Steam's website refused it ({status})"),
         }));
     }

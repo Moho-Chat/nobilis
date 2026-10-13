@@ -112,6 +112,8 @@ pub struct Group {
     pub muted: bool,
     pub notify: i32,
     pub disabled: bool,
+    /// Members Steam says may not be who they appear to be, by account number.
+    pub suspicious: std::collections::BTreeSet<u32>,
 }
 
 impl Group {
@@ -417,6 +419,7 @@ pub async fn load(link: &Link, account_id: &str, own: u32) -> Result<Vec<u32>, S
         if let Some(user) = &pair.user_chat_group_state {
             g.take_user(user);
         }
+        g.suspicious = active.chat_group_notices.iter().filter(|n| n.chat_group_id == Some(id)).flat_map(|n| n.member_notices.iter()).filter(|n| n.notice_type == Some(super::notices::SUSPICIOUS)).filter_map(|n| n.accountid).collect();
         groups.insert(id, g);
     }
     let people: Vec<u32> = groups.values().flat_map(|g| g.members.iter().map(|m| m.account)).chain(groups.values().map(|g| g.owner)).filter(|a| *a != 0 && *a != own).collect();
@@ -473,6 +476,7 @@ pub fn publish(state: &AppState, account_id: &str, roster: &Roster) {
             state.runtime.set_buffer_topic(state, &buffer.id, &g.tagline);
             state.runtime.set_buffer_read_only(state, &buffer.id, (!g.may_speak()).then_some("You can read this group but not write in it."));
             state.runtime.set_silenced(state, &buffer.id, g.muted);
+            state.runtime.set_buffer_notice(state, &buffer.id, suspicious_notice(account_id, g, roster));
             if let Some(url) = &g.avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
             }
@@ -517,6 +521,16 @@ pub fn learn(account_id: &str, roster: &Roster, accounts: impl IntoIterator<Item
 /// What is known of somebody; their number, for a name, when nothing is.
 fn person(account_id: &str, account: u32) -> Person {
     with(account_id, |a| a.people.get(&account).cloned()).unwrap_or_else(|| Person { name: steamid::text_of(account), avatar: None, friend: false })
+}
+
+/// The banner over a group's rooms while Steam warns of somebody in it.
+fn suspicious_notice(account_id: &str, g: &Group, roster: &Roster) -> Option<crate::model::BufferNotice> {
+    if g.suspicious.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = g.suspicious.iter().map(|a| if roster.has_name(*a) { who(roster, *a) } else { person(account_id, *a).name }).collect();
+    let list = names.join(", ");
+    Some(crate::model::BufferNotice { kind: "suspicious".to_string(), text: format!("Steam warns that {list} may not be who they appear to be. Be careful with links, offers and requests for anything - and do not give out your account details.") })
 }
 
 /// The people in a group as the window's member list reads them: online ones
@@ -809,6 +823,30 @@ pub fn heard(state: &AppState, account_id: &str, roster: &Roster, method: &str, 
                 if known {
                     publish(state, account_id, roster);
                 }
+            }
+        }
+        // Steam warning of somebody in the group, or lifting the warning.
+        "ChatRoomClient.NotifyChatRoomNotice#1" => {
+            let n = ChatRoomNoticeNotification::decode(body).ok()?;
+            if n.notice_type != Some(super::notices::SUSPICIOUS) {
+                return None;
+            }
+            let (group, who) = (n.chat_group_id?, n.steamid_sender.and_then(steamid::account_of)?);
+            let known = with(account_id, |a| {
+                a.groups.get_mut(&group).map(|g| {
+                    if n.active.unwrap_or(true) {
+                        g.suspicious.insert(who);
+                    } else {
+                        g.suspicious.remove(&who);
+                    }
+                })
+                .is_some()
+            });
+            if known {
+                if !roster.has_name(who) {
+                    out.ask.push(who);
+                }
+                publish(state, account_id, roster);
             }
         }
         // Read on another client.
@@ -1109,6 +1147,8 @@ pub enum Action {
     Links { group: u64 },
     Notify { group: u64, level: i32 },
     Bans { group: u64 },
+    Avatar { group: u64, path: String },
+    DismissNotices { group: u64 },
     CreateRole { group: u64, name: String },
     RenameRole { group: u64, role: u64, name: String },
     DeleteRole { group: u64, role: u64 },
@@ -1302,6 +1342,23 @@ async fn do_act(state: &AppState, account_id: &str, action: Action) -> Result<Va
                     Some(json!({ "code": code, "link": format!("https://s.team/chat/{code}"), "expires": l.time_expires.filter(|t| *t > 0), "creator": l.steamid_creator.and_then(steamid::account_of).map(steamid::text_of) }))
                 }).collect::<Vec<_>>()
             }))
+        }
+        // A new picture: sent to the site, then the group is told what it is called.
+        Action::Avatar { group, path } => {
+            let config = state.accounts.get_steam(account_id).ok_or("this Steam account is not set up")?;
+            let sha = super::web::upload_avatar(&link, account_id, config.steamid, &config.refresh_token, &path).await?;
+            let _: SetAvatarResponse = command(&link, "SetChatRoomGroupAvatar", &SetAvatarRequest { chat_group_id: Some(group), avatar_sha: Some(sha) }).await?;
+            reread(&link, account_id, group, own).await;
+            Ok(json!({}))
+        }
+        // The warnings about people in the group have been seen: Steam is told, so it does not
+        // raise them again, and the banner goes.
+        Action::DismissNotices { group } => {
+            let senders: Vec<u32> = with(account_id, |a| a.groups.get_mut(&group).map(|g| std::mem::take(&mut g.suspicious).into_iter().collect()).unwrap_or_default());
+            for who in senders {
+                let _ = link.notify("ChatRoom.DismissChatRoomNotice#1", &DismissChatRoomNotice { chat_group_id: Some(group), steamid_sender: Some(steamid::steamid_of(who)), notice_type: Some(super::notices::SUSPICIOUS) });
+            }
+            Ok(json!({}))
         }
         Action::Bans { group } => {
             let listed: GetBanListResponse = command(&link, "GetBanList", &GetBanListRequest { chat_group_id: Some(group) }).await?;
@@ -1570,5 +1627,28 @@ mod tests {
         // A reconnect: nothing is loaded yet, so nothing may be concluded from the list being empty.
         publish(&state, "steam:groups-b", &roster);
         assert!(state.runtime.list_buffer_groups().iter().any(|g| g.id == rail_id("steam:groups-b", 7)));
+    }
+
+    #[tokio::test]
+    async fn steam_warning_of_a_member_is_a_banner_over_the_rooms_until_it_is_lifted() {
+        use prost::Message;
+        let state = crate::backend::kick::testkit::simulated_daemon("steam-groups-notice");
+        let acc = "steam:groups-notice";
+        let roster = set_up(&state, acc);
+        publish(&state, acc, &roster);
+        let room = crate::model::buffer_id(acc, "Raiders/#General");
+        assert!(state.runtime.get_buffer(&room).unwrap().notice.is_none());
+        let raised = ChatRoomNoticeNotification { chat_group_id: Some(7), steamid_sender: Some(steamid::steamid_of(6)), notice_type: Some(1), active: Some(true) };
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", raised.encode_to_vec());
+        let banner = state.runtime.get_buffer(&room).unwrap().notice.expect("a banner");
+        assert_eq!(banner.kind, "suspicious");
+        assert!(banner.text.contains("may not be who they appear to be"), "{}", banner.text);
+        // A kind of notice this does not know says nothing.
+        let other = ChatRoomNoticeNotification { notice_type: Some(9), ..raised.clone() };
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", other.encode_to_vec());
+        // Lifted: the banner goes.
+        notify(&state, acc, &roster, "ChatRoomClient.NotifyChatRoomNotice#1", ChatRoomNoticeNotification { active: Some(false), ..raised }.encode_to_vec());
+        assert!(state.runtime.get_buffer(&room).unwrap().notice.is_none());
+        clear(acc);
     }
 }
