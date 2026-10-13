@@ -1029,7 +1029,12 @@ async fn the_newest_messages_as_steam_writes_them() {
     })
     .await;
     let link = state.runtime.steam_link(&id).unwrap();
-    let _ = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 6).await;
+    let got = super::history::fetch(&link, sender.steamid, receiver.steamid, None, 40).await;
+    if let Ok((messages, _)) = &got {
+        for m in messages {
+            println!("RAW {m:?}");
+        }
+    }
     if let Some(link) = state.runtime.take_steam_link(&id) {
         crate::backend::steam::sign_off(link);
     }
@@ -3309,4 +3314,28 @@ async fn a_group_watched_from_the_official_client() {
         crate::backend::steam::sign_off(link);
     }
     tokio::time::sleep(Duration::from_millis(800)).await;
+}
+
+/// What groups an account has sorted its friends into, as Steam tells the daemon at sign-in:
+/// the headings the window is to make. Reads and prints; changes nothing.
+#[tokio::test]
+#[ignore = "needs a real Steam account; changes nothing"]
+async fn the_friend_groups_an_account_has_at_sign_in() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-groups-read");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let held = super::groups::held(&id).to_json();
+    for g in held.as_array().cloned().unwrap_or_default() {
+        println!("GROUPS {} {} with {} friend(s)", g["id"], g["name"], g["members"].as_array().map(|m| m.len()).unwrap_or(0));
+    }
+    println!("GROUPS total {}", held.as_array().map(|a| a.len()).unwrap_or(0));
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
 }

@@ -90,6 +90,12 @@ impl Groups {
         self.members.remove(&group);
     }
 
+    /// The folder a friend is filed under: the lowest-numbered one they are in, which is the one the
+    /// window's single heading for a conversation stands for.
+    pub fn folder_of(&self, friend: u64) -> Option<&str> {
+        self.members.iter().find(|(_, members)| members.contains(&friend)).and_then(|(id, _)| self.names.get(id)).map(String::as_str)
+    }
+
     /// As the window reads it: each group with its name and the friends in it
     /// by their 64-bit ids, which is how a conversation names who it is with.
     pub fn to_json(&self) -> Value {
@@ -124,6 +130,31 @@ pub fn heard(state: &AppState, account_id: &str, list: &ClientFriendsGroupsList)
         groups.clone()
     };
     tell(state, account_id, &groups);
+    file_conversations(state, account_id);
+}
+
+/// A folder's name as it is shown. Steam's own list holds some of an account's with "Steam - " in
+/// front of the name, which its own client does not show, so neither does this.
+pub fn heading_of(name: &str) -> String {
+    name.strip_prefix("Steam - ").unwrap_or(name).trim().to_string()
+}
+
+/// Files every conversation of the account under its friend's folder, as the heading the channel list
+/// draws it under, and takes it out of one the friend has left. Said to the window only where it
+/// changed, so this is as cheap to call after every change as it is needed.
+pub fn file_conversations(state: &AppState, account_id: &str) {
+    let groups = held(account_id);
+    for buffer in state.runtime.list_buffers().into_iter().filter(|b| b.account_id == account_id && b.kind == "dm") {
+        let Some(friend) = buffer.remote_id.as_deref().and_then(friend_of) else { continue };
+        let heading = groups.folder_of(friend).map(heading_of);
+        state.runtime.set_buffer_category(state, &buffer.id, heading.as_deref(), 0);
+    }
+}
+
+/// The same for one conversation, for when it has only just been made.
+pub fn file_one(state: &AppState, account_id: &str, buffer_id: &str, friend: u64) {
+    let heading = held(account_id).folder_of(friend).map(heading_of);
+    state.runtime.set_buffer_category(state, buffer_id, heading.as_deref(), 0);
 }
 
 fn tell(state: &AppState, account_id: &str, groups: &Groups) {
@@ -204,6 +235,7 @@ pub async fn change(state: &AppState, link: &Link, account_id: &str, own: u64, w
         groups.clone()
     };
     tell(state, account_id, &groups);
+    file_conversations(state, account_id);
     Ok(made)
 }
 
@@ -214,6 +246,21 @@ pub fn friend_of(text: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_friend_is_filed_under_the_lowest_numbered_folder_they_are_in_and_the_prefix_is_not_shown() {
+        let mut groups = Groups::default();
+        groups.put_group(7, "Steam - Goons", &[10, 11]);
+        groups.put_group(3, "Friends", &[11]);
+        assert_eq!(groups.folder_of(10), Some("Steam - Goons"));
+        assert_eq!(groups.folder_of(11), Some("Friends"), "in two: the lower number stands for them");
+        assert_eq!(groups.folder_of(12), None);
+        assert_eq!(heading_of("Steam - Goons"), "Goons");
+        assert_eq!(heading_of("Friends"), "Friends");
+        assert_eq!(heading_of("Steam - "), "", "nothing left is nothing shown");
+        groups.put_member(3, 11, false);
+        assert_eq!(groups.folder_of(11), Some("Steam - Goons"), "out of one, in the other");
+    }
+
     use super::*;
 
     const A: u64 = 76561197960287930;
