@@ -109,7 +109,8 @@ pub fn store_quietly(state: &AppState, buffer: &Buffer, own: u32, past: &[Past])
         let is_own = p.account == own;
         let from = if is_own { own_name.as_str() } else { buffer.name.as_str() };
         let sender = (!is_own).then(|| steamid::text_of(p.account));
-        let stored = state.store.append_message(&buffer.id, &p.id(), from, &p.text, i64::from(p.timestamp), false, false, "chat", None, &p.reactions, is_own, None, &p.embeds, &[], sender.as_deref(), None, "dm", None, &[]);
+        let text = if is_own { p.text.clone() } else { super::account::filtered(&buffer.account_id, true, &p.text) };
+        let stored = state.store.append_message(&buffer.id, &p.id(), from, &text, i64::from(p.timestamp), false, false, "chat", None, &p.reactions, is_own, None, &p.embeds, &[], sender.as_deref(), None, "dm", None, &[]);
         if matches!(stored, Ok(true)) {
             added += 1;
         } else if !p.reactions.is_empty() {
@@ -220,7 +221,7 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, own: u32,
                 name,
                 "dm",
                 &friend_name,
-                &p.text,
+                &super::account::filtered(account_id, true, &p.text),
                 false,
                 "chat",
                 None,

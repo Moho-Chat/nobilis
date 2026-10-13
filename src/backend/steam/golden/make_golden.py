@@ -34,6 +34,8 @@ FILES = [
     "steammessages_auth.steamclient.proto",
     "steammessages_player.steamclient.proto",
     "steammessages_clientserver_2.proto",
+    "steammessages_parental.steamclient.proto",
+    "steammessages_parental_objects.proto",
     # What those import.
     "steammessages_unified_base.steamclient.proto",
     "enums.proto",
@@ -50,6 +52,8 @@ fmsg = importlib.import_module("steammessages_friendmessages.steamclient_pb2")
 auth = importlib.import_module("steammessages_auth.steamclient_pb2")
 player = importlib.import_module("steammessages_player.steamclient_pb2")
 cs2 = importlib.import_module("steammessages_clientserver_2_pb2")
+parental = importlib.import_module("steammessages_parental.steamclient_pb2")
+parental_objects = importlib.import_module("steammessages_parental_objects_pb2")
 
 ID = 76561197960287930  # an account's 64-bit id
 ID2 = 76561197960265729
@@ -95,6 +99,29 @@ CASES = {
     "ClientChangeStatus": (friends.CMsgClientChangeStatus, dict(
         persona_state=7, player_name="Some One", is_auto_generated_name=True, high_priority=True,
         persona_set_by_user=True, persona_state_flags=1, need_persona_response=True, is_client_idle=True)),
+    "GetCommunityPreferencesRequest": (player.CPlayer_GetCommunityPreferences_Request, dict()),
+    "CommunityPreferences": (player.CPlayer_CommunityPreferences, dict(
+        timestamp_updated=1790000000, parenthesize_nicknames=True, text_filter_setting=2, text_filter_ignore_friends=False, text_filter_words_revision=7)),
+    "GetCommunityPreferencesResponse": (player.CPlayer_GetCommunityPreferences_Response, dict(preferences=dict(text_filter_setting=1, text_filter_ignore_friends=True))),
+    "GetTextFilterWordsRequest": (player.CPlayer_GetTextFilterWords_Request, dict()),
+    "TextFilterWords": (player.CPlayer_TextFilterWords, dict(text_filter_custom_banned_words=["a", "b"], text_filter_custom_clean_words=["c"], text_filter_words_revision=3)),
+    "GetTextFilterWordsResponse": (player.CPlayer_GetTextFilterWords_Response, dict(words=dict(text_filter_custom_banned_words=["x"]))),
+    "GetPrivacySettingsRequest": (player.CPlayer_GetPrivacySettings_Request, dict()),
+    "PrivacySettings": (player.CPrivacySettings, dict(
+        privacy_state=3, privacy_state_inventory=2, privacy_state_gifts=1, privacy_state_ownedgames=3, privacy_state_playtime=2, privacy_state_friendslist=1)),
+    "GetPrivacySettingsResponse": (player.CPlayer_GetPrivacySettings_Response, dict(privacy_settings=dict(privacy_state=2))),
+    "GetParentalSettingsRequest": (parental.CParental_GetParentalSettings_Request, dict(steamid=ID)),
+    "ParentalSettings": (parental_objects.ParentalSettings, dict(steamid=ID, is_enabled=True, enabled_features=15, temporary_enabled_features=3)),
+    "GetParentalSettingsResponse": (parental.CParental_GetParentalSettings_Response, dict(settings=dict(is_enabled=True, enabled_features=8))),
+    "EnumerateTokensRequest": (auth.CAuthentication_RefreshToken_Enumerate_Request, dict(include_revoked=True)),
+    "TokenUsageEvent": (auth.CAuthentication_RefreshToken_Enumerate_Response.TokenUsageEvent, dict(time=1790000001, country="GB", state="ENG", city="London")),
+    "RefreshTokenDescription": (auth.CAuthentication_RefreshToken_Enumerate_Response.RefreshTokenDescription, dict(
+        token_id=2**40 + 3, token_description="moho on host", time_updated=1790000002, platform_type=3, logged_in=True,
+        first_seen=dict(time=1, country="GB"), last_seen=dict(time=2, city="London"))),
+    "EnumerateTokensResponse": (auth.CAuthentication_RefreshToken_Enumerate_Response, dict(
+        refresh_tokens=[dict(token_id=5, token_description="phone", platform_type=3)], requesting_token=5)),
+    "RevokeRefreshTokenRequest": (auth.CAuthentication_RefreshToken_Revoke_Request, dict(token_id=2**40 + 3, steamid=ID)),
+    "RevokeRefreshTokenResponse": (auth.CAuthentication_RefreshToken_Revoke_Response, dict()),
     "FriendGroup": (friends.CMsgClientFriendsGroupsList.FriendGroup, dict(nGroupID=7, strGroupName="Raiders")),
     "FriendGroupMembership": (friends.CMsgClientFriendsGroupsList.FriendGroupsMembership, dict(ulSteamID=ID, nGroupID=7)),
     "ClientFriendsGroupsList": (friends.CMsgClientFriendsGroupsList, dict(

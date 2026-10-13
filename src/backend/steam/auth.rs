@@ -223,8 +223,41 @@ pub async fn send_code(link: &Link, begun: &Begun, guard: &Guard, code: &str) ->
     Ok(())
 }
 
+/// Starts a sign-in that a phone will approve by scanning a code. Answers with
+/// the address the code carries; the session is then polled as any other.
+pub async fn begin_qr(link: &Link) -> Result<(Begun, String), CallError> {
+    let request = BeginAuthViaQrRequest { device_friendly_name: Some(device_name()), platform_type: Some(PLATFORM_TYPE), device_details: Some(device_details()), website_id: Some(WEBSITE_ID.to_string()) };
+    let begun: BeginAuthViaQrResponse = link.call("Authentication.BeginAuthSessionViaQR#1", &request, false).await?;
+    let url = begun.challenge_url.filter(|u| !u.is_empty()).ok_or_else(|| CallError::Unreadable("Steam gave no code to scan".to_string()))?;
+    Ok((
+        Begun { client_id: begun.client_id.unwrap_or_default(), request_id: begun.request_id.unwrap_or_default(), interval: poll_interval(begun.interval), steamid: 0, confirmations: Vec::new() },
+        url,
+    ))
+}
+
+/// Who a token is for: its subject, in the middle part of the token. A scan
+/// does not say, and an account is kept by its number.
+pub fn steamid_of_token(token: &str) -> Option<u64> {
+    let payload = token.split('.').nth(1)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    claims["sub"].as_str()?.parse().ok()
+}
+
+/// What one look at a session that is waiting for a scan found.
+pub struct Polled {
+    pub tokens: Option<Tokens>,
+    /// The code runs out and is replaced: the address to draw now.
+    pub new_challenge: Option<String>,
+}
+
 /// Asks once whether the session has gone through. `None` means not yet.
 pub async fn poll(link: &Link, begun: &mut Begun) -> Result<Option<Tokens>, CallError> {
+    Ok(poll_session(link, begun).await?.tokens)
+}
+
+/// The same, and what else the answer said.
+pub async fn poll_session(link: &Link, begun: &mut Begun) -> Result<Polled, CallError> {
     let answer: PollAuthSessionResponse = link
         .call(
             "Authentication.PollAuthSessionStatus#1",
@@ -236,15 +269,14 @@ pub async fn poll(link: &Link, begun: &mut Begun) -> Result<Option<Tokens>, Call
     if let Some(id) = answer.new_client_id.filter(|id| *id != 0) {
         begun.client_id = id;
     }
-    match answer.refresh_token.filter(|t| !t.is_empty()) {
-        None => Ok(None),
-        Some(refresh_token) => Ok(Some(Tokens {
-            refresh_token,
-            access_token: answer.access_token.unwrap_or_default(),
-            account_name: answer.account_name.filter(|n| !n.is_empty()),
-            guard_data: answer.new_guard_data.filter(|g| !g.is_empty()),
-        })),
-    }
+    let new_challenge = answer.new_challenge_url.filter(|u| !u.is_empty());
+    let tokens = answer.refresh_token.filter(|t| !t.is_empty()).map(|refresh_token| Tokens {
+        refresh_token,
+        access_token: answer.access_token.unwrap_or_default(),
+        account_name: answer.account_name.filter(|n| !n.is_empty()),
+        guard_data: answer.new_guard_data.filter(|g| !g.is_empty()),
+    });
+    Ok(Polled { tokens, new_challenge })
 }
 
 #[cfg(test)]
@@ -457,5 +489,14 @@ mod tests {
     fn the_session_is_named_for_the_machine_it_is_on() {
         assert!(device_name().starts_with("moho"));
         assert_eq!(os_type(), if cfg!(windows) { 16 } else { 4294967093 });
+    }
+
+    #[test]
+    fn a_token_says_whose_it_is_in_its_subject() {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"iss":"steam","sub":"76561197960287930","aud":["mobile"]}"#);
+        assert_eq!(steamid_of_token(&format!("eyJhbGciOiJFZERTQSJ9.{payload}.signature")), Some(76561197960287930));
+        assert_eq!(steamid_of_token("not a token"), None);
+        assert_eq!(steamid_of_token("a.b.c"), None);
     }
 }

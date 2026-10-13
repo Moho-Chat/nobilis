@@ -888,3 +888,58 @@ async fn invite_links_are_listed_made_and_revoked() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Scan-to-sign-in against real Steam, as far as it can go without a phone: the
+/// session begins, Steam gives the address a code carries, a picture of it is
+/// written, and polling it is answered "not yet". Then the sign-in is cancelled.
+/// Needs no account.
+#[tokio::test]
+#[ignore = "needs the network; signs nothing in"]
+async fn a_scan_to_sign_in_begins_and_waits_for_a_phone() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-qr");
+    let key = crate::net::route::pending_key("steam");
+    let servers = super::cm::discover(&key, 0).await.expect("Steam's server list");
+    let urls: Vec<String> = servers.iter().take(4).map(|s| s.url()).collect();
+    let (cancel, cancelled) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let task = tokio::spawn({
+        let state = state.clone();
+        async move { super::login::flow_qr(&state, "probe-qr", &urls, cancelled).await }
+    });
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let path = crate::media_cache::transient_dir().join("moho-steam-qr-probe-qr.png");
+    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    println!("QR picture written: {} bytes", size);
+    drop(cancel);
+    let ended = tokio::time::timeout(Duration::from_secs(40), task).await;
+    println!("QR ended: {:?}", ended.map(|r| r.map(|o| o.map(|c| c.is_some()))));
+    let _ = std::fs::remove_file(path);
+    assert!(size > 500, "a picture was written");
+}
+
+/// What the account is, as Steam says it, and where it is signed in. Reads only.
+#[tokio::test]
+#[ignore = "needs a real Steam account; changes nothing"]
+async fn the_account_facts_and_sessions_are_read() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-facts");
+    for role in ["SENDER"] {
+        let config = account(role);
+        let id = config.account_id();
+        state.accounts.add_steam(config.clone()).unwrap();
+        connect::spawn(state.clone(), config.clone());
+        within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+        within(30, "the facts", || super::account::held(&id).privacy.is_some() || super::account::held(&id).family_view.is_some() || super::account::held(&id).filter.is_some()).await;
+        println!("FACTS {role} {}", super::account::held(&id).to_json());
+        let link = state.runtime.steam_link(&id).unwrap();
+        let sessions = super::account::sessions(&link).await;
+        println!("SESSIONS {role} {:?}", sessions.as_ref().map(|s| s.iter().map(|x| (x.description.clone(), x.platform, x.current, x.place.clone())).collect::<Vec<_>>()));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let exp = super::account::expires_at(&config.refresh_token);
+        println!("TOKEN expires in {:?} days; due for renewal: {}", exp.map(|e| (e as i64 - now as i64) / 86400), super::account::due_for_renewal(&config.refresh_token, now));
+        if let Some(link) = state.runtime.take_steam_link(&id) {
+            crate::backend::steam::sign_off(link);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

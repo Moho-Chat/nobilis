@@ -75,12 +75,28 @@ fn fill_names(card: &mut Value, names: &[(String, String)]) {
     }
 }
 
+/// A length of time in the units a person says it in.
+fn how_long(seconds: u64) -> String {
+    match seconds {
+        0..=59 => "under a minute".to_string(),
+        60..=3599 => format!("{} min", seconds / 60),
+        _ => format!("{}h {:02}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
 /// Adds what is already known from how they are showing.
 fn fill_from_presence(card: &mut Value, member: &Value) {
     profile::set(card, "status", member["status"].as_str().map(|s| json!(s)));
     profile::set(card, "avatarUrl", member["avatarUrl"].as_str().map(|s| json!(s)));
     profile::set(card, "activity", Some(member["activity"].clone()).filter(|a| !a.is_null()));
     profile::note(card, "On", member["client"].as_str().unwrap_or_default());
+    // Only as long as moho has seen it: Steam does not say how long anybody has been in a game.
+    if let Some(since) = member["playingSince"].as_u64().filter(|s| *s > 0) {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if now > since {
+            profile::note(card, "Seen playing for", how_long(now - since));
+        }
+    }
     profile::note(card, "Doing", member["rich"].as_str().unwrap_or_default());
     // Only for somebody who is not here: for somebody who is, it is now.
     if member["status"].as_str() == Some("offline") {
@@ -131,6 +147,17 @@ mod tests {
 
     fn labels(card: &Value) -> Vec<(String, String)> {
         card["extra"].as_array().map(|a| a.iter().map(|e| (e["label"].as_str().unwrap().to_string(), e["value"].as_str().unwrap().to_string())).collect()).unwrap_or_default()
+    }
+
+    #[test]
+    fn how_long_they_have_been_seen_playing_is_said_in_a_person_s_units() {
+        assert_eq!(how_long(20), "under a minute");
+        assert_eq!(how_long(600), "10 min");
+        assert_eq!(how_long(3600 + 5 * 60), "1h 05m");
+        let mut card = profile::pending("steam", "steam:me", "Gabe");
+        let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 4000;
+        fill_from_presence(&mut card, &json!({ "status": "online", "activity": { "kind": "game", "text": "X" }, "playingSince": since }));
+        assert_eq!(labels(&card), [("Seen playing for".to_string(), "1h 06m".to_string())]);
     }
 
     #[test]

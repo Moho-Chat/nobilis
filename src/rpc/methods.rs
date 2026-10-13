@@ -106,7 +106,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addMatrixAccount" | "addMatrixAccountDeviceCode" | "matrixAuthMetadata" | "registerMatrixAccount"
         | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
-        "addSteamAccount" => Some("steam"),
+        "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
         _ => None,
     }
 }
@@ -4073,6 +4073,13 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // The same by scanning a code with the Steam app on a phone: nothing is typed.
+        "addSteamAccountQr" => {
+            let login_id = format!("steam-{}", crate::model::next_message_id());
+            backend::steam::login::start_qr(state.clone(), login_id.clone());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
         // The code Steam asked for, for a sign-in that is waiting on one.
         "submitSteamGuardCode" => {
             let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), p_str_opt(params, "code")) else {
@@ -4147,6 +4154,40 @@ pub async fn dispatch(
             None => (None, Some("steamFriendGroups requires \"accountId\"".to_string())),
             Some(account_id) => (Some(backend::steam::groups::held(account_id).to_json()), None),
         },
+
+        // What the account is - limited or not, Family View, the text filter, who may
+        // see what - and where it is signed in, which can be ended from here.
+        "steamAccountFacts" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamAccountFacts requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(backend::steam::account::held(account_id).to_json()), None),
+        },
+        "steamSessions" | "steamRevokeSession" => {
+            use backend::steam::account;
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some(format!("{method} requires \"accountId\"")));
+            };
+            let (Some(link), Some(config)) = (state.runtime.steam_link(account_id), state.accounts.get_steam(account_id)) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            if method == "steamRevokeSession" {
+                let Some(token_id) = p_str_opt(params, "tokenId").and_then(|t| t.parse::<u64>().ok()) else {
+                    return (None, Some("steamRevokeSession requires \"tokenId\"".to_string()));
+                };
+                if let Err(e) = account::revoke(&link, config.steamid, token_id).await {
+                    return (None, Some(e));
+                }
+            }
+            match account::sessions(&link).await {
+                Ok(list) => (
+                    Some(serde_json::json!(list
+                        .iter()
+                        .map(|s| serde_json::json!({ "tokenId": s.id.to_string(), "description": s.description, "platform": s.platform, "lastSeen": s.last_seen, "place": s.place, "current": s.current }))
+                        .collect::<Vec<_>>())),
+                    None,
+                ),
+                Err(e) => (None, Some(e)),
+            }
+        }
 
         // Who the account has blocked, and lifting a block: a blocked person has no
         // conversation to do it from.

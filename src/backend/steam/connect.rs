@@ -83,7 +83,7 @@ pub enum Ending {
 /// What Steam said to a sign-in.
 #[derive(Debug, PartialEq)]
 pub enum Logon {
-    Welcome { heartbeat: Duration, steamid: u64, session: i32 },
+    Welcome { heartbeat: Duration, steamid: u64, session: i32, account_flags: u32 },
     Refused(Ending),
     /// This server cannot take it; another may.
     TryAnother(String),
@@ -101,6 +101,7 @@ pub fn read_logon(packet: &Packet) -> Result<Logon> {
             heartbeat: Duration::from_secs(heartbeat.clamp(5, 300) as u64),
             steamid: packet.header.steamid.or(response.client_supplied_steamid).unwrap_or_default(),
             session: packet.header.client_sessionid.unwrap_or_default(),
+            account_flags: response.account_flags.unwrap_or(0),
         });
     }
     Ok(match code {
@@ -236,6 +237,7 @@ struct Registered<'a> {
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
         super::groups::clear(self.account_id);
+        super::account::clear(self.account_id);
         super::blocked::clear(self.account_id);
         self.state.runtime.take_steam_link(self.account_id);
     }
@@ -263,8 +265,8 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
             Ok(Some(_)) => continue,
         }
     };
-    let (heartbeat, steamid, session) = match read_logon(&reply)? {
-        Logon::Welcome { heartbeat, steamid, session } => (heartbeat, steamid, session),
+    let (heartbeat, steamid, session, account_flags) = match read_logon(&reply)? {
+        Logon::Welcome { heartbeat, steamid, session, account_flags } => (heartbeat, steamid, session, account_flags),
         Logon::Refused(ending) => return Ok(Outcome::Ended(ending)),
         Logon::TryAnother(why) => return Ok(Outcome::Unreached(why)),
     };
@@ -280,6 +282,13 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         state.runtime.set_own_identity(account_id, &config.username);
     }
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
+    // What the account is and what Steam holds back from it, and keeping its
+    // sign-in alive: asked in the background, so nothing waits for either.
+    tokio::spawn(super::account::load(state.clone(), link.clone(), account_id.to_string(), steamid, account_flags));
+    {
+        let (state, link, config) = (state.clone(), link.clone(), config.clone());
+        tokio::spawn(async move { super::account::renew_if_due(&state, &link, &config).await });
+    }
 
     // Appearing at all takes saying so: an account that signs in and says
     // nothing is not shown as online to anyone. The status somebody chose is
@@ -418,6 +427,7 @@ impl Drive<'_> {
                         if renamed {
                             self.shown.publish(self.state, &self.roster);
                         }
+                        self.shown.apply_mutes(self.state, &self.roster);
                     }
                 }
                 heard = self.apps.heard.recv() => {
@@ -537,6 +547,7 @@ impl Drive<'_> {
                             if self.roster.set_preferences(&prefs) {
                                 self.shown.publish(self.state, &self.roster);
                             }
+                            self.shown.apply_mutes(self.state, &self.roster);
                         }
                     }
                 }
@@ -980,7 +991,7 @@ mod tests {
     #[test]
     fn steams_heartbeat_interval_is_kept_to_something_sensible() {
         let welcomed = read_logon(&reply_logon(1, 1)).unwrap();
-        assert_eq!(welcomed, Logon::Welcome { heartbeat: Duration::from_secs(5), steamid: ME, session: 4242 }, "never faster than every five seconds");
+        assert_eq!(welcomed, Logon::Welcome { heartbeat: Duration::from_secs(5), steamid: ME, session: 4242, account_flags: 0 }, "never faster than every five seconds");
         assert!(matches!(read_logon(&reply_logon(1, 99999)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(300)));
         assert!(matches!(read_logon(&reply_logon(1, 0)).unwrap(), Logon::Welcome { heartbeat, .. } if heartbeat == Duration::from_secs(27)), "no interval means the usual one");
     }

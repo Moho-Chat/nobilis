@@ -54,6 +54,14 @@ impl Conversations {
         }
     }
 
+    /// Follows the account's mutes - set in another client, or here - onto the
+    /// conversations: muted on Steam is silent here, and the row says so.
+    pub fn apply_mutes(&self, state: &AppState, roster: &Roster) {
+        for (account, shown) in &self.shown {
+            state.runtime.set_silenced(state, &crate::model::buffer_id(&self.account_id, &shown.name), roster.muted(*account));
+        }
+    }
+
     /// The name of the conversation with this person, as it is on screen now.
     pub fn name_of(&self, account: u32) -> Option<&str> {
         self.shown.get(&account).map(|s| s.name.as_str())
@@ -93,6 +101,8 @@ impl Conversations {
             let buffer = state.runtime.ensure_buffer(state, &self.account_id, &name, "dm");
             // Made new, or renamed from its number: a warning on it comes back.
             super::notices::restore_buffer(state, &self.account_id, &buffer.id);
+            // And whether the account has muted them, wherever it did.
+            state.runtime.set_silenced(state, &buffer.id, roster.muted(account));
             state.runtime.set_buffer_remote_id(state, &buffer.id, &steamid::text_of(account));
             if let Some(url) = &avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
@@ -105,6 +115,7 @@ impl Conversations {
                 "userId": steamid::text_of(account),
                 "status": status,
                 "activity": activity.map(|(kind, text)| json!({ "kind": kind, "text": text })),
+                "playingSince": persona.filter(|p| p.app.is_some() || p.game.is_some()).and_then(|p| p.playing_since),
                 "client": detail.0,
                 "lastSeen": detail.1,
                 "rich": detail.2,
@@ -249,6 +260,25 @@ mod tests {
         assert_eq!(roster.game_of(22202).as_deref(), Some("My Mod"));
         roster.apply_persona(&update(vec![PersonaFriend { friendid: Some(steamid::steamid_of(22202)), gameid: Some(0), ..Default::default() }]));
         assert_eq!(roster.game_of(22202), None);
+    }
+
+    #[test]
+    fn a_mute_set_on_steam_silences_the_conversation_here_and_lifting_it_unsilences() {
+        let state = simulated_daemon("steam-publish-mute");
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&friends(&[22202]));
+        roster.apply_persona(&update(vec![who(22202, "Gabe", 1)]));
+        let mut shown = Conversations::new(ACCOUNT);
+        shown.publish(&state, &roster);
+        let id = crate::model::buffer_id(ACCOUNT, "Gabe");
+        assert!(!state.runtime.get_buffer(&id).unwrap().server_muted);
+        // Muted in another client: it arrives as the account's preferences for them.
+        roster.set_preferences(&PerFriendPreferences { accountid: Some(22202), notifications_showmessages: Some(crate::backend::steam::friends::NOTIFY_NEVER), ..Default::default() });
+        shown.apply_mutes(&state, &roster);
+        assert!(state.runtime.get_buffer(&id).unwrap().server_muted, "the row says it is muted");
+        roster.set_preferences(&PerFriendPreferences { accountid: Some(22202), ..Default::default() });
+        shown.apply_mutes(&state, &roster);
+        assert!(!state.runtime.get_buffer(&id).unwrap().server_muted);
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub struct Persona {
     pub game: Option<String>,
     /// Its number, which is all Steam says of a game that is on Steam.
     pub app: Option<u64>,
+    /// When this was first seen to be what they are playing, unix seconds. Steam does not
+    /// say how long anybody has been in a game, so this is only since moho noticed.
+    pub playing_since: Option<u32>,
     /// The avatar's hash as hex.
     pub avatar: Option<String>,
     /// `EPersonaStateFlag`: which kind of client they are on, among other things.
@@ -218,6 +221,11 @@ impl Roster {
         before.as_deref() != self.nickname(account)
     }
 
+    /// Whether the account has muted this friend's messages, on any of its clients.
+    pub fn muted(&self, account: u32) -> bool {
+        self.preferences.get(&account).is_some_and(|p| p.notifications_showmessages == Some(NOTIFY_NEVER))
+    }
+
     /// Sets only what the account calls a friend, keeping the rest it holds.
     /// Returns whether that name changed.
     pub fn set_nickname(&mut self, account: u32, nickname: Option<&str>) -> bool {
@@ -306,11 +314,13 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
     if update.gameid == Some(0) || update.game_played_app_id == Some(0) {
         held.game = None;
         held.app = None;
+        held.playing_since = None;
     }
     if let Some(app) = update.game_played_app_id.map(u64::from).filter(|a| *a > 0).or(update.gameid.filter(|g| *g > 0)) {
         if held.app != Some(app) {
             // A different game: what was said of the last is not said of this one.
             held.game = None;
+            held.playing_since = Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0));
         }
         held.app = Some(app);
     }

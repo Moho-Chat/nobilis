@@ -861,6 +861,158 @@ pub struct ClientRemoveFriendFromGroupResponse {
     pub eresult: Option<u32>,
 }
 
+/// What the account has set for how text from others is filtered.
+#[derive(Clone, PartialEq, Message)]
+pub struct GetCommunityPreferencesRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CommunityPreferences {
+    #[prost(uint32, optional, tag = "3")]
+    pub timestamp_updated: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub parenthesize_nicknames: Option<bool>,
+    /// `ETextFilterSetting`: 0 opted out of the lab, 1 on, 2 on but profanity allowed, 3 off.
+    #[prost(int32, optional, tag = "5")]
+    pub text_filter_setting: Option<i32>,
+    #[prost(bool, optional, tag = "6")]
+    pub text_filter_ignore_friends: Option<bool>,
+    #[prost(uint32, optional, tag = "7")]
+    pub text_filter_words_revision: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetCommunityPreferencesResponse {
+    #[prost(message, optional, tag = "1")]
+    pub preferences: Option<CommunityPreferences>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetTextFilterWordsRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TextFilterWords {
+    #[prost(string, repeated, tag = "1")]
+    pub text_filter_custom_banned_words: Vec<String>,
+    #[prost(string, repeated, tag = "2")]
+    pub text_filter_custom_clean_words: Vec<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub text_filter_words_revision: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetTextFilterWordsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub words: Option<TextFilterWords>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetPrivacySettingsRequest {}
+
+/// Who may see what on the account: 1 private, 2 friends only, 3 public.
+#[derive(Clone, PartialEq, Message)]
+pub struct PrivacySettings {
+    #[prost(int32, optional, tag = "1")]
+    pub privacy_state: Option<i32>,
+    #[prost(int32, optional, tag = "2")]
+    pub privacy_state_inventory: Option<i32>,
+    #[prost(int32, optional, tag = "3")]
+    pub privacy_state_gifts: Option<i32>,
+    #[prost(int32, optional, tag = "4")]
+    pub privacy_state_ownedgames: Option<i32>,
+    #[prost(int32, optional, tag = "5")]
+    pub privacy_state_playtime: Option<i32>,
+    #[prost(int32, optional, tag = "6")]
+    pub privacy_state_friendslist: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetPrivacySettingsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub privacy_settings: Option<PrivacySettings>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetParentalSettingsRequest {
+    #[prost(fixed64, optional, tag = "10")]
+    pub steamid: Option<u64>,
+}
+
+/// Family View, as far as saying whether it is on and what it holds back.
+#[derive(Clone, PartialEq, Message)]
+pub struct ParentalSettings {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid: Option<u64>,
+    #[prost(bool, optional, tag = "9")]
+    pub is_enabled: Option<bool>,
+    #[prost(uint32, optional, tag = "10")]
+    pub enabled_features: Option<u32>,
+    #[prost(uint32, optional, tag = "13")]
+    pub temporary_enabled_features: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetParentalSettingsResponse {
+    #[prost(message, optional, tag = "1")]
+    pub settings: Option<ParentalSettings>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EnumerateTokensRequest {
+    #[prost(bool, optional, tag = "1")]
+    pub include_revoked: Option<bool>,
+}
+
+/// Where and when a signed-in session was first or last seen.
+#[derive(Clone, PartialEq, Message)]
+pub struct TokenUsageEvent {
+    #[prost(uint32, optional, tag = "1")]
+    pub time: Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub country: Option<String>,
+    #[prost(string, optional, tag = "5")]
+    pub state: Option<String>,
+    #[prost(string, optional, tag = "6")]
+    pub city: Option<String>,
+}
+
+/// One signed-in session of the account: a phone, a browser, a launcher.
+#[derive(Clone, PartialEq, Message)]
+pub struct RefreshTokenDescription {
+    #[prost(fixed64, optional, tag = "1")]
+    pub token_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub token_description: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_updated: Option<u32>,
+    #[prost(int32, optional, tag = "4")]
+    pub platform_type: Option<i32>,
+    #[prost(bool, optional, tag = "5")]
+    pub logged_in: Option<bool>,
+    #[prost(message, optional, tag = "9")]
+    pub first_seen: Option<TokenUsageEvent>,
+    #[prost(message, optional, tag = "10")]
+    pub last_seen: Option<TokenUsageEvent>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct EnumerateTokensResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub refresh_tokens: Vec<RefreshTokenDescription>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub requesting_token: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RevokeRefreshTokenRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub token_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RevokeRefreshTokenResponse {}
+
 /// Everything an account may put in a message beyond words.
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientEmoticonList {
@@ -1142,6 +1294,10 @@ mod tests {
                 GetPerFriendPreferencesResponse, SetPerFriendPreferencesRequest, SetPerFriendPreferencesResponse,
                 PerFriendPreferencesChanged, FriendNicknameChanged, IgnoreFriendRequest, IgnoreFriendResponse,
                 ClientGetEmoticonList, EmoticonOwned, StickerOwned, EffectOwned, ClientEmoticonList,
+                GetCommunityPreferencesRequest, CommunityPreferences, GetCommunityPreferencesResponse, GetTextFilterWordsRequest,
+                TextFilterWords, GetTextFilterWordsResponse, GetPrivacySettingsRequest, PrivacySettings, GetPrivacySettingsResponse,
+                GetParentalSettingsRequest, ParentalSettings, GetParentalSettingsResponse, EnumerateTokensRequest, TokenUsageEvent,
+                RefreshTokenDescription, EnumerateTokensResponse, RevokeRefreshTokenRequest, RevokeRefreshTokenResponse,
                 FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
                 ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
                 ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
@@ -1149,7 +1305,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 87, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 105, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

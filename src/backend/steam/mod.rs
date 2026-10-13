@@ -38,6 +38,7 @@ pub mod invites;
 pub mod history;
 pub mod link;
 pub mod login;
+pub mod account;
 pub mod apps;
 pub mod blocked;
 pub mod notices;
@@ -75,11 +76,23 @@ pub fn sign_off(link: link::Link) {
     });
 }
 
+/// Says why a refusal may be what it is, when the account is one Steam holds back.
+pub fn explained(account_id: &str, why: String) -> String {
+    let facts = account::held(account_id);
+    if facts.family_view.is_some_and(|(_, holds_friends)| holds_friends) {
+        return format!("{why} (Family View is on for this account and holds friends and chat back; unlock it in Steam to chat)");
+    }
+    why
+}
+
 /// Sends a direct message in the conversation `buffer` is, and stores it.
 pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
     let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
-    let sent = chat::send(&link, &recipient, body).await.inspect_err(|why| tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id))?;
+    let sent = chat::send(&link, &recipient, body).await.map_err(|why| {
+        tracing::info!("steam[{}]: a message to {recipient} was not sent: {why}", buffer.account_id);
+        explained(&buffer.account_id, why)
+    })?;
     tracing::info!("steam[{}]: sent a message to {recipient} as {}", buffer.account_id, sent.id);
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_default();
     state.runtime.record_message_at(

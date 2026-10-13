@@ -110,6 +110,116 @@ pub fn start(state: AppState, login_id: String, username: String, password: Stri
     });
 }
 
+/// Starts a sign-in by scanning a code with the Steam app on a phone: no name
+/// and no password are typed here at all. Answers at once; the code to draw
+/// and the end are events - `steamLoginQr` carries the picture, and the rest is
+/// as for a typed sign-in.
+pub fn start_qr(state: AppState, login_id: String) {
+    let (code_tx, code_rx) = mpsc::unbounded_channel();
+    waiting().lock().unwrap().insert(login_id.clone(), code_tx);
+    tokio::spawn(async move {
+        let outcome = async {
+            let key = crate::net::route::pending_key("steam");
+            let servers = cm::discover(&key, 0).await?;
+            let urls: Vec<String> = servers.iter().take(4).map(|s| s.url()).collect();
+            flow_qr(&state, &login_id, &urls, code_rx).await
+        }
+        .await;
+        waiting().lock().unwrap().remove(&login_id);
+        let _ = std::fs::remove_file(qr_path(&login_id));
+        match outcome {
+            Ok(Some(saved)) => {
+                let account = finish(&saved);
+                connect::spawn(state.clone(), saved);
+                state.events.emit("steamLoginResult", json!({ "loginId": login_id, "success": true, "account": account }));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::info!("steam: sign-in {login_id}: {error}");
+                state.events.emit("steamLoginResult", json!({ "loginId": login_id, "success": false, "error": error }));
+            }
+        }
+    });
+}
+
+fn qr_path(login_id: &str) -> std::path::PathBuf {
+    crate::media_cache::transient_dir().join(format!("moho-steam-qr-{}.png", login_id.replace(|c: char| !c.is_ascii_alphanumeric(), "-")))
+}
+
+/// The address as a picture a phone can scan. The code is a credential for as
+/// long as it is shown: whoever scans and approves it is signed in as them.
+pub fn write_qr(address: &str, path: &std::path::Path) -> Result<()> {
+    let code = qrcode::QrCode::new(address.as_bytes())?;
+    let image = code.render::<image::Luma<u8>>().min_dimensions(320, 320).build();
+    image.save_with_format(path, image::ImageFormat::Png).context("encoding the QR code as PNG")?;
+    let _ = crate::secure::restrict_file_to_owner(path);
+    Ok(())
+}
+
+/// The scan-to-sign-in itself, on the first of `urls` that answers.
+pub async fn flow_qr(state: &AppState, login_id: &str, urls: &[String], mut cancelled: mpsc::UnboundedReceiver<String>) -> Result<Option<SteamAccountConfig>> {
+    let status = |detail: &str| state.events.emit("steamLoginStatus", json!({ "loginId": login_id, "detail": detail }));
+    let key = crate::net::route::pending_key("steam");
+    status("connecting to Steam");
+    let mut opened = None;
+    let mut last = anyhow!("no Steam server to connect to");
+    for url in urls {
+        match link::open(&key, url).await {
+            Ok(ok) => {
+                opened = Some(ok);
+                break;
+            }
+            Err(e) => last = e,
+        }
+    }
+    let (link, _told) = opened.ok_or(last).context("reaching Steam")?;
+    link.send(emsg::CLIENT_HELLO, &ClientHello { protocol_version: Some(connect::PROTOCOL_VERSION) })?;
+
+    let (mut begun, address) = auth::begin_qr(&link).await.map_err(|e| anyhow!("{e}"))?;
+    let path = qr_path(login_id);
+    write_qr(&address, &path)?;
+    state.events.emit("steamLoginQr", json!({ "loginId": login_id, "path": path.to_string_lossy() }));
+    status("waiting for the code to be scanned");
+
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let tokens = loop {
+        tokio::select! {
+            // The form was closed (or the sender dropped): nobody is waiting.
+            _ = cancelled.recv() => return Ok(None),
+            _ = tokio::time::sleep(begun.interval) => {
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("the code was not scanned in time; start again");
+                }
+                let polled = auth::poll_session(&link, &mut begun).await.map_err(|e| anyhow!("{e}"))?;
+                // A code runs out and is replaced: the picture follows it.
+                if let Some(next) = polled.new_challenge {
+                    write_qr(&next, &path)?;
+                    state.events.emit("steamLoginQr", json!({ "loginId": login_id, "path": path.to_string_lossy(), "renewed": true }));
+                }
+                if let Some(tokens) = polled.tokens {
+                    break tokens;
+                }
+            }
+        }
+    };
+    status("signed in");
+    let steamid = auth::steamid_of_token(&tokens.refresh_token).ok_or_else(|| anyhow!("Steam's token did not say whose it is"))?;
+    let username = tokens.account_name.clone().map(|n| n.to_lowercase()).ok_or_else(|| anyhow!("Steam did not say the account's name"))?;
+    let config = SteamAccountConfig {
+        username,
+        steamid,
+        display_name: None,
+        refresh_token: tokens.refresh_token,
+        guard_data: tokens.guard_data,
+        session: "chat".to_string(),
+        use_tor: crate::net::route::router().wanted(&key),
+        strict_route: false,
+    };
+    let saved = state.accounts.add_steam(config).context("saving the account")?;
+    Ok(Some(saved))
+}
+
 /// What a finished sign-in is worth to the window: the account as it lists,
 /// and the route the account will be reached by remembered for it.
 pub fn finish(saved: &SteamAccountConfig) -> serde_json::Value {
@@ -149,7 +259,11 @@ pub async fn flow(
     link.send(emsg::CLIENT_HELLO, &ClientHello { protocol_version: Some(connect::PROTOCOL_VERSION) })?;
 
     status("signing in");
-    let mut begun = auth::begin(&link, &username, password, None).await.map_err(|e| anyhow!("{e}"))?;
+    // The note Steam gave last time this machine signed this account in, if there
+    // is one: sent so that Steam knows the machine and does not ask for a Guard
+    // code again.
+    let remembered = state.accounts.get_steam(&format!("steam:{username}")).and_then(|a| a.guard_data).filter(|g| !g.is_empty());
+    let mut begun = auth::begin(&link, &username, password, remembered.as_deref()).await.map_err(|e| anyhow!("{e}"))?;
     let steamid = begun.steamid;
 
     let options = options_of(&begun);
@@ -363,6 +477,35 @@ mod tests {
         // Everything Steam was sent about the password was encrypted.
         let begin = seen.lock().unwrap().iter().find(|p| p.header.target_job_name.as_deref() == Some("Authentication.BeginAuthSessionViaCredentials#1")).cloned().unwrap();
         assert!(!String::from_utf8_lossy(&begin.body).contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn a_machine_that_signed_in_before_says_so() {
+        let state = simulated_daemon("steam-login-remembered");
+        let _ = state.accounts.add_steam(SteamAccountConfig { username: "someone".into(), steamid: 76561197960287930, refresh_token: "old".into(), guard_data: Some("remember-me".into()), session: "chat".into(), ..Default::default() });
+        let (n, e) = keys();
+        let begin_seen = Arc::new(Mutex::new(None::<BeginAuthViaCredentialsRequest>));
+        let url = serve({
+            let seen = begin_seen.clone();
+            Box::new(move |req| {
+                let method = req.header.target_job_name.clone().unwrap_or_default();
+                Some(vec![match method.as_str() {
+                    "Authentication.GetPasswordRSAPublicKey#1" => answer(&req, 1, GetPasswordRsaPublicKeyResponse { publickey_mod: Some(n.clone()), publickey_exp: Some(e.clone()), timestamp: Some(1) }.encode_to_vec()),
+                    "Authentication.BeginAuthSessionViaCredentials#1" => {
+                        *seen.lock().unwrap() = Some(BeginAuthViaCredentialsRequest::decode(req.body.as_slice()).unwrap());
+                        // Steam knows the machine: nothing more is asked, and the next poll goes through.
+                        answer(&req, 1, BeginAuthViaCredentialsResponse { client_id: Some(9), request_id: Some(vec![1]), interval: Some(0.5), steamid: Some(76561197960287930), ..Default::default() }.encode_to_vec())
+                    }
+                    "Authentication.PollAuthSessionStatus#1" => answer(&req, 1, PollAuthSessionResponse { refresh_token: Some("new".into()), account_name: Some("someone".into()), new_guard_data: Some("remember-me-too".into()), ..Default::default() }.encode_to_vec()),
+                    _ => answer(&req, 1, Vec::new()),
+                }])
+            })
+        })
+        .await;
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let saved = flow(&state, "login-r", "someone", "hunter2", &[url], rx).await.unwrap().expect("signed in");
+        assert_eq!(begin_seen.lock().unwrap().as_ref().and_then(|b| b.guard_data.as_deref()), Some("remember-me"), "the note from last time went with the sign-in");
+        assert_eq!(saved.guard_data.as_deref(), Some("remember-me-too"), "and the new one is kept");
     }
 
     #[tokio::test]
