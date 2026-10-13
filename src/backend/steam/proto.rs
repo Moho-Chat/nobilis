@@ -1013,6 +1013,705 @@ pub struct RevokeRefreshTokenRequest {
 #[derive(Clone, PartialEq, Message)]
 pub struct RevokeRefreshTokenResponse {}
 
+
+// ---- Steam chat groups: the messages this backend speaks, by Valve's own field names ----
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomState {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub chat_name: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub voice_allowed: Option<bool>,
+    #[prost(uint32, optional, tag = "5")]
+    pub time_last_message: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub sort_order: Option<u32>,
+    #[prost(string, optional, tag = "7")]
+    pub last_message: Option<String>,
+    #[prost(uint32, optional, tag = "8")]
+    pub accountid_last_message: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomMember {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(int32, optional, tag = "3")]
+    pub state: Option<i32>,
+    #[prost(int32, optional, tag = "4")]
+    pub rank: Option<i32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub time_kick_expire: Option<u32>,
+    #[prost(uint64, repeated, packed = "false", tag = "7")]
+    pub role_ids: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRole {
+    #[prost(uint64, optional, tag = "1")]
+    pub role_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub name: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub ordinal: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomGroupHeaderState {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub chat_name: Option<String>,
+    #[prost(uint32, optional, tag = "13")]
+    pub clanid: Option<u32>,
+    #[prost(uint32, optional, tag = "14")]
+    pub accountid_owner: Option<u32>,
+    #[prost(string, optional, tag = "15")]
+    pub tagline: Option<String>,
+    #[prost(bytes = "vec", optional, tag = "16")]
+    pub avatar_sha: Option<Vec<u8>>,
+    #[prost(uint64, optional, tag = "17")]
+    pub default_role_id: Option<u64>,
+    #[prost(message, repeated, tag = "18")]
+    pub roles: Vec<ChatRole>,
+    #[prost(string, optional, tag = "25")]
+    pub avatar_ugc_url: Option<String>,
+    #[prost(bool, optional, tag = "26")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomGroupState {
+    #[prost(message, optional, tag = "1")]
+    pub header_state: Option<ChatRoomGroupHeaderState>,
+    #[prost(message, repeated, tag = "2")]
+    pub members: Vec<ChatRoomMember>,
+    #[prost(uint64, optional, tag = "4")]
+    pub default_chat_id: Option<u64>,
+    #[prost(message, repeated, tag = "5")]
+    pub chat_rooms: Vec<ChatRoomState>,
+    #[prost(message, repeated, tag = "7")]
+    pub kicked: Vec<ChatRoomMember>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserChatRoomState {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub time_joined: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_last_ack: Option<u32>,
+    #[prost(int32, optional, tag = "4")]
+    pub desktop_notification_level: Option<i32>,
+    #[prost(int32, optional, tag = "5")]
+    pub mobile_notification_level: Option<i32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub time_last_mention: Option<u32>,
+    #[prost(bool, optional, tag = "7")]
+    pub unread_indicator_muted: Option<bool>,
+    #[prost(uint32, optional, tag = "8")]
+    pub time_first_unread: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserChatRoomGroupState {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub time_joined: Option<u32>,
+    #[prost(message, repeated, tag = "3")]
+    pub user_chat_room_state: Vec<UserChatRoomState>,
+    #[prost(int32, optional, tag = "4")]
+    pub desktop_notification_level: Option<i32>,
+    #[prost(int32, optional, tag = "5")]
+    pub mobile_notification_level: Option<i32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub time_last_group_ack: Option<u32>,
+    #[prost(bool, optional, tag = "7")]
+    pub unread_indicator_muted: Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub direct_messages_allowed: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatGroupSummary {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub chat_group_name: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub active_member_count: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub active_voice_member_count: Option<u32>,
+    #[prost(uint64, optional, tag = "5")]
+    pub default_chat_id: Option<u64>,
+    #[prost(message, repeated, tag = "6")]
+    pub chat_rooms: Vec<ChatRoomState>,
+    #[prost(uint32, optional, tag = "7")]
+    pub clanid: Option<u32>,
+    #[prost(string, optional, tag = "8")]
+    pub chat_group_tagline: Option<String>,
+    #[prost(uint32, optional, tag = "9")]
+    pub accountid_owner: Option<u32>,
+    #[prost(uint32, repeated, packed = "false", tag = "10")]
+    pub top_members: Vec<u32>,
+    #[prost(bytes = "vec", optional, tag = "11")]
+    pub chat_group_avatar_sha: Option<Vec<u8>>,
+    #[prost(int32, optional, tag = "12")]
+    pub rank: Option<i32>,
+    #[prost(uint64, optional, tag = "13")]
+    pub default_role_id: Option<u64>,
+    #[prost(uint64, repeated, packed = "false", tag = "14")]
+    pub role_ids: Vec<u64>,
+    #[prost(uint32, optional, tag = "17")]
+    pub appid: Option<u32>,
+    #[prost(string, optional, tag = "21")]
+    pub avatar_ugc_url: Option<String>,
+    #[prost(bool, optional, tag = "22")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomSummaryPair {
+    #[prost(message, optional, tag = "1")]
+    pub user_chat_group_state: Option<UserChatRoomGroupState>,
+    #[prost(message, optional, tag = "2")]
+    pub group_summary: Option<ChatGroupSummary>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetMyChatRoomGroupsRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetMyChatRoomGroupsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub chat_room_groups: Vec<ChatRoomSummaryPair>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetChatRoomGroupStateRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetChatRoomGroupStateResponse {
+    #[prost(message, optional, tag = "1")]
+    pub state: Option<ChatRoomGroupState>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetSessionActiveGroupsRequest {
+    #[prost(uint64, repeated, packed = "false", tag = "1")]
+    pub chat_group_ids: Vec<u64>,
+    #[prost(uint64, repeated, packed = "false", tag = "2")]
+    pub chat_groups_data_requested: Vec<u64>,
+    #[prost(int32, optional, tag = "3")]
+    pub virtualize_members_threshold: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetSessionActiveGroupsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub chat_states: Vec<ChatRoomGroupState>,
+    #[prost(uint64, repeated, packed = "false", tag = "2")]
+    pub virtualize_members_chat_group_ids: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatSendRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub message: Option<String>,
+    #[prost(bool, optional, tag = "4")]
+    pub echo_to_sender: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatSendResponse {
+    #[prost(string, optional, tag = "1")]
+    pub modified_message: Option<String>,
+    #[prost(uint32, optional, tag = "2")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub ordinal: Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub message_without_bb_code: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatHistoryRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub last_time: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub last_ordinal: Option<u32>,
+    #[prost(uint32, optional, tag = "5")]
+    pub start_time: Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub start_ordinal: Option<u32>,
+    #[prost(uint32, optional, tag = "7")]
+    pub max_count: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ServerMessage {
+    #[prost(int32, optional, tag = "1")]
+    pub message: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub string_param: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub accountid_param: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatMessageReaction {
+    #[prost(int32, optional, tag = "1")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "2")]
+    pub reaction: Option<String>,
+    #[prost(uint32, optional, tag = "3")]
+    pub num_reactors: Option<u32>,
+    #[prost(bool, optional, tag = "4")]
+    pub has_user_reacted: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatHistoryMessage {
+    #[prost(uint32, optional, tag = "1")]
+    pub sender: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub server_timestamp: Option<u32>,
+    #[prost(string, optional, tag = "3")]
+    pub message: Option<String>,
+    #[prost(uint32, optional, tag = "4")]
+    pub ordinal: Option<u32>,
+    #[prost(message, optional, tag = "5")]
+    pub server_message: Option<ServerMessage>,
+    #[prost(bool, optional, tag = "6")]
+    pub deleted: Option<bool>,
+    #[prost(message, repeated, tag = "7")]
+    pub reactions: Vec<ChatMessageReaction>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatHistoryResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub messages: Vec<ChatHistoryMessage>,
+    #[prost(bool, optional, tag = "4")]
+    pub more_available: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatMentions {
+    #[prost(bool, optional, tag = "1")]
+    pub mention_all: Option<bool>,
+    #[prost(bool, optional, tag = "2")]
+    pub mention_here: Option<bool>,
+    #[prost(uint32, repeated, packed = "false", tag = "3")]
+    pub mention_accountids: Vec<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatIncoming {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "3")]
+    pub steamid_sender: Option<u64>,
+    #[prost(string, optional, tag = "4")]
+    pub message: Option<String>,
+    #[prost(uint32, optional, tag = "5")]
+    pub timestamp: Option<u32>,
+    #[prost(message, optional, tag = "6")]
+    pub mentions: Option<ChatMentions>,
+    #[prost(uint32, optional, tag = "7")]
+    pub ordinal: Option<u32>,
+    #[prost(message, optional, tag = "8")]
+    pub server_message: Option<ServerMessage>,
+    #[prost(string, optional, tag = "9")]
+    pub message_no_bbcode: Option<String>,
+    #[prost(string, optional, tag = "10")]
+    pub chat_name: Option<String>,
+    #[prost(string, optional, tag = "11")]
+    pub notification_key: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatAck {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub timestamp: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatModifiedMessage {
+    #[prost(uint32, optional, tag = "1")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub ordinal: Option<u32>,
+    #[prost(bool, optional, tag = "3")]
+    pub deleted: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatModified {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub messages: Vec<ChatModifiedMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatMemberChange {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub member: Option<ChatRoomMember>,
+    #[prost(int32, optional, tag = "3")]
+    pub change: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatHeaderChange {
+    #[prost(message, optional, tag = "1")]
+    pub header_state: Option<ChatRoomGroupHeaderState>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoomsChange {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub default_chat_id: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub chat_rooms: Vec<ChatRoomState>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatUserStateChange {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub user_chat_group_state: Option<UserChatRoomGroupState>,
+    #[prost(message, optional, tag = "3")]
+    pub group_summary: Option<ChatGroupSummary>,
+    #[prost(int32, optional, tag = "4")]
+    pub user_action: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateChatGroupRequest {
+    #[prost(fixed64, optional, tag = "1")]
+    pub steamid_partner: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid_invited: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub name: Option<String>,
+    #[prost(fixed64, repeated, packed = "false", tag = "4")]
+    pub steamid_invitees: Vec<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateChatGroupResponse {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub state: Option<ChatRoomGroupState>,
+    #[prost(message, optional, tag = "3")]
+    pub user_chat_state: Option<UserChatRoomGroupState>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct JoinChatGroupRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub invite_code: Option<String>,
+    #[prost(uint64, optional, tag = "3")]
+    pub chat_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct JoinChatGroupResponse {
+    #[prost(message, optional, tag = "1")]
+    pub state: Option<ChatRoomGroupState>,
+    #[prost(message, optional, tag = "3")]
+    pub user_chat_state: Option<UserChatRoomGroupState>,
+    #[prost(uint64, optional, tag = "4")]
+    pub join_chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "5")]
+    pub time_expire: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LeaveChatGroupRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LeaveChatGroupResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateChatRoomRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub name: Option<String>,
+    #[prost(bool, optional, tag = "3")]
+    pub allow_voice: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateChatRoomResponse {
+    #[prost(message, optional, tag = "1")]
+    pub chat_room: Option<ChatRoomState>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteChatRoomRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteChatRoomResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameChatRoomRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameChatRoomResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameChatGroupRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameChatGroupResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateInviteLinkRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint32, optional, tag = "2")]
+    pub seconds_valid: Option<u32>,
+    #[prost(uint64, optional, tag = "3")]
+    pub chat_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateInviteLinkResponse {
+    #[prost(string, optional, tag = "1")]
+    pub invite_code: Option<String>,
+    #[prost(uint32, optional, tag = "2")]
+    pub seconds_valid: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetInviteLinksRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InviteLinkInfo {
+    #[prost(string, optional, tag = "1")]
+    pub invite_code: Option<String>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid_creator: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_expires: Option<u32>,
+    #[prost(uint64, optional, tag = "4")]
+    pub chat_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetInviteLinksResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub invite_links: Vec<InviteLinkInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetInviteLinkInfoRequest {
+    #[prost(string, optional, tag = "1")]
+    pub invite_code: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetInviteLinkInfoResponse {
+    #[prost(fixed64, optional, tag = "3")]
+    pub steamid_sender: Option<u64>,
+    #[prost(uint32, optional, tag = "4")]
+    pub time_expires: Option<u32>,
+    #[prost(uint64, optional, tag = "6")]
+    pub chat_id: Option<u64>,
+    #[prost(message, optional, tag = "8")]
+    pub group_summary: Option<ChatGroupSummary>,
+    #[prost(message, optional, tag = "9")]
+    pub user_chat_group_state: Option<UserChatRoomGroupState>,
+    #[prost(uint32, optional, tag = "10")]
+    pub time_kick_expire: Option<u32>,
+    #[prost(bool, optional, tag = "11")]
+    pub banned: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteInviteLinkRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub invite_code: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteInviteLinkResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct KickChatUserRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid: Option<u64>,
+    #[prost(int32, optional, tag = "3")]
+    pub expiration: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct KickChatUserResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BanChatUserRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid: Option<u64>,
+    #[prost(bool, optional, tag = "3")]
+    pub ban_state: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BanChatUserResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MuteChatUserRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid: Option<u64>,
+    #[prost(int32, optional, tag = "3")]
+    pub expiration: Option<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MuteChatUserResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteChatMessage {
+    #[prost(uint32, optional, tag = "1")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub ordinal: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteChatMessagesRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(message, repeated, tag = "3")]
+    pub messages: Vec<DeleteChatMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteChatMessagesResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatReactionRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub ordinal: Option<u32>,
+    #[prost(int32, optional, tag = "5")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "6")]
+    pub reaction: Option<String>,
+    #[prost(bool, optional, tag = "7")]
+    pub is_add: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatReactionResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatReactionNotice {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub chat_id: Option<u64>,
+    #[prost(uint32, optional, tag = "3")]
+    pub server_timestamp: Option<u32>,
+    #[prost(uint32, optional, tag = "4")]
+    pub ordinal: Option<u32>,
+    #[prost(fixed64, optional, tag = "5")]
+    pub reactor: Option<u64>,
+    #[prost(int32, optional, tag = "6")]
+    pub reaction_type: Option<i32>,
+    #[prost(string, optional, tag = "7")]
+    pub reaction: Option<String>,
+    #[prost(bool, optional, tag = "8")]
+    pub is_add: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InviteFriendToChatGroupRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "2")]
+    pub steamid: Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub chat_id: Option<u64>,
+    #[prost(bool, optional, tag = "4")]
+    pub skip_friendsui_check: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InviteFriendToChatGroupResponse {}
+
 /// Everything an account may put in a message beyond words.
 #[derive(Clone, PartialEq, Message)]
 pub struct ClientEmoticonList {
@@ -1298,6 +1997,27 @@ mod tests {
                 TextFilterWords, GetTextFilterWordsResponse, GetPrivacySettingsRequest, PrivacySettings, GetPrivacySettingsResponse,
                 GetParentalSettingsRequest, ParentalSettings, GetParentalSettingsResponse, EnumerateTokensRequest, TokenUsageEvent,
                 RefreshTokenDescription, EnumerateTokensResponse, RevokeRefreshTokenRequest, RevokeRefreshTokenResponse,
+                ChatRoomState, ChatRoomMember, ChatRole, ChatRoomGroupHeaderState,
+                ChatRoomGroupState, UserChatRoomState, UserChatRoomGroupState, ChatGroupSummary,
+                ChatRoomSummaryPair, GetMyChatRoomGroupsRequest, GetMyChatRoomGroupsResponse,
+                GetChatRoomGroupStateRequest, GetChatRoomGroupStateResponse,
+                SetSessionActiveGroupsRequest, SetSessionActiveGroupsResponse, ChatSendRequest,
+                ChatSendResponse, ChatHistoryRequest, ServerMessage, ChatMessageReaction,
+                ChatHistoryMessage, ChatHistoryResponse, ChatMentions, ChatIncoming, ChatAck,
+                ChatModifiedMessage, ChatModified, ChatMemberChange, ChatHeaderChange,
+                ChatRoomsChange, ChatUserStateChange, CreateChatGroupRequest,
+                CreateChatGroupResponse, JoinChatGroupRequest, JoinChatGroupResponse,
+                LeaveChatGroupRequest, LeaveChatGroupResponse, CreateChatRoomRequest,
+                CreateChatRoomResponse, DeleteChatRoomRequest, DeleteChatRoomResponse,
+                RenameChatRoomRequest, RenameChatRoomResponse, RenameChatGroupRequest,
+                RenameChatGroupResponse, CreateInviteLinkRequest, CreateInviteLinkResponse,
+                GetInviteLinksRequest, InviteLinkInfo, GetInviteLinksResponse,
+                GetInviteLinkInfoRequest, GetInviteLinkInfoResponse, DeleteInviteLinkRequest,
+                DeleteInviteLinkResponse, KickChatUserRequest, KickChatUserResponse,
+                BanChatUserRequest, BanChatUserResponse, MuteChatUserRequest, MuteChatUserResponse,
+                DeleteChatMessage, DeleteChatMessagesRequest, DeleteChatMessagesResponse,
+                ChatReactionRequest, ChatReactionResponse, ChatReactionNotice,
+                InviteFriendToChatGroupRequest, InviteFriendToChatGroupResponse,
                 FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
                 ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
                 ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
@@ -1305,7 +2025,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 105, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 173, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare
