@@ -60,6 +60,25 @@ fn read(message: &PastMessage, own: u32) -> Option<Past> {
     Some(Past { account, timestamp: message.timestamp.unwrap_or_default(), ordinal: message.ordinal.unwrap_or_default(), text, reactions: super::reactions::from_history(own, &message.reactions), embeds, invite })
 }
 
+/// The conversations Steam has said have nothing before what is held: asking again for the part
+/// before would get the same answer, and it is asked every time the top is scrolled to.
+static AT_START: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+
+/// Whether this conversation is known to be held back to its first message.
+pub fn at_start(buffer_id: &str) -> bool {
+    AT_START.lock().unwrap().contains(buffer_id)
+}
+
+/// Remembers that there is nothing before what is held, or that there is after all.
+pub fn note_start(buffer_id: &str, reached: bool) {
+    let mut held = AT_START.lock().unwrap();
+    if reached {
+        held.insert(buffer_id.to_string());
+    } else {
+        held.remove(buffer_id);
+    }
+}
+
 /// Asks for up to `count` messages of a conversation that are older than
 /// `older_than` - a second and an ordinal within it - or the newest when that
 /// is absent. Oldest first, and whether there are more before them.
@@ -135,12 +154,17 @@ pub async fn open(state: &AppState, buffer: &Buffer) -> Result<usize, String> {
 /// The part before what is shown, stored: what scrolling to the top asks for.
 /// `before` is the second of the oldest message on screen.
 pub async fn older(state: &AppState, buffer: &Buffer, before: i64) -> Result<usize, String> {
+    // Steam has already said there is nothing before this: no question to ask again.
+    if at_start(&buffer.id) {
+        return Ok(0);
+    }
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
     let (own, friend) = people(state, buffer)?;
     let before = u32::try_from(before).map_err(|_| "that is not a time Steam knows".to_string())?;
     // Up to and including the second asked about, whichever ordinal: what is
     // already stored is recognised and not stored again.
-    let (past, _) = fetch(&link, own, friend, Some((before, u32::MAX)), PAGE).await?;
+    let (past, more) = fetch(&link, own, friend, Some((before, u32::MAX)), PAGE).await?;
+    note_start(&buffer.id, !more);
     Ok(store_quietly(state, buffer, steamid::account_of(own).unwrap_or_default(), &past))
 }
 
@@ -378,12 +402,21 @@ mod tests {
         let (roster, mut shown) = friends_list();
         shown.publish(&state, &roster);
         let buffer = state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).unwrap();
-        state.runtime.set_steam_link(ACCOUNT, link_to(steam(five(), vec![], Arc::default())).await);
+        note_start(&buffer.id, false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        state.runtime.set_steam_link(ACCOUNT, link_to(steam(five(), vec![], seen.clone())).await);
+        assert!(older(&state, &buffer, -5).await.is_err());
         // Everything from the second of 120 on is on screen.
         assert_eq!(older(&state, &buffer, 120).await.unwrap(), 4, "everything up to and including that second is stored, whichever of it was shown");
         let texts: Vec<String> = held(&state).into_iter().map(|m| m.1).collect();
         assert_eq!(texts, ["one", "two", "three", "same second"]);
-        assert!(older(&state, &buffer, -5).await.is_err());
+        // Steam said there was nothing before that, so scrolling to the top again asks nothing.
+        let asked = seen.lock().unwrap().len();
+        assert!(at_start(&buffer.id));
+        assert_eq!(older(&state, &buffer, 20).await.unwrap(), 0);
+        assert_eq!(older(&state, &buffer, 20).await.unwrap(), 0);
+        assert_eq!(seen.lock().unwrap().len(), asked, "no question was sent");
+        note_start(&buffer.id, false);
     }
 
     #[tokio::test]

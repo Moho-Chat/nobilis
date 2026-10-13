@@ -1086,7 +1086,7 @@ fn read_past(m: &ChatHistoryMessage, own: u32) -> Option<Past> {
 }
 
 /// Asks for a page of a room, oldest first, and whether there is more before it.
-async fn fetch(link: &Link, own: u32, group: u64, room: u64, older_than: Option<(u32, u32)>) -> Result<Vec<Past>, String> {
+async fn fetch(link: &Link, own: u32, group: u64, room: u64, older_than: Option<(u32, u32)>) -> Result<(Vec<Past>, bool), String> {
     let (last_time, last_ordinal) = older_than.unwrap_or((u32::MAX, 0));
     let answer: ChatHistoryResponse = link
         .call("ChatRoom.GetMessageHistory#1", &ChatHistoryRequest { chat_group_id: Some(group), chat_id: Some(room), last_time: Some(last_time), last_ordinal: Some(last_ordinal), start_time: Some(0), start_ordinal: Some(0), max_count: Some(PAGE) }, true)
@@ -1095,7 +1095,7 @@ async fn fetch(link: &Link, own: u32, group: u64, room: u64, older_than: Option<
     let mut past: Vec<Past> = answer.messages.iter().filter_map(|m| read_past(m, own)).collect();
     // Steam answers newest first.
     past.reverse();
-    Ok(past)
+    Ok((past, answer.more_available.unwrap_or(false)))
 }
 
 fn store_quietly(state: &AppState, account_id: &str, name: &str, own: u32, past: &[Past]) -> usize {
@@ -1138,7 +1138,14 @@ pub async fn history(state: &AppState, buffer: &Buffer, before: Option<i64>) -> 
         Some(b) => Some((u32::try_from(b).map_err(|_| "that is not a time Steam knows".to_string())?, u32::MAX)),
         None => None,
     };
-    let past = fetch(&link, own, group, room, older).await?;
+    // Steam has already said there is nothing before this: no question to ask again.
+    if older.is_some() && super::history::at_start(&buffer.id) {
+        return Ok(0);
+    }
+    let (past, more) = fetch(&link, own, group, room, older).await?;
+    if older.is_some() {
+        super::history::note_start(&buffer.id, !more);
+    }
     Ok(store_quietly(state, &buffer.account_id, &buffer.name, own, &past))
 }
 
@@ -1292,7 +1299,7 @@ pub async fn catch_up(state: &AppState, link: &Link, account_id: &str, roster: &
             continue;
         }
         let past = match fetch(link, own, group, room, None).await {
-            Ok(p) => p,
+            Ok((p, _)) => p,
             Err(e) => {
                 tracing::info!("steam[{account_id}]: could not catch up on {name}: {e}");
                 continue;
