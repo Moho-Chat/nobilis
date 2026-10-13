@@ -127,11 +127,24 @@ pub async fn open_with(key: &str, url: &str, timeout: Duration) -> Result<(Link,
 
     let reader = tokio::spawn({
         let jobs = jobs.clone();
+        let key = key.to_string();
         async move {
-            while let Some(Ok(frame)) = stream.next().await {
+            let mut why = "the stream ended".to_string();
+            loop {
+                let frame = match stream.next().await {
+                    None => break,
+                    Some(Err(e)) => {
+                        why = format!("a read failed: {e}");
+                        break;
+                    }
+                    Some(Ok(frame)) => frame,
+                };
                 let bytes = match frame {
                     Ws::Binary(bytes) => bytes,
-                    Ws::Close(_) => break,
+                    Ws::Close(close) => {
+                        why = format!("Steam closed it: {}", close.map(|c| format!("{} {}", c.code, c.reason)).unwrap_or_else(|| "no reason given".to_string()));
+                        break;
+                    }
                     // Pings are answered by the library; text is not a thing
                     // this server sends.
                     _ => continue,
@@ -172,6 +185,7 @@ pub async fn open_with(key: &str, url: &str, timeout: Duration) -> Result<(Link,
                     }
                 }
             }
+            tracing::info!("steam[{key}]: the connection ended: {why}");
             // Nobody is going to be answered now. Dropping the waiters is how
             // each of them finds out, and dropping `told` is how the owner of
             // the connection does. Marked ended in the same breath, so a

@@ -605,3 +605,36 @@ async fn the_newest_messages_as_steam_writes_them() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// Whether a session stays up: signs the sender in and watches it for as long
+/// as `MOHO_STEAM_SOAK_SECS` says (five minutes by default), counting how
+/// often it is lost. What the daemon logs about each ending is printed.
+#[tokio::test]
+#[ignore = "needs a real Steam account; sends nothing, and takes minutes"]
+async fn a_session_stays_connected() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let _ = tracing_subscriber::fmt().with_env_filter("nobilis::backend::steam=info").with_test_writer().try_init();
+    let state = simulated_daemon("steam-probe-soak");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    let secs: u64 = std::env::var("MOHO_STEAM_SOAK_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
+    let (mut lost, mut last) = (0, state.runtime.conn_state(&id));
+    for _ in 0..secs * 2 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = state.runtime.conn_state(&id);
+        if now != last {
+            println!("{:?} -> {:?}", last, now);
+            if last == Some(ConnState::Connected) {
+                lost += 1;
+            }
+            last = now;
+        }
+    }
+    println!("lost the connection {lost} time(s) in {secs}s; now {last:?}");
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

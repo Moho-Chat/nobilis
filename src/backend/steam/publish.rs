@@ -64,7 +64,17 @@ impl Conversations {
     pub fn publish(&mut self, state: &AppState, roster: &Roster) {
         let names = roster.conversation_names();
         for account in roster.participants() {
-            let Some(name) = names.get(&account).cloned() else { continue };
+            let Some(mut name) = names.get(&account).cloned() else { continue };
+            // A session that has only just begun knows its friends by number
+            // until their names arrive. A conversation already called something
+            // keeps that: renamed to a number and back, a friend list would
+            // flicker into digits at every reconnect, and a connection that
+            // keeps dropping would leave it that way.
+            if !roster.has_name(account) {
+                if let Some(held) = self.shown.get(&account).map(|s| s.name.clone()).filter(|n| *n != steamid::text_of(account)) {
+                    name = held;
+                }
+            }
             let persona = roster.persona(account);
             let status = persona.map_or("offline", |p| presence::status_of(p.state));
             let avatar = persona.and_then(|p| p.avatar.clone());
@@ -163,6 +173,32 @@ mod tests {
         assert_eq!(members.as_array().unwrap().len(), 1, "a direct message's list is the other person alone");
         assert_eq!((members[0]["nick"].as_str(), members[0]["status"].as_str(), members[0]["away"].as_bool()), (Some("Gabe"), Some("online"), Some(false)));
         assert_eq!(shown.name_of(22202), Some("Gabe"));
+    }
+
+    #[test]
+    fn a_reconnect_does_not_turn_the_friends_back_into_numbers() {
+        let state = simulated_daemon("steam-publish-reconnect");
+        let mut roster = Roster::default();
+        roster.apply_friends_list(&friends(&[22202]));
+        roster.apply_persona(&update(vec![who(22202, "Gabe", 1)]));
+        Conversations::new(ACCOUNT).publish(&state, &roster);
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).is_some());
+
+        // A new session: the conversations as they were, and a roster that has
+        // the friends list and nobody's name yet.
+        let mut shown = Conversations::new(ACCOUNT);
+        shown.adopt(&state, ACCOUNT);
+        let mut fresh = Roster::default();
+        fresh.apply_friends_list(&friends(&[22202]));
+        shown.publish(&state, &fresh);
+        assert_eq!(shown.name_of(22202), Some("Gabe"), "still called what they were called");
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "76561197960287930")).is_none(), "and no conversation made under the number");
+        assert!(state.runtime.get_buffer(&crate::model::buffer_id(ACCOUNT, "Gabe")).is_some());
+
+        // When the name does arrive, a changed one is honoured.
+        fresh.apply_persona(&update(vec![who(22202, "Gabriel", 1)]));
+        shown.publish(&state, &fresh);
+        assert_eq!(shown.name_of(22202), Some("Gabriel"));
     }
 
     #[test]

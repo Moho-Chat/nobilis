@@ -211,6 +211,14 @@ impl Roster {
     /// including exactly what another friend's name becomes once decorated, so
     /// the result is checked and anyone still sharing a name is marked again,
     /// differently, until nobody is.
+    /// Whether anything is known to call this person: a nickname the account
+    /// gave them, or the name they have. Without either, `conversation_names`
+    /// has only their number to offer.
+    pub fn has_name(&self, account: u32) -> bool {
+        self.nickname(account).map(clean_name).is_some_and(|n| !n.is_empty())
+            || self.personas.get(&account).and_then(|p| p.name.as_deref()).map(clean_name).is_some_and(|n| !n.is_empty())
+    }
+
     pub fn conversation_names(&self) -> HashMap<u32, String> {
         // What the account calls them, if it has said; otherwise what they
         // call themselves.

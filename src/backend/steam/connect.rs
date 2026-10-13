@@ -186,6 +186,7 @@ async fn run_with_retry(state: &AppState, config: &SteamAccountConfig, account_i
         };
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
         let wait = wait.unwrap_or_else(|| state.runtime.next_retry_delay(account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY));
+        tracing::info!("steam[{account_id}]: not connected ({detail}); trying again in {}s", wait.as_secs());
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
     }
@@ -240,6 +241,7 @@ impl Drop for Registered<'_> {
 
 /// Signs in on one server and stays until it ends.
 pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: &str, url: &str) -> Result<Outcome> {
+    let began = std::time::Instant::now();
     let (link, mut told) = match link::open(account_id, url).await {
         Ok(opened) => opened,
         Err(e) => return Ok(Outcome::Unreached(format!("{e:#}"))),
@@ -297,6 +299,7 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
     }
     .run(&mut told, heartbeat)
     .await;
+    tracing::info!("steam[{account_id}]: the session lasted {}s and ended: {ending:?}", began.elapsed().as_secs());
     Ok(Outcome::Ended(ending))
 }
 
@@ -346,7 +349,21 @@ impl Drive<'_> {
                     self.catch_up_at = None;
                     // Bounded: the connection is not heard from while this runs, and
                     // a Steam that stops answering must not stop that for long.
-                    let unnamed = tokio::time::timeout(CATCH_UP_FOR, super::history::catch_up(self.state, self.link, self.account_id, self.own, &self.roster, &self.shown)).await.unwrap_or(0);
+                    let work = tokio::time::timeout(CATCH_UP_FOR, super::history::catch_up(self.state, self.link, self.account_id, self.own, &self.roster, &self.shown));
+                    tokio::pin!(work);
+                    // The heartbeat goes on meanwhile: an account with many
+                    // conversations makes this long, and a connection that says
+                    // nothing for that long is one Steam is entitled to drop.
+                    let unnamed = loop {
+                        tokio::select! {
+                            done = &mut work => break done.unwrap_or(0),
+                            _ = beat.tick() => {
+                                if self.link.send(emsg::CLIENT_HEART_BEAT, &ClientHeartBeat::default()).is_err() {
+                                    return Ending::Closed;
+                                }
+                            }
+                        }
+                    };
                     // Conversations whose friends had not been named yet have
                     // nowhere to be read into: a few more tries, as the names
                     // arrive, and then they are left for opening.
@@ -438,6 +455,7 @@ impl Drive<'_> {
             }
             emsg::CLIENT_LOGGED_OFF => {
                 let code = ClientLoggedOff::decode(packet.body.as_slice()).ok().and_then(|m| m.eresult).unwrap_or(eresult::FAIL);
+                tracing::info!("steam[{}]: Steam signed this session out: {} ({code})", self.account_id, eresult::describe(code));
                 return Some(match code {
                     eresult::LOGGED_IN_ELSEWHERE => Ending::Stop(eresult::describe(code)),
                     c if eresult::means_sign_in_again(c) => Ending::Stop(format!("{}. Sign in to Steam again from Accounts.", eresult::describe(c))),
