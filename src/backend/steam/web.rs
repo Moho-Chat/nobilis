@@ -131,7 +131,7 @@ pub async fn access_token(link: &Link, steamid: u64, refresh_token: &str) -> Res
 
 /// The website as this account: a client, the cookie it signs in with, and the
 /// session id the forms repeat.
-async fn login(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<(reqwest::Client, String, String), String> {
+pub(super) async fn login(link: &Link, key: &str, steamid: u64, refresh_token: &str) -> Result<(reqwest::Client, String, String), String> {
     let router = crate::net::route::router();
     let token = access_token(link, steamid, refresh_token).await?;
     let session_id = {
@@ -267,7 +267,7 @@ pub async fn send_file(
 
 /// An answer's text. The site compresses what it likes whatever it is asked,
 /// and a refusal's reason is in the body, so it is unpacked here.
-fn plain(raw: &[u8]) -> String {
+pub(super) fn plain(raw: &[u8]) -> String {
     use std::io::Read;
     if raw.starts_with(&[0x1f, 0x8b]) {
         let mut out = String::new();

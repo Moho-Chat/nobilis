@@ -177,6 +177,14 @@ impl Roster {
     }
 
     /// The people who have asked to be our friend, in a steady order.
+    /// Everybody the account has blocked or ignored: Steam's "blocked" and the two
+    /// ways it says "ignored".
+    pub fn blocked(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self.relationships.iter().filter(|(_, r)| matches!(**r, 1 | 5 | 6)).map(|(a, _)| *a).collect();
+        out.sort_unstable();
+        out
+    }
+
     pub fn asked_us(&self) -> Vec<u32> {
         self.with_relationship(REL_REQUEST_RECIPIENT)
     }

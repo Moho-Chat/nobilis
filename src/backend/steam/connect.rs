@@ -236,6 +236,7 @@ struct Registered<'a> {
 impl Drop for Registered<'_> {
     fn drop(&mut self) {
         super::groups::clear(self.account_id);
+        super::blocked::clear(self.account_id);
         self.state.runtime.take_steam_link(self.account_id);
     }
 }
@@ -454,16 +455,18 @@ impl Drive<'_> {
                     // request can say who it is from.
                     let known = |a: &u32| self.roster.is_friend(*a) || self.roster.asked_us().contains(a);
                     let ask: Vec<u32> = if list.bincremental.unwrap_or(false) {
-                        changed.into_iter().filter(known).collect()
+                        changed.into_iter().filter(|a| known(a) || self.roster.blocked().contains(a)).collect()
                     } else {
                         let mut all = self.roster.friends();
                         all.extend(self.roster.asked_us());
+                        all.extend(self.roster.blocked());
                         all
                     };
                     self.ask_about(&ask);
                     self.shown.publish(self.state, &self.roster);
                     // Conversations that were not there at the start are now.
                     super::notices::restore(self.state, self.account_id);
+                    super::blocked::publish(self.state, self.account_id, &self.roster);
                     friendship::publish(self.state, self.account_id, &self.roster, &mut self.asked);
                     // Their names arrive in the next moments; what was missed is
                     // read into conversations that have them.
@@ -484,6 +487,7 @@ impl Drive<'_> {
                     }
                     self.ask_game_names();
                     self.shown.publish(self.state, &self.roster);
+                    super::blocked::publish(self.state, self.account_id, &self.roster);
                 }
             }
             // The groups the account sorts its friends into, and changes to them.

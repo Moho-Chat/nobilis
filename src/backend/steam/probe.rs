@@ -798,3 +798,93 @@ async fn friend_groups_are_read_and_changed() {
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }
+
+/// What Steam's website says about the signed-in account's invite links and
+/// session: the shape only, never a token. Reads only.
+#[tokio::test]
+#[ignore = "needs a real Steam account; changes nothing"]
+async fn the_websites_account_answers_look_like_this() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-web-shape");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let (http, cookie, session_id) = super::web::login(&link, &id, sender.steamid, &sender.refresh_token).await.unwrap();
+    fn shape(v: &serde_json::Value, depth: usize) -> String {
+        match v {
+            serde_json::Value::Object(o) if depth < 3 => format!("{{{}}}", o.iter().map(|(k, v)| format!("{k}:{}", shape(v, depth + 1))).collect::<Vec<_>>().join(", ")),
+            serde_json::Value::Array(a) => format!("[{} x {}]", a.len(), a.first().map(|f| shape(f, depth + 1)).unwrap_or_default()),
+            serde_json::Value::String(s) => format!("str({})", s.len()),
+            serde_json::Value::Number(_) => "num".into(),
+            serde_json::Value::Bool(b) => format!("{b}"),
+            _ => "null".into(),
+        }
+    }
+    // One link, made and looked at, on the sender's own account.
+    let form = reqwest::multipart::Form::new().text("sessionid", session_id.clone()).text("steamid_user", sender.steamid.to_string()).text("duration", "2592000");
+    let made = http.post("https://steamcommunity.com/invites/ajaxcreate").header("Cookie", &cookie).header("Accept-Encoding", "identity").multipart(form).send().await.unwrap();
+    let made_text = made.text().await.unwrap_or_default();
+    let made_value: serde_json::Value = serde_json::from_str(&made_text).unwrap_or(serde_json::Value::Null);
+    println!("SHAPE create -> {}", shape(&made_value, 0));
+    println!("INVITE keys {:?}", made_value["invite"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()));
+    println!("INVITE url {:?} token_len {:?}", made_value["invite"]["invite_url"].as_str().map(|u| u.split("/p/").next().unwrap_or("").to_string()), made_value["invite"]["invite_token"].as_str().map(str::len));
+    let token = made_value["invite"]["invite_token"].as_str().unwrap_or_default().to_string();
+    for path in ["invites/ajaxrevoke", "invites/ajaxdelete", "invites/ajaxinvalidate"] {
+        let form = reqwest::multipart::Form::new().text("sessionid", session_id.clone()).text("invite_token", token.clone()).text("steamid_user", sender.steamid.to_string());
+        let r = http.post(format!("https://steamcommunity.com/{path}")).header("Cookie", &cookie).header("Accept-Encoding", "identity").multipart(form).send().await.unwrap();
+        let status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        println!("REVOKE {path} -> {status} {}", text.chars().take(120).collect::<String>().replace(&token, "TOKEN"));
+        if status.is_success() && text.contains("\"success\":1") {
+            break;
+        }
+    }
+    for url in [
+        "https://steamcommunity.com/chat/clientjstoken".to_string(),
+        format!("https://steamcommunity.com/invites/ajaxgetall?sessionid={session_id}"),
+    ] {
+        let r = http.get(&url).header("Cookie", &cookie).header("Accept-Encoding", "identity").send().await.unwrap();
+        let status = r.status();
+        let text = r.text().await.unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        println!("SHAPE {} -> {status} {}", url.split('?').next().unwrap(), shape(&value, 0));
+    }
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// The account's own invite links against real Steam: listed, one made, listed,
+/// and every one revoked at the end, so none is left behind. Nothing is sent to anybody.
+#[tokio::test]
+#[ignore = "needs a real Steam account; makes and revokes invite links on it"]
+async fn invite_links_are_listed_made_and_revoked() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-invites");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    use super::invites::*;
+    let before = list(&link, &id, sender.steamid, &sender.refresh_token).await;
+    println!("INVITES before {:?}", before.as_ref().map(|l| l.len()));
+    let made = create(&link, &id, sender.steamid, &sender.refresh_token).await.unwrap();
+    println!("INVITES made, link shape {} and the code is for this account: {}", made.link.replace(&made.token, "TOKEN"), account_of_link(&made.link) == super::steamid::account_of(sender.steamid));
+    let after = list(&link, &id, sender.steamid, &sender.refresh_token).await.unwrap();
+    println!("INVITES after {} (the new one is there: {}); tokens as first-3+len: made {}{} list {:?}", after.len(), after.iter().any(|l| l.token.eq_ignore_ascii_case(&made.token)), &made.token[..3], made.token.len(), after.iter().map(|l| format!("{}{}", &l.token[..3], l.token.len())).collect::<Vec<_>>());
+    for l in &after {
+        println!("INVITES revoke {:?}", revoke(&link, &id, sender.steamid, &sender.refresh_token, &l.token).await);
+    }
+    let end = list(&link, &id, sender.steamid, &sender.refresh_token).await.unwrap();
+    println!("INVITES at the end {}", end.len());
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}

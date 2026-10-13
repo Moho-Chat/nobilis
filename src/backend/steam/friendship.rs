@@ -38,6 +38,11 @@ pub fn parse_target(text: &str) -> Result<Target, String> {
     if let Some(inner) = text.strip_prefix("[U:1:").and_then(|t| t.strip_suffix(']')) {
         return inner.parse::<u32>().map(|n| Target::Id(steamid::steamid_of(n))).map_err(|_| format!("{text} is not a Steam id"));
     }
+    // An invite link, `s.team/p/<code>/<token>`, or a profile address in the
+    // same code's form: it says which account, and is asked as a request.
+    if text.contains("s.team/p/") || text.contains("/user/") {
+        return super::invites::account_of_link(text).map(|n| Target::Id(steamid::steamid_of(n))).ok_or_else(|| "that is not a Steam invite link".to_string());
+    }
     // A profile address. Only the numeric form says who it is; a custom name
     // in one is looked up on the website, which this does not talk to.
     if let Some((_, rest)) = text.split_once("steamcommunity.com/") {
@@ -162,6 +167,8 @@ mod tests {
         assert_eq!(parse_target("76561197960287930"), Ok(Target::Id(id)));
         assert_eq!(parse_target("  76561197960287930\n"), Ok(Target::Id(id)));
         assert_eq!(parse_target("22202"), Ok(Target::Id(id)), "a friend code is the account number");
+        assert_eq!(parse_target("https://s.team/p/dknq-cpfb/QWERTYUI"), Ok(Target::Id(steamid::steamid_of(664476208))), "an invite link says whose it is");
+        assert!(parse_target("https://s.team/p/not-code/TOKEN").is_err());
         assert_eq!(parse_target("[U:1:22202]"), Ok(Target::Id(id)));
         assert_eq!(parse_target("https://steamcommunity.com/profiles/76561197960287930/"), Ok(Target::Id(id)));
         assert_eq!(parse_target("mohotester"), Ok(Target::Name("mohotester".to_string())));

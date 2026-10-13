@@ -4148,6 +4148,50 @@ pub async fn dispatch(
             Some(account_id) => (Some(backend::steam::groups::held(account_id).to_json()), None),
         },
 
+        // Who the account has blocked, and lifting a block: a blocked person has no
+        // conversation to do it from.
+        "steamBlockedList" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamBlockedList requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(backend::steam::blocked::held(account_id)), None),
+        },
+        "steamUnblock" => {
+            let (Some(account_id), Some(friend)) = (p_str_opt(params, "accountId"), p_str_opt(params, "steamid").and_then(backend::steam::groups::friend_of)) else {
+                return (None, Some("steamUnblock requires \"accountId\" and \"steamid\"".to_string()));
+            };
+            let Some(link) = state.runtime.steam_link(account_id) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            match backend::steam::prefs::block(&link, friend, false).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The links this account gives out for others to add it by: listed, made, taken back.
+        "steamInviteLinks" => {
+            use backend::steam::invites;
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("steamInviteLinks requires \"accountId\"".to_string()));
+            };
+            let (Some(link), Some(config)) = (state.runtime.steam_link(account_id), state.accounts.get_steam(account_id)) else {
+                return (None, Some("this Steam account is not connected".to_string()));
+            };
+            let (steamid, token) = (config.steamid, config.refresh_token.as_str());
+            let result = match p_str_opt(params, "action").unwrap_or("list") {
+                "create" => invites::create(&link, account_id, steamid, token).await.map(|_| ()),
+                "revoke" => invites::revoke(&link, account_id, steamid, token, p_str_opt(params, "token").unwrap_or_default()).await,
+                _ => Ok(()),
+            };
+            match result {
+                Err(e) => (None, Some(e)),
+                // Always the list as it is now, so the window need not guess what a change did.
+                Ok(()) => match invites::list(&link, account_id, steamid, token).await {
+                    Ok(links) => (Some(serde_json::json!(links.iter().map(|l| serde_json::json!({ "token": l.token, "link": l.link, "created": l.created, "lastsSeconds": l.lasts_seconds })).collect::<Vec<_>>())), None),
+                    Err(e) => (None, Some(e)),
+                },
+            }
+        }
+
         // Changes one: a friend into or out of a group, or the group itself - made,
         // renamed or deleted. Answers with the number of a group that was made.
         "steamGroupChange" => {
