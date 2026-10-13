@@ -77,6 +77,9 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         "center" | "c" | "color" | "bgcolor" | "size" | "smalltext" | "list" | "olist" | "dynamiclink" | "doclink" | "expand" | "table" | "tr" | "td" | "th" => inner.to_string(),
         // A person named in a group: the words are the name, with its @.
         "mention" => inner.to_string(),
+        // What Steam's own servers wrap a store address in (`[steamstore app="220"]`):
+        // the address is the message, and the window makes a card of it as of any link.
+        "steamstore" => inner.to_string(),
         // Effects are an animation over the window, with nothing to say.
         "roomeffect" => String::new(),
         _ => inner.to_string(),
@@ -94,7 +97,7 @@ fn host_of(url: &str) -> Option<String> {
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
     "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention",
+    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention", "steamstore",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.
@@ -326,6 +329,11 @@ mod tests {
         assert_eq!(to_markup("see [url=https://example.com/x fromclient=1]https://example.com/x[/url]!"), "see https://example.com/x!", "a link that is its own label is just the address");
         assert_eq!(to_markup("[url=\"https://example.com\"]quoted[/url]"), "[quoted](https://example.com)");
         assert_eq!(to_markup("[url=https://e.com]a ] b[/url]"), "[a \\] b](https://e.com)", "a bracket in the label cannot end it early");
+    }
+
+    #[test]
+    fn a_store_address_wrapped_by_steam_is_the_address() {
+        assert_eq!(to_markup("see [steamstore app=\"220\"]https://store.steampowered.com/app/220/[/steamstore]"), "see https://store.steampowered.com/app/220/");
     }
 
     #[test]

@@ -1248,6 +1248,7 @@ pub fn group_refusal(error: &super::link::CallError) -> String {
     use super::link::CallError;
     match error {
         CallError::Refused(super::eresult::ACCESS_DENIED, _) => "you do not have the permission for that in this group".to_string(),
+        CallError::Refused(super::eresult::BANNED, _) => "you have been banned from that group".to_string(),
         CallError::Refused(12, _) => "Steam does not accept that name".to_string(),
         CallError::Refused(super::eresult::LIMIT_EXCEEDED, _) => "the group is at a limit Steam keeps (rooms, roles, invite links or members)".to_string(),
         CallError::Refused(super::eresult::NO_MATCH | super::eresult::FILE_NOT_FOUND | super::eresult::INVALID_STATE, _) => "that group, room or person is not there any more".to_string(),
