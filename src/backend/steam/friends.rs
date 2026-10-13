@@ -46,11 +46,17 @@ pub struct Persona {
     pub flags: u32,
     /// Whether they are on a Steam Deck.
     pub on_deck: bool,
+    /// What kind of device Steam says they are on (`EGamingDeviceType`).
+    pub device: u32,
     /// The last time they were seen, unix seconds.
     pub last_seen: Option<u32>,
     /// What the game they are in says about what they are doing, where it says.
     pub rich: Option<String>,
 }
+
+/// `EGamingDeviceType` as the Steam client reads it: a Steam Deck, and a Steam Machine.
+pub const DEVICE_STEAM_DECK: u32 = 544;
+pub const DEVICE_STEAM_MACHINE: u32 = 545;
 
 /// The picture Steam shows for somebody who has not set one.
 const DEFAULT_AVATAR: &str = "fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb";
@@ -333,8 +339,14 @@ fn merge(held: &mut Persona, update: &PersonaFriend) {
     if let Some(flags) = update.persona_state_flags {
         held.flags = flags;
     }
+    // The Steam Deck is said two ways: a flag, and the kind of device it is (544), which is what
+    // the Steam client itself goes by; and 545 is a Steam Machine.
     if let Some(deck) = update.on_steam_deck {
         held.on_deck = deck;
+    }
+    if let Some(kind) = update.gaming_device_type {
+        held.device = kind;
+        held.on_deck = held.on_deck || kind == DEVICE_STEAM_DECK;
     }
     if let Some(seen) = [update.last_seen_online, update.last_logoff, update.last_logon].into_iter().flatten().filter(|t| *t > 0).max() {
         held.last_seen = Some(held.last_seen.map_or(seen, |old| old.max(seen)));
@@ -578,6 +590,16 @@ mod tests {
         // Once they are a friend they are only counted once.
         r.apply_friends_list(&list(true, &[(77, REL_FRIEND)]));
         assert_eq!(r.participants(), vec![10, 77]);
+    }
+
+    #[test]
+    fn a_steam_deck_is_known_by_the_kind_of_device_as_the_steam_client_knows_it() {
+        let mut roster = Roster::default();
+        let said = |kind: u32| ClientPersonaState { friends: vec![PersonaFriend { friendid: Some(steamid::steamid_of(10)), gaming_device_type: Some(kind), persona_state: Some(1), ..Default::default() }], ..Default::default() };
+        roster.apply_persona(&said(544));
+        assert!(roster.persona(10).unwrap().on_deck, "544 is a Steam Deck");
+        roster.apply_persona(&said(545));
+        assert_eq!(roster.persona(10).unwrap().device, DEVICE_STEAM_MACHINE);
     }
 
     #[test]

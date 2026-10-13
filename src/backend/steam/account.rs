@@ -30,20 +30,90 @@ pub fn is_limited(account_flags: u32) -> bool {
     account_flags & LIMITED != 0
 }
 
-/// The words the account has asked to have hidden, and when.
+/// Steam's own lists of what is rude, as patterns, one to a line: what the client itself fetches
+/// from the community site. `profanity` is dropped by the setting that allows it, and `clean` is
+/// what is let through whatever else says.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Dictionary {
+    pub banned: Vec<String>,
+    pub profanity: Vec<String>,
+    pub clean: Vec<String>,
+}
+
+/// The words the account has asked to have hidden, and the patterns they and Steam's lists make.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TextFilter {
-    /// `ETextFilterSetting`: 1 on, 2 on with profanity allowed; anything else is off here.
+    /// `ETextFilterSetting`: 0 and 3 use none of Steam's lists, 2 only the banned one, 1 both.
     pub setting: i32,
     pub ignore_friends: bool,
     pub banned: Vec<String>,
     pub clean: Vec<String>,
+    pub compiled: Compiled,
+}
+
+/// What the lists and the account's own words make: one pattern for what is hidden and one for
+/// what is let through, each only as good as the lines in them that are patterns at all.
+#[derive(Clone, Debug, Default)]
+pub struct Compiled {
+    hidden: Option<regex::Regex>,
+    allowed: Option<regex::Regex>,
+}
+
+impl PartialEq for Compiled {
+    fn eq(&self, other: &Self) -> bool {
+        self.hidden.as_ref().map(|r| r.as_str()) == other.hidden.as_ref().map(|r| r.as_str()) && self.allowed.as_ref().map(|r| r.as_str()) == other.allowed.as_ref().map(|r| r.as_str())
+    }
+}
+
+/// The lines that are patterns this can read, as one alternation. A line that is not one is left
+/// out, as the client leaves out one its own engine cannot compile.
+fn alternation(lines: impl IntoIterator<Item = String>) -> Option<String> {
+    let usable: Vec<String> = lines.into_iter().map(|l| l.trim().trim_start_matches('\u{feff}').to_string()).filter(|l| !l.is_empty() && regex::Regex::new(&format!(r"(?i)\b({l})\b")).is_ok()).collect();
+    (!usable.is_empty()).then(|| usable.join("|"))
 }
 
 impl TextFilter {
-    fn on(&self) -> bool {
-        matches!(self.setting, 1 | 2)
+    /// Builds the patterns the client builds: Steam's lists as the setting says, and the account's own
+    /// words on top whatever the setting is.
+    pub fn compile(setting: i32, banned: &[String], clean: &[String], dictionary: &Dictionary) -> Compiled {
+        let mut hidden: Vec<String> = match setting {
+            0 | 3 => Vec::new(),
+            2 => dictionary.banned.clone(),
+            _ => dictionary.profanity.iter().chain(&dictionary.banned).cloned().collect(),
+        };
+        hidden.extend(banned.iter().cloned());
+        let allowed: Vec<String> = dictionary.clean.iter().chain(clean).cloned().collect();
+        Compiled {
+            hidden: alternation(hidden).and_then(|a| regex::Regex::new(&format!(r"(?i)\b({a})\b")).ok()),
+            allowed: alternation(allowed).and_then(|a| regex::Regex::new(&format!(r"(?i)^(\b({a})\b)$")).ok()),
+        }
     }
+}
+
+/// Steam's lists, asked of the community site once a run.
+static DICTIONARY: LazyLock<Mutex<Option<Arc<Dictionary>>>> = LazyLock::new(Default::default);
+
+async fn dictionary(key: &str) -> Arc<Dictionary> {
+    if let Some(held) = DICTIONARY.lock().unwrap().clone() {
+        return held;
+    }
+    let router = crate::net::route::router();
+    let http = router.client_if("steam", router.routed(key), |b| b.timeout(std::time::Duration::from_secs(30)).user_agent(concat!("moho/", env!("CARGO_PKG_VERSION"))));
+    let fetch = |kind: &'static str| {
+        let http = http.clone();
+        async move {
+            let url = format!("https://community.fastly.steamstatic.com/textfilter/gettextfilterdictionary?type={kind}&language=english&v=1");
+            let raw = http.get(url).send().await.ok().filter(|r| r.status().is_success())?.bytes().await.ok()?;
+            Some(super::web::plain(&raw).lines().map(str::to_string).collect::<Vec<_>>())
+        }
+    };
+    let (banned, profanity, clean) = tokio::join!(fetch("banned"), fetch("profanity"), fetch("clean_public"));
+    let dictionary = Arc::new(Dictionary { banned: banned.unwrap_or_default(), profanity: profanity.unwrap_or_default(), clean: clean.unwrap_or_default() });
+    // Kept only when it came: a list that did not is asked for again next time.
+    if !dictionary.banned.is_empty() {
+        *DICTIONARY.lock().unwrap() = Some(dictionary.clone());
+    }
+    dictionary
 }
 
 /// What is known about the account, as the window reads it.
@@ -71,7 +141,7 @@ impl Facts {
             "limited": self.limited,
             "familyView": self.family_view.map(|(enabled, holds_friends)| json!({ "enabled": enabled, "holdsFriendsBack": holds_friends })),
             "textFilter": self.filter.as_ref().map(|f| json!({
-                "on": f.on(),
+                "on": f.compiled.hidden.is_some(),
                 "setting": match f.setting { 1 => "on", 2 => "on, profanity allowed", 3 => "off", _ => "not in use" },
                 "ignoreFriends": f.ignore_friends,
                 "words": f.banned.len(),
@@ -116,10 +186,17 @@ pub async fn load(state: AppState, link: Link, account_id: String, steamid: u64,
         link.call::<_, GetPrivacySettingsResponse>("Player.GetPrivacySettings#1", &GetPrivacySettingsRequest {}, true),
         link.call::<_, GetParentalSettingsResponse>("Parental.GetParentalSettings#1", &parental_request, true),
     );
-    let filter = preferences.ok().and_then(|p| p.preferences).map(|p| {
-        let words = words.ok().and_then(|w| w.words).unwrap_or_default();
-        TextFilter { setting: p.text_filter_setting.unwrap_or(0), ignore_friends: p.text_filter_ignore_friends.unwrap_or(true), banned: words.text_filter_custom_banned_words, clean: words.text_filter_custom_clean_words }
-    });
+    let filter = match preferences.ok().and_then(|p| p.preferences) {
+        Some(p) => {
+            let words = words.ok().and_then(|w| w.words).unwrap_or_default();
+            let setting = p.text_filter_setting.unwrap_or(0);
+            // Steam's own lists are needed only where the setting uses them.
+            let lists = if matches!(setting, 1 | 2) { (*dictionary(&account_id).await).clone() } else { Dictionary::default() };
+            let compiled = TextFilter::compile(setting, &words.text_filter_custom_banned_words, &words.text_filter_custom_clean_words, &lists);
+            Some(TextFilter { setting, ignore_friends: p.text_filter_ignore_friends.unwrap_or(true), banned: words.text_filter_custom_banned_words, clean: words.text_filter_custom_clean_words, compiled })
+        }
+        None => None,
+    };
     let family_view = parental.ok().and_then(|p| p.settings).map(|s| {
         let enabled = s.is_enabled.unwrap_or(false);
         (enabled, enabled && s.enabled_features.unwrap_or(0) & (1 << FRIENDS_FEATURE) == 0)
@@ -127,45 +204,31 @@ pub async fn load(state: AppState, link: Link, account_id: String, steamid: u64,
     keep(&state, &account_id, Facts { limited: is_limited(account_flags), family_view, filter, privacy: privacy.ok().and_then(|p| p.privacy_settings) });
 }
 
-/// A message with the words the account hides masked, for somebody the filter
-/// applies to: a stranger always, and a friend unless the account says friends
-/// are not filtered. Steam's own list of what is rude is Steam's and is not
-/// here; these are the words the account added to it.
+/// A message with the words the account hides masked, for somebody the filter applies to: a stranger
+/// always, and a friend unless the account says friends are not filtered.
 pub fn filtered(account_id: &str, from_friend: bool, text: &str) -> String {
     let facts = HELD.lock().unwrap().get(account_id).cloned();
     let Some(filter) = facts.as_ref().and_then(|f| f.filter.as_ref()) else { return text.to_string() };
-    if !filter.on() || (from_friend && filter.ignore_friends) || filter.banned.is_empty() {
+    if (from_friend && filter.ignore_friends) || filter.compiled.hidden.is_none() {
         return text.to_string();
     }
-    mask(text, &filter.banned, &filter.clean)
+    mask(text, &filter.compiled)
 }
 
-/// Replaces each whole word that is in `banned` and not in `clean` with hearts, as Steam does.
-pub fn mask(text: &str, banned: &[String], clean: &[String]) -> String {
-    let hidden = |word: &str| {
-        let lower = word.to_lowercase();
-        banned.iter().any(|b| b.to_lowercase() == lower) && !clean.iter().any(|c| c.to_lowercase() == lower)
-    };
-    let mut out = String::new();
-    let mut word = String::new();
-    for c in text.chars().chain(std::iter::once('\0')) {
-        if c.is_alphanumeric() || c == '\'' {
-            word.push(c);
-            continue;
-        }
-        if !word.is_empty() {
-            if hidden(&word) {
-                out.extend(std::iter::repeat_n('\u{2665}', word.chars().count()));
+/// Replaces each whole word the patterns hide with a heart for every letter, unless the word is one the
+/// allowed pattern says is clean, as Steam does.
+pub fn mask(text: &str, patterns: &Compiled) -> String {
+    let Some(hidden) = &patterns.hidden else { return text.to_string() };
+    hidden
+        .replace_all(text, |found: &regex::Captures| {
+            let word = &found[0];
+            if patterns.allowed.as_ref().is_some_and(|a| a.is_match(word)) {
+                word.to_string()
             } else {
-                out.push_str(&word);
+                "\u{2665}".repeat(word.chars().count())
             }
-            word.clear();
-        }
-        if c != '\0' {
-            out.push(c);
-        }
-    }
-    out
+        })
+        .into_owned()
 }
 
 /// A place the account is signed in.
@@ -268,29 +331,55 @@ mod tests {
         assert!(!is_limited(1 | 16384));
     }
 
+    fn lists() -> Dictionary {
+        Dictionary { banned: vec!["bann?ed".into(), "[unclosed".into()], profanity: vec!["f+u+d+ge".into()], clean: vec!["banned together".into(), "bannedx".into()] }
+    }
+
     #[test]
-    fn what_the_account_hides_is_hidden_as_whole_words_with_hearts() {
-        let banned = vec!["heck".to_string(), "Darn".to_string()];
-        let clean = vec!["darn".to_string()];
-        assert_eq!(mask("what the heck, a Heckle and DARN it", &banned, &[]), "what the \u{2665}\u{2665}\u{2665}\u{2665}, a Heckle and \u{2665}\u{2665}\u{2665}\u{2665} it");
-        assert_eq!(mask("darn", &banned, &clean), "darn", "a word the account marked clean is not hidden");
-        assert_eq!(mask("nothing here", &banned, &clean), "nothing here");
-        assert_eq!(mask("", &banned, &clean), "");
+    fn what_the_lists_and_the_account_hide_is_hidden_as_whole_words_with_a_heart_each() {
+        let own = ["heck".to_string(), "Darn".to_string()];
+        let on = TextFilter::compile(1, &own, &["darn".to_string()], &lists());
+        assert_eq!(mask("what the heck, a Heckle and DARN it", &on), "what the \u{2665}\u{2665}\u{2665}\u{2665}, a Heckle and DARN it", "the account's own words, and what it marked clean is let through");
+        assert_eq!(mask("fuuudge and banned and bannedx", &on), "\u{2665}\u{2665}\u{2665}\u{2665}\u{2665}\u{2665}\u{2665} and \u{2665}\u{2665}\u{2665}\u{2665}\u{2665}\u{2665} and bannedx", "Steam's lists, with a line that is no pattern left out and a clean word let through");
+        assert_eq!(mask("banned together", &on), "\u{2665}\u{2665}\u{2665}\u{2665}\u{2665}\u{2665} together", "as in the client, a clean entry lets through only a match that is the whole of it");
+        assert_eq!(mask("nothing here", &on), "nothing here");
+        // The setting that allows profanity uses only the banned list.
+        let mild = TextFilter::compile(2, &[], &[], &lists());
+        assert_eq!(mask("fudge banned", &mild), "fudge \u{2665}\u{2665}\u{2665}\u{2665}\u{2665}\u{2665}");
+        // Switched off: Steam's lists are not used, but the account's own words still are, as in the client.
+        let off = TextFilter::compile(3, &own, &[], &lists());
+        assert_eq!(mask("banned heck", &off), "banned \u{2665}\u{2665}\u{2665}\u{2665}");
     }
 
     #[test]
     fn the_filter_applies_to_strangers_and_to_friends_only_if_the_account_says_so() {
         let id = "steam:filter-test";
-        let words = || TextFilter { setting: 1, ignore_friends: true, banned: vec!["heck".into()], clean: vec![] };
+        let words = || TextFilter { setting: 1, ignore_friends: true, banned: vec!["heck".into()], clean: vec![], compiled: TextFilter::compile(1, &["heck".to_string()], &[], &Dictionary::default()) };
         HELD.lock().unwrap().insert(id.into(), Arc::new(Facts { filter: Some(words()), ..Default::default() }));
         assert_eq!(filtered(id, false, "oh heck"), "oh \u{2665}\u{2665}\u{2665}\u{2665}");
         assert_eq!(filtered(id, true, "oh heck"), "oh heck", "friends are not filtered by default");
         HELD.lock().unwrap().insert(id.into(), Arc::new(Facts { filter: Some(TextFilter { ignore_friends: false, ..words() }), ..Default::default() }));
         assert_eq!(filtered(id, true, "oh heck"), "oh \u{2665}\u{2665}\u{2665}\u{2665}");
-        HELD.lock().unwrap().insert(id.into(), Arc::new(Facts { filter: Some(TextFilter { setting: 3, ..words() }), ..Default::default() }));
-        assert_eq!(filtered(id, false, "oh heck"), "oh heck", "switched off");
         assert_eq!(filtered("steam:nobody", false, "oh heck"), "oh heck", "no filter known");
         clear(id);
+    }
+
+    /// Steam's real lists from the community site, and what they make of a sentence. The words used are the
+    /// mildest on the list. Needs the network.
+    #[tokio::test]
+    #[ignore = "needs the network"]
+    async fn steams_own_lists_are_fetched_and_hide_what_they_say() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let d = dictionary("steam:filter-probe").await;
+        println!("FILTER lists: {} banned, {} profanity, {} clean", d.banned.len(), d.profanity.len(), d.clean.len());
+        let on = TextFilter::compile(1, &[], &[], &d);
+        let mild = TextFilter::compile(2, &[], &[], &d);
+        println!("FILTER on:    {:?}", mask("what the fuck, a fukushima trip and pussycat", &on));
+        println!("FILTER mild:  {:?}", mask("what the fuck, a fukushima trip and pussycat", &mild));
+        assert!(d.banned.len() > 20 && d.profanity.len() > 20);
+        assert_eq!(mask("what the fuck", &on), "what the \u{2665}\u{2665}\u{2665}\u{2665}");
+        assert_eq!(mask("fukushima pussycat", &on), "fukushima pussycat", "clean words are let through");
+        assert_eq!(mask("what the fuck", &mild), "what the fuck", "the setting that allows profanity");
     }
 
     #[test]
@@ -324,7 +413,7 @@ mod tests {
         let facts = Facts {
             limited: true,
             family_view: Some((true, true)),
-            filter: Some(TextFilter { setting: 2, ignore_friends: true, banned: vec!["a".into(), "b".into()], clean: vec![] }),
+            filter: Some(TextFilter { setting: 2, ignore_friends: true, banned: vec!["a".into(), "b".into()], clean: vec![], compiled: Compiled::default() }),
             privacy: Some(PrivacySettings { privacy_state: Some(3), privacy_state_friendslist: Some(1), ..Default::default() }),
         };
         let j = facts.to_json();

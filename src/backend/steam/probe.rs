@@ -1068,6 +1068,10 @@ async fn a_chat_group_is_made_used_and_left() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     println!("E2E avatar after {:?}; rail icon {:?}", groups::held(&id, group).and_then(|g| g.avatar), state.runtime.list_buffer_groups().into_iter().find(|g| g.id == rail).and_then(|g| g.icon_url));
     println!("E2E dismiss notices {:?}", groups::act(&state, &id, Action::DismissNotices { group }).await);
+    println!("E2E notify {:?}", groups::act(&state, &id, Action::Notify { group, level: Some(2), muted: Some(true) }).await);
+    let mine: Result<GetMyChatRoomGroupsResponse, _> = state.runtime.steam_link(&id).unwrap().call("ChatRoom.GetMyChatRoomGroups#1", &GetMyChatRoomGroupsRequest {}, true).await;
+    println!("E2E notify as Steam holds it {:?}", mine.map(|m| m.chat_room_groups.iter().filter(|p| p.user_chat_group_state.as_ref().and_then(|u| u.chat_group_id) == Some(group)).map(|p| p.user_chat_group_state.as_ref().map(|u| (u.desktop_notification_level, u.mobile_notification_level, u.unread_indicator_muted))).collect::<Vec<_>>()));
+    println!("E2E notify back to all {:?}", groups::act(&state, &id, Action::Notify { group, level: Some(4), muted: None }).await);
     println!("E2E bans {:?}", groups::act(&state, &id, Action::Bans { group }).await);
     println!("E2E create role {:?}", groups::act(&state, &id, Action::CreateRole { group, name: "Raiders".into() }).await);
     let role = groups::held(&id, group).unwrap().roles.iter().find(|(_, n)| n == "Raiders").map(|(r, _)| *r);

@@ -30,6 +30,13 @@ struct Shown {
     detail: (Option<&'static str>, Option<u32>, Option<String>),
 }
 
+/// Which kind of device a person is on, in words: a Steam Machine is said by what Steam calls the
+/// device, the rest by what their client says.
+fn client_name(p: &super::friends::Persona) -> Option<&'static str> {
+    let said = presence::client_of(p.state, p.flags, p.on_deck)?;
+    Some(if p.device == super::friends::DEVICE_STEAM_MACHINE && !p.on_deck { "Steam Machine" } else { said })
+}
+
 pub struct Conversations {
     account_id: String,
     shown: HashMap<u32, Shown>,
@@ -87,7 +94,7 @@ impl Conversations {
             let status = persona.map_or("offline", |p| presence::status_of(p.state));
             let avatar = persona.and_then(|p| p.avatar.clone());
             let activity = persona.and_then(|p| presence::activity(p.state, roster.game_of(account).as_deref()));
-            let detail = persona.map_or((None, None, None), |p| (presence::client_of(p.state, p.flags, p.on_deck), p.last_seen, p.rich.clone()));
+            let detail = persona.map_or((None, None, None), |p| (client_name(p), p.last_seen, p.rich.clone()));
             let next = Shown { name: name.clone(), status, activity: activity.clone(), avatar: avatar.clone(), detail: detail.clone() };
             let before = self.shown.get(&account);
             if before == Some(&next) {

@@ -4292,7 +4292,7 @@ pub async fn dispatch(
                     None => return (None, Some("deleteRoom needs \"roomId\"".to_string())),
                 },
                 ("kick", Some(group)) => match number("steamid") {
-                    Some(who) => Action::Kick { group, who, seconds: p_i64(params, "seconds", 0) as i32 },
+                    Some(who) => Action::Kick { group, who, seconds: p_i64(params, "seconds", 3600) as i32 },
                     None => return (None, Some("kick needs \"steamid\"".to_string())),
                 },
                 ("ban", Some(group)) => match number("steamid") {
@@ -4300,7 +4300,7 @@ pub async fn dispatch(
                     None => return (None, Some("ban needs \"steamid\"".to_string())),
                 },
                 ("mute", Some(group)) => match number("steamid") {
-                    Some(who) => Action::Mute { group, who, seconds: p_i64(params, "seconds", 0) as i32 },
+                    Some(who) => Action::Mute { group, who, seconds: p_i64(params, "seconds", 600) as i32 },
                     None => return (None, Some("mute needs \"steamid\"".to_string())),
                 },
                 ("inviteFriend", Some(group)) => match number("steamid") {
@@ -4310,7 +4310,7 @@ pub async fn dispatch(
                 ("makeInvite", Some(group)) => Action::MakeInvite { group, seconds: p_i64(params, "seconds", 0).max(0) as u32 },
                 ("revokeInvite", Some(group)) => Action::RevokeInvite { group, code: text("code") },
                 ("links", Some(group)) => Action::Links { group },
-                ("notify", Some(group)) => Action::Notify { group, level: p_i64(params, "level", 2) as i32 },
+                ("notify", Some(group)) => Action::Notify { group, level: params.get("level").and_then(|v| v.as_i64()).map(|l| l as i32), muted: params.get("muted").and_then(|v| v.as_bool()) },
                 ("bans", Some(group)) => Action::Bans { group },
                 ("avatar", Some(group)) => Action::Avatar { group, path: text("path") },
                 ("dismissNotices", Some(group)) => Action::DismissNotices { group },
