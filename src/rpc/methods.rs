@@ -435,7 +435,9 @@ pub async fn dispatch(
                     // Best-effort - failing to reach Steam leaves what is
                     // stored, which is what is returned below either way.
                     if buffer.account_id.starts_with("steam:") {
-                        let fetched = if before > 0 {
+                        let fetched = if backend::steam::chatgroups::is_room(&buffer) {
+                            backend::steam::chatgroups::history(state, &buffer, (before > 0).then_some(before)).await
+                        } else if before > 0 {
                             backend::steam::history::older(state, &buffer, before).await
                         } else {
                             backend::steam::history::open(state, &buffer).await
@@ -1132,7 +1134,7 @@ pub async fn dispatch(
                         "discord" => backend::discord::profile(&state, &account_id, &buffer_id, &user_id, &who).await,
                         "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
                         "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
-                        "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who).await,
+                        "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1211,7 +1213,8 @@ pub async fn dispatch(
                 // Steam keeps a read position for each conversation, and tells
                 // every other client of the account when it moves.
                 Some(buffer) if buffer.account_id.starts_with("steam:") => {
-                    if let Err(e) = backend::steam::history::mark_read(state, &buffer) {
+                    let marked = if backend::steam::chatgroups::is_room(&buffer) { backend::steam::chatgroups::mark_read(state, &buffer) } else { backend::steam::history::mark_read(state, &buffer) };
+                    if let Err(e) = marked {
                         tracing::debug!("steam read position: {e}");
                     }
                     (Some(ok_node()), None)
@@ -3191,7 +3194,9 @@ pub async fn dispatch(
             let Some((account_id, rest)) = group_id.split_once('|') else {
                 return (None, Some("that is not something you can leave".to_string()));
             };
-            let result = if let Some(guild_id) = rest.strip_prefix("guild:") {
+            let result = if let Some(group) = backend::steam::chatgroups::group_of_rail_id(group_id) {
+                backend::steam::chatgroups::act(state, group.0, backend::steam::chatgroups::Action::Leave { group: group.1 }).await.map(|_| ()).map_err(anyhow::Error::msg)
+            } else if let Some(guild_id) = rest.strip_prefix("guild:") {
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
                 backend::matrix::leave_room(state, account_id, room_id).await
@@ -3315,6 +3320,8 @@ pub async fn dispatch(
                     };
                     let result = if paths.is_empty() {
                         backend::steam::send_message(state, &buffer, body).await
+                    } else if backend::steam::chatgroups::is_room(&buffer) {
+                        Err("Steam only takes pictures and videos in direct messages here so far".to_string())
                     } else {
                         let spoilers: Vec<&str> = params
                             .get("spoilerPaths")
@@ -3495,6 +3502,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("steam:") && backend::steam::chatgroups::is_room(&buffer) => match backend::steam::chatgroups::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("steam:") => match backend::steam::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3529,6 +3540,10 @@ pub async fn dispatch(
                         }
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("steam:") && backend::steam::chatgroups::is_room(&buffer) => match backend::steam::chatgroups::delete_message(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::delete_message(state, &buffer.account_id, &buffer.name, msg_id) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
@@ -4235,6 +4250,84 @@ pub async fn dispatch(
 
         // Changes one: a friend into or out of a group, or the group itself - made,
         // renamed or deleted. Answers with the number of a group that was made.
+        // The chat groups of a Steam account, whole: for the settings that edit them.
+        "steamChatGroups" => match p_str_opt(params, "accountId") {
+            None => (None, Some("steamChatGroups requires \"accountId\"".to_string())),
+            Some(account_id) => (Some(backend::steam::chatgroups::to_json(account_id, p_str_opt(params, "groupId").and_then(|g| g.parse().ok()))), None),
+        },
+        "steamChatGroupAction" => {
+            use backend::steam::chatgroups::Action;
+            let (Some(account_id), Some(what)) = (p_str_opt(params, "accountId"), p_str_opt(params, "action")) else {
+                return (None, Some("steamChatGroupAction requires \"accountId\" and \"action\"".to_string()));
+            };
+            let number = |key: &str| p_str_opt(params, key).and_then(|v| v.parse::<u64>().ok());
+            let text = |key: &str| p_str(params, key, "").to_string();
+            let group = number("groupId");
+            let action = match (what, group) {
+                ("create", _) => Action::Create { name: text("name") },
+                ("join", _) => Action::Join { invite: text("invite") },
+                ("leave", Some(group)) => Action::Leave { group },
+                ("rename", Some(group)) => Action::Rename { group, name: text("name") },
+                ("tagline", Some(group)) => Action::Tagline { group, text: text("text") },
+                ("createRoom", Some(group)) => Action::CreateRoom { group, name: text("name") },
+                ("renameRoom", Some(group)) => match number("roomId") {
+                    Some(room) => Action::RenameRoom { group, room, name: text("name") },
+                    None => return (None, Some("renameRoom needs \"roomId\"".to_string())),
+                },
+                ("deleteRoom", Some(group)) => match number("roomId") {
+                    Some(room) => Action::DeleteRoom { group, room },
+                    None => return (None, Some("deleteRoom needs \"roomId\"".to_string())),
+                },
+                ("kick", Some(group)) => match number("steamid") {
+                    Some(who) => Action::Kick { group, who, seconds: p_i64(params, "seconds", 0) as i32 },
+                    None => return (None, Some("kick needs \"steamid\"".to_string())),
+                },
+                ("ban", Some(group)) => match number("steamid") {
+                    Some(who) => Action::Ban { group, who, banned: p_bool(params, "banned", true) },
+                    None => return (None, Some("ban needs \"steamid\"".to_string())),
+                },
+                ("mute", Some(group)) => match number("steamid") {
+                    Some(who) => Action::Mute { group, who, seconds: p_i64(params, "seconds", 0) as i32 },
+                    None => return (None, Some("mute needs \"steamid\"".to_string())),
+                },
+                ("inviteFriend", Some(group)) => match number("steamid") {
+                    Some(who) => Action::InviteFriend { group, who },
+                    None => return (None, Some("inviteFriend needs \"steamid\"".to_string())),
+                },
+                ("makeInvite", Some(group)) => Action::MakeInvite { group, seconds: p_i64(params, "seconds", 0).max(0) as u32 },
+                ("revokeInvite", Some(group)) => Action::RevokeInvite { group, code: text("code") },
+                ("links", Some(group)) => Action::Links { group },
+                ("notify", Some(group)) => Action::Notify { group, level: p_i64(params, "level", 2) as i32 },
+                ("bans", Some(group)) => Action::Bans { group },
+                ("createRole", Some(group)) => Action::CreateRole { group, name: text("name") },
+                ("renameRole", Some(group)) => match number("roleId") {
+                    Some(role) => Action::RenameRole { group, role, name: text("name") },
+                    None => return (None, Some("renameRole needs \"roleId\"".to_string())),
+                },
+                ("deleteRole", Some(group)) => match number("roleId") {
+                    Some(role) => Action::DeleteRole { group, role },
+                    None => return (None, Some("deleteRole needs \"roleId\"".to_string())),
+                },
+                ("roleActions", Some(group)) => match number("roleId") {
+                    Some(role) => Action::RoleActions { group, role },
+                    None => return (None, Some("roleActions needs \"roleId\"".to_string())),
+                },
+                ("setRoleActions", Some(group)) => match number("roleId") {
+                    Some(role) => Action::SetRoleActions { group, role, actions: backend::steam::chatgroups::actions_of(role, params.get("actions").unwrap_or(&serde_json::Value::Null)) },
+                    None => return (None, Some("setRoleActions needs \"roleId\"".to_string())),
+                },
+                ("giveRole" | "takeRole", Some(group)) => match (number("steamid"), number("roleId")) {
+                    (Some(who), Some(role)) if what == "giveRole" => Action::GiveRole { group, who, role },
+                    (Some(who), Some(role)) => Action::TakeRole { group, who, role },
+                    _ => return (None, Some("giving or taking a role needs \"steamid\" and \"roleId\"".to_string())),
+                },
+                _ => return (None, Some("that is not something a Steam group can be asked to do".to_string())),
+            };
+            match backend::steam::chatgroups::act(state, account_id, action).await {
+                Ok(done) => (Some(done), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
         "steamGroupChange" => {
             use backend::steam::groups::{self, Change};
             let Some(account_id) = p_str_opt(params, "accountId") else {

@@ -27,6 +27,7 @@
 pub mod auth;
 pub mod bbcode;
 pub mod chat;
+pub mod chatgroups;
 pub mod cm;
 pub mod connect;
 pub mod emoticons;
@@ -87,6 +88,10 @@ pub fn explained(account_id: &str, why: String) -> String {
 
 /// Sends a direct message in the conversation `buffer` is, and stores it.
 pub async fn send_message(state: &AppState, buffer: &crate::model::Buffer, body: &str) -> Result<(), String> {
+    // A room of a chat group is spoken in as a group, not to a person.
+    if chatgroups::is_room(buffer) {
+        return chatgroups::send(state, buffer, body).await;
+    }
     let link = state.runtime.steam_link(&buffer.account_id).ok_or("this Steam account is not connected")?;
     let recipient = buffer.remote_id.clone().ok_or("this conversation is not with a Steam account")?;
     let sent = chat::send(&link, &recipient, body).await.map_err(|why| {

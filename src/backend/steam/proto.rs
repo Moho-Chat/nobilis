@@ -1076,6 +1076,8 @@ pub struct ChatRoomGroupHeaderState {
     pub default_role_id: Option<u64>,
     #[prost(message, repeated, tag = "18")]
     pub roles: Vec<ChatRole>,
+    #[prost(message, repeated, tag = "19")]
+    pub role_actions: Vec<ChatRoleActions>,
     #[prost(string, optional, tag = "25")]
     pub avatar_ugc_url: Option<String>,
     #[prost(bool, optional, tag = "26")]
@@ -1675,7 +1677,10 @@ pub struct ChatReactionRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
-pub struct ChatReactionResponse {}
+pub struct ChatReactionResponse {
+    #[prost(uint32, optional, tag = "1")]
+    pub num_reactors: Option<u32>,
+}
 
 #[derive(Clone, PartialEq, Message)]
 pub struct ChatReactionNotice {
@@ -1711,6 +1716,183 @@ pub struct InviteFriendToChatGroupRequest {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct InviteFriendToChatGroupResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ChatRoleActions {
+    #[prost(uint64, optional, tag = "1")]
+    pub role_id: Option<u64>,
+    #[prost(bool, optional, tag = "2")]
+    pub can_create_rename_delete_channel: Option<bool>,
+    #[prost(bool, optional, tag = "3")]
+    pub can_kick: Option<bool>,
+    #[prost(bool, optional, tag = "4")]
+    pub can_ban: Option<bool>,
+    #[prost(bool, optional, tag = "5")]
+    pub can_invite: Option<bool>,
+    #[prost(bool, optional, tag = "6")]
+    pub can_change_tagline_avatar_name: Option<bool>,
+    #[prost(bool, optional, tag = "7")]
+    pub can_chat: Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub can_view_history: Option<bool>,
+    #[prost(bool, optional, tag = "9")]
+    pub can_change_group_roles: Option<bool>,
+    #[prost(bool, optional, tag = "10")]
+    pub can_change_user_roles: Option<bool>,
+    #[prost(bool, optional, tag = "11")]
+    pub can_mention_all: Option<bool>,
+    #[prost(bool, optional, tag = "12")]
+    pub can_set_watching_broadcast: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetTaglineRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub tagline: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetTaglineResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct UserChatGroupPreferences {
+    #[prost(int32, optional, tag = "1")]
+    pub desktop_notification_level: Option<i32>,
+    #[prost(int32, optional, tag = "2")]
+    pub mobile_notification_level: Option<i32>,
+    #[prost(bool, optional, tag = "3")]
+    pub unread_indicator_muted: Option<bool>,
+    #[prost(bool, optional, tag = "4")]
+    pub direct_messages_allowed: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetUserPreferencesRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(message, optional, tag = "2")]
+    pub chat_group_preferences: Option<UserChatGroupPreferences>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SetUserPreferencesResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateRoleRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(string, optional, tag = "2")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CreateRoleResponse {
+    #[prost(message, optional, tag = "2")]
+    pub actions: Option<ChatRoleActions>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameRoleRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub role_id: Option<u64>,
+    #[prost(string, optional, tag = "3")]
+    pub name: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RenameRoleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteRoleRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub role_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteRoleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetRoleActionsRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub role_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetRoleActionsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub actions: Vec<ChatRoleActions>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReplaceRoleActionsRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "2")]
+    pub role_id: Option<u64>,
+    #[prost(message, optional, tag = "4")]
+    pub actions: Option<ChatRoleActions>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReplaceRoleActionsResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddRoleToUserRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub role_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "4")]
+    pub steamid: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddRoleToUserResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteRoleFromUserRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+    #[prost(uint64, optional, tag = "3")]
+    pub role_id: Option<u64>,
+    #[prost(fixed64, optional, tag = "4")]
+    pub steamid: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DeleteRoleFromUserResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetBanListRequest {
+    #[prost(uint64, optional, tag = "1")]
+    pub chat_group_id: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BanInfo {
+    #[prost(uint32, optional, tag = "1")]
+    pub accountid: Option<u32>,
+    #[prost(uint32, optional, tag = "2")]
+    pub accountid_actor: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub time_banned: Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub ban_reason: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetBanListResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub bans: Vec<BanInfo>,
+}
 
 /// Everything an account may put in a message beyond words.
 #[derive(Clone, PartialEq, Message)]
@@ -2018,14 +2200,15 @@ mod tests {
                 DeleteChatMessage, DeleteChatMessagesRequest, DeleteChatMessagesResponse,
                 ChatReactionRequest, ChatReactionResponse, ChatReactionNotice,
                 InviteFriendToChatGroupRequest, InviteFriendToChatGroupResponse,
-                FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
+                ChatRoleActions, SetTaglineRequest, SetTaglineResponse, UserChatGroupPreferences, SetUserPreferencesRequest, SetUserPreferencesResponse, CreateRoleRequest, CreateRoleResponse, RenameRoleRequest, RenameRoleResponse, DeleteRoleRequest, DeleteRoleResponse, GetRoleActionsRequest, GetRoleActionsResponse, ReplaceRoleActionsRequest, ReplaceRoleActionsResponse, AddRoleToUserRequest, AddRoleToUserResponse, DeleteRoleFromUserRequest, DeleteRoleFromUserResponse, GetBanListRequest, BanInfo, GetBanListResponse,
+        FriendGroup, FriendGroupMembership, ClientFriendsGroupsList, ClientCreateFriendsGroup,
                 ClientCreateFriendsGroupResponse, ClientDeleteFriendsGroup, ClientDeleteFriendsGroupResponse,
                 ClientManageFriendsGroup, ClientManageFriendsGroupResponse, ClientAddFriendToGroup,
                 ClientAddFriendToGroupResponse, ClientRemoveFriendFromGroup, ClientRemoveFriendFromGroupResponse,
             );
             seen += 1;
         }
-        assert_eq!(seen, 173, "a message was added without a vector, or one was lost");
+        assert_eq!(seen, 196, "a message was added without a vector, or one was lost");
     }
 
     /// Spot values too, so a failure above has something concrete to compare

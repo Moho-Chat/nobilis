@@ -115,15 +115,26 @@ async fn ask_level(link: &Link, friend: u32) -> Option<u32> {
 }
 
 /// The card for the person a conversation is with.
-pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &str) -> Value {
+pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &str, user_id: &str) -> Value {
     let mut card = profile::pending("steam", account_id, who);
     card["pending"] = json!(false);
     let buffer = state.runtime.get_buffer(buffer_id);
-    let friend = buffer.as_ref().and_then(|b| b.remote_id.as_deref()).and_then(|id| id.parse::<u64>().ok()).filter(|id| steamid::account_of(*id).is_some());
+    // A conversation is with one person; a room of a group is with many, and the
+    // member who was asked about is named.
+    let in_room = buffer.as_ref().is_some_and(super::chatgroups::is_room);
+    let friend = if in_room { user_id.parse::<u64>().ok() } else { buffer.as_ref().and_then(|b| b.remote_id.as_deref()).and_then(|id| id.parse::<u64>().ok()) }.filter(|id| steamid::account_of(*id).is_some());
     let Some(friend) = friend else { return card };
     card["id"] = json!(friend.to_string());
-    if let Some(member) = state.runtime.get_presence(buffer_id).and_then(|m| m.as_array().and_then(|a| a.first().cloned())) {
+    let listed = state.runtime.get_presence(buffer_id).and_then(|m| m.as_array().cloned()).unwrap_or_default();
+    let member = if in_room { listed.into_iter().find(|m| m["userId"].as_str() == Some(&friend.to_string())) } else { listed.into_iter().next() };
+    if let Some(member) = member {
         fill_from_presence(&mut card, &member);
+        if in_room {
+            if let Some(roles) = member["roles"].as_array().filter(|r| !r.is_empty()) {
+                card["roles"] = json!(roles);
+                card["isModerator"] = json!(member["powerLevel"].as_i64().unwrap_or(0) >= super::chatgroups::RANK_MODERATOR as i64);
+            }
+        }
     }
     if let Some(link) = state.runtime.steam_link(account_id) {
         let number = steamid::account_of(friend).unwrap_or_default();

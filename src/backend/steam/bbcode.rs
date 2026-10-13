@@ -75,6 +75,8 @@ fn render(tag: &str, attr: Option<&str>, inner: &str, cards: &mut Vec<Embed>) ->
         "p" => format!("{inner}\n"),
         // Tags that only lay out or colour: what is inside is the message.
         "center" | "c" | "color" | "bgcolor" | "size" | "smalltext" | "list" | "olist" | "dynamiclink" | "doclink" | "expand" | "table" | "tr" | "td" | "th" => inner.to_string(),
+        // A person named in a group: the words are the name, with its @.
+        "mention" => inner.to_string(),
         // Effects are an animation over the window, with nothing to say.
         "roomeffect" => String::new(),
         _ => inner.to_string(),
@@ -92,7 +94,7 @@ fn host_of(url: &str) -> Option<String> {
 /// Every tag that is read; anything else stays as the text it was typed as.
 const KNOWN: &[&str] = &[
     "b", "i", "u", "strike", "s", "spoiler", "h1", "h2", "h3", "h4", "h5", "quote", "pullquote", "url", "emoticon", "sticker", "img", "docimg", "p", "center", "c", "color", "bgcolor", "size",
-    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*",
+    "video", "looping_media", "og", "smalltext", "list", "olist", "dynamiclink", "doclink", "expand", "table", "tr", "td", "th", "roomeffect", "code", "noparse", "hr", "*", "mention",
 ];
 
 /// Whose contents are not read: code is code, and noparse says so.

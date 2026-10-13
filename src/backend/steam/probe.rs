@@ -415,7 +415,7 @@ async fn nicknames_notifications_and_a_friends_card_work_against_steam() {
     let number = super::steamid::account_of(receiver.steamid).unwrap();
 
     // Their card: Steam's answers, in the shape the window draws.
-    let card = super::profile::build(&state, &id, &conversation().unwrap().id, &original).await;
+    let card = super::profile::build(&state, &id, &conversation().unwrap().id, &original, "").await;
     let labels: Vec<&str> = card["extra"].as_array().map(|a| a.iter().filter_map(|e| e["label"].as_str()).collect()).unwrap_or_default();
     println!("card: id {} status {} labels {labels:?} created {}", card["id"], card["status"], card.get("createdTs").is_some());
     assert_eq!(card["id"], receiver.steamid.to_string());
@@ -940,6 +940,152 @@ async fn the_account_facts_and_sessions_are_read() {
         if let Some(link) = state.runtime.take_steam_link(&id) {
             crate::backend::steam::sign_off(link);
         }
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+/// The chat groups an account is in, as Steam lists them, and what making one is answered with.
+/// Run as the throwaway account only: it makes a group and leaves it again.
+#[tokio::test]
+#[ignore = "needs a real Steam account; makes and leaves a chat group on it"]
+async fn chat_groups_are_listed_and_one_is_made() {
+    use super::proto::*;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-chatgroups");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let link = state.runtime.steam_link(&id).unwrap();
+    let mine: Result<GetMyChatRoomGroupsResponse, _> = link.call("ChatRoom.GetMyChatRoomGroups#1", &GetMyChatRoomGroupsRequest {}, true).await;
+    println!("GROUPS mine {:#?}", mine);
+    let made: Result<CreateChatGroupResponse, _> = link
+        .call("ChatRoom.CreateChatRoomGroup#1", &CreateChatGroupRequest { name: Some("moho probe".into()), ..Default::default() }, true)
+        .await;
+    println!("GROUPS made {:#?}", made);
+    if let Ok(made) = made {
+        if let Some(group) = made.chat_group_id {
+            let msg: Result<ChatSendResponse, _> = link
+                .call("ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: made.state.as_ref().and_then(|s| s.default_chat_id), message: Some("hello from the probe".into()), echo_to_sender: Some(true) }, true)
+                .await;
+            println!("GROUPS sent {:#?}", msg);
+            let hist: Result<ChatHistoryResponse, _> = link
+                .call("ChatRoom.GetMessageHistory#1", &ChatHistoryRequest { chat_group_id: Some(group), chat_id: made.state.as_ref().and_then(|s| s.default_chat_id), max_count: Some(20), ..Default::default() }, true)
+                .await;
+            println!("GROUPS history {:#?}", hist);
+            let links: Result<CreateInviteLinkResponse, _> = link.call("ChatRoom.CreateInviteLink#1", &CreateInviteLinkRequest { chat_group_id: Some(group), seconds_valid: Some(3600), chat_id: None }, true).await;
+            println!("GROUPS invite {:#?}", links);
+            let left: Result<LeaveChatGroupResponse, _> = link.call("ChatRoom.LeaveChatRoomGroup#1", &LeaveChatGroupRequest { chat_group_id: Some(group) }, true).await;
+            println!("GROUPS left {:?}", left);
+        }
+    }
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+}
+
+fn link_for_raw(state: &crate::state::AppState, id: &str) -> super::link::Link {
+    state.runtime.steam_link(id).unwrap()
+}
+
+/// Chat groups end to end against real Steam, as the throwaway account: a group is made,
+/// shows up as a server with a channel, is spoken in, gains a room, is renamed, has an
+/// invite made and revoked, and is left. Every step is read back from what the window would see.
+#[tokio::test]
+#[ignore = "needs a real Steam account; makes, uses and leaves a chat group on it"]
+async fn a_chat_group_is_made_used_and_left() {
+    use super::chatgroups::{self as groups, Action};
+    use super::proto::*;
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let state = simulated_daemon("steam-probe-groups-e2e");
+    let sender = account("SENDER");
+    let id = sender.account_id();
+    state.accounts.add_steam(sender.clone()).unwrap();
+    connect::spawn(state.clone(), sender.clone());
+    within(60, "the account to be signed in", || state.runtime.conn_state(&id) == Some(ConnState::Connected)).await;
+    let channels = |state: &crate::state::AppState| -> Vec<String> { state.runtime.list_buffers().into_iter().filter(|b| b.account_id == id && b.kind == "channel").map(|b| b.name).collect() };
+    // Left over from an earlier run: leave them first.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    println!("E2E at the start: channels {:?}", channels(&state));
+
+    let made = groups::act(&state, &id, Action::Create { name: "moho e2e".into() }).await;
+    println!("E2E create {made:?}");
+    let rail = made.unwrap()["groupId"].as_str().unwrap().to_string();
+    let (_, group) = groups::group_of_rail_id(&rail).map(|(a, g)| (a.to_string(), g)).unwrap();
+    within(10, "the group's channel to appear", || channels(&state).iter().any(|n| n == "moho e2e/#General")).await;
+    println!("E2E channels now {:?}; rail groups {:?}", channels(&state), state.runtime.list_buffer_groups().into_iter().filter(|g| g.account_id == id).map(|g| (g.id, g.name, g.kind)).collect::<Vec<_>>());
+
+    let buffer = state.runtime.get_buffer(&crate::model::buffer_id(&id, "moho e2e/#General")).unwrap();
+    println!("E2E remote id {:?}, group {:?}, read-only {:?}", buffer.remote_id, buffer.group_id, buffer.read_only);
+    println!("E2E members shown {:?}", state.runtime.get_presence(&buffer.id));
+
+    println!("E2E send {:?}", super::send_message(&state, &buffer, "hello [b]world[/b] :steamhappy:").await);
+    println!("E2E mention send {:?}", super::send_message(&state, &buffer, "@Mohotester ping").await);
+    let raw: Result<ChatHistoryResponse, _> = link_for_raw(&state, &id).call("ChatRoom.GetMessageHistory#1", &ChatHistoryRequest { chat_group_id: Some(group), chat_id: groups::ids_of(&buffer).map(|(_, r)| r), max_count: Some(5), ..Default::default() }, true).await;
+    println!("E2E raw history {:?}", raw.map(|h| h.messages.iter().map(|m| m.message.clone()).collect::<Vec<_>>()));
+    let stored = state.store.get_backlog(&buffer.id, 0, 10).unwrap();
+    println!("E2E stored {:?}", stored.iter().map(|m| (m.id.clone(), m.from.clone(), m.body.clone(), m.ts)).collect::<Vec<_>>());
+
+    // Our own message echoed back as a notification, to see the live path decode and land.
+    let link = state.runtime.steam_link(&id).unwrap();
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    let echoed: Result<ChatSendResponse, _> = link
+        .call("ChatRoom.SendChatMessage#1", &ChatSendRequest { chat_group_id: Some(group), chat_id: groups::ids_of(&buffer).map(|(_, r)| r), message: Some("echo please".into()), echo_to_sender: Some(true) }, true)
+        .await;
+    println!("E2E raw send {echoed:?}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!("E2E after the echo {:?}", state.store.get_backlog(&buffer.id, 0, 10).unwrap().iter().map(|m| (m.id.clone(), m.body.clone())).collect::<Vec<_>>());
+    println!("E2E history adds (0 means live and history agree on the id): {:?}", groups::history(&state, &buffer, None).await);
+
+    if let Some(first) = stored.first() {
+        println!("E2E react {:?}", groups::react(&state, &buffer, &first.id, "[steam:emote:steamhappy]", true).await);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        println!("E2E reactions {:?}", state.store.get_message(&buffer.id, &first.id).ok().flatten().map(|m| m.reactions));
+        println!("E2E mark read {:?}", groups::mark_read(&state, &buffer));
+        println!("E2E history {:?}", groups::history(&state, &buffer, None).await);
+        println!("E2E delete {:?}", groups::delete_message(&state, &buffer, &first.id).await);
+    }
+
+    println!("E2E room {:?}", groups::act(&state, &id, Action::CreateRoom { group, name: "second".into() }).await);
+    within(10, "the second room's channel", || channels(&state).iter().any(|n| n == "moho e2e/#second")).await;
+    let second = groups::held(&id, group).unwrap().rooms.iter().find(|r| r.name == "second").map(|r| r.id).unwrap();
+    println!("E2E rename room {:?}", groups::act(&state, &id, Action::RenameRoom { group, room: second, name: "third".into() }).await);
+    within(10, "the renamed room's channel", || channels(&state).iter().any(|n| n == "moho e2e/#third") && !channels(&state).iter().any(|n| n == "moho e2e/#second")).await;
+    println!("E2E rename group {:?}", groups::act(&state, &id, Action::Rename { group, name: "moho e2e renamed".into() }).await);
+    within(10, "the renamed group's channels", || channels(&state).iter().any(|n| n == "moho e2e renamed/#third")).await;
+    println!("E2E tagline {:?}", groups::act(&state, &id, Action::Tagline { group, text: "a tagline".into() }).await);
+    let made = groups::act(&state, &id, Action::MakeInvite { group, seconds: 3600 }).await;
+    println!("E2E invite {made:?}");
+    println!("E2E links {:?}", groups::act(&state, &id, Action::Links { group }).await);
+    if let Some(code) = made.ok().and_then(|v| v["code"].as_str().map(str::to_string)) {
+        println!("E2E revoke {:?}", groups::act(&state, &id, Action::RevokeInvite { group, code }).await);
+    }
+    println!("E2E bans {:?}", groups::act(&state, &id, Action::Bans { group }).await);
+    println!("E2E create role {:?}", groups::act(&state, &id, Action::CreateRole { group, name: "Raiders".into() }).await);
+    let role = groups::held(&id, group).unwrap().roles.iter().find(|(_, n)| n == "Raiders").map(|(r, _)| *r);
+    println!("E2E role found {role:?}");
+    if let Some(role) = role {
+        println!("E2E rename role {:?}", groups::act(&state, &id, Action::RenameRole { group, role, name: "Raid leaders".into() }).await);
+        println!("E2E role actions {:?}", groups::act(&state, &id, Action::RoleActions { group, role }).await);
+        let mut a = groups::actions_of(role, &serde_json::json!({ "chat": true, "kick": true }));
+        a.can_ban = Some(true);
+        println!("E2E set role actions {:?}", groups::act(&state, &id, Action::SetRoleActions { group, role, actions: a }).await);
+        println!("E2E role actions after {:?}", groups::act(&state, &id, Action::RoleActions { group, role }).await);
+        println!("E2E give role {:?}", groups::act(&state, &id, Action::GiveRole { group, who: sender.steamid, role }).await);
+        println!("E2E members with roles {:?}", groups::held(&id, group).map(|g| g.members.iter().map(|m| (m.account, m.roles.clone())).collect::<Vec<_>>()));
+        println!("E2E take role {:?}", groups::act(&state, &id, Action::TakeRole { group, who: sender.steamid, role }).await);
+        println!("E2E delete role {:?}", groups::act(&state, &id, Action::DeleteRole { group, role }).await);
+    }
+    println!("E2E json {}", groups::to_json(&id, Some(group)));
+    println!("E2E delete room {:?}", groups::act(&state, &id, Action::DeleteRoom { group, room: second }).await);
+    within(10, "the deleted room's channel to go", || !channels(&state).iter().any(|n| n.ends_with("/#third"))).await;
+    println!("E2E leave {:?}", groups::act(&state, &id, Action::Leave { group }).await);
+    within(10, "the group's channels to go", || !channels(&state).iter().any(|n| n.starts_with("moho e2e"))).await;
+    println!("E2E at the end: channels {:?}, rail groups {:?}", channels(&state), state.runtime.list_buffer_groups().into_iter().filter(|g| g.account_id == id).count());
+    if let Some(link) = state.runtime.take_steam_link(&id) {
+        crate::backend::steam::sign_off(link);
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
 }

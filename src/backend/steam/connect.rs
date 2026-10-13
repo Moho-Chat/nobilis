@@ -239,6 +239,7 @@ impl Drop for Registered<'_> {
         super::groups::clear(self.account_id);
         super::account::clear(self.account_id);
         super::blocked::clear(self.account_id);
+        super::chatgroups::clear(self.account_id);
         self.state.runtime.take_steam_link(self.account_id);
     }
 }
@@ -307,6 +308,7 @@ pub async fn session(state: &AppState, config: &SteamAccountConfig, account_id: 
         catch_up_tries: 0,
         prefs_wanted: None,
         apps: AppNames::new(),
+        groups_wanted: None,
         shown: Conversations::new(account_id),
     }
     .run(&mut told, heartbeat)
@@ -334,6 +336,8 @@ struct Drive<'a> {
     prefs_wanted: Option<tokio::sync::oneshot::Receiver<Vec<PerFriendPreferences>>>,
     /// What the games people are in are called: asked of the store, once each.
     apps: AppNames,
+    /// The chat groups, on their way; and whether to read them again.
+    groups_wanted: Option<tokio::sync::oneshot::Receiver<Result<Vec<u32>, String>>>,
 }
 
 /// Games whose names have been asked for, so none is asked about twice, and
@@ -385,6 +389,8 @@ impl Drive<'_> {
                 }
             }
         });
+        self.load_groups();
+        let poked = super::chatgroups::pokes(self.account_id);
         let mut beat = tokio::time::interval(heartbeat);
         beat.tick().await; // the first tick is immediate
         loop {
@@ -394,7 +400,11 @@ impl Drive<'_> {
                     self.catch_up_at = None;
                     // Bounded: the connection is not heard from while this runs, and
                     // a Steam that stops answering must not stop that for long.
-                    let work = tokio::time::timeout(CATCH_UP_FOR, super::history::catch_up(self.state, self.link, self.account_id, self.own, &self.roster, &self.shown));
+                    let work = tokio::time::timeout(CATCH_UP_FOR, async {
+                        let unnamed = super::history::catch_up(self.state, self.link, self.account_id, self.own, &self.roster, &self.shown).await;
+                        super::chatgroups::catch_up(self.state, self.link, self.account_id, &self.roster).await;
+                        unnamed
+                    });
                     tokio::pin!(work);
                     // The heartbeat goes on meanwhile: an account with many
                     // conversations makes this long, and a connection that says
@@ -428,6 +438,26 @@ impl Drive<'_> {
                             self.shown.publish(self.state, &self.roster);
                         }
                         self.shown.apply_mutes(self.state, &self.roster);
+                    }
+                }
+                _ = poked.notified() => {
+                    super::chatgroups::publish(self.state, self.account_id, &self.roster);
+                    let unknown = super::chatgroups::unknown(self.account_id, &self.roster);
+                    self.ask_about(&unknown);
+                }
+                loaded = async { match self.groups_wanted.as_mut() { Some(rx) => rx.await, None => std::future::pending().await } } => {
+                    self.groups_wanted = None;
+                    match loaded {
+                        Ok(Ok(people)) => {
+                            let unknown: Vec<u32> = people.into_iter().filter(|p| !self.roster.has_name(*p)).collect();
+                            self.ask_about(&unknown);
+                            super::chatgroups::publish(self.state, self.account_id, &self.roster);
+                            // What was said in them while away.
+                            self.catch_up_tries = CATCH_UP_RETRIES;
+                            self.catch_up_at = Some(tokio::time::Instant::now() + Duration::from_millis(500));
+                        }
+                        Ok(Err(why)) => tracing::info!("steam[{}]: the chat groups could not be read: {why}", self.account_id),
+                        Err(_) => {}
                     }
                 }
                 heard = self.apps.heard.recv() => {
@@ -498,6 +528,9 @@ impl Drive<'_> {
                     self.ask_game_names();
                     self.shown.publish(self.state, &self.roster);
                     super::blocked::publish(self.state, self.account_id, &self.roster);
+                    if super::chatgroups::involves(self.account_id, &changed) {
+                        super::chatgroups::publish(self.state, self.account_id, &self.roster);
+                    }
                 }
             }
             // The groups the account sorts its friends into, and changes to them.
@@ -580,11 +613,33 @@ impl Drive<'_> {
                         self.read_elsewhere(&ack);
                     }
                 }
+                Some(method) if method.starts_with("ChatRoomClient.") => {
+                    if let Some(heard) = super::chatgroups::heard(self.state, self.account_id, &self.roster, method, &packet.body) {
+                        self.ask_about(&heard.ask);
+                        if heard.reload {
+                            self.load_groups();
+                        }
+                    }
+                }
                 other => tracing::info!("steam[{}]: a notification this client does not use: {other:?}", self.account_id),
             },
             other => tracing::debug!("steam[{}]: message {other}", self.account_id),
         }
         None
+    }
+
+    /// Reads the account's chat groups in the background; they are taken in
+    /// when they arrive. A read already on its way is left to finish.
+    fn load_groups(&mut self) {
+        if self.groups_wanted.is_some() {
+            return;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.groups_wanted = Some(rx);
+        let (link, account_id, own) = (self.link.clone(), self.account_id.to_string(), self.own);
+        tokio::spawn(async move {
+            let _ = tx.send(super::chatgroups::load(&link, &account_id, own).await);
+        });
     }
 
     /// Somebody is writing to us. Said only for a conversation that exists:
@@ -1014,7 +1069,7 @@ mod tests {
         .await;
         let (link, mut told) = link::open(ACCOUNT, &url).await.unwrap();
         link.set_identity(Identity { steamid: ME, session: 1 });
-        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None, apps: AppNames::new() };
+        let drive = Drive { state: &state, account_id: ACCOUNT, link: &link, own: 22202, roster: Roster::default(), shown: Conversations::new(ACCOUNT), asked: Default::default(), catch_up_at: None, catch_up_tries: 0, prefs_wanted: None, apps: AppNames::new(), groups_wanted: None };
         let running = tokio::time::timeout(Duration::from_secs(5), async {
             // Ends when the test has seen enough and the server is dropped.
             let watcher = async {
