@@ -551,7 +551,7 @@ async fn prepare(
     // Follow state is not asked for here: this runs for every channel at
     // connect, and that would be one extra request per channel before the
     // first message arrives. It is filled in when the channel is opened.
-    announce_stream(state, &buffer.id, &channel, None);
+    announce_stream(state, &buffer.id, &channel, None, channel.playback_url.as_deref().filter(|_| channel.live.is_some()).map(api::Playback::of).as_ref());
 
     // The streamer's own picture on the channel. Parsed since the first
     // version of this backend and used by nothing, so every Kick channel drew
