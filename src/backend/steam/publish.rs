@@ -111,8 +111,8 @@ impl Conversations {
             // And whether the account has muted them, wherever it did.
             state.runtime.set_silenced(state, &buffer.id, roster.muted(account));
             state.runtime.set_buffer_remote_id(state, &buffer.id, &steamid::text_of(account));
-            // Under the folder Steam has the friend in, if it has said yet.
-            super::groups::file_one(state, &self.account_id, &buffer.id, steamid::steamid_of(account));
+            // Under no heading of a service's: see groups::unfile_conversations.
+            super::groups::unfile_one(state, &buffer.id);
             if let Some(url) = &avatar {
                 state.runtime.set_buffer_avatar(state, &buffer.id, url);
             }
