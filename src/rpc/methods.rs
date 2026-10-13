@@ -175,6 +175,9 @@ pub async fn dispatch(
                 return (None, Some("listAllEmoji requires \"bufferId\"".to_string()));
             };
             let account_id = channel_account(state, buffer_id);
+            if account_id.starts_with("steam:") {
+                backend::steam::emoticons::refresh(state, &account_id).await;
+            }
             let mut sources = state.runtime.emoji_catalogue(&account_id);
             // Steam's stickers are sent, not typed: they have their own tab, asked for
             // by `listSteamStickers`, and are not a section of emoji.
@@ -225,6 +228,8 @@ pub async fn dispatch(
             None => (None, Some("listSteamStickers requires \"bufferId\"".to_string())),
             Some(buffer_id) => {
                 let account_id = channel_account(state, buffer_id);
+                // What the account has can have changed since it signed in.
+                backend::steam::emoticons::refresh(state, &account_id).await;
                 let stickers: Vec<serde_json::Value> = state
                     .runtime
                     .emoji_catalogue(&account_id)

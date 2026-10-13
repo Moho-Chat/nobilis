@@ -69,12 +69,54 @@ fn source(id: &str, name: &str, emoji: Vec<EmojiEntry>) -> EmojiSource {
     EmojiSource { id: id.to_string(), name: name.to_string(), service: "steam".to_string(), kind: "text".to_string(), icon_url: None, buffers: Vec::new(), sendable_anywhere: true, emoji }
 }
 
+/// Who is waiting to hear the list again, and when it was last asked for.
+static REFRESHES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, Heard>>> = std::sync::LazyLock::new(Default::default);
+
+/// What is held about one account's list: who waits for it, and when it came.
+type Heard = (std::sync::Arc<tokio::sync::Notify>, Option<std::time::Instant>);
+
+/// How long a list is taken to be current without asking again.
+const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long to wait for Steam's answer before offering what is held.
+const WAIT_FOR: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Asks Steam again what the account has, and waits for the answer.
+///
+/// The list is asked for once at sign-in and changes when something is earned or
+/// bought - a sticker added in the Steam client while moho is open is not in
+/// what was heard. So the picker asks as it opens. A list heard in the last few
+/// seconds is not asked for again, and a Steam that does not answer costs only
+/// the wait, after which what is held is offered as it was.
+pub async fn refresh(state: &AppState, account_id: &str) {
+    let Some(link) = state.runtime.steam_link(account_id) else { return };
+    let notify = {
+        let mut held = REFRESHES.lock().unwrap();
+        let entry = held.entry(account_id.to_string()).or_insert_with(|| (Default::default(), None));
+        if entry.1.is_some_and(|at| at.elapsed() < FRESH_FOR) {
+            return;
+        }
+        entry.0.clone()
+    };
+    let heard = notify.notified();
+    tokio::pin!(heard);
+    heard.as_mut().enable();
+    if link.send(emsg::CLIENT_GET_EMOTICON_LIST, &ClientGetEmoticonList {}).is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(WAIT_FOR, heard).await;
+}
+
 /// Keeps what Steam says the account has, as what the picker offers.
 pub fn keep(state: &AppState, account_id: &str, list: &ClientEmoticonList) {
     let (emoticons, stickers) = (emoticon_entries(list), sticker_entries(list));
     tracing::debug!("steam[{account_id}]: {} emoticon(s), {} sticker(s), {} effect(s)", emoticons.len(), stickers.len(), list.effects.len());
     state.runtime.set_emoji_source(account_id, source("steam", "Steam", emoticons));
     state.runtime.set_emoji_source(account_id, source(STICKERS, "Steam stickers", stickers));
+    let mut held = REFRESHES.lock().unwrap();
+    let entry = held.entry(account_id.to_string()).or_insert_with(|| (Default::default(), None));
+    entry.1 = Some(std::time::Instant::now());
+    entry.0.notify_waiters();
 }
 
 /// Asks Steam for what the account has. The full list - stickers and effects as
@@ -147,6 +189,46 @@ mod tests {
         let sources = state.runtime.emoji_catalogue("steam:me");
         let by = |id: &str| sources.iter().find(|s| s.id == id).map(|s| s.emoji.len());
         assert_eq!((by("steam"), by(STICKERS)), (Some(1), Some(2)));
+    }
+
+    #[tokio::test]
+    async fn the_list_is_asked_for_again_as_the_picker_opens_and_not_twice_in_a_row() {
+        use crate::backend::steam::link::{self, fake::*};
+        use prost::Message;
+        let state = crate::backend::kick::testkit::simulated_daemon("steam-emoticons-refresh");
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let url = serve(Box::new({
+            let asked = asked.clone();
+            move |p| {
+                if p.emsg != emsg::CLIENT_GET_EMOTICON_LIST {
+                    return Some(vec![]);
+                }
+                asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Steam says what the account has now: three stickers it did not have at sign-in.
+                let now = ClientEmoticonList { emoticons: vec![have("a", 0)], stickers: vec![sticker("A", 0), sticker("B", 0), sticker("C", 0)], effects: vec![] };
+                Some(vec![tell(emsg::CLIENT_EMOTICON_LIST, now.encode_to_vec())])
+            }
+        }))
+        .await;
+        let (link, mut told) = link::open_with("test", &url, std::time::Duration::from_secs(2)).await.unwrap();
+        state.runtime.set_steam_link("steam:refreshing", link);
+        // What the connection does with that message.
+        let hold = state.clone();
+        tokio::spawn(async move {
+            while let Some(packet) = told.recv().await {
+                if packet.emsg == emsg::CLIENT_EMOTICON_LIST {
+                    keep(&hold, "steam:refreshing", &ClientEmoticonList::decode(packet.body.as_slice()).unwrap());
+                }
+            }
+        });
+        let stickers = |state: &AppState| state.runtime.emoji_catalogue("steam:refreshing").iter().find(|s| s.id == STICKERS).map(|s| s.emoji.len());
+        assert_eq!(stickers(&state), None);
+        refresh(&state, "steam:refreshing").await;
+        assert_eq!(stickers(&state), Some(3), "what was earned after sign-in is there");
+        refresh(&state, "steam:refreshing").await;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "a list just heard is not asked for again");
+        // An account that is not connected has nothing to ask.
+        refresh(&state, "steam:nobody").await;
     }
 
     #[tokio::test]
