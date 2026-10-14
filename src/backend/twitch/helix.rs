@@ -128,6 +128,8 @@ impl std::fmt::Display for HelixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HelixError::Refused(why) => write!(f, "{why}"),
+            // A reason about the account itself (no verified phone number) is not cured by signing in again.
+            HelixError::Auth(why) if why.to_lowercase().contains("verified") || why.to_lowercase().contains("phone") => write!(f, "Twitch does not allow this for this account ({why}). Verify the account on twitch.tv to enable it."),
             HelixError::Auth(why) => write!(f, "Twitch does not allow this for this account{}. Sign in again from Accounts to refresh what it may do.", if why.is_empty() { String::new() } else { format!(" ({why})") }),
             HelixError::Failed(e) => write!(f, "{e:#}"),
         }
