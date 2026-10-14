@@ -188,6 +188,11 @@ pub struct Account {
     /// Matrix only: whether this account keeps a dehydrated device.
     #[serde(rename = "dehydration", default)]
     pub dehydration: bool,
+    /// Twitch only: whether this account holds a twitch.tv website session for
+    /// playing video as the person (their Turbo, their subscriptions). Said as
+    /// a yes or no and never the session itself.
+    #[serde(rename = "webSession", default, skip_serializing_if = "std::ops::Not::not")]
+    pub web_session: bool,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on

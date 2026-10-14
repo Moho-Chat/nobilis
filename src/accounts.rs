@@ -447,6 +447,12 @@ pub struct TwitchAccountConfig {
     /// The channels this account has open, by login, so they come back.
     #[serde(default)]
     pub channels: Vec<String>,
+    /// The `auth-token` of a twitch.tv session this person signed in to for
+    /// video, if they did. A credential of the same standing as the tokens
+    /// above and kept the same way; it is what makes their Turbo or their
+    /// subscriptions count when a stream is played (see backend/twitch/playback.rs).
+    #[serde(default)]
+    pub web_token: String,
     /// An account with no sign-in, which reads and does not send.
     #[serde(default)]
     pub anonymous: bool,
@@ -788,6 +794,9 @@ impl AccountStore {
                 }
                 if config.channels.is_empty() {
                     config.channels = old.channels.clone();
+                }
+                if config.web_token.is_empty() {
+                    config.web_token = old.web_token.clone();
                 }
             }
             twitch.insert(id, config.clone());
@@ -1388,6 +1397,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: false,
     }
 }
 
@@ -1427,6 +1437,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: false,
     }
 }
 
@@ -1465,6 +1476,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: false,
     }
 }
 
@@ -1512,6 +1524,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: false,
     }
 }
 
@@ -1558,6 +1571,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: false,
     }
 }
 
@@ -1599,6 +1613,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         rtc_focus_url: None,
         sliding_sync: false,
         dehydration: false,
+        web_session: !a.web_token.is_empty(),
     }
 }
 
@@ -1641,6 +1656,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         rtc_focus_url: a.rtc_focus_url.clone(),
         sliding_sync: a.prefer_sliding_sync,
         dehydration: a.dehydration_enabled,
+        web_session: false,
     }
 }
 

@@ -249,13 +249,19 @@ fn send_wait(sent: &VecDeque<std::time::Instant>, limit: usize) -> Option<u64> {
 struct Timing {
     join_every: Duration,
     join_patience: Duration,
+    poll_every: Duration,
+    /// Whether to ask Twitch what is on air. A test with a websocket for a Twitch has no GraphQL to ask.
+    watch_streams: bool,
 }
 
 impl Default for Timing {
     fn default() -> Self {
-        Self { join_every: JOIN_EVERY, join_patience: JOIN_PATIENCE }
+        Self { join_every: JOIN_EVERY, join_patience: JOIN_PATIENCE, poll_every: POLL_EVERY, watch_streams: true }
     }
 }
+
+/// How often what is on air is asked for.
+const POLL_EVERY: Duration = Duration::from_secs(60);
 
 /// One chat connection, from connecting to its end. `Ok` when Twitch asked us
 /// to reconnect; an error when it dropped.
@@ -275,6 +281,10 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
     let mut sent: VecDeque<std::time::Instant> = VecDeque::new();
     let mut welcomed = false;
     let mut pace = tokio::time::interval(timing.join_every);
+    // What is on air, asked for every channel this connection has open, once a
+    // minute: Twitch tells nobody when a stream starts or how many are watching.
+    let mut poll = tokio::time::interval(timing.poll_every);
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_heard = tokio::time::Instant::now();
 
     loop {
@@ -313,6 +323,11 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                             if let Some(channel) = outcome.joined {
                                 joined.insert(channel.clone());
                                 remember(state, account_id, &channel);
+                                // What it is broadcasting, now: the header and the Watch button have nothing until this answers.
+                                if timing.watch_streams {
+                                    let (state, account_id, channel) = (state.clone(), account_id.to_string(), channel.clone());
+                                    tokio::spawn(async move { super::stream::refresh(&state, &account_id, &[channel]).await });
+                                }
                                 for (_, _, reply) in waiting.iter_mut().filter(|w| w.0 == channel) {
                                     if let Some(reply) = reply.take() {
                                         let _ = reply.send(Ok(()));
@@ -368,6 +383,13 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                         let result = say(state, account_id, &mut rooms, &joined, &mut sent, moderator, &channel, &text, reply_to.as_deref(), helix, &mut socket).await;
                         let _ = respond.send(result);
                     }
+                }
+            }
+
+            _ = poll.tick() => {
+                if welcomed && !joined.is_empty() && timing.watch_streams {
+                    let (state, account_id, logins) = (state.clone(), account_id.to_string(), joined.iter().cloned().collect::<Vec<_>>());
+                    tokio::spawn(async move { super::stream::refresh(&state, &account_id, &logins).await });
                 }
             }
 
@@ -727,7 +749,7 @@ mod tests {
     }
 
     fn quick() -> Timing {
-        Timing { join_every: Duration::from_millis(20), join_patience: Duration::from_millis(400) }
+        Timing { join_every: Duration::from_millis(20), join_patience: Duration::from_millis(400), poll_every: Duration::from_secs(3600), watch_streams: false }
     }
 
     fn anonymous(state: &AppState) {

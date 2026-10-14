@@ -127,6 +127,7 @@ pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify
         // Signing in again keeps the channels that were open: a renewed
         // sign-in is not a reason to forget where the person was.
         channels: existing.map(|e| e.channels).unwrap_or_default(),
+        web_token: String::new(),
         anonymous: false,
         use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("twitch")),
         // Never strict at sign-in; the account store keeps an existing

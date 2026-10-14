@@ -4216,6 +4216,68 @@ pub async fn dispatch(
             (Some(ok_node()), None)
         }
 
+        // The window's answer to a request for an integrity token, which
+        // Twitch sometimes demands before it will give a stream's address and
+        // which only a real page on twitch.tv can make. See playback.rs.
+        "provideTwitchIntegrity" => {
+            let Some(request_id) = p_str_opt(params, "requestId") else {
+                return (None, Some("provideTwitchIntegrity requires \"requestId\"".to_string()));
+            };
+            let outcome = match (p_str_opt(params, "token"), params.get("expiration").and_then(|v| v.as_i64())) {
+                (Some(token), Some(expiration)) if !token.is_empty() => Ok((token.to_string(), expiration)),
+                _ => Err(p_str_opt(params, "error").unwrap_or("no token").to_string()),
+            };
+            (Some(serde_json::json!({ "accepted": backend::twitch::playback::provide_integrity(request_id, outcome) })), None)
+        }
+
+        // The `auth-token` of a twitch.tv session, for playing a stream as
+        // the person who signed in (their Turbo, their subscriptions). Sent
+        // here by the window's sign-in page and by nothing else; an empty one
+        // forgets it.
+        "setTwitchWebToken" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setTwitchWebToken requires \"accountId\"".to_string()));
+            };
+            let token = p_str_opt(params, "token").unwrap_or("").trim().to_string();
+            match state.accounts.mutate_twitch(account_id, |a| a.web_token = token.clone()) {
+                Ok(true) => (Some(ok_node()), None),
+                Ok(false) => (None, Some("no such Twitch account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Opens the channels a Twitch account follows: the ones on air now, or
+        // all of them up to two hundred. Joined one at a time by the
+        // connection, which paces them to what Twitch allows; this answers
+        // with how many were asked for.
+        "syncTwitchFollows" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("syncTwitchFollows requires \"accountId\"".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_twitch(account_id).filter(|a| a.is_signed_in()) else {
+                return (None, Some("sign in to Twitch from Accounts to see the channels you follow".to_string()));
+            };
+            let live_only = params.get("liveOnly").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(sender) = state.runtime.twitch_sender(account_id) else {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            };
+            let http = match backend::twitch::client() {
+                Ok(c) => c,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            let who = backend::twitch::helix::Caller { root: backend::twitch::helix::API_ROOT, client_id: backend::twitch::auth::CLIENT_ID, token: &cfg.access_token };
+            match backend::twitch::helix::followed(&http, &who, &cfg.user_id, live_only, 200).await {
+                Ok(logins) => {
+                    let count = logins.len();
+                    for login in logins {
+                        let _ = sender.send(backend::twitch::Command::Join(login, None));
+                    }
+                    (Some(serde_json::json!({ "count": count })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // A Twitch channel's recent past, from the third-party service the
         // window was told it may ask (Settings, Twitch). Twitch keeps no
         // history of its own; see backend/twitch/history.rs.
@@ -4731,6 +4793,12 @@ pub async fn dispatch(
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("refreshKickStream requires \"bufferId\"".to_string()));
             };
+            // Twitch's channels answer the same question, in the same event.
+            if buffer_id.starts_with("twitch:") {
+                let (state, buffer_id) = (state.clone(), buffer_id.to_string());
+                tokio::spawn(async move { backend::twitch::stream::refresh_one(&state, &buffer_id).await });
+                return (Some(ok_node()), None);
+            }
             if state.runtime.kick_channel(buffer_id).is_none() {
                 return (None, Some("that is not a Kick channel".to_string()));
             }

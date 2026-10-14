@@ -114,6 +114,48 @@ pub async fn send_chat_message(http: &reqwest::Client, who: &Caller<'_>, out: &O
     }
 }
 
+/// The channels an account follows, by login: only the ones live now when
+/// `live_only` (one request), otherwise all of them up to `cap`, a hundred a page.
+///
+/// Needs the `user:read:follows` scope. A 401 means the token will not do
+/// for it and is said as such, since the likely cause is an account that
+/// signed in before the scope was asked for.
+pub async fn followed(http: &reqwest::Client, who: &Caller<'_>, user_id: &str, live_only: bool, cap: usize) -> anyhow::Result<Vec<String>> {
+    let mut logins: Vec<String> = Vec::new();
+    let mut after = String::new();
+    loop {
+        let mut url = format!("{}/{}?user_id={user_id}&first=100", who.root, if live_only { "streams/followed" } else { "channels/followed" });
+        if !after.is_empty() {
+            url.push_str(&format!("&after={after}"));
+        }
+        let res = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", who.token))
+            .header("Client-Id", who.client_id)
+            .send()
+            .await
+            .context("reaching Twitch for the channels you follow")?;
+        let status = res.status();
+        let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            let said = body.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            anyhow::bail!("Twitch would not list the channels you follow ({status}){}. Signing in to Twitch again from Accounts may fix it.", if said.is_empty() { String::new() } else { format!(": {said}") });
+        }
+        for row in body.get("data").and_then(|d| d.as_array()).into_iter().flatten() {
+            if let Some(login) = row.get("broadcaster_login").or_else(|| row.get("user_login")).and_then(|l| l.as_str()) {
+                logins.push(login.to_lowercase());
+            }
+        }
+        after = body.pointer("/pagination/cursor").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        // The live list is one page of a hundred, which is every channel a person follows that is on air at once.
+        if live_only || after.is_empty() || logins.len() >= cap {
+            break;
+        }
+    }
+    logins.truncate(cap);
+    Ok(logins)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +245,28 @@ mod tests {
         assert!(matches!(send(&root, None).await, Err(SendError::Refused(_))));
         assert!(matches!(send(&root, None).await, Err(SendError::Unavailable(_))));
         assert!(matches!(send("http://127.0.0.1:9", None).await, Err(SendError::Unavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn the_channels_somebody_follows_are_listed_page_by_page_up_to_a_cap_and_the_live_ones_in_one_request() {
+        let (root, seen) = twitch(vec![
+            (200, r#"{"data":[{"broadcaster_login":"Alpha"},{"broadcaster_login":"beta"}],"pagination":{"cursor":"next-page"}}"#),
+            (200, r#"{"data":[{"broadcaster_login":"gamma"}],"pagination":{}}"#),
+            (200, r#"{"data":[{"user_login":"Live1"},{"user_login":"live2"}],"pagination":{"cursor":"ignored"}}"#),
+            (200, r#"{"data":[{"broadcaster_login":"a"},{"broadcaster_login":"b"},{"broadcaster_login":"c"}],"pagination":{"cursor":"more"}}"#),
+            (401, r#"{"message":"Missing scope: user:read:follows"}"#),
+        ])
+        .await;
+        let who = Caller { root: &root, client_id: "cid", token: "tok" };
+        let client = reqwest::Client::new();
+        assert_eq!(followed(&client, &who, "42", false, 200).await.unwrap(), vec!["alpha", "beta", "gamma"]);
+        let asked = seen.lock().unwrap().clone();
+        assert!(asked[0].starts_with("GET /channels/followed?user_id=42&first=100 "), "{}", asked[0]);
+        assert!(asked[1].contains("after=next-page"), "{}", asked[1]);
+        assert_eq!(followed(&client, &who, "42", true, 200).await.unwrap(), vec!["live1", "live2"]);
+        assert!(seen.lock().unwrap()[2].starts_with("GET /streams/followed?"), "the live list is its own call, once");
+        assert_eq!(followed(&client, &who, "42", false, 2).await.unwrap(), vec!["a", "b"], "cut at the cap, and no further page asked for");
+        let e = followed(&client, &who, "42", false, 200).await.unwrap_err();
+        assert!(e.to_string().contains("Missing scope") && e.to_string().contains("Signing in"), "{e}");
     }
 }
