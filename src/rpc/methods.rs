@@ -966,6 +966,27 @@ pub async fn dispatch(
                     Err(_) => (None, Some("Kick took too long to answer for that channel".to_string())),
                 };
             }
+            // Twitch is the same shape: a channel is a streamer, naming one is
+            // the whole of joining it, and the connection remembers it once
+            // Twitch has said it is there.
+            if id.starts_with("twitch:") {
+                let Some(channel) = backend::twitch::connect::normalise_login(name) else {
+                    return (None, Some(format!("\"{name}\" is not a Twitch channel")));
+                };
+                let Some(sender) = state.runtime.twitch_sender(id) else {
+                    return (None, Some("that Twitch account is not connected".to_string()));
+                };
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                if sender.send(backend::twitch::Command::Join(channel, Some(reply))).is_err() {
+                    return (None, Some("that Twitch account is not connected".to_string()));
+                }
+                return match tokio::time::timeout(std::time::Duration::from_secs(60), answer).await {
+                    Ok(Ok(Ok(()))) => (Some(ok_node()), None),
+                    Ok(Ok(Err(e))) => (None, Some(e)),
+                    Ok(Err(_)) => (None, Some("the Twitch connection dropped before the channel opened".to_string())),
+                    Err(_) => (None, Some("Twitch took too long to answer for that channel".to_string())),
+                };
+            }
             match state.runtime.irc_sender(id) {
                 None => (None, Some("join failed (account not connected?)".to_string())),
                 Some(sender) => match sender.send_join(name) {
@@ -3151,6 +3172,13 @@ pub async fn dispatch(
                                 let left: Vec<String> = cfg.channels.into_iter().filter(|c| *c != buffer.name).collect();
                                 let _ = state.accounts.set_kick_channels(&buffer.account_id, left);
                             }
+                        } else if buffer.account_id.starts_with("twitch:") {
+                            // As Kick's: nothing to leave, so it parts the
+                            // connection's channel and forgets the handle.
+                            if let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) {
+                                let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
+                            }
+                            let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -3411,6 +3439,31 @@ pub async fn dispatch(
                     match backend::kick::api::send_message(&http, token, channel.chatroom_id, body, reply_to.as_ref()).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("twitch:") => {
+                    // Twitch's chat is one connection with the account's
+                    // channels on it: the message goes down it, and the
+                    // answer says whether Twitch can have it. No attachments:
+                    // Twitch chat has none, so one is ignored as Kick's is.
+                    let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
+                        return (None, Some("that Twitch account is not connected".to_string()));
+                    };
+                    let (respond, answer) = tokio::sync::oneshot::channel();
+                    let command = backend::twitch::Command::Say {
+                        channel: buffer.name.clone(),
+                        text: body.to_string(),
+                        reply_to: reply_to_id.map(str::to_string),
+                        respond,
+                    };
+                    if sender.send(command).is_err() {
+                        return (None, Some("that Twitch account is not connected".to_string()));
+                    }
+                    match tokio::time::timeout(std::time::Duration::from_secs(20), answer).await {
+                        Ok(Ok(Ok(()))) => (Some(ok_node()), None),
+                        Ok(Ok(Err(e))) => (None, Some(e)),
+                        Ok(Err(_)) => (None, Some("the Twitch connection dropped before the message was sent".to_string())),
+                        Err(_) => (None, Some("Twitch took too long to take that message".to_string())),
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {

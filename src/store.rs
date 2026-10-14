@@ -595,6 +595,21 @@ impl Store {
         Ok(rows > 0)
     }
 
+    /// Marks everything one person said in a conversation as removed, and answers
+    /// which messages that was. Twitch does this to a person's messages when it
+    /// times them out or bans them: no message is named, the person is.
+    pub fn mark_moderated_by_sender(&self, buffer_id: &str, sender_id: &str, why: &crate::model::Moderated) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(why)?;
+        let mut stmt = conn.prepare("SELECT msg_id FROM messages WHERE buffer_id = ?1 AND sender_id = ?2 AND kind = 'chat' AND moderated IS NULL")?;
+        let ids: Vec<String> = stmt.query_map(params![buffer_id, sender_id], |row| row.get::<_, String>(0))?.filter_map(|r| r.ok()).collect();
+        drop(stmt);
+        for id in &ids {
+            conn.execute("UPDATE messages SET moderated = ?3 WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, id, json])?;
+        }
+        Ok(ids)
+    }
+
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
         let rows = conn.execute("DELETE FROM messages WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;

@@ -537,6 +537,7 @@ pub struct Runtime {
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
+    twitch_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>>>,
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
@@ -1093,6 +1094,7 @@ impl Runtime {
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
+            twitch_senders: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
@@ -3908,6 +3910,14 @@ impl Runtime {
         self.kick_senders.lock().unwrap().insert(account_id.to_string(), sender);
     }
 
+    pub fn set_twitch_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>) {
+        self.twitch_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    }
+
+    pub fn twitch_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>> {
+        self.twitch_senders.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn kick_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
         self.kick_senders.lock().unwrap().get(account_id).cloned()
     }
@@ -4802,6 +4812,34 @@ impl Runtime {
         }
     }
 
+    /// Everything a person said in a conversation, kept and marked as removed:
+    /// what a timeout or a ban does to their messages.
+    pub fn moderate_sender(&self, state: &AppState, buffer_id: &str, sender_id: &str, why: &model::Moderated) {
+        match state.store.mark_moderated_by_sender(buffer_id, sender_id, why) {
+            Ok(ids) => {
+                for id in ids {
+                    state.events.emit("messageModerated", json!({ "bufferId": buffer_id, "id": id, "moderated": why }));
+                }
+            }
+            Err(e) => tracing::warn!("failed to mark a person's messages as removed: {e}"),
+        }
+    }
+
+    /// Says how a channel's chat is restricted, in the words the header shows,
+    /// where the service has its own modes (Twitch's room state).
+    pub fn set_channel_modes(&self, state: &AppState, buffer_id: &str, modes: Option<String>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.channel_modes == modes {
+                return;
+            }
+            buffer.channel_modes = modes;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
     pub fn delete_message(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
         match state.store.delete_message(buffer_id, msg_id) {
             Ok(true) => state.events.emit("messageDeleted", json!({ "bufferId": buffer_id, "id": msg_id })),
@@ -5550,7 +5588,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, steam_links, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, steam_links, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

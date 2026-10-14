@@ -25,11 +25,12 @@ pub struct Builtin {
 }
 
 const IRC: &[&str] = &["irc"];
-const IRC_AND_MATRIX: &[&str] = &["irc", "matrix"];
+/// `/me` is the one command Twitch's chat itself understands, so it is sent as typed.
+const ME: &[&str] = &["irc", "matrix", "twitch"];
 const MATRIX: &[&str] = &["matrix"];
 /// Everywhere, including the services with no list of their own - moho keeps
 /// one for those.
-const EVERY: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat"];
+const EVERY: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat", "twitch"];
 /// The ones that are only text, and so work wherever this daemon does the
 /// sending itself.
 ///
@@ -37,7 +38,7 @@ const EVERY: &[&str] = &["irc", "matrix", "discord", "kick", "sneedchat"];
 /// anybody else sees it, and inventing four more that only this client knows
 /// about would mean the same typing doing different things depending on which
 /// client you were at.
-const TEXT_ONLY: &[&str] = &["irc", "matrix", "discord", "kick"];
+const TEXT_ONLY: &[&str] = &["irc", "matrix", "discord", "kick", "twitch"];
 /// Spoilers exist on the two services that have a syntax for them.
 const SPOILERS: &[&str] = &["discord", "matrix"];
 const SNEEDCHAT: &[&str] = &["sneedchat"];
@@ -45,7 +46,7 @@ const SNEEDCHAT: &[&str] = &["sneedchat"];
 /// Ordered roughly by how often each is wanted, since a fuzzy match that ties
 /// keeps this order.
 pub const BUILTINS: &[Builtin] = &[
-    Builtin { name: "me", usage: "<action>", description: "Say something as an action", services: IRC_AND_MATRIX },
+    Builtin { name: "me", usage: "<action>", description: "Say something as an action", services: ME },
     Builtin { name: "join", usage: "<#channel>", description: "Join a channel", services: IRC },
     Builtin { name: "part", usage: "", description: "Leave this channel", services: IRC },
     Builtin { name: "msg", usage: "<nick> <message>", description: "Send somebody a private message", services: IRC },

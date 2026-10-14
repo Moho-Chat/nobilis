@@ -900,6 +900,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("kick") => "kick",
         Some("sneedchat") => "sneedchat",
         Some("steam") => "steam",
+        Some("twitch") => "twitch",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",

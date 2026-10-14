@@ -12,17 +12,21 @@
 //! - `auth` - Twitch's sign-in (the device code flow) and what comes of it:
 //!   tokens, renewing them, finding out who they belong to
 //! - `login` - adding an account: the sign-in a person takes part in
-//! - `connect` - an account's connection: keeping its token good, and (as the
-//!   rounds in the plan are built) listening
+//! - `irc` - one line of Twitch's chat: tags, prefix, command, parameters
+//! - `chat` - what the lines mean: messages, cards, removals, a channel's modes
+//! - `connect` - an account's connection: keeping its token good, and the chat
+//!   connection with its channels
 //!
 //! As in the other backends, `spawn` is re-exported so callers say
 //! `backend::twitch::spawn` without knowing which file that is.
 
 pub mod auth;
+pub mod chat;
 pub mod connect;
+pub mod irc;
 pub mod login;
 
-pub use connect::spawn;
+pub use connect::{spawn, Command};
 
 /// What routes this service's requests when any Twitch account goes through
 /// Tor or the proxy. One key for the whole service, as Kick's is: the
