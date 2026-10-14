@@ -963,12 +963,12 @@ mod tests {
         assert_eq!(w.roster("chan").len(), SPEAKERS_REMEMBERED);
         // The count is of everybody, not of those listed.
         assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
-        // And somebody who spoke long ago and speaks again is not counted twice.
-        w.heard("chan", Speaker { nick: "nick0".into(), user_id: None, badge: None });
-        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
         // The most recent survive; a list nobody can scan is no better than
         // an empty one, and the newest names are the ones being read.
         assert_eq!(w.roster("chan")[0]["nick"], format!("nick{}", SPEAKERS_REMEMBERED + 49));
+        // And somebody who spoke long ago and speaks again is not counted twice.
+        w.heard("chan", Speaker { nick: "nick0".into(), user_id: None, badge: None });
+        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
     }
 
     #[test]
