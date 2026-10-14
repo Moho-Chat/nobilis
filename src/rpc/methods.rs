@@ -3485,7 +3485,7 @@ pub async fn dispatch(
                         let (respond, answer) = tokio::sync::oneshot::channel();
                         let command = backend::twitch::Command::Act {
                             channel: String::new(),
-                            action: backend::twitch::moderation::Action::Whisper { to: buffer.name.clone(), text: body.to_string() },
+                            action: backend::twitch::moderation::Action::Whisper { to: buffer.name.trim_start_matches('@').to_string(), text: body.to_string() },
                             target_id: None,
                             respond,
                         };
@@ -5603,7 +5603,7 @@ pub async fn dispatch(
                     if who.is_empty() || !who.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                         Err(anyhow::anyhow!("no login to whisper to"))
                     } else {
-                        Ok(state.runtime.ensure_buffer(state, account_id, &who, "dm").id)
+                        Ok(state.runtime.ensure_buffer(state, account_id, &backend::twitch::chat::whisper_buffer(&who), "dm").id)
                     }
                 }
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),

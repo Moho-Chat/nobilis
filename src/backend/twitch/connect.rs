@@ -599,7 +599,7 @@ async fn act(
             state.runtime.record_message_at(
                 state,
                 account_id,
-                to,
+                &super::chat::whisper_buffer(to),
                 "dm",
                 &shown,
                 text,
@@ -617,6 +617,8 @@ async fn act(
                 None,
             );
         }
+        // A timeout or ban is told to the whole room by Twitch, and comes back as its own card: not said twice.
+        super::moderation::Action::Timeout { .. } | super::moderation::Action::Ban { .. } => {}
         _ if !channel.is_empty() => super::moderation::say_done(state, account_id, channel, &done),
         _ => {}
     }

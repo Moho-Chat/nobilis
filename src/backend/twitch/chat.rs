@@ -754,6 +754,12 @@ fn roomstate(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line)
     first.then_some(channel)
 }
 
+/// What a whisper conversation is called: the other person's login behind an `@`, so it can never be the
+/// same conversation as that person's channel (a channel is named by its bare login).
+pub fn whisper_buffer(login: &str) -> String {
+    format!("@{}", login.trim_start_matches('@').to_lowercase())
+}
+
 /// A whisper sent to this account: a conversation with the person who sent it.
 fn whisper(state: &AppState, account_id: &str, line: &Line) {
     let from = line.nick().unwrap_or_default().to_lowercase();
@@ -767,7 +773,7 @@ fn whisper(state: &AppState, account_id: &str, line: &Line) {
     state.runtime.record_message_at(
         state,
         account_id,
-        &from,
+        &whisper_buffer(&from),
         "dm",
         &display,
         &emote_tokens(text, line.tag("emotes")),
