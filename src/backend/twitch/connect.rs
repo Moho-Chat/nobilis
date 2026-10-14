@@ -507,13 +507,24 @@ async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id:
     super::badges::load_channel(&http, super::gql::ROOT, channel).await;
 
     // Twitch's own emotes for this account, which only an account can ask about.
-    let (Some(cfg), Some(room)) = (state.accounts.get_twitch(account_id), room_id) else { return };
+    if let Some(room) = room_id {
+        refresh_user_emotes(state, account_id, channel, room).await;
+    }
+}
+
+/// Reads the emotes this account can use in a channel again, and replaces what the picker offers with them:
+/// an emote that has lapsed (a 24-hour unlock, a limited-time one) is gone from Twitch's answer and so from the
+/// picker, and one just unlocked is there.
+pub async fn refresh_user_emotes(state: &AppState, account_id: &str, channel: &str, room_id: &str) {
+    let Ok(http) = super::client() else { return };
+    let Some(cfg) = state.accounts.get_twitch(account_id) else { return };
     if !cfg.is_signed_in() || !cfg.scopes.iter().any(|s| s == "user:read:emotes") || cfg.user_id.is_empty() {
         return;
     }
     let who = super::helix::Caller { root: super::helix::API_ROOT, client_id: auth::CLIENT_ID, token: &cfg.access_token };
-    match super::helix::user_emotes(&http, &who, &cfg.user_id, room, 3000).await {
-        Ok(emotes) if !emotes.is_empty() => {
+    match super::helix::user_emotes(&http, &who, &cfg.user_id, room_id, 3000).await {
+        Ok(emotes) => {
+            super::emotes::note_user_emotes(account_id, channel, room_id);
             let buffer_id = crate::model::buffer_id(account_id, channel);
             state.runtime.set_emoji_source(
                 account_id,
@@ -529,7 +540,6 @@ async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id:
                 },
             );
         }
-        Ok(_) => {}
         Err(e) => tracing::debug!("twitch[{account_id}]: your emotes in {channel}: {e:#}"),
     }
 }

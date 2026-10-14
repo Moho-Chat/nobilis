@@ -281,6 +281,11 @@ pub async fn dispatch(
             // Twitch's: what the account can use there, and the other services'.
             Some(buffer_id) if buffer_id.starts_with("twitch:") => {
                 let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (Some(serde_json::json!([])), None) };
+                // What this account can use there changes under it (a 24-hour unlock lapses, a reward unlocks one):
+                // read again when the picker asks and what it was told is a couple of minutes old.
+                if let (Some(room), true) = backend::twitch::emotes::user_emotes_state(&buffer.account_id, &buffer.name, std::time::Duration::from_secs(120)) {
+                    backend::twitch::connect::refresh_user_emotes(state, &buffer.account_id, &buffer.name, &room).await;
+                }
                 let mut sources = state.runtime.emoji_catalogue(&buffer.account_id);
                 sources.retain(|s| s.buffers.iter().any(|b| b == buffer_id));
                 sources.extend(backend::twitch::emotes::sources(&buffer.name, buffer_id));
@@ -5136,7 +5141,7 @@ pub async fn dispatch(
                 Ok((rewards, points)) => {
                     let list: Vec<serde_json::Value> = rewards
                         .into_iter()
-                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image }))
+                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image, "unavailable": r.unavailable, "choices": r.choices.iter().map(|c| serde_json::json!({ "id": c.id, "label": c.label, "image": c.image })).collect::<Vec<_>>() }))
                         .collect();
                     (Some(serde_json::json!({ "rewards": list, "points": points.balance, "name": points.name })), None)
                 }
@@ -5148,7 +5153,7 @@ pub async fn dispatch(
             let (Some(buffer_id), Some(reward_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rewardId")) else {
                 return (None, Some("redeemTwitchReward requires \"bufferId\" and \"rewardId\"".to_string()));
             };
-            match backend::twitch::points::redeem_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, reward_id, p_str_opt(params, "input")).await {
+            match backend::twitch::points::redeem_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, reward_id, p_str_opt(params, "input"), p_str_opt(params, "choice")).await {
                 Ok(p) => (Some(serde_json::json!({ "points": p.balance })), None),
                 Err(e) => (None, Some(e)),
             }

@@ -258,6 +258,27 @@ pub fn forget(channel: &str) {
     held.seventv_sets.remove(channel);
 }
 
+/// When an account's own emotes in a channel were last fetched, and the channel's number (for fetching them again
+/// from anywhere): Twitch lets an emote lapse (a 24-hour unlock, a limited-time one) and gives no word of it, so the
+/// list is read again when it is asked for and has gone stale, and the picker shows only what is there.
+fn refreshed() -> &'static Mutex<HashMap<String, (std::time::Instant, String)>> {
+    static REFRESHED: std::sync::OnceLock<Mutex<HashMap<String, (std::time::Instant, String)>>> = std::sync::OnceLock::new();
+    REFRESHED.get_or_init(Default::default)
+}
+
+/// Says the account's emotes in a channel were just fetched.
+pub fn note_user_emotes(account_id: &str, channel: &str, room_id: &str) {
+    refreshed().lock().unwrap().insert(format!("{account_id}|{channel}"), (std::time::Instant::now(), room_id.to_string()));
+}
+
+/// The channel's number, and whether the account's emotes there are older than `max_age` (or never fetched).
+pub fn user_emotes_state(account_id: &str, channel: &str, max_age: std::time::Duration) -> (Option<String>, bool) {
+    match refreshed().lock().unwrap().get(&format!("{account_id}|{channel}")) {
+        Some((at, room)) => (Some(room.clone()), at.elapsed() > max_age),
+        None => (None, true),
+    }
+}
+
 /// The 7TV set a channel's emotes came from, if it has one.
 pub fn seventv_set(channel: &str) -> Option<String> {
     held().lock().unwrap().seventv_sets.get(channel).cloned()
