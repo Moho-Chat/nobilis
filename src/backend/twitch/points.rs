@@ -412,6 +412,7 @@ fn owned_emotes(state: &AppState, account_id: &str, buffer_id: &str) -> std::col
         .into_iter()
         .filter(|s| s.buffers.iter().any(|b| b == buffer_id))
         .flat_map(|s| s.emoji)
+        .filter(|e| !e.locked)
         .filter_map(|e| e.id.strip_prefix("[twitch:").and_then(|t| t.split(':').nth(1)).map(str::to_string))
         .collect()
 }

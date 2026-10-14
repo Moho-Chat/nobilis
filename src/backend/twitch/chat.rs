@@ -146,11 +146,9 @@ fn buffer_id(account_id: &str, channel: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// What is known about the channel a message is in, for turning its words into
-/// pictures: whether the three third-party services' emotes are looked for, and
-/// whether a cheer's amount is. `None` converts Twitch's own emotes only.
+/// pictures: whether a cheer's amount is looked for. `None` converts Twitch's own emotes only.
 #[derive(Clone, Copy)]
-pub struct Words<'a> {
-    pub channel: &'a str,
+pub struct Words {
     pub bits: bool,
 }
 
@@ -187,9 +185,7 @@ fn plain_words(text: &str, words: Option<&Words>) -> String {
         if word.is_empty() {
             return;
         }
-        if let Some(e) = super::emotes::find(words.channel, word) {
-            out.push_str(&e.token());
-        } else if let Some((prefix, amount)) = Some(words.bits).filter(|b| *b).and_then(|_| cheer_of(word)) {
+        if let Some((prefix, amount)) = Some(words.bits).filter(|b| *b).and_then(|_| cheer_of(word)) {
             out.push_str(&format!("[twitch:cheer:{prefix}:{amount}]"));
         } else {
             out.push_str(word);
@@ -442,7 +438,7 @@ fn privmsg(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, h
     // The emote positions are counted in the text as it was sent, so they are read against it
     // whole, and the `@name` Twitch puts in front of a reply - plain text, never an emote - is
     // taken off the result.
-    let converted = tokens(plain, line.tag("emotes"), Some(&Words { channel: &channel, bits: !line.tag("bits").is_empty() }));
+    let converted = tokens(plain, line.tag("emotes"), Some(&Words { bits: !line.tag("bits").is_empty() }));
     let body = match &reply {
         Some(_) => strip_mention(&converted, line.tag("reply-parent-user-login")),
         None => converted,
@@ -1148,21 +1144,13 @@ mod tests {
     }
 
     #[test]
-    fn the_other_services_emotes_and_cheers_are_found_among_the_words_and_never_inside_a_token() {
-        use crate::backend::twitch::emotes::{self, Provider};
-        emotes::set_enabled(true, true, true);
-        emotes::keep(Provider::SevenTv, Some("wordchan"), emotes::read_seventv(&serde_json::json!({ "emotes": [{ "id": "01AB", "name": "OMEGALUL", "flags": 0, "data": { "animated": true } }] })));
-        let words = Words { channel: "wordchan", bits: true };
-        // Twitch's own emote first (positions are counted over the whole text), the others in the words between.
+    fn cheers_are_found_among_the_words_and_never_inside_a_token() {
+        let words = Words { bits: true };
+        // Twitch's own emote first (positions are counted over the whole text), the cheers in the words between.
         let out = tokens("Kappa OMEGALUL  cheer100 Cheer5 notacheer7 Kappa", "25:0-4,43-47", Some(&words));
-        assert_eq!(out, "[twitch:emote:25:Kappa] [twitch:7tv:01AB:OMEGALUL]  [twitch:cheer:cheer:100] [twitch:cheer:cheer:5] notacheer7 [twitch:emote:25:Kappa]");
+        assert_eq!(out, "[twitch:emote:25:Kappa] OMEGALUL  [twitch:cheer:cheer:100] [twitch:cheer:cheer:5] notacheer7 [twitch:emote:25:Kappa]");
         // Not looked for where nobody asked: no bits, no cheers.
-        assert_eq!(tokens("cheer100", "", Some(&Words { channel: "wordchan", bits: false })), "cheer100");
-        // A switched-off service is left as text.
-        emotes::set_enabled(true, true, false);
-        assert_eq!(tokens("OMEGALUL", "", Some(&words)), "OMEGALUL");
-        emotes::set_enabled(true, true, true);
-        emotes::forget("wordchan");
+        assert_eq!(tokens("cheer100", "", Some(&Words { bits: false })), "cheer100");
         assert_eq!(cheer_of("Cheer100"), Some(("cheer".to_string(), 100)));
         assert_eq!(cheer_of("BibleThump50"), Some(("biblethump".to_string(), 50)));
         assert_eq!(cheer_of("hello5"), None);

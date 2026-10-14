@@ -197,14 +197,6 @@ pub async fn dispatch(
             // by `listSteamStickers`, and are not a section of emoji.
             sources.retain(|s| s.id != backend::steam::emoticons::STICKERS);
 
-            // Twitch's other emote services: held in memory per channel, so
-            // they are read when asked and follow the switches as they change.
-            if account_id.starts_with("twitch:") {
-                if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
-                    sources.extend(backend::twitch::emotes::sources(&buffer.name, buffer_id));
-                }
-            }
-
             // Sneedchat's table is the same everywhere and belongs to no
             // room, so it is added here rather than recorded per channel.
             if account_id.starts_with("sneedchat:") {
@@ -297,12 +289,11 @@ pub async fn dispatch(
                 }
                 let mut sources = state.runtime.emoji_catalogue(&buffer.account_id);
                 sources.retain(|s| s.buffers.iter().any(|b| b == buffer_id));
-                sources.extend(backend::twitch::emotes::sources(&buffer.name, buffer_id));
                 let mut seen = std::collections::HashSet::new();
                 let emoji: Vec<serde_json::Value> = sources
                     .into_iter()
                     .flat_map(|s| s.emoji)
-                    .filter(|e| seen.insert(e.name.clone()))
+                    .filter(|e| !e.locked && seen.insert(e.name.clone()))
                     .map(|e| serde_json::json!({ "id": e.id, "name": e.name, "animated": e.animated, "url": e.url, "locked": false }))
                     .collect();
                 (Some(serde_json::json!(emoji)), None)
@@ -4350,15 +4341,6 @@ pub async fn dispatch(
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
-        }
-
-        // Which of BetterTTV, FrankerFaceZ and 7TV the window wants. Each is
-        // somebody else's server told which channel is being opened, so each
-        // has its own switch (Settings, Twitch); until the window says, all on.
-        "setTwitchEmoteProviders" => {
-            let on = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(true);
-            backend::twitch::emotes::set_enabled(on("bttv"), on("ffz"), on("seventv"));
-            (Some(ok_node()), None)
         }
 
         // Something a moderator does to a Twitch channel from a menu: remove a

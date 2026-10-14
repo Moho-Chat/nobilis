@@ -289,6 +289,36 @@ pub async fn user_emotes(http: &reqwest::Client, who: &Caller<'_>, user_id: &str
     Ok(out)
 }
 
+/// Every emote a channel has of its own (subscriber tiers, Bits tiers, follower emotes), whether or not an account
+/// can use them: what the picker greys out is what is in here and not in `user_emotes`.
+pub async fn channel_emotes(http: &reqwest::Client, who: &Caller<'_>, broadcaster_id: &str) -> anyhow::Result<Vec<UserEmote>> {
+    let res = http
+        .get(format!("{}/chat/emotes?broadcaster_id={broadcaster_id}", who.root))
+        .header("Authorization", format!("Bearer {}", who.token))
+        .header("Client-Id", who.client_id)
+        .send()
+        .await
+        .context("reaching Twitch for the channel's emotes")?;
+    let status = res.status();
+    let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        anyhow::bail!("Twitch would not list the channel's emotes ({status})");
+    }
+    let template = body.get("template").and_then(|t| t.as_str()).unwrap_or("https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}");
+    Ok(body
+        .get("data")
+        .and_then(|d| d.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let (id, name) = (e.get("id")?.as_str()?, e.get("name")?.as_str()?);
+            let animated = e.get("format").and_then(|f| f.as_array()).is_some_and(|f| f.iter().any(|x| x == "animated"));
+            let url = template.replace("{{id}}", id).replace("{{format}}", "static").replace("{{theme_mode}}", "dark").replace("{{scale}}", "2.0");
+            Some(UserEmote { id: id.to_string(), name: name.to_string(), url, animated })
+        })
+        .collect())
+}
+
 /// The channels an account follows, by login: only the ones live now when
 /// `live_only` (one request), otherwise all of them up to `cap`, a hundred a page.
 ///
@@ -461,5 +491,21 @@ mod tests {
         assert!(seen.lock().unwrap()[0].starts_with("GET /chat/emotes/user?user_id=42&broadcaster_id=100 "));
         assert!(seen.lock().unwrap()[1].contains("after=p2"));
         assert!(user_emotes(&client, &who, "42", "100", 1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_channels_own_emotes_are_listed_whether_or_not_they_can_be_used() {
+        let (root, seen) = twitch(vec![
+            (200, r#"{"data":[{"id":"emotesv2_a","name":"binxSub","emote_type":"subscriptions","format":["static","animated"]},{"id":"7","name":"binxFollow","emote_type":"follower","format":["static"]}],"template":"https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}"}"#),
+            (401, "{}"),
+        ])
+        .await;
+        let who = Caller { root: &root, client_id: "cid", token: "tok" };
+        let client = reqwest::Client::new();
+        let got = channel_emotes(&client, &who, "100").await.unwrap();
+        assert_eq!(got.iter().map(|e| (e.name.as_str(), e.animated)).collect::<Vec<_>>(), vec![("binxSub", true), ("binxFollow", false)]);
+        assert_eq!(got[1].url, "https://static-cdn.jtvnw.net/emoticons/v2/7/static/dark/2.0");
+        assert!(seen.lock().unwrap()[0].starts_with("GET /chat/emotes?broadcaster_id=100 "));
+        assert!(channel_emotes(&client, &who, "100").await.is_err());
     }
 }

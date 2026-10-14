@@ -65,7 +65,6 @@ pub fn spawn(state: AppState, config: TwitchAccountConfig) {
     let (tx, rx) = mpsc::unbounded_channel::<Command>();
     state.runtime.set_twitch_sender(&account_id, tx);
     let realtime = super::realtime::register(&account_id);
-    let emote_events = super::emoteevents::register(&account_id);
     let join_handle = tokio::spawn({
         let account_id = account_id.clone();
         let state = state.clone();
@@ -76,7 +75,6 @@ pub fn spawn(state: AppState, config: TwitchAccountConfig) {
                 _ = keeper(&state, &account_id, auth::ID_ROOT) => {}
                 _ = chat_loop(&state, &account_id, rx) => {}
                 // Raids, polls and predictions, heard from Twitch's own realtime service.
-                _ = super::emoteevents::run(emote_events, super::emoteevents::SEVENTV_URL.to_string(), super::emoteevents::BTTV_URL.to_string()) => {}
                 _ = super::realtime::run(state.clone(), account_id.clone(), realtime, super::realtime::HERMES_URL.to_string(), super::gql::ROOT.to_string()) => {}
             }
             state.runtime.remove_task_handle(&account_id);
@@ -395,8 +393,6 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                         }
                         rooms.forget_channel(&channel);
                         super::realtime::unwatch(account_id, &channel);
-                        super::emoteevents::unwatch(account_id, &channel);
-                        super::emotes::forget(&channel);
                         super::badges::forget(&channel);
                         let _ = state.accounts.mutate_twitch(account_id, |a| a.channels.retain(|c| *c != channel));
                     }
@@ -493,17 +489,10 @@ async fn open_follows(state: &AppState, account_id: &str, helix: &str, channels:
 }
 
 /// What a channel's chat is written in, fetched as it is joined: Twitch's badge
-/// pictures and the three other services' emotes (global ones once), and, for
-/// an account that signed in with the scope, the emotes it can use there.
+/// pictures and, for an account that signed in with the scope, the emotes it can use there.
 async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id: Option<&str>) {
     let Ok(http) = super::client() else { return };
-    super::emotes::load_global(&http, &super::emotes::ROOTS).await;
     super::badges::load_global(&http, super::gql::ROOT).await;
-    if let Some(room) = room_id {
-        super::emotes::load_channel(&http, &super::emotes::ROOTS, channel, room).await;
-        // Kept current from here on, now that the 7TV set it uses is known.
-        super::emoteevents::watch(account_id, channel, room);
-    }
     super::badges::load_channel(&http, super::gql::ROOT, channel).await;
 
     // Twitch's own emotes for this account, which only an account can ask about.
@@ -523,22 +512,40 @@ pub async fn refresh_user_emotes(state: &AppState, account_id: &str, channel: &s
     }
     let who = super::helix::Caller { root: super::helix::API_ROOT, client_id: auth::CLIENT_ID, token: &cfg.access_token };
     match super::helix::user_emotes(&http, &who, &cfg.user_id, room_id, 3000).await {
-        Ok(emotes) => {
+        Ok(mine) => {
             super::emotes::note_user_emotes(account_id, channel, room_id);
             let buffer_id = crate::model::buffer_id(account_id, channel);
-            state.runtime.set_emoji_source(
-                account_id,
-                crate::model::EmojiSource {
-                    id: format!("twitch:{channel}"),
-                    name: "Twitch".to_string(),
-                    service: "twitch".to_string(),
-                    kind: "text".to_string(),
-                    icon_url: None,
-                    buffers: vec![buffer_id],
-                    sendable_anywhere: false,
-                    emoji: emotes.into_iter().map(|e| crate::model::EmojiEntry { id: format!("[twitch:{}:{}:{}]", if e.animated { "aemote" } else { "emote" }, e.id, e.name.replace(']', "_")), name: e.name, url: Some(e.url), animated: e.animated, locked: false }).collect(),
-                },
-            );
+            let entry = |e: &super::helix::UserEmote, locked: bool| crate::model::EmojiEntry {
+                id: format!("[twitch:{}:{}:{}]", if e.animated { "aemote" } else { "emote" }, e.id, e.name.replace(']', "_")),
+                name: e.name.clone(),
+                url: Some(e.url.clone()),
+                animated: e.animated,
+                locked,
+            };
+            // What the channel has of its own is shown whole: what the account can use, and what it would have to
+            // subscribe or follow for (greyed out, as Kick's are). Twitch's other emotes the account has follow.
+            let channels = super::helix::channel_emotes(&http, &who, room_id).await.unwrap_or_default();
+            let theirs: HashSet<&str> = channels.iter().map(|e| e.id.as_str()).collect();
+            let have: HashSet<&str> = mine.iter().map(|e| e.id.as_str()).collect();
+            let section = |id: String, name: String, emoji: Vec<crate::model::EmojiEntry>| crate::model::EmojiSource {
+                id,
+                name,
+                service: "twitch".to_string(),
+                kind: "text".to_string(),
+                icon_url: None,
+                buffers: vec![buffer_id.clone()],
+                sendable_anywhere: false,
+                emoji,
+            };
+            if !channels.is_empty() {
+                let own: Vec<_> = channels.iter().map(|e| entry(e, !have.contains(e.id.as_str()))).collect();
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), channel.to_string(), own));
+                let rest: Vec<_> = mine.iter().filter(|e| !theirs.contains(e.id.as_str())).map(|e| entry(e, false)).collect();
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:other"), "Twitch".to_string(), rest));
+            } else {
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), "Twitch".to_string(), mine.iter().map(|e| entry(e, false)).collect()));
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:other"), "Twitch".to_string(), Vec::new()));
+            }
         }
         Err(e) => tracing::debug!("twitch[{account_id}]: your emotes in {channel}: {e:#}"),
     }
@@ -746,10 +753,11 @@ where
         .into_iter()
         .filter(|s| s.buffers.iter().any(|b| *b == crate::model::buffer_id(account_id, channel)))
         .flat_map(|s| s.emoji)
+        .filter(|e| !e.locked)
         .map(|e| (e.name, e.id))
         .collect();
     let drawn: String = typed.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
-    let drawn = super::emotes::tokens_for_own(channel, &drawn, &mine);
+    let drawn = super::emotes::tokens_for_own(&drawn, &mine);
     let (action, plain) = match (text.strip_prefix("/me "), drawn.strip_prefix("/me ")) {
         (Some(_), Some(rest)) => (true, rest.to_string()),
         _ => (false, drawn),
@@ -1061,7 +1069,7 @@ mod tests {
         // A reply to what Fan said: Twitch's tag, and the name in front as its own clients write it.
         say_in(&tx, "xqc", "same", Some("m1")).await.unwrap();
         // An emote picked from the picker leaves as its word and is drawn in our own line as the picture it is.
-        say_in(&tx, "xqc", "[twitch:bttv:9:Pog] nice", None).await.unwrap();
+        say_in(&tx, "xqc", "[twitch:emote:9:Pog] nice", None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let sent = got.lock().unwrap().clone();
@@ -1076,7 +1084,7 @@ mod tests {
         let log = state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap();
         let mine: Vec<_> = log.iter().filter(|m| m.is_own).collect();
         assert_eq!(mine.len(), 4);
-        assert_eq!(mine[3].body, "[twitch:bttv:9:Pog] nice", "our own line keeps the picture");
+        assert_eq!(mine[3].body, "[twitch:emote:9:Pog] nice", "our own line keeps the picture");
         assert_eq!((mine[0].from.as_str(), mine[0].body.as_str(), mine[0].sender_color.as_deref()), ("Someone", "hello there", Some("#8A2BE2")));
         assert!(mine[0].badges.iter().any(|b| b.kind == "moderator"));
         assert!(mine[1].is_action && mine[1].body == "waves");
