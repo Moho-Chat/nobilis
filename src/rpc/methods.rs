@@ -223,9 +223,19 @@ pub async fn dispatch(
 
             // Whether each source reaches this conversation. Worked out here
             // rather than stored, because it is a fact about the pair.
+            // A Twitch channel's section is marked by the channel's own picture, which is known to the
+            // conversation and not to the source.
+            let channel_picture = state.runtime.get_buffer(buffer_id).filter(|_| account_id.starts_with("twitch:")).and_then(|b| b.avatar_url.map(|a| (format!("twitch:{}", b.name), a)));
             let answer: Vec<serde_json::Value> = sources
                 .into_iter()
-                .map(|s| {
+                .map(|mut s| {
+                    if s.icon_url.is_none() {
+                        if let Some((id, picture)) = &channel_picture {
+                            if s.id == *id {
+                                s.icon_url = Some(picture.clone());
+                            }
+                        }
+                    }
                     let here = s.buffers.is_empty() || s.buffers.iter().any(|b| b == buffer_id);
                     let usable = here || s.sendable_anywhere;
                     let mut v = serde_json::to_value(&s).unwrap_or_default();

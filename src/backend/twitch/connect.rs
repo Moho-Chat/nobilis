@@ -538,7 +538,9 @@ pub async fn refresh_user_emotes(state: &AppState, account_id: &str, channel: &s
                 emoji,
             };
             if !channels.is_empty() {
-                let own: Vec<_> = channels.iter().map(|e| entry(e, !have.contains(e.id.as_str()))).collect();
+                // What can be used comes first, in the order Twitch lists it; what cannot follows, greyed out.
+                let (usable, locked): (Vec<_>, Vec<_>) = channels.iter().partition(|e| have.contains(e.id.as_str()));
+                let own: Vec<_> = usable.into_iter().map(|e| entry(e, false)).chain(locked.into_iter().map(|e| entry(e, true))).collect();
                 state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), channel.to_string(), own));
                 let rest: Vec<_> = mine.iter().filter(|e| !theirs.contains(e.id.as_str())).map(|e| entry(e, false)).collect();
                 state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:other"), "Twitch".to_string(), rest));
