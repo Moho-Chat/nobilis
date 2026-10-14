@@ -418,6 +418,40 @@ pub fn tokens_to_names(text: &str) -> String {
     out
 }
 
+/// What the sender's own message is shown as: each word that is an emote becomes its token, so the line the
+/// sender sees has the same pictures the others see (Twitch does not send a message back to the one who sent it,
+/// so nothing else would draw them). `mine` is the sender's own emotes in this channel by word, as the picker
+/// holds them (the entry's id is the token); a token already in the text, from the picker, is kept.
+pub fn tokens_for_own(channel: &str, text: &str, mine: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        if word.starts_with("[twitch:") {
+            out.push_str(word);
+        } else if let Some(token) = mine.get(word.as_str()) {
+            out.push_str(token);
+        } else if let Some(e) = find(channel, word) {
+            out.push_str(&e.token());
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 /// A channel's own emote by word, whichever provider, ignoring the switches: for tests of what is held.
 #[cfg(test)]
 pub fn find_in(channel: &str, word: &str) -> Option<Emote> {
@@ -574,6 +608,19 @@ pub fn say_animated(id: &str, yes: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_senders_own_line_shows_each_emote_as_a_picture_whether_it_was_picked_or_typed() {
+        let mut table = Table::default();
+        table.add(Emote { provider: Provider::SevenTv, id: "01ABC".into(), name: "catJAM".into(), animated: true });
+        keep(Provider::SevenTv, Some("own-line-test"), table);
+        let mine: HashMap<String, String> = [("Kappa".to_string(), "[twitch:emote:25:Kappa]".to_string())].into_iter().collect();
+        assert_eq!(
+            tokens_for_own("own-line-test", "hi Kappa  catJAM [twitch:bttv:9:Pog] plain", &mine),
+            "hi [twitch:emote:25:Kappa]  [twitch:7tv:01ABC:catJAM] [twitch:bttv:9:Pog] plain"
+        );
+        forget("own-line-test");
+    }
+
     #[test]
     fn a_picked_emote_leaves_as_its_word_and_nothing_else_is_touched() {
         assert_eq!(tokens_to_names("hi [twitch:7tv:01ABC:catJAM] and [twitch:emote:25:Kappa]!"), "hi catJAM and Kappa!");

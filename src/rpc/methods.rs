@@ -183,6 +183,15 @@ pub async fn dispatch(
             if account_id.starts_with("steam:") {
                 backend::steam::emoticons::refresh(state, &account_id).await;
             }
+            // Twitch's: what the account can use in a channel changes under it (a reward unlocks one, a 24-hour
+            // unlock lapses), so the picker reads it again when what it holds is a couple of minutes old.
+            if account_id.starts_with("twitch:") {
+                if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                    if let (Some(room), true) = backend::twitch::emotes::user_emotes_state(&buffer.account_id, &buffer.name, std::time::Duration::from_secs(120)) {
+                        backend::twitch::connect::refresh_user_emotes(state, &buffer.account_id, &buffer.name, &room).await;
+                    }
+                }
+            }
             let mut sources = state.runtime.emoji_catalogue(&account_id);
             // Steam's stickers are sent, not typed: they have their own tab, asked for
             // by `listSteamStickers`, and are not a section of emoji.

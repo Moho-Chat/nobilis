@@ -24,7 +24,7 @@ use crate::runtime::ConnState;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use futures::{SinkExt, StreamExt};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -665,6 +665,7 @@ where
         return Ok(());
     }
     // An emote picked from the picker is a picture in the box and a token in the text; Twitch reads its word.
+    let typed = text;
     let text = super::emotes::tokens_to_names(text);
     // Twitch's chat is one line: a break typed in the box becomes a space.
     let text: String = text.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
@@ -738,9 +739,20 @@ where
     // it is shown as sent, in the colour and badges Twitch last said we have.
     // One sent by Helix is shown under the id Twitch gave it, so if Twitch
     // does send it back it is the same message and not a second.
-    let (action, plain) = match text.strip_prefix("/me ") {
-        Some(rest) => (true, rest.to_string()),
-        None => (false, text.clone()),
+    // Each emote in it, picked or typed, is drawn as the picture the others see.
+    let mine: HashMap<String, String> = state
+        .runtime
+        .emoji_catalogue(account_id)
+        .into_iter()
+        .filter(|s| s.buffers.iter().any(|b| *b == crate::model::buffer_id(account_id, channel)))
+        .flat_map(|s| s.emoji)
+        .map(|e| (e.name, e.id))
+        .collect();
+    let drawn: String = typed.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+    let drawn = super::emotes::tokens_for_own(channel, &drawn, &mine);
+    let (action, plain) = match (text.strip_prefix("/me "), drawn.strip_prefix("/me ")) {
+        (Some(_), Some(rest)) => (true, rest.to_string()),
+        _ => (false, drawn),
     };
     let shown = if rooms.me_display.is_empty() { cfg.login.clone() } else { rooms.me_display.clone() };
     let style = crate::model::SenderStyle { color: rooms.me_color.clone(), badges: rooms.me_badges.get(channel).cloned().unwrap_or_default() };
@@ -1048,6 +1060,8 @@ mod tests {
         say_in(&tx, "xqc", "/me waves", None).await.unwrap();
         // A reply to what Fan said: Twitch's tag, and the name in front as its own clients write it.
         say_in(&tx, "xqc", "same", Some("m1")).await.unwrap();
+        // An emote picked from the picker leaves as its word and is drawn in our own line as the picture it is.
+        say_in(&tx, "xqc", "[twitch:bttv:9:Pog] nice", None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let sent = got.lock().unwrap().clone();
@@ -1056,11 +1070,13 @@ mod tests {
         assert!(sent.iter().any(|l| l == "PRIVMSG #xqc :hello there"), "a line break is a space: {sent:?}");
         assert!(sent.iter().any(|l| l == "PRIVMSG #xqc :/me waves"));
         assert!(sent.iter().any(|l| l == "@reply-parent-msg-id=m1 PRIVMSG #xqc :@fan same"), "{sent:?}");
+        assert!(sent.iter().any(|l| l == "PRIVMSG #xqc :Pog nice"), "{sent:?}");
 
         // Shown as sent: under the name Twitch writes it, in our colour, with the badge we were just told we have.
         let log = state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap();
         let mine: Vec<_> = log.iter().filter(|m| m.is_own).collect();
-        assert_eq!(mine.len(), 3);
+        assert_eq!(mine.len(), 4);
+        assert_eq!(mine[3].body, "[twitch:bttv:9:Pog] nice", "our own line keeps the picture");
         assert_eq!((mine[0].from.as_str(), mine[0].body.as_str(), mine[0].sender_color.as_deref()), ("Someone", "hello there", Some("#8A2BE2")));
         assert!(mine[0].badges.iter().any(|b| b.kind == "moderator"));
         assert!(mine[1].is_action && mine[1].body == "waves");
