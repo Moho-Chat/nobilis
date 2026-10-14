@@ -5114,19 +5114,14 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "watching": live_id.is_some() })), None)
         }
 
-        // A Twitch channel's points: the balance and any bonus waiting to be claimed, and claiming it. As the
-        // person's twitch.tv session, and only when asked for (see backend/twitch/points.rs).
-        "twitchPoints" | "claimTwitchPoints" => {
+        // A Twitch channel's points balance, as the person's twitch.tv session; only when asked for (see
+        // backend/twitch/points.rs).
+        "twitchPoints" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some(format!("{method} requires \"bufferId\"")));
+                return (None, Some("twitchPoints requires \"bufferId\"".to_string()));
             };
-            let result = if method == "twitchPoints" {
-                backend::twitch::points::points_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await
-            } else {
-                backend::twitch::points::claim_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await
-            };
-            match result {
-                Ok(p) => (Some(serde_json::json!({ "points": p.balance, "claimId": p.claim_id, "name": p.name })), None),
+            match backend::twitch::points::points_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await {
+                Ok(p) => (Some(serde_json::json!({ "points": p.balance, "name": p.name })), None),
                 Err(e) => (None, Some(e)),
             }
         }

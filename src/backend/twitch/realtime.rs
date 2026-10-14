@@ -360,7 +360,7 @@ pub async fn refresh_balance(state: &AppState, root: &str, account_id: &str, cha
         // Directly: `publish` would carry the old balance back over the new one.
         crate::backend::kick::cards::publish_card(state, &buffer_id, "prediction", Some(card));
     }
-    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": balance, "claimId": points.claim_id, "name": points.name }));
+    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": balance, "name": points.name }));
 }
 
 /// A poll or prediction the channel already has going, asked for from the GraphQL when it is opened.

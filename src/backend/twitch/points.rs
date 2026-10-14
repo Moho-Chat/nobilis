@@ -1,12 +1,13 @@
 //! What a signed-in twitch.tv session can do in a channel that the official API cannot: see the channel
-//! points balance, claim the bonus chest, put points on a prediction, vote in a poll.
+//! points balance, put points on a prediction, vote in a poll. (The bonus chest is deliberately not claimed from
+//! here: it only appears to a viewer that reports watching, which moho does not do.)
 //!
 //! All of it is Twitch's private GraphQL (see gql.rs), and all of it as the person's own twitch.tv session - the
 //! `auth-token` that signing in leaves with the account (see `playback`), since the token moho uses for chat
 //! and the official API is not accepted there. Without that session these say so, in words, and do nothing.
 //!
-//! Nothing here runs by itself. A balance is read when the window shows the channel; a bonus is claimed, a bet
-//! placed and a vote cast only when the person presses the button for it. The player's "watch time" reports,
+//! Nothing here runs by itself. A balance is read when the window shows the channel; a bet is placed and a vote
+//! cast only when the person presses the button for it. The player's "watch time" reports,
 //! which a points bot sends to earn faster, are not sent (see the plan, Gitea issue #55).
 
 use super::gql;
@@ -14,27 +15,21 @@ use super::playback::{self, PlaybackError};
 use crate::state::AppState;
 use serde_json::{json, Value};
 
-/// The balance in a channel, and a bonus waiting to be claimed.
+/// The balance in a channel.
 #[derive(Debug, PartialEq, Clone)]
 pub struct Points {
     pub balance: Option<u64>,
-    /// The id the bonus is claimed by, when there is one to claim.
-    pub claim_id: Option<String>,
-    /// The channel's number, which claiming is addressed by.
-    pub channel_id: String,
     /// What the channel calls its points, if it renamed them.
     pub name: Option<String>,
 }
 
-const CONTEXT: &str = "query($login:String!){ user(login:$login){ channel{ id self{ communityPoints{ balance availableClaim{ id } } } communityPointsSettings{ name } } } }";
+const CONTEXT: &str = "query($login:String!){ user(login:$login){ channel{ self{ communityPoints{ balance } } communityPointsSettings{ name } } } }";
 
 pub fn read_points(answer: &Value) -> Option<Points> {
     let channel = answer.pointer("/data/user/channel").filter(|c| !c.is_null())?;
     let points = channel.pointer("/self/communityPoints").filter(|p| !p.is_null());
     Some(Points {
         balance: points.and_then(|p| p.get("balance")).and_then(|b| b.as_u64()),
-        claim_id: points.and_then(|p| p.pointer("/availableClaim/id")).and_then(|i| i.as_str()).map(str::to_string),
-        channel_id: channel.get("id")?.as_str()?.to_string(),
         name: channel.pointer("/communityPointsSettings/name").and_then(|n| n.as_str()).filter(|n| !n.is_empty()).map(str::to_string),
     })
 }
@@ -92,15 +87,6 @@ pub async fn context(state: &AppState, http: &reqwest::Client, root: &str, login
         return Err(said);
     }
     read_points(&answer).ok_or_else(|| format!("Twitch has no channel points for {login}"))
-}
-
-/// Claims the bonus.
-pub async fn claim(state: &AppState, http: &reqwest::Client, root: &str, channel_id: &str, claim_id: &str, web_token: Option<&str>) -> Result<(), String> {
-    let token = token(web_token)?;
-    const CLAIM: &str = "mutation($i:ClaimCommunityPointsInput!){ claimCommunityPoints(input:$i){ error{ code } } }";
-    let body = gql::query(CLAIM, json!({ "i": { "channelID": channel_id, "claimID": claim_id } }));
-    let answer = playback::call_as_session(state, http, root, &body, token).await.map_err(explain)?;
-    refusal(&answer, "claimCommunityPoints").map_or(Ok(()), Err)
 }
 
 /// Puts points on an outcome of a prediction.
@@ -180,18 +166,8 @@ pub async fn points_in_buffer(state: &AppState, root: &str, buffer_id: &str) -> 
     let (cfg, channel) = session_of(state, buffer_id)?;
     let http = super::client().map_err(|e| format!("{e:#}"))?;
     let points = context(state, &http, root, &channel, Some(&cfg.web_token)).await?;
-    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": points.balance, "claimId": points.claim_id, "name": points.name }));
+    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": points.balance, "name": points.name }));
     Ok(points)
-}
-
-/// Claims the bonus waiting in the channel, and answers the balance after.
-pub async fn claim_in_buffer(state: &AppState, root: &str, buffer_id: &str) -> Result<Points, String> {
-    let (cfg, channel) = session_of(state, buffer_id)?;
-    let http = super::client().map_err(|e| format!("{e:#}"))?;
-    let before = context(state, &http, root, &channel, Some(&cfg.web_token)).await?;
-    let Some(claim_id) = before.claim_id.clone() else { return Err("there is no bonus to claim here".to_string()) };
-    claim(state, &http, root, &before.channel_id, &claim_id, Some(&cfg.web_token)).await?;
-    points_in_buffer(state, root, buffer_id).await
 }
 
 #[cfg(test)]
@@ -200,10 +176,10 @@ mod tests {
 
     #[test]
     fn the_balance_and_the_bonus_are_read_and_a_signed_out_answer_has_neither() {
-        let signed_in = json!({ "data": { "user": { "channel": { "id": "71", "self": { "communityPoints": { "balance": 4200, "availableClaim": { "id": "c9" } } }, "communityPointsSettings": { "name": "Sloths" } } } } });
-        assert_eq!(read_points(&signed_in), Some(Points { balance: Some(4200), claim_id: Some("c9".into()), channel_id: "71".into(), name: Some("Sloths".into()) }));
-        let anonymous = json!({ "data": { "user": { "channel": { "id": "71", "self": { "communityPoints": null }, "communityPointsSettings": { "name": null } } } } });
-        assert_eq!(read_points(&anonymous), Some(Points { balance: None, claim_id: None, channel_id: "71".into(), name: None }));
+        let signed_in = json!({ "data": { "user": { "channel": { "self": { "communityPoints": { "balance": 4200 } }, "communityPointsSettings": { "name": "Sloths" } } } } });
+        assert_eq!(read_points(&signed_in), Some(Points { balance: Some(4200), name: Some("Sloths".into()) }));
+        let anonymous = json!({ "data": { "user": { "channel": { "self": { "communityPoints": null }, "communityPointsSettings": { "name": null } } } } });
+        assert_eq!(read_points(&anonymous), Some(Points { balance: None, name: None }));
         assert_eq!(read_points(&json!({ "data": { "user": null } })), None);
     }
 
@@ -314,7 +290,7 @@ mod tests {
             if req.contains("makePrediction") {
                 r#"{"data":{"makePrediction":{"error":null}}}"#.to_string()
             } else {
-                r#"{"data":{"user":{"channel":{"id":"71","self":{"communityPoints":{"balance":400,"availableClaim":null}},"communityPointsSettings":{"name":null}}}}}"#.to_string()
+                r#"{"data":{"user":{"channel":{"self":{"communityPoints":{"balance":400}},"communityPointsSettings":{"name":null}}}}}"#.to_string()
             }
         })
         .await;
@@ -328,33 +304,7 @@ mod tests {
         assert_eq!((card["votedOptionId"].as_str(), card["stake"].as_f64(), card["balance"].as_u64()), (Some("o1"), Some(100.0), Some(400)));
     }
 
-    #[tokio::test]
-    async fn the_bonus_is_claimed_by_the_id_twitch_offered_and_the_balance_read_again() {
-        let (state, buffer) = channel("twitch-points-claim", "websession");
-        let asked = Arc::new(Mutex::new(0));
-        let counter = asked.clone();
-        let (root, seen) = fake_gql(move |req| {
-            if req.contains("claimCommunityPoints") {
-                return r#"{"data":{"claimCommunityPoints":{"error":null}}}"#.to_string();
-            }
-            let mut n = counter.lock().unwrap();
-            *n += 1;
-            if *n == 1 {
-                r#"{"data":{"user":{"channel":{"id":"71","self":{"communityPoints":{"balance":100,"availableClaim":{"id":"c9"}}},"communityPointsSettings":{"name":"Sloths"}}}}}"#.to_string()
-            } else {
-                r#"{"data":{"user":{"channel":{"id":"71","self":{"communityPoints":{"balance":150,"availableClaim":null}},"communityPointsSettings":{"name":"Sloths"}}}}}"#.to_string()
-            }
-        })
-        .await;
-        let after = claim_in_buffer(&state, &root, &buffer).await.unwrap();
-        assert_eq!((after.balance, after.claim_id), (Some(150), None));
-        let claim_request = seen.lock().unwrap().iter().find(|r| r.contains("claimCommunityPoints")).cloned().unwrap();
-        assert!(claim_request.contains("\"channelID\":\"71\"") && claim_request.contains("\"claimID\":\"c9\""), "{claim_request}");
-        // Nothing waiting is said, not sent.
-        assert_eq!(claim_in_buffer(&state, &root, &buffer).await.unwrap_err(), "there is no bonus to claim here");
-    }
-
-    /// Against the real Twitch, with nothing at stake: reads a balance, and sends a vote, a bet and a claim that
+    /// Against the real Twitch, with nothing at stake: reads a balance, and sends a vote and a bet that
     /// name things that do not exist, which Twitch refuses in words. Shows the session is accepted and the
     /// requests are shaped as it wants. `TWITCH_LIVE_WEB_TOKEN=... TWITCH_LIVE_USER_ID=... TWITCH_LIVE_CHANNEL=...
     /// cargo test --release live_ -- --ignored --nocapture`.
@@ -375,6 +325,5 @@ mod tests {
         println!("balance: {:?}", context(&state, &http, root, &channel, Some(&token)).await);
         println!("vote in a poll that is not there: {:?}", vote(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", &user, Some(&token)).await);
         println!("bet on a prediction that is not there: {:?}", bet(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", 10, Some(&token)).await);
-        println!("claim a bonus that is not there: {:?}", claim(&state, &http, root, "1", "nonexistent", Some(&token)).await);
     }
 }
