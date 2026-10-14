@@ -646,7 +646,7 @@ fn clearchat(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line)
     let buffer = buffer_id(account_id, &channel);
     let target = line.text().trim();
     if target.is_empty() {
-        state.runtime.record_message(state, account_id, &channel, "channel", &channel, "Chat was cleared by a moderator", false, "moderation", None, None, false, None, Vec::new(), Vec::new(), None);
+        moderation_card(state, account_id, &channel, "cleaning_services", "Chat", "was cleared by a moderator", None);
         return;
     }
     // Everything they said is gone from Twitch's chat, and drawn as removed
@@ -674,7 +674,7 @@ fn clearchat(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line)
         None,
         false,
         None,
-        vec![Embed { kind: Some("moderation".into()), author: Some(target.to_string()), title: Some(what), ..Default::default() }],
+        vec![Embed { kind: Some("moderation".into()), author: Some(target.to_string()), title: Some(what), icon: Some(if duration.is_some() { "timer_off" } else { "gavel" }.to_string()), ..Default::default() }],
         Vec::new(),
         None,
     );
@@ -698,6 +698,11 @@ fn clearmsg(state: &AppState, account_id: &str, line: &Line) {
         return;
     }
     state.runtime.moderate_message(state, &buffer_id(account_id, &channel), target, &Moderated::default());
+    // Said once, to the room, as the timeouts and bans are: the removed message itself stays, struck through.
+    let who = line.tag("login");
+    if !who.is_empty() {
+        moderation_card(state, account_id, &channel, "delete", who, "had a message removed", None);
+    }
 }
 
 /// A channel's modes, said in words. `None` for a channel with none.
@@ -794,7 +799,43 @@ fn whisper(state: &AppState, account_id: &str, line: &Line) {
 
 /// A NOTICE, said in the channel it is about (or in none, for the server's),
 /// and, when it is the one that says the sign-in failed, as a refusal.
+/// Says something a moderator did, or a change to the room, as the card Kick's bans are: a mark for what it
+/// was, what it was about in bold, and what happened. `by` is who did it, where that is known.
+pub fn moderation_card(state: &AppState, account_id: &str, channel: &str, icon: &str, subject: &str, what: &str, by: Option<&str>) {
+    let embed = Embed { kind: Some("moderation".into()), author: Some(subject.to_string()), title: Some(what.to_string()), description: by.map(str::to_string), icon: Some(icon.to_string()), ..Default::default() };
+    state.runtime.record_message(state, account_id, channel, "channel", channel, &format!("{subject} {what}"), false, "moderation", None, None, false, None, vec![embed], Vec::new(), None);
+}
+
+/// The first number in some words, "every 10 seconds" -> 10.
+fn number_in(text: &str) -> Option<u64> {
+    text.split(|c: char| !c.is_ascii_digit()).find(|p| !p.is_empty()).and_then(|p| p.parse().ok())
+}
+
+/// A change to the room's modes, which Twitch says to the whole room as a notice: drawn as a card, not a line.
+/// `None` for any other notice.
+fn mode_card(line: &Line) -> Option<(&'static str, &'static str, String)> {
+    let text = line.text();
+    Some(match line.tag("msg-id") {
+        "slow_on" => ("timer", "Slow mode", number_in(text.split("every").nth(1).unwrap_or(text)).map(|n| format!("is on: one message every {n} seconds")).unwrap_or_else(|| "is on".into())),
+        "slow_off" => ("timer", "Slow mode", "is off".into()),
+        "subs_on" => ("workspace_premium", "Subscribers-only mode", "is on".into()),
+        "subs_off" => ("workspace_premium", "Subscribers-only mode", "is off".into()),
+        "emote_only_on" => ("mood", "Emote-only mode", "is on".into()),
+        "emote_only_off" => ("mood", "Emote-only mode", "is off".into()),
+        "followers_on" => ("group", "Followers-only mode", text.split("in ").nth(1).and_then(|r| r.split(" followers").next()).map(|d| format!("is on: followers of {d}")).unwrap_or_else(|| "is on".into())),
+        "followers_on_zero" => ("group", "Followers-only mode", "is on".into()),
+        "followers_off" => ("group", "Followers-only mode", "is off".into()),
+        "r9k_on" => ("fingerprint", "Unique-chat mode", "is on".into()),
+        "r9k_off" => ("fingerprint", "Unique-chat mode", "is off".into()),
+        _ => return None,
+    })
+}
+
 fn notice(state: &AppState, account_id: &str, line: &Line) -> Option<String> {
+    if let (Some(channel), Some((icon, subject, what))) = (line.channel(), mode_card(line)) {
+        moderation_card(state, account_id, &channel, icon, subject, &what, None);
+        return None;
+    }
     let text = line.text();
     let lower = text.to_lowercase();
     if line.channel().is_none() && (lower.contains("authentication failed") || lower.contains("improperly formatted auth") || lower.contains("invalid nick")) {
@@ -951,15 +992,51 @@ mod tests {
         let l = log(&state, "xqc");
         let removed: Vec<bool> = l.iter().filter(|m| m.kind == "chat").map(|m| m.moderated.is_some()).collect();
         assert_eq!(removed, vec![true, true, true]);
-        let card = l.iter().find(|m| m.kind == "moderation").expect("a line about the timeout");
+        // The removed message is told as a card, then the timeout.
+        let first = l.iter().find(|m| m.kind == "moderation").expect("a card about the removal");
+        assert_eq!((first.embeds[0].author.as_deref(), first.embeds[0].title.as_deref(), first.embeds[0].icon.as_deref()), (Some("p8"), Some("had a message removed"), Some("delete")));
+        let card = l.iter().filter(|m| m.kind == "moderation").nth(1).expect("a line about the timeout");
         assert_eq!(card.embeds[0].title.as_deref(), Some("was timed out for 10 minutes"));
+        assert_eq!(card.embeds[0].icon.as_deref(), Some("timer_off"));
         assert_eq!(card.embeds[0].author.as_deref(), Some("p7"));
         // A ban with no length, and a cleared room.
         feed(&state, &mut rooms, "@room-id=1;target-user-id=9 :tmi.twitch.tv CLEARCHAT #xqc :p9");
         feed(&state, &mut rooms, "@room-id=1 :tmi.twitch.tv CLEARCHAT #xqc");
         let bodies: Vec<String> = log(&state, "xqc").iter().filter(|m| m.kind == "moderation").map(|m| m.body.clone()).collect();
-        assert_eq!(bodies[1], "p9 was banned");
-        assert_eq!(bodies[2], "Chat was cleared by a moderator");
+        assert_eq!(bodies[2], "p9 was banned");
+        assert_eq!(bodies[3], "Chat was cleared by a moderator");
+    }
+
+    #[test]
+    fn a_change_to_the_rooms_modes_is_a_card_with_what_it_is_now() {
+        let state = testkit::simulated_daemon("twitch-mode-cards");
+        let mut rooms = Rooms::default();
+        for (id, text) in [
+            ("slow_on", "This room is now in slow mode. You may send messages every 10 seconds."),
+            ("slow_off", "This room is no longer in slow mode."),
+            ("subs_on", "This room is now in subscribers-only mode."),
+            ("emote_only_off", "This room is no longer in emote-only mode."),
+            ("followers_on", "This room is now in 10 minutes followers-only mode."),
+            ("followers_on_zero", "This room is now in followers-only mode."),
+            ("r9k_on", "This room is now in unique-chat mode."),
+        ] {
+            feed(&state, &mut rooms, &format!("@msg-id={id} :tmi.twitch.tv NOTICE #xqc :{text}"));
+        }
+        let cards: Vec<(String, String, String)> = log(&state, "xqc")
+            .iter()
+            .filter(|m| m.kind == "moderation")
+            .map(|m| (m.embeds[0].author.clone().unwrap(), m.embeds[0].title.clone().unwrap(), m.embeds[0].icon.clone().unwrap()))
+            .collect();
+        let want = [
+            ("Slow mode", "is on: one message every 10 seconds", "timer"),
+            ("Slow mode", "is off", "timer"),
+            ("Subscribers-only mode", "is on", "workspace_premium"),
+            ("Emote-only mode", "is off", "mood"),
+            ("Followers-only mode", "is on: followers of 10 minutes", "group"),
+            ("Followers-only mode", "is on", "group"),
+            ("Unique-chat mode", "is on", "fingerprint"),
+        ];
+        assert_eq!(cards, want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string())).collect::<Vec<_>>());
     }
 
     #[test]

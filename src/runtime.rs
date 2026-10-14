@@ -1054,6 +1054,13 @@ fn cap_cache<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, limit: usize) 
     });
 }
 
+/// The heading a conversation is always filed under, for a service whose list has fixed ones: Twitch's is
+/// "Channels" and "Direct Messages" (whispers), the second drawn only while there is a whisper to put under it.
+/// They are the service's own headings, so they cannot be renamed, removed or filled by hand.
+fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
+    account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self {
@@ -1648,7 +1655,12 @@ impl Runtime {
         let id = model::buffer_id(account_id, name);
         self.confirm_restored(account_id, &id, false);
         let mut buffers = self.buffers.lock().unwrap();
-        if let Some(existing) = buffers.get(&id) {
+        if let Some(existing) = buffers.get_mut(&id) {
+            // A Twitch account's list is always headed the same two ways (see `fixed_category`), including
+            // for what was open before it was.
+            if existing.category.is_none() {
+                existing.category = fixed_category(account_id, kind);
+            }
             return existing.clone();
         }
         let last_activity_ts = state.store.last_activity(&id).unwrap_or(0);
@@ -1664,7 +1676,7 @@ impl Runtime {
             // Filled in by whichever backend knows: a Discord guild files its
             // channels under the server's own headings, and everything else
             // has none.
-            category: None,
+            category: fixed_category(account_id, kind),
             position: 0,
             syncing: false,
             link: None,

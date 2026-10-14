@@ -617,9 +617,7 @@ async fn act(
                 None,
             );
         }
-        // A timeout or ban is told to the whole room by Twitch, and comes back as its own card: not said twice.
-        super::moderation::Action::Timeout { .. } | super::moderation::Action::Ban { .. } => {}
-        _ if !channel.is_empty() => super::moderation::say_done(state, account_id, channel, &done),
+        _ if !channel.is_empty() => super::moderation::say_done(state, account_id, channel, action, &done),
         _ => {}
     }
     Ok(done)

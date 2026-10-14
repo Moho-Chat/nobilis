@@ -237,7 +237,18 @@ pub async fn run(http: &reqwest::Client, cx: &Ctx<'_>, action: &Action, target_i
 
 /// Said in the channel, as a line of its own, so the one who acted - and any
 /// other window of theirs - sees what was done.
-pub fn say_done(state: &AppState, account_id: &str, channel: &str, what: &str) {
+pub fn say_done(state: &AppState, account_id: &str, channel: &str, action: &Action, what: &str) {
+    // What Twitch tells the whole room comes back as its own card (modes, removals, timeouts, bans, clearing
+    // the chat, announcements); what only this account did is said here, as one.
+    let card = |icon: &str, subject: &str, what: &str| super::chat::moderation_card(state, account_id, channel, icon, subject, what, None);
+    match action {
+        Action::Unban { user } => return card("lock_open", user, "is allowed back"),
+        Action::Block { user } => return card("block", user, "was blocked"),
+        Action::Unblock { user } => return card("check_circle", user, "was unblocked"),
+        Action::Shoutout { user } => return card("campaign", user, "was given a shoutout"),
+        Action::Timeout { .. } | Action::Ban { .. } | Action::Delete { .. } | Action::Slow(_) | Action::Followers(_) | Action::Subscribers(_) | Action::EmoteOnly(_) | Action::Unique(_) | Action::Announce { .. } | Action::Whisper { .. } => return,
+        Action::Color(_) => {}
+    }
     state.runtime.record_message(state, account_id, channel, "channel", channel, what, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
 }
 
