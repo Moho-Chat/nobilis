@@ -114,6 +114,164 @@ pub async fn send_chat_message(http: &reqwest::Client, who: &Caller<'_>, out: &O
     }
 }
 
+/// Why a call to Helix did not work.
+#[derive(Debug)]
+pub enum HelixError {
+    /// Twitch understood and said no, in words that should reach the person.
+    Refused(String),
+    /// The token or what it was allowed to do will not do for this.
+    Auth(String),
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for HelixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HelixError::Refused(why) => write!(f, "{why}"),
+            HelixError::Auth(why) => write!(f, "Twitch does not allow this for this account{}. Turn moderation on for it in Accounts, or sign in again.", if why.is_empty() { String::new() } else { format!(" ({why})") }),
+            HelixError::Failed(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+/// One call to Helix with the account's token: the answer's JSON, or why not.
+async fn request(http: &reqwest::Client, who: &Caller<'_>, method: reqwest::Method, path: &str, query: &[(&str, &str)], body: Option<serde_json::Value>) -> Result<serde_json::Value, HelixError> {
+    let mut url = format!("{}{path}", who.root);
+    if !query.is_empty() {
+        let mut q = url::form_urlencoded::Serializer::new(String::new());
+        for (k, v) in query {
+            q.append_pair(k, v);
+        }
+        url.push('?');
+        url.push_str(&q.finish());
+    }
+    let mut req = http.request(method, &url).header("Authorization", format!("Bearer {}", who.token)).header("Client-Id", who.client_id);
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let res = req.send().await.context("reaching Twitch").map_err(HelixError::Failed)?;
+    let status = res.status().as_u16();
+    let text = res.text().await.unwrap_or_default();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let said = value.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    match status {
+        200..=204 => Ok(value),
+        401 => Err(HelixError::Auth(said)),
+        // 403 is "you may not do that here", and is a verdict on the action when it carries Twitch's reason.
+        400 | 403 | 404 | 409 | 422 | 425 => Err(HelixError::Refused(if said.is_empty() { format!("Twitch refused ({status})") } else { said })),
+        429 => Err(HelixError::Refused("Twitch says you are doing that too fast. Wait a moment.".to_string())),
+        other => Err(HelixError::Failed(anyhow::anyhow!("Twitch answered {other}{}", if said.is_empty() { String::new() } else { format!(": {said}") }))),
+    }
+}
+
+/// Twitch's number for a login, or `None` where it has no such user.
+pub async fn user_id_of(http: &reqwest::Client, who: &Caller<'_>, login: &str) -> Result<Option<String>, HelixError> {
+    let answer = request(http, who, reqwest::Method::GET, "/users", &[("login", login)], None).await?;
+    Ok(answer.pointer("/data/0/id").and_then(|i| i.as_str()).map(str::to_string))
+}
+
+/// Which channel and who is acting in it: what every moderation call carries.
+pub struct Room<'a> {
+    pub broadcaster_id: &'a str,
+    pub moderator_id: &'a str,
+}
+
+/// Times somebody out for `seconds`, or bans them when there is no length.
+pub async fn ban(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, user_id: &str, seconds: Option<u64>, reason: &str) -> Result<(), HelixError> {
+    let mut data = serde_json::json!({ "user_id": user_id });
+    if let Some(seconds) = seconds {
+        data["duration"] = serde_json::json!(seconds);
+    }
+    if !reason.is_empty() {
+        data["reason"] = serde_json::json!(reason);
+    }
+    request(http, who, reqwest::Method::POST, "/moderation/bans", &[("broadcaster_id", room.broadcaster_id), ("moderator_id", room.moderator_id)], Some(serde_json::json!({ "data": data }))).await.map(|_| ())
+}
+
+/// Lets somebody back: ends a ban, or a timeout early.
+pub async fn unban(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, user_id: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::DELETE, "/moderation/bans", &[("broadcaster_id", room.broadcaster_id), ("moderator_id", room.moderator_id), ("user_id", user_id)], None).await.map(|_| ())
+}
+
+/// Removes one message, or - with no id - everything in the chat.
+pub async fn delete_chat(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, message_id: Option<&str>) -> Result<(), HelixError> {
+    let mut query = vec![("broadcaster_id", room.broadcaster_id), ("moderator_id", room.moderator_id)];
+    if let Some(id) = message_id {
+        query.push(("message_id", id));
+    }
+    request(http, who, reqwest::Method::DELETE, "/moderation/chat", &query, None).await.map(|_| ())
+}
+
+/// Changes the chat's modes: only the fields given are changed.
+pub async fn chat_settings(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, patch: serde_json::Value) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::PATCH, "/chat/settings", &[("broadcaster_id", room.broadcaster_id), ("moderator_id", room.moderator_id)], Some(patch)).await.map(|_| ())
+}
+
+/// Makes an announcement in the channel, in one of Twitch's colours.
+pub async fn announce(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, message: &str, color: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::POST, "/chat/announcements", &[("broadcaster_id", room.broadcaster_id), ("moderator_id", room.moderator_id)], Some(serde_json::json!({ "message": message, "color": color }))).await.map(|_| ())
+}
+
+/// Changes the account's own name colour: one of Twitch's names, or a `#rrggbb` where the account may.
+pub async fn set_color(http: &reqwest::Client, who: &Caller<'_>, user_id: &str, color: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::PUT, "/chat/color", &[("user_id", user_id), ("color", color)], None).await.map(|_| ())
+}
+
+/// Sends a whisper.
+pub async fn whisper(http: &reqwest::Client, who: &Caller<'_>, from_id: &str, to_id: &str, message: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::POST, "/whispers", &[("from_user_id", from_id), ("to_user_id", to_id)], Some(serde_json::json!({ "message": message }))).await.map(|_| ())
+}
+
+/// One emote an account can use in a channel.
+#[derive(Debug, PartialEq)]
+pub struct UserEmote {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub animated: bool,
+}
+
+/// The emotes an account can use in a channel: Twitch's global ones, the
+/// channel's, and any the account has from elsewhere (a subscription to
+/// another streamer's that carries over, a follower emote). Needs the
+/// `user:read:emotes` scope.
+pub async fn user_emotes(http: &reqwest::Client, who: &Caller<'_>, user_id: &str, broadcaster_id: &str, cap: usize) -> anyhow::Result<Vec<UserEmote>> {
+    let mut out: Vec<UserEmote> = Vec::new();
+    let mut after = String::new();
+    loop {
+        let mut url = format!("{}/chat/emotes/user?user_id={user_id}&broadcaster_id={broadcaster_id}", who.root);
+        if !after.is_empty() {
+            url.push_str(&format!("&after={after}"));
+        }
+        let res = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", who.token))
+            .header("Client-Id", who.client_id)
+            .send()
+            .await
+            .context("reaching Twitch for the emotes you can use")?;
+        let status = res.status();
+        let body: serde_json::Value = res.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            anyhow::bail!("Twitch would not list your emotes ({status})");
+        }
+        let template = body.get("template").and_then(|t| t.as_str()).unwrap_or("https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}");
+        for e in body.get("data").and_then(|d| d.as_array()).into_iter().flatten() {
+            let (Some(id), Some(name)) = (e.get("id").and_then(|i| i.as_str()), e.get("name").and_then(|n| n.as_str())) else { continue };
+            let animated = e.get("format").and_then(|f| f.as_array()).is_some_and(|f| f.iter().any(|x| x == "animated"));
+            // The still form at twice the size: a cell in the picker is small, and the window animates by token.
+            let url = template.replace("{{id}}", id).replace("{{format}}", "static").replace("{{theme_mode}}", "dark").replace("{{scale}}", "2.0");
+            out.push(UserEmote { id: id.to_string(), name: name.to_string(), url, animated });
+        }
+        after = body.pointer("/pagination/cursor").and_then(|c| c.as_str()).unwrap_or("").to_string();
+        if after.is_empty() || out.len() >= cap {
+            break;
+        }
+    }
+    out.truncate(cap);
+    Ok(out)
+}
+
 /// The channels an account follows, by login: only the ones live now when
 /// `live_only` (one request), otherwise all of them up to `cap`, a hundred a page.
 ///
@@ -268,5 +426,23 @@ mod tests {
         assert_eq!(followed(&client, &who, "42", false, 2).await.unwrap(), vec!["a", "b"], "cut at the cap, and no further page asked for");
         let e = followed(&client, &who, "42", false, 200).await.unwrap_err();
         assert!(e.to_string().contains("Missing scope") && e.to_string().contains("Signing in"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn the_emotes_somebody_may_use_in_a_channel_come_with_their_pictures_and_whether_they_move() {
+        let (root, seen) = twitch(vec![
+            (200, r#"{"data":[{"id":"25","name":"Kappa","emote_type":"globals","format":["static"]},{"id":"emotesv2_abc","name":"Dance","emote_type":"subscriptions","format":["static","animated"]}],"template":"https://static-cdn.jtvnw.net/emoticons/v2/{{id}}/{{format}}/{{theme_mode}}/{{scale}}","pagination":{"cursor":"p2"}}"#),
+            (200, r#"{"data":[{"id":"9","name":"Last","format":["static"]}],"pagination":{}}"#),
+            (401, "{}"),
+        ])
+        .await;
+        let who = Caller { root: &root, client_id: "cid", token: "tok" };
+        let client = reqwest::Client::new();
+        let got = user_emotes(&client, &who, "42", "100", 1000).await.unwrap();
+        assert_eq!(got.iter().map(|e| (e.name.as_str(), e.animated)).collect::<Vec<_>>(), vec![("Kappa", false), ("Dance", true), ("Last", false)]);
+        assert_eq!(got[0].url, "https://static-cdn.jtvnw.net/emoticons/v2/25/static/dark/2.0");
+        assert!(seen.lock().unwrap()[0].starts_with("GET /chat/emotes/user?user_id=42&broadcaster_id=100 "));
+        assert!(seen.lock().unwrap()[1].contains("after=p2"));
+        assert!(user_emotes(&client, &who, "42", "100", 1000).await.is_err());
     }
 }

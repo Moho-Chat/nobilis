@@ -1398,6 +1398,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         sliding_sync: false,
         dehydration: false,
         web_session: false,
+        moderation: false,
     }
 }
 
@@ -1438,6 +1439,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         sliding_sync: false,
         dehydration: false,
         web_session: false,
+        moderation: false,
     }
 }
 
@@ -1477,6 +1479,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         sliding_sync: false,
         dehydration: false,
         web_session: false,
+        moderation: false,
     }
 }
 
@@ -1525,6 +1528,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         sliding_sync: false,
         dehydration: false,
         web_session: false,
+        moderation: false,
     }
 }
 
@@ -1572,6 +1576,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         sliding_sync: false,
         dehydration: false,
         web_session: false,
+        moderation: false,
     }
 }
 
@@ -1614,6 +1619,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         sliding_sync: false,
         dehydration: false,
         web_session: !a.web_token.is_empty(),
+        moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
     }
 }
 
@@ -1657,6 +1663,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         sliding_sync: a.prefer_sliding_sync,
         dehydration: a.dehydration_enabled,
         web_session: false,
+        moderation: false,
     }
 }
 

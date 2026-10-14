@@ -193,6 +193,10 @@ pub struct Account {
     /// a yes or no and never the session itself.
     #[serde(rename = "webSession", default, skip_serializing_if = "std::ops::Not::not")]
     pub web_session: bool,
+    /// Twitch only: whether this account was signed in with the rights to
+    /// moderate, whisper and change its colour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moderation: bool,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on

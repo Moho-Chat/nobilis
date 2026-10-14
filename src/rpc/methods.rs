@@ -188,6 +188,14 @@ pub async fn dispatch(
             // by `listSteamStickers`, and are not a section of emoji.
             sources.retain(|s| s.id != backend::steam::emoticons::STICKERS);
 
+            // Twitch's other emote services: held in memory per channel, so
+            // they are read when asked and follow the switches as they change.
+            if account_id.starts_with("twitch:") {
+                if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                    sources.extend(backend::twitch::emotes::sources(&buffer.name, buffer_id));
+                }
+            }
+
             // Sneedchat's table is the same everywhere and belongs to no
             // room, so it is added here rather than recorded per channel.
             if account_id.starts_with("sneedchat:") {
@@ -270,6 +278,21 @@ pub async fn dispatch(
                     None,
                 ),
             },
+            // Twitch's: what the account can use there, and the other services'.
+            Some(buffer_id) if buffer_id.starts_with("twitch:") => {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (Some(serde_json::json!([])), None) };
+                let mut sources = state.runtime.emoji_catalogue(&buffer.account_id);
+                sources.retain(|s| s.buffers.iter().any(|b| b == buffer_id));
+                sources.extend(backend::twitch::emotes::sources(&buffer.name, buffer_id));
+                let mut seen = std::collections::HashSet::new();
+                let emoji: Vec<serde_json::Value> = sources
+                    .into_iter()
+                    .flat_map(|s| s.emoji)
+                    .filter(|e| seen.insert(e.name.clone()))
+                    .map(|e| serde_json::json!({ "id": e.id, "name": e.name, "animated": e.animated, "url": e.url, "locked": false }))
+                    .collect();
+                (Some(serde_json::json!(emoji)), None)
+            }
             // Steam's emoticons are the account's, the same in every conversation.
             Some(buffer_id) if buffer_id.starts_with("steam:") => {
                 let emoji: Vec<serde_json::Value> = state
@@ -579,6 +602,11 @@ pub async fn dispatch(
                     }
                 }
 
+                // Whether this account may moderate a Twitch channel, which Twitch
+                // says once on joining and a window opened later missed.
+                if let Some(moderator) = state.runtime.twitch_rights(buffer_id) {
+                    state.events.emit("twitchRights", serde_json::json!({ "bufferId": buffer_id, "moderator": moderator }));
+                }
                 // And what a Kick channel is broadcasting, which changes while
                 // nobody is looking: a viewer count from an hour ago is worse
                 // than none, so opening the channel asks again.
@@ -3449,6 +3477,25 @@ pub async fn dispatch(
                     let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
                         return (None, Some("that Twitch account is not connected".to_string()));
                     };
+                    // A whisper is a conversation of its own and is sent by the official API.
+                    if buffer.kind == "dm" {
+                        let (respond, answer) = tokio::sync::oneshot::channel();
+                        let command = backend::twitch::Command::Act {
+                            channel: String::new(),
+                            action: backend::twitch::moderation::Action::Whisper { to: buffer.name.clone(), text: body.to_string() },
+                            target_id: None,
+                            respond,
+                        };
+                        if sender.send(command).is_err() {
+                            return (None, Some("that Twitch account is not connected".to_string()));
+                        }
+                        return match tokio::time::timeout(std::time::Duration::from_secs(20), answer).await {
+                            Ok(Ok(Ok(_))) => (Some(ok_node()), None),
+                            Ok(Ok(Err(e))) => (None, Some(e)),
+                            Ok(Err(_)) => (None, Some("the Twitch connection dropped before the whisper was sent".to_string())),
+                            Err(_) => (None, Some("Twitch took too long to take that whisper".to_string())),
+                        };
+                    }
                     let (respond, answer) = tokio::sync::oneshot::channel();
                     let command = backend::twitch::Command::Say {
                         channel: buffer.name.clone(),
@@ -4204,7 +4251,9 @@ pub async fn dispatch(
         // events: see backend/twitch/login.rs.
         "startTwitchLogin" => {
             let login_id = format!("twitch-{}", crate::model::next_message_id());
-            backend::twitch::login::start(state.clone(), login_id.clone());
+            // With the rights to moderate and whisper added, when the account's card asked for them.
+            let moderation = params.get("moderation").and_then(|v| v.as_bool()).unwrap_or(false);
+            backend::twitch::login::start(state.clone(), login_id.clone(), moderation);
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
@@ -4275,6 +4324,51 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "count": count })), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Which of BetterTTV, FrankerFaceZ and 7TV the window wants. Each is
+        // somebody else's server told which channel is being opened, so each
+        // has its own switch (Settings, Twitch); until the window says, all on.
+        "setTwitchEmoteProviders" => {
+            let on = |key: &str| params.get(key).and_then(|v| v.as_bool()).unwrap_or(true);
+            backend::twitch::emotes::set_enabled(on("bttv"), on("ffz"), on("seventv"));
+            (Some(ok_node()), None)
+        }
+
+        // Something a moderator does to a Twitch channel from a menu: remove a
+        // message, time somebody out, ban them, let them back. The slash
+        // commands do the same through the composer (backend/twitch/moderation.rs).
+        "twitchModerate" => {
+            use backend::twitch::moderation::Action;
+            let (Some(buffer_id), Some(kind)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "action")) else {
+                return (None, Some("twitchModerate requires \"bufferId\" and \"action\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("twitch:")) else {
+                return (None, Some("that is not a Twitch channel".to_string()));
+            };
+            let login = p_str_opt(params, "login").unwrap_or("").trim().trim_start_matches('@').to_lowercase();
+            let reason = p_str_opt(params, "reason").unwrap_or("").to_string();
+            let action = match kind {
+                "delete" => Action::Delete { message_id: p_str_opt(params, "messageId").map(str::to_string) },
+                "timeout" => Action::Timeout { user: login, seconds: params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(600), reason },
+                "ban" => Action::Ban { user: login, reason },
+                "unban" => Action::Unban { user: login },
+                other => return (None, Some(format!("no Twitch moderation action called {other}"))),
+            };
+            let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            };
+            let (respond, answer) = tokio::sync::oneshot::channel();
+            let command = backend::twitch::Command::Act { channel: buffer.name.clone(), action, target_id: p_str_opt(params, "userId").map(str::to_string), respond };
+            if sender.send(command).is_err() {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(30), answer).await {
+                Ok(Ok(Ok(done))) => (Some(serde_json::json!({ "done": done })), None),
+                Ok(Ok(Err(e))) => (None, Some(e)),
+                Ok(Err(_)) => (None, Some("the Twitch connection dropped".to_string())),
+                Err(_) => (None, Some("Twitch took too long to answer".to_string())),
             }
         }
 
@@ -5478,6 +5572,15 @@ pub async fn dispatch(
                         Err(anyhow::anyhow!("Matrix needs the person's id, not their name"))
                     } else {
                         backend::matrix::open_dm(state, account_id, user_id, nick).await
+                    }
+                }
+                // A Twitch whisper is a conversation with a login: it exists as soon as it is named.
+                "twitch" => {
+                    let who = if nick.is_empty() { user_id } else { nick }.trim().trim_start_matches('@').to_lowercase();
+                    if who.is_empty() || !who.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        Err(anyhow::anyhow!("no login to whisper to"))
+                    } else {
+                        Ok(state.runtime.ensure_buffer(state, account_id, &who, "dm").id)
                     }
                 }
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),

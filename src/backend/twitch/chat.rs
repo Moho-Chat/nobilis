@@ -145,8 +145,72 @@ fn buffer_id(account_id: &str, channel: &str) -> String {
 // Pieces of a message
 // ---------------------------------------------------------------------------
 
+/// What is known about the channel a message is in, for turning its words into
+/// pictures: whether the three third-party services' emotes are looked for, and
+/// whether a cheer's amount is. `None` converts Twitch's own emotes only.
+#[derive(Clone, Copy)]
+pub struct Words<'a> {
+    pub channel: &'a str,
+    pub bits: bool,
+}
+
+/// The prefixes Twitch's cheermotes are written with, in any case. A channel
+/// can have cheermotes of its own with its own prefix, which are left as text.
+const CHEERS: &[&str] = &[
+    "cheer", "biblethump", "cheerwhal", "corgo", "uni", "showlove", "party", "seemsgood", "pride", "kappa", "frankerz", "heyguys",
+    "dansgame", "elegiggle", "trihard", "kreygasm", "4head", "swiftrage", "notlikethis", "failfish", "vohiyo", "pjsalt", "mrdestructoid",
+    "bday", "ripcheer", "shamrock", "bitboss", "streamlabs", "muxy", "holidaycheer", "goal", "anon", "charity",
+];
+
+/// A word that is a cheer - a prefix and an amount, `Cheer100` - as (prefix, amount).
+pub fn cheer_of(word: &str) -> Option<(String, u64)> {
+    let split = word.find(|c: char| c.is_ascii_digit())?;
+    let (prefix, digits) = word.split_at(split);
+    if prefix.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) || digits.len() > 9 {
+        return None;
+    }
+    let lower = prefix.to_lowercase();
+    if !CHEERS.contains(&lower.as_str()) {
+        return None;
+    }
+    Some((lower, digits.parse().ok()?))
+}
+
+/// The words of a stretch of text that is not one of Twitch's own emotes, with
+/// each that is an emote of the other three services (or a cheer) replaced by
+/// its token. Whitespace is kept exactly as it was.
+fn plain_words(text: &str, words: Option<&Words>) -> String {
+    let Some(words) = words else { return text.to_string() };
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if word.is_empty() {
+            return;
+        }
+        if let Some(e) = super::emotes::find(words.channel, word) {
+            out.push_str(&e.token());
+        } else if let Some((prefix, amount)) = Some(words.bits).filter(|b| *b).and_then(|_| cheer_of(word)) {
+            out.push_str(&format!("[twitch:cheer:{prefix}:{amount}]"));
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_whitespace() {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
+}
+
 /// The text with each of Twitch's own emotes replaced by the token the window
-/// draws a picture for: `[twitch:emote:<id>:<name>]`.
+/// draws a picture for: `[twitch:emote:<id>:<name>]`, or `aemote` for one that
+/// moves.
 ///
 /// The `emotes` tag is `<id>:<from>-<to>,<from>-<to>/<id>:...`, with positions
 /// counted in **characters** (Unicode code points) of the text as sent - not
@@ -154,12 +218,14 @@ fn buffer_id(account_id: &str, channel: &str) -> String {
 /// the usual way this goes wrong. A range that does not fit the text is
 /// skipped rather than trusted.
 pub fn emote_tokens(text: &str, tag: &str) -> String {
-    if tag.is_empty() {
-        return text.to_string();
-    }
+    tokens(text, tag, None)
+}
+
+/// The same, and the words in between turned into the other emotes' tokens.
+pub fn tokens(text: &str, tag: &str, words: Option<&Words>) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<(usize, usize, &str)> = Vec::new();
-    for emote in tag.split('/') {
+    for emote in tag.split('/').filter(|e| !e.is_empty()) {
         let Some((id, ranges)) = emote.split_once(':') else { continue };
         if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             continue;
@@ -179,49 +245,72 @@ pub fn emote_tokens(text: &str, tag: &str) -> String {
         if from < at {
             continue; // overlapping: the first one stands
         }
-        out.extend(&chars[at..from]);
+        out.push_str(&plain_words(&chars[at..from].iter().collect::<String>(), words));
         let name: String = chars[from..=to].iter().map(|c| if *c == ']' { '_' } else { *c }).collect();
-        out.push_str(&format!("[twitch:emote:{id}:{name}]"));
+        let kind = if super::emotes::animated(id) == Some(true) { "aemote" } else { "emote" };
+        out.push_str(&format!("[twitch:{kind}:{id}:{name}]"));
         at = to + 1;
     }
-    out.extend(&chars[at..]);
+    out.push_str(&plain_words(&chars[at..].iter().collect::<String>(), words));
     out
 }
 
-/// The badges that say something about a person, from the `badges` and
-/// `badge-info` tags, in the order Twitch ranks them.
+/// How Twitch ranks a badge for where it goes in a row, highest first, and the
+/// word that stands for it where there is no picture. A set not listed is
+/// ranked below them all and has no word: a campaign's or an event's is left
+/// out where there is no picture, rather than drawn as three meaningless letters.
+fn role(set: &str) -> Option<(&'static str, u32)> {
+    Some(match set {
+        "broadcaster" => ("Broadcaster", 100),
+        "staff" => ("Twitch staff", 95),
+        "admin" => ("Twitch admin", 94),
+        "global_mod" => ("Global moderator", 93),
+        "moderator" => ("Moderator", 80),
+        "lead_moderator" => ("Lead moderator", 81),
+        "vip" => ("VIP", 70),
+        "founder" => ("Founder", 62),
+        "subscriber" => ("Subscriber", 60),
+        "partner" => ("Verified", 50),
+        _ => return None,
+    })
+}
+
+/// The most pictures one name carries. Some people wear half a dozen, and a name
+/// with that many beside it is the loudest thing on the line.
+const MAX_BADGE_PICTURES: usize = 5;
+
+/// The badges beside a name, from the `badges` and `badge-info` tags, in the
+/// order Twitch ranks them.
 ///
-/// Drawn as words for now (the pictures come with the channel's own badge
-/// sets): the roles worth looking for in a busy chat, and a mark on a first
-/// message. A set nobody here has a word for - a campaign's, an event's - is
-/// left out rather than drawn as three meaningless letters.
+/// Each is a picture when Twitch's table for the channel has one (see
+/// `badges.rs`) and a word for the roles worth looking for in a busy chat when
+/// it does not yet - the table is fetched as a channel is joined, so the first
+/// few messages may arrive before it. A mark on a first message and on a
+/// message mirrored from another channel of a shared chat, and on a cheer, are
+/// ours and are words.
 pub fn badges_of(line: &Line) -> Vec<Badge> {
+    let channel = line.channel().unwrap_or_default();
     let info: HashMap<&str, &str> = line.tag("badge-info").split(',').filter_map(|b| b.split_once('/')).collect();
     let mut out: Vec<Badge> = Vec::new();
+    let mut pictures = 0;
     for badge in line.tag("badges").split(',') {
         let Some((set, _version)) = badge.split_once('/') else { continue };
-        let (text, rank) = match set {
-            "broadcaster" => ("Broadcaster", 100),
-            "staff" => ("Twitch staff", 95),
-            "admin" => ("Twitch admin", 94),
-            "global_mod" => ("Global moderator", 93),
-            "moderator" => ("Moderator", 80),
-            "lead_moderator" => ("Lead moderator", 81),
-            "vip" => ("VIP", 70),
-            "founder" => ("Founder", 62),
-            "subscriber" => ("Subscriber", 60),
-            "partner" => ("Verified", 50),
-            _ => continue,
-        };
         // Months, for the badges that count them: a subscriber's `badge-info` says how long.
         let months = info.get(set).and_then(|m| m.parse::<u32>().ok());
-        out.push(Badge {
-            kind: if set == "partner" { "verified".to_string() } else if set == "lead_moderator" { "moderator".to_string() } else { set.to_string() },
-            text: text.to_string(),
-            count: months,
-            image: None,
-            sort_order: Some(rank),
-        });
+        let known = role(set);
+        let rank = known.map(|(_, r)| r).unwrap_or(10) as i32;
+        if let Some(picture) = super::badges::find(&channel, badge).filter(|_| pictures < MAX_BADGE_PICTURES) {
+            pictures += 1;
+            out.push(Badge { kind: set.to_string(), text: picture.title, count: months, image: Some(picture.image), sort_order: Some(rank) });
+        } else if let Some((text, rank)) = known {
+            out.push(Badge {
+                kind: if set == "partner" { "verified".to_string() } else if set == "lead_moderator" { "moderator".to_string() } else { set.to_string() },
+                text: text.to_string(),
+                count: months,
+                image: None,
+                sort_order: Some(rank as i32),
+            });
+        }
     }
     if line.tag("first-msg") == "1" {
         out.push(Badge { kind: "first-message".into(), text: "First message in this channel".into(), count: None, image: None, sort_order: Some(0) });
@@ -229,13 +318,16 @@ pub fn badges_of(line: &Line) -> Vec<Badge> {
     if !line.tag("source-room-id").is_empty() && line.tag("source-room-id") != line.tag("room-id") {
         out.push(Badge { kind: "shared-chat".into(), text: "From another channel in a shared chat".into(), count: None, image: None, sort_order: Some(1) });
     }
+    if let Ok(bits) = line.tag("bits").parse::<u64>() {
+        out.push(Badge { kind: "cheer".into(), text: format!("Cheered {bits} bits"), count: None, image: None, sort_order: Some(2) });
+    }
     out.sort_by_key(|b| std::cmp::Reverse(b.sort_order.unwrap_or(0)));
     out
 }
 
 /// The word that marks somebody in the roster: their strongest badge.
 fn strongest(badges: &[Badge]) -> Option<String> {
-    badges.iter().find(|b| matches!(b.kind.as_str(), "broadcaster" | "moderator" | "vip" | "founder" | "subscriber")).map(|b| b.kind.clone())
+    badges.iter().find(|b| matches!(b.kind.as_str(), "broadcaster" | "moderator" | "lead_moderator" | "vip" | "founder" | "subscriber")).map(|b| if b.kind == "lead_moderator" { "moderator".to_string() } else { b.kind.clone() })
 }
 
 /// What a reply was answering, from the `reply-*` tags, and the text with the
@@ -248,14 +340,7 @@ pub fn reply_of(line: &Line, text: &str) -> (Option<ReplyPreview>, String) {
     }
     let from = Some(line.tag("reply-parent-display-name")).filter(|s| !s.is_empty()).unwrap_or_else(|| line.tag("reply-parent-user-login"));
     let root = Some(line.tag("reply-thread-parent-msg-id")).filter(|s| !s.is_empty()).unwrap_or(parent);
-    let login = line.tag("reply-parent-user-login");
-    let body = match text.strip_prefix('@') {
-        Some(rest) if !login.is_empty() => {
-            let (name, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-            if name.eq_ignore_ascii_case(login) { tail.to_string() } else { text.to_string() }
-        }
-        _ => text.to_string(),
-    };
+    let body = strip_mention(text, line.tag("reply-parent-user-login"));
     (
         Some(ReplyPreview {
             id: parent.to_string(),
@@ -267,6 +352,17 @@ pub fn reply_of(line: &Line, text: &str) -> (Option<ReplyPreview>, String) {
         }),
         body,
     )
+}
+
+/// Takes the `@login ` off the front of a reply's text, if that is what is there.
+pub fn strip_mention(text: &str, login: &str) -> String {
+    match text.strip_prefix('@') {
+        Some(rest) if !login.is_empty() => {
+            let (name, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+            if name.eq_ignore_ascii_case(login) { tail.to_string() } else { text.to_string() }
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// Splits Twitch's `/me` marker off a message: (is an action, the text).
@@ -319,7 +415,8 @@ pub fn handle(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line
             }
         }
         "GLOBALUSERSTATE" => globaluserstate(state, account_id, rooms, line),
-        "USERSTATE" => userstate(rooms, line),
+        "USERSTATE" => userstate(state, account_id, rooms, line),
+        "WHISPER" => whisper(state, account_id, line),
         "RECONNECT" => outcome.reconnect = true,
         _ => {}
     }
@@ -340,11 +437,16 @@ fn privmsg(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, h
         return;
     }
     let display = Some(line.tag("display-name")).filter(|d| !d.is_empty()).map(str::to_string).unwrap_or_else(|| login.clone());
-    let (reply, plain) = reply_of(line, line.text());
-    let (action, plain) = action_of(&plain);
-    let body = emote_tokens(plain, if reply.is_some() { "" } else { line.tag("emotes") });
-    // A reply's text lost its first word, and the emote positions were counted
-    // before that: they are no use against what is left.
+    let (reply, _) = reply_of(line, line.text());
+    let (action, plain) = action_of(line.text());
+    // The emote positions are counted in the text as it was sent, so they are read against it
+    // whole, and the `@name` Twitch puts in front of a reply - plain text, never an emote - is
+    // taken off the result.
+    let converted = tokens(plain, line.tag("emotes"), Some(&Words { channel: &channel, bits: !line.tag("bits").is_empty() }));
+    let body = match &reply {
+        Some(_) => strip_mention(&converted, line.tag("reply-parent-user-login")),
+        None => converted,
+    };
     let badges = badges_of(line);
     let style = SenderStyle { color: Some(line.tag("color").to_string()).filter(|c| !c.is_empty()), badges: badges.clone() };
 
@@ -359,7 +461,10 @@ fn privmsg(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, h
     }
     // Being named is being highlighted, by login: the display name can be in
     // another script, and what people type after an @ is the login.
-    let mentioned = !rooms.me_login.is_empty() && login != rooms.me_login && mentions(plain, &rooms.me_login);
+    let mentioned = (!rooms.me_login.is_empty() && login != rooms.me_login && mentions(plain, &rooms.me_login))
+        // "Highlight my message", which a viewer buys with channel points: drawn as a mention is, so the
+        // channel's attention goes where the person paid for it to.
+        || line.tag("msg-id") == "highlighted-message";
     state.runtime.record_message_at(
         state,
         account_id,
@@ -649,6 +754,38 @@ fn roomstate(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line)
     first.then_some(channel)
 }
 
+/// A whisper sent to this account: a conversation with the person who sent it.
+fn whisper(state: &AppState, account_id: &str, line: &Line) {
+    let from = line.nick().unwrap_or_default().to_lowercase();
+    let text = line.text();
+    if from.is_empty() || text.is_empty() {
+        return;
+    }
+    let display = Some(line.tag("display-name")).filter(|d| !d.is_empty()).map(str::to_string).unwrap_or_else(|| from.clone());
+    let badges = badges_of(line);
+    let style = SenderStyle { color: Some(line.tag("color").to_string()).filter(|c| !c.is_empty()), badges };
+    state.runtime.record_message_at(
+        state,
+        account_id,
+        &from,
+        "dm",
+        &display,
+        &emote_tokens(text, line.tag("emotes")),
+        false,
+        "chat",
+        None,
+        Some(line.tag("message-id").to_string()).filter(|i| !i.is_empty()),
+        false,
+        None,
+        Vec::new(),
+        Vec::new(),
+        Some(line.tag("user-id").to_string()).filter(|i| !i.is_empty()),
+        None,
+        None,
+        Some(style),
+    );
+}
+
 /// A NOTICE, said in the channel it is about (or in none, for the server's),
 /// and, when it is the one that says the sign-in failed, as a refusal.
 fn notice(state: &AppState, account_id: &str, line: &Line) -> Option<String> {
@@ -690,16 +827,25 @@ fn globaluserstate(state: &AppState, account_id: &str, rooms: &mut Rooms, line: 
     }
 }
 
-fn userstate(rooms: &mut Rooms, line: &Line) {
+fn userstate(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line) {
     let Some(channel) = line.channel() else { return };
     if !line.tag("color").is_empty() {
         rooms.me_color = Some(line.tag("color").to_string());
     }
     let badges = badges_of(line);
-    if badges.iter().any(|b| b.kind == "broadcaster" || b.kind == "moderator") || line.tag("mod") == "1" {
+    let before = rooms.moderator_in.contains(&channel);
+    if badges.iter().any(|b| b.kind == "broadcaster" || b.kind == "moderator" || b.kind == "lead_moderator") || line.tag("mod") == "1" {
         rooms.moderator_in.insert(channel.clone());
     } else {
         rooms.moderator_in.remove(&channel);
+    }
+    // Said to the window, which offers moderation only where it is a right: when it changes, and the
+    // first time, so a window that was open when the channel was joined knows.
+    let now = rooms.moderator_in.contains(&channel);
+    let buffer_id = buffer_id(account_id, &channel);
+    if before != now || state.runtime.twitch_rights(&buffer_id).is_none() {
+        state.runtime.set_twitch_rights(&buffer_id, now);
+        state.events.emit("twitchRights", serde_json::json!({ "bufferId": buffer_id, "moderator": now }));
     }
     rooms.me_badges.insert(channel, badges.into_iter().filter(|b| b.kind != "first-message" && b.kind != "shared-chat").collect());
 }
@@ -916,5 +1062,64 @@ mod tests {
     #[test]
     fn spans_are_said_as_people_say_them() {
         assert_eq!([span(30), span(600), span(3600), span(7200), span(86400), span(90)], ["30 seconds", "10 minutes", "1 hour", "2 hours", "1 day", "90 seconds"]);
+    }
+
+    #[test]
+    fn the_other_services_emotes_and_cheers_are_found_among_the_words_and_never_inside_a_token() {
+        use crate::backend::twitch::emotes::{self, Provider};
+        emotes::set_enabled(true, true, true);
+        emotes::keep(Provider::SevenTv, Some("wordchan"), emotes::read_seventv(&serde_json::json!({ "emotes": [{ "id": "01AB", "name": "OMEGALUL", "flags": 0, "data": { "animated": true } }] })));
+        let words = Words { channel: "wordchan", bits: true };
+        // Twitch's own emote first (positions are counted over the whole text), the others in the words between.
+        let out = tokens("Kappa OMEGALUL  cheer100 Cheer5 notacheer7 Kappa", "25:0-4,43-47", Some(&words));
+        assert_eq!(out, "[twitch:emote:25:Kappa] [twitch:7tv:01AB:OMEGALUL]  [twitch:cheer:cheer:100] [twitch:cheer:cheer:5] notacheer7 [twitch:emote:25:Kappa]");
+        // Not looked for where nobody asked: no bits, no cheers.
+        assert_eq!(tokens("cheer100", "", Some(&Words { channel: "wordchan", bits: false })), "cheer100");
+        // A switched-off service is left as text.
+        emotes::set_enabled(true, true, false);
+        assert_eq!(tokens("OMEGALUL", "", Some(&words)), "OMEGALUL");
+        emotes::set_enabled(true, true, true);
+        emotes::forget("wordchan");
+        assert_eq!(cheer_of("Cheer100"), Some(("cheer".to_string(), 100)));
+        assert_eq!(cheer_of("BibleThump50"), Some(("biblethump".to_string(), 50)));
+        assert_eq!(cheer_of("hello5"), None);
+        assert_eq!(cheer_of("Cheer"), None);
+        assert_eq!(cheer_of("Cheer5x"), None);
+    }
+
+    #[test]
+    fn an_emote_known_to_move_is_drawn_moving_and_one_in_a_reply_still_has_its_place() {
+        crate::backend::twitch::emotes::say_animated("moves_1", true);
+        assert_eq!(emote_tokens("hi", "moves_1:0-1"), "[twitch:aemote:moves_1:hi]");
+        // The reply's `@name ` is taken off after the emote is found, so the positions still fit.
+        let state = testkit::simulated_daemon("twitch-reply-emote");
+        let mut rooms = Rooms::default();
+        feed(&state, &mut rooms, "@display-name=A;emotes=25:14-18;id=r1;reply-parent-display-name=Bob;reply-parent-msg-body=hi;reply-parent-msg-id=p1;reply-parent-user-login=bob;room-id=1;user-id=3 :a!a@a.tmi.twitch.tv PRIVMSG #xqc :@bob nice one Kappa");
+        assert_eq!(log(&state, "xqc")[0].body, "nice one [twitch:emote:25:Kappa]");
+    }
+
+    #[test]
+    fn badges_are_pictures_when_twitch_has_told_us_what_they_look_like_and_words_when_it_has_not() {
+        use crate::backend::twitch::badges::{keep_for_test, Picture};
+        let pic = |t: &str| Picture { title: t.to_string(), image: format!("https://static-cdn.jtvnw.net/badges/v1/{t}/2") };
+        keep_for_test(Some("badgechat"), [("subscriber/36".to_string(), pic("3 years")), ("moderator/1".to_string(), pic("mod")), ("premium/1".to_string(), pic("prime"))].into_iter().collect());
+        let line = irc::parse("@badge-info=subscriber/37;badges=moderator/1,subscriber/36,premium/1,campaign-x/1;bits=100;room-id=1 :a!a@a.tmi.twitch.tv PRIVMSG #badgechat :hi").unwrap();
+        let badges = badges_of(&line);
+        // Pictures for what has one (premium too, which has no word), a word for the cheer, nothing for the campaign.
+        assert_eq!(badges.iter().map(|b| (b.kind.as_str(), b.image.is_some())).collect::<Vec<_>>(), vec![("moderator", true), ("subscriber", true), ("premium", true), ("cheer", false)]);
+        assert_eq!(badges[1].text, "3 years");
+        assert_eq!(badges[1].count, Some(37));
+        // Another channel, where nothing is known: the roles are words again.
+        let elsewhere = badges_of(&irc::parse("@badges=moderator/1,subscriber/36;room-id=2 :a!a@a.tmi.twitch.tv PRIVMSG #elsewhere :hi").unwrap());
+        assert_eq!(elsewhere.iter().map(|b| (b.kind.as_str(), b.image.is_none())).collect::<Vec<_>>(), vec![("moderator", true), ("subscriber", true)]);
+        crate::backend::twitch::badges::forget("badgechat");
+    }
+
+    #[test]
+    fn a_highlighted_message_is_drawn_as_a_mention_is() {
+        let state = testkit::simulated_daemon("twitch-highlighted");
+        let mut rooms = Rooms::default();
+        feed(&state, &mut rooms, "@display-name=A;id=hl1;msg-id=highlighted-message;room-id=1;user-id=3 :a!a@a.tmi.twitch.tv PRIVMSG #xqc :look at me");
+        assert!(log(&state, "xqc")[0].is_highlight);
     }
 }

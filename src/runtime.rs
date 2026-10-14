@@ -538,6 +538,8 @@ pub struct Runtime {
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
     twitch_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>>>,
+    /// Whether this account may moderate each Twitch channel it has open, as Twitch last said.
+    twitch_rights: Mutex<HashMap<String, bool>>,
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
@@ -1095,6 +1097,7 @@ impl Runtime {
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
             twitch_senders: Mutex::new(HashMap::new()),
+            twitch_rights: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
@@ -3914,6 +3917,14 @@ impl Runtime {
         self.twitch_senders.lock().unwrap().insert(account_id.to_string(), sender);
     }
 
+    pub fn set_twitch_rights(&self, buffer_id: &str, moderator: bool) {
+        self.twitch_rights.lock().unwrap().insert(buffer_id.to_string(), moderator);
+    }
+
+    pub fn twitch_rights(&self, buffer_id: &str) -> Option<bool> {
+        self.twitch_rights.lock().unwrap().get(buffer_id).copied()
+    }
+
     pub fn twitch_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>> {
         self.twitch_senders.lock().unwrap().get(account_id).cloned()
     }
@@ -5588,7 +5599,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, steam_links, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

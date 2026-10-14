@@ -227,6 +227,13 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The integrity cache and the requests waiting on the window are the process's, so the tests that touch
+    /// them take turns.
+    fn turn() -> &'static tokio::sync::Mutex<()> {
+        static TURN: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        TURN.get_or_init(Default::default)
+    }
+
     /// What the token's JSON says, as captured from a live answer, with the fields varied.
     fn token(extra: Value) -> Value {
         let mut about = json!({
@@ -312,6 +319,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_call_is_the_players_own_and_carries_the_accounts_token_only_when_there_is_one() {
+        let _turn = turn().lock().await;
+        *cache().lock().unwrap() = None;
         let state = testkit::simulated_daemon("twitch-playback");
         let (root, seen) = graphql(vec![(200, token(json!({})).to_string()), (200, token(json!({ "hide_ads": true })).to_string())]).await;
         let http = reqwest::Client::new();
@@ -330,6 +339,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_error_that_is_not_about_integrity_is_said_and_a_refusal_is_said_with_its_status() {
+        let _turn = turn().lock().await;
+        *cache().lock().unwrap() = None;
         let state = testkit::simulated_daemon("twitch-playback-errors");
         let (root, _) = graphql(vec![
             (200, json!({ "errors": [{ "message": "service timeout" }] }).to_string()),
@@ -345,6 +356,8 @@ mod tests {
 
     #[tokio::test]
     async fn when_twitch_wants_an_integrity_token_the_window_is_asked_and_the_call_is_made_again_with_it() {
+        let _turn = turn().lock().await;
+        *cache().lock().unwrap() = None;
         let state = testkit::simulated_daemon("twitch-playback-integrity");
         *cache().lock().unwrap() = None;
         let (root, seen) = graphql(vec![(200, json!({ "errors": [{ "message": "failed integrity check" }] }).to_string()), (200, token(json!({})).to_string())]).await;
@@ -373,6 +386,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_integrity_token_that_cannot_be_made_is_a_reason_not_a_hang() {
+        let _turn = turn().lock().await;
+        *cache().lock().unwrap() = None;
         let state = testkit::simulated_daemon("twitch-playback-integrity-fails");
         *cache().lock().unwrap() = None;
         let (root, _) = graphql(vec![(200, json!({ "errors": [{ "message": "failed integrity check" }] }).to_string())]).await;

@@ -49,6 +49,10 @@ pub enum Command {
     Part(String),
     /// Say something in one, optionally as a reply to a message by its id.
     Say { channel: String, text: String, reply_to: Option<String>, respond: oneshot::Sender<std::result::Result<(), String>> },
+    /// Do something to a channel's chat, or as oneself: remove a message, time
+    /// somebody out, change a mode, whisper (see `moderation`). `target_id`
+    /// is the person's Twitch number where the window already knows it.
+    Act { channel: String, action: super::moderation::Action, target_id: Option<String>, respond: oneshot::Sender<std::result::Result<String, String>> },
 }
 
 pub fn spawn(state: AppState, config: TwitchAccountConfig) {
@@ -324,9 +328,14 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                                 joined.insert(channel.clone());
                                 remember(state, account_id, &channel);
                                 // What it is broadcasting, now: the header and the Watch button have nothing until this answers.
+                                // And what its chat is written in: the badge pictures and the other services' emotes.
                                 if timing.watch_streams {
                                     let (state, account_id, channel) = (state.clone(), account_id.to_string(), channel.clone());
-                                    tokio::spawn(async move { super::stream::refresh(&state, &account_id, &[channel]).await });
+                                    let room = rooms.room_ids.get(&channel).cloned();
+                                    tokio::spawn(async move {
+                                        let (refreshing, extras) = (super::stream::refresh(&state, &account_id, std::slice::from_ref(&channel)), load_extras(&state, &account_id, &channel, room.as_deref()));
+                                        tokio::join!(refreshing, extras);
+                                    });
                                 }
                                 for (_, _, reply) in waiting.iter_mut().filter(|w| w.0 == channel) {
                                     if let Some(reply) = reply.take() {
@@ -376,7 +385,13 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                             socket.send(WsMessage::Text(format!("PART #{channel}\r\n"))).await?;
                         }
                         rooms.forget_channel(&channel);
+                        super::emotes::forget(&channel);
+                        super::badges::forget(&channel);
                         let _ = state.accounts.mutate_twitch(account_id, |a| a.channels.retain(|c| *c != channel));
+                    }
+                    Command::Act { channel, action, target_id, respond } => {
+                        let result = act(state, account_id, &mut rooms, &channel, &action, target_id.as_deref(), helix).await;
+                        let _ = respond.send(result);
                     }
                     Command::Say { channel, text, reply_to, respond } => {
                         let moderator = rooms.moderator_in.contains(&channel);
@@ -428,6 +443,46 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
     }
 }
 
+/// What a channel's chat is written in, fetched as it is joined: Twitch's badge
+/// pictures and the three other services' emotes (global ones once), and, for
+/// an account that signed in with the scope, the emotes it can use there.
+async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id: Option<&str>) {
+    let Ok(http) = super::client() else { return };
+    super::emotes::load_global(&http, &super::emotes::ROOTS).await;
+    super::badges::load_global(&http, super::gql::ROOT).await;
+    if let Some(room) = room_id {
+        super::emotes::load_channel(&http, &super::emotes::ROOTS, channel, room).await;
+    }
+    super::badges::load_channel(&http, super::gql::ROOT, channel).await;
+
+    // Twitch's own emotes for this account, which only an account can ask about.
+    let (Some(cfg), Some(room)) = (state.accounts.get_twitch(account_id), room_id) else { return };
+    if !cfg.is_signed_in() || !cfg.scopes.iter().any(|s| s == "user:read:emotes") || cfg.user_id.is_empty() {
+        return;
+    }
+    let who = super::helix::Caller { root: super::helix::API_ROOT, client_id: auth::CLIENT_ID, token: &cfg.access_token };
+    match super::helix::user_emotes(&http, &who, &cfg.user_id, room, 3000).await {
+        Ok(emotes) if !emotes.is_empty() => {
+            let buffer_id = crate::model::buffer_id(account_id, channel);
+            state.runtime.set_emoji_source(
+                account_id,
+                crate::model::EmojiSource {
+                    id: format!("twitch:{channel}"),
+                    name: "Twitch".to_string(),
+                    service: "twitch".to_string(),
+                    kind: "text".to_string(),
+                    icon_url: None,
+                    buffers: vec![buffer_id],
+                    sendable_anywhere: false,
+                    emoji: emotes.into_iter().map(|e| crate::model::EmojiEntry { id: e.name.clone(), name: e.name, url: Some(e.url), animated: e.animated, locked: false }).collect(),
+                },
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::debug!("twitch[{account_id}]: your emotes in {channel}: {e:#}"),
+    }
+}
+
 /// Saves a channel once Twitch has said it is there, so it comes back tomorrow.
 fn remember(state: &AppState, account_id: &str, channel: &str) {
     if let Some(cfg) = state.accounts.get_twitch(account_id) {
@@ -437,6 +492,81 @@ fn remember(state: &AppState, account_id: &str, channel: &str) {
             let _ = state.accounts.mutate_twitch(account_id, |a| a.channels = channels.clone());
         }
     }
+}
+
+/// What scope an action needs, said to a person who has not turned it on.
+fn scope_for(action: &super::moderation::Action) -> &'static str {
+    use super::moderation::Action::*;
+    match action {
+        Timeout { .. } | Ban { .. } | Unban { .. } => "moderator:manage:banned_users",
+        Delete { .. } => "moderator:manage:chat_messages",
+        Slow(_) | Followers(_) | Subscribers(_) | EmoteOnly(_) | Unique(_) => "moderator:manage:chat_settings",
+        Announce { .. } => "moderator:manage:announcements",
+        Color(_) => "user:manage:chat_color",
+        Whisper { .. } => "user:manage:whispers",
+    }
+}
+
+/// Does what was asked, and says so in the channel (or, for a whisper, in its conversation).
+async fn act(
+    state: &AppState,
+    account_id: &str,
+    rooms: &mut Rooms,
+    channel: &str,
+    action: &super::moderation::Action,
+    target_id: Option<&str>,
+    helix: &str,
+) -> std::result::Result<String, String> {
+    let Some(cfg) = state.accounts.get_twitch(account_id).filter(|a| a.is_signed_in()) else {
+        return Err("Sign in to Twitch from Accounts first".into());
+    };
+    if !cfg.scopes.iter().any(|s| s == scope_for(action)) {
+        return Err("Turn moderation on for this account in Accounts first: it was signed in without the right to do that".into());
+    }
+    let is_whisper = matches!(action, super::moderation::Action::Whisper { .. });
+    let room_id = rooms.room_ids.get(channel).cloned().unwrap_or_default();
+    if !is_whisper && !matches!(action, super::moderation::Action::Color(_)) && room_id.is_empty() {
+        return Err(format!("Twitch has not told this account about {channel} yet"));
+    }
+    let http = super::client().map_err(|e| format!("{e:#}"))?;
+    let cx = super::moderation::Ctx {
+        token: &cfg.access_token,
+        my_id: &cfg.user_id,
+        room_id: &room_id,
+        moderator: rooms.moderator_in.contains(channel),
+        api_root: helix,
+        client_id: auth::CLIENT_ID,
+    };
+    let done = super::moderation::run(&http, &cx, action, target_id).await?;
+    match action {
+        super::moderation::Action::Whisper { to, text } => {
+            // Shown in the whisper's own conversation, as sent.
+            let shown = if rooms.me_display.is_empty() { cfg.login.clone() } else { rooms.me_display.clone() };
+            state.runtime.record_message_at(
+                state,
+                account_id,
+                to,
+                "dm",
+                &shown,
+                text,
+                false,
+                "chat",
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                Vec::new(),
+                Some(cfg.user_id.clone()).filter(|i| !i.is_empty()),
+                None,
+                None,
+                None,
+            );
+        }
+        _ if !channel.is_empty() => super::moderation::say_done(state, account_id, channel, &done),
+        _ => {}
+    }
+    Ok(done)
 }
 
 /// What it takes to send a message and show it as sent.
@@ -463,6 +593,12 @@ where
     }
     if !joined.contains(channel) {
         return Err(format!("This account has not joined {channel} yet"));
+    }
+    // A slash command is an action, not a message: Twitch no longer reads them as text.
+    if let Some(parsed) = super::moderation::parse(text) {
+        let action = parsed?;
+        act(state, account_id, rooms, channel, &action, None, helix).await?;
+        return Ok(());
     }
     // Twitch's chat is one line: a break typed in the box becomes a space.
     let text: String = text.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");

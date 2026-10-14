@@ -38,17 +38,17 @@ pub fn cancel(login_id: &str) {
 }
 
 /// Starts a sign-in. Answers at once; the rest is events.
-pub fn start(state: AppState, login_id: String) {
-    start_at(state, login_id, auth::ID_ROOT.to_string(), true)
+pub fn start(state: AppState, login_id: String, moderation: bool) {
+    start_at(state, login_id, auth::ID_ROOT.to_string(), true, moderation)
 }
 
 /// The same against a given server, and with or without starting the
 /// connection once it is done - which is what lets a test do it without one.
-pub fn start_at(state: AppState, login_id: String, root: String, connect: bool) {
+pub fn start_at(state: AppState, login_id: String, root: String, connect: bool, moderation: bool) {
     let stop = Arc::new(Notify::new());
     waiting().lock().unwrap().insert(login_id.clone(), stop.clone());
     tokio::spawn(async move {
-        let outcome = flow(&state, &login_id, &root, stop).await;
+        let outcome = flow(&state, &login_id, &root, stop, moderation).await;
         waiting().lock().unwrap().remove(&login_id);
         match outcome {
             Ok(Some(saved)) => {
@@ -70,12 +70,12 @@ pub fn start_at(state: AppState, login_id: String, root: String, connect: bool) 
 }
 
 /// The sign-in itself. `None` when it was cancelled.
-pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify>) -> Result<Option<TwitchAccountConfig>> {
+pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify>, moderation: bool) -> Result<Option<TwitchAccountConfig>> {
     let status = |detail: &str| state.events.emit("twitchLoginStatus", json!({ "loginId": login_id, "detail": detail }));
     let http = super::client()?;
 
     status("Asking Twitch for a code");
-    let code = auth::start(&http, root).await?;
+    let code = auth::start(&http, root, moderation).await?;
     state.events.emit(
         "twitchLoginCode",
         json!({
@@ -83,7 +83,7 @@ pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify
             "userCode": code.user_code,
             "verificationUri": code.verification_uri,
             "expiresIn": code.expires_in,
-            "scopes": auth::SCOPES.iter().map(|(s, why)| json!({ "scope": s, "why": why })).collect::<Vec<_>>(),
+            "scopes": auth::SCOPES.iter().chain(if moderation { auth::MODERATION_SCOPES } else { &[] }.iter()).map(|(s, why)| json!({ "scope": s, "why": why })).collect::<Vec<_>>(),
         }),
     );
     status("Waiting for you to approve it on twitch.tv");
@@ -98,7 +98,7 @@ pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify
         if tokio::time::Instant::now() >= deadline {
             bail!("The code ran out before it was approved. Start again for a new one.");
         }
-        match auth::poll(&http, root, &code.device_code).await {
+        match auth::poll(&http, root, &code.device_code, moderation).await {
             Ok(Poll::Pending) => {}
             Ok(Poll::SlowDown) => interval += Duration::from_secs(5),
             Ok(Poll::Denied) => bail!("The sign-in was refused on twitch.tv."),
@@ -195,7 +195,7 @@ mod tests {
         let state = testkit::simulated_daemon("twitch-login");
         let mut events = state.events.subscribe();
         let root = twitch(1).await;
-        start_at(state.clone(), "login-1".into(), root, false);
+        start_at(state.clone(), "login-1".into(), root, false, false);
 
         let code = next_event(&mut events, "twitchLoginCode").await;
         assert_eq!(code["userCode"], "WXYZ1234");
@@ -216,7 +216,7 @@ mod tests {
         let state = testkit::simulated_daemon("twitch-login-cancel");
         let mut events = state.events.subscribe();
         let root = twitch(1000).await;
-        start_at(state.clone(), "login-2".into(), root, false);
+        start_at(state.clone(), "login-2".into(), root, false, false);
         next_event(&mut events, "twitchLoginCode").await;
         cancel("login-2");
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -228,7 +228,7 @@ mod tests {
     async fn an_unreachable_twitch_is_said_by_the_form() {
         let state = testkit::simulated_daemon("twitch-login-down");
         let mut events = state.events.subscribe();
-        start_at(state.clone(), "login-3".into(), "http://127.0.0.1:9".into(), false);
+        start_at(state.clone(), "login-3".into(), "http://127.0.0.1:9".into(), false, false);
         let result = next_event(&mut events, "twitchLoginResult").await;
         assert_eq!(result["success"], false);
         assert!(result["error"].as_str().unwrap().to_lowercase().contains("twitch"), "{result}");

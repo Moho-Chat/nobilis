@@ -41,9 +41,29 @@ pub const SCOPES: &[(&str, &str)] = &[
     ("user:read:emotes", "show the emotes you can use"),
 ];
 
+/// What moderation, whispers and a name colour need, and what each is for.
+/// Asked for only when somebody turns them on from the account's card, which
+/// signs in again with these added: an account that only chats has no reason
+/// to be able to ban anybody.
+pub const MODERATION_SCOPES: &[(&str, &str)] = &[
+    ("moderator:manage:banned_users", "time people out, ban them and let them back"),
+    ("moderator:manage:chat_messages", "delete messages"),
+    ("moderator:manage:chat_settings", "change the room's modes (slow, followers-only and the rest)"),
+    ("moderator:manage:announcements", "make announcements"),
+    ("user:manage:chat_color", "change your name colour"),
+    ("user:manage:whispers", "send whispers"),
+    ("whispers:read", "read whispers sent to you"),
+];
+
 /// The scopes as Twitch wants them in a request: one string, space between.
-pub fn scope_string() -> String {
-    SCOPES.iter().map(|(s, _)| *s).collect::<Vec<_>>().join(" ")
+pub fn scope_string(moderation: bool) -> String {
+    let extra = if moderation { MODERATION_SCOPES } else { &[] };
+    SCOPES.iter().chain(extra.iter()).map(|(s, _)| *s).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a set of scopes is the one that turned moderation on.
+pub fn has_moderation(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s == "moderator:manage:banned_users")
 }
 
 /// The code to show, and where to enter it.
@@ -151,8 +171,8 @@ fn message_of(body: &serde_json::Value) -> String {
 }
 
 /// Asks Twitch for a code for somebody to approve.
-pub async fn start(http: &reqwest::Client, root: &str) -> Result<DeviceCode> {
-    let (status, body) = post_form(http, &format!("{root}/oauth2/device"), &[("client_id", CLIENT_ID), ("scopes", &scope_string())]).await?;
+pub async fn start(http: &reqwest::Client, root: &str, moderation: bool) -> Result<DeviceCode> {
+    let (status, body) = post_form(http, &format!("{root}/oauth2/device"), &[("client_id", CLIENT_ID), ("scopes", &scope_string(moderation))]).await?;
     if status != 200 {
         bail!("Twitch would not start a sign-in ({status}): {}", message_of(&body));
     }
@@ -160,13 +180,13 @@ pub async fn start(http: &reqwest::Client, root: &str) -> Result<DeviceCode> {
 }
 
 /// Asks whether the code has been approved.
-pub async fn poll(http: &reqwest::Client, root: &str, device_code: &str) -> Result<Poll> {
+pub async fn poll(http: &reqwest::Client, root: &str, device_code: &str, moderation: bool) -> Result<Poll> {
     let (status, body) = post_form(
         http,
         &format!("{root}/oauth2/token"),
         &[
             ("client_id", CLIENT_ID),
-            ("scopes", &scope_string()),
+            ("scopes", &scope_string(moderation)),
             ("device_code", device_code),
             ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
         ],
@@ -307,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn a_sign_in_asks_for_the_scopes_moho_needs_with_its_own_client_id() {
         let (root, seen) = twitch(vec![(200, CODE)]).await;
-        let code = start(&http(), &root).await.unwrap();
+        let code = start(&http(), &root, false).await.unwrap();
         assert_eq!((code.user_code.as_str(), code.interval, code.expires_in), ("ABCDEFGH", 5, 1800));
         assert!(code.verification_uri.ends_with("device-code=ABCDEFGH"));
         let seen = seen.lock().unwrap();
@@ -317,6 +337,10 @@ mod tests {
         assert!(seen[0].1.contains("scopes=chat%3Aread+chat%3Aedit"), "{}", seen[0].1);
         // And no secret anywhere: moho is a public client.
         assert!(!seen[0].1.contains("secret"));
+        // Nothing to moderate with unless it was asked for.
+        assert!(!seen[0].1.contains("moderator"), "{}", seen[0].1);
+        assert!(scope_string(true).contains("moderator:manage:banned_users") && scope_string(true).contains("whispers:read"));
+        assert!(has_moderation(&["chat:read".to_string(), "moderator:manage:banned_users".to_string()]) && !has_moderation(&["chat:read".to_string()]));
     }
 
     #[tokio::test]
@@ -330,7 +354,7 @@ mod tests {
         ])
         .await;
         let client = http();
-        let ask = || poll(&client, &root, "dev123");
+        let ask = || poll(&client, &root, "dev123", false);
         assert_eq!(ask().await.unwrap(), Poll::Pending);
         assert_eq!(ask().await.unwrap(), Poll::SlowDown);
         assert_eq!(ask().await.unwrap(), Poll::Denied);
@@ -344,7 +368,7 @@ mod tests {
     #[tokio::test]
     async fn the_poll_names_the_grant_and_the_code() {
         let (root, seen) = twitch(vec![(400, r#"{"message":"authorization_pending"}"#)]).await;
-        let _ = poll(&http(), &root, "dev123").await;
+        let _ = poll(&http(), &root, "dev123", false).await;
         let seen = seen.lock().unwrap();
         assert!(seen[0].1.contains("device_code=dev123"), "{}", seen[0].1);
         assert!(seen[0].1.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"), "{}", seen[0].1);
@@ -353,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_nobody_expected_is_an_error_with_twitchs_words() {
         let (root, _) = twitch(vec![(500, r#"{"message":"the sky fell"}"#)]).await;
-        let e = poll(&http(), &root, "d").await.unwrap_err();
+        let e = poll(&http(), &root, "d", false).await.unwrap_err();
         assert!(format!("{e}").contains("the sky fell"), "{e}");
     }
 

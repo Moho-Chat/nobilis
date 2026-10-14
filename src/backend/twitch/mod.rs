@@ -12,7 +12,10 @@
 //! - `auth` - Twitch's sign-in (the device code flow) and what comes of it:
 //!   tokens, renewing them, finding out who they belong to
 //! - `login` - adding an account: the sign-in a person takes part in
+//! - `moderation` - removing messages, timeouts and bans, the room's modes, whispers: slash commands and menus alike
 //! - `irc` - one line of Twitch's chat: tags, prefix, command, parameters
+//! - `emotes` - BetterTTV, FrankerFaceZ and 7TV's emotes, and whether one of Twitch's own is animated
+//! - `badges` - the pictures for the badges beside a name
 //! - `chat` - what the lines mean: messages, cards, removals, a channel's modes
 //! - `gql` - Twitch's own GraphQL, which answers what its official API will not without an account
 //! - `stream` - what is on air in a channel, said as the stream event the window draws
@@ -26,13 +29,16 @@
 //! `backend::twitch::spawn` without knowing which file that is.
 
 pub mod auth;
+pub mod badges;
 pub mod chat;
 pub mod connect;
+pub mod emotes;
 pub mod gql;
 pub mod helix;
 pub mod history;
 pub mod irc;
 pub mod login;
+pub mod moderation;
 pub mod playback;
 pub mod stream;
 
