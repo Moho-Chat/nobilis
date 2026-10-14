@@ -115,13 +115,13 @@ impl Watched {
         if let Some(room) = self.by_chatroom.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
             self.by_chatroom.remove(&room);
             names.push(format!("chatrooms.{room}.v2"));
-            names.push(format!("chatrooms.{room}"));
             names.push(format!("chatroom_{room}"));
         }
         if let Some(channel) = self.by_channel.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
             self.by_channel.remove(&channel);
             names.push(format!("channel.{channel}"));
             names.push(format!("channel_{channel}"));
+            names.push(format!("predictions-channel-{channel}"));
         }
         names
     }

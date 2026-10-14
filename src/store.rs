@@ -187,6 +187,12 @@ impl Store {
             // Whether that reference is a message brought here rather than
             // one answered - see model::ReplyPreview::forwarded.
             "ALTER TABLE messages ADD COLUMN reply_forwarded INTEGER NOT NULL DEFAULT 0",
+            // The message a chain of replies grew from - see
+            // model::ReplyPreview::thread_root.
+            "ALTER TABLE messages ADD COLUMN reply_thread_root TEXT",
+            // A message the service took down and this client kept - see
+            // model::Moderated. JSON, and null for a message nobody removed.
+            "ALTER TABLE messages ADD COLUMN moderated TEXT",
         ] {
             let _ = conn.execute(stmt, []);
         }
@@ -443,8 +449,8 @@ impl Store {
             // OR IGNORE against the (buffer_id, msg_id) index: recording the
             // same message twice is a backend replaying history it already
             // has, and the right answer is to keep the copy already stored.
-            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind, sender_color, badges, reply_is_thread, reply_forwarded)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19, ?20, COALESCE(?21, '[]'), ?22, ?23)",
+            "INSERT OR IGNORE INTO messages (msg_id, buffer_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, buffer_kind, sender_color, badges, reply_is_thread, reply_forwarded, reply_thread_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, COALESCE(?12, '[]'), ?13, ?14, COALESCE(?15, '[]'), ?16, COALESCE(?17, '[]'), ?18, ?19, ?20, COALESCE(?21, '[]'), ?22, ?23, ?24)",
             params![
                 msg_id,
                 buffer_id,
@@ -469,6 +475,7 @@ impl Store {
                 serde_json::to_string(badges).ok(),
                 reply_to.is_some_and(|r| r.thread) as i32,
                 reply_to.is_some_and(|r| r.forwarded) as i32,
+                reply_to.and_then(|r| r.thread_root.as_deref()),
             ],
         )?;
         // Whether this was actually new. The insert has always ignored a
@@ -577,6 +584,15 @@ impl Store {
         tx.execute("DELETE FROM live_cards WHERE buffer_id = ?1", params![buffer_id])?;
         tx.commit()?;
         Ok(bodies)
+    }
+
+    /// Keeps a message the service has removed, marked as removed. Answers
+    /// whether it was here to mark.
+    pub fn mark_moderated(&self, buffer_id: &str, msg_id: &str, why: &crate::model::Moderated) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(why)?;
+        let rows = conn.execute("UPDATE messages SET moderated = ?3 WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id, json])?;
+        Ok(rows > 0)
     }
 
     pub fn delete_message(&self, buffer_id: &str, msg_id: &str) -> Result<bool> {
@@ -748,7 +764,8 @@ impl Store {
             from: row.get::<_, Option<String>>("reply_to_from").ok().flatten().unwrap_or_default(),
             body: row.get::<_, Option<String>>("reply_to_body").ok().flatten().unwrap_or_default(),
             thread: row.get::<_, Option<i64>>("reply_is_thread").ok().flatten().unwrap_or(0) != 0,
-            forwarded: row.get::<_, Option<i64>>("reply_forwarded").ok().flatten().unwrap_or(0) != 0 });
+            forwarded: row.get::<_, Option<i64>>("reply_forwarded").ok().flatten().unwrap_or(0) != 0,
+            thread_root: row.get::<_, Option<String>>("reply_thread_root").ok().flatten() });
         let json_column = |name: &str| -> String {
             row.get::<_, Option<String>>(name).ok().flatten().unwrap_or_else(|| "[]".to_string())
         };
@@ -758,6 +775,7 @@ impl Store {
         drop_missing_local_copies(&mut attachments);
         let badges = serde_json::from_str(&json_column("badges")).unwrap_or_default();
         let components = serde_json::from_str(&json_column("components")).unwrap_or_default();
+        let moderated = row.get::<_, Option<String>>("moderated").ok().flatten().and_then(|json| serde_json::from_str(&json).ok());
         Ok(Message {
             id: row.get::<_, Option<String>>("msg_id")?.unwrap_or_default(),
             buffer_id: buffer_id.to_string(),
@@ -782,6 +800,7 @@ impl Store {
             badges,
             html: row.get("html")?,
             components,
+            moderated,
         })
     }
 
@@ -789,7 +808,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
              WHERE buffer_id = ?1 AND (?2 <= 0 OR ts < ?2)
              ORDER BY ts DESC LIMIT ?3",
@@ -865,7 +884,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 200 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2
              ORDER BY ts ASC LIMIT ?3",
@@ -888,7 +907,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let limit = if limit > 0 { limit } else { 500 };
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
              WHERE buffer_id = ?1 AND ts > ?2 AND ts <= ?3
              ORDER BY ts ASC LIMIT ?4",
@@ -929,7 +948,7 @@ impl Store {
     pub fn messages_around(&self, buffer_id: &str, ts: i64, span: i64) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let span = if span > 0 { span } else { 50 };
-        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components";
+        const COLUMNS: &str = "msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated";
 
         let mut older = conn.prepare(&format!(
             "SELECT {COLUMNS} FROM messages WHERE buffer_id = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT ?3"
@@ -975,7 +994,7 @@ impl Store {
             format!(" OR (buffer_kind IS NULL AND buffer_id IN ({places}))")
         };
         let sql = format!(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, buffer_id
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated, buffer_id
              FROM messages
              WHERE is_highlight = 1 AND is_own = 0 AND (buffer_kind = 'channel'{legacy})
              ORDER BY ts DESC LIMIT ?"
@@ -1236,7 +1255,7 @@ impl Store {
         let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         let pattern = format!("%{escaped}%");
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
              WHERE buffer_id = ?1 AND body LIKE ?2 ESCAPE '\\'
              ORDER BY ts DESC LIMIT ?3",
@@ -1301,9 +1320,9 @@ impl Store {
     pub fn thread_messages(&self, buffer_id: &str, root_id: &str) -> Result<Vec<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
-             WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR msg_id = ?2)
+             WHERE buffer_id = ?1 AND ((reply_to_id = ?2 AND reply_is_thread = 1) OR reply_thread_root = ?2 OR msg_id = ?2)
              ORDER BY ts ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![buffer_id, root_id], |row| Self::row_to_message(buffer_id, row))?;
@@ -1313,7 +1332,7 @@ impl Store {
     pub fn get_message(&self, buffer_id: &str, msg_id: &str) -> Result<Option<Message>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components
+            "SELECT msg_id, from_nick, body, ts, is_action, is_highlight, kind, reply_to_id, reply_to_from, reply_to_body, edited, reactions, is_own, avatar_url, embeds, sender_id, attachments, html, sender_color, badges, reply_is_thread, reply_forwarded, components, reply_thread_root, moderated
              FROM messages
              WHERE buffer_id = ?1 AND msg_id = ?2",
         )?;

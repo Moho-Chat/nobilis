@@ -114,6 +114,10 @@ pub(super) struct ChatMessage {
     /// the cap. Kick's replies are quotable however old the original is.
     #[serde(default)]
     metadata: Option<ReplyMetadata>,
+    /// The message at the top of the chain this one is part of, on a reply.
+    /// Empty or absent on anything that is not one.
+    #[serde(default)]
+    thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +133,12 @@ pub(super) struct OriginalMessage {
     id: String,
     #[serde(default)]
     content: Option<String>,
+    /// Where the original itself sits: empty when it began the chain, and the
+    /// chain's first message when it was a reply. It is how a reply read from
+    /// history, which does not carry the thread on the reply itself, finds its
+    /// thread.
+    #[serde(default)]
+    thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,7 +183,7 @@ pub(super) fn handle_event(
             let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else { return Ok(()) };
             let Some(slug) = watched.chatroom(msg.chatroom_id).cloned() else { return Ok(()) };
             let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
-            let reply_to = reply_preview(msg.metadata.as_ref());
+            let reply_to = reply_preview(msg.metadata.as_ref(), msg.thread_parent_id.as_deref());
             let style = style_of(msg.sender.identity.as_ref());
             // Kick has no viewer list to ask for, so the panel is built from
             // who is talking - which is who somebody wants to reach anyway.
@@ -257,7 +267,10 @@ pub(super) fn handle_event(
                 .or_else(|| payload.get("id"))
                 .and_then(|v| v.as_str());
             if let Some(id) = id {
-                state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &slug), id);
+                // Kept and marked, not removed: what it said is worth reading
+                // beside the fact that it is gone, and how a removed message
+                // is drawn is the window's to decide.
+                state.runtime.moderate_message(state, &crate::model::buffer_id(account_id, &slug), id, &moderation_of(&payload));
             }
         }
 
@@ -437,7 +450,7 @@ pub async fn backfill(
             &msg.content,
             false,
             "chat",
-            reply_preview_from_value(msg.metadata.as_ref()),
+            reply_preview_from_value(msg.metadata.as_ref(), msg.thread_parent_id.as_deref()),
             Some(msg.id.clone()),
             false,
             None,
@@ -456,9 +469,33 @@ pub async fn backfill(
 ///
 /// History carries it in the same shape, so this is the one parser rather than
 /// a second one that could drift.
-pub(super) fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
-    let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
-    reply_preview(Some(&parsed))
+///
+/// An object on the live socket and a string of JSON in history, which is
+/// the same object written down: a reply read back from history lost its quote
+/// because only the first was understood.
+pub(super) fn reply_preview_from_value(metadata: Option<&serde_json::Value>, thread_parent: Option<&str>) -> Option<crate::model::ReplyPreview> {
+    let metadata = metadata?;
+    let parsed: ReplyMetadata = match metadata {
+        serde_json::Value::String(text) => serde_json::from_str(text).ok()?,
+        other => serde_json::from_value(other.clone()).ok()?,
+    };
+    reply_preview(Some(&parsed), thread_parent)
+}
+
+/// Who took a message down and for what, as the event says it.
+///
+/// `aiModerated` and `violatedRules` are on the payload of the event for a
+/// message Kick's automatic moderation removed; a person's removal has
+/// neither, which reads as not automatic with nothing to say about rules.
+pub(super) fn moderation_of(payload: &serde_json::Value) -> crate::model::Moderated {
+    crate::model::Moderated {
+        ai: payload.get("aiModerated").and_then(|v| v.as_bool()).unwrap_or(false),
+        rules: payload
+            .get("violatedRules")
+            .and_then(|v| v.as_array())
+            .map(|rules| rules.iter().filter_map(|r| r.as_str()).map(str::to_string).collect())
+            .unwrap_or_default(),
+    }
 }
 
 /// The one badge worth marking somebody with in a list.
@@ -500,15 +537,24 @@ pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::Se
 /// no author and no text is drawn as an empty quote above the message, which
 /// reads as something failing to load rather than as a reply. Better to show
 /// the message plainly than to show a hole above it.
-pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::ReplyPreview> {
+///
+/// `thread_parent` is what the message itself says its chain began with. When
+/// it says nothing - a reply out of history - the original's own place in its
+/// chain gives the same answer, and an original that began one is the root.
+pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>, thread_parent: Option<&str>) -> Option<crate::model::ReplyPreview> {
     let metadata = metadata?;
     let original = metadata.original_message.as_ref()?;
     let from = metadata.original_sender.as_ref()?.username.clone()?;
+    let filled = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(str::to_string);
+    let thread_root = filled(thread_parent).or_else(|| filled(original.thread_parent_id.as_deref())).unwrap_or_else(|| original.id.clone());
     Some(crate::model::ReplyPreview {
         id: original.id.clone(),
         from,
         body: original.content.clone().unwrap_or_default(),
-        thread: false, forwarded: false })
+        thread: false,
+        forwarded: false,
+        thread_root: Some(thread_root),
+    })
 }
 
 /// One line for something somebody did in a channel, or None if this event is
@@ -946,7 +992,7 @@ mod tests {
             "original_message": { "id": "ddeccb11-29bc-4cf1-ab2a-9b409293de76", "content": "L0L0WERFLGEWRUGHBER" }
         }))
         .unwrap();
-        let preview = reply_preview(Some(&metadata)).unwrap();
+        let preview = reply_preview(Some(&metadata), None).unwrap();
         assert_eq!(preview.from, "Greg");
         assert_eq!(preview.id, "ddeccb11-29bc-4cf1-ab2a-9b409293de76");
         assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
@@ -978,7 +1024,7 @@ mod tests {
         let msg: ChatMessage = serde_json::from_str(raw).expect("a real reply frame must parse");
         assert_eq!(msg.chatroom_id, 2393554);
         assert_eq!(msg.sender.username.as_deref(), Some("L3galizeWee"));
-        let preview = reply_preview(msg.metadata.as_ref()).expect("and carry what it answered");
+        let preview = reply_preview(msg.metadata.as_ref(), None).expect("and carry what it answered");
         assert_eq!(preview.from, "Greg");
         assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
     }
@@ -990,12 +1036,12 @@ mod tests {
         let raw = r#"{ "id": "x", "chatroom_id": 1, "content": "hi", "type": "message",
           "sender": { "id": 2, "username": "someone" }, "metadata": { "message_ref": "1788305786864" } }"#;
         let msg: ChatMessage = serde_json::from_str(raw).unwrap();
-        assert!(reply_preview(msg.metadata.as_ref()).is_none());
+        assert!(reply_preview(msg.metadata.as_ref(), None).is_none());
     }
 
     #[test]
     fn an_ordinary_message_is_not_a_reply() {
-        assert!(reply_preview(None).is_none());
+        assert!(reply_preview(None, None).is_none());
     }
 
     #[test]
@@ -1004,10 +1050,10 @@ mod tests {
         // which is worse than showing the message plainly.
         let no_sender: ReplyMetadata =
             serde_json::from_value(serde_json::json!({ "original_message": { "id": "x", "content": "y" } })).unwrap();
-        assert!(reply_preview(Some(&no_sender)).is_none());
+        assert!(reply_preview(Some(&no_sender), None).is_none());
         let no_message: ReplyMetadata =
             serde_json::from_value(serde_json::json!({ "original_sender": { "username": "Greg" } })).unwrap();
-        assert!(reply_preview(Some(&no_message)).is_none());
+        assert!(reply_preview(Some(&no_message), None).is_none());
     }
 
     #[test]
@@ -1256,8 +1302,12 @@ mod tests {
         assert_eq!(testkit::lines(&state, "odablock"), vec!["went live", "ended the stream"]);
     }
 
+    fn backlog(state: &AppState) -> Vec<crate::model::Message> {
+        state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).expect("backlog")
+    }
+
     #[test]
-    fn a_message_taken_down_leaves_the_log() {
+    fn a_message_taken_down_stays_in_the_log_marked() {
         let state = testkit::simulated_daemon("deleted");
         let mut watched = testkit::watching_odablock();
         spoken(&state, &mut watched, "keep", "stays");
@@ -1266,7 +1316,94 @@ mod tests {
         // Kick nests the id under `message` on one event and sends it flat on another.
         feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "message": { "id": "nested" } }));
         feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "id": "flat" }));
-        assert_eq!(testkit::lines(&state, "odablock"), vec!["stays"]);
+        let log = backlog(&state);
+        // Nothing left, and the words of the ones taken down are still there to read.
+        assert_eq!(log.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["stays", "goes", "goes too"]);
+        assert_eq!(log.iter().map(|m| m.moderated.is_some()).collect::<Vec<_>>(), vec![false, true, true]);
+    }
+
+    #[test]
+    fn what_the_automatic_moderator_said_is_kept_with_the_message() {
+        let state = testkit::simulated_daemon("moderated");
+        let mut watched = testkit::watching_odablock();
+        spoken(&state, &mut watched, "bad", "something vile");
+        // As measured on a live channel: the event has its own id, and the message's is nested.
+        feed(
+            &state,
+            &mut watched,
+            "App\\Events\\MessageDeletedEvent",
+            serde_json::json!({ "id": "event-id", "message": { "id": "bad" }, "aiModerated": true, "violatedRules": ["hate"] }),
+        );
+        let log = backlog(&state);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].moderated, Some(crate::model::Moderated { ai: true, rules: vec!["hate".into()] }));
+    }
+
+    #[test]
+    fn a_person_removing_a_message_is_not_the_automatic_moderator() {
+        let why = moderation_of(&serde_json::json!({ "message": { "id": "x" } }));
+        assert_eq!(why, crate::model::Moderated { ai: false, rules: vec![] });
+    }
+
+    #[test]
+    fn a_reply_names_the_thread_it_belongs_to() {
+        // The top-level field when there is one: this is a reply to a reply, so what it quotes and
+        // the thread it is in are different messages.
+        let metadata: ReplyMetadata = serde_json::from_value(serde_json::json!({
+            "original_sender": { "id": 1, "username": "Greg" },
+            "original_message": { "id": "middle", "content": "hello" }
+        }))
+        .unwrap();
+        let preview = reply_preview(Some(&metadata), Some("top")).unwrap();
+        assert_eq!((preview.id.as_str(), preview.thread_root.as_deref()), ("middle", Some("top")));
+        // Without it, a reply to a message that began nothing starts the thread itself.
+        let preview = reply_preview(Some(&metadata), Some("")).unwrap();
+        assert_eq!(preview.thread_root.as_deref(), Some("middle"));
+    }
+
+    #[test]
+    fn a_reply_out_of_history_finds_its_thread_in_what_it_quoted() {
+        // History writes the metadata down as a string and leaves the thread off the reply; the
+        // quoted message knows its own.
+        let written = serde_json::Value::String(
+            serde_json::json!({
+                "original_sender": { "id": 1, "username": "Greg" },
+                "original_message": { "id": "middle", "content": "hello", "thread_parent_id": "top" }
+            })
+            .to_string(),
+        );
+        let preview = reply_preview_from_value(Some(&written), None).expect("a string of JSON is the same metadata");
+        assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.thread_root.as_deref()), ("middle", "Greg", Some("top")));
+    }
+
+    #[test]
+    fn replies_are_stored_with_their_thread_and_read_back_whole() {
+        let state = testkit::simulated_daemon("threads");
+        let mut watched = testkit::watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": "top", "chatroom_id": 2393554, "content": "the question", "created_at": "2026-10-14T00:59:00+00:00",
+            "sender": { "id": 9, "username": "bob", "identity": null }
+        }));
+        for (id, to, root) in [("r1", "top", "top"), ("r2", "r1", "top"), ("elsewhere", "x", "x")] {
+            feed(
+                &state,
+                &mut watched,
+                "App\\Events\\ChatMessageEvent",
+                serde_json::json!({
+                    "id": id, "chatroom_id": 2393554, "content": id, "type": "reply",
+                    "created_at": "2026-10-14T01:00:00+00:00",
+                    "sender": { "id": 7, "username": "someone" },
+                    "thread_parent_id": root,
+                    "metadata": { "original_sender": { "id": 1, "username": "Greg" }, "original_message": { "id": to, "content": "quoted" } }
+                }),
+            );
+        }
+        let buffer = crate::model::buffer_id("kick:tester", "odablock");
+        let thread = state.store.thread_messages(&buffer, "top").unwrap();
+        assert_eq!(thread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["top", "r1", "r2"]);
+        let r2 = thread.iter().find(|m| m.id == "r2").unwrap().reply_to.clone().unwrap();
+        // It still quotes what it answered, and says which thread that is part of.
+        assert_eq!((r2.id.as_str(), r2.thread, r2.thread_root.as_deref()), ("r1", false, Some("top")));
     }
 
     #[test]
@@ -1356,14 +1493,14 @@ mod tests {
             "original_sender": { "id": 1, "username": "Greg" },
             "original_message": { "id": "abc", "content": "hello" }
         });
-        let preview = reply_preview_from_value(Some(&whole)).unwrap();
+        let preview = reply_preview_from_value(Some(&whole), None).unwrap();
         assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.body.as_str()), ("abc", "Greg", "hello"));
         // Half of one is a hole above the message, and is left out.
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } }))).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } }))).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } }))).is_none());
-        assert!(reply_preview_from_value(None).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata"))).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } })), None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } })), None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } })), None).is_none());
+        assert!(reply_preview_from_value(None, None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata")), None).is_none());
     }
 
     #[test]

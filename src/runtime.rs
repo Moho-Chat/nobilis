@@ -4608,6 +4608,7 @@ impl Runtime {
             // Filled in by the backend that has them, immediately after this
             // returns - only Discord has any, and it is the one that knows.
             components: Vec::new(),
+            moderated: None,
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),
@@ -4757,6 +4758,17 @@ impl Runtime {
 
     /// Discord's MESSAGE_DELETE - removes the row and tells clients to
     /// drop it from view, same as Discord's own clients (no tombstone).
+    /// A message the service took down, kept and marked as taken down. Quiet
+    /// about one that is not stored: a removal of something older than this
+    /// client's scrollback is not news here.
+    pub fn moderate_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, why: &model::Moderated) {
+        match state.store.mark_moderated(buffer_id, msg_id, why) {
+            Ok(true) => state.events.emit("messageModerated", json!({ "bufferId": buffer_id, "id": msg_id, "moderated": why })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to mark a message as removed: {e}"),
+        }
+    }
+
     pub fn delete_message(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
         match state.store.delete_message(buffer_id, msg_id) {
             Ok(true) => state.events.emit("messageDeleted", json!({ "bufferId": buffer_id, "id": msg_id })),

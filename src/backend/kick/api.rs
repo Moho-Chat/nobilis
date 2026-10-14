@@ -902,8 +902,13 @@ pub struct HistoryMessage {
     #[serde(default)]
     pub created_at: Option<String>,
     pub sender: HistorySender,
+    /// A string of JSON here, not the object the live socket sends.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Where a reply's chain began. This endpoint has never sent it; the
+    /// other history one does, and so does the socket.
+    #[serde(default)]
+    pub thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
