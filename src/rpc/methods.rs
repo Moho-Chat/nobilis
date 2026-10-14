@@ -5126,6 +5126,34 @@ pub async fn dispatch(
             }
         }
 
+        // What a Twitch channel trades its points for, and spending them on one: the panel over the chat lists
+        // them and a button redeems (see backend/twitch/points.rs).
+        "listTwitchRewards" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listTwitchRewards requires \"bufferId\"".to_string()));
+            };
+            match backend::twitch::points::rewards_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await {
+                Ok((rewards, points)) => {
+                    let list: Vec<serde_json::Value> = rewards
+                        .into_iter()
+                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image }))
+                        .collect();
+                    (Some(serde_json::json!({ "rewards": list, "points": points.balance, "name": points.name })), None)
+                }
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "redeemTwitchReward" => {
+            let (Some(buffer_id), Some(reward_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rewardId")) else {
+                return (None, Some("redeemTwitchReward requires \"bufferId\" and \"rewardId\"".to_string()));
+            };
+            match backend::twitch::points::redeem_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, reward_id, p_str_opt(params, "input")).await {
+                Ok(p) => (Some(serde_json::json!({ "points": p.balance })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "kickPoints" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("kickPoints requires \"bufferId\"".to_string()));

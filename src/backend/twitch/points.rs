@@ -34,6 +34,51 @@ pub fn read_points(answer: &Value) -> Option<Points> {
     })
 }
 
+/// One thing a channel trades its points for.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Reward {
+    pub id: String,
+    pub title: String,
+    pub cost: u64,
+    pub prompt: Option<String>,
+    /// Whether it can be had right now: switched on, in stock and not paused.
+    pub enabled: bool,
+    pub paused: bool,
+    /// It asks the person to type something.
+    pub needs_input: bool,
+    pub color: Option<String>,
+    pub image: Option<String>,
+}
+
+const REWARDS: &str = "query($login:String!){ user(login:$login){ channel{ id self{ communityPoints{ balance } } communityPointsSettings{ name customRewards{ id title cost prompt isEnabled isPaused isInStock isUserInputRequired backgroundColor image{ url } defaultImage{ url } } } } } }";
+
+/// A channel's rewards, its number, and this account's balance, from one answer.
+pub fn read_rewards(answer: &Value) -> Option<(String, Vec<Reward>, Points)> {
+    let channel = answer.pointer("/data/user/channel").filter(|c| !c.is_null())?;
+    let rewards = channel
+        .pointer("/communityPointsSettings/customRewards")
+        .and_then(|r| r.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|r| {
+                    Some(Reward {
+                        id: r.get("id")?.as_str()?.to_string(),
+                        title: r.get("title")?.as_str()?.to_string(),
+                        cost: r.get("cost")?.as_u64()?,
+                        prompt: r.get("prompt").and_then(|p| p.as_str()).filter(|p| !p.is_empty()).map(str::to_string),
+                        enabled: r.get("isEnabled").and_then(|b| b.as_bool()).unwrap_or(false) && r.get("isInStock").and_then(|b| b.as_bool()).unwrap_or(true) && !r.get("isPaused").and_then(|b| b.as_bool()).unwrap_or(false),
+                        paused: r.get("isPaused").and_then(|b| b.as_bool()).unwrap_or(false),
+                        needs_input: r.get("isUserInputRequired").and_then(|b| b.as_bool()).unwrap_or(false),
+                        color: r.get("backgroundColor").and_then(|c| c.as_str()).map(str::to_string),
+                        image: r.pointer("/image/url").or_else(|| r.pointer("/defaultImage/url")).and_then(|u| u.as_str()).map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((channel.get("id")?.as_str()?.to_string(), rewards, read_points(answer)?))
+}
+
 fn explain(e: PlaybackError) -> String {
     match e {
         PlaybackError::NeedsIntegrity => "Twitch wants proof this is a browser and moho could not make it. Try again in a moment".to_string(),
@@ -69,6 +114,10 @@ fn refusal(answer: &Value, field: &str) -> Option<String> {
         "ALREADY_VOTED" | "ALREADY_PREDICTED" => "You have already answered that".to_string(),
         "CANNOT_PREDICT_ON_BOTH_OUTCOMES" | "OTHER_OUTCOME_ALREADY_PREDICTED" => "You already put points on the other outcome".to_string(),
         "EVENT_NOT_ACTIVE" | "POLL_NOT_ACTIVE" | "PREDICTION_LOCKED" => "That is closed".to_string(),
+        "GLOBAL_COOLDOWN" | "COOLDOWN" => "That reward is cooling down".to_string(),
+        "MAX_PER_STREAM" | "MAX_PER_USER_PER_STREAM" | "MAX_REDEMPTIONS" => "That reward has been had as many times as this stream allows".to_string(),
+        "REWARD_DISABLED" | "REWARD_NOT_ENABLED" | "REWARD_PAUSED" | "REWARD_OUT_OF_STOCK" => "That reward is not available right now".to_string(),
+        "CHANNEL_NOT_LIVE" | "STREAM_NOT_LIVE" => "That reward can be had while the channel is live".to_string(),
         "NOT_FOUND" | "POLL_NOT_FOUND" | "EVENT_NOT_FOUND" | "CLAIM_NOT_FOUND" => "That is no longer there".to_string(),
         "MAX_POINTS_EXCEEDED" => "That is more than the channel allows on one prediction".to_string(),
         other => format!("Twitch refused: {}", other.to_lowercase().replace('_', " ")),
@@ -105,6 +154,28 @@ pub async fn vote(state: &AppState, http: &reqwest::Client, root: &str, poll_id:
     let body = gql::query(VOTE, json!({ "i": { "pollID": poll_id, "choiceID": choice_id, "userID": user_id, "voteID": fresh_id() } }));
     let answer = playback::call_as_session(state, http, root, &body, token).await.map_err(explain)?;
     refusal(&answer, "voteInPoll").map_or(Ok(()), Err)
+}
+
+/// A channel's rewards and this account's balance: the panel over the chat lists them.
+pub async fn rewards(state: &AppState, http: &reqwest::Client, root: &str, login: &str, web_token: Option<&str>) -> Result<(String, Vec<Reward>, Points), String> {
+    let token = token(web_token)?;
+    let answer = playback::call_as_session(state, http, root, &gql::query(REWARDS, json!({ "login": login })), token).await.map_err(explain)?;
+    if let Some(said) = gql::error_of(&answer) {
+        return Err(said);
+    }
+    read_rewards(&answer).ok_or_else(|| format!("Twitch has no channel points for {login}"))
+}
+
+/// Spends points on a reward. `input` is what a reward that asks for something was given.
+pub async fn redeem(state: &AppState, http: &reqwest::Client, root: &str, channel_id: &str, reward: &Reward, input: Option<&str>, web_token: Option<&str>) -> Result<(), String> {
+    let token = token(web_token)?;
+    const REDEEM: &str = "mutation($i:RedeemCommunityPointsCustomRewardInput!){ redeemCommunityPointsCustomReward(input:$i){ error{ code } } }";
+    let mut i = json!({ "channelID": channel_id, "cost": reward.cost, "prompt": reward.prompt, "rewardID": reward.id, "title": reward.title, "transactionID": fresh_id() });
+    if let Some(text) = input.map(str::trim).filter(|t| !t.is_empty()) {
+        i["textInput"] = json!(text);
+    }
+    let answer = playback::call_as_session(state, http, root, &gql::query(REDEEM, json!({ "i": i })), token).await.map_err(explain)?;
+    refusal(&answer, "redeemCommunityPointsCustomReward").map_or(Ok(()), Err)
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +239,37 @@ pub async fn points_in_buffer(state: &AppState, root: &str, buffer_id: &str) -> 
     let points = context(state, &http, root, &channel, Some(&cfg.web_token)).await?;
     state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": points.balance, "name": points.name }));
     Ok(points)
+}
+
+/// The rewards of a conversation's channel, and the balance, for the panel; the balance is also said to the window.
+pub async fn rewards_in_buffer(state: &AppState, root: &str, buffer_id: &str) -> Result<(Vec<Reward>, Points), String> {
+    let (cfg, channel) = session_of(state, buffer_id)?;
+    let http = super::client().map_err(|e| format!("{e:#}"))?;
+    let (_, rewards, points) = rewards(state, &http, root, &channel, Some(&cfg.web_token)).await?;
+    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": points.balance, "name": points.name }));
+    Ok((rewards, points))
+}
+
+/// Redeems a reward of a conversation's channel by its id, after checking it is there, is on offer, and is affordable,
+/// and answers the balance after.
+pub async fn redeem_in_buffer(state: &AppState, root: &str, buffer_id: &str, reward_id: &str, input: Option<&str>) -> Result<Points, String> {
+    let (cfg, channel) = session_of(state, buffer_id)?;
+    let http = super::client().map_err(|e| format!("{e:#}"))?;
+    let (channel_id, rewards, points) = rewards(state, &http, root, &channel, Some(&cfg.web_token)).await?;
+    let reward = rewards.into_iter().find(|r| r.id == reward_id).ok_or_else(|| "That reward is no longer there".to_string())?;
+    if !reward.enabled {
+        return Err(if reward.paused { "That reward is paused right now".to_string() } else { "That reward is not available right now".to_string() });
+    }
+    if reward.needs_input && input.map(str::trim).unwrap_or("").is_empty() {
+        return Err("That reward asks you to type something".to_string());
+    }
+    if let Some(balance) = points.balance {
+        if balance < reward.cost {
+            return Err(format!("You have {balance} of the {} points that costs", reward.cost));
+        }
+    }
+    redeem(state, &http, root, &channel_id, &reward, input, Some(&cfg.web_token)).await?;
+    points_in_buffer(state, root, buffer_id).await
 }
 
 #[cfg(test)]
@@ -323,7 +425,63 @@ mod tests {
             println!("a bet of {amount} on a real prediction: {:?}", bet(&state, &http, root, &event, &outcome, amount, Some(&token)).await);
         }
         println!("balance: {:?}", context(&state, &http, root, &channel, Some(&token)).await);
+        // The channel's rewards, and a redeem of one that does not exist (nothing is spent).
+        match rewards(&state, &http, root, &channel, Some(&token)).await {
+            Ok((channel_id, list, points)) => {
+                println!("rewards: {} offered, balance {:?}; first: {:?}", list.len(), points.balance, list.first().map(|r| (&r.title, r.cost, r.enabled)));
+                let fake = Reward { id: "00000000-0000-0000-0000-000000000000".into(), title: "nothing".into(), cost: 10, prompt: None, enabled: true, paused: false, needs_input: false, color: None, image: None };
+                println!("redeem a reward that is not there: {:?}", redeem(&state, &http, root, &channel_id, &fake, None, Some(&token)).await);
+            }
+            Err(e) => println!("rewards: {e}"),
+        }
         println!("vote in a poll that is not there: {:?}", vote(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", &user, Some(&token)).await);
         println!("bet on a prediction that is not there: {:?}", bet(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", 10, Some(&token)).await);
+    }
+
+    const REWARDS_ANSWER: &str = r##"{"data":{"user":{"channel":{"id":"71","self":{"communityPoints":{"balance":600}},"communityPointsSettings":{"name":"Sloths","customRewards":[
+        {"id":"r1","title":"Drink water","cost":500,"prompt":null,"isEnabled":true,"isPaused":false,"isInStock":true,"isUserInputRequired":false,"backgroundColor":"#6BB7FA","image":null,"defaultImage":{"url":"https://img/default.png"}},
+        {"id":"r2","title":"Say a name","cost":100,"prompt":"Who?","isEnabled":true,"isPaused":false,"isInStock":true,"isUserInputRequired":true,"backgroundColor":"#E37C10","image":{"url":"https://img/own.png"},"defaultImage":null},
+        {"id":"r3","title":"Dance","cost":50,"prompt":null,"isEnabled":true,"isPaused":true,"isInStock":true,"isUserInputRequired":false,"backgroundColor":null,"image":null,"defaultImage":null},
+        {"id":"r4","title":"Costly","cost":9000,"prompt":null,"isEnabled":true,"isPaused":false,"isInStock":true,"isUserInputRequired":false,"backgroundColor":null,"image":null,"defaultImage":null}]}}}}}"##;
+
+    #[test]
+    fn a_channels_rewards_are_read_with_what_makes_each_available() {
+        let (channel, rewards, points) = read_rewards(&serde_json::from_str(REWARDS_ANSWER).unwrap()).unwrap();
+        assert_eq!((channel.as_str(), points.balance, points.name.as_deref()), ("71", Some(600), Some("Sloths")));
+        let ids: Vec<(&str, u64, bool, bool, bool)> = rewards.iter().map(|r| (r.id.as_str(), r.cost, r.enabled, r.paused, r.needs_input)).collect();
+        assert_eq!(ids, vec![("r1", 500, true, false, false), ("r2", 100, true, false, true), ("r3", 50, false, true, false), ("r4", 9000, true, false, false)]);
+        assert_eq!(rewards[0].image.as_deref(), Some("https://img/default.png"));
+        assert_eq!(rewards[1].image.as_deref(), Some("https://img/own.png"));
+        assert_eq!(rewards[1].prompt.as_deref(), Some("Who?"));
+    }
+
+    #[tokio::test]
+    async fn a_reward_is_redeemed_with_what_twitch_needs_and_a_refusal_is_stopped_before_it_is_sent() {
+        let (state, buffer) = channel("twitch-points-redeem", "websession");
+        let asked = Arc::new(Mutex::new(0));
+        let counter = asked.clone();
+        let (root, seen) = fake_gql(move |req| {
+            if req.contains("redeemCommunityPointsCustomReward") {
+                return r#"{"data":{"redeemCommunityPointsCustomReward":{"error":null}}}"#.to_string();
+            }
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            if *n <= 4 { REWARDS_ANSWER.to_string() } else { REWARDS_ANSWER.replace("\"balance\":600", "\"balance\":500") }
+        })
+        .await;
+        // Paused, too dear, asks for a word and was not given one, and not there: each said, none sent.
+        assert_eq!(redeem_in_buffer(&state, &root, &buffer, "r3", None).await.unwrap_err(), "That reward is paused right now");
+        assert_eq!(redeem_in_buffer(&state, &root, &buffer, "r4", None).await.unwrap_err(), "You have 600 of the 9000 points that costs");
+        assert_eq!(redeem_in_buffer(&state, &root, &buffer, "r2", Some("  ")).await.unwrap_err(), "That reward asks you to type something");
+        assert_eq!(redeem_in_buffer(&state, &root, &buffer, "nope", None).await.unwrap_err(), "That reward is no longer there");
+        assert!(!seen.lock().unwrap().iter().any(|r| r.contains("redeemCommunityPointsCustomReward")), "nothing was spent");
+        // One that is on offer, with what it asks for.
+        let after = redeem_in_buffer(&state, &root, &buffer, "r2", Some("Greg")).await.unwrap();
+        assert_eq!(after.balance, Some(500));
+        let request = seen.lock().unwrap().iter().find(|r| r.contains("redeemCommunityPointsCustomReward")).cloned().unwrap();
+        for part in ["\"channelID\":\"71\"", "\"rewardID\":\"r2\"", "\"cost\":100", "\"title\":\"Say a name\"", "\"prompt\":\"Who?\"", "\"textInput\":\"Greg\"", "transactionID"] {
+            assert!(request.contains(part), "{part} in {request}");
+        }
+        assert!(request.to_lowercase().contains("authorization: oauth websession"));
     }
 }
