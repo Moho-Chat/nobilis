@@ -539,7 +539,11 @@ pub async fn dispatch(
                 // until the next incremental change (see Runtime::
                 // set_presence's doc comment).
                 if let Some(members) = state.runtime.get_presence(buffer_id) {
-                    state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": members }));
+                    let mut change = serde_json::json!({ "bufferId": buffer_id, "members": members });
+                    if let Some(total) = state.runtime.get_presence_total(buffer_id) {
+                        change["total"] = serde_json::json!(total);
+                    }
+                    state.events.emit("presenceChange", change);
                 }
                 // Read markers are replayed for the same reason: they arrive
                 // on sync and are not repeated once they stop moving, so a

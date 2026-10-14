@@ -449,6 +449,13 @@ pub struct Runtime {
     /// snapshot here lets subscribe() replay it immediately - see
     /// rpc/methods.rs's subscribe handler.
     presence: Mutex<HashMap<String, serde_json::Value>>,
+    /// How many people a roster stands for, where that is more than it lists.
+    ///
+    /// Kick's roster is the most recent speakers and is cut off to something
+    /// a window can draw, while the count of everybody who has spoken keeps
+    /// going. Beside the snapshot above so that a window opened later is told
+    /// it as well.
+    presence_total: Mutex<HashMap<String, usize>>,
     /// Generic (protocol-agnostic) "what's my own display name on this
     /// account" - record_message's highlight check needs this for every
     /// backend, not just IRC (which already tracked it per-connection via
@@ -1065,6 +1072,7 @@ impl Runtime {
             discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
+            presence_total: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
             discord_channels: Mutex::new(HashMap::new()),
             discord_gateway_sessions: Mutex::new(HashMap::new()),
@@ -2018,6 +2026,14 @@ impl Runtime {
 
     pub fn set_presence(&self, buffer_id: &str, members: serde_json::Value) {
         self.presence.lock().unwrap().insert(buffer_id.to_string(), members);
+    }
+
+    pub fn set_presence_total(&self, buffer_id: &str, total: usize) {
+        self.presence_total.lock().unwrap().insert(buffer_id.to_string(), total);
+    }
+
+    pub fn get_presence_total(&self, buffer_id: &str) -> Option<usize> {
+        self.presence_total.lock().unwrap().get(buffer_id).copied()
     }
 
     pub fn get_presence(&self, buffer_id: &str) -> Option<serde_json::Value> {
@@ -5513,7 +5529,7 @@ impl Runtime {
             restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,
             discord_own_roles, discord_guild_roles, discord_guild_owners,
-            discord_member_windows, presence, own_identity,
+            discord_member_windows, presence, presence_total, own_identity,
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,

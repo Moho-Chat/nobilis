@@ -79,6 +79,8 @@ pub(super) struct Watched {
     /// wants the panel for: to mention them, whisper them, or see who the
     /// moderators are.
     pub(super) speakers: HashMap<String, Vec<Speaker>>,
+    /// Every name that has spoken in each channel, for counting.
+    pub(super) chatters: HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// Somebody who has said something, and how they looked saying it.
@@ -91,12 +93,15 @@ pub(super) struct Speaker {
     pub(super) badge: Option<String>,
 }
 
-/// How many to remember per channel.
+/// How many to list per channel.
 ///
-/// A busy stream produces hundreds of distinct names an hour, and a list
-/// nobody can scan is no better than an empty one. This is the last two
-/// hundred to have spoken, which is the window somebody is actually reading.
-pub(super) const SPEAKERS_REMEMBERED: usize = 200;
+/// A busy stream produces thousands of distinct names an hour, and the list is
+/// sent whole every time a new one joins it and drawn row by row - a few
+/// hundred is what that stays cheap for. It is the most recent to have
+/// spoken, which is the window somebody is actually reading. How many people
+/// have spoken is counted apart from it (`Watched::chatters`) and is not cut
+/// off.
+pub(super) const SPEAKERS_REMEMBERED: usize = 500;
 
 #[derive(Deserialize)]
 pub(super) struct ChatMessage {
@@ -198,8 +203,10 @@ pub(super) fn handle_event(
             ) {
                 let buffer_id = crate::model::buffer_id(account_id, &slug);
                 let roster = serde_json::json!(watched.roster(&slug));
+                let total = watched.chatters(&slug);
                 state.runtime.set_presence(&buffer_id, roster.clone());
-                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster }));
+                state.runtime.set_presence_total(&buffer_id, total);
+                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster, "total": total }));
             }
             state.runtime.record_message_at(
                 state,
@@ -954,6 +961,11 @@ mod tests {
             w.heard("chan", Speaker { nick: format!("nick{i}"), user_id: None, badge: None });
         }
         assert_eq!(w.roster("chan").len(), SPEAKERS_REMEMBERED);
+        // The count is of everybody, not of those listed.
+        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
+        // And somebody who spoke long ago and speaks again is not counted twice.
+        w.heard("chan", Speaker { nick: "nick0".into(), user_id: None, badge: None });
+        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
         // The most recent survive; a list nobody can scan is no better than
         // an empty one, and the newest names are the ones being read.
         assert_eq!(w.roster("chan")[0]["nick"], format!("nick{}", SPEAKERS_REMEMBERED + 49));

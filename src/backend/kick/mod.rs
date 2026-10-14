@@ -68,6 +68,9 @@ impl Watched {
     /// nearly identical. Their badges changing is - somebody subscribes, or
     /// is given moderator, and the list should follow.
     fn heard(&mut self, slug: &str, speaker: Speaker) -> bool {
+        // Everybody who has spoken, kept for the count alone: the list below is
+        // cut off, and what it is cut off at is not how many people have talked.
+        self.chatters.entry(slug.to_string()).or_default().insert(speaker.nick.clone());
         let list = self.speakers.entry(slug.to_string()).or_default();
         if let Some(existing) = list.iter_mut().find(|s| s.nick == speaker.nick) {
             let changed = existing.badge != speaker.badge;
@@ -77,6 +80,11 @@ impl Watched {
         list.insert(0, speaker);
         list.truncate(SPEAKERS_REMEMBERED);
         true
+    }
+
+    /// How many different people have spoken in this channel since it was opened.
+    fn chatters(&self, slug: &str) -> usize {
+        self.chatters.get(slug).map_or(0, |set| set.len())
     }
 
     fn roster(&self, slug: &str) -> Vec<serde_json::Value> {
@@ -111,6 +119,7 @@ impl Watched {
     /// events for a conversation that has been closed.
     fn remove(&mut self, slug: &str) -> Vec<String> {
         self.speakers.remove(slug);
+        self.chatters.remove(slug);
         let mut names = Vec::new();
         if let Some(room) = self.by_chatroom.iter().find(|(_, s)| *s == slug).map(|(i, _)| *i) {
             self.by_chatroom.remove(&room);
