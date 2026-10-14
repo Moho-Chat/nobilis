@@ -30,8 +30,26 @@ fn waiting() -> &'static Mutex<HashMap<String, Arc<Notify>>> {
     WAITING.get_or_init(Default::default)
 }
 
+/// The twitch.tv session some sign-ins bring with them, by sign-in: the window that signs a person in to twitch.tv
+/// and then has them approve the code is one action, and the session it saw on the way is for the account the
+/// code becomes. Kept only for as long as the sign-in lasts.
+fn web_tokens() -> &'static Mutex<HashMap<String, String>> {
+    static TOKENS: std::sync::OnceLock<Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+/// Hands a sign-in the person's twitch.tv session, to be saved with the account it makes.
+pub fn set_web_token(login_id: &str, token: &str) -> bool {
+    if token.trim().is_empty() || !waiting().lock().unwrap().contains_key(login_id) {
+        return false;
+    }
+    web_tokens().lock().unwrap().insert(login_id.to_string(), token.trim().to_string());
+    true
+}
+
 /// Ends a sign-in that is waiting, because the form was closed.
 pub fn cancel(login_id: &str) {
+    web_tokens().lock().unwrap().remove(login_id);
     if let Some(stop) = waiting().lock().unwrap().remove(login_id) {
         stop.notify_one();
     }
@@ -50,6 +68,7 @@ pub fn start_at(state: AppState, login_id: String, root: String, connect: bool, 
     tokio::spawn(async move {
         let outcome = flow(&state, &login_id, &root, stop, moderation).await;
         waiting().lock().unwrap().remove(&login_id);
+        web_tokens().lock().unwrap().remove(&login_id);
         match outcome {
             Ok(Some(saved)) => {
                 if connect {
@@ -135,6 +154,11 @@ pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify
         // account's strict routing across a sign-in.
         strict_route: false,
     })?;
+    // The twitch.tv session the window signed in to on the way, if it did: video plays as the person from the start.
+    if let Some(token) = web_tokens().lock().unwrap().remove(login_id) {
+        state.accounts.mutate_twitch(&saved.account_id(), |a| a.web_token = token.clone())?;
+        return Ok(state.accounts.get_twitch(&saved.account_id()));
+    }
     Ok(Some(saved))
 }
 
@@ -233,5 +257,21 @@ mod tests {
         let result = next_event(&mut events, "twitchLoginResult").await;
         assert_eq!(result["success"], false);
         assert!(result["error"].as_str().unwrap().to_lowercase().contains("twitch"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_twitch_session_handed_over_while_waiting_is_saved_with_the_account_the_code_becomes() {
+        let state = testkit::simulated_daemon("twitch-login-web");
+        let mut events = state.events.subscribe();
+        let root = twitch(1).await;
+        start_at(state.clone(), "login-4".into(), root, false, false);
+        next_event(&mut events, "twitchLoginCode").await;
+        assert!(set_web_token("login-4", "  web-session  "));
+        assert!(!set_web_token("nobody", "x"), "a sign-in that is not waiting takes nothing");
+        let result = next_event(&mut events, "twitchLoginResult").await;
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["account"]["webSession"], true);
+        assert_eq!(state.accounts.get_twitch("twitch:someone").unwrap().web_token, "web-session");
+        assert!(web_tokens().lock().unwrap().get("login-4").is_none(), "nothing is left lying about");
     }
 }

@@ -4286,6 +4286,19 @@ pub async fn dispatch(
         // the person who signed in (their Turbo, their subscriptions). Sent
         // here by the window's sign-in page and by nothing else; an empty one
         // forgets it.
+        // The twitch.tv session the sign-in window saw while the person signed in there, handed to the sign-in
+        // that is waiting for them to approve its code, so one action gives the account both.
+        "setTwitchLoginWebToken" => {
+            let (Some(login_id), Some(token)) = (p_str_opt(params, "loginId"), p_str_opt(params, "token")) else {
+                return (None, Some("setTwitchLoginWebToken requires \"loginId\" and \"token\"".to_string()));
+            };
+            if backend::twitch::login::set_web_token(login_id, token) {
+                (Some(ok_node()), None)
+            } else {
+                (None, Some("no Twitch sign-in is waiting".to_string()))
+            }
+        }
+
         "setTwitchWebToken" => {
             let Some(account_id) = p_str_opt(params, "accountId") else {
                 return (None, Some("setTwitchWebToken requires \"accountId\"".to_string()));
