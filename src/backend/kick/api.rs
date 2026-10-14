@@ -936,9 +936,12 @@ pub struct ChatIdentity {
     pub color: Option<String>,
     #[serde(default)]
     pub badges: Vec<Badge>,
+    /// The pictures: level, event and founder badges, and a channel's own.
+    #[serde(default)]
+    pub badges_v2: Vec<BadgeV2>,
 }
 
-#[derive(Deserialize, Debug, Clone, Serialize)]
+#[derive(Deserialize, Debug, Clone, Serialize, Default)]
 pub struct Badge {
     /// `moderator`, `subscriber`, `verified`, `og`, `founder`, `vip`...
     #[serde(rename = "type")]
@@ -949,6 +952,38 @@ pub struct Badge {
     /// Months subscribed, for the badges that count.
     #[serde(default)]
     pub count: Option<u32>,
+    /// A picture to draw it with, for the badges Kick sends as one: the level,
+    /// a channel's or an event's own, the founder's. The role badges above
+    /// have none and are drawn as words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Where Kick ranks it, highest first. Only used to put the badges in
+    /// Kick's order, which the role and the picture badges share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i32>,
+}
+
+/// A badge in Kick's newer list, which says what it looks like where the old
+/// list names a role. `selected` is the person's own choice to wear it: a
+/// level badge comes on every message, and only some people show theirs.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BadgeV2 {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub selected: Option<bool>,
+    #[serde(default)]
+    pub sort_order: Option<i32>,
+    #[serde(default)]
+    pub metadata: Option<BadgeV2Metadata>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BadgeV2Metadata {
+    #[serde(default)]
+    pub level: Option<u32>,
 }
 
 #[derive(Deserialize)]

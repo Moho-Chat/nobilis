@@ -527,16 +527,44 @@ pub(super) fn strongest_badge(badges: &[api::Badge]) -> Option<String> {
 /// the ones a reader is actually scanning for.
 pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::SenderStyle {
     let Some(identity) = identity else { return crate::model::SenderStyle::default() };
-    crate::model::SenderStyle {
-        color: identity.color.clone().filter(|c| !c.is_empty()),
-        badges: identity
-            .badges
+    // The role badges are drawn as words, and Kick's picture badges beside them
+    // as pictures - the ones the person chose to wear, in Kick's order. The
+    // old list's own "level" is dropped as it always was: the picture one says
+    // the same with a number a reader can see.
+    let mut badges: Vec<api::Badge> = identity.badges.iter().filter(|b| !matches!(b.kind.as_str(), "level" | "")).cloned().collect();
+    let mut pictures: Vec<api::Badge> = identity
+            .badges_v2
             .iter()
-            .filter(|b| !matches!(b.kind.as_str(), "level" | ""))
-            .cloned()
-            .collect(),
-    }
+            .filter(|b| b.selected.unwrap_or(true) && !b.name.is_empty())
+            .filter_map(|b| {
+                let image = b.image_url.clone().filter(|u| u.starts_with("https://"))?;
+                let level = b.metadata.as_ref().and_then(|m| m.level);
+                Some(api::Badge {
+                    // Named by what Kick calls it, apart from the role names.
+                    kind: b.name.clone(),
+                    text: match level {
+                        Some(level) if b.name == "level" => format!("Level {level}"),
+                        _ => b.name.clone(),
+                    },
+                    count: None,
+                    image: Some(image),
+                    sort_order: b.sort_order,
+                })
+            })
+            .collect();
+    // The highest-ranked of them, if there are more than a name can carry.
+    pictures.sort_by_key(|b| std::cmp::Reverse(b.sort_order.unwrap_or(0)));
+    pictures.truncate(MAX_BADGE_PICTURES);
+    badges.extend(pictures);
+    // Highest first, as Kick's own apps put them, and stable so two of a rank
+    // stay in the order they came.
+    badges.sort_by_key(|b| std::cmp::Reverse(b.sort_order.unwrap_or(0)));
+    crate::model::SenderStyle { color: identity.color.clone().filter(|c| !c.is_empty()), badges }
 }
+
+/// How many picture badges one name carries. Some people wear a dozen, and a
+/// name with that many beside it is the loudest thing on the line.
+const MAX_BADGE_PICTURES: usize = 4;
 
 /// What a reply was replying to, out of the metadata Kick attaches to it.
 ///
@@ -973,7 +1001,7 @@ mod tests {
 
     #[test]
     fn marks_somebody_by_the_badge_worth_finding_them_by() {
-        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), ..Default::default() };
         // Ranked by what a reader is scanning for, not by what is rarest: a
         // moderator who is also a subscriber shows as a moderator.
         assert_eq!(strongest_badge(&[badge("subscriber"), badge("moderator")]).as_deref(), Some("moderator"));
@@ -1486,17 +1514,60 @@ mod tests {
 
     #[test]
     fn a_sender_is_drawn_in_their_colour_with_the_badges_that_say_something() {
-        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), ..Default::default() };
         assert_eq!(style_of(None).color, None);
         let style = style_of(Some(&api::ChatIdentity {
             color: Some("#75FD46".into()),
             badges: vec![badge("moderator"), badge("level"), badge(""), badge("subscriber")],
+            ..Default::default()
         }));
         assert_eq!(style.color.as_deref(), Some("#75FD46"));
         // An engagement level and a nameless badge say nothing about the person.
         assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "subscriber"]);
         // A colour that is empty is no colour.
-        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), badges: vec![] })).color, None);
+        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), ..Default::default() })).color, None);
+    }
+
+    /// As measured on a live channel: the picture badges come in their own list,
+    /// each with the person's choice to wear it and where Kick ranks it.
+    #[test]
+    fn the_pictures_a_person_chose_to_wear_come_after_their_role_in_kicks_order() {
+        let identity: api::ChatIdentity = serde_json::from_value(serde_json::json!({
+            "color": "#E9113C",
+            "badges": [
+                { "type": "moderator", "text": "Moderator", "sort_order": 12 },
+                { "type": "sub_gifter", "text": "Sub Gifter", "count": 1, "sort_order": 8 }
+            ],
+            "badges_v2": [
+                { "name": "level", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/48_a.png", "metadata": { "level": 48 }, "selected": true, "sort_order": 1 },
+                { "name": "GOAT", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/GOAT_b.png", "selected": true, "sort_order": 4 },
+                { "name": "GoldenK", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/GoldenK_c.png", "selected": false, "sort_order": 4 },
+                { "name": "kick_founder22", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/f.png", "selected": true, "sort_order": 2 }
+            ]
+        }))
+        .unwrap();
+        let style = style_of(Some(&identity));
+        // Not the one the person chose not to wear, and highest rank first.
+        assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "sub_gifter", "GOAT", "kick_founder22", "level"]);
+        // Words for the roles, pictures for the rest, and the level says what it is.
+        assert!(style.badges[0].image.is_none());
+        assert_eq!(style.badges[2].image.as_deref(), Some("https://ext.cdn.kick.com/chat/badges/GOAT_b.png"));
+        assert_eq!(style.badges[4].text, "Level 48");
+    }
+
+    #[test]
+    fn a_badge_picture_is_only_ever_a_web_address_and_a_crowd_of_them_is_cut() {
+        let wear = |name: &str, url: &str| api::BadgeV2 { name: name.into(), image_url: Some(url.into()), selected: Some(true), ..Default::default() };
+        let identity = api::ChatIdentity {
+            badges_v2: vec![
+                wear("local", "file:///etc/passwd"),
+                wear("a", "https://x/a.png"), wear("b", "https://x/b.png"), wear("c", "https://x/c.png"),
+                wear("d", "https://x/d.png"), wear("e", "https://x/e.png"),
+            ],
+            ..Default::default()
+        };
+        let kinds: Vec<_> = style_of(Some(&identity)).badges.into_iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, vec!["a", "b", "c", "d"]);
     }
 
     #[test]

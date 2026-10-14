@@ -3813,6 +3813,18 @@ impl Runtime {
         self.kick_streams.lock().unwrap().get(buffer_id).cloned()
     }
 
+    /// The conversation an account has open for a Kick channel, by the channel's
+    /// own number - which is how the points event names it.
+    pub fn kick_buffer_of_channel(&self, account_id: &str, channel_id: u64) -> Option<String> {
+        let prefix = format!("{account_id}|");
+        self.kick_channels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(buffer_id, channel)| buffer_id.starts_with(&prefix) && channel.channel_id == channel_id)
+            .map(|(buffer_id, _)| buffer_id.clone())
+    }
+
     pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {
         self.kick_channels.lock().unwrap().get(buffer_id).cloned()
     }

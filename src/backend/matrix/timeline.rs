@@ -348,7 +348,7 @@ pub(super) async fn handle_timeline_event(
                 badges: vec![crate::backend::kick::api::Badge {
                     kind: "unverified".to_string(),
                     text: "Sent from a device you have not verified".to_string(),
-                    count: None,
+                    ..Default::default()
                 }],
             }),
             _ => None,
