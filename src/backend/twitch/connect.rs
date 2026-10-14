@@ -525,7 +525,7 @@ async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id:
                     icon_url: None,
                     buffers: vec![buffer_id],
                     sendable_anywhere: false,
-                    emoji: emotes.into_iter().map(|e| crate::model::EmojiEntry { id: e.name.clone(), name: e.name, url: Some(e.url), animated: e.animated, locked: false }).collect(),
+                    emoji: emotes.into_iter().map(|e| crate::model::EmojiEntry { id: format!("[twitch:{}:{}:{}]", if e.animated { "aemote" } else { "emote" }, e.id, e.name.replace(']', "_")), name: e.name, url: Some(e.url), animated: e.animated, locked: false }).collect(),
                 },
             );
         }
@@ -658,6 +658,8 @@ where
         act(state, account_id, rooms, channel, &action, None, helix).await?;
         return Ok(());
     }
+    // An emote picked from the picker is a picture in the box and a token in the text; Twitch reads its word.
+    let text = super::emotes::tokens_to_names(text);
     // Twitch's chat is one line: a break typed in the box becomes a space.
     let text: String = text.split(['\r', '\n']).map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
     if text.is_empty() {

@@ -229,7 +229,7 @@ pub async fn run(http: &reqwest::Client, cx: &Ctx<'_>, action: &Action, target_i
         }
         Action::Whisper { to, text } => {
             let id = resolve(to).await?;
-            said(helix::whisper(http, &who, cx.my_id, &id, text).await, format!("Whisper sent to {to}"))
+            said(helix::whisper(http, &who, cx.my_id, &id, &super::emotes::tokens_to_names(text)).await, format!("Whisper sent to {to}"))
         }
     }
 }

@@ -366,6 +366,37 @@ pub fn find(channel: &str, word: &str) -> Option<Emote> {
     None
 }
 
+/// The words an emote token stands for: `[twitch:bttv:9:Pog]` is sent as `Pog`.
+///
+/// The window puts a picture in the message box where an emote was picked, and what that picture is made of is
+/// this token (the same one an incoming message carries, so one piece of code draws both). Twitch reads an emote
+/// as its word, so that is what leaves.
+pub fn tokens_to_names(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("[twitch:") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let parsed = after.find(']').and_then(|end| {
+            let mut parts = after[1..end].splitn(4, ':');
+            let (_, kind, _id, name) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+            matches!(kind, "emote" | "aemote" | "bttv" | "ffz" | "7tv").then_some((name, end))
+        });
+        match parsed {
+            Some((name, end)) => {
+                out.push_str(name);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push_str("[twitch:");
+                rest = &after["[twitch:".len()..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A channel's own emote by word, whichever provider, ignoring the switches: for tests of what is held.
 #[cfg(test)]
 pub fn find_in(channel: &str, word: &str) -> Option<Emote> {
@@ -392,7 +423,7 @@ pub fn sources(channel: &str, buffer_id: &str) -> Vec<EmojiSource> {
                 icon_url: None,
                 buffers: if scope == "channel" { vec![buffer_id.to_string()] } else { Vec::new() },
                 sendable_anywhere: scope == "global",
-                emoji: table.iter().map(|e| EmojiEntry { id: e.name.clone(), name: e.name.clone(), url: Some(provider.image(&e.id)), animated: e.animated, locked: false }).collect(),
+                emoji: table.iter().map(|e| EmojiEntry { id: e.token(), name: e.name.clone(), url: Some(provider.image(&e.id)), animated: e.animated, locked: false }).collect(),
             });
         }
     }
@@ -522,6 +553,14 @@ pub fn say_animated(id: &str, yes: bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_picked_emote_leaves_as_its_word_and_nothing_else_is_touched() {
+        assert_eq!(tokens_to_names("hi [twitch:7tv:01ABC:catJAM] and [twitch:emote:25:Kappa]!"), "hi catJAM and Kappa!");
+        assert_eq!(tokens_to_names("[twitch:aemote:emotesv2_ab12:Wow]"), "Wow");
+        assert_eq!(tokens_to_names("[twitch:cheer:cheer:100] stays, [twitch:bad"), "[twitch:cheer:cheer:100] stays, [twitch:bad");
+        assert_eq!(tokens_to_names("plain [text] here"), "plain [text] here");
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -586,7 +625,9 @@ mod tests {
         let ffz = sources.iter().find(|s| s.id == "ffz:channel:pickerchan").expect("a section");
         assert_eq!((ffz.kind.as_str(), ffz.sendable_anywhere), ("text", false));
         assert_eq!(ffz.buffers, vec!["twitch:~anonymous|pickerchan"]);
-        assert_eq!((ffz.emoji[0].id.as_str(), ffz.emoji[0].url.as_deref()), ("Hello", Some("https://cdn.frankerfacez.com/emote/4/2")));
+        // Named by the token the box draws a picture from, which leaves as the word (see `tokens_to_names`).
+        assert_eq!((ffz.emoji[0].id.as_str(), ffz.emoji[0].name.as_str(), ffz.emoji[0].url.as_deref()), ("[twitch:ffz:4:Hello]", "Hello", Some("https://cdn.frankerfacez.com/emote/4/2")));
+        assert_eq!(tokens_to_names(&ffz.emoji[0].id), "Hello");
         forget("pickerchan");
     }
 
