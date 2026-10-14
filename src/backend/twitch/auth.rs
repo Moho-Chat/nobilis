@@ -36,6 +36,7 @@ pub const ID_ROOT: &str = "https://id.twitch.tv";
 pub const SCOPES: &[(&str, &str)] = &[
     ("chat:read", "read chat"),
     ("chat:edit", "send messages"),
+    ("user:write:chat", "hear why Twitch turned a message down"),
     ("user:read:follows", "list the channels you follow"),
     ("user:read:emotes", "show the emotes you can use"),
 ];

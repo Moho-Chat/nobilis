@@ -303,7 +303,7 @@ pub fn handle(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line
     let mut outcome = Outcome::default();
     match line.command.as_str() {
         "PRIVMSG" => privmsg(state, account_id, rooms, line, historical),
-        "USERNOTICE" => usernotice(state, account_id, rooms, line),
+        "USERNOTICE" => usernotice(state, account_id, rooms, line, historical),
         "CLEARCHAT" => clearchat(state, account_id, rooms, line),
         "CLEARMSG" => clearmsg(state, account_id, line),
         "ROOMSTATE" => {
@@ -349,7 +349,8 @@ fn privmsg(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, h
     let style = SenderStyle { color: Some(line.tag("color").to_string()).filter(|c| !c.is_empty()), badges: badges.clone() };
 
     let buffer = buffer_id(account_id, &channel);
-    if rooms.heard(&channel, Speaker { login: login.clone(), display: display.clone(), user_id: line.tag("user-id").to_string(), badge: strongest(&badges) }) {
+    // The past is not who is here: only what is said now makes the roster.
+    if !historical && rooms.heard(&channel, Speaker { login: login.clone(), display: display.clone(), user_id: line.tag("user-id").to_string(), badge: strongest(&badges) }) {
         let roster = serde_json::json!(rooms.roster(&channel));
         let total = rooms.chatter_count(&channel);
         state.runtime.set_presence(&buffer, roster.clone());
@@ -387,7 +388,7 @@ fn mentions(text: &str, login: &str) -> bool {
     text.to_lowercase().split(|c: char| !(c.is_alphanumeric() || c == '_')).any(|word| word == login)
 }
 
-fn usernotice(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line) {
+fn usernotice(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, historical: bool) {
     let Some(channel) = line.channel() else { return };
     let mut kind = line.tag("msg-id").to_string();
     // A notice mirrored from another channel of a shared chat is that channel's
@@ -414,7 +415,9 @@ fn usernotice(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line
         let user_id = line.tag("user-id").to_string();
         let badges = badges_of(line);
         let style = SenderStyle { color: Some(line.tag("color").to_string()).filter(|c| !c.is_empty()), badges: badges.clone() };
-        rooms.heard(&channel, Speaker { login: who_login.to_string(), display: who.clone(), user_id: user_id.clone(), badge: strongest(&badges) });
+        if !historical {
+            rooms.heard(&channel, Speaker { login: who_login.to_string(), display: who.clone(), user_id: user_id.clone(), badge: strongest(&badges) });
+        }
         state.runtime.record_message_at(
             state,
             account_id,

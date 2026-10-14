@@ -217,7 +217,7 @@ async fn chat_loop(state: &AppState, account_id: &str, mut rx: mpsc::UnboundedRe
         if state.accounts.get_twitch(account_id).is_none() {
             return;
         }
-        match session(state, account_id, &mut rx, IRC_URL, Timing::default()).await {
+        match session(state, account_id, &mut rx, IRC_URL, super::helix::API_ROOT, Timing::default()).await {
             Ok(()) => wait = 3,
             Err(e) => {
                 tracing::debug!("twitch[{account_id}]: chat ended: {e:#}");
@@ -259,7 +259,7 @@ impl Default for Timing {
 
 /// One chat connection, from connecting to its end. `Ok` when Twitch asked us
 /// to reconnect; an error when it dropped.
-async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedReceiver<Command>, url: &str, timing: Timing) -> Result<()> {
+async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedReceiver<Command>, url: &str, helix: &str, timing: Timing) -> Result<()> {
     let Some(cfg) = state.accounts.get_twitch(account_id) else { return Ok(()) };
     let token = cfg.is_signed_in().then(|| cfg.access_token.clone());
     let (mut socket, _) = crate::net::route::websocket(super::SHARED_KEY, url).await.context("connecting to Twitch's chat")?;
@@ -365,7 +365,7 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                     }
                     Command::Say { channel, text, reply_to, respond } => {
                         let moderator = rooms.moderator_in.contains(&channel);
-                        let result = say(state, account_id, &mut rooms, &joined, &mut sent, moderator, &channel, &text, reply_to.as_deref(), &mut socket).await;
+                        let result = say(state, account_id, &mut rooms, &joined, &mut sent, moderator, &channel, &text, reply_to.as_deref(), helix, &mut socket).await;
                         let _ = respond.send(result);
                     }
                 }
@@ -429,6 +429,7 @@ async fn say<S>(
     channel: &str,
     text: &str,
     reply_to: Option<&str>,
+    helix: &str,
     socket: &mut S,
 ) -> std::result::Result<(), String>
 where
@@ -456,37 +457,76 @@ where
         return Err(format!("Twitch lets an account send {} messages in 30 seconds. Wait {wait} seconds.", if moderator { SEND_LIMIT_MODERATOR } else { SEND_LIMIT }));
     }
 
-    // The reply, quoted from what is stored: the window has it, and Twitch
-    // shows a reply's parent from the tags it carries.
+    // The reply, quoted from what is stored when it is stored. Twitch needs
+    // only the id of what is answered; the name in front and the quote above
+    // are for how it is drawn.
     let parent = reply_to.and_then(|id| state.store.get_message(&crate::model::buffer_id(account_id, channel), id).ok().flatten());
-    let (tags, shown_text) = match (&parent, reply_to) {
-        (Some(parent), Some(id)) => {
+    let shown_text = match &parent {
+        Some(parent) => {
             // Twitch's own clients put the name in front of a reply's text.
             let login = parent.from.to_lowercase();
             let named = login.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-            let body = if named && !text.starts_with('@') { format!("@{login} {text}") } else { text.clone() };
-            (format!("@reply-parent-msg-id={id} "), body)
+            if named && !text.starts_with('@') { format!("@{login} {text}") } else { text.clone() }
         }
-        _ => (String::new(), text.clone()),
+        None => text.clone(),
     };
-    socket
-        .send(WsMessage::Text(format!("{tags}PRIVMSG #{channel} :{shown_text}\r\n")))
-        .await
-        .map_err(|e| format!("Twitch's chat is not answering: {e}"))?;
+
+    // By Helix when this account may: it says whether a message was sent and
+    // why not, and gives the message its id. Anything that stops it before
+    // Twitch has heard the message (the network, a scope, a token) falls back
+    // to IRC, which asks for no more than the account already agreed to.
+    let room_id = rooms.room_ids.get(channel).cloned();
+    let mut echoed_id: Option<String> = None;
+    let mut via_helix = false;
+    let by_helix = cfg.scopes.iter().any(|s| s == "user:write:chat") && !cfg.user_id.is_empty() && room_id.is_some();
+    if by_helix {
+        match super::client() {
+            Ok(http) => match super::helix::send_chat_message(
+                &http,
+                &super::helix::Caller { root: helix, client_id: auth::CLIENT_ID, token: &cfg.access_token },
+                &super::helix::Outgoing { broadcaster_id: room_id.as_deref().unwrap_or(""), sender_id: &cfg.user_id, message: &shown_text, reply_parent: reply_to },
+            )
+            .await
+            {
+                Ok(sent_by_helix) => match sent_by_helix.dropped {
+                    None => {
+                        via_helix = true;
+                        echoed_id = Some(sent_by_helix.message_id).filter(|id| !id.is_empty());
+                    }
+                    Some(why) => return Err(why),
+                },
+                Err(super::helix::SendError::Refused(why)) => return Err(why),
+                Err(super::helix::SendError::Unavailable(e)) => tracing::debug!("twitch[{account_id}]: Helix would not take a message, sending by IRC: {e:#}"),
+            },
+            Err(e) => tracing::debug!("twitch[{account_id}]: no HTTP client for Helix: {e:#}"),
+        }
+    }
+    if !via_helix {
+        let tags = reply_to.map(|id| format!("@reply-parent-msg-id={id} ")).unwrap_or_default();
+        socket
+            .send(WsMessage::Text(format!("{tags}PRIVMSG #{channel} :{shown_text}\r\n")))
+            .await
+            .map_err(|e| format!("Twitch's chat is not answering: {e}"))?;
+    }
     sent.push_back(std::time::Instant::now());
 
     // Twitch does not send a message back to the one who sent it over IRC, so
     // it is shown as sent, in the colour and badges Twitch last said we have.
+    // One sent by Helix is shown under the id Twitch gave it, so if Twitch
+    // does send it back it is the same message and not a second.
     let (action, plain) = match text.strip_prefix("/me ") {
         Some(rest) => (true, rest.to_string()),
         None => (false, text.clone()),
     };
     let shown = if rooms.me_display.is_empty() { cfg.login.clone() } else { rooms.me_display.clone() };
     let style = crate::model::SenderStyle { color: rooms.me_color.clone(), badges: rooms.me_badges.get(channel).cloned().unwrap_or_default() };
-    let reply = parent.as_ref().map(|p| {
-        let root = p.reply_to.as_ref().and_then(|r| r.thread_root.clone()).unwrap_or_else(|| p.id.clone());
-        crate::model::ReplyPreview { id: p.id.clone(), from: p.from.clone(), body: p.body.clone(), thread: false, forwarded: false, thread_root: Some(root) }
-    });
+    let reply = match (&parent, reply_to) {
+        (Some(p), _) => {
+            let root = p.reply_to.as_ref().and_then(|r| r.thread_root.clone()).unwrap_or_else(|| p.id.clone());
+            Some(crate::model::ReplyPreview { id: p.id.clone(), from: p.from.clone(), body: p.body.clone(), thread: false, forwarded: false, thread_root: Some(root) })
+        }
+        _ => None,
+    };
     state.runtime.record_message_at(
         state,
         account_id,
@@ -497,7 +537,7 @@ where
         action,
         "chat",
         reply,
-        None,
+        echoed_id,
         false,
         None,
         Vec::new(),
@@ -721,7 +761,7 @@ mod tests {
         let url = fake_twitch(Fake { exists: vec!["xqc"], got: got.clone(), ..Default::default() }).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:~anonymous");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
 
         join(&tx, "XQC").await.expect("a channel that exists");
         // Its conversation exists, it said hello, and the room's modes are in its header.
@@ -758,7 +798,7 @@ mod tests {
         let url = fake_twitch(Fake { exists: vec![], ..Default::default() }).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:~anonymous");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
         let e = join(&tx, "nosuchchannel").await.unwrap_err();
         assert!(e.contains("no channel called nosuchchannel"), "{e}");
         assert!(state.runtime.get_buffer("twitch:~anonymous|nosuchchannel").is_none(), "no empty conversation is left behind");
@@ -776,7 +816,7 @@ mod tests {
         let url = fake_twitch(Fake { exists: vec!["xqc"], got: got.clone(), ..Default::default() }).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:someone");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
         join(&tx, "xqc").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -812,7 +852,7 @@ mod tests {
         let url = fake_twitch(Fake { exists: vec!["xqc"], ..Default::default() }).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:someone");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
         join(&tx, "xqc").await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(say_in(&tx, "xqc", "   ", None).await.unwrap_err().contains("nothing to send"));
@@ -848,7 +888,7 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:someone");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
         join(&tx, "xqc").await.unwrap();
         for i in 0..SEND_LIMIT {
             say_in(&tx, "xqc", &format!("m{i}"), None).await.unwrap();
@@ -865,7 +905,7 @@ mod tests {
         let url = fake_twitch(Fake { exists: vec!["xqc"], reconnect: true, ..Default::default() }).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (s, id) = (state.clone(), "twitch:~anonymous");
-        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, quick()).await });
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
         let _ = join(&tx, "xqc").await;
         let ended = tokio::time::timeout(Duration::from_secs(5), task).await.expect("it ends").unwrap();
         assert!(ended.is_ok(), "RECONNECT is not a failure");
@@ -874,7 +914,7 @@ mod tests {
         signed_in_chat(&state);
         let url = fake_twitch(Fake { refuse: true, ..Default::default() }).await;
         let (_tx, mut rx) = mpsc::unbounded_channel();
-        let e = session(&state, "twitch:someone", &mut rx, &url, quick()).await.unwrap_err();
+        let e = session(&state, "twitch:someone", &mut rx, &url, "http://127.0.0.1:9", quick()).await.unwrap_err();
         assert!(format!("{e}").contains("authentication failed"), "{e}");
     }
 
@@ -886,5 +926,136 @@ mod tests {
         for typed in ["", "   ", "has space", "bang!", "a".repeat(26).as_str(), "twitch.tv/"] {
             assert_eq!(normalise_login(typed), None, "{typed}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_message_that_is_not_stored_still_names_it_to_twitch() {
+        let state = testkit::simulated_daemon("twitch-session-reply-unstored");
+        signed_in_chat(&state);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let url = fake_twitch(Fake { exists: vec!["xqc"], got: got.clone(), ..Default::default() }).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (s, id) = (state.clone(), "twitch:someone");
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, "http://127.0.0.1:9", quick()).await });
+        join(&tx, "xqc").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The first message of a thread, older than the scrollback: nothing to quote, everything to name.
+        say_in(&tx, "xqc", "answering the root", Some("root-from-long-ago")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(got.lock().unwrap().iter().any(|l| l == "@reply-parent-msg-id=root-from-long-ago PRIVMSG #xqc :answering the root"));
+        task.abort();
+    }
+
+    /// A Helix that answers a message by what it says, and remembers what it was told.
+    async fn fake_helix(status: u16, body: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Arc<Mutex<Vec<String>>> = Default::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut got = 0;
+                    loop {
+                        let n = sock.read(&mut buf[got..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        got += n;
+                        let text = String::from_utf8_lossy(&buf[..got]).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end].lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+                            if got >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    log.lock().unwrap().push(String::from_utf8_lossy(&buf[..got]).to_string());
+                    let reply = format!("HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (root, seen)
+    }
+
+    fn signed_in_with_helix(state: &AppState) {
+        state
+            .accounts
+            .add_twitch(TwitchAccountConfig {
+                login: "someone".into(),
+                user_id: "42".into(),
+                access_token: "tok".into(),
+                refresh_token: "r".into(),
+                expires_at: chrono::Utc::now().timestamp() + 10_000,
+                scopes: vec!["chat:read".into(), "chat:edit".into(), "user:write:chat".into()],
+                ..Default::default()
+            })
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_account_that_may_uses_helix_and_the_message_is_shown_under_the_id_twitch_gave_it() {
+        let state = testkit::simulated_daemon("twitch-session-helix");
+        signed_in_with_helix(&state);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let url = fake_twitch(Fake { exists: vec!["xqc"], got: got.clone(), ..Default::default() }).await;
+        let (helix, asked) = fake_helix(200, r#"{"data":[{"message_id":"from-helix","is_sent":true}]}"#).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (s, id) = (state.clone(), "twitch:someone");
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, &helix, quick()).await });
+        join(&tx, "xqc").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        say_in(&tx, "xqc", "by the official way", None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Helix heard it, with the room's number from the room state and our own id; IRC did not.
+        let request = asked.lock().unwrap()[0].clone();
+        assert!(request.contains(r#""broadcaster_id":"100""#) && request.contains(r#""sender_id":"42""#) && request.contains("by the official way"), "{request}");
+        assert!(!got.lock().unwrap().iter().any(|l| l.starts_with("PRIVMSG")));
+        let log = state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap();
+        let mine = log.iter().find(|m| m.is_own).expect("shown as sent");
+        assert_eq!((mine.id.as_str(), mine.body.as_str()), ("from-helix", "by the official way"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_twitch_drops_is_an_error_with_its_reason_and_is_not_shown() {
+        let state = testkit::simulated_daemon("twitch-session-helix-drop");
+        signed_in_with_helix(&state);
+        let url = fake_twitch(Fake { exists: vec!["xqc"], ..Default::default() }).await;
+        let (helix, _) = fake_helix(200, r#"{"data":[{"message_id":"","is_sent":false,"drop_reason":{"code":"msg_duplicate","message":"Your message was not sent because it is identical to the previous one."}}]}"#).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (s, id) = (state.clone(), "twitch:someone");
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, &helix, quick()).await });
+        join(&tx, "xqc").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let e = say_in(&tx, "xqc", "again", None).await.unwrap_err();
+        assert!(e.contains("identical to the previous one"), "{e}");
+        assert!(!state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap().iter().any(|m| m.is_own));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn when_helix_cannot_be_reached_the_message_goes_by_irc_instead() {
+        let state = testkit::simulated_daemon("twitch-session-helix-fallback");
+        signed_in_with_helix(&state);
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let url = fake_twitch(Fake { exists: vec!["xqc"], got: got.clone(), ..Default::default() }).await;
+        // A 401: Helix will not take this token for a message, which is no verdict on the message.
+        let (helix, _) = fake_helix(401, r#"{"message":"Missing scope: user:write:chat"}"#).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (s, id) = (state.clone(), "twitch:someone");
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, &helix, quick()).await });
+        join(&tx, "xqc").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        say_in(&tx, "xqc", "the old way", None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(got.lock().unwrap().iter().any(|l| l == "PRIVMSG #xqc :the old way"));
+        assert!(state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap().iter().any(|m| m.is_own && m.body == "the old way"));
+        task.abort();
     }
 }

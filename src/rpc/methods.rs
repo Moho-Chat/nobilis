@@ -4216,6 +4216,22 @@ pub async fn dispatch(
             (Some(ok_node()), None)
         }
 
+        // A Twitch channel's recent past, from the third-party service the
+        // window was told it may ask (Settings, Twitch). Twitch keeps no
+        // history of its own; see backend/twitch/history.rs.
+        "twitchRecentMessages" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("twitchRecentMessages requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("twitch:")) else {
+                return (None, Some("that is not a Twitch channel".to_string()));
+            };
+            match backend::twitch::history::load(state, &buffer.account_id, &buffer.name, backend::twitch::history::ROOT).await {
+                Ok(read) => (Some(serde_json::json!({ "read": read })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The code Steam asked for, for a sign-in that is waiting on one.
         "submitSteamGuardCode" => {
             let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), p_str_opt(params, "code")) else {

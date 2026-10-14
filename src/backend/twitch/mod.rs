@@ -14,6 +14,8 @@
 //! - `login` - adding an account: the sign-in a person takes part in
 //! - `irc` - one line of Twitch's chat: tags, prefix, command, parameters
 //! - `chat` - what the lines mean: messages, cards, removals, a channel's modes
+//! - `helix` - Twitch's official API, as far as moho uses it
+//! - `history` - a channel's recent past, from a third-party service, if asked
 //! - `connect` - an account's connection: keeping its token good, and the chat
 //!   connection with its channels
 //!
@@ -23,6 +25,8 @@
 pub mod auth;
 pub mod chat;
 pub mod connect;
+pub mod helix;
+pub mod history;
 pub mod irc;
 pub mod login;
 
