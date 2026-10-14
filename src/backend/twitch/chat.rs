@@ -461,10 +461,10 @@ fn privmsg(state: &AppState, account_id: &str, rooms: &mut Rooms, line: &Line, h
     }
     // Being named is being highlighted, by login: the display name can be in
     // another script, and what people type after an @ is the login.
-    let mentioned = (!rooms.me_login.is_empty() && login != rooms.me_login && mentions(plain, &rooms.me_login))
-        // "Highlight my message", which a viewer buys with channel points: drawn as a mention is, so the
-        // channel's attention goes where the person paid for it to.
-        || line.tag("msg-id") == "highlighted-message";
+    // Only being named. A message a viewer paid channel points to "highlight" (`msg-id=highlighted-message`) is
+    // nobody's business but the channel's: counting it as a mention made it a notification and an unread mention,
+    // and big channels have them every few seconds.
+    let mentioned = !rooms.me_login.is_empty() && login != rooms.me_login && mentions(plain, &rooms.me_login);
     state.runtime.record_message_at(
         state,
         account_id,
@@ -1199,10 +1199,17 @@ mod tests {
     }
 
     #[test]
-    fn a_highlighted_message_is_drawn_as_a_mention_is() {
+    fn a_message_highlighted_with_channel_points_is_not_a_mention_and_notifies_nobody() {
         let state = testkit::simulated_daemon("twitch-highlighted");
-        let mut rooms = Rooms::default();
+        let mut rooms = Rooms { me_login: "someone".into(), ..Default::default() };
+        let mut events = state.events.subscribe();
         feed(&state, &mut rooms, "@display-name=A;id=hl1;msg-id=highlighted-message;room-id=1;user-id=3 :a!a@a.tmi.twitch.tv PRIVMSG #xqc :look at me");
-        assert!(log(&state, "xqc")[0].is_highlight);
+        assert!(!log(&state, "xqc")[0].is_highlight);
+        while let Ok(event) = events.try_recv() {
+            assert_ne!(event.name, "notification", "a paid highlight is not a reason to interrupt anybody");
+        }
+        // Being named still is.
+        feed(&state, &mut rooms, "@display-name=B;id=m2;room-id=1;user-id=4 :b!b@b.tmi.twitch.tv PRIVMSG #xqc :hey @someone");
+        assert!(log(&state, "xqc")[1].is_highlight);
     }
 }
