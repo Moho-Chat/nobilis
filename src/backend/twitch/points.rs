@@ -57,6 +57,10 @@ pub struct Choice {
     pub id: String,
     pub label: String,
     pub image: Option<String>,
+    /// For a changed version of an emote: the emote it is a change of (its name), and that emote's picture, so the
+    /// window can show the emotes first and then what can be done to the one picked.
+    pub group: Option<String>,
+    pub group_image: Option<String>,
 }
 
 /// One thing a channel trades its points for.
@@ -137,7 +141,7 @@ pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -
         .flat_map(|product| product.get("emotes").and_then(|e| e.as_array()).into_iter().flatten())
         .filter_map(|e| Some((e.get("id")?.as_str()?.to_string(), e.get("token")?.as_str()?.to_string())))
         .collect();
-    let unowned: Vec<Choice> = sub_emotes.iter().filter(|(_, token)| !owned.contains(token)).map(|(id, token)| Choice { id: id.clone(), label: token.clone(), image: Some(emote_image(id)) }).collect();
+    let unowned: Vec<Choice> = sub_emotes.iter().filter(|(_, token)| !owned.contains(token)).map(|(id, token)| Choice { id: id.clone(), label: token.clone(), image: Some(emote_image(id)), group: None, group_image: None }).collect();
     let variants: Vec<Choice> = channel
         .pointer("/communityPointsSettings/emoteVariants")
         .and_then(|v| v.as_array())
@@ -148,7 +152,7 @@ pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -
             let token = sub_emotes.iter().find(|(id, _)| id == base).map(|(_, t)| t.clone()).unwrap_or_else(|| base.to_string());
             v.get("modifications").and_then(|m| m.as_array()).into_iter().flatten().filter_map(move |m| {
                 let id = m.get("id")?.as_str()?.to_string();
-                Some(Choice { label: format!("{token}, {}", modification_name(&id)), image: Some(emote_image(&id)), id })
+                Some(Choice { label: format!("{token}, {}", modification_name(&id)), image: Some(emote_image(&id)), id, group: Some(token.clone()), group_image: Some(emote_image(base)) })
             })
         })
         .collect();

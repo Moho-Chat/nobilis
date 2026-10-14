@@ -5141,7 +5141,7 @@ pub async fn dispatch(
                 Ok((rewards, points)) => {
                     let list: Vec<serde_json::Value> = rewards
                         .into_iter()
-                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image, "unavailable": r.unavailable, "choices": r.choices.iter().map(|c| serde_json::json!({ "id": c.id, "label": c.label, "image": c.image })).collect::<Vec<_>>() }))
+                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image, "unavailable": r.unavailable, "choices": r.choices.iter().map(|c| serde_json::json!({ "id": c.id, "label": c.label, "image": c.image, "group": c.group, "groupImage": c.group_image })).collect::<Vec<_>>() }))
                         .collect();
                     (Some(serde_json::json!({ "rewards": list, "points": points.balance, "name": points.name })), None)
                 }

@@ -142,8 +142,10 @@ struct Integrity {
     expires_at: i64,
 }
 
-fn cache() -> &'static Mutex<Option<Integrity>> {
-    static CACHE: std::sync::OnceLock<Mutex<Option<Integrity>>> = std::sync::OnceLock::new();
+/// Integrity tokens by the session they were made for ("" for anonymous): Twitch wants the one made as the
+/// account for a call made as the account, and refuses one made anonymously for it.
+fn cache() -> &'static Mutex<HashMap<String, Integrity>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Integrity>>> = std::sync::OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
 
@@ -157,8 +159,8 @@ fn waiting() -> &'static Mutex<Waiting> {
 /// How long before its end an integrity token is let go of.
 const INTEGRITY_MARGIN: i64 = 600;
 
-fn good_integrity() -> Option<Integrity> {
-    let held = cache().lock().unwrap().clone()?;
+fn good_integrity(session: Option<&str>) -> Option<Integrity> {
+    let held = cache().lock().unwrap().get(session.unwrap_or("")).cloned()?;
     (held.expires_at - chrono::Utc::now().timestamp() > INTEGRITY_MARGIN).then_some(held)
 }
 
@@ -172,21 +174,22 @@ pub fn provide_integrity(request_id: &str, outcome: Result<(String, i64), String
 }
 
 /// Asks the window to make an integrity token and waits for it.
-async fn obtain_integrity(state: &AppState) -> Option<Integrity> {
-    if let Some(held) = good_integrity() {
+async fn obtain_integrity(state: &AppState, session: Option<&str>) -> Option<Integrity> {
+    if let Some(held) = good_integrity(session) {
         return Some(held);
     }
     let request_id = format!("integrity-{}", crate::model::next_message_id());
     let (reply, answer) = tokio::sync::oneshot::channel();
     waiting().lock().unwrap().insert(request_id.clone(), reply);
     let device_id = gql::device_id().to_string();
-    state.events.emit("twitchIntegrityNeeded", json!({ "requestId": request_id, "deviceId": device_id }));
+    // The window that makes it asks Twitch as the account (the session goes to main alone: it is not forwarded on).
+    state.events.emit("twitchIntegrityNeeded", json!({ "requestId": request_id, "deviceId": device_id, "authToken": session.unwrap_or("") }));
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), answer).await;
     waiting().lock().unwrap().remove(&request_id);
     match outcome {
         Ok(Ok(Ok((token, expires_ms)))) => {
             let made = Integrity { device_id, token, expires_at: expires_ms / 1000 };
-            *cache().lock().unwrap() = Some(made.clone());
+            cache().lock().unwrap().insert(session.unwrap_or("").to_string(), made.clone());
             Some(made)
         }
         Ok(Ok(Err(why))) => {
@@ -200,13 +203,13 @@ async fn obtain_integrity(state: &AppState) -> Option<Integrity> {
 /// One call to the GraphQL as the person's twitch.tv session, with an integrity token if Twitch asks for one.
 /// Answers the JSON, whose own `errors` are the caller's to read; a refusal for want of integrity is a `NeedsIntegrity`.
 pub async fn call_as_session(state: &AppState, http: &reqwest::Client, gql_root: &str, body: &Value, web_token: &str) -> Result<Value, PlaybackError> {
-    let mut integrity = good_integrity();
+    let mut integrity = good_integrity(Some(web_token));
     for attempt in 0..2 {
         let who = Who { web_token: Some(web_token), integrity: integrity.as_ref().map(|i| (i.device_id.as_str(), i.token.as_str())) };
         let answer = gql::call(http, gql_root, body, &who).await.map_err(PlaybackError::Failed)?;
         if gql::error_of(&answer).map(|s| s.to_lowercase().contains("integrity")).unwrap_or(false) {
             if attempt == 0 {
-                integrity = obtain_integrity(state).await;
+                integrity = obtain_integrity(state, Some(web_token)).await;
                 if integrity.is_some() {
                     continue;
                 }
@@ -220,14 +223,14 @@ pub async fn call_as_session(state: &AppState, http: &reqwest::Client, gql_root:
 
 /// The address of a channel's video, or why there is none.
 pub async fn playback(state: &AppState, http: &reqwest::Client, gql_root: &str, usher_root: &str, login: &str, web_token: Option<&str>) -> Result<Playback, PlaybackError> {
-    let mut integrity = good_integrity();
+    let mut integrity = good_integrity(web_token.filter(|t| !t.is_empty()));
     for attempt in 0..2 {
         let who = Who { web_token, integrity: integrity.as_ref().map(|i| (i.device_id.as_str(), i.token.as_str())) };
         let answer = gql::call(http, gql_root, &token_query(login), &who).await.map_err(PlaybackError::Failed)?;
         if let Some(said) = gql::error_of(&answer) {
             if said.to_lowercase().contains("integrity") {
                 if attempt == 0 {
-                    integrity = obtain_integrity(state).await;
+                    integrity = obtain_integrity(state, web_token.filter(|t| !t.is_empty())).await;
                     if integrity.is_some() {
                         continue;
                     }
@@ -341,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn the_call_is_the_players_own_and_carries_the_accounts_token_only_when_there_is_one() {
         let _turn = turn().lock().await;
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let state = testkit::simulated_daemon("twitch-playback");
         let (root, seen) = graphql(vec![(200, token(json!({})).to_string()), (200, token(json!({ "hide_ads": true })).to_string())]).await;
         let http = reqwest::Client::new();
@@ -361,7 +364,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_that_is_not_about_integrity_is_said_and_a_refusal_is_said_with_its_status() {
         let _turn = turn().lock().await;
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let state = testkit::simulated_daemon("twitch-playback-errors");
         let (root, _) = graphql(vec![
             (200, json!({ "errors": [{ "message": "service timeout" }] }).to_string()),
@@ -378,9 +381,9 @@ mod tests {
     #[tokio::test]
     async fn when_twitch_wants_an_integrity_token_the_window_is_asked_and_the_call_is_made_again_with_it() {
         let _turn = turn().lock().await;
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let state = testkit::simulated_daemon("twitch-playback-integrity");
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let (root, seen) = graphql(vec![(200, json!({ "errors": [{ "message": "failed integrity check" }] }).to_string()), (200, token(json!({})).to_string())]).await;
         let mut events = state.events.subscribe();
         let answerer = tokio::spawn(async move {
@@ -401,16 +404,16 @@ mod tests {
         let second = seen.lock().unwrap()[1].to_lowercase();
         assert!(second.contains("client-integrity: v4.local.made"), "{second}");
         // Kept: the next call carries it without asking again.
-        assert!(good_integrity().is_some());
-        *cache().lock().unwrap() = None;
+        assert!(good_integrity(None).is_some());
+        cache().lock().unwrap().clear();
     }
 
     #[tokio::test]
     async fn an_integrity_token_that_cannot_be_made_is_a_reason_not_a_hang() {
         let _turn = turn().lock().await;
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let state = testkit::simulated_daemon("twitch-playback-integrity-fails");
-        *cache().lock().unwrap() = None;
+        cache().lock().unwrap().clear();
         let (root, _) = graphql(vec![(200, json!({ "errors": [{ "message": "failed integrity check" }] }).to_string())]).await;
         let mut events = state.events.subscribe();
         tokio::spawn(async move {
@@ -425,5 +428,38 @@ mod tests {
         let e = playback(&state, &reqwest::Client::new(), &root, USHER_ROOT, "xqc", None).await.unwrap_err();
         assert!(matches!(e, PlaybackError::NeedsIntegrity), "{e}");
         assert!(!provide_integrity("nobody-asked", Err("late".into())), "a late answer to nothing is refused");
+    }
+
+    #[tokio::test]
+    async fn a_call_made_as_the_account_asks_for_an_integrity_token_made_as_the_account_and_keeps_it_apart_from_the_anonymous_one() {
+        let _turn = turn().lock().await;
+        cache().lock().unwrap().clear();
+        let state = testkit::simulated_daemon("twitch-session-integrity");
+        let (root, seen) = graphql(vec![(200, json!({ "errors": [{ "message": "failed integrity check" }] }).to_string()), (200, json!({ "data": { "x": 1 } }).to_string()), (200, json!({ "data": { "x": 2 } }).to_string())]).await;
+        let mut events = state.events.subscribe();
+        let answerer = tokio::spawn(async move {
+            loop {
+                let event = events.recv().await.expect("the bus is open");
+                if event.name == "twitchIntegrityNeeded" {
+                    // Said to the window that makes it, so it can make it as the account.
+                    assert_eq!(event.data["authToken"], "web-session");
+                    let id = event.data["requestId"].as_str().unwrap().to_string();
+                    let ends = (chrono::Utc::now().timestamp() + 16 * 3600) * 1000;
+                    assert!(provide_integrity(&id, Ok(("v4.local.as-account".to_string(), ends))));
+                    return;
+                }
+            }
+        });
+        let http = reqwest::Client::new();
+        call_as_session(&state, &http, &root, &json!({ "query": "mutation { x }" }), "web-session").await.unwrap();
+        answerer.await.unwrap();
+        assert!(seen.lock().unwrap()[1].contains("client-integrity: v4.local.as-account"));
+        // The token made as the account is the account's; an anonymous call has none held.
+        assert!(good_integrity(Some("web-session")).is_some());
+        assert!(good_integrity(None).is_none());
+        // And the next call as the account uses it without asking again.
+        call_as_session(&state, &http, &root, &json!({ "query": "mutation { x }" }), "web-session").await.unwrap();
+        assert!(seen.lock().unwrap()[2].contains("client-integrity: v4.local.as-account"));
+        cache().lock().unwrap().clear();
     }
 }
