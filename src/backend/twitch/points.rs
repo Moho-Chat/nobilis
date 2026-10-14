@@ -366,6 +366,12 @@ mod tests {
         let state = testkit::simulated_daemon("twitch-points-live");
         let http = crate::backend::twitch::client().unwrap();
         let root = gql::ROOT;
+        // A real prediction and outcome (from `TWITCH_LIVE_EVENT` and `TWITCH_LIVE_OUTCOME`), with more points than
+        // the account has: Twitch refuses it for want of points, which proves the bet is understood and spends nothing.
+        if let (Ok(event), Ok(outcome)) = (std::env::var("TWITCH_LIVE_EVENT"), std::env::var("TWITCH_LIVE_OUTCOME")) {
+            let amount: u64 = std::env::var("TWITCH_LIVE_BET").ok().and_then(|a| a.parse().ok()).unwrap_or(10);
+            println!("a bet of {amount} on a real prediction: {:?}", bet(&state, &http, root, &event, &outcome, amount, Some(&token)).await);
+        }
         println!("balance: {:?}", context(&state, &http, root, &channel, Some(&token)).await);
         println!("vote in a poll that is not there: {:?}", vote(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", &user, Some(&token)).await);
         println!("bet on a prediction that is not there: {:?}", bet(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", 10, Some(&token)).await);
