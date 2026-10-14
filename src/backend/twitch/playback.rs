@@ -197,6 +197,27 @@ async fn obtain_integrity(state: &AppState) -> Option<Integrity> {
     }
 }
 
+/// One call to the GraphQL as the person's twitch.tv session, with an integrity token if Twitch asks for one.
+/// Answers the JSON, whose own `errors` are the caller's to read; a refusal for want of integrity is a `NeedsIntegrity`.
+pub async fn call_as_session(state: &AppState, http: &reqwest::Client, gql_root: &str, body: &Value, web_token: &str) -> Result<Value, PlaybackError> {
+    let mut integrity = good_integrity();
+    for attempt in 0..2 {
+        let who = Who { web_token: Some(web_token), integrity: integrity.as_ref().map(|i| (i.device_id.as_str(), i.token.as_str())) };
+        let answer = gql::call(http, gql_root, body, &who).await.map_err(PlaybackError::Failed)?;
+        if gql::error_of(&answer).map(|s| s.to_lowercase().contains("integrity")).unwrap_or(false) {
+            if attempt == 0 {
+                integrity = obtain_integrity(state).await;
+                if integrity.is_some() {
+                    continue;
+                }
+            }
+            return Err(PlaybackError::NeedsIntegrity);
+        }
+        return Ok(answer);
+    }
+    Err(PlaybackError::NeedsIntegrity)
+}
+
 /// The address of a channel's video, or why there is none.
 pub async fn playback(state: &AppState, http: &reqwest::Client, gql_root: &str, usher_root: &str, login: &str, web_token: Option<&str>) -> Result<Playback, PlaybackError> {
     let mut integrity = good_integrity();

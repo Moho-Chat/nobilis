@@ -193,8 +193,8 @@ pub fn poll_card(poll: &Value, _now: i64) -> Option<Value> {
         "votedOptionId": null,
         "state": status.to_lowercase(),
         "open": open,
-        // Shown, not answered from here: see TWITCH_WATCH_ONLY in the RPC.
-        "readOnly": true,
+        // Twitch's polls are ended on twitch.tv by the streamer or a moderator, not from a viewer's card.
+        "noEnd": true,
     }))
 }
 
@@ -235,7 +235,7 @@ pub fn prediction_card(event: &Value, now: i64) -> Option<Value> {
         "LOCKED" => "locked",
         "RESOLVE_PENDING" | "RESOLVED" => "resolved",
         "CANCEL_PENDING" | "CANCELED" => "canceled",
-        other => return Some(json!({ "kind": "prediction", "id": format!("prediction:{id}"), "state": other.to_lowercase(), "options": options, "title": text(event, &["title"]).unwrap_or(""), "duration": window, "remaining": 0, "resultDisplayDuration": 0, "hasVoted": false, "votedOptionId": null, "total": pot, "minBet": MIN_BET, "readOnly": true })),
+        other => return Some(json!({ "kind": "prediction", "id": format!("prediction:{id}"), "state": other.to_lowercase(), "options": options, "title": text(event, &["title"]).unwrap_or(""), "duration": window, "remaining": 0, "resultDisplayDuration": 0, "hasVoted": false, "votedOptionId": null, "total": pot, "minBet": MIN_BET, "noEnd": true })),
     };
     Some(json!({
         "kind": "prediction",
@@ -250,7 +250,7 @@ pub fn prediction_card(event: &Value, now: i64) -> Option<Value> {
         "total": pot,
         "state": state,
         "minBet": MIN_BET,
-        "readOnly": true,
+        "noEnd": true,
     }))
 }
 
@@ -261,8 +261,15 @@ pub const MIN_BET: u32 = 10;
 // Saying it
 // ---------------------------------------------------------------------------
 
+/// Whether this account can answer a poll or a prediction: it has the twitch.tv session that Twitch takes votes
+/// and bets from.
+fn answerable(state: &AppState, account_id: &str) -> bool {
+    state.accounts.get_twitch(account_id).is_some_and(|a| !a.web_token.is_empty())
+}
+
 /// Publishes a card, carrying across what the socket cannot know: this account's own vote and bet and what it has to spend.
-pub fn publish(state: &AppState, buffer_id: &str, kind: &str, mut card: Value) {
+pub fn publish(state: &AppState, account_id: &str, buffer_id: &str, kind: &str, mut card: Value) {
+    card["readOnly"] = json!(!answerable(state, account_id));
     if let Some(known) = state.runtime.live_card(buffer_id, kind) {
         if known["id"] == card["id"] {
             for key in ["hasVoted", "votedOptionId", "stake", "balance"] {
@@ -320,7 +327,15 @@ fn act(state: &AppState, account_id: &str, channel: &str, kind: Kind, payload: &
             raid_said(state, account_id, channel, &event);
         }
         Some(event @ Event::RaidCalledOff { .. }) => raid_said(state, account_id, channel, &event),
-        Some(Event::Card { kind, card }) => publish(state, &buffer_id, kind, card),
+        Some(Event::Card { kind, card }) => {
+            let fresh = kind == "prediction" && state.runtime.live_card(&buffer_id, kind).is_none_or(|known| known["id"] != card["id"]);
+            publish(state, account_id, &buffer_id, kind, card);
+            // A new prediction asks what this account has to bet with, once.
+            if fresh && answerable(state, account_id) {
+                let (state, account_id, channel) = (state.clone(), account_id.to_string(), channel.to_string());
+                tokio::spawn(async move { refresh_balance(&state, gql::ROOT, &account_id, &channel).await });
+            }
+        }
         Some(Event::CardGone { kind }) => gone(state, &buffer_id, kind),
         None => {}
     }
@@ -332,6 +347,20 @@ pub fn notification(frame: &Value) -> Option<(String, Value)> {
     let sub = n.pointer("/subscription/id")?.as_str()?.to_string();
     let payload: Value = serde_json::from_str(n.get("pubsub")?.as_str()?).ok()?;
     Some((sub, payload))
+}
+
+/// Reads what this account has to bet with in a channel and puts it on the prediction card that is up, if any.
+pub async fn refresh_balance(state: &AppState, root: &str, account_id: &str, channel: &str) {
+    let Some(cfg) = state.accounts.get_twitch(account_id) else { return };
+    let Ok(http) = super::client() else { return };
+    let Ok(points) = super::points::context(state, &http, root, channel, Some(&cfg.web_token)).await else { return };
+    let (buffer_id, Some(balance)) = (crate::model::buffer_id(account_id, channel), points.balance) else { return };
+    if let Some(mut card) = state.runtime.live_card(&buffer_id, "prediction") {
+        card["balance"] = json!(balance);
+        // Directly: `publish` would carry the old balance back over the new one.
+        crate::backend::kick::cards::publish_card(state, &buffer_id, "prediction", Some(card));
+    }
+    state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": balance, "claimId": points.claim_id, "name": points.name }));
 }
 
 /// A poll or prediction the channel already has going, asked for from the GraphQL when it is opened.
@@ -348,10 +377,13 @@ pub async fn current(state: &AppState, account_id: &str, channel: &str, gql_root
     let now = crate::backend::kick::cards::now_secs();
     let buffer_id = crate::model::buffer_id(account_id, channel);
     if let Some(card) = answer.pointer("/data/user/viewablePoll").filter(|p| !p.is_null()).and_then(|p| poll_card(p, now)) {
-        publish(state, &buffer_id, "poll", card);
+        publish(state, account_id, &buffer_id, "poll", card);
     }
     if let Some(card) = answer.pointer("/data/user/channel/activePredictionEvents/0").filter(|p| !p.is_null()).and_then(|p| prediction_card(p, now)) {
-        publish(state, &buffer_id, "prediction", card);
+        publish(state, account_id, &buffer_id, "prediction", card);
+        if answerable(state, account_id) {
+            refresh_balance(state, gql_root, account_id, channel).await;
+        }
     }
 }
 

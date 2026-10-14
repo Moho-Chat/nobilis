@@ -21,6 +21,7 @@
 //! - `gql` - Twitch's own GraphQL, which answers what its official API will not without an account
 //! - `stream` - what is on air in a channel, said as the stream event the window draws
 //! - `playback` - the address of a channel's video, and the integrity token Twitch sometimes wants for it
+//! - `points` - channel points, the bonus, bets and votes, as the person's twitch.tv session
 //! - `realtime` - what Twitch says as it happens beyond the chat: raids, polls and predictions
 //! - `helix` - Twitch's official API, as far as moho uses it
 //! - `history` - a channel's recent past, from a third-party service, if asked
@@ -43,6 +44,7 @@ pub mod irc;
 pub mod login;
 pub mod moderation;
 pub mod playback;
+pub mod points;
 pub mod realtime;
 pub mod stream;
 
