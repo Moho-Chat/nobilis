@@ -84,7 +84,7 @@ pub struct Reward {
     pub unavailable: Option<String>,
 }
 
-const REWARDS: &str = "query($login:String!){ user(login:$login){ subscriptionProducts{ tier emotes{ id token } } channel{ id self{ communityPoints{ balance } } communityPointsSettings{ name customRewards{ id title cost prompt isEnabled isPaused isInStock isUserInputRequired backgroundColor image{ url } defaultImage{ url } } automaticRewards{ id type cost defaultCost isEnabled defaultBackgroundColor backgroundColor defaultImage{ url } } emoteVariants{ id modifications{ id } } } } } }";
+const REWARDS: &str = "query($login:String!){ user(login:$login){ channel{ id self{ communityPoints{ balance } } communityPointsSettings{ name customRewards{ id title cost prompt isEnabled isPaused isInStock isUserInputRequired backgroundColor image{ url } defaultImage{ url } } automaticRewards{ id type cost defaultCost isEnabled defaultBackgroundColor backgroundColor defaultImage{ url } } emoteVariants{ id isUnlockable emote{ id token } modifications{ id } } } } } }";
 
 fn emote_image(id: &str) -> String {
     format!("https://static-cdn.jtvnw.net/emoticons/v2/{id}/default/dark/1.0")
@@ -102,8 +102,9 @@ fn modification_name(id: &str) -> &'static str {
     }
 }
 
-/// A channel's rewards, its number, and this account's balance, from one answer. `owned` is the names of the
-/// emotes the account can already use there, which an unlock does not offer again.
+/// A channel's rewards, its number, and this account's balance, from one answer. `owned` is the ids of the
+/// emotes the account can already use there: an unlock does not offer those again, and a change is offered
+/// only for those.
 pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -> Option<(String, Vec<Reward>, Points)> {
     let channel = answer.pointer("/data/user/channel").filter(|c| !c.is_null())?;
     let flag = |r: &Value, k: &str, default: bool| r.get(k).and_then(|b| b.as_bool()).unwrap_or(default);
@@ -132,30 +133,38 @@ pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -
         })
         .unwrap_or_default();
 
-    // The subscriber emotes of the channel, by id, for the unlocks that choose one.
-    let sub_emotes: Vec<(String, String)> = answer
-        .pointer("/data/user/subscriptionProducts")
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .flat_map(|product| product.get("emotes").and_then(|e| e.as_array()).into_iter().flatten())
-        .filter_map(|e| Some((e.get("id")?.as_str()?.to_string(), e.get("token")?.as_str()?.to_string())))
-        .collect();
-    let unowned: Vec<Choice> = sub_emotes.iter().filter(|(_, token)| !owned.contains(token)).map(|(id, token)| Choice { id: id.clone(), label: token.clone(), image: Some(emote_image(id)), group: None, group_image: None }).collect();
-    let variants: Vec<Choice> = channel
+    // The emotes Twitch lets be unlocked or changed are the channel's `emoteVariants`, and only the ones it marks
+    // unlockable are in the pool (asking for another is refused as an invalid emote). The unlocks offer those the
+    // account does not have; a change is offered for those it does.
+    struct Variant {
+        id: String,
+        token: String,
+        unlockable: bool,
+        modifications: Vec<String>,
+    }
+    let variants: Vec<Variant> = channel
         .pointer("/communityPointsSettings/emoteVariants")
         .and_then(|v| v.as_array())
         .into_iter()
         .flatten()
-        .flat_map(|v| {
-            let base = v.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            let token = sub_emotes.iter().find(|(id, _)| id == base).map(|(_, t)| t.clone()).unwrap_or_else(|| base.to_string());
-            v.get("modifications").and_then(|m| m.as_array()).into_iter().flatten().filter_map(move |m| {
-                let id = m.get("id")?.as_str()?.to_string();
-                Some(Choice { label: format!("{token}, {}", modification_name(&id)), image: Some(emote_image(&id)), id, group: Some(token.clone()), group_image: Some(emote_image(base)) })
+        .filter_map(|v| {
+            Some(Variant {
+                id: v.get("id")?.as_str()?.to_string(),
+                token: v.pointer("/emote/token").and_then(|t| t.as_str())?.to_string(),
+                unlockable: flag(v, "isUnlockable", false),
+                modifications: v.get("modifications").and_then(|m| m.as_array()).into_iter().flatten().filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string)).collect(),
             })
         })
         .collect();
+    let unowned: Vec<Choice> = variants.iter().filter(|v| v.unlockable && !owned.contains(&v.id)).map(|v| Choice { id: v.id.clone(), label: v.token.clone(), image: Some(emote_image(&v.id)), group: None, group_image: None }).collect();
+    let changes: Vec<Choice> = variants
+        .iter()
+        .filter(|v| owned.contains(&v.id))
+        .flat_map(|v| {
+            v.modifications.iter().map(move |m| Choice { label: format!("{}, {}", v.token, modification_name(m)), image: Some(emote_image(m)), id: m.clone(), group: Some(v.token.clone()), group_image: Some(emote_image(&v.id)) })
+        })
+        .collect();
+    let variants = changes;
 
     for r in channel.pointer("/communityPointsSettings/automaticRewards").and_then(|r| r.as_array()).into_iter().flatten() {
         let (Some(id), Some(kind)) = (r.get("id").and_then(|i| i.as_str()), r.get("type").and_then(|t| t.as_str())) else { continue };
@@ -164,7 +173,7 @@ pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -
             "SEND_HIGHLIGHTED_MESSAGE" => ("Highlight My Message", "Write something special and give it some glitz in chat", Kind::Highlight, true, Vec::new()),
             "RANDOM_SUB_EMOTE_UNLOCK" => ("Unlock a Random Sub Emote", "Unlocks a random subscriber emote you do not have", Kind::RandomEmote, false, Vec::new()),
             "CHOSEN_SUB_EMOTE_UNLOCK" => ("Choose an Emote to Unlock", "Pick a subscriber emote to unlock for 24 hours", Kind::ChosenEmote, false, unowned.clone()),
-            "CHOSEN_MODIFIED_SUB_EMOTE_UNLOCK" => ("Modify a Single Emote", "Unlock a changed version of a subscriber emote", Kind::ModifiedEmote, false, variants.clone()),
+            "CHOSEN_MODIFIED_SUB_EMOTE_UNLOCK" => ("Modify a Single Emote", "Change one of this channel's emotes you have", Kind::ModifiedEmote, false, variants.clone()),
             "SINGLE_MESSAGE_BYPASS_SUB_MODE" => ("Send a Message in Sub-Only Mode", "Send one message past subscribers-only mode", Kind::Other, false, Vec::new()),
             // Paid for in Bits and not in points: not for here.
             _ => continue,
@@ -173,7 +182,7 @@ pub fn read_rewards(answer: &Value, owned: &std::collections::HashSet<String>) -
         if kind == Kind::Other {
             unavailable = Some("Send this one from twitch.tv's chat box".to_string());
         } else if (matches!(kind, Kind::ChosenEmote | Kind::ModifiedEmote) && choices.is_empty()) || (kind == Kind::RandomEmote && unowned.is_empty()) {
-            unavailable = Some("There is nothing left here to unlock".to_string());
+            unavailable = Some(if kind == Kind::ModifiedEmote { "You have none of this channel's emotes to change yet".to_string() } else { "There is nothing left here to unlock".to_string() });
         }
         rewards.push(Reward {
             id: id.to_string(),
@@ -233,6 +242,7 @@ fn refusal(answer: &Value, field: &str) -> Option<String> {
         "REWARD_DISABLED" | "REWARD_NOT_ENABLED" | "REWARD_PAUSED" | "REWARD_OUT_OF_STOCK" => "That reward is not available right now".to_string(),
         "CHANNEL_NOT_LIVE" | "STREAM_NOT_LIVE" => "That reward can be had while the channel is live".to_string(),
         "NOT_FOUND" | "POLL_NOT_FOUND" | "EVENT_NOT_FOUND" | "CLAIM_NOT_FOUND" => "That is no longer there".to_string(),
+        "INVALID_EMOTE" | "EMOTE_NOT_UNLOCKABLE" | "EMOTE_ALREADY_UNLOCKED" | "EMOTE_NOT_FOUND" => "Twitch will not unlock that emote (it may already be yours, or not in this channel's pool)".to_string(),
         "MAX_POINTS_EXCEEDED" => "That is more than the channel allows on one prediction".to_string(),
         other => format!("Twitch refused: {}", other.to_lowercase().replace('_', " ")),
     })
@@ -393,9 +403,17 @@ pub async fn points_in_buffer(state: &AppState, root: &str, buffer_id: &str) -> 
     Ok(points)
 }
 
-/// The names of the emotes this account can already use in a conversation's channel.
+/// The ids of the emotes this account can already use in a conversation's channel (the picker's entries are named by
+/// a token that carries the id: `[twitch:emote:<id>:<name>]`).
 fn owned_emotes(state: &AppState, account_id: &str, buffer_id: &str) -> std::collections::HashSet<String> {
-    state.runtime.emoji_catalogue(account_id).into_iter().filter(|s| s.buffers.iter().any(|b| b == buffer_id)).flat_map(|s| s.emoji).map(|e| e.name).collect()
+    state
+        .runtime
+        .emoji_catalogue(account_id)
+        .into_iter()
+        .filter(|s| s.buffers.iter().any(|b| b == buffer_id))
+        .flat_map(|s| s.emoji)
+        .filter_map(|e| e.id.strip_prefix("[twitch:").and_then(|t| t.split(':').nth(1)).map(str::to_string))
+        .collect()
 }
 
 /// The rewards of a conversation's channel, and the balance, for the panel; the balance is also said to the window.
@@ -405,6 +423,14 @@ pub async fn rewards_in_buffer(state: &AppState, root: &str, buffer_id: &str) ->
     let owned = owned_emotes(state, &cfg.account_id(), buffer_id);
     let (_, rewards, points) = rewards(state, &http, root, &channel, &owned, Some(&cfg.web_token)).await?;
     state.events.emit("twitchPoints", json!({ "bufferId": buffer_id, "points": points.balance, "name": points.name }));
+    // Twitch's proof that this is a browser takes a few seconds to make the first time (and then lasts for hours):
+    // made now, while the panel is being read, so a press of Redeem is not what waits for it.
+    if rewards.iter().any(|r| r.enabled && r.kind != Kind::Other) {
+        let (state, token) = (state.clone(), cfg.web_token.clone());
+        tokio::spawn(async move {
+            playback::warm_up(&state, &token).await;
+        });
+    }
     Ok((rewards, points))
 }
 
@@ -609,7 +635,7 @@ mod tests {
         println!("bet on a prediction that is not there: {:?}", bet(&state, &http, root, "00000000-0000-0000-0000-000000000000", "00000000-0000-0000-0000-000000000001", 10, Some(&token)).await);
     }
 
-    const REWARDS_ANSWER: &str = r##"{"data":{"user":{"subscriptionProducts":[{"tier":"1000","emotes":[{"id":"e1","token":"binxbWut"},{"id":"e2","token":"binxbYAP"},{"id":"e3","token":"binxbDrama"}]}],"channel":{"id":"71","self":{"communityPoints":{"balance":600}},"communityPointsSettings":{"name":"Sloths","customRewards":[
+    const REWARDS_ANSWER: &str = r##"{"data":{"user":{"channel":{"id":"71","self":{"communityPoints":{"balance":600}},"communityPointsSettings":{"name":"Sloths","customRewards":[
         {"id":"r1","title":"Drink water","cost":500,"prompt":null,"isEnabled":true,"isPaused":false,"isInStock":true,"isUserInputRequired":false,"backgroundColor":"#6BB7FA","image":null,"defaultImage":{"url":"https://img/default.png"}},
         {"id":"r2","title":"Say a name","cost":100,"prompt":"Who?","isEnabled":true,"isPaused":false,"isInStock":true,"isUserInputRequired":true,"backgroundColor":"#E37C10","image":{"url":"https://img/own.png"},"defaultImage":null},
         {"id":"r3","title":"Dance","cost":50,"prompt":null,"isEnabled":true,"isPaused":true,"isInStock":true,"isUserInputRequired":false,"backgroundColor":null,"image":null,"defaultImage":null},
@@ -620,7 +646,7 @@ mod tests {
         {"id":"71:CHOSEN_MODIFIED_SUB_EMOTE_UNLOCK","type":"CHOSEN_MODIFIED_SUB_EMOTE_UNLOCK","cost":900,"defaultCost":900,"isEnabled":true,"defaultBackgroundColor":"#00FA05","backgroundColor":null,"defaultImage":null},
         {"id":"71:SINGLE_MESSAGE_BYPASS_SUB_MODE","type":"SINGLE_MESSAGE_BYPASS_SUB_MODE","cost":350,"defaultCost":350,"isEnabled":true,"defaultBackgroundColor":"#9146FF","backgroundColor":null,"defaultImage":null},
         {"id":"71:SEND_GIGANTIFIED_EMOTE","type":"SEND_GIGANTIFIED_EMOTE","cost":null,"defaultCost":0,"isEnabled":true,"defaultBackgroundColor":"#69B6FF","backgroundColor":null,"defaultImage":null}],
-        "emoteVariants":[{"id":"e3","modifications":[{"id":"e3_BW"},{"id":"e3_SG"}]}]}}}}}"##;
+        "emoteVariants":[{"id":"e1","isUnlockable":true,"emote":{"id":"e1","token":"binxbWut"},"modifications":[]},{"id":"e2","isUnlockable":true,"emote":{"id":"e2","token":"binxbYAP"},"modifications":[]},{"id":"e3","isUnlockable":true,"emote":{"id":"e3","token":"binxbDrama"},"modifications":[{"id":"e3_BW"},{"id":"e3_SG"}]},{"id":"e4","isUnlockable":false,"emote":{"id":"e4","token":"binxbNope"},"modifications":[{"id":"e4_BW"}]}]}}}}}"##;
 
     #[test]
     fn a_channels_rewards_are_read_with_what_makes_each_available() {
@@ -635,20 +661,21 @@ mod tests {
 
     #[test]
     fn twitchs_own_rewards_are_listed_with_what_each_takes_and_the_bits_ones_are_left_out() {
-        let owned: std::collections::HashSet<String> = ["binxbWut".to_string()].into_iter().collect();
+        let owned: std::collections::HashSet<String> = ["e1", "e3"].iter().map(|s| s.to_string()).collect();
         let (_, rewards, _) = read_rewards(&serde_json::from_str(REWARDS_ANSWER).unwrap(), &owned).unwrap();
         let auto: Vec<&Reward> = rewards.iter().filter(|r| r.kind != Kind::Custom).collect();
         let kinds: Vec<(Kind, u64, bool)> = auto.iter().map(|r| (r.kind, r.cost, r.needs_input)).collect();
         // Highlight (typed), random, chosen, modified, and the one that is sent from twitch.tv; the Bits one is not here.
         assert_eq!(kinds, vec![(Kind::Highlight, 100, true), (Kind::RandomEmote, 320, false), (Kind::ChosenEmote, 480, false), (Kind::ModifiedEmote, 900, false), (Kind::Other, 350, false)]);
-        // What the account already has is not offered again; a change is offered for each version.
+        // What the account already has is not offered again, nor is an emote Twitch does not put in the pool; a change is
+        // offered only for an emote the account has.
         let chosen: Vec<&str> = auto[2].choices.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(chosen, vec!["binxbYAP", "binxbDrama"]);
+        assert_eq!(chosen, vec!["binxbYAP"]);
         let modified: Vec<&str> = auto[3].choices.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(modified, vec!["binxbDrama, black and white", "binxbDrama, with sunglasses"]);
         assert_eq!(auto[4].unavailable.as_deref(), Some("Send this one from twitch.tv's chat box"));
         // With every emote owned there is nothing to unlock, which is said.
-        let all: std::collections::HashSet<String> = ["binxbWut", "binxbYAP", "binxbDrama"].iter().map(|s| s.to_string()).collect();
+        let all: std::collections::HashSet<String> = ["e1", "e2", "e3"].iter().map(|s| s.to_string()).collect();
         let (_, none_left, _) = read_rewards(&serde_json::from_str(REWARDS_ANSWER).unwrap(), &all).unwrap();
         let chosen_none = none_left.iter().find(|r| r.kind == Kind::ChosenEmote).unwrap();
         assert_eq!(chosen_none.unavailable.as_deref(), Some("There is nothing left here to unlock"));

@@ -200,6 +200,12 @@ async fn obtain_integrity(state: &AppState, session: Option<&str>) -> Option<Int
     }
 }
 
+/// Makes the integrity token for a session ahead of the call that will want it (it takes a few seconds and lasts
+/// hours), so that call does not wait for it. Nothing is said if it cannot be made: the call tries again then.
+pub async fn warm_up(state: &AppState, session: &str) {
+    let _ = obtain_integrity(state, Some(session)).await;
+}
+
 /// One call to the GraphQL as the person's twitch.tv session, with an integrity token if Twitch asks for one.
 /// Answers the JSON, whose own `errors` are the caller's to read; a refusal for want of integrity is a `NeedsIntegrity`.
 pub async fn call_as_session(state: &AppState, http: &reqwest::Client, gql_root: &str, body: &Value, web_token: &str) -> Result<Value, PlaybackError> {
