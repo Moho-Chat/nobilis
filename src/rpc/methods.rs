@@ -18,6 +18,9 @@ fn channel_account(state: &AppState, buffer_id: &str) -> String {
     state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default()
 }
 
+/// What a vote or a bet on a Twitch channel is told: its polls and predictions are shown, not answered.
+const TWITCH_WATCH_ONLY: &str = "moho shows a Twitch channel's polls and predictions as they happen; answering them is done on twitch.tv";
+
 fn kick_credential(state: &AppState, account_id: &str) -> std::result::Result<(reqwest::Client, String), String> {
     let cfg = state.accounts.get_kick(account_id).ok_or_else(|| "no such account".to_string())?;
     let token = cfg
@@ -4354,6 +4357,9 @@ pub async fn dispatch(
                 "timeout" => Action::Timeout { user: login, seconds: params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(600), reason },
                 "ban" => Action::Ban { user: login, reason },
                 "unban" => Action::Unban { user: login },
+                "block" => Action::Block { user: login },
+                "unblock" => Action::Unblock { user: login },
+                "shoutout" => Action::Shoutout { user: login },
                 other => return (None, Some(format!("no Twitch moderation action called {other}"))),
             };
             let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
@@ -4981,6 +4987,9 @@ pub async fn dispatch(
                     };
                 }
             }
+            if channel_account(state, buffer_id).starts_with("twitch:") {
+                return (None, Some(TWITCH_WATCH_ONLY.to_string()));
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -5008,6 +5017,9 @@ pub async fn dispatch(
                 return (None, Some("betPrediction requires \"optionId\"".to_string()));
             };
             let amount = params.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+            if channel_account(state, buffer_id).starts_with("twitch:") {
+                return (None, Some(TWITCH_WATCH_ONLY.to_string()));
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };

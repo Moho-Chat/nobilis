@@ -115,6 +115,26 @@ impl Table {
         self.by_name.insert(e.name.clone(), e);
     }
 
+    #[cfg(test)]
+    pub fn add_for_test(&mut self, e: Emote) {
+        self.add(e);
+    }
+
+    /// Takes one out by the word it is typed as.
+    fn remove_name(&mut self, name: &str) {
+        if self.by_name.remove(name).is_some() {
+            self.order.retain(|n| n != name);
+        }
+    }
+
+    /// Takes one out by its id, for a service that says which emote went and not what it was called.
+    fn remove_id(&mut self, id: &str) {
+        let names: Vec<String> = self.by_name.values().filter(|e| e.id == id).map(|e| e.name.clone()).collect();
+        for name in names {
+            self.remove_name(&name);
+        }
+    }
+
     pub fn get(&self, word: &str) -> Option<&Emote> {
         self.by_name.get(word)
     }
@@ -209,6 +229,8 @@ struct Held {
     global: HashMap<Provider, Arc<Table>>,
     /// By channel login.
     channels: HashMap<String, HashMap<Provider, Arc<Table>>>,
+    /// The 7TV emote set each channel uses, which 7TV's live changes are keyed by.
+    seventv_sets: HashMap<String, String>,
 }
 
 fn held() -> &'static Mutex<Held> {
@@ -231,7 +253,92 @@ pub fn keep(provider: Provider, channel: Option<&str>, table: Table) {
 
 /// Forgets a channel's tables, when it is closed.
 pub fn forget(channel: &str) {
-    held().lock().unwrap().channels.remove(channel);
+    let mut held = held().lock().unwrap();
+    held.channels.remove(channel);
+    held.seventv_sets.remove(channel);
+}
+
+/// The 7TV set a channel's emotes came from, if it has one.
+pub fn seventv_set(channel: &str) -> Option<String> {
+    held().lock().unwrap().seventv_sets.get(channel).cloned()
+}
+
+/// One change to a table that a service announced as it happened.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// Added, or - if the word is already one - replaced.
+    Add(Emote),
+    /// Gone, by the word it was typed as.
+    RemoveName(String),
+    /// Gone, by id.
+    RemoveId(String),
+}
+
+/// Applies changes to a channel's table for one service. A channel not held (closed since) is left alone, and
+/// so is a change to nothing: the next full fetch is the truth, this keeps it fresh in between.
+pub fn apply(provider: Provider, channel: &str, changes: &[Change]) {
+    if changes.is_empty() {
+        return;
+    }
+    let mut held = held().lock().unwrap();
+    let Some(slot) = held.channels.get_mut(channel).and_then(|c| c.get_mut(&provider)) else { return };
+    let mut table = (**slot).clone();
+    for change in changes {
+        match change {
+            Change::Add(e) => table.add(e.clone()),
+            Change::RemoveName(n) => table.remove_name(n),
+            Change::RemoveId(id) => table.remove_id(id),
+        }
+    }
+    *slot = Arc::new(table);
+}
+
+/// What a 7TV `emote_set.update` dispatch changed: emotes pushed in, pulled out, or renamed or swapped.
+pub fn read_seventv_changes(body: &Value) -> Vec<Change> {
+    let emote = |v: &Value| -> Option<Emote> {
+        let (id, name) = (text(v, "id")?, text(v, "name")?);
+        Some(Emote { provider: Provider::SevenTv, id, name, animated: v.pointer("/data/animated").and_then(|a| a.as_bool()).unwrap_or(false) })
+    };
+    let mut out = Vec::new();
+    let about_emotes = |c: &Value| c.get("key").and_then(|k| k.as_str()) == Some("emotes");
+    for c in body.get("pulled").and_then(|p| p.as_array()).into_iter().flatten().filter(|c| about_emotes(c)) {
+        if let Some(name) = c.get("old_value").and_then(|v| text(v, "name")) {
+            out.push(Change::RemoveName(name));
+        }
+    }
+    for c in body.get("updated").and_then(|p| p.as_array()).into_iter().flatten().filter(|c| about_emotes(c)) {
+        if let Some(name) = c.get("old_value").and_then(|v| text(v, "name")) {
+            out.push(Change::RemoveName(name));
+        }
+        if let Some(e) = c.get("value").and_then(emote) {
+            if !c.pointer("/value/flags").and_then(|f| f.as_u64()).is_some_and(|f| f & 1 == 1) {
+                out.push(Change::Add(e));
+            }
+        }
+    }
+    for c in body.get("pushed").and_then(|p| p.as_array()).into_iter().flatten().filter(|c| about_emotes(c)) {
+        if let Some(e) = c.get("value").and_then(emote) {
+            if !c.pointer("/value/flags").and_then(|f| f.as_u64()).is_some_and(|f| f & 1 == 1) {
+                out.push(Change::Add(e));
+            }
+        }
+    }
+    out
+}
+
+/// What a BetterTTV event changed.
+pub fn read_bttv_change(event: &Value) -> Option<Change> {
+    let data = event.get("data")?;
+    match event.get("name")?.as_str()? {
+        "emote_create" | "emote_update" => {
+            let e = data.get("emote")?;
+            let (id, code) = (text(e, "id")?, text(e, "code")?);
+            let animated = e.get("animated").and_then(|a| a.as_bool()).unwrap_or_else(|| e.get("imageType").and_then(|t| t.as_str()) == Some("gif"));
+            Some(Change::Add(Emote { provider: Provider::Bttv, id, name: code, animated }))
+        }
+        "emote_delete" => text(data, "emoteId").map(Change::RemoveId),
+        _ => None,
+    }
 }
 
 
@@ -257,6 +364,13 @@ pub fn find(channel: &str, word: &str) -> Option<Emote> {
         }
     }
     None
+}
+
+/// A channel's own emote by word, whichever provider, ignoring the switches: for tests of what is held.
+#[cfg(test)]
+pub fn find_in(channel: &str, word: &str) -> Option<Emote> {
+    let held = held().lock().unwrap();
+    held.channels.get(channel)?.values().find_map(|t| t.get(word).cloned())
 }
 
 /// Every emote of an enabled service the channel can use, as the picker's sections.
@@ -333,7 +447,12 @@ pub async fn load_channel(http: &reqwest::Client, roots: &Roots, login: &str, ro
         let answer = match provider {
             Provider::Bttv => fetch(http, &format!("{}/cached/users/twitch/{room_id}", roots.bttv)).await.map(|a| read_bttv(&a)),
             Provider::Ffz => fetch(http, &format!("{}/room/id/{room_id}", roots.ffz)).await.map(|a| read_ffz(&a)),
-            Provider::SevenTv => fetch(http, &format!("{}/users/twitch/{room_id}", roots.seventv)).await.map(|a| read_seventv(&a)),
+            Provider::SevenTv => fetch(http, &format!("{}/users/twitch/{room_id}", roots.seventv)).await.map(|a| {
+                if let Some(set) = a.pointer("/emote_set/id").and_then(|i| i.as_str()) {
+                    held().lock().unwrap().seventv_sets.insert(login.to_string(), set.to_string());
+                }
+                read_seventv(&a)
+            }),
         };
         // Held even when empty: a channel that has none is not asked again.
         keep(provider, Some(login), answer.unwrap_or_default());

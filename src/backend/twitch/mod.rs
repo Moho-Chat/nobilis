@@ -15,11 +15,13 @@
 //! - `moderation` - removing messages, timeouts and bans, the room's modes, whispers: slash commands and menus alike
 //! - `irc` - one line of Twitch's chat: tags, prefix, command, parameters
 //! - `emotes` - BetterTTV, FrankerFaceZ and 7TV's emotes, and whether one of Twitch's own is animated
+//! - `emoteevents` - their changes, as 7TV and BetterTTV announce them
 //! - `badges` - the pictures for the badges beside a name
 //! - `chat` - what the lines mean: messages, cards, removals, a channel's modes
 //! - `gql` - Twitch's own GraphQL, which answers what its official API will not without an account
 //! - `stream` - what is on air in a channel, said as the stream event the window draws
 //! - `playback` - the address of a channel's video, and the integrity token Twitch sometimes wants for it
+//! - `realtime` - what Twitch says as it happens beyond the chat: raids, polls and predictions
 //! - `helix` - Twitch's official API, as far as moho uses it
 //! - `history` - a channel's recent past, from a third-party service, if asked
 //! - `connect` - an account's connection: keeping its token good, and the chat
@@ -32,6 +34,7 @@ pub mod auth;
 pub mod badges;
 pub mod chat;
 pub mod connect;
+pub mod emoteevents;
 pub mod emotes;
 pub mod gql;
 pub mod helix;
@@ -40,6 +43,7 @@ pub mod irc;
 pub mod login;
 pub mod moderation;
 pub mod playback;
+pub mod realtime;
 pub mod stream;
 
 pub use connect::{spawn, Command};

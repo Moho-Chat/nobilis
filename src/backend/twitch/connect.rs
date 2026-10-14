@@ -64,6 +64,8 @@ pub fn spawn(state: AppState, config: TwitchAccountConfig) {
     // reconnecting waits in the queue and is made when it is back.
     let (tx, rx) = mpsc::unbounded_channel::<Command>();
     state.runtime.set_twitch_sender(&account_id, tx);
+    let realtime = super::realtime::register(&account_id);
+    let emote_events = super::emoteevents::register(&account_id);
     let join_handle = tokio::spawn({
         let account_id = account_id.clone();
         let state = state.clone();
@@ -73,6 +75,9 @@ pub fn spawn(state: AppState, config: TwitchAccountConfig) {
             tokio::select! {
                 _ = keeper(&state, &account_id, auth::ID_ROOT) => {}
                 _ = chat_loop(&state, &account_id, rx) => {}
+                // Raids, polls and predictions, heard from Twitch's own realtime service.
+                _ = super::emoteevents::run(emote_events, super::emoteevents::SEVENTV_URL.to_string(), super::emoteevents::BTTV_URL.to_string()) => {}
+                _ = super::realtime::run(state.clone(), account_id.clone(), realtime, super::realtime::HERMES_URL.to_string(), super::gql::ROOT.to_string()) => {}
             }
             state.runtime.remove_task_handle(&account_id);
         }
@@ -332,6 +337,9 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                                 if timing.watch_streams {
                                     let (state, account_id, channel) = (state.clone(), account_id.to_string(), channel.clone());
                                     let room = rooms.room_ids.get(&channel).cloned();
+                                    if let Some(room) = room.as_deref() {
+                                        super::realtime::watch(&account_id, &channel, room);
+                                    }
                                     tokio::spawn(async move {
                                         let (refreshing, extras) = (super::stream::refresh(&state, &account_id, std::slice::from_ref(&channel)), load_extras(&state, &account_id, &channel, room.as_deref()));
                                         tokio::join!(refreshing, extras);
@@ -385,6 +393,8 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                             socket.send(WsMessage::Text(format!("PART #{channel}\r\n"))).await?;
                         }
                         rooms.forget_channel(&channel);
+                        super::realtime::unwatch(account_id, &channel);
+                        super::emoteevents::unwatch(account_id, &channel);
                         super::emotes::forget(&channel);
                         super::badges::forget(&channel);
                         let _ = state.accounts.mutate_twitch(account_id, |a| a.channels.retain(|c| *c != channel));
@@ -452,6 +462,8 @@ async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id:
     super::badges::load_global(&http, super::gql::ROOT).await;
     if let Some(room) = room_id {
         super::emotes::load_channel(&http, &super::emotes::ROOTS, channel, room).await;
+        // Kept current from here on, now that the 7TV set it uses is known.
+        super::emoteevents::watch(account_id, channel, room);
     }
     super::badges::load_channel(&http, super::gql::ROOT, channel).await;
 
@@ -504,6 +516,8 @@ fn scope_for(action: &super::moderation::Action) -> &'static str {
         Announce { .. } => "moderator:manage:announcements",
         Color(_) => "user:manage:chat_color",
         Whisper { .. } => "user:manage:whispers",
+        Block { .. } | Unblock { .. } => "user:manage:blocked_users",
+        Shoutout { .. } => "moderator:manage:shoutouts",
     }
 }
 
@@ -521,11 +535,16 @@ async fn act(
         return Err("Sign in to Twitch from Accounts first".into());
     };
     if !cfg.scopes.iter().any(|s| s == scope_for(action)) {
-        return Err("Turn moderation on for this account in Accounts first: it was signed in without the right to do that".into());
+        return Err(if auth::has_moderation(&cfg.scopes) {
+            "This sign-in predates that right. Turn moderation on again in Accounts to add it".into()
+        } else {
+            "Turn moderation on for this account in Accounts first: it was signed in without the right to do that".into()
+        });
     }
-    let is_whisper = matches!(action, super::moderation::Action::Whisper { .. });
+    use super::moderation::Action as A;
+    let is_whisper = matches!(action, A::Whisper { .. });
     let room_id = rooms.room_ids.get(channel).cloned().unwrap_or_default();
-    if !is_whisper && !matches!(action, super::moderation::Action::Color(_)) && room_id.is_empty() {
+    if !is_whisper && !matches!(action, A::Color(_) | A::Block { .. } | A::Unblock { .. }) && room_id.is_empty() {
         return Err(format!("Twitch has not told this account about {channel} yet"));
     }
     let http = super::client().map_err(|e| format!("{e:#}"))?;

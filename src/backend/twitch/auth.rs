@@ -53,6 +53,8 @@ pub const MODERATION_SCOPES: &[(&str, &str)] = &[
     ("user:manage:chat_color", "change your name colour"),
     ("user:manage:whispers", "send whispers"),
     ("whispers:read", "read whispers sent to you"),
+    ("moderator:manage:shoutouts", "give shoutouts"),
+    ("user:manage:blocked_users", "block and unblock people"),
 ];
 
 /// The scopes as Twitch wants them in a request: one string, space between.

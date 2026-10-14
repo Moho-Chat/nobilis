@@ -217,6 +217,21 @@ pub async fn set_color(http: &reqwest::Client, who: &Caller<'_>, user_id: &str, 
     request(http, who, reqwest::Method::PUT, "/chat/color", &[("user_id", user_id), ("color", color)], None).await.map(|_| ())
 }
 
+/// Blocks somebody (for the account, on Twitch's side, everywhere).
+pub async fn block(http: &reqwest::Client, who: &Caller<'_>, user_id: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::PUT, "/users/blocks", &[("target_user_id", user_id)], None).await.map(|_| ())
+}
+
+/// Lets somebody through again.
+pub async fn unblock(http: &reqwest::Client, who: &Caller<'_>, user_id: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::DELETE, "/users/blocks", &[("target_user_id", user_id)], None).await.map(|_| ())
+}
+
+/// Points the channel's viewers at another channel, in chat.
+pub async fn shoutout(http: &reqwest::Client, who: &Caller<'_>, room: &Room<'_>, to_id: &str) -> Result<(), HelixError> {
+    request(http, who, reqwest::Method::POST, "/chat/shoutouts", &[("from_broadcaster_id", room.broadcaster_id), ("to_broadcaster_id", to_id), ("moderator_id", room.moderator_id)], None).await.map(|_| ())
+}
+
 /// Sends a whisper.
 pub async fn whisper(http: &reqwest::Client, who: &Caller<'_>, from_id: &str, to_id: &str, message: &str) -> Result<(), HelixError> {
     request(http, who, reqwest::Method::POST, "/whispers", &[("from_user_id", from_id), ("to_user_id", to_id)], Some(serde_json::json!({ "message": message }))).await.map(|_| ())

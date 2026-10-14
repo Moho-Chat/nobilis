@@ -33,13 +33,18 @@ pub enum Action {
     Announce { text: String, color: String },
     Color(String),
     Whisper { to: String, text: String },
+    /// Twitch's own block list, for the account.
+    Block { user: String },
+    Unblock { user: String },
+    /// A shoutout to another channel, in this one.
+    Shoutout { user: String },
 }
 
 impl Action {
     /// Whether it is something a moderator does to the room, which needs the
     /// right to, as against what a person does as themselves.
     pub fn needs_moderator(&self) -> bool {
-        !matches!(self, Action::Color(_) | Action::Whisper { .. })
+        !matches!(self, Action::Color(_) | Action::Whisper { .. } | Action::Block { .. } | Action::Unblock { .. })
     }
 }
 
@@ -133,6 +138,9 @@ pub fn parse(text: &str) -> Option<Result<Action, String>> {
         "color" => {
             if rest.is_empty() { Err("/color needs a colour: a name like coral or blue_violet, or #rrggbb with Twitch Turbo or Prime".to_string()) } else { Ok(Action::Color(rest.split_whitespace().next().unwrap_or("").to_string())) }
         }
+        "block" => user(words.next()).map(|who| Action::Block { user: who }),
+        "unblock" => user(words.next()).map(|who| Action::Unblock { user: who }),
+        "shoutout" | "so" => user(words.next()).map(|who| Action::Shoutout { user: who }),
         "w" | "whisper" => match (words.next().and_then(login_of), words.collect::<Vec<_>>().join(" ")) {
             (Some(to), text) if !text.is_empty() => Ok(Action::Whisper { to, text }),
             _ => Err("/w needs a name and a message: /w <name> <message>".to_string()),
@@ -207,6 +215,18 @@ pub async fn run(http: &reqwest::Client, cx: &Ctx<'_>, action: &Action, target_i
         Action::Unique(on) => said(helix::chat_settings(http, &who, &room, serde_json::json!({ "unique_chat_mode": on })).await, format!("Unique-chat mode is {}", if *on { "on" } else { "off" })),
         Action::Announce { text, color } => said(helix::announce(http, &who, &room, text, color).await, "Announced".to_string()),
         Action::Color(color) => said(helix::set_color(http, &who, cx.my_id, color).await, format!("Your name is {color}")),
+        Action::Block { user } => {
+            let id = resolve(user).await?;
+            said(helix::block(http, &who, &id).await, format!("{user} is blocked"))
+        }
+        Action::Unblock { user } => {
+            let id = resolve(user).await?;
+            said(helix::unblock(http, &who, &id).await, format!("{user} is unblocked"))
+        }
+        Action::Shoutout { user } => {
+            let id = resolve(user).await?;
+            said(helix::shoutout(http, &who, &room, &id).await, format!("Shouted out {user}"))
+        }
         Action::Whisper { to, text } => {
             let id = resolve(to).await?;
             said(helix::whisper(http, &who, cx.my_id, &id, text).await, format!("Whisper sent to {to}"))
@@ -279,6 +299,9 @@ mod tests {
         assert_eq!(ok("/announcegreen Hello"), Action::Announce { text: "Hello".into(), color: "green".into() });
         assert!(parse("/announce").unwrap().is_err());
         assert_eq!(ok("/color coral"), Action::Color("coral".into()));
+        assert_eq!((ok("/block @Bob"), ok("/unblock bob")), (Action::Block { user: "bob".into() }, Action::Unblock { user: "bob".into() }));
+        assert_eq!(ok("/so Bob"), Action::Shoutout { user: "bob".into() });
+        assert!(!Action::Block { user: "x".into() }.needs_moderator() && Action::Shoutout { user: "x".into() }.needs_moderator());
         assert_eq!(ok("/w @Bob hello there"), Action::Whisper { to: "bob".into(), text: "hello there".into() });
         assert!(parse("/w bob").unwrap().is_err());
         assert!(!Action::Color("x".into()).needs_moderator() && Action::Slow(None).needs_moderator());
