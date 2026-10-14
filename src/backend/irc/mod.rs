@@ -35,6 +35,7 @@ pub mod typing;
 pub mod dcc;
 pub mod nickserv;
 pub mod metadata;
+pub mod modes;
 pub mod sts;
 pub mod sasl;
 pub mod latesasl;
