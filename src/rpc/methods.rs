@@ -4254,9 +4254,7 @@ pub async fn dispatch(
         // events: see backend/twitch/login.rs.
         "startTwitchLogin" => {
             let login_id = format!("twitch-{}", crate::model::next_message_id());
-            // With the rights to moderate and whisper added, when the account's card asked for them.
-            let moderation = params.get("moderation").and_then(|v| v.as_bool()).unwrap_or(false);
-            backend::twitch::login::start(state.clone(), login_id.clone(), moderation);
+            backend::twitch::login::start(state.clone(), login_id.clone());
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 

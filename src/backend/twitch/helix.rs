@@ -128,7 +128,7 @@ impl std::fmt::Display for HelixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HelixError::Refused(why) => write!(f, "{why}"),
-            HelixError::Auth(why) => write!(f, "Twitch does not allow this for this account{}. Turn moderation on for it in Accounts, or sign in again.", if why.is_empty() { String::new() } else { format!(" ({why})") }),
+            HelixError::Auth(why) => write!(f, "Twitch does not allow this for this account{}. Sign in again from Accounts to refresh what it may do.", if why.is_empty() { String::new() } else { format!(" ({why})") }),
             HelixError::Failed(e) => write!(f, "{e:#}"),
         }
     }

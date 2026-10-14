@@ -574,11 +574,7 @@ async fn act(
         return Err("Sign in to Twitch from Accounts first".into());
     };
     if !cfg.scopes.iter().any(|s| s == scope_for(action)) {
-        return Err(if auth::has_moderation(&cfg.scopes) {
-            "This sign-in predates that right. Turn moderation on again in Accounts to add it".into()
-        } else {
-            "Turn moderation on for this account in Accounts first: it was signed in without the right to do that".into()
-        });
+        return Err("This sign-in was made before that was part of signing in. Sign in again from Accounts to add it".into());
     }
     use super::moderation::Action as A;
     let is_whisper = matches!(action, A::Whisper { .. });

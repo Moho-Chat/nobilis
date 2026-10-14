@@ -8,9 +8,10 @@
 //! are used to typing and makes the calls. The window's own menus - a message's
 //! Delete, a name's Time out - make the same ones.
 //!
-//! Only for accounts that were given the rights: signing in asks for no more
-//! than chatting needs, and moderation is turned on from the account's card,
-//! which signs in again with these added (see `auth::MODERATION_SCOPES`).
+//! The rights come with signing in (see `auth::MODERATION_SCOPES`), so one sign-in has every feature;
+//! what an account may actually do in a channel is Twitch's to say on each call, and moho offers
+//! the menus only where the account is a moderator or the broadcaster. An account signed in before
+//! they were part of it is told to sign in again.
 
 use super::helix::{self, Caller, Room};
 use crate::state::AppState;
@@ -412,7 +413,7 @@ mod tests {
         let e = run(&client, &cx(&root, true), &Action::Ban { user: "bob".into(), reason: String::new() }, Some("7")).await.unwrap_err();
         assert!(e.contains("already banned"), "{e}");
         let e = run(&client, &cx(&root, true), &Action::Ban { user: "bob".into(), reason: String::new() }, Some("7")).await.unwrap_err();
-        assert!(e.contains("Turn moderation on"), "{e}");
+        assert!(e.contains("Sign in again"), "{e}");
         // Whispers and colours are what a person does as themselves, with no moderator needed.
         let (root, _) = helix_server(vec![(204, "{}"), (204, "{}")]).await;
         run(&client, &cx(&root, false), &Action::Color("coral".into()), None).await.unwrap();
