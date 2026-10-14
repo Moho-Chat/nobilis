@@ -411,6 +411,75 @@ impl SteamAccountConfig {
     }
 }
 
+/// A Twitch account: a signed-in person, or an anonymous reader.
+///
+/// What is kept is the pair of tokens the device flow handed back (see
+/// backend/twitch/auth.rs), never a password - Twitch's sign-in happens on
+/// twitch.tv, in the person's own browser, and moho only ever sees the result.
+/// The access token lasts four hours and is renewed with the refresh token,
+/// which Twitch lets go of after thirty days unused.
+///
+/// An anonymous reader has neither and reads every channel, as a signed-out
+/// Kick account does; sending needs the sign-in.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TwitchAccountConfig {
+    /// The login, lower-case: Twitch does not tell "Someone" and "someone"
+    /// apart, and neither can the id built from it. Empty when anonymous.
+    #[serde(default)]
+    pub login: String,
+    /// Twitch's own number for the account, which is what its API is keyed by
+    /// and which survives the login being renamed.
+    #[serde(default)]
+    pub user_id: String,
+    /// What to call this account here. Local: Twitch is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    /// When the access token stops working, in Unix seconds.
+    #[serde(default)]
+    pub expires_at: i64,
+    /// What the person agreed to when they signed in.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The channels this account has open, by login, so they come back.
+    #[serde(default)]
+    pub channels: Vec<String>,
+    /// An account with no sign-in, which reads and does not send.
+    #[serde(default)]
+    pub anonymous: bool,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy
+    /// set in the network settings. Off by default.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's
+    /// conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+/// The id of the one anonymous Twitch account. A `~` cannot be in a Twitch
+/// login, so no signed-in account can ever have it.
+pub const TWITCH_ANONYMOUS_ID: &str = "twitch:~anonymous";
+
+impl TwitchAccountConfig {
+    pub fn account_id(&self) -> String {
+        if self.anonymous {
+            TWITCH_ANONYMOUS_ID.to_string()
+        } else {
+            format!("twitch:{}", self.login)
+        }
+    }
+
+    /// Whether there is a sign-in behind this account: what "signed in" means
+    /// for one that never keeps a password.
+    pub fn is_signed_in(&self) -> bool {
+        !self.anonymous && !self.access_token.is_empty()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -429,6 +498,8 @@ struct AccountsFile {
     kick: Vec<KickAccountConfig>,
     #[serde(default, rename = "steam_account")]
     steam: Vec<SteamAccountConfig>,
+    #[serde(default, rename = "twitch_account")]
+    twitch: Vec<TwitchAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -446,6 +517,8 @@ pub struct AccountStore {
     /// predate Steam did not each need a sixth argument. Anything that
     /// changes this map must let go of its lock before it calls `persist`.
     steam: Mutex<HashMap<String, SteamAccountConfig>>,
+    /// Read by `persist` the same way, for the same reason.
+    twitch: Mutex<HashMap<String, TwitchAccountConfig>>,
 }
 
 impl AccountStore {
@@ -456,7 +529,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -467,11 +540,21 @@ impl AccountStore {
             let matrix = file.matrix.into_iter().map(|a| (a.account_id(), a)).collect();
             let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
             let steam = file.steam.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam)
+            let twitch = file.twitch.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
-        Ok(Self { path, irc: Mutex::new(irc), discord: Mutex::new(discord), sneedchat: Mutex::new(sneedchat), matrix: Mutex::new(matrix), kick: Mutex::new(kick), steam: Mutex::new(steam) })
+        Ok(Self {
+            path,
+            irc: Mutex::new(irc),
+            discord: Mutex::new(discord),
+            sneedchat: Mutex::new(sneedchat),
+            matrix: Mutex::new(matrix),
+            kick: Mutex::new(kick),
+            steam: Mutex::new(steam),
+            twitch: Mutex::new(twitch),
+        })
     }
 
     /// Callers already hold whichever map they just mutated - the others
@@ -492,6 +575,7 @@ impl AccountStore {
             matrix: matrix.values().cloned().collect(),
             kick: kick.values().cloned().collect(),
             steam: self.steam.lock().unwrap().values().cloned().collect(),
+            twitch: self.twitch.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -680,6 +764,52 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_twitch(&self, account_id: &str) -> Option<TwitchAccountConfig> {
+        self.twitch.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_twitch(&self) -> Vec<TwitchAccountConfig> {
+        self.twitch.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again with the same login is how a token Twitch has
+    /// stopped accepting gets replaced. What the person set up on the account
+    /// - its route, its name here, the channels it had open - stays.
+    pub fn add_twitch(&self, mut config: TwitchAccountConfig) -> Result<TwitchAccountConfig> {
+        config.login = config.login.trim().to_lowercase();
+        let id = config.account_id();
+        {
+            let mut twitch = self.twitch.lock().unwrap();
+            if let Some(old) = twitch.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+                if config.channels.is_empty() {
+                    config.channels = old.channels.clone();
+                }
+            }
+            twitch.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Twitch account, and writes the file. `false` when there is
+    /// no such account. The lock is let go before the write.
+    pub fn mutate_twitch(&self, account_id: &str, change: impl FnOnce(&mut TwitchAccountConfig)) -> Result<bool> {
+        {
+            let mut twitch = self.twitch.lock().unwrap();
+            match twitch.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
     pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
@@ -818,6 +948,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.twitch.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -843,6 +977,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_steam(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_twitch(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -920,6 +1057,13 @@ impl AccountStore {
         }
         {
             let removed = self.steam.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.twitch.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1086,6 +1230,9 @@ impl AccountStore {
         if self.mutate_steam(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_twitch(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -1117,6 +1264,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.steam.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.twitch.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -1411,6 +1561,47 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
     }
 }
 
+/// Twitch has none of IRC's concepts either. `has_password` says there is a
+/// token, which is what "signed in" means for an account that never keeps a
+/// password; an anonymous reader has none and says so.
+pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "twitch".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| if a.anonymous { "Anonymous".to_string() } else { a.login.clone() }),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+    }
+}
+
 /// Matrix has none of IRC's autojoin/SASL/NickServ concepts either - same
 /// zero-value convention as discord_account_to_json/sneedchat_account_to_json.
 /// `has_key_backup` comes from the caller (Runtime::list_accounts) rather
@@ -1597,5 +1788,69 @@ mod steam_account_tests {
         assert_eq!(reopened.get_kick("kick:streamer").unwrap().channels, vec!["x".to_string()]);
         assert!(reopened.get_steam("steam:someone").is_some(), "writing another service's account kept this one");
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod twitch_account_tests {
+    use super::*;
+
+    fn store(name: &str) -> AccountStore {
+        let path = std::env::temp_dir().join(format!("nobilis-twitch-accounts-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        AccountStore::open(path).unwrap()
+    }
+
+    fn account(login: &str, access: &str) -> TwitchAccountConfig {
+        TwitchAccountConfig { login: login.into(), user_id: "42".into(), access_token: access.into(), refresh_token: "ref".into(), expires_at: 1000, scopes: vec!["chat:read".into()], ..Default::default() }
+    }
+
+    #[test]
+    fn a_twitch_account_survives_a_restart_with_its_tokens() {
+        let s = store("restart");
+        s.add_twitch(account("Someone", "acc")).unwrap();
+        let text = std::fs::read_to_string(s.path_for_tests()).unwrap();
+        assert!(text.contains("[[twitch_account]]"), "{text}");
+        let reopened = AccountStore::open(s.path_for_tests().to_path_buf()).unwrap();
+        let got = reopened.get_twitch("twitch:someone").expect("found under its lower-case id");
+        assert_eq!((got.login.as_str(), got.user_id.as_str(), got.access_token.as_str(), got.scopes.len()), ("someone", "42", "acc", 1));
+        assert!(got.is_signed_in());
+    }
+
+    #[test]
+    fn an_anonymous_reader_has_an_id_no_login_can_have() {
+        let s = store("anon");
+        let saved = s.add_twitch(TwitchAccountConfig { anonymous: true, ..Default::default() }).unwrap();
+        assert_eq!(saved.account_id(), TWITCH_ANONYMOUS_ID);
+        assert!(!saved.is_signed_in());
+        assert!(!TWITCH_ANONYMOUS_ID.trim_start_matches("twitch:").chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        let json = twitch_account_to_json(&saved, "connected");
+        assert_eq!((json.service.as_str(), json.display_name.as_str(), json.has_password), ("twitch", "Anonymous", false));
+    }
+
+    #[test]
+    fn signing_in_again_keeps_the_route_the_name_and_the_open_channels() {
+        let s = store("again");
+        s.add_twitch(account("someone", "old")).unwrap();
+        s.mutate_twitch("twitch:someone", |a| {
+            a.channels = vec!["xqc".into()];
+            a.display_name = Some("Mine".into());
+        })
+        .unwrap();
+        s.set_route_level("twitch:someone", "strict").unwrap();
+        let again = s.add_twitch(account("SOMEONE", "new")).unwrap();
+        assert_eq!(s.all_twitch().len(), 1, "the same login is the same account");
+        assert_eq!((again.access_token.as_str(), again.channels.clone(), again.display_name.clone()), ("new", vec!["xqc".to_string()], Some("Mine".to_string())));
+        assert!(again.strict_route && again.use_tor, "a sign-in does not take a route away");
+    }
+
+    #[test]
+    fn removing_a_twitch_account_removes_it_from_the_file() {
+        let s = store("remove");
+        s.add_twitch(account("someone", "acc")).unwrap();
+        assert!(s.remove("twitch:someone").unwrap());
+        assert!(s.get_twitch("twitch:someone").is_none());
+        let reopened = AccountStore::open(s.path_for_tests().to_path_buf()).unwrap();
+        assert!(reopened.all_twitch().is_empty());
     }
 }

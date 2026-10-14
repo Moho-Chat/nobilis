@@ -1239,6 +1239,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::steam_account_to_json(cfg, conn, self.own_identity(&id).as_deref())
         }));
+        out.extend(state.accounts.all_twitch().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::twitch_account_to_json(cfg, conn)
+        }));
         out
     }
 

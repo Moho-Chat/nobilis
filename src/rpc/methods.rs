@@ -82,6 +82,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_steam(id) {
             backend::steam::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("twitch:") {
+        if let Some(cfg) = state.accounts.get_twitch(id) {
+            backend::twitch::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -107,6 +111,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
+        "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         _ => None,
     }
 }
@@ -382,6 +387,7 @@ pub async fn dispatch(
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
+                { "id": "twitch", "name": "Twitch", "available": true },
             ])),
             None,
         ),
@@ -727,8 +733,23 @@ pub async fn dispatch(
                 if id.starts_with("discord:") {
                     backend::discord::golive::forget(id);
                 }
+                // A Twitch sign-in is ended at Twitch as well, so removing the
+                // account here does not leave a token good for four more
+                // hours and a refresh token good for thirty days. Best effort:
+                // the account is removed either way.
+                let twitch_tokens = state.accounts.get_twitch(id).filter(|a| a.is_signed_in()).map(|a| (a.access_token, a.refresh_token));
                 match state.accounts.remove(id) {
-                    Ok(true) => (Some(ok_node()), None),
+                    Ok(true) => {
+                        if let Some((access, refresh)) = twitch_tokens {
+                            tokio::spawn(async move {
+                                if let Ok(http) = backend::twitch::client() {
+                                    let _ = backend::twitch::auth::revoke(&http, backend::twitch::auth::ID_ROOT, &access).await;
+                                    let _ = backend::twitch::auth::revoke(&http, backend::twitch::auth::ID_ROOT, &refresh).await;
+                                }
+                            });
+                        }
+                        (Some(ok_node()), None)
+                    }
                     Ok(false) => (None, Some("no such account".to_string())),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }
@@ -776,6 +797,14 @@ pub async fn dispatch(
                         match state.accounts.get_steam(id) {
                             Some(cfg) => {
                                 backend::steam::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("twitch:") {
+                        match state.accounts.get_twitch(id) {
+                            Some(cfg) => {
+                                backend::twitch::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -4097,6 +4126,41 @@ pub async fn dispatch(
             let login_id = format!("steam-{}", crate::model::next_message_id());
             backend::steam::login::start_qr(state.clone(), login_id.clone());
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Adding a Twitch account that only reads: no sign-in, nothing to
+        // wait for. Twitch's chat is public, so an anonymous reader sees every
+        // channel it is pointed at, and one that signs in later gets to send.
+        "addTwitchAccount" => {
+            let config = crate::accounts::TwitchAccountConfig {
+                anonymous: true,
+                use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("twitch")),
+                ..Default::default()
+            };
+            match state.accounts.add_twitch(config) {
+                Ok(saved) => {
+                    backend::twitch::spawn(state.clone(), saved.clone());
+                    (Some(serde_json::json!({ "accountId": saved.account_id() })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Signing in to Twitch takes place over time - the person approves a
+        // code on twitch.tv - so this answers with an id and the rest is
+        // events: see backend/twitch/login.rs.
+        "startTwitchLogin" => {
+            let login_id = format!("twitch-{}", crate::model::next_message_id());
+            backend::twitch::login::start(state.clone(), login_id.clone());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The form was closed with a sign-in still waiting.
+        "cancelTwitchLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::twitch::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
         }
 
         // The code Steam asked for, for a sign-in that is waiting on one.
