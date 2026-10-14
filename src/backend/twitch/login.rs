@@ -126,6 +126,7 @@ pub async fn flow(state: &AppState, login_id: &str, root: &str, stop: Arc<Notify
         scopes: if who.scopes.is_empty() { tokens.scope } else { who.scopes },
         // Signing in again keeps the channels that were open: a renewed
         // sign-in is not a reason to forget where the person was.
+        followed_synced: existing.as_ref().map(|e| e.followed_synced).unwrap_or(false),
         channels: existing.map(|e| e.channels).unwrap_or_default(),
         web_token: String::new(),
         anonymous: false,

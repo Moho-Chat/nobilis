@@ -312,8 +312,9 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                             if line.command == "001" && !welcomed {
                                 welcomed = true;
                                 state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
-                                // What was open last time.
-                                let channels = state.accounts.get_twitch(account_id).map(|a| a.channels).unwrap_or_default();
+                                // What was open last time, and - the first time a signed-in account connects - what it follows.
+                                let mut channels = state.accounts.get_twitch(account_id).map(|a| a.channels).unwrap_or_default();
+                                open_follows(state, account_id, helix, &mut channels).await;
                                 for channel in channels {
                                     state.runtime.ensure_buffer(state, account_id, &channel, "channel");
                                     waiting.push((channel.clone(), tokio::time::Instant::now() + timing.join_patience + timing.join_every * queue.len() as u32, None));
@@ -450,6 +451,44 @@ async fn session(state: &AppState, account_id: &str, rx: &mut mpsc::UnboundedRec
                 }
             }
         }
+    }
+}
+
+/// How many followed channels are opened the first time: the live ones first, then the rest, up to this many.
+const FOLLOWED_OPENED: usize = 100;
+
+/// Adds what a signed-in account follows to the channels to open, once.
+///
+/// Once and never again, as Kick's is - the flag is kept with the account. A list read at every connection would
+/// put back every channel the person had closed, which is the one thing closing a channel is meant to mean; after
+/// this the list is theirs, and "Open everyone I follow" in Accounts reads it again when they want that.
+async fn open_follows(state: &AppState, account_id: &str, helix: &str, channels: &mut Vec<String>) {
+    let Some(cfg) = state.accounts.get_twitch(account_id).filter(|a| a.is_signed_in() && !a.followed_synced) else { return };
+    if !cfg.scopes.iter().any(|s| s == "user:read:follows") || cfg.user_id.is_empty() {
+        return;
+    }
+    let Ok(http) = super::client() else { return };
+    let who = super::helix::Caller { root: helix, client_id: auth::CLIENT_ID, token: &cfg.access_token };
+    let live = super::helix::followed(&http, &who, &cfg.user_id, true, FOLLOWED_OPENED).await;
+    let all = super::helix::followed(&http, &who, &cfg.user_id, false, FOLLOWED_OPENED).await;
+    if let (Err(e), Err(_)) = (&live, &all) {
+        // Not retried at the next connection either, if it had been read before; here it never was, so it is tried again.
+        state.runtime.report_progress(state, account_id, &format!("could not read your Twitch follows: {e:#}"));
+        return;
+    }
+    let before = channels.len();
+    for login in live.unwrap_or_default().into_iter().chain(all.unwrap_or_default()) {
+        if channels.len() - before >= FOLLOWED_OPENED {
+            break;
+        }
+        if !channels.contains(&login) {
+            channels.push(login);
+        }
+    }
+    let _ = state.accounts.mutate_twitch(account_id, |a| a.followed_synced = true);
+    let added = channels.len() - before;
+    if added > 0 {
+        state.runtime.report_progress(state, account_id, &format!("opened {added} channels you follow on Twitch"));
     }
 }
 
@@ -1234,5 +1273,53 @@ mod tests {
         assert!(got.lock().unwrap().iter().any(|l| l == "PRIVMSG #xqc :the old way"));
         assert!(state.store.get_backlog("twitch:someone|xqc", 0, 20).unwrap().iter().any(|m| m.is_own && m.body == "the old way"));
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_first_time_a_signed_in_account_connects_the_channels_it_follows_are_opened_and_never_again() {
+        let state = testkit::simulated_daemon("twitch-follows-open");
+        state
+            .accounts
+            .add_twitch(TwitchAccountConfig {
+                login: "someone".into(),
+                user_id: "42".into(),
+                access_token: "tok".into(),
+                refresh_token: "r".into(),
+                expires_at: chrono::Utc::now().timestamp() + 10_000,
+                scopes: vec!["chat:read".into(), "user:read:follows".into()],
+                channels: vec!["already".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let (helix, seen) = fake_helix(200, r#"{"data":[{"broadcaster_login":"Alpha"},{"broadcaster_login":"beta"},{"broadcaster_login":"already"}]}"#).await;
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let url = fake_twitch(Fake { exists: vec!["alpha", "beta", "already"], got: got.clone(), ..Default::default() }).await;
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let (s, id) = (state.clone(), "twitch:someone");
+        let task = tokio::spawn(async move { session(&s, id, &mut rx, &url, &helix, quick()).await });
+        for _ in 0..100 {
+            if got.lock().unwrap().iter().filter(|l| l.starts_with("JOIN #")).count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        task.abort();
+        let joined: Vec<String> = got.lock().unwrap().iter().filter_map(|l| l.strip_prefix("JOIN #").map(str::to_string)).collect();
+        assert_eq!(joined, vec!["already", "alpha", "beta"], "what was open, then the follows, each once");
+        let requests = seen.lock().unwrap().clone();
+        assert!(requests.iter().any(|r| r.contains("streams/followed")) && requests.iter().any(|r| r.contains("channels/followed")), "{requests:?}");
+        assert!(state.accounts.get_twitch("twitch:someone").unwrap().followed_synced);
+
+        // The next connection opens what is saved and asks about no one.
+        let (helix2, seen2) = fake_helix(200, r#"{"data":[{"broadcaster_login":"gamma"}]}"#).await;
+        let got2 = Arc::new(Mutex::new(Vec::new()));
+        let url2 = fake_twitch(Fake { exists: vec!["gamma", "already", "alpha", "beta"], got: got2.clone(), ..Default::default() }).await;
+        let (_tx2, mut rx2) = mpsc::unbounded_channel();
+        let (s2, id2) = (state.clone(), "twitch:someone");
+        let task2 = tokio::spawn(async move { session(&s2, id2, &mut rx2, &url2, &helix2, quick()).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        task2.abort();
+        assert!(!got2.lock().unwrap().iter().any(|l| l == "JOIN #gamma"));
+        assert!(seen2.lock().unwrap().is_empty(), "the follows are not read again");
     }
 }

@@ -453,6 +453,10 @@ pub struct TwitchAccountConfig {
     /// subscriptions count when a stream is played (see backend/twitch/playback.rs).
     #[serde(default)]
     pub web_token: String,
+    /// Whether the channels this account follows have been opened already. Once, at first connection: a list
+    /// read again every time would put back every channel the person had closed.
+    #[serde(default)]
+    pub followed_synced: bool,
     /// An account with no sign-in, which reads and does not send.
     #[serde(default)]
     pub anonymous: bool,
