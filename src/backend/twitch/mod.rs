@@ -16,6 +16,7 @@
 //! - `irc` - one line of Twitch's chat: tags, prefix, command, parameters
 //! - `emotes` - whether one of Twitch's own emotes is animated, and how an account's own are turned between picture and word
 //! - `badges` - the pictures for the badges beside a name
+//! - `watch` - telling Twitch a channel is being watched, so its points build while the video plays
 //! - `chat` - what the lines mean: messages, cards, removals, a channel's modes
 //! - `gql` - Twitch's own GraphQL, which answers what its official API will not without an account
 //! - `stream` - what is on air in a channel, said as the stream event the window draws
@@ -45,6 +46,7 @@ pub mod playback;
 pub mod points;
 pub mod realtime;
 pub mod stream;
+pub mod watch;
 
 pub use connect::{spawn, Command};
 

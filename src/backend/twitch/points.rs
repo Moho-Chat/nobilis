@@ -345,7 +345,7 @@ pub async fn redeem_automatic(state: &AppState, http: &reqwest::Client, root: &s
 // ---------------------------------------------------------------------------
 
 /// The account behind a Twitch channel's conversation, and the channel's login.
-fn session_of(state: &AppState, buffer_id: &str) -> Result<(crate::accounts::TwitchAccountConfig, String), String> {
+pub(super) fn session_of(state: &AppState, buffer_id: &str) -> Result<(crate::accounts::TwitchAccountConfig, String), String> {
     let buffer = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("twitch:")).ok_or_else(|| "that is not a Twitch channel".to_string())?;
     let cfg = state.accounts.get_twitch(&buffer.account_id).ok_or_else(|| "no such Twitch account".to_string())?;
     Ok((cfg, buffer.name))
@@ -468,7 +468,7 @@ pub async fn redeem_in_buffer(state: &AppState, root: &str, buffer_id: &str, rew
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -507,7 +507,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A GraphQL that answers by what was asked, and keeps what it was sent (headers and body).
-    async fn fake_gql(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
+    pub(in crate::backend::twitch) async fn fake_gql(answer: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let root = format!("http://{}", listener.local_addr().unwrap());
         let seen: Arc<Mutex<Vec<String>>> = Default::default();
@@ -544,7 +544,7 @@ mod tests {
         (root, seen)
     }
 
-    fn channel(name: &str, web_token: &str) -> (AppState, String) {
+    pub(in crate::backend::twitch) fn channel(name: &str, web_token: &str) -> (AppState, String) {
         let state = testkit::simulated_daemon(name);
         state.accounts.add_twitch(TwitchAccountConfig { login: "me".into(), user_id: "42".into(), access_token: "t".into(), refresh_token: "r".into(), expires_at: chrono::Utc::now().timestamp() + 9000, web_token: web_token.into(), ..Default::default() }).unwrap();
         state.runtime.ensure_buffer(&state, "twitch:me", "xqc", "channel");

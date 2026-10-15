@@ -5132,6 +5132,18 @@ pub async fn dispatch(
             }
         }
 
+        // The window is playing a Twitch channel's video: told once a minute, and passed on to Twitch as the
+        // player on twitch.tv does it (see backend/twitch/watch.rs).
+        "reportTwitchWatching" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("reportTwitchWatching requires \"bufferId\"".to_string()));
+            };
+            match backend::twitch::watch::report(state, backend::twitch::gql::ROOT, backend::twitch::watch::PAGE_ROOT, buffer_id).await {
+                Ok(sent) => (Some(serde_json::json!({ "sent": sent })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // What a Twitch channel trades its points for, and spending them on one: the panel over the chat lists
         // them and a button redeems (see backend/twitch/points.rs).
         "listTwitchRewards" => {
