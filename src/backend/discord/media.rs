@@ -629,6 +629,7 @@ mod tests {
             buffer_id: "b".into(),
             html: None,
             components: Vec::new(),
+            moderated: None,
             sender_color: None,
             badges: Vec::new(),
             from: "x".into(),

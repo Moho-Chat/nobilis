@@ -79,11 +79,37 @@ pub async fn negotiate(http: &reqwest::Client, token: &str, user_id: &str) -> Re
 
 /// A token for one livestream's channel - what actually says who is watching.
 pub async fn channel_token(http: &reqwest::Client, token: &str, livestream_id: u64) -> Result<String> {
-    let body = serde_json::json!({ "channel": channel_name(livestream_id) });
+    subscription_token(http, token, &channel_name(livestream_id)).await
+}
+
+/// A token to subscribe to one of Kick's private channels, by name.
+pub async fn subscription_token(http: &reqwest::Client, token: &str, channel: &str) -> Result<String> {
+    let body = serde_json::json!({ "channel": channel });
     let resp = post(http, token, &format!("{WEB_ROOT}/api/v1/realtime/auth/channel"), body)
         .await
         .context("asking Kick to let us watch")?;
     resp["data"]["token"].as_str().map(str::to_string).context("Kick sent no subscription token")
+}
+
+/// Where Kick says what this account's points now are, in every channel at once.
+///
+/// Keyed by the *account*, not the streamer - Kick's own app subscribes to it
+/// the same way, once - and each event names the channel it is about.
+pub fn points_channel_name(user_id: &str) -> String {
+    format!("private-channelpoints-{user_id}")
+}
+
+/// What a points event says: which channel, and what the balance there now is.
+///
+/// Kick's app does exactly this with it - finds the channel by `channel_id`
+/// and replaces the balance it holds with `balance`. A balance is a whole
+/// number of points, though the number is read leniently: it has come as a
+/// float elsewhere on this API.
+pub fn points_update(data: &serde_json::Value) -> Option<(u64, i64)> {
+    let number = |v: &serde_json::Value| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)).or_else(|| v.as_str().and_then(|s| s.parse().ok()));
+    let channel = data.get("channel_id").and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))?;
+    let balance = number(data.get("balance")?)?;
+    Some((channel, balance))
 }
 
 /// The channel watch time is counted on.
@@ -161,6 +187,17 @@ pub mod frames {
 /// two viewers, and merging them would credit one for the other's time.
 pub type Watching = std::collections::BTreeMap<String, u64>;
 
+/// Tells the window what this account's points in a channel now are.
+fn announce_points(state: &crate::state::AppState, account_id: &str, data: &serde_json::Value) {
+    let Some((channel_id, balance)) = points_update(data) else {
+        tracing::debug!("kick[{account_id}]: a points event with no channel or balance: {data}");
+        return;
+    };
+    // A channel this window has not opened has nowhere to show it.
+    let Some(buffer_id) = state.runtime.kick_buffer_of_channel(account_id, channel_id) else { return };
+    state.events.emit("kickPoints", serde_json::json!({ "bufferId": buffer_id, "points": balance }));
+}
+
 /// Keeps one connection open for as long as anything is being watched.
 ///
 /// Restarted rather than repaired when the socket dies: a subscription is
@@ -211,6 +248,18 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
     // changes without tearing the connection down.
     let mut subscribed: std::collections::BTreeMap<String, u64> = Default::default();
 
+    // The balance, pushed as it changes: the earn every five minutes, a bet, a
+    // reward bought somewhere else. The window asks for it too, once a minute,
+    // which is the fallback for a channel that is not live and so is not here.
+    let points = points_channel_name(user_id);
+    match subscription_token(&http, token, &points).await {
+        Ok(jwt) => {
+            socket.send(Message::Text(frames::subscribe(id(), &points, &jwt).to_string())).await?;
+            tracing::info!("kick[{account_id}]: following {points}");
+        }
+        Err(e) => tracing::debug!("kick[{account_id}]: cannot follow points: {e:#}"),
+    }
+
     loop {
         let wanted = state.runtime.kick_watching(account_id);
         if wanted.is_empty() || begun.elapsed() > std::time::Duration::from_secs(30 * 60) {
@@ -256,6 +305,12 @@ async fn session(state: &crate::state::AppState, account_id: &str, user_id: &str
                 Message::Text(text) => {
                     for line in text.lines().filter(|l| !l.trim().is_empty()) {
                         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+                        if let super::realtime::Said::Published { channel, event, data } = super::realtime::read(line).into_iter().next().unwrap_or(super::realtime::Said::Other) {
+                            if channel == points && event.ends_with("ChannelPointsUpdatedEvent") {
+                                announce_points(state, account_id, &data);
+                            }
+                            continue;
+                        }
                         if frames::is_ping(&value) {
                             socket.send(Message::Text(frames::pong().to_string())).await?;
                         } else if let Some(why) = frames::error_in(&value) {
@@ -294,6 +349,19 @@ mod tests {
         assert!(!frames::is_ping(&json!([])));
         assert!(!frames::is_ping(&json!(null)));
         assert_eq!(frames::pong(), json!({}));
+    }
+
+    /// As Kick's own app reads it: the channel, and the balance that replaces the one held.
+    #[test]
+    fn a_points_event_names_the_channel_and_the_new_balance() {
+        assert_eq!(points_channel_name("1234"), "private-channelpoints-1234");
+        assert_eq!(points_update(&json!({ "channel_id": 5312671, "balance": 1450 })), Some((5312671, 1450)));
+        // However the number is written.
+        assert_eq!(points_update(&json!({ "channel_id": "668", "balance": 12.0 })), Some((668, 12)));
+        assert_eq!(points_update(&json!({ "channel_id": 668, "balance": "90" })), Some((668, 90)));
+        // Without both it says nothing.
+        assert_eq!(points_update(&json!({ "channel_id": 668 })), None);
+        assert_eq!(points_update(&json!({ "balance": 5 })), None);
     }
 
     #[test]

@@ -188,6 +188,15 @@ pub struct Account {
     /// Matrix only: whether this account keeps a dehydrated device.
     #[serde(rename = "dehydration", default)]
     pub dehydration: bool,
+    /// Twitch only: whether this account holds a twitch.tv website session for
+    /// playing video as the person (their Turbo, their subscriptions). Said as
+    /// a yes or no and never the session itself.
+    #[serde(rename = "webSession", default, skip_serializing_if = "std::ops::Not::not")]
+    pub web_session: bool,
+    /// Twitch only: whether this account was signed in with the rights to
+    /// moderate, whisper and change its colour.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub moderation: bool,
 }
 
 /// One room in a Sneedchat account's currently-enabled list, as exposed on
@@ -463,6 +472,32 @@ pub struct ReplyPreview {
     /// something else entirely.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forwarded: bool,
+    /// The message a whole chain of replies grew from, where the service
+    /// groups them into one conversation.
+    ///
+    /// Kick does: every reply carries the id of the message at the top of its
+    /// chain, however deep it is, while `id` stays the message it answered. A
+    /// reply therefore points two ways - back at what it quoted, and up at the
+    /// thread it belongs to - and a client wants both: the first for the quote
+    /// above it, the second for a thread to open.
+    #[serde(rename = "threadRoot", default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
+}
+
+/// Why a message the service took down is gone, kept with the message.
+///
+/// Kick tells everyone in a channel when a message is removed, and says by
+/// whom only as far as "a machine did it, and for breaking these rules". The
+/// text stays here rather than leaving the log, so that what it said is still
+/// readable - how it is drawn is up to the client.
+#[derive(Serialize, serde::Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Moderated {
+    /// Whether Kick's automatic moderation did it, rather than a person.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ai: bool,
+    /// The rules it was said to break: `hate`, `harassment`, and so on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<String>,
 }
 
 /// How a service says a sender should look.
@@ -791,6 +826,10 @@ pub struct Message {
     /// Buttons and menus on the message, where the service has them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<Component>,
+    /// Set once the service has taken this message down: it is still here, and
+    /// this says it should be drawn as removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moderated: Option<Moderated>,
 }
 
 pub fn buffer_id(account_id: &str, name: &str) -> String {
@@ -870,6 +909,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("kick") => "kick",
         Some("sneedchat") => "sneedchat",
         Some("steam") => "steam",
+        Some("twitch") => "twitch",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",

@@ -11,7 +11,7 @@ use super::*;
 ///
 /// Kick's own channel endpoint carries all of it and this backend was already
 /// calling it - the numbers were parsed away and dropped.
-pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, following: Option<bool>) {
+pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::Channel, following: Option<bool>, playback: Option<&api::Playback>) {
     let stream = serde_json::json!({
         "bufferId": buffer_id,
         "live": channel.live.is_some(),
@@ -29,7 +29,10 @@ pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::
         // whoever wants to watch, because every frontend that shows video
         // needs it and the refresh already running is what replaces the
         // signed token before it expires.
-        "playbackUrl": channel.playback_url,
+        "playbackUrl": playback.map(|p| p.url.clone()),
+        // When that address stops being accepted, so whoever plays it can ask for a new one in time
+        // rather than finding out from a segment that is refused.
+        "playbackExpires": playback.and_then(|p| p.expires),
         // Absent rather than false for an account that is not signed in:
         // "not following" and "cannot say" are different, and a button that
         // offers to follow when it cannot is a button that fails when pressed.
@@ -37,6 +40,38 @@ pub(super) fn announce_stream(state: &AppState, buffer_id: &str, channel: &api::
     });
     state.runtime.set_kick_stream(buffer_id, stream.clone());
     state.events.emit("kickStream", stream);
+}
+
+/// How long before an address stops being accepted a new one is asked for.
+const RENEW_BEFORE: i64 = 180;
+
+/// The address of a live channel's video: the one the stream already has while it is good for a few
+/// minutes yet, otherwise a new one from the call that gives only that, and failing that the one the
+/// channel payload carried.
+pub(super) async fn playback_for(state: &AppState, buffer_id: &str, http: &reqwest::Client, channel: &api::Channel) -> Option<api::Playback> {
+    channel.live.as_ref()?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
+    if let Some(have) = state.runtime.kick_stream(buffer_id) {
+        let url = have["playbackUrl"].as_str();
+        let expires = have["playbackExpires"].as_i64();
+        if let (Some(url), Some(expires)) = (url, expires) {
+            if expires - now > RENEW_BEFORE {
+                return Some(api::Playback::of(url));
+            }
+        }
+    }
+    match api::playback(http, &channel.slug).await {
+        Ok(p) => {
+            if p.ads_opt_out == Some(false) {
+                tracing::warn!("kick: the address for {} no longer opts out of ads", channel.slug);
+            }
+            Some(p)
+        }
+        Err(e) => {
+            tracing::debug!("kick: the address for {}: {e:#}", channel.slug);
+            channel.playback_url.as_deref().map(api::Playback::of)
+        }
+    }
 }
 
 /// Whether this account follows the channel, where it can say.
@@ -169,7 +204,8 @@ pub async fn refresh_stream_now(state: &AppState, buffer_id: &str) {
     match api::channel(&http, &channel.slug).await {
         Ok(fresh) => {
             let following = following_now(state, &http, &account_id, &channel.slug, known).await;
-            announce_stream(state, buffer_id, &fresh, following);
+            let playback = playback_for(state, buffer_id, &http, &fresh).await;
+            announce_stream(state, buffer_id, &fresh, following, playback.as_ref());
         }
         Err(e) => tracing::debug!("kick: refreshing {}: {e:#}", channel.slug),
     }

@@ -207,7 +207,7 @@ pub async fn refresh_prediction(state: &AppState, buffer_id: &str) {
 }
 
 /// Stores a card, writes it down, and tells the client - or says it is gone.
-pub(super) fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serde_json::Value>) {
+pub(crate) fn publish_card(state: &AppState, buffer_id: &str, kind: &str, card: Option<serde_json::Value>) {
     // When this was true, stamped here so every card carries one.
     //
     // The clock is the whole point: `remaining` is a number of seconds that
@@ -263,7 +263,7 @@ pub fn card_is_current(card: &serde_json::Value) -> bool {
 }
 
 /// The wall clock, in seconds, as everything here writes it down.
-pub(super) fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

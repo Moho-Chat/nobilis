@@ -79,6 +79,8 @@ pub(super) struct Watched {
     /// wants the panel for: to mention them, whisper them, or see who the
     /// moderators are.
     pub(super) speakers: HashMap<String, Vec<Speaker>>,
+    /// Every name that has spoken in each channel, for counting.
+    pub(super) chatters: HashMap<String, std::collections::HashSet<String>>,
 }
 
 /// Somebody who has said something, and how they looked saying it.
@@ -91,12 +93,15 @@ pub(super) struct Speaker {
     pub(super) badge: Option<String>,
 }
 
-/// How many to remember per channel.
+/// How many to list per channel.
 ///
-/// A busy stream produces hundreds of distinct names an hour, and a list
-/// nobody can scan is no better than an empty one. This is the last two
-/// hundred to have spoken, which is the window somebody is actually reading.
-pub(super) const SPEAKERS_REMEMBERED: usize = 200;
+/// A busy stream produces thousands of distinct names an hour, and the list is
+/// sent whole every time a new one joins it and drawn row by row - a few
+/// hundred is what that stays cheap for. It is the most recent to have
+/// spoken, which is the window somebody is actually reading. How many people
+/// have spoken is counted apart from it (`Watched::chatters`) and is not cut
+/// off.
+pub(super) const SPEAKERS_REMEMBERED: usize = 500;
 
 #[derive(Deserialize)]
 pub(super) struct ChatMessage {
@@ -114,6 +119,10 @@ pub(super) struct ChatMessage {
     /// the cap. Kick's replies are quotable however old the original is.
     #[serde(default)]
     metadata: Option<ReplyMetadata>,
+    /// The message at the top of the chain this one is part of, on a reply.
+    /// Empty or absent on anything that is not one.
+    #[serde(default)]
+    thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +138,12 @@ pub(super) struct OriginalMessage {
     id: String,
     #[serde(default)]
     content: Option<String>,
+    /// Where the original itself sits: empty when it began the chain, and the
+    /// chain's first message when it was a reply. It is how a reply read from
+    /// history, which does not carry the thread on the reply itself, finds its
+    /// thread.
+    #[serde(default)]
+    thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,7 +188,7 @@ pub(super) fn handle_event(
             let Ok(msg) = serde_json::from_value::<ChatMessage>(payload) else { return Ok(()) };
             let Some(slug) = watched.chatroom(msg.chatroom_id).cloned() else { return Ok(()) };
             let from = msg.sender.username.clone().unwrap_or_else(|| "someone".to_string());
-            let reply_to = reply_preview(msg.metadata.as_ref());
+            let reply_to = reply_preview(msg.metadata.as_ref(), msg.thread_parent_id.as_deref());
             let style = style_of(msg.sender.identity.as_ref());
             // Kick has no viewer list to ask for, so the panel is built from
             // who is talking - which is who somebody wants to reach anyway.
@@ -188,8 +203,10 @@ pub(super) fn handle_event(
             ) {
                 let buffer_id = crate::model::buffer_id(account_id, &slug);
                 let roster = serde_json::json!(watched.roster(&slug));
+                let total = watched.chatters(&slug);
                 state.runtime.set_presence(&buffer_id, roster.clone());
-                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster }));
+                state.runtime.set_presence_total(&buffer_id, total);
+                state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": roster, "total": total }));
             }
             state.runtime.record_message_at(
                 state,
@@ -257,7 +274,10 @@ pub(super) fn handle_event(
                 .or_else(|| payload.get("id"))
                 .and_then(|v| v.as_str());
             if let Some(id) = id {
-                state.runtime.delete_message(state, &crate::model::buffer_id(account_id, &slug), id);
+                // Kept and marked, not removed: what it said is worth reading
+                // beside the fact that it is gone, and how a removed message
+                // is drawn is the window's to decide.
+                state.runtime.moderate_message(state, &crate::model::buffer_id(account_id, &slug), id, &moderation_of(&payload));
             }
         }
 
@@ -437,7 +457,7 @@ pub async fn backfill(
             &msg.content,
             false,
             "chat",
-            reply_preview_from_value(msg.metadata.as_ref()),
+            reply_preview_from_value(msg.metadata.as_ref(), msg.thread_parent_id.as_deref()),
             Some(msg.id.clone()),
             false,
             None,
@@ -456,9 +476,33 @@ pub async fn backfill(
 ///
 /// History carries it in the same shape, so this is the one parser rather than
 /// a second one that could drift.
-pub(super) fn reply_preview_from_value(metadata: Option<&serde_json::Value>) -> Option<crate::model::ReplyPreview> {
-    let parsed: ReplyMetadata = serde_json::from_value(metadata?.clone()).ok()?;
-    reply_preview(Some(&parsed))
+///
+/// An object on the live socket and a string of JSON in history, which is
+/// the same object written down: a reply read back from history lost its quote
+/// because only the first was understood.
+pub(super) fn reply_preview_from_value(metadata: Option<&serde_json::Value>, thread_parent: Option<&str>) -> Option<crate::model::ReplyPreview> {
+    let metadata = metadata?;
+    let parsed: ReplyMetadata = match metadata {
+        serde_json::Value::String(text) => serde_json::from_str(text).ok()?,
+        other => serde_json::from_value(other.clone()).ok()?,
+    };
+    reply_preview(Some(&parsed), thread_parent)
+}
+
+/// Who took a message down and for what, as the event says it.
+///
+/// `aiModerated` and `violatedRules` are on the payload of the event for a
+/// message Kick's automatic moderation removed; a person's removal has
+/// neither, which reads as not automatic with nothing to say about rules.
+pub(super) fn moderation_of(payload: &serde_json::Value) -> crate::model::Moderated {
+    crate::model::Moderated {
+        ai: payload.get("aiModerated").and_then(|v| v.as_bool()).unwrap_or(false),
+        rules: payload
+            .get("violatedRules")
+            .and_then(|v| v.as_array())
+            .map(|rules| rules.iter().filter_map(|r| r.as_str()).map(str::to_string).collect())
+            .unwrap_or_default(),
+    }
 }
 
 /// The one badge worth marking somebody with in a list.
@@ -483,16 +527,44 @@ pub(super) fn strongest_badge(badges: &[api::Badge]) -> Option<String> {
 /// the ones a reader is actually scanning for.
 pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::SenderStyle {
     let Some(identity) = identity else { return crate::model::SenderStyle::default() };
-    crate::model::SenderStyle {
-        color: identity.color.clone().filter(|c| !c.is_empty()),
-        badges: identity
-            .badges
+    // The role badges are drawn as words, and Kick's picture badges beside them
+    // as pictures - the ones the person chose to wear, in Kick's order. The
+    // old list's own "level" is dropped as it always was: the picture one says
+    // the same with a number a reader can see.
+    let mut badges: Vec<api::Badge> = identity.badges.iter().filter(|b| !matches!(b.kind.as_str(), "level" | "")).cloned().collect();
+    let mut pictures: Vec<api::Badge> = identity
+            .badges_v2
             .iter()
-            .filter(|b| !matches!(b.kind.as_str(), "level" | ""))
-            .cloned()
-            .collect(),
-    }
+            .filter(|b| b.selected.unwrap_or(true) && !b.name.is_empty())
+            .filter_map(|b| {
+                let image = b.image_url.clone().filter(|u| u.starts_with("https://"))?;
+                let level = b.metadata.as_ref().and_then(|m| m.level);
+                Some(api::Badge {
+                    // Named by what Kick calls it, apart from the role names.
+                    kind: b.name.clone(),
+                    text: match level {
+                        Some(level) if b.name == "level" => format!("Level {level}"),
+                        _ => b.name.clone(),
+                    },
+                    count: None,
+                    image: Some(image),
+                    sort_order: b.sort_order,
+                })
+            })
+            .collect();
+    // The highest-ranked of them, if there are more than a name can carry.
+    pictures.sort_by_key(|b| std::cmp::Reverse(b.sort_order.unwrap_or(0)));
+    pictures.truncate(MAX_BADGE_PICTURES);
+    badges.extend(pictures);
+    // Highest first, as Kick's own apps put them, and stable so two of a rank
+    // stay in the order they came.
+    badges.sort_by_key(|b| std::cmp::Reverse(b.sort_order.unwrap_or(0)));
+    crate::model::SenderStyle { color: identity.color.clone().filter(|c| !c.is_empty()), badges }
 }
+
+/// How many picture badges one name carries. Some people wear a dozen, and a
+/// name with that many beside it is the loudest thing on the line.
+const MAX_BADGE_PICTURES: usize = 4;
 
 /// What a reply was replying to, out of the metadata Kick attaches to it.
 ///
@@ -500,15 +572,24 @@ pub(super) fn style_of(identity: Option<&api::ChatIdentity>) -> crate::model::Se
 /// no author and no text is drawn as an empty quote above the message, which
 /// reads as something failing to load rather than as a reply. Better to show
 /// the message plainly than to show a hole above it.
-pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>) -> Option<crate::model::ReplyPreview> {
+///
+/// `thread_parent` is what the message itself says its chain began with. When
+/// it says nothing - a reply out of history - the original's own place in its
+/// chain gives the same answer, and an original that began one is the root.
+pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>, thread_parent: Option<&str>) -> Option<crate::model::ReplyPreview> {
     let metadata = metadata?;
     let original = metadata.original_message.as_ref()?;
     let from = metadata.original_sender.as_ref()?.username.clone()?;
+    let filled = |s: Option<&str>| s.filter(|s| !s.is_empty()).map(str::to_string);
+    let thread_root = filled(thread_parent).or_else(|| filled(original.thread_parent_id.as_deref())).unwrap_or_else(|| original.id.clone());
     Some(crate::model::ReplyPreview {
         id: original.id.clone(),
         from,
         body: original.content.clone().unwrap_or_default(),
-        thread: false, forwarded: false })
+        thread: false,
+        forwarded: false,
+        thread_root: Some(thread_root),
+    })
 }
 
 /// One line for something somebody did in a channel, or None if this event is
@@ -908,14 +989,19 @@ mod tests {
             w.heard("chan", Speaker { nick: format!("nick{i}"), user_id: None, badge: None });
         }
         assert_eq!(w.roster("chan").len(), SPEAKERS_REMEMBERED);
+        // The count is of everybody, not of those listed.
+        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
         // The most recent survive; a list nobody can scan is no better than
         // an empty one, and the newest names are the ones being read.
         assert_eq!(w.roster("chan")[0]["nick"], format!("nick{}", SPEAKERS_REMEMBERED + 49));
+        // And somebody who spoke long ago and speaks again is not counted twice.
+        w.heard("chan", Speaker { nick: "nick0".into(), user_id: None, badge: None });
+        assert_eq!(w.chatters("chan"), SPEAKERS_REMEMBERED + 50);
     }
 
     #[test]
     fn marks_somebody_by_the_badge_worth_finding_them_by() {
-        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), ..Default::default() };
         // Ranked by what a reader is scanning for, not by what is rarest: a
         // moderator who is also a subscriber shows as a moderator.
         assert_eq!(strongest_badge(&[badge("subscriber"), badge("moderator")]).as_deref(), Some("moderator"));
@@ -946,7 +1032,7 @@ mod tests {
             "original_message": { "id": "ddeccb11-29bc-4cf1-ab2a-9b409293de76", "content": "L0L0WERFLGEWRUGHBER" }
         }))
         .unwrap();
-        let preview = reply_preview(Some(&metadata)).unwrap();
+        let preview = reply_preview(Some(&metadata), None).unwrap();
         assert_eq!(preview.from, "Greg");
         assert_eq!(preview.id, "ddeccb11-29bc-4cf1-ab2a-9b409293de76");
         assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
@@ -978,7 +1064,7 @@ mod tests {
         let msg: ChatMessage = serde_json::from_str(raw).expect("a real reply frame must parse");
         assert_eq!(msg.chatroom_id, 2393554);
         assert_eq!(msg.sender.username.as_deref(), Some("L3galizeWee"));
-        let preview = reply_preview(msg.metadata.as_ref()).expect("and carry what it answered");
+        let preview = reply_preview(msg.metadata.as_ref(), None).expect("and carry what it answered");
         assert_eq!(preview.from, "Greg");
         assert_eq!(preview.body, "L0L0WERFLGEWRUGHBER");
     }
@@ -990,12 +1076,12 @@ mod tests {
         let raw = r#"{ "id": "x", "chatroom_id": 1, "content": "hi", "type": "message",
           "sender": { "id": 2, "username": "someone" }, "metadata": { "message_ref": "1788305786864" } }"#;
         let msg: ChatMessage = serde_json::from_str(raw).unwrap();
-        assert!(reply_preview(msg.metadata.as_ref()).is_none());
+        assert!(reply_preview(msg.metadata.as_ref(), None).is_none());
     }
 
     #[test]
     fn an_ordinary_message_is_not_a_reply() {
-        assert!(reply_preview(None).is_none());
+        assert!(reply_preview(None, None).is_none());
     }
 
     #[test]
@@ -1004,10 +1090,10 @@ mod tests {
         // which is worse than showing the message plainly.
         let no_sender: ReplyMetadata =
             serde_json::from_value(serde_json::json!({ "original_message": { "id": "x", "content": "y" } })).unwrap();
-        assert!(reply_preview(Some(&no_sender)).is_none());
+        assert!(reply_preview(Some(&no_sender), None).is_none());
         let no_message: ReplyMetadata =
             serde_json::from_value(serde_json::json!({ "original_sender": { "username": "Greg" } })).unwrap();
-        assert!(reply_preview(Some(&no_message)).is_none());
+        assert!(reply_preview(Some(&no_message), None).is_none());
     }
 
     #[test]
@@ -1256,8 +1342,12 @@ mod tests {
         assert_eq!(testkit::lines(&state, "odablock"), vec!["went live", "ended the stream"]);
     }
 
+    fn backlog(state: &AppState) -> Vec<crate::model::Message> {
+        state.store.get_backlog(&crate::model::buffer_id("kick:tester", "odablock"), 0, 50).expect("backlog")
+    }
+
     #[test]
-    fn a_message_taken_down_leaves_the_log() {
+    fn a_message_taken_down_stays_in_the_log_marked() {
         let state = testkit::simulated_daemon("deleted");
         let mut watched = testkit::watching_odablock();
         spoken(&state, &mut watched, "keep", "stays");
@@ -1266,7 +1356,94 @@ mod tests {
         // Kick nests the id under `message` on one event and sends it flat on another.
         feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "message": { "id": "nested" } }));
         feed(&state, &mut watched, "App\\Events\\MessageDeletedEvent", serde_json::json!({ "id": "flat" }));
-        assert_eq!(testkit::lines(&state, "odablock"), vec!["stays"]);
+        let log = backlog(&state);
+        // Nothing left, and the words of the ones taken down are still there to read.
+        assert_eq!(log.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["stays", "goes", "goes too"]);
+        assert_eq!(log.iter().map(|m| m.moderated.is_some()).collect::<Vec<_>>(), vec![false, true, true]);
+    }
+
+    #[test]
+    fn what_the_automatic_moderator_said_is_kept_with_the_message() {
+        let state = testkit::simulated_daemon("moderated");
+        let mut watched = testkit::watching_odablock();
+        spoken(&state, &mut watched, "bad", "something vile");
+        // As measured on a live channel: the event has its own id, and the message's is nested.
+        feed(
+            &state,
+            &mut watched,
+            "App\\Events\\MessageDeletedEvent",
+            serde_json::json!({ "id": "event-id", "message": { "id": "bad" }, "aiModerated": true, "violatedRules": ["hate"] }),
+        );
+        let log = backlog(&state);
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].moderated, Some(crate::model::Moderated { ai: true, rules: vec!["hate".into()] }));
+    }
+
+    #[test]
+    fn a_person_removing_a_message_is_not_the_automatic_moderator() {
+        let why = moderation_of(&serde_json::json!({ "message": { "id": "x" } }));
+        assert_eq!(why, crate::model::Moderated { ai: false, rules: vec![] });
+    }
+
+    #[test]
+    fn a_reply_names_the_thread_it_belongs_to() {
+        // The top-level field when there is one: this is a reply to a reply, so what it quotes and
+        // the thread it is in are different messages.
+        let metadata: ReplyMetadata = serde_json::from_value(serde_json::json!({
+            "original_sender": { "id": 1, "username": "Greg" },
+            "original_message": { "id": "middle", "content": "hello" }
+        }))
+        .unwrap();
+        let preview = reply_preview(Some(&metadata), Some("top")).unwrap();
+        assert_eq!((preview.id.as_str(), preview.thread_root.as_deref()), ("middle", Some("top")));
+        // Without it, a reply to a message that began nothing starts the thread itself.
+        let preview = reply_preview(Some(&metadata), Some("")).unwrap();
+        assert_eq!(preview.thread_root.as_deref(), Some("middle"));
+    }
+
+    #[test]
+    fn a_reply_out_of_history_finds_its_thread_in_what_it_quoted() {
+        // History writes the metadata down as a string and leaves the thread off the reply; the
+        // quoted message knows its own.
+        let written = serde_json::Value::String(
+            serde_json::json!({
+                "original_sender": { "id": 1, "username": "Greg" },
+                "original_message": { "id": "middle", "content": "hello", "thread_parent_id": "top" }
+            })
+            .to_string(),
+        );
+        let preview = reply_preview_from_value(Some(&written), None).expect("a string of JSON is the same metadata");
+        assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.thread_root.as_deref()), ("middle", "Greg", Some("top")));
+    }
+
+    #[test]
+    fn replies_are_stored_with_their_thread_and_read_back_whole() {
+        let state = testkit::simulated_daemon("threads");
+        let mut watched = testkit::watching_odablock();
+        feed(&state, &mut watched, "App\\Events\\ChatMessageEvent", serde_json::json!({
+            "id": "top", "chatroom_id": 2393554, "content": "the question", "created_at": "2026-10-14T00:59:00+00:00",
+            "sender": { "id": 9, "username": "bob", "identity": null }
+        }));
+        for (id, to, root) in [("r1", "top", "top"), ("r2", "r1", "top"), ("elsewhere", "x", "x")] {
+            feed(
+                &state,
+                &mut watched,
+                "App\\Events\\ChatMessageEvent",
+                serde_json::json!({
+                    "id": id, "chatroom_id": 2393554, "content": id, "type": "reply",
+                    "created_at": "2026-10-14T01:00:00+00:00",
+                    "sender": { "id": 7, "username": "someone" },
+                    "thread_parent_id": root,
+                    "metadata": { "original_sender": { "id": 1, "username": "Greg" }, "original_message": { "id": to, "content": "quoted" } }
+                }),
+            );
+        }
+        let buffer = crate::model::buffer_id("kick:tester", "odablock");
+        let thread = state.store.thread_messages(&buffer, "top").unwrap();
+        assert_eq!(thread.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["top", "r1", "r2"]);
+        let r2 = thread.iter().find(|m| m.id == "r2").unwrap().reply_to.clone().unwrap();
+        // It still quotes what it answered, and says which thread that is part of.
+        assert_eq!((r2.id.as_str(), r2.thread, r2.thread_root.as_deref()), ("r1", false, Some("top")));
     }
 
     #[test]
@@ -1337,17 +1514,60 @@ mod tests {
 
     #[test]
     fn a_sender_is_drawn_in_their_colour_with_the_badges_that_say_something() {
-        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), count: None };
+        let badge = |kind: &str| api::Badge { kind: kind.into(), text: kind.into(), ..Default::default() };
         assert_eq!(style_of(None).color, None);
         let style = style_of(Some(&api::ChatIdentity {
             color: Some("#75FD46".into()),
             badges: vec![badge("moderator"), badge("level"), badge(""), badge("subscriber")],
+            ..Default::default()
         }));
         assert_eq!(style.color.as_deref(), Some("#75FD46"));
         // An engagement level and a nameless badge say nothing about the person.
         assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "subscriber"]);
         // A colour that is empty is no colour.
-        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), badges: vec![] })).color, None);
+        assert_eq!(style_of(Some(&api::ChatIdentity { color: Some(String::new()), ..Default::default() })).color, None);
+    }
+
+    /// As measured on a live channel: the picture badges come in their own list,
+    /// each with the person's choice to wear it and where Kick ranks it.
+    #[test]
+    fn the_pictures_a_person_chose_to_wear_come_after_their_role_in_kicks_order() {
+        let identity: api::ChatIdentity = serde_json::from_value(serde_json::json!({
+            "color": "#E9113C",
+            "badges": [
+                { "type": "moderator", "text": "Moderator", "sort_order": 12 },
+                { "type": "sub_gifter", "text": "Sub Gifter", "count": 1, "sort_order": 8 }
+            ],
+            "badges_v2": [
+                { "name": "level", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/48_a.png", "metadata": { "level": 48 }, "selected": true, "sort_order": 1 },
+                { "name": "GOAT", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/GOAT_b.png", "selected": true, "sort_order": 4 },
+                { "name": "GoldenK", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/GoldenK_c.png", "selected": false, "sort_order": 4 },
+                { "name": "kick_founder22", "badge_type": "global", "image_url": "https://ext.cdn.kick.com/chat/badges/f.png", "selected": true, "sort_order": 2 }
+            ]
+        }))
+        .unwrap();
+        let style = style_of(Some(&identity));
+        // Not the one the person chose not to wear, and highest rank first.
+        assert_eq!(style.badges.iter().map(|b| b.kind.as_str()).collect::<Vec<_>>(), vec!["moderator", "sub_gifter", "GOAT", "kick_founder22", "level"]);
+        // Words for the roles, pictures for the rest, and the level says what it is.
+        assert!(style.badges[0].image.is_none());
+        assert_eq!(style.badges[2].image.as_deref(), Some("https://ext.cdn.kick.com/chat/badges/GOAT_b.png"));
+        assert_eq!(style.badges[4].text, "Level 48");
+    }
+
+    #[test]
+    fn a_badge_picture_is_only_ever_a_web_address_and_a_crowd_of_them_is_cut() {
+        let wear = |name: &str, url: &str| api::BadgeV2 { name: name.into(), image_url: Some(url.into()), selected: Some(true), ..Default::default() };
+        let identity = api::ChatIdentity {
+            badges_v2: vec![
+                wear("local", "file:///etc/passwd"),
+                wear("a", "https://x/a.png"), wear("b", "https://x/b.png"), wear("c", "https://x/c.png"),
+                wear("d", "https://x/d.png"), wear("e", "https://x/e.png"),
+            ],
+            ..Default::default()
+        };
+        let kinds: Vec<_> = style_of(Some(&identity)).badges.into_iter().map(|b| b.kind).collect();
+        assert_eq!(kinds, vec!["a", "b", "c", "d"]);
     }
 
     #[test]
@@ -1356,14 +1576,14 @@ mod tests {
             "original_sender": { "id": 1, "username": "Greg" },
             "original_message": { "id": "abc", "content": "hello" }
         });
-        let preview = reply_preview_from_value(Some(&whole)).unwrap();
+        let preview = reply_preview_from_value(Some(&whole), None).unwrap();
         assert_eq!((preview.id.as_str(), preview.from.as_str(), preview.body.as_str()), ("abc", "Greg", "hello"));
         // Half of one is a hole above the message, and is left out.
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } }))).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } }))).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } }))).is_none());
-        assert!(reply_preview_from_value(None).is_none());
-        assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata"))).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_message": { "id": "abc", "content": "hello" } })), None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1, "username": "Greg" } })), None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!({ "original_sender": { "id": 1 }, "original_message": { "id": "abc" } })), None).is_none());
+        assert!(reply_preview_from_value(None, None).is_none());
+        assert!(reply_preview_from_value(Some(&serde_json::json!("not metadata")), None).is_none());
     }
 
     #[test]

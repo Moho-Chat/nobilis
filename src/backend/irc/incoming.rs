@@ -7,6 +7,18 @@
 
 use super::*;
 
+/// The line written in a channel when the server says what modes it has: the letters, and what they mean, so
+/// somebody new to IRC need not know them ("#archlinux is +Cnrt -- No CTCP messages to the channel, ...").
+pub fn channel_modes_line(channel: &str, modes: &str, params: &[String]) -> String {
+    if modes.trim_matches('+').is_empty() {
+        return format!("{channel} has no modes set");
+    }
+    match super::modes::describe(modes, params) {
+        Some(why) => format!("{channel} is {modes} -- {why}"),
+        None => format!("{channel} is {modes}"),
+    }
+}
+
 pub fn is_channel(target: &str) -> bool {
     target.starts_with(['#', '&', '+', '!'])
 }
@@ -290,7 +302,10 @@ pub(super) async fn handle_message(
                             let adding = matches!(m, Mode::Plus(_, None));
                             let letter = mode_letter(mode);
                             state.runtime.set_irc_channel_mode(state, account_id, &channel, letter, adding);
-                            let body = format!("{from} sets {}{letter} on {channel}", if adding { "+" } else { "-" });
+                            let mut body = format!("{from} sets {}{letter} on {channel}", if adding { "+" } else { "-" });
+                            if let Some(why) = super::modes::describe_change(letter, adding) {
+                                body = format!("{body} -- {why}");
+                            }
                             state.runtime.record_message(state, account_id, &channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
                             continue;
                         }
@@ -847,11 +862,7 @@ pub(super) async fn handle_message(
             if let Some(channel) = args.get(1) {
                 let modes = args.get(2).map(String::as_str).unwrap_or("");
                 state.runtime.set_irc_channel_modes(state, account_id, channel, modes);
-                let body = if modes.trim_matches('+').is_empty() {
-                    format!("{channel} has no modes set")
-                } else {
-                    format!("{channel} is {modes}")
-                };
+                let body = channel_modes_line(channel, modes, &args.iter().skip(3).cloned().collect::<Vec<_>>());
                 state.runtime.record_message(state, account_id, channel, "channel", "*", &body, false, "system", None, None, false, None, Vec::new(), Vec::new(), None);
             }
         }
@@ -1135,6 +1146,16 @@ pub(super) fn buffer_kind_hint(target: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_channels_modes_are_written_with_what_they_mean() {
+        assert_eq!(
+            channel_modes_line("#archlinux", "+Cnrt", &[]),
+            "#archlinux is +Cnrt -- No CTCP messages to the channel, no messages from outside the channel, registered users only, topic locked to operators."
+        );
+        assert_eq!(channel_modes_line("#quiet", "+", &[]), "#quiet has no modes set");
+        assert_eq!(channel_modes_line("#odd", "+Z", &[]), "#odd is +Z -- +Z is this network's own.");
+    }
+
     use super::*;
 
     fn person(nick: &str, host: &str) -> Prefix {

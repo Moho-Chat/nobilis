@@ -24,7 +24,7 @@ pub(super) fn relation_preview(state: &AppState, buffer_id: &str, content: &Valu
     let in_thread = thread.is_some();
     let target = thread.or_else(|| protocol::reply_target(content))?;
     match state.store.get_message(buffer_id, target) {
-        Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target.to_string(), from: m.from, body: m.body, thread: in_thread, forwarded: false }),
+        Ok(Some(m)) => Some(crate::model::ReplyPreview { id: target.to_string(), from: m.from, body: m.body, thread: in_thread, forwarded: false, thread_root: None }),
         _ => Some(crate::model::ReplyPreview { id: target.to_string(), thread: in_thread, ..Default::default() }),
     }
 }
@@ -348,7 +348,7 @@ pub(super) async fn handle_timeline_event(
                 badges: vec![crate::backend::kick::api::Badge {
                     kind: "unverified".to_string(),
                     text: "Sent from a device you have not verified".to_string(),
-                    count: None,
+                    ..Default::default()
                 }],
             }),
             _ => None,

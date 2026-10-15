@@ -449,6 +449,13 @@ pub struct Runtime {
     /// snapshot here lets subscribe() replay it immediately - see
     /// rpc/methods.rs's subscribe handler.
     presence: Mutex<HashMap<String, serde_json::Value>>,
+    /// How many people a roster stands for, where that is more than it lists.
+    ///
+    /// Kick's roster is the most recent speakers and is cut off to something
+    /// a window can draw, while the count of everybody who has spoken keeps
+    /// going. Beside the snapshot above so that a window opened later is told
+    /// it as well.
+    presence_total: Mutex<HashMap<String, usize>>,
     /// Generic (protocol-agnostic) "what's my own display name on this
     /// account" - record_message's highlight check needs this for every
     /// backend, not just IRC (which already tracked it per-connection via
@@ -530,6 +537,9 @@ pub struct Runtime {
     /// One per connected Kick account, since one websocket carries every
     /// channel that account watches - see backend::kick's module doc.
     kick_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>>>,
+    twitch_senders: Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>>>,
+    /// Whether this account may moderate each Twitch channel it has open, as Twitch last said.
+    twitch_rights: Mutex<HashMap<String, bool>>,
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
@@ -1044,6 +1054,13 @@ fn cap_cache<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, limit: usize) 
     });
 }
 
+/// The heading a conversation is always filed under, for a service whose list has fixed ones: Twitch's is
+/// "Channels" and "Direct Messages" (whispers), the second drawn only while there is a whisper to put under it.
+/// They are the service's own headings, so they cannot be renamed, removed or filled by hand.
+fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
+    account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Self {
@@ -1065,6 +1082,7 @@ impl Runtime {
             discord_member_windows: Mutex::new(HashMap::new()),
             buffers: Mutex::new(HashMap::new()),
             presence: Mutex::new(HashMap::new()),
+            presence_total: Mutex::new(HashMap::new()),
             own_identity: Mutex::new(HashMap::new()),
             discord_channels: Mutex::new(HashMap::new()),
             discord_gateway_sessions: Mutex::new(HashMap::new()),
@@ -1085,6 +1103,8 @@ impl Runtime {
             discord_friends: Mutex::new(HashMap::new()),
             sneedchat_senders: Mutex::new(HashMap::new()),
             kick_senders: Mutex::new(HashMap::new()),
+            twitch_senders: Mutex::new(HashMap::new()),
+            twitch_rights: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
@@ -1230,6 +1250,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::steam_account_to_json(cfg, conn, self.own_identity(&id).as_deref())
+        }));
+        out.extend(state.accounts.all_twitch().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::twitch_account_to_json(cfg, conn)
         }));
         out
     }
@@ -1630,7 +1655,12 @@ impl Runtime {
         let id = model::buffer_id(account_id, name);
         self.confirm_restored(account_id, &id, false);
         let mut buffers = self.buffers.lock().unwrap();
-        if let Some(existing) = buffers.get(&id) {
+        if let Some(existing) = buffers.get_mut(&id) {
+            // A Twitch account's list is always headed the same two ways (see `fixed_category`), including
+            // for what was open before it was.
+            if existing.category.is_none() {
+                existing.category = fixed_category(account_id, kind);
+            }
             return existing.clone();
         }
         let last_activity_ts = state.store.last_activity(&id).unwrap_or(0);
@@ -1646,7 +1676,7 @@ impl Runtime {
             // Filled in by whichever backend knows: a Discord guild files its
             // channels under the server's own headings, and everything else
             // has none.
-            category: None,
+            category: fixed_category(account_id, kind),
             position: 0,
             syncing: false,
             link: None,
@@ -2020,6 +2050,14 @@ impl Runtime {
         self.presence.lock().unwrap().insert(buffer_id.to_string(), members);
     }
 
+    pub fn set_presence_total(&self, buffer_id: &str, total: usize) {
+        self.presence_total.lock().unwrap().insert(buffer_id.to_string(), total);
+    }
+
+    pub fn get_presence_total(&self, buffer_id: &str) -> Option<usize> {
+        self.presence_total.lock().unwrap().get(buffer_id).copied()
+    }
+
     pub fn get_presence(&self, buffer_id: &str) -> Option<serde_json::Value> {
         self.presence.lock().unwrap().get(buffer_id).cloned()
     }
@@ -2036,6 +2074,14 @@ impl Runtime {
             .entry(account_id.to_string())
             .or_default()
             .insert(source.id.clone(), source);
+    }
+
+    /// Forgets a source and the ones named under it (`id:...`), for a set that is rebuilt whole.
+    pub fn clear_emoji_sources(&self, account_id: &str, id: &str) {
+        if let Some(sources) = self.emoji_catalogue.lock().unwrap().get_mut(account_id) {
+            let under = format!("{id}:");
+            sources.retain(|have, _| have != id && !have.starts_with(&under));
+        }
     }
 
     /// Everything this account can reach, newest knowledge of each source.
@@ -3797,6 +3843,18 @@ impl Runtime {
         self.kick_streams.lock().unwrap().get(buffer_id).cloned()
     }
 
+    /// The conversation an account has open for a Kick channel, by the channel's
+    /// own number - which is how the points event names it.
+    pub fn kick_buffer_of_channel(&self, account_id: &str, channel_id: u64) -> Option<String> {
+        let prefix = format!("{account_id}|");
+        self.kick_channels
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(buffer_id, channel)| buffer_id.starts_with(&prefix) && channel.channel_id == channel_id)
+            .map(|(buffer_id, _)| buffer_id.clone())
+    }
+
     pub fn kick_channel(&self, buffer_id: &str) -> Option<KickChannel> {
         self.kick_channels.lock().unwrap().get(buffer_id).cloned()
     }
@@ -3873,6 +3931,22 @@ impl Runtime {
 
     pub fn set_kick_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>) {
         self.kick_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    }
+
+    pub fn set_twitch_sender(&self, account_id: &str, sender: tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>) {
+        self.twitch_senders.lock().unwrap().insert(account_id.to_string(), sender);
+    }
+
+    pub fn set_twitch_rights(&self, buffer_id: &str, moderator: bool) {
+        self.twitch_rights.lock().unwrap().insert(buffer_id.to_string(), moderator);
+    }
+
+    pub fn twitch_rights(&self, buffer_id: &str) -> Option<bool> {
+        self.twitch_rights.lock().unwrap().get(buffer_id).copied()
+    }
+
+    pub fn twitch_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::twitch::Command>> {
+        self.twitch_senders.lock().unwrap().get(account_id).cloned()
     }
 
     pub fn kick_sender(&self, account_id: &str) -> Option<tokio::sync::mpsc::UnboundedSender<crate::backend::kick::Command>> {
@@ -4608,6 +4682,7 @@ impl Runtime {
             // Filled in by the backend that has them, immediately after this
             // returns - only Discord has any, and it is the one that knows.
             components: Vec::new(),
+            moderated: None,
             id: msg_id,
             buffer_id: buffer.id.clone(),
             from: from.to_string(),
@@ -4757,6 +4832,45 @@ impl Runtime {
 
     /// Discord's MESSAGE_DELETE - removes the row and tells clients to
     /// drop it from view, same as Discord's own clients (no tombstone).
+    /// A message the service took down, kept and marked as taken down. Quiet
+    /// about one that is not stored: a removal of something older than this
+    /// client's scrollback is not news here.
+    pub fn moderate_message(&self, state: &AppState, buffer_id: &str, msg_id: &str, why: &model::Moderated) {
+        match state.store.mark_moderated(buffer_id, msg_id, why) {
+            Ok(true) => state.events.emit("messageModerated", json!({ "bufferId": buffer_id, "id": msg_id, "moderated": why })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to mark a message as removed: {e}"),
+        }
+    }
+
+    /// Everything a person said in a conversation, kept and marked as removed:
+    /// what a timeout or a ban does to their messages.
+    pub fn moderate_sender(&self, state: &AppState, buffer_id: &str, sender_id: &str, why: &model::Moderated) {
+        match state.store.mark_moderated_by_sender(buffer_id, sender_id, why) {
+            Ok(ids) => {
+                for id in ids {
+                    state.events.emit("messageModerated", json!({ "bufferId": buffer_id, "id": id, "moderated": why }));
+                }
+            }
+            Err(e) => tracing::warn!("failed to mark a person's messages as removed: {e}"),
+        }
+    }
+
+    /// Says how a channel's chat is restricted, in the words the header shows,
+    /// where the service has its own modes (Twitch's room state).
+    pub fn set_channel_modes(&self, state: &AppState, buffer_id: &str, modes: Option<String>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            let Some(buffer) = buffers.get_mut(buffer_id) else { return };
+            if buffer.channel_modes == modes {
+                return;
+            }
+            buffer.channel_modes = modes;
+            buffer.clone()
+        };
+        state.events.emit("bufferListChange", serde_json::to_value(&updated).unwrap());
+    }
+
     pub fn delete_message(&self, state: &AppState, buffer_id: &str, msg_id: &str) {
         match state.store.delete_message(buffer_id, msg_id) {
             Ok(true) => state.events.emit("messageDeleted", json!({ "bufferId": buffer_id, "id": msg_id })),
@@ -5501,11 +5615,11 @@ impl Runtime {
             restored_buffers, restored_groups, layout_confirmed,
             connect_generation, matrix_invites, discord_resync,
             discord_own_roles, discord_guild_roles, discord_guild_owners,
-            discord_member_windows, presence, own_identity,
+            discord_member_windows, presence, presence_total, own_identity,
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, steam_links, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

@@ -82,6 +82,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_steam(id) {
             backend::steam::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("twitch:") {
+        if let Some(cfg) = state.accounts.get_twitch(id) {
+            backend::twitch::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -107,6 +111,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         | "matrixRegistrationFlows" | "matrixLoginFlows" | "addMatrixAccountSso" | "addMatrixAccountQr" => Some("matrix"),
         "addKickAccount" => Some("kick"),
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
+        "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         _ => None,
     }
 }
@@ -178,6 +183,15 @@ pub async fn dispatch(
             if account_id.starts_with("steam:") {
                 backend::steam::emoticons::refresh(state, &account_id).await;
             }
+            // Twitch's: what the account can use in a channel changes under it (a reward unlocks one, a 24-hour
+            // unlock lapses), so the picker reads it again when what it holds is a couple of minutes old.
+            if account_id.starts_with("twitch:") {
+                if let Some(buffer) = state.runtime.get_buffer(buffer_id) {
+                    if let (Some(room), true) = backend::twitch::emotes::user_emotes_state(&buffer.account_id, &buffer.name, std::time::Duration::from_secs(120)) {
+                        backend::twitch::connect::refresh_user_emotes(state, &buffer.account_id, &buffer.name, &room).await;
+                    }
+                }
+            }
             let mut sources = state.runtime.emoji_catalogue(&account_id);
             // Steam's stickers are sent, not typed: they have their own tab, asked for
             // by `listSteamStickers`, and are not a section of emoji.
@@ -209,9 +223,19 @@ pub async fn dispatch(
 
             // Whether each source reaches this conversation. Worked out here
             // rather than stored, because it is a fact about the pair.
+            // A Twitch channel's section is marked by the channel's own picture, which is known to the
+            // conversation and not to the source.
+            let channel_picture = state.runtime.get_buffer(buffer_id).filter(|_| account_id.starts_with("twitch:")).and_then(|b| b.avatar_url.map(|a| (format!("twitch:{}", b.name), a)));
             let answer: Vec<serde_json::Value> = sources
                 .into_iter()
-                .map(|s| {
+                .map(|mut s| {
+                    if s.icon_url.is_none() {
+                        if let Some((id, picture)) = &channel_picture {
+                            if s.id == *id {
+                                s.icon_url = Some(picture.clone());
+                            }
+                        }
+                    }
                     let here = s.buffers.is_empty() || s.buffers.iter().any(|b| b == buffer_id);
                     let usable = here || s.sendable_anywhere;
                     let mut v = serde_json::to_value(&s).unwrap_or_default();
@@ -265,6 +289,25 @@ pub async fn dispatch(
                     None,
                 ),
             },
+            // Twitch's: what the account can use there, and the other services'.
+            Some(buffer_id) if buffer_id.starts_with("twitch:") => {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (Some(serde_json::json!([])), None) };
+                // What this account can use there changes under it (a 24-hour unlock lapses, a reward unlocks one):
+                // read again when the picker asks and what it was told is a couple of minutes old.
+                if let (Some(room), true) = backend::twitch::emotes::user_emotes_state(&buffer.account_id, &buffer.name, std::time::Duration::from_secs(120)) {
+                    backend::twitch::connect::refresh_user_emotes(state, &buffer.account_id, &buffer.name, &room).await;
+                }
+                let mut sources = state.runtime.emoji_catalogue(&buffer.account_id);
+                sources.retain(|s| s.buffers.iter().any(|b| b == buffer_id));
+                let mut seen = std::collections::HashSet::new();
+                let emoji: Vec<serde_json::Value> = sources
+                    .into_iter()
+                    .flat_map(|s| s.emoji)
+                    .filter(|e| !e.locked && seen.insert(e.name.clone()))
+                    .map(|e| serde_json::json!({ "id": e.id, "name": e.name, "animated": e.animated, "url": e.url, "locked": false }))
+                    .collect();
+                (Some(serde_json::json!(emoji)), None)
+            }
             // Steam's emoticons are the account's, the same in every conversation.
             Some(buffer_id) if buffer_id.starts_with("steam:") => {
                 let emoji: Vec<serde_json::Value> = state
@@ -382,6 +425,7 @@ pub async fn dispatch(
                 { "id": "sneedchat", "name": "Sneedchat", "available": true },
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
+                { "id": "twitch", "name": "Twitch", "available": true },
             ])),
             None,
         ),
@@ -539,7 +583,11 @@ pub async fn dispatch(
                 // until the next incremental change (see Runtime::
                 // set_presence's doc comment).
                 if let Some(members) = state.runtime.get_presence(buffer_id) {
-                    state.events.emit("presenceChange", serde_json::json!({ "bufferId": buffer_id, "members": members }));
+                    let mut change = serde_json::json!({ "bufferId": buffer_id, "members": members });
+                    if let Some(total) = state.runtime.get_presence_total(buffer_id) {
+                        change["total"] = serde_json::json!(total);
+                    }
+                    state.events.emit("presenceChange", change);
                 }
                 // Read markers are replayed for the same reason: they arrive
                 // on sync and are not repeated once they stop moving, so a
@@ -569,6 +617,11 @@ pub async fn dispatch(
                     }
                 }
 
+                // Whether this account may moderate a Twitch channel, which Twitch
+                // says once on joining and a window opened later missed.
+                if let Some(moderator) = state.runtime.twitch_rights(buffer_id) {
+                    state.events.emit("twitchRights", serde_json::json!({ "bufferId": buffer_id, "moderator": moderator }));
+                }
                 // And what a Kick channel is broadcasting, which changes while
                 // nobody is looking: a viewer count from an hour ago is worse
                 // than none, so opening the channel asks again.
@@ -723,8 +776,23 @@ pub async fn dispatch(
                 if id.starts_with("discord:") {
                     backend::discord::golive::forget(id);
                 }
+                // A Twitch sign-in is ended at Twitch as well, so removing the
+                // account here does not leave a token good for four more
+                // hours and a refresh token good for thirty days. Best effort:
+                // the account is removed either way.
+                let twitch_tokens = state.accounts.get_twitch(id).filter(|a| a.is_signed_in()).map(|a| (a.access_token, a.refresh_token));
                 match state.accounts.remove(id) {
-                    Ok(true) => (Some(ok_node()), None),
+                    Ok(true) => {
+                        if let Some((access, refresh)) = twitch_tokens {
+                            tokio::spawn(async move {
+                                if let Ok(http) = backend::twitch::client() {
+                                    let _ = backend::twitch::auth::revoke(&http, backend::twitch::auth::ID_ROOT, &access).await;
+                                    let _ = backend::twitch::auth::revoke(&http, backend::twitch::auth::ID_ROOT, &refresh).await;
+                                }
+                            });
+                        }
+                        (Some(ok_node()), None)
+                    }
                     Ok(false) => (None, Some("no such account".to_string())),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }
@@ -772,6 +840,14 @@ pub async fn dispatch(
                         match state.accounts.get_steam(id) {
                             Some(cfg) => {
                                 backend::steam::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("twitch:") {
+                        match state.accounts.get_twitch(id) {
+                            Some(cfg) => {
+                                backend::twitch::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -931,6 +1007,27 @@ pub async fn dispatch(
                     Ok(Ok(Err(e))) => (None, Some(e)),
                     Ok(Err(_)) => (None, Some("the Kick connection dropped before the channel opened".to_string())),
                     Err(_) => (None, Some("Kick took too long to answer for that channel".to_string())),
+                };
+            }
+            // Twitch is the same shape: a channel is a streamer, naming one is
+            // the whole of joining it, and the connection remembers it once
+            // Twitch has said it is there.
+            if id.starts_with("twitch:") {
+                let Some(channel) = backend::twitch::connect::normalise_login(name) else {
+                    return (None, Some(format!("\"{name}\" is not a Twitch channel")));
+                };
+                let Some(sender) = state.runtime.twitch_sender(id) else {
+                    return (None, Some("that Twitch account is not connected".to_string()));
+                };
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                if sender.send(backend::twitch::Command::Join(channel, Some(reply))).is_err() {
+                    return (None, Some("that Twitch account is not connected".to_string()));
+                }
+                return match tokio::time::timeout(std::time::Duration::from_secs(60), answer).await {
+                    Ok(Ok(Ok(()))) => (Some(ok_node()), None),
+                    Ok(Ok(Err(e))) => (None, Some(e)),
+                    Ok(Err(_)) => (None, Some("the Twitch connection dropped before the channel opened".to_string())),
+                    Err(_) => (None, Some("Twitch took too long to answer for that channel".to_string())),
                 };
             }
             match state.runtime.irc_sender(id) {
@@ -3118,6 +3215,13 @@ pub async fn dispatch(
                                 let left: Vec<String> = cfg.channels.into_iter().filter(|c| *c != buffer.name).collect();
                                 let _ = state.accounts.set_kick_channels(&buffer.account_id, left);
                             }
+                        } else if buffer.account_id.starts_with("twitch:") {
+                            // As Kick's: nothing to leave, so it parts the
+                            // connection's channel and forgets the handle.
+                            if let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) {
+                                let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
+                            }
+                            let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -3378,6 +3482,50 @@ pub async fn dispatch(
                     match backend::kick::api::send_message(&http, token, channel.chatroom_id, body, reply_to.as_ref()).await {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("twitch:") => {
+                    // Twitch's chat is one connection with the account's
+                    // channels on it: the message goes down it, and the
+                    // answer says whether Twitch can have it. No attachments:
+                    // Twitch chat has none, so one is ignored as Kick's is.
+                    let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
+                        return (None, Some("that Twitch account is not connected".to_string()));
+                    };
+                    // A whisper is a conversation of its own and is sent by the official API.
+                    if buffer.kind == "dm" {
+                        let (respond, answer) = tokio::sync::oneshot::channel();
+                        let command = backend::twitch::Command::Act {
+                            channel: String::new(),
+                            action: backend::twitch::moderation::Action::Whisper { to: buffer.name.trim_start_matches('@').to_string(), text: body.to_string() },
+                            target_id: None,
+                            respond,
+                        };
+                        if sender.send(command).is_err() {
+                            return (None, Some("that Twitch account is not connected".to_string()));
+                        }
+                        return match tokio::time::timeout(std::time::Duration::from_secs(20), answer).await {
+                            Ok(Ok(Ok(_))) => (Some(ok_node()), None),
+                            Ok(Ok(Err(e))) => (None, Some(e)),
+                            Ok(Err(_)) => (None, Some("the Twitch connection dropped before the whisper was sent".to_string())),
+                            Err(_) => (None, Some("Twitch took too long to take that whisper".to_string())),
+                        };
+                    }
+                    let (respond, answer) = tokio::sync::oneshot::channel();
+                    let command = backend::twitch::Command::Say {
+                        channel: buffer.name.clone(),
+                        text: body.to_string(),
+                        reply_to: reply_to_id.map(str::to_string),
+                        respond,
+                    };
+                    if sender.send(command).is_err() {
+                        return (None, Some("that Twitch account is not connected".to_string()));
+                    }
+                    match tokio::time::timeout(std::time::Duration::from_secs(20), answer).await {
+                        Ok(Ok(Ok(()))) => (Some(ok_node()), None),
+                        Ok(Ok(Err(e))) => (None, Some(e)),
+                        Ok(Err(_)) => (None, Some("the Twitch connection dropped before the message was sent".to_string())),
+                        Err(_) => (None, Some("Twitch took too long to take that message".to_string())),
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => {
@@ -4095,6 +4243,171 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Adding a Twitch account that only reads: no sign-in, nothing to
+        // wait for. Twitch's chat is public, so an anonymous reader sees every
+        // channel it is pointed at, and one that signs in later gets to send.
+        "addTwitchAccount" => {
+            let config = crate::accounts::TwitchAccountConfig {
+                anonymous: true,
+                use_tor: crate::net::route::router().wanted(&crate::net::route::pending_key("twitch")),
+                ..Default::default()
+            };
+            match state.accounts.add_twitch(config) {
+                Ok(saved) => {
+                    backend::twitch::spawn(state.clone(), saved.clone());
+                    (Some(serde_json::json!({ "accountId": saved.account_id() })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Signing in to Twitch takes place over time - the person approves a
+        // code on twitch.tv - so this answers with an id and the rest is
+        // events: see backend/twitch/login.rs.
+        "startTwitchLogin" => {
+            let login_id = format!("twitch-{}", crate::model::next_message_id());
+            backend::twitch::login::start(state.clone(), login_id.clone());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The form was closed with a sign-in still waiting.
+        "cancelTwitchLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::twitch::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
+        // The window's answer to a request for an integrity token, which
+        // Twitch sometimes demands before it will give a stream's address and
+        // which only a real page on twitch.tv can make. See playback.rs.
+        "provideTwitchIntegrity" => {
+            let Some(request_id) = p_str_opt(params, "requestId") else {
+                return (None, Some("provideTwitchIntegrity requires \"requestId\"".to_string()));
+            };
+            let outcome = match (p_str_opt(params, "token"), params.get("expiration").and_then(|v| v.as_i64())) {
+                (Some(token), Some(expiration)) if !token.is_empty() => Ok((token.to_string(), expiration)),
+                _ => Err(p_str_opt(params, "error").unwrap_or("no token").to_string()),
+            };
+            (Some(serde_json::json!({ "accepted": backend::twitch::playback::provide_integrity(request_id, outcome) })), None)
+        }
+
+        // The `auth-token` of a twitch.tv session, for playing a stream as
+        // the person who signed in (their Turbo, their subscriptions). Sent
+        // here by the window's sign-in page and by nothing else; an empty one
+        // forgets it.
+        // The twitch.tv session the sign-in window saw while the person signed in there, handed to the sign-in
+        // that is waiting for them to approve its code, so one action gives the account both.
+        "setTwitchLoginWebToken" => {
+            let (Some(login_id), Some(token)) = (p_str_opt(params, "loginId"), p_str_opt(params, "token")) else {
+                return (None, Some("setTwitchLoginWebToken requires \"loginId\" and \"token\"".to_string()));
+            };
+            if backend::twitch::login::set_web_token(login_id, token) {
+                (Some(ok_node()), None)
+            } else {
+                (None, Some("no Twitch sign-in is waiting".to_string()))
+            }
+        }
+
+        "setTwitchWebToken" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("setTwitchWebToken requires \"accountId\"".to_string()));
+            };
+            let token = p_str_opt(params, "token").unwrap_or("").trim().to_string();
+            match state.accounts.mutate_twitch(account_id, |a| a.web_token = token.clone()) {
+                Ok(true) => (Some(ok_node()), None),
+                Ok(false) => (None, Some("no such Twitch account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Opens the channels a Twitch account follows: the ones on air now, or
+        // all of them up to two hundred. Joined one at a time by the
+        // connection, which paces them to what Twitch allows; this answers
+        // with how many were asked for.
+        "syncTwitchFollows" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else {
+                return (None, Some("syncTwitchFollows requires \"accountId\"".to_string()));
+            };
+            let Some(cfg) = state.accounts.get_twitch(account_id).filter(|a| a.is_signed_in()) else {
+                return (None, Some("sign in to Twitch from Accounts to see the channels you follow".to_string()));
+            };
+            let live_only = params.get("liveOnly").and_then(|v| v.as_bool()).unwrap_or(true);
+            let Some(sender) = state.runtime.twitch_sender(account_id) else {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            };
+            let http = match backend::twitch::client() {
+                Ok(c) => c,
+                Err(e) => return (None, Some(format!("{e:#}"))),
+            };
+            let who = backend::twitch::helix::Caller { root: backend::twitch::helix::API_ROOT, client_id: backend::twitch::auth::CLIENT_ID, token: &cfg.access_token };
+            match backend::twitch::helix::followed(&http, &who, &cfg.user_id, live_only, 200).await {
+                Ok(logins) => {
+                    let count = logins.len();
+                    for login in logins {
+                        let _ = sender.send(backend::twitch::Command::Join(login, None));
+                    }
+                    (Some(serde_json::json!({ "count": count })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Something a moderator does to a Twitch channel from a menu: remove a
+        // message, time somebody out, ban them, let them back. The slash
+        // commands do the same through the composer (backend/twitch/moderation.rs).
+        "twitchModerate" => {
+            use backend::twitch::moderation::Action;
+            let (Some(buffer_id), Some(kind)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "action")) else {
+                return (None, Some("twitchModerate requires \"bufferId\" and \"action\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("twitch:")) else {
+                return (None, Some("that is not a Twitch channel".to_string()));
+            };
+            let login = p_str_opt(params, "login").unwrap_or("").trim().trim_start_matches('@').to_lowercase();
+            let reason = p_str_opt(params, "reason").unwrap_or("").to_string();
+            let action = match kind {
+                "delete" => Action::Delete { message_id: p_str_opt(params, "messageId").map(str::to_string) },
+                "timeout" => Action::Timeout { user: login, seconds: params.get("seconds").and_then(|v| v.as_u64()).unwrap_or(600), reason },
+                "ban" => Action::Ban { user: login, reason },
+                "unban" => Action::Unban { user: login },
+                "block" => Action::Block { user: login },
+                "unblock" => Action::Unblock { user: login },
+                "shoutout" => Action::Shoutout { user: login },
+                other => return (None, Some(format!("no Twitch moderation action called {other}"))),
+            };
+            let Some(sender) = state.runtime.twitch_sender(&buffer.account_id) else {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            };
+            let (respond, answer) = tokio::sync::oneshot::channel();
+            let command = backend::twitch::Command::Act { channel: buffer.name.clone(), action, target_id: p_str_opt(params, "userId").map(str::to_string), respond };
+            if sender.send(command).is_err() {
+                return (None, Some("that Twitch account is not connected".to_string()));
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(30), answer).await {
+                Ok(Ok(Ok(done))) => (Some(serde_json::json!({ "done": done })), None),
+                Ok(Ok(Err(e))) => (None, Some(e)),
+                Ok(Err(_)) => (None, Some("the Twitch connection dropped".to_string())),
+                Err(_) => (None, Some("Twitch took too long to answer".to_string())),
+            }
+        }
+
+        // A Twitch channel's recent past, from the third-party service the
+        // window was told it may ask (Settings, Twitch). Twitch keeps no
+        // history of its own; see backend/twitch/history.rs.
+        "twitchRecentMessages" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("twitchRecentMessages requires \"bufferId\"".to_string()));
+            };
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("twitch:")) else {
+                return (None, Some("that is not a Twitch channel".to_string()));
+            };
+            match backend::twitch::history::load(state, &buffer.account_id, &buffer.name, backend::twitch::history::ROOT).await {
+                Ok(read) => (Some(serde_json::json!({ "read": read })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // The code Steam asked for, for a sign-in that is waiting on one.
         "submitSteamGuardCode" => {
             let (Some(login_id), Some(code)) = (p_str_opt(params, "loginId"), p_str_opt(params, "code")) else {
@@ -4594,6 +4907,12 @@ pub async fn dispatch(
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("refreshKickStream requires \"bufferId\"".to_string()));
             };
+            // Twitch's channels answer the same question, in the same event.
+            if buffer_id.starts_with("twitch:") {
+                let (state, buffer_id) = (state.clone(), buffer_id.to_string());
+                tokio::spawn(async move { backend::twitch::stream::refresh_one(&state, &buffer_id).await });
+                return (Some(ok_node()), None);
+            }
             if state.runtime.kick_channel(buffer_id).is_none() {
                 return (None, Some("that is not a Kick channel".to_string()));
             }
@@ -4682,6 +5001,16 @@ pub async fn dispatch(
                     };
                 }
             }
+            if channel_account(state, buffer_id).starts_with("twitch:") {
+                // Twitch's choices are named by ids of their own, which the window hands back as text.
+                let Some(choice) = p_str_opt(params, "answerId") else {
+                    return (None, Some("votePoll requires \"answerId\"".to_string()));
+                };
+                return match backend::twitch::points::vote_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, choice).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -4709,6 +5038,12 @@ pub async fn dispatch(
                 return (None, Some("betPrediction requires \"optionId\"".to_string()));
             };
             let amount = params.get("amount").and_then(|v| v.as_i64()).unwrap_or(0);
+            if channel_account(state, buffer_id).starts_with("twitch:") {
+                return match backend::twitch::points::bet_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, option_id, amount.max(0) as u64).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             let Some(channel) = state.runtime.kick_channel(buffer_id) else {
                 return (None, Some("that is not a Kick channel".to_string()));
             };
@@ -4783,6 +5118,58 @@ pub async fn dispatch(
                 .flatten();
             state.runtime.set_kick_watching(&buffer.account_id, buffer_id, live_id);
             (Some(serde_json::json!({ "watching": live_id.is_some() })), None)
+        }
+
+        // A Twitch channel's points balance, as the person's twitch.tv session; only when asked for (see
+        // backend/twitch/points.rs).
+        "twitchPoints" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("twitchPoints requires \"bufferId\"".to_string()));
+            };
+            match backend::twitch::points::points_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await {
+                Ok(p) => (Some(serde_json::json!({ "points": p.balance, "name": p.name })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The window is playing a Twitch channel's video: told once a minute, and passed on to Twitch as the
+        // player on twitch.tv does it (see backend/twitch/watch.rs).
+        "reportTwitchWatching" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("reportTwitchWatching requires \"bufferId\"".to_string()));
+            };
+            match backend::twitch::watch::report(state, backend::twitch::gql::ROOT, backend::twitch::watch::PAGE_ROOT, buffer_id).await {
+                Ok(sent) => (Some(serde_json::json!({ "sent": sent })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // What a Twitch channel trades its points for, and spending them on one: the panel over the chat lists
+        // them and a button redeems (see backend/twitch/points.rs).
+        "listTwitchRewards" => {
+            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
+                return (None, Some("listTwitchRewards requires \"bufferId\"".to_string()));
+            };
+            match backend::twitch::points::rewards_in_buffer(state, backend::twitch::gql::ROOT, buffer_id).await {
+                Ok((rewards, points)) => {
+                    let list: Vec<serde_json::Value> = rewards
+                        .into_iter()
+                        .map(|r| serde_json::json!({ "id": r.id, "title": r.title, "cost": r.cost, "description": r.prompt, "enabled": r.enabled, "paused": r.paused, "needsInput": r.needs_input, "color": r.color, "image": r.image, "unavailable": r.unavailable, "choices": r.choices.iter().map(|c| serde_json::json!({ "id": c.id, "label": c.label, "image": c.image, "group": c.group, "groupImage": c.group_image })).collect::<Vec<_>>() }))
+                        .collect();
+                    (Some(serde_json::json!({ "rewards": list, "points": points.balance, "name": points.name })), None)
+                }
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "redeemTwitchReward" => {
+            let (Some(buffer_id), Some(reward_id)) = (p_str_opt(params, "bufferId"), p_str_opt(params, "rewardId")) else {
+                return (None, Some("redeemTwitchReward requires \"bufferId\" and \"rewardId\"".to_string()));
+            };
+            match backend::twitch::points::redeem_in_buffer(state, backend::twitch::gql::ROOT, buffer_id, reward_id, p_str_opt(params, "input"), p_str_opt(params, "choice")).await {
+                Ok(p) => (Some(serde_json::json!({ "points": p.balance })), None),
+                Err(e) => (None, Some(e)),
+            }
         }
 
         "kickPoints" => {
@@ -5273,6 +5660,15 @@ pub async fn dispatch(
                         Err(anyhow::anyhow!("Matrix needs the person's id, not their name"))
                     } else {
                         backend::matrix::open_dm(state, account_id, user_id, nick).await
+                    }
+                }
+                // A Twitch whisper is a conversation with a login: it exists as soon as it is named.
+                "twitch" => {
+                    let who = if nick.is_empty() { user_id } else { nick }.trim().trim_start_matches('@').to_lowercase();
+                    if who.is_empty() || !who.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                        Err(anyhow::anyhow!("no login to whisper to"))
+                    } else {
+                        Ok(state.runtime.ensure_buffer(state, account_id, &backend::twitch::chat::whisper_buffer(&who), "dm").id)
                     }
                 }
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),

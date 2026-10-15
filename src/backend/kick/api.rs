@@ -83,6 +83,53 @@ pub struct Channel {
     pub playback_url: Option<String>,
 }
 
+/// Where a stream's video is, and until when that address is good.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playback {
+    /// A signed Amazon IVS playlist address: the signature is in the query, so it is fetched with no
+    /// credential of ours.
+    pub url: String,
+    /// When the signature stops being accepted, in unix seconds, where the address says.
+    pub expires: Option<i64>,
+    /// Whether the signature opts out of ad insertion, which Kick's own web page is given.
+    pub ads_opt_out: Option<bool>,
+}
+
+impl Playback {
+    pub fn of(url: &str) -> Playback {
+        let claims = token_claims(url);
+        Playback { url: url.to_string(), expires: claims.as_ref().and_then(|c| c["exp"].as_i64()), ads_opt_out: claims.as_ref().and_then(|c| c["aws:ads-opt-out"].as_bool()) }
+    }
+}
+
+/// What a signed playlist address says about itself: the claims of the token in its query.
+fn token_claims(url: &str) -> Option<serde_json::Value> {
+    use base64::Engine;
+    let token = url.split_once('?')?.1.split('&').find_map(|pair| pair.strip_prefix("token="))?;
+    let claims = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(claims.trim_end_matches('=')).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// A live channel's playlist address, asked for on its own.
+///
+/// The channel payload carries one too, but that is eight kilobytes about everything else and is kept
+/// by Kick for a while, so the address in it can be most of the way to its expiry. This answers with
+/// the address alone, signed fresh, for a tenth of the bytes; it is the call Kick's apps make. The
+/// signature lasts about ten minutes, which is what `Playback::expires` is for.
+pub async fn playback(http: &reqwest::Client, slug: &str) -> Result<Playback> {
+    let res = paced(http.get(format!("{API_ROOT}/api/v2/channels/{slug}/playback-url")).header("Accept", "application/json"), Priority::Background)
+        .await
+        .context("asking Kick where the stream is")?;
+    let status = res.status();
+    if !status.is_success() {
+        bail!("Kick answered {status} for the stream's address");
+    }
+    let body: serde_json::Value = res.json().await.context("unreadable answer")?;
+    let url = body["data"].as_str().filter(|u| u.starts_with("https://")).context("Kick sent no address for the stream")?;
+    Ok(Playback::of(url))
+}
+
 /// A stream in progress, as the channel endpoint describes it.
 #[derive(Clone, Debug, Default)]
 pub struct Live {
@@ -855,8 +902,13 @@ pub struct HistoryMessage {
     #[serde(default)]
     pub created_at: Option<String>,
     pub sender: HistorySender,
+    /// A string of JSON here, not the object the live socket sends.
     #[serde(default)]
     pub metadata: Option<serde_json::Value>,
+    /// Where a reply's chain began. This endpoint has never sent it; the
+    /// other history one does, and so does the socket.
+    #[serde(default)]
+    pub thread_parent_id: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -884,9 +936,12 @@ pub struct ChatIdentity {
     pub color: Option<String>,
     #[serde(default)]
     pub badges: Vec<Badge>,
+    /// The pictures: level, event and founder badges, and a channel's own.
+    #[serde(default)]
+    pub badges_v2: Vec<BadgeV2>,
 }
 
-#[derive(Deserialize, Debug, Clone, Serialize)]
+#[derive(Deserialize, Debug, Clone, Serialize, Default)]
 pub struct Badge {
     /// `moderator`, `subscriber`, `verified`, `og`, `founder`, `vip`...
     #[serde(rename = "type")]
@@ -897,6 +952,38 @@ pub struct Badge {
     /// Months subscribed, for the badges that count.
     #[serde(default)]
     pub count: Option<u32>,
+    /// A picture to draw it with, for the badges Kick sends as one: the level,
+    /// a channel's or an event's own, the founder's. The role badges above
+    /// have none and are drawn as words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// Where Kick ranks it, highest first. Only used to put the badges in
+    /// Kick's order, which the role and the picture badges share.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort_order: Option<i32>,
+}
+
+/// A badge in Kick's newer list, which says what it looks like where the old
+/// list names a role. `selected` is the person's own choice to wear it: a
+/// level badge comes on every message, and only some people show theirs.
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BadgeV2 {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub selected: Option<bool>,
+    #[serde(default)]
+    pub sort_order: Option<i32>,
+    #[serde(default)]
+    pub metadata: Option<BadgeV2Metadata>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+pub struct BadgeV2Metadata {
+    #[serde(default)]
+    pub level: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -2177,5 +2264,32 @@ pub async fn redeem(http: &reqwest::Client, token: &str, slug: &str, reward_id: 
     match reason {
         Some(why) => bail!("{why}"),
         None => bail!("Kick answered {status}"),
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::*;
+    use base64::Engine;
+
+    fn address(claims: serde_json::Value) -> String {
+        let part = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+        format!("https://example.live-video.net/api/video/v1/x.m3u8?token=eyJhbGciOiJFUzM4NCJ9.{part}.sig")
+    }
+
+    #[test]
+    fn an_address_says_when_it_expires_and_whether_it_opts_out_of_ads() {
+        let p = Playback::of(&address(serde_json::json!({ "exp": 1791932879, "aws:ads-opt-out": true })));
+        assert_eq!((p.expires, p.ads_opt_out), (Some(1791932879), Some(true)));
+        let p = Playback::of(&address(serde_json::json!({ "exp": 5 })));
+        assert_eq!((p.expires, p.ads_opt_out), (Some(5), None), "silence is not a refusal");
+    }
+
+    #[test]
+    fn an_address_that_is_not_signed_the_way_it_expects_has_no_expiry_and_is_still_an_address() {
+        for url in ["https://example.net/x.m3u8", "https://example.net/x.m3u8?other=1", "https://example.net/x.m3u8?token=notajwt", "https://example.net/x.m3u8?token=a.!!!.c"] {
+            let p = Playback::of(url);
+            assert_eq!((p.url.as_str(), p.expires), (url, None));
+        }
     }
 }

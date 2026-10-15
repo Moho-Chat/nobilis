@@ -551,7 +551,7 @@ async fn prepare(
     // Follow state is not asked for here: this runs for every channel at
     // connect, and that would be one extra request per channel before the
     // first message arrives. It is filled in when the channel is opened.
-    announce_stream(state, &buffer.id, &channel, None);
+    announce_stream(state, &buffer.id, &channel, None, channel.playback_url.as_deref().filter(|_| channel.live.is_some()).map(api::Playback::of).as_ref());
 
     // The streamer's own picture on the channel. Parsed since the first
     // version of this backend and used by nothing, so every Kick channel drew
@@ -659,20 +659,24 @@ async fn prepare(
 
 /// Asks the socket for everything that happens in a channel's chat.
 ///
-/// Five subscriptions, not one, because Kick scatters them and only the first
+/// Several subscriptions, not one, because Kick scatters them and only the first
 /// carries what people say. Watching that one alone is why a chat can look
 /// quiet while the stream is visibly reacting to something. Measured against a
 /// live subathon rather than guessed - each name here is one an event was
 /// actually observed arriving on:
 ///
 ///   - `chatrooms.<room>.v2`  what people say, and plain subscriptions
-///   - `chatrooms.<room>`     rewards, and the info lines Kick's own UI draws
-///   - `chatroom_<room>`      gifted subscriptions, on an older name entirely
+///   - `chatroom_<room>`      rewards and gifted subscriptions, on an older name entirely
 ///   - `channel.<channel>`    going live, and the channel's own subscriptions
 ///   - `channel_<channel>`    KICKs sent to the streamer, and goal and leaderboard updates
 ///
+/// There used to be a sixth, `chatrooms.<room>` without the `.v2`. Kick's own
+/// apps do not ask for it, and six minutes on a channel with 60,000 watching
+/// delivered nothing on it - chat came on `.v2` and rewards on `chatroom_` -
+/// so it was a subscription to silence, paid for on every channel opened.
+///
 /// The overlap is real and deliberate on Kick's part: one subscription arrives
-/// three times over three of these. Which of the three is believed is settled
+/// more than once over several of these. Which of the three is believed is settled
 /// in `describe_action`, not here - subscribing to fewer channels would lose
 /// whole categories of event to avoid a duplicate that is cheaper to filter.
 ///
@@ -681,7 +685,6 @@ async fn prepare(
 pub(super) async fn subscribe(socket: &mut Socket, chatroom_id: u64, channel_id: u64) -> Result<()> {
     for channel in [
         format!("chatrooms.{chatroom_id}.v2"),
-        format!("chatrooms.{chatroom_id}"),
         format!("chatroom_{chatroom_id}"),
         format!("channel.{channel_id}"),
         // A third name for the channel, with an underscore, which is where
@@ -827,7 +830,7 @@ mod tests {
         let none = serde_json::json!({});
         // All four names this connection subscribes to resolve to the same
         // streamer, across both of Kick's number spaces.
-        for name in ["chatrooms.2393554.v2", "chatrooms.2393554", "chatroom_2393554", "channel.2401072"] {
+        for name in ["chatrooms.2393554.v2", "chatroom_2393554", "channel.2401072"] {
             assert_eq!(channel_of(&w, &Some(name.into()), &none).as_deref(), Some("odablock"), "for {name}");
         }
     }
@@ -887,18 +890,17 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["channel.2401072", "channel_2401072", "chatroom_2393554", "chatrooms.2393554", "chatrooms.2393554.v2"]
+            vec!["channel.2401072", "channel_2401072", "chatroom_2393554", "chatrooms.2393554.v2", "predictions-channel-2401072"]
         );
         // And it is gone from both maps, so a straggling event has nowhere to
         // land rather than reopening the buffer that was just closed.
-        assert_eq!(channel_of(&w, &Some("chatrooms.2393554".into()), &serde_json::json!({})), None);
+        assert_eq!(channel_of(&w, &Some("chatrooms.2393554.v2".into()), &serde_json::json!({})), None);
         assert!(w.remove("odablock").is_empty());
     }
 
     #[test]
     fn reads_the_id_out_of_a_subscription_name() {
         assert_eq!(id_in_subscription("chatrooms.123.v2"), Some(Subscribed::Chatroom(123)));
-        assert_eq!(id_in_subscription("chatrooms.123"), Some(Subscribed::Chatroom(123)));
         assert_eq!(id_in_subscription("chatroom_123"), Some(Subscribed::Chatroom(123)));
         assert_eq!(id_in_subscription("channel.123"), Some(Subscribed::Channel(123)));
         assert_eq!(id_in_subscription("channel_123"), Some(Subscribed::Channel(123)));
