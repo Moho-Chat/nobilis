@@ -8,6 +8,37 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
+/// Who owns emotes an account has: found out once from Twitch and kept, since a channel's name and picture change
+/// rarely and a subscription list can name dozens.
+#[derive(Clone)]
+pub struct Owner {
+    pub login: String,
+    pub name: String,
+    pub picture: String,
+}
+
+fn known_owners() -> &'static Mutex<HashMap<String, Owner>> {
+    static KNOWN: std::sync::OnceLock<Mutex<HashMap<String, Owner>>> = std::sync::OnceLock::new();
+    KNOWN.get_or_init(Default::default)
+}
+
+/// The channels these numbers belong to, by number; one whose owner Twitch would not name is not in the answer.
+pub async fn owners(http: &reqwest::Client, who: &super::helix::Caller<'_>, ids: &[String]) -> HashMap<String, Owner> {
+    let missing: Vec<String> = {
+        let known = known_owners().lock().unwrap();
+        ids.iter().filter(|i| !known.contains_key(*i)).cloned().collect()
+    };
+    if !missing.is_empty() {
+        let found = super::helix::users_by_id(http, who, &missing).await;
+        let mut known = known_owners().lock().unwrap();
+        for (id, login, name, picture) in found {
+            known.insert(id, Owner { login, name, picture });
+        }
+    }
+    let known = known_owners().lock().unwrap();
+    ids.iter().filter_map(|i| known.get(i).map(|o| (i.clone(), o.clone()))).collect()
+}
+
 /// When an account's own emotes in a channel were last fetched, and the channel's number (for fetching them again
 /// from anywhere): Twitch lets an emote lapse (a 24-hour unlock, a limited-time one) and gives no word of it, so the
 /// list is read again when it is asked for and has gone stale, and the picker shows only what is there.

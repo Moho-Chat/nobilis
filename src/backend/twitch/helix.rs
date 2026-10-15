@@ -242,6 +242,8 @@ pub async fn whisper(http: &reqwest::Client, who: &Caller<'_>, from_id: &str, to
 /// One emote an account can use in a channel.
 #[derive(Debug, PartialEq)]
 pub struct UserEmote {
+    /// The broadcaster who owns it: a channel's number, or empty / `twitch` for Twitch's own.
+    pub owner: String,
     pub id: String,
     pub name: String,
     pub url: String,
@@ -278,7 +280,8 @@ pub async fn user_emotes(http: &reqwest::Client, who: &Caller<'_>, user_id: &str
             let animated = e.get("format").and_then(|f| f.as_array()).is_some_and(|f| f.iter().any(|x| x == "animated"));
             // The still form at twice the size: a cell in the picker is small, and the window animates by token.
             let url = template.replace("{{id}}", id).replace("{{format}}", "static").replace("{{theme_mode}}", "dark").replace("{{scale}}", "2.0");
-            out.push(UserEmote { id: id.to_string(), name: name.to_string(), url, animated });
+            let owner = e.get("owner_id").and_then(|o| o.as_str()).unwrap_or("").to_string();
+            out.push(UserEmote { owner, id: id.to_string(), name: name.to_string(), url, animated });
         }
         after = body.pointer("/pagination/cursor").and_then(|c| c.as_str()).unwrap_or("").to_string();
         if after.is_empty() || out.len() >= cap {
@@ -314,9 +317,24 @@ pub async fn channel_emotes(http: &reqwest::Client, who: &Caller<'_>, broadcaste
             let (id, name) = (e.get("id")?.as_str()?, e.get("name")?.as_str()?);
             let animated = e.get("format").and_then(|f| f.as_array()).is_some_and(|f| f.iter().any(|x| x == "animated"));
             let url = template.replace("{{id}}", id).replace("{{format}}", "static").replace("{{theme_mode}}", "dark").replace("{{scale}}", "2.0");
-            Some(UserEmote { id: id.to_string(), name: name.to_string(), url, animated })
+            let owner = e.get("owner_id").and_then(|o| o.as_str()).unwrap_or("").to_string();
+            Some(UserEmote { owner, id: id.to_string(), name: name.to_string(), url, animated })
         })
         .collect())
+}
+
+/// Who some accounts are: (id, login, name shown, picture), as many as are found. A hundred to a request.
+pub async fn users_by_id(http: &reqwest::Client, who: &Caller<'_>, ids: &[String]) -> Vec<(String, String, String, String)> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(100) {
+        let query: Vec<(&str, &str)> = chunk.iter().map(|i| ("id", i.as_str())).collect();
+        let Ok(answer) = request(http, who, reqwest::Method::GET, "/users", &query, None).await else { continue };
+        for u in answer.get("data").and_then(|d| d.as_array()).into_iter().flatten() {
+            let text = |k: &str| u.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+            out.push((text("id"), text("login"), text("display_name"), text("profile_image_url")));
+        }
+    }
+    out
 }
 
 /// The channels an account follows, by login: only the ones live now when
@@ -491,6 +509,15 @@ mod tests {
         assert!(seen.lock().unwrap()[0].starts_with("GET /chat/emotes/user?user_id=42&broadcaster_id=100 "));
         assert!(seen.lock().unwrap()[1].contains("after=p2"));
         assert!(user_emotes(&client, &who, "42", "100", 1000).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_owners_of_emotes_are_named_with_their_pictures() {
+        let (root, seen) = twitch(vec![(200, r#"{"data":[{"id":"7","login":"skitzy_va","display_name":"Skitzy_VA","profile_image_url":"https://img/s.png"}]}"#)]).await;
+        let who = Caller { root: &root, client_id: "cid", token: "tok" };
+        let got = users_by_id(&reqwest::Client::new(), &who, &["7".to_string(), "8".to_string()]).await;
+        assert_eq!(got, vec![("7".to_string(), "skitzy_va".to_string(), "Skitzy_VA".to_string(), "https://img/s.png".to_string())]);
+        assert!(seen.lock().unwrap()[0].starts_with("GET /users?id=7&id=8 "), "{}", seen.lock().unwrap()[0]);
     }
 
     #[tokio::test]

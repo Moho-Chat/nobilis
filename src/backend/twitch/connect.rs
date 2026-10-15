@@ -501,6 +501,31 @@ async fn load_extras(state: &AppState, account_id: &str, channel: &str, room_id:
     }
 }
 
+/// Sorts what an account has into what belongs to the channel and what does not. A channel's own emotes are what it
+/// lists (those the account has first, then the ones it would have to subscribe or follow for), and a changed version
+/// of one (`<id>_BW`, `_SG` and so on, which a reward unlocks and the channel's list does not name) or any emote the
+/// channel owns is the channel's too. Returns (the channel's the account can use, the channel's it cannot, the rest).
+fn split_channel<'a>(
+    room_id: &str,
+    channels: &'a [super::helix::UserEmote],
+    mine: &'a [super::helix::UserEmote],
+) -> (Vec<&'a super::helix::UserEmote>, Vec<&'a super::helix::UserEmote>, Vec<&'a super::helix::UserEmote>) {
+    if channels.is_empty() {
+        return (Vec::new(), Vec::new(), mine.iter().collect());
+    }
+    let theirs: HashSet<&str> = channels.iter().map(|e| e.id.as_str()).collect();
+    let have: HashSet<&str> = mine.iter().map(|e| e.id.as_str()).collect();
+    let belongs = |e: &super::helix::UserEmote| {
+        theirs.contains(e.id.as_str())
+            || (!room_id.is_empty() && e.owner == room_id)
+            || e.id.split_once('_').is_some_and(|(base, change)| theirs.contains(base) && change.len() <= 3 && change.chars().all(|c| c.is_ascii_uppercase()))
+    };
+    let mut usable: Vec<&super::helix::UserEmote> = channels.iter().filter(|e| have.contains(e.id.as_str())).collect();
+    usable.extend(mine.iter().filter(|e| belongs(e) && !theirs.contains(e.id.as_str())));
+    let locked = channels.iter().filter(|e| !have.contains(e.id.as_str())).collect();
+    (usable, locked, mine.iter().filter(|e| !belongs(e)).collect())
+}
+
 /// Reads the emotes this account can use in a channel again, and replaces what the picker offers with them:
 /// an emote that has lapsed (a 24-hour unlock, a limited-time one) is gone from Twitch's answer and so from the
 /// picker, and one just unlocked is there.
@@ -512,8 +537,11 @@ pub async fn refresh_user_emotes(state: &AppState, account_id: &str, channel: &s
     }
     let who = super::helix::Caller { root: super::helix::API_ROOT, client_id: auth::CLIENT_ID, token: &cfg.access_token };
     match super::helix::user_emotes(&http, &who, &cfg.user_id, room_id, 3000).await {
-        Ok(mine) => {
+        Ok(mut mine) => {
             super::emotes::note_user_emotes(account_id, channel, room_id);
+            // Twitch lists an emote once for each set it is in: one picture is one cell.
+            let mut seen = HashSet::new();
+            mine.retain(|e| seen.insert(e.id.clone()));
             let buffer_id = crate::model::buffer_id(account_id, channel);
             let entry = |e: &super::helix::UserEmote, locked: bool| crate::model::EmojiEntry {
                 id: format!("[twitch:{}:{}:{}]", if e.animated { "aemote" } else { "emote" }, e.id, e.name.replace(']', "_")),
@@ -523,30 +551,46 @@ pub async fn refresh_user_emotes(state: &AppState, account_id: &str, channel: &s
                 locked,
             };
             // What the channel has of its own is shown whole: what the account can use, and what it would have to
-            // subscribe or follow for (greyed out, as Kick's are). Twitch's other emotes the account has follow.
+            // subscribe or follow for (greyed out, as Kick's are). The rest of what the account has is grouped by
+            // whose it is: Twitch's own, and a section for each other channel (with its picture) that gives the
+            // account emotes, as a subscription elsewhere does.
             let channels = super::helix::channel_emotes(&http, &who, room_id).await.unwrap_or_default();
-            let theirs: HashSet<&str> = channels.iter().map(|e| e.id.as_str()).collect();
-            let have: HashSet<&str> = mine.iter().map(|e| e.id.as_str()).collect();
-            let section = |id: String, name: String, emoji: Vec<crate::model::EmojiEntry>| crate::model::EmojiSource {
+            let (own_usable, own_locked, other) = split_channel(room_id, &channels, &mine);
+            let section = |id: String, name: String, icon_url: Option<String>, emoji: Vec<crate::model::EmojiEntry>| crate::model::EmojiSource {
                 id,
                 name,
                 service: "twitch".to_string(),
                 kind: "text".to_string(),
-                icon_url: None,
+                icon_url,
                 buffers: vec![buffer_id.clone()],
                 sendable_anywhere: false,
                 emoji,
             };
+            // Rebuilt whole: an owner the account no longer has emotes from is not left behind.
+            state.runtime.clear_emoji_sources(account_id, &format!("twitch:{channel}"));
+            let mut owners: Vec<String> = other.iter().map(|e| e.owner.clone()).filter(|o| !o.is_empty() && o != "twitch" && o != "0").collect();
+            owners.sort();
+            owners.dedup();
+            let people = super::emotes::owners(&http, &who, &owners).await;
+            let mut twitchs: Vec<crate::model::EmojiEntry> = Vec::new();
+            let mut by_owner: std::collections::BTreeMap<String, Vec<crate::model::EmojiEntry>> = Default::default();
+            for e in other {
+                match people.get(&e.owner) {
+                    Some(person) if !e.owner.is_empty() => by_owner.entry(person.login.clone()).or_default().push(entry(e, false)),
+                    _ => twitchs.push(entry(e, false)),
+                }
+            }
             if !channels.is_empty() {
                 // What can be used comes first, in the order Twitch lists it; what cannot follows, greyed out.
-                let (usable, locked): (Vec<_>, Vec<_>) = channels.iter().partition(|e| have.contains(e.id.as_str()));
-                let own: Vec<_> = usable.into_iter().map(|e| entry(e, false)).chain(locked.into_iter().map(|e| entry(e, true))).collect();
-                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), channel.to_string(), own));
-                let rest: Vec<_> = mine.iter().filter(|e| !theirs.contains(e.id.as_str())).map(|e| entry(e, false)).collect();
-                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:other"), "Twitch".to_string(), rest));
-            } else {
-                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), "Twitch".to_string(), mine.iter().map(|e| entry(e, false)).collect()));
-                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:other"), "Twitch".to_string(), Vec::new()));
+                let own: Vec<_> = own_usable.into_iter().map(|e| entry(e, false)).chain(own_locked.into_iter().map(|e| entry(e, true))).collect();
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}"), channel.to_string(), None, own));
+            }
+            state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:1"), "Twitch".to_string(), None, twitchs));
+            for (login, emoji) in by_owner {
+                let person = people.values().find(|p| p.login == login);
+                let picture = person.map(|p| p.picture.clone()).filter(|p| !p.is_empty());
+                let name = person.map(|p| p.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| login.clone());
+                state.runtime.set_emoji_source(account_id, section(format!("twitch:{channel}:2:{login}"), name, picture, emoji));
             }
         }
         Err(e) => tracing::debug!("twitch[{account_id}]: your emotes in {channel}: {e:#}"),
@@ -1052,6 +1096,21 @@ mod tests {
         // And what is not a login at all is refused at once.
         assert!(join(&tx, "not a channel!").await.unwrap_err().contains("cannot be a Twitch channel"));
         task.abort();
+    }
+
+    #[test]
+    fn what_a_reward_unlocked_is_listed_with_the_channels_own_emotes() {
+        use crate::backend::twitch::helix::UserEmote;
+        let e = |owner: &str, id: &str| UserEmote { owner: owner.into(), id: id.into(), name: id.into(), url: String::new(), animated: false };
+        let channels = vec![e("71", "a"), e("71", "b"), e("71", "c")];
+        let mine = vec![e("twitch", "25"), e("71", "a"), e("twitch", "b_BW"), e("9", "z"), e("71", "d")];
+        let (usable, locked, other) = split_channel("71", &channels, &mine);
+        let names = |v: &[&UserEmote]| v.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&usable), ["a", "b_BW", "d"], "what the account has first, a changed one and one the channel owns with them");
+        assert_eq!(names(&locked), ["b", "c"]);
+        assert_eq!(names(&other), ["25", "z"]);
+        // With the channel's list unavailable nothing is claimed for it.
+        assert_eq!(split_channel("71", &[], &mine).2.len(), 5);
     }
 
     #[tokio::test]

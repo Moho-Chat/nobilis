@@ -2076,6 +2076,14 @@ impl Runtime {
             .insert(source.id.clone(), source);
     }
 
+    /// Forgets a source and the ones named under it (`id:...`), for a set that is rebuilt whole.
+    pub fn clear_emoji_sources(&self, account_id: &str, id: &str) {
+        if let Some(sources) = self.emoji_catalogue.lock().unwrap().get_mut(account_id) {
+            let under = format!("{id}:");
+            sources.retain(|have, _| have != id && !have.starts_with(&under));
+        }
+    }
+
     /// Everything this account can reach, newest knowledge of each source.
     pub fn emoji_catalogue(&self, account_id: &str) -> Vec<crate::model::EmojiSource> {
         self.emoji_catalogue
