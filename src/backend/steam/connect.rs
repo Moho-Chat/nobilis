@@ -39,8 +39,8 @@ pub const PROTOCOL_VERSION: u32 = 65581;
 /// How long Steam has to answer a sign-in.
 const LOGON_TIMEOUT: Duration = Duration::from_secs(30);
 
-const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
-const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 
 /// How long to leave an account alone after Steam says it is being asked too
 /// often. Seconds would be asking again; this is the length of time that the
@@ -124,10 +124,11 @@ pub fn logon_message(config: &SteamAccountConfig, language: &str) -> ClientLogon
         should_remember_password: Some(true),
         // Where the machine is on its own network is nothing Steam needs to
         // be told; the field exists and asks to be filled.
-        obfuscated_private_ip: Some(IpAddress { ip: Some(ip_address::Ip::V4(0)) }),
+        obfuscated_private_ip: Some(IpAddress { ip: Some(ip_address::Ip::V4(auth::logon_id())) }),
         chat_mode: Some(2),
         account_name: Some(config.username.clone()),
         machine_name: Some(auth::device_name()),
+        machine_id: Some(auth::machine_id()),
         supports_rate_limit_response: Some(true),
         // The refresh token, which is what this field takes whatever its name.
         access_token: Some(config.refresh_token.clone()),

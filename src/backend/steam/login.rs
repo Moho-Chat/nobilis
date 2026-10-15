@@ -305,7 +305,7 @@ pub async fn flow(
         display_name: None,
         refresh_token: tokens.refresh_token,
         guard_data: tokens.guard_data,
-        // Always the mobile chat session; kept so older files still read.
+        // The kind is no longer chosen; kept so older files still read.
         session: "chat".to_string(),
         use_tor: crate::net::route::router().wanted(&key),
         strict_route: false,

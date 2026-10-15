@@ -27,19 +27,75 @@ use base64::Engine;
 use rsa::{BigUint, Pkcs1v15Encrypt, RsaPublicKey};
 use std::time::Duration;
 
-/// What moho signs in as: the Steam mobile app's chat session.
+/// What moho signs in as: a desktop Steam client, the way every other third-party client does.
 ///
-/// This is part of the token Steam issues and decides how Steam treats the
-/// connection that uses it. The desktop client's session is one per account,
-/// so signing in as it would sign the Steam launcher out (and the reverse).
-/// The mobile chat session is chat and friends only, and lives beside the
-/// launcher. It is the only kind moho offers.
+/// This is part of the token Steam issues and decides how Steam treats the connection that uses it. It was the
+/// mobile app's chat session (platform 3, app type 2, website "Mobile") until Steam raised an account alert for an
+/// unexpected device: a "phone" that reports a Linux desktop's operating system, has no machine id and logs on again
+/// every time its connection is closed does not look like any real device. SteamKit2, ArchiSteamFarm, node-steam-user,
+/// node-steam-session and steam-vent all sign in as the desktop client (platform 1, website "Client"), and so does this.
 ///
-/// `EAuthTokenPlatformType` 3 is the mobile app.
-const PLATFORM_TYPE: i32 = 3;
-/// `EAuthTokenAppType` 2 is the mobile chat app.
-const APP_TYPE: i32 = 2;
-const WEBSITE_ID: &str = "Mobile";
+/// `EAuthTokenPlatformType` 1 is the desktop client. It has no app type.
+const PLATFORM_TYPE: i32 = 1;
+const WEBSITE_ID: &str = "Client";
+/// `EGamingDeviceType` 1 is an ordinary PC, as node-steam-session sends for the desktop client.
+const GAMING_DEVICE_TYPE: u32 = 1;
+
+/// This install's own random number, made once and kept next to the daemon's other files, from which its machine
+/// id and logon id are drawn. One per install and not per account: a machine is one machine however many accounts
+/// sign in on it, and two installs (a test window, a second computer) are two.
+pub fn install_id() -> [u8; 16] {
+    // A test never writes to the real data directory.
+    #[cfg(test)]
+    return [7u8; 16];
+    #[cfg(not(test))]
+    {
+    static ID: std::sync::OnceLock<[u8; 16]> = std::sync::OnceLock::new();
+    *ID.get_or_init(|| {
+        let path = crate::default_data_dir().join("steam-install-id");
+        if let Some(read) = std::fs::read_to_string(&path).ok().and_then(|t| hex::decode(t.trim()).ok()).and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+            return read;
+        }
+        let made: [u8; 16] = rand::random();
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")));
+        let _ = std::fs::write(&path, hex::encode(made));
+        made
+    })
+    }
+}
+
+/// The machine id Steam's client sends: a binary key-value object of three SHA-1 hashes (named BB3, FF2 and 3B3 in the
+/// client), here of strings made from the install's number, so it is the same each time and different for each install.
+pub fn machine_id_from(install: &[u8; 16]) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let mut out = vec![0u8];
+    out.extend_from_slice(b"MessageObject\0");
+    for name in ["BB3", "FF2", "3B3"] {
+        let hash = hex::encode(Sha1::digest(format!("moho {name} {}", hex::encode(install)).as_bytes()));
+        out.push(1);
+        out.extend_from_slice(name.as_bytes());
+        out.push(0);
+        out.extend_from_slice(hash.as_bytes());
+        out.push(0);
+    }
+    out.extend_from_slice(&[8, 8]);
+    out
+}
+
+pub fn machine_id() -> Vec<u8> {
+    machine_id_from(&install_id())
+}
+
+/// What tells this install's sessions from another's on the same account: Steam ends a session when a later one with
+/// the same logon id arrives, and lets those with different ones live side by side. The desktop client sends its own
+/// private address here; this sends a number of its own, never zero (which is "none").
+pub fn logon_id_from(install: &[u8; 16]) -> u32 {
+    (u32::from_le_bytes([install[0], install[1], install[2], install[3]]) | 1) ^ 0xBAAD_F00D
+}
+
+pub fn logon_id() -> u32 {
+    logon_id_from(&install_id())
+}
 
 /// `EOSType` as the connection reports it: Linux 6.x is -184 and Windows 10
 /// is 16, sent as the unsigned number the field is.
@@ -155,7 +211,9 @@ fn device_details() -> DeviceDetails {
         device_friendly_name: Some(device_name()),
         platform_type: Some(PLATFORM_TYPE),
         os_type: Some(os_type() as i32),
-        app_type: Some(APP_TYPE),
+        gaming_device_type: Some(GAMING_DEVICE_TYPE),
+        // Sent with a password sign-in, as the desktop client's is.
+        machine_id: Some(machine_id()),
         ..DeviceDetails::default()
     }
 }
@@ -433,8 +491,11 @@ mod tests {
         assert_eq!(begin_req.encryption_timestamp, Some(1790000005000));
         assert_eq!(begin_req.persistence, Some(1));
         assert_eq!(begin_req.guard_data.as_deref(), Some("old-guard"));
-        assert_eq!(begin_req.platform_type, Some(3), "it signs in as the mobile app, never as the desktop client");
-        assert_eq!(begin_req.device_details.unwrap().app_type, Some(2));
+        assert_eq!(begin_req.platform_type, Some(1), "it signs in as a desktop client, like every other third-party client");
+        assert_eq!(begin_req.website_id.as_deref(), Some("Client"));
+        let details = begin_req.device_details.unwrap();
+        assert_eq!((details.platform_type, details.app_type, details.gaming_device_type), (Some(1), None, Some(1)));
+        assert_eq!(details.machine_id.as_deref(), Some(machine_id().as_slice()), "and with its install's machine id");
         assert!(!begin_req.encrypted_password.unwrap().contains("hunter2"));
 
         let code_req = UpdateAuthWithGuardCodeRequest::decode(seen[2].body.as_slice()).unwrap();
@@ -518,5 +579,24 @@ mod tests {
         assert_eq!(steamid_of_token(&format!("eyJhbGciOiJFZERTQSJ9.{payload}.signature")), Some(76561197960287930));
         assert_eq!(steamid_of_token("not a token"), None);
         assert_eq!(steamid_of_token("a.b.c"), None);
+    }
+
+    #[test]
+    fn the_machine_id_is_a_key_value_object_of_three_hashes_that_is_the_same_for_one_install_and_not_for_another() {
+        let one = machine_id_from(&[1u8; 16]);
+        assert_eq!(one, machine_id_from(&[1u8; 16]));
+        assert_ne!(one, machine_id_from(&[2u8; 16]));
+        // 0x00 "MessageObject" 0x00, then three strings named BB3, FF2 and 3B3 of forty hex digits, then 0x08 0x08.
+        assert!(one.starts_with(b"\0MessageObject\0\x01BB3\0"));
+        assert!(one.ends_with(&[0, 8, 8]));
+        let text = String::from_utf8_lossy(&one).to_string();
+        for name in ["BB3", "FF2", "3B3"] {
+            assert!(text.contains(name));
+        }
+        assert_eq!(one.len(), 1 + 14 + 3 * (1 + 3 + 1 + 40 + 1) + 2);
+        assert_ne!(logon_id_from(&[1u8; 16]), 0);
+        assert_ne!(logon_id_from(&[1u8; 16]), logon_id_from(&[2u8; 16]));
+        // Never the same as the zero a client with no id of its own sends.
+        assert_ne!(logon_id_from(&[0xFF; 16]), 0);
     }
 }
