@@ -218,9 +218,16 @@ pub fn record(state: &AppState, account_id: &str, own: &Own, message: &Message) 
 /// The same, remembering who the sender is for `names` when it is given.
 pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Message, names: Option<&std::sync::Mutex<std::collections::HashMap<i64, String>>>) -> bool {
     let Some(peer) = message.peer() else { return false };
+    record_in(state, account_id, own, message, peer, message.sender(), names)
+}
+
+/// The same for a message whose conversation the caller found. A message a person sent in a private chat arrives as
+/// a short update that names no one, so the library cannot say who it is from or where it is: the caller asks
+/// Telegram, and the other person in a private chat is the sender of everything not sent by the account.
+pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Message, peer: &Peer, sender: Option<&Peer>, names: Option<&std::sync::Mutex<std::collections::HashMap<i64, String>>>) -> bool {
     let buffer = peers::buffer_for(state, account_id, peer);
     let outgoing = message.outgoing();
-    let sender = message.sender();
+    let sender = sender.or_else(|| (!outgoing && matches!(peer, Peer::User(_))).then_some(peer));
     if let (Some(names), Some(Peer::User(user))) = (names, sender) {
         names.lock().unwrap_or_else(|e| e.into_inner()).insert(user.id().bare_id_unchecked(), name_of(&Peer::User(user.clone())));
     }

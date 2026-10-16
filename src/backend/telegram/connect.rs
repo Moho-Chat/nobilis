@@ -178,7 +178,7 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
                 }
             }
             update = stream.next() => match update {
-                Ok(update) => handle_update(state, account_id, &handle, update),
+                Ok(update) => handle_update(state, account_id, &handle, update).await,
                 Err(e) => {
                     let _ = stream.sync_update_state().await;
                     return match classify(&e) {
@@ -192,16 +192,29 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
 }
 
 /// What Telegram sent unasked: a message, an edit, something deleted.
-fn handle_update(state: &AppState, account_id: &str, handle: &Handle, update: grammers_client::update::Update) {
+async fn handle_update(state: &AppState, account_id: &str, handle: &Handle, update: grammers_client::update::Update) {
     use grammers_client::update::Update;
     match update {
         Update::NewMessage(message) => {
-            messages::record_named(state, account_id, &handle.own, &message, Some(&handle.names));
+            let recorded = match message.peer() {
+                Some(_) => messages::record_named(state, account_id, &handle.own, &message, Some(&handle.names)),
+                // A short update from a person names no one: asked of Telegram, who is the other side.
+                None => {
+                    let (state, account_id, handle) = (state.clone(), account_id.to_string(), handle.clone());
+                    tokio::spawn(async move { record_unnamed(&state, &account_id, &handle, &message).await });
+                    return;
+                }
+            };
+            tracing::debug!("telegram[{account_id}]: new message in {:?}: recorded {recorded}", message.peer_id());
         }
         Update::Raw(raw) => super::updates::raw(state, account_id, handle, &raw.raw),
         Update::MessageEdited(message) => {
-            if let Some(peer) = message.peer() {
-                let buffer = peers::buffer_for(state, account_id, peer);
+            let peer = match message.peer() {
+                Some(peer) => Some(peer.clone()),
+                None => resolve(handle, &message).await,
+            };
+            if let Some(peer) = peer {
+                let buffer = peers::buffer_for(state, account_id, &peer);
                 let body = messages::body_of(&message);
                 let attachments = buffer.remote_id.as_deref().map(|remote| super::media::attachments_of(handle.own.user_id, remote, &message)).unwrap_or_default();
                 state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &attachments);
@@ -213,6 +226,21 @@ fn handle_update(state: &AppState, account_id: &str, handle: &Handle, update: gr
             }
         }
         _ => {}
+    }
+}
+
+/// The conversation a message from a short update belongs to, from what the session knows of the person.
+async fn resolve(handle: &Handle, message: &grammers_client::message::Message) -> Option<grammers_client::peer::Peer> {
+    let peer_ref = message.peer_ref().await.ok().flatten()?;
+    handle.client.resolve_peer(peer_ref).await.ok()
+}
+
+async fn record_unnamed(state: &AppState, account_id: &str, handle: &Handle, message: &grammers_client::message::Message) {
+    match resolve(handle, message).await {
+        Some(peer) => {
+            messages::record_in(state, account_id, &handle.own, message, &peer, None, Some(&handle.names));
+        }
+        None => tracing::warn!("telegram[{account_id}]: a message in {:?} from somebody this account has no record of was not shown", message.peer_id()),
     }
 }
 
