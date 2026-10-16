@@ -1291,7 +1291,13 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
     let gone = |p: &Option<String>| -> bool {
         let Some(p) = p.as_deref() else { return false };
         let Some(rest) = p.strip_prefix("file://") else { return false };
-        !std::path::Path::new(rest).exists()
+        // Telegram's are named before they are fetched, and fetched when the window asks (see backend/telegram/media.rs):
+        // a file that is not there yet is the usual state of one, not a sign it was swept.
+        let path = std::path::Path::new(rest);
+        if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n == crate::backend::telegram::media::MEDIA || n == crate::backend::telegram::media::AVATARS) {
+            return false;
+        }
+        !path.exists()
     };
     for att in attachments.iter_mut() {
         if gone(&att.thumbnail_path) {
@@ -1998,6 +2004,22 @@ mod tests {
         assert!(attachments[0].path.is_none(), "a swept original was still advertised");
         assert!(attachments[1].thumbnail_path.is_none(), "a swept thumbnail was still advertised");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_telegram_file_not_fetched_yet_is_still_advertised() {
+        // Its name is given when the message is recorded and the file is fetched when the window asks, so
+        // "not there" is how it starts and not a sign it was swept.
+        let mut attachments = vec![Attachment {
+            path: Some("file:///home/someone/.cache/nobilis/telegram-media/tg_1_n1_2_full.jpg".to_string()),
+            thumbnail_path: Some("file:///home/someone/.cache/nobilis/telegram-media/tg_1_n1_2_thumb.jpg".to_string()),
+            ..Default::default()
+        }];
+        drop_missing_local_copies(&mut attachments);
+        assert!(attachments[0].path.is_some() && attachments[0].thumbnail_path.is_some());
+        let mut swept = vec![Attachment { path: Some("file:///home/someone/.cache/nobilis/matrix-media/gone.jpg".to_string()), ..Default::default() }];
+        drop_missing_local_copies(&mut swept);
+        assert!(swept[0].path.is_none(), "another service's swept file is still dropped");
     }
 
     #[test]
