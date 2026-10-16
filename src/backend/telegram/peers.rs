@@ -12,6 +12,7 @@
 use crate::model::Buffer;
 use crate::state::AppState;
 use grammers_client::peer::Peer;
+use grammers_client::tl;
 use grammers_session::types::PeerId;
 
 pub const DIRECT_MESSAGES: &str = "Direct Messages";
@@ -94,6 +95,108 @@ pub fn buffer_for(state: &AppState, account_id: &str, peer: &Peer) -> Buffer {
     state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
 }
 
+
+/// What the window says in place of the message box where the account may not write: the words every service uses.
+pub const NO_SEND_PERMISSION: &str = "You do not have permission to send messages in this channel.";
+
+/// What decides whether an account may write in a group or a channel, read off what Telegram says about it.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Rights {
+    /// A broadcast channel, where only those allowed to post may write.
+    pub broadcast: bool,
+    pub creator: bool,
+    /// An administrator (of any kind) of this chat.
+    pub admin: bool,
+    /// An administrator who may post in a broadcast channel.
+    pub may_post: bool,
+    /// The account has left, or was removed.
+    pub gone: bool,
+    /// The chat was upgraded to a supergroup and no longer takes messages.
+    pub deactivated: bool,
+    /// This account in particular may not send.
+    pub banned_here: bool,
+    /// Nobody but administrators may send.
+    pub members_banned: bool,
+}
+
+/// Why the account cannot write in a chat, or `None` when it can.
+pub fn read_only_reason(r: &Rights) -> Option<&'static str> {
+    if r.gone {
+        return Some("You are not a member of this chat.");
+    }
+    if r.deactivated {
+        return Some("This group was upgraded and no longer takes messages.");
+    }
+    let boss = r.creator || r.admin;
+    if r.broadcast {
+        return (!(r.creator || r.may_post)).then_some(NO_SEND_PERMISSION);
+    }
+    if r.banned_here || (r.members_banned && !boss) {
+        return Some(NO_SEND_PERMISSION);
+    }
+    None
+}
+
+fn sending_banned(rights: &Option<tl::enums::ChatBannedRights>, now: i64) -> bool {
+    match rights {
+        Some(tl::enums::ChatBannedRights::Rights(b)) => b.send_messages && (b.until_date == 0 || i64::from(b.until_date) > now),
+        None => false,
+    }
+}
+
+fn is_admin(rights: &Option<tl::enums::ChatAdminRights>) -> bool {
+    rights.is_some()
+}
+
+fn may_post(rights: &Option<tl::enums::ChatAdminRights>) -> bool {
+    matches!(rights, Some(tl::enums::ChatAdminRights::Rights(a)) if a.post_messages)
+}
+
+fn rights_of_channel(c: &tl::types::Channel, now: i64) -> Rights {
+    Rights {
+        broadcast: c.broadcast,
+        creator: c.creator,
+        admin: is_admin(&c.admin_rights),
+        may_post: may_post(&c.admin_rights),
+        gone: c.left,
+        deactivated: false,
+        banned_here: sending_banned(&c.banned_rights, now),
+        members_banned: sending_banned(&c.default_banned_rights, now),
+    }
+}
+
+/// What the account may do in a conversation. Only meaningful for a peer read from the dialog list: one that arrived
+/// with a message may be a "min" copy without the account's rights in it.
+pub fn rights_of(peer: &Peer, now: i64) -> Option<Rights> {
+    match peer {
+        Peer::Channel(channel) => Some(rights_of_channel(&channel.raw, now)),
+        Peer::Group(group) => Some(match &group.raw {
+            tl::enums::Chat::Chat(c) => Rights {
+                creator: c.creator,
+                admin: is_admin(&c.admin_rights),
+                gone: c.left,
+                deactivated: c.deactivated,
+                members_banned: sending_banned(&c.default_banned_rights, now),
+                ..Default::default()
+            },
+            tl::enums::Chat::Channel(c) => rights_of_channel(c, now),
+            // A chat that is gone, or that this account cannot see.
+            _ => Rights { gone: true, ..Default::default() },
+        }),
+        Peer::User(user) if user.id().bare_id_unchecked() == 777000 => None,
+        _ => None,
+    }
+}
+
+/// The reason the window gives for a message box it does not show, for a conversation read from the dialog list.
+pub fn read_only_for(peer: &Peer, now: i64) -> Option<&'static str> {
+    if let Peer::User(user) = peer {
+        // Telegram's own service account sends its login codes and takes no reply.
+        return (user.id().bare_id_unchecked() == 777000).then_some("Telegram does not take replies here.");
+    }
+    rights_of(peer, now).and_then(|r| read_only_reason(&r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +210,35 @@ mod tests {
         assert_eq!(unique_name(&taken, "111", "Anna", None), "Anna");
         assert_eq!(unique_name(&taken, "333", "Boris", None), "Boris");
         assert_eq!(unique_name(&taken, "123456789", "Anna", None), "Anna ·6789");
+    }
+
+    #[test]
+    fn a_broadcast_channel_takes_messages_only_from_those_allowed_to_post() {
+        let feed = Rights { broadcast: true, ..Default::default() };
+        assert_eq!(read_only_reason(&feed), Some(NO_SEND_PERMISSION));
+        assert_eq!(read_only_reason(&Rights { admin: true, ..feed.clone() }), Some(NO_SEND_PERMISSION), "an administrator who may not post is a reader here");
+        assert_eq!(read_only_reason(&Rights { admin: true, may_post: true, ..feed.clone() }), None);
+        assert_eq!(read_only_reason(&Rights { creator: true, ..feed }), None);
+    }
+
+    #[test]
+    fn a_group_takes_messages_unless_this_account_or_every_member_is_banned_from_sending() {
+        assert_eq!(read_only_reason(&Rights::default()), None);
+        assert_eq!(read_only_reason(&Rights { banned_here: true, ..Default::default() }), Some(NO_SEND_PERMISSION));
+        assert_eq!(read_only_reason(&Rights { members_banned: true, ..Default::default() }), Some(NO_SEND_PERMISSION));
+        assert_eq!(read_only_reason(&Rights { members_banned: true, admin: true, ..Default::default() }), None, "administrators may still send where members may not");
+        assert!(read_only_reason(&Rights { gone: true, ..Default::default() }).unwrap().contains("not a member"));
+        assert!(read_only_reason(&Rights { deactivated: true, ..Default::default() }).unwrap().contains("upgraded"));
+    }
+
+    #[test]
+    fn a_ban_on_sending_that_has_run_out_is_not_one() {
+        use tl::types::ChatBannedRights as B;
+        let banned = |until| Some(tl::enums::ChatBannedRights::Rights(B { send_messages: true, until_date: until, view_messages: false, send_media: false, send_stickers: false, send_gifs: false, send_games: false, send_inline: false, embed_links: false, send_polls: false, change_info: false, invite_users: false, pin_messages: false, manage_topics: false, send_photos: false, send_videos: false, send_roundvideos: false, send_audios: false, send_voices: false, send_docs: false, send_plain: false, edit_rank: false, manage_linked_peers: false, send_reactions: false }));
+        assert!(sending_banned(&banned(0), 1000), "no end is for ever");
+        assert!(sending_banned(&banned(2000), 1000));
+        assert!(!sending_banned(&banned(500), 1000));
+        assert!(!sending_banned(&None, 1000));
     }
 
     #[test]

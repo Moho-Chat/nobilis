@@ -23,7 +23,10 @@ pub async fn sync(state: &AppState, account_id: &str, client: &Client, own: &Own
         if let Some(last) = &dialog.last_message {
             messages::record(state, account_id, own, last);
         }
-        let _ = buffer;
+        // Whether the account may write there, read off the dialog's own copy of the chat (which carries its rights):
+        // where it may not, the window shows why in place of the message box.
+        let now = chrono::Utc::now().timestamp();
+        state.runtime.set_buffer_read_only(state, &buffer.id, peers::read_only_for(dialog.peer(), now));
         count += 1;
     }
     tracing::info!("telegram[{account_id}]: {count} conversations");
