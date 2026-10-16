@@ -211,7 +211,13 @@ pub async fn restore(state: &AppState, path: &str, buffer_id: Option<&str>, mess
         }
         "discord-icons" => crate::backend::discord::restore_guild_icon(&path).await?,
         "kick-emotes" => crate::backend::kick::emotecache::restore_cached(&path).await?,
-        "telegram-media" | "telegram-avatars" => crate::backend::telegram::media::restore_cached(state, &path).await?,
+        "telegram-media" | "telegram-avatars" => match crate::backend::telegram::media::restore_cached(state, &path).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!("telegram: fetching {} again: {e:#}", path.display());
+                return Err(e);
+            }
+        },
         _ => bail!("{} is fetched again by what uses it, not by name", cache.dir),
     };
     Ok(format!("file://{}", restored.display()))

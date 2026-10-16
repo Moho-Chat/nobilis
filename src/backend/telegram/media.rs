@@ -27,9 +27,18 @@ pub const AVATARS: &str = "telegram-avatars";
 /// How many downloads run at once: enough for a screenful of pictures, few enough not to look like a scraper.
 const AT_ONCE: usize = 4;
 
-fn permits() -> &'static tokio::sync::Semaphore {
+/// How many whole files (videos, documents) are fetched at once. They take minutes, and pictures must not wait behind
+/// them: those have places of their own.
+const BIG_AT_ONCE: usize = 2;
+
+fn permits(big: bool) -> &'static tokio::sync::Semaphore {
     static P: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
-    P.get_or_init(|| tokio::sync::Semaphore::new(AT_ONCE))
+    static BIG: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    if big {
+        BIG.get_or_init(|| tokio::sync::Semaphore::new(BIG_AT_ONCE))
+    } else {
+        P.get_or_init(|| tokio::sync::Semaphore::new(AT_ONCE))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -239,8 +248,8 @@ fn is_voice(document: &Document) -> bool {
 }
 
 /// Downloads to a file, whole and renamed into place so a half-written one is never taken for a picture.
-async fn download_to<D: Downloadable>(client: &grammers_client::Client, what: &D, path: &Path) -> Result<()> {
-    let _permit = permits().acquire().await?;
+async fn download_to<D: Downloadable>(client: &grammers_client::Client, what: &D, path: &Path, big: bool) -> Result<()> {
+    let _permit = permits(big).acquire().await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -264,16 +273,16 @@ async fn fetch(handle: &Handle, remote: &str, message: i32, variant: Variant, pa
                 Variant::Full => pick(&sizes, 1280),
             };
             match wanted {
-                Some(size) => download_to(&handle.client, size, path).await,
-                None => download_to(&handle.client, &photo, path).await,
+                Some(size) => download_to(&handle.client, size, path, false).await,
+                None => download_to(&handle.client, &photo, path, false).await,
             }
         }
         Media::Sticker(sticker) => match variant {
-            Variant::Full => download_to(&handle.client, &sticker.document, path).await,
+            Variant::Full => download_to(&handle.client, &sticker.document, path, false).await,
             Variant::Thumb => download_thumb(&handle.client, &sticker.document, path).await,
         },
         Media::Document(document) => match variant {
-            Variant::Full => download_to(&handle.client, &document, path).await,
+            Variant::Full => download_to(&handle.client, &document, path, true).await,
             Variant::Thumb => download_thumb(&handle.client, &document, path).await,
         },
         _ => bail!("that kind of media cannot be fetched"),
@@ -288,7 +297,7 @@ async fn download_thumb(client: &grammers_client::Client, document: &Document, p
         tokio::fs::write(path, bytes).await?;
         return Ok(());
     }
-    download_to(client, size, path).await
+    download_to(client, size, path, false).await
 }
 
 /// Fetches a cached Telegram file again, after it expired, was cleared, or was named before it was ever fetched.
@@ -323,7 +332,7 @@ async fn fetch_avatar(handle: &Handle, remote: &str, photo_id: i64, path: &Path)
     let id: PeerId = peers::peer_id_of(remote).ok_or_else(|| anyhow!("not a Telegram conversation"))?;
     let peer = handle.session.peer_ref(id).await.ok().flatten().ok_or_else(|| anyhow!("Telegram has not told this account about that picture's owner yet"))?;
     let what = grammers_client::media::ChatPhoto { raw: tl::types::InputPeerPhotoFileLocation { big: false, peer: peer.into(), photo_id }.into() };
-    download_to(&handle.client, &what, path).await
+    download_to(&handle.client, &what, path, false).await
 }
 
 #[cfg(test)]
