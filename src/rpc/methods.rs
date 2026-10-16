@@ -492,6 +492,14 @@ pub async fn dispatch(
                             tracing::debug!("steam history: {e}");
                         }
                     }
+                    // Telegram keeps every message too: opening a conversation asks for its recent end, scrolling to
+                    // the top for the part before. Best-effort, like Steam's.
+                    if buffer.account_id.starts_with("telegram:") {
+                        let fetched = if before > 0 { backend::telegram::history::older(state, &buffer, before).await } else { backend::telegram::history::open(state, &buffer).await };
+                        if let Err(e) = fetched {
+                            tracing::debug!("telegram history: {e:#}");
+                        }
+                    }
                     // Kick pages back through its own history endpoint,
                     // continuing from where the last page stopped rather than
                     // by timestamp - the endpoint is cursor-based, and asking

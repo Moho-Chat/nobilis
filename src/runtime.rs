@@ -543,6 +543,8 @@ pub struct Runtime {
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
+    /// A connected Telegram account's client, by account id (see backend/telegram).
+    telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -1058,6 +1060,10 @@ fn cap_cache<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, limit: usize) 
 /// "Channels" and "Direct Messages" (whispers), the second drawn only while there is a whisper to put under it.
 /// They are the service's own headings, so they cannot be renamed, removed or filled by hand.
 fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
+    if account_id.starts_with("telegram:") {
+        // Groups are the usual channel; a broadcast channel moves to its own heading when its buffer is made.
+        return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
+    }
     account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
 }
 
@@ -1106,6 +1112,7 @@ impl Runtime {
             twitch_senders: Mutex::new(HashMap::new()),
             twitch_rights: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
+            telegram_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -4350,6 +4357,18 @@ impl Runtime {
     }
 
     /// Registers a signed-in Steam connection.
+    pub fn set_telegram_handle(&self, account_id: &str, handle: crate::backend::telegram::Handle) {
+        self.telegram_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_telegram_handle(&self, account_id: &str) {
+        self.telegram_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn telegram_handle(&self, account_id: &str) -> Option<crate::backend::telegram::Handle> {
+        self.telegram_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
         self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
     }
@@ -5624,7 +5643,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

@@ -6,6 +6,9 @@
 //! - when Telegram has ended the session, because the same key can never work again.
 
 use super::link::{self, Link};
+use super::messages::{self, Own};
+use super::peers;
+use super::Handle;
 use super::session::{self, FileSession};
 use crate::accounts::TelegramAccountConfig;
 use crate::runtime::ConnState;
@@ -126,6 +129,7 @@ async fn run(state: &AppState, config: &TelegramAccountConfig, account_id: &str)
     }
     let mut link = link::open(state, account_id, config.api_id, session).await?;
     let ending = stay(state, config, account_id, &mut link).await;
+    state.runtime.clear_telegram_handle(account_id);
     link.close().await;
     ending
 }
@@ -137,15 +141,30 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
         Err(e) => return Ok(classify(&e)).and_then(|ending| if ending == Ending::Closed { Err(anyhow::Error::from(e)).context("asking Telegram whether the session is good") } else { Ok(ending) }),
     }
     // The name and number the account has now, which are Telegram's to change.
+    let mut own = Own { name: if config.name.is_empty() { config.phone.clone() } else { config.name.clone() }, user_id: config.user_id };
     if let Ok(me) = link.client.get_me().await {
         let (name, username) = (me.full_name(), me.username().map(str::to_string));
+        if !name.is_empty() {
+            own.name = name.clone();
+        }
         let _ = state.accounts.mutate_telegram(account_id, |a| {
             a.name = name;
             a.username = username;
         });
     }
+    state.runtime.set_own_identity(account_id, &own.name);
+    state.runtime.set_telegram_handle(account_id, Handle { client: link.client.clone(), session: link.session.clone(), own: own.clone() });
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
     tracing::info!("telegram[{account_id}]: connected as {} ({})", config.user_id, config.username.as_deref().unwrap_or("no username"));
+    // The conversations, in the background: the connection is up whether or not this succeeds.
+    tokio::spawn({
+        let (state, account_id, client, own) = (state.clone(), account_id.to_string(), link.client.clone(), own.clone());
+        async move {
+            if let Err(e) = super::dialogs::sync(&state, &account_id, &client, &own).await {
+                tracing::warn!("telegram[{account_id}]: reading the conversations: {e:#}");
+            }
+        }
+    });
 
     let updates = link.updates.take().context("the updates were already taken")?;
     let mut stream = link.client.stream_updates(updates, UpdatesConfiguration { catch_up: true }).await.map_err(|e| anyhow::anyhow!("starting to read updates: {e}"))?;
@@ -158,8 +177,7 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
                 }
             }
             update = stream.next() => match update {
-                // Round 2 turns these into messages.
-                Ok(_) => {}
+                Ok(update) => handle_update(state, account_id, &own, update),
                 Err(e) => {
                     let _ = stream.sync_update_state().await;
                     return match classify(&e) {
@@ -168,6 +186,53 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
                     };
                 }
             },
+        }
+    }
+}
+
+/// What Telegram sent unasked: a message, an edit, something deleted.
+fn handle_update(state: &AppState, account_id: &str, own: &Own, update: grammers_client::update::Update) {
+    use grammers_client::update::Update;
+    match update {
+        Update::NewMessage(message) => {
+            messages::record(state, account_id, own, &message);
+        }
+        Update::MessageEdited(message) => {
+            if let Some(peer) = message.peer() {
+                let buffer = peers::buffer_for(state, account_id, peer);
+                let body = messages::body_of(&message);
+                state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &[]);
+            }
+        }
+        Update::MessageDeleted(deleted) => {
+            for id in deleted.messages() {
+                forget_message(state, account_id, deleted.channel_id(), *id);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Removes a message Telegram says is gone. A channel's deletion names the channel; any other names only the number,
+/// which is unique across the account's people and small groups, so the conversations are looked through.
+fn forget_message(state: &AppState, account_id: &str, channel: Option<i64>, id: i32) {
+    let msg_id = id.to_string();
+    let candidates: Vec<crate::model::Buffer> = state
+        .runtime
+        .list_buffers()
+        .into_iter()
+        .filter(|b| b.account_id == account_id)
+        .filter(|b| match (channel, b.remote_id.as_deref()) {
+            (Some(c), Some(remote)) => remote == peers::remote_id(grammers_session::types::PeerId::channel_unchecked(c)),
+            (Some(_), None) => false,
+            (None, Some(remote)) => !remote.starts_with("-100"),
+            (None, None) => false,
+        })
+        .collect();
+    for buffer in candidates {
+        if state.store.get_message(&buffer.id, &msg_id).ok().flatten().is_some() {
+            state.runtime.delete_message(state, &buffer.id, &msg_id);
+            return;
         }
     }
 }

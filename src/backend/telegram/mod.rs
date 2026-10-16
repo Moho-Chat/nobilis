@@ -9,6 +9,10 @@
 //! - `link` - one connection to Telegram: the sender pool, the client and the stream of updates
 //! - `login` - adding an account: phone, code, cloud password
 //! - `connect` - an account's connection, kept up and reconnected
+//! - `dialogs` - the account's conversations, read when it connects
+//! - `history` - a conversation's history, read when it is opened and scrolled back
+//! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
+//! - `messages` - a message as moho's, with its entities as html
 //!
 //! # The api_id
 //!
@@ -24,11 +28,25 @@
 //! saved and reused; nothing here signs in afresh to get over a hiccup.
 
 pub mod connect;
+pub mod dialogs;
+pub mod history;
 pub mod link;
 pub mod login;
+pub mod messages;
+pub mod peers;
 pub mod session;
 
 use grammers_mtsender::ConnectionParams;
+use std::sync::Arc;
+
+/// What the rest of the daemon needs to act on a connected account: its client, its session (to turn a conversation
+/// into something Telegram will accept, an id with the authority to use it) and its own name.
+#[derive(Clone)]
+pub struct Handle {
+    pub client: grammers_client::Client,
+    pub session: Arc<session::FileSession>,
+    pub own: messages::Own,
+}
 
 /// The name Telegram shows for this app's sessions: `moho` and the kind of machine it runs on.
 pub fn device_model() -> String {
