@@ -91,6 +91,7 @@ impl Cx {
             Want::Poster(id) => self.documents.contains_key(&id),
         };
         if !known {
+            tracing::info!("telegram: an article uses {want:?}, which its page does not carry ({} pictures, {} files)", self.photos.len(), self.documents.len());
             return None;
         }
         if !self.wanted.contains(&want) {
@@ -229,11 +230,16 @@ fn block(b: &B, cx: &mut Cx) -> String {
             format!("<blockquote class=\"pull\"><p>{}</p>{}</blockquote>", rich(&q.text, cx), if who.is_empty() { String::new() } else { format!("<cite>{who}</cite>") })
         }
         B::Photo(p) => {
-            let Some(src) = cx.picture(Want::Photo(p.photo_id)) else { return String::new() };
-            let img = format!("<img src=\"{src}\" alt=\"\">");
-            let img = match &p.url {
-                Some(url) => format!("<a href=\"{}\">{img}</a>", safe_url(url)),
-                None => img,
+            // A picture the page does not carry still has its words.
+            let img = match cx.picture(Want::Photo(p.photo_id)) {
+                Some(src) => {
+                    let img = format!("<img src=\"{src}\" alt=\"\">");
+                    match &p.url {
+                        Some(url) => format!("<a href=\"{}\">{img}</a>", safe_url(url)),
+                        None => img,
+                    }
+                }
+                None => String::new(),
             };
             format!("<figure>{img}{}</figure>", caption(&p.caption, cx))
         }
@@ -289,7 +295,7 @@ h1{font-size:2rem;line-height:1.2;margin:.8em 0 .4em}h2{font-size:1.5rem;margin:
 p{margin:.9em 0}.kicker{color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-size:.8rem;margin:1.6em 0 0}
 .subtitle{color:var(--muted);font-size:1.15rem}.byline,.footer{color:var(--muted);font-size:.9rem}
 figure{margin:1.4em -20px}figure img,.cover img{display:block;width:100%;height:auto}figcaption{padding:.5em 20px 0;color:var(--muted);font-size:.9rem}figcaption cite{display:block;font-style:normal;opacity:.8}
-.cover{margin:0 -20px}.cover figure{margin:0}.collage div{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px}.collage figure{margin:0}
+.cover{margin:0 -20px}.cover figure{margin:0}.cover figcaption{padding:.7em 20px;text-transform:uppercase;letter-spacing:.04em;font-size:.8rem}.cover figcaption cite{margin:.6em -20px -.7em;padding:.6em 20px;background:var(--soft);color:var(--fg);font-size:1rem;font-weight:600;text-transform:none;letter-spacing:0;opacity:1}.collage div{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px}.collage figure{margin:0}
 .note{display:block;padding:.6em 20px;color:var(--muted);font-size:.9rem}
 blockquote{margin:1.2em 0;padding:.1em 1em;border-left:3px solid var(--link);color:var(--fg)}blockquote.pull{font-size:1.25rem;border-left:0;text-align:center;font-style:italic}cite{display:block;color:var(--muted);font-style:normal;font-size:.9rem}
 pre{background:var(--soft);padding:12px 14px;overflow:auto;border-radius:6px;font-size:.9rem}code{font-family:ui-monospace,Menlo,Consolas,monospace}mark{background:#ffe08a55;color:inherit}
@@ -308,6 +314,7 @@ pub async fn article(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<
     let tl::enums::WebPage::Page(page) = &media.raw.webpage else { return Err("Telegram has no preview of that page".to_string()) };
     let url = page.url.clone();
     let title = page.title.clone().unwrap_or_default();
+    let (preview_photo, preview_document) = (page.photo.clone(), page.document.clone());
     let mut cached = page.cached_page.clone();
     // A message may carry only the start of the page: the whole of it is asked for.
     if matches!(&cached, Some(tl::enums::Page::Page(p)) if p.part) {
@@ -323,8 +330,9 @@ pub async fn article(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<
         account: handle.own.user_id,
         remote,
         message: id,
-        photos: doc.photos.iter().filter_map(|p| match p { tl::enums::Photo::Photo(x) => Some((x.id, p.clone())), _ => None }).collect(),
-        documents: doc.documents.iter().filter_map(|d| match d { tl::enums::Document::Document(x) => Some((x.id, d.clone())), _ => None }).collect(),
+        // The page's own picture (the one its preview shows) is often the cover and is not listed again with the rest.
+        photos: doc.photos.iter().chain(preview_photo.iter()).filter_map(|p| match p { tl::enums::Photo::Photo(x) => Some((x.id, p.clone())), _ => None }).collect(),
+        documents: doc.documents.iter().chain(preview_document.iter()).filter_map(|d| match d { tl::enums::Document::Document(x) => Some((x.id, d.clone())), _ => None }).collect(),
         wanted: Vec::new(),
     };
     let body = blocks(&doc.blocks, &mut cx);
@@ -420,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn a_picture_the_page_lacks_leaves_nothing_and_one_it_has_is_named_by_its_file() {
+    fn a_picture_the_page_lacks_keeps_its_words_and_one_it_has_is_named_by_its_file() {
         let mut c = cx();
         let photo = B::Photo(tl::types::PageBlockPhoto {
             spoiler: false,
@@ -429,7 +437,8 @@ mod tests {
             url: None,
             webpage_id: None,
         });
-        assert_eq!(block(&photo, &mut c), "");
+        let without = block(&photo, &mut c);
+        assert!(!without.contains("<img") && without.contains("a caption"), "{without}");
         c.photos.insert(9, tl::enums::Photo::Empty(tl::types::PhotoEmpty { id: 9 }));
         let html = block(&photo, &mut c);
         assert!(html.contains("moho-media://file/?p=") && html.contains("_iv9.jpg") && html.contains("a caption"), "{html}");
