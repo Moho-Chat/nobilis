@@ -4,24 +4,32 @@
 //! request gives the list its names, kinds and recent activity without opening any of them. History proper is read
 //! when a conversation is opened (see `history`).
 
-use super::messages::{self, Own};
+use super::messages;
+use super::Handle;
 use super::peers;
 use crate::state::AppState;
 use anyhow::Result;
-use grammers_client::Client;
+use grammers_client::tl;
 
 /// How many conversations are read on connect. Telegram pages them a hundred at a time.
 const LIMIT: usize = 200;
 
 /// Makes a buffer of each of the account's conversations, newest activity first, and records the last message of each.
-pub async fn sync(state: &AppState, account_id: &str, client: &Client, own: &Own) -> Result<usize> {
-    let mut dialogs = client.iter_dialogs();
+pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result<usize> {
+    let mut dialogs = handle.client.iter_dialogs();
     let mut count = 0;
     while count < LIMIT {
         let Some(dialog) = dialogs.next().await.map_err(|e| anyhow::anyhow!("{e}"))? else { break };
         let buffer = peers::buffer_for(state, account_id, dialog.peer());
+        if let grammers_client::peer::Peer::User(user) = dialog.peer() {
+            handle.names.lock().unwrap_or_else(|e| e.into_inner()).insert(user.id().bare_id_unchecked(), peers::title_of(dialog.peer()));
+        }
         if let Some(last) = &dialog.last_message {
-            messages::record(state, account_id, own, last);
+            messages::record_named(state, account_id, &handle.own, last, Some(&handle.names));
+        }
+        // Nothing unread there, as Telegram counts it: the window need not call it unread either.
+        if matches!(&dialog.raw, tl::enums::Dialog::Dialog(d) if d.unread_count == 0) {
+            state.events.emit("bufferRead", serde_json::json!({ "accountId": account_id, "bufferId": buffer.id }));
         }
         // Whether the account may write there, read off the dialog's own copy of the chat (which carries its rights):
         // where it may not, the window shows why in place of the message box.

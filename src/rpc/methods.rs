@@ -1096,6 +1096,15 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    // It lapses by itself, so only "typing" is said.
+                    if typing {
+                        if let Err(e) = backend::telegram::send::typing(state, &buffer).await {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 // IRC says it with a client-only tag on an empty TAGMSG,
                 // and says nothing at all where the server has no
                 // message-tags to carry one - see send_typing.
@@ -1320,6 +1329,13 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // Telegram keeps a read position for each conversation too, and tells the account's other apps.
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    if let Err(e) = backend::telegram::send::mark_read(state, &buffer).await {
+                        tracing::debug!("telegram read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -3430,6 +3446,17 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    // Files are Round 4's; what arrives that Telegram cannot use yet is refused in words rather
+                    // than dropped, because a message with its picture silently missing is the worse trade.
+                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
+                        return (None, Some("files cannot be sent to Telegram from here yet".to_string()));
+                    }
+                    match backend::telegram::send::send(state, &buffer, body, reply_to_id).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("steam:") => {
                     // Steam has no replies or edits for a direct message in
                     // this client yet: what arrives that it cannot use is
@@ -3626,6 +3653,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
@@ -3692,6 +3723,14 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    // For everyone unless the window says it is only to be removed from this account's view.
+                    let everyone = params.get("forEveryone").and_then(|v| v.as_bool()).unwrap_or(true);
+                    match backend::telegram::send::delete(state, &buffer, msg_id, everyone).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("kick:") => {
                     match (kick_credential(state, &buffer.account_id), state.runtime.kick_channel(buffer_id)) {
                         (Err(e), _) => (None, Some(e)),

@@ -153,14 +153,15 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
         });
     }
     state.runtime.set_own_identity(account_id, &own.name);
-    state.runtime.set_telegram_handle(account_id, Handle { client: link.client.clone(), session: link.session.clone(), own: own.clone() });
+    let handle = Handle { client: link.client.clone(), session: link.session.clone(), own: own.clone(), names: Default::default() };
+    state.runtime.set_telegram_handle(account_id, handle.clone());
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
     tracing::info!("telegram[{account_id}]: connected as {} ({})", config.user_id, config.username.as_deref().unwrap_or("no username"));
     // The conversations, in the background: the connection is up whether or not this succeeds.
     tokio::spawn({
-        let (state, account_id, client, own) = (state.clone(), account_id.to_string(), link.client.clone(), own.clone());
+        let (state, account_id, handle) = (state.clone(), account_id.to_string(), handle.clone());
         async move {
-            if let Err(e) = super::dialogs::sync(&state, &account_id, &client, &own).await {
+            if let Err(e) = super::dialogs::sync(&state, &account_id, &handle).await {
                 tracing::warn!("telegram[{account_id}]: reading the conversations: {e:#}");
             }
         }
@@ -177,7 +178,7 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
                 }
             }
             update = stream.next() => match update {
-                Ok(update) => handle_update(state, account_id, &own, update),
+                Ok(update) => handle_update(state, account_id, &handle, update),
                 Err(e) => {
                     let _ = stream.sync_update_state().await;
                     return match classify(&e) {
@@ -191,12 +192,13 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
 }
 
 /// What Telegram sent unasked: a message, an edit, something deleted.
-fn handle_update(state: &AppState, account_id: &str, own: &Own, update: grammers_client::update::Update) {
+fn handle_update(state: &AppState, account_id: &str, handle: &Handle, update: grammers_client::update::Update) {
     use grammers_client::update::Update;
     match update {
         Update::NewMessage(message) => {
-            messages::record(state, account_id, own, &message);
+            messages::record_named(state, account_id, &handle.own, &message, Some(&handle.names));
         }
+        Update::Raw(raw) => super::updates::raw(state, account_id, handle, &raw.raw),
         Update::MessageEdited(message) => {
             if let Some(peer) = message.peer() {
                 let buffer = peers::buffer_for(state, account_id, peer);

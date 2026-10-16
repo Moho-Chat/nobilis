@@ -11,6 +11,9 @@
 //! - `connect` - an account's connection, kept up and reconnected
 //! - `dialogs` - the account's conversations, read when it connects
 //! - `history` - a conversation's history, read when it is opened and scrolled back
+//! - `markup` - what the message box holds, as plain text and entities
+//! - `updates` - what Telegram sends that is not a message: typing, reads on other apps
+//! - `send` - saying things: send, answer, edit, delete, typing, read
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -32,8 +35,11 @@ pub mod dialogs;
 pub mod history;
 pub mod link;
 pub mod login;
+pub mod markup;
 pub mod messages;
 pub mod peers;
+pub mod send;
+pub mod updates;
 pub mod session;
 
 use grammers_mtsender::ConnectionParams;
@@ -46,6 +52,9 @@ pub struct Handle {
     pub client: grammers_client::Client,
     pub session: Arc<session::FileSession>,
     pub own: messages::Own,
+    /// What people are called, by Telegram's number for them, so a typing notice can say who. Filled as people are
+    /// met in the conversation list and in messages.
+    pub names: Arc<std::sync::Mutex<std::collections::HashMap<i64, String>>>,
 }
 
 /// The name Telegram shows for this app's sessions: `moho` and the kind of machine it runs on.

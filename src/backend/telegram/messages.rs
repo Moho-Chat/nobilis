@@ -211,10 +211,18 @@ pub fn body_of(message: &Message) -> String {
 
 /// Records a message in its conversation, as it arrived live or as history. `false` when it was already there.
 pub fn record(state: &AppState, account_id: &str, own: &Own, message: &Message) -> bool {
+    record_named(state, account_id, own, message, None)
+}
+
+/// The same, remembering who the sender is for `names` when it is given.
+pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Message, names: Option<&std::sync::Mutex<std::collections::HashMap<i64, String>>>) -> bool {
     let Some(peer) = message.peer() else { return false };
     let buffer = peers::buffer_for(state, account_id, peer);
     let outgoing = message.outgoing();
     let sender = message.sender();
+    if let (Some(names), Some(Peer::User(user))) = (names, sender) {
+        names.lock().unwrap_or_else(|e| e.into_inner()).insert(user.id().bare_id_unchecked(), name_of(&Peer::User(user.clone())));
+    }
     let from = if outgoing {
         own.name.clone()
     } else {
