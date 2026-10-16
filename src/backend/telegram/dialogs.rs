@@ -28,6 +28,10 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result
         if let Some(last) = &dialog.last_message {
             messages::record_named(state, account_id, &handle.own, last, Some(&handle.names));
         }
+        // Silenced on the account, perhaps on the phone.
+        if let tl::enums::Dialog::Dialog(d) = &dialog.raw {
+            state.runtime.set_silenced(state, &buffer.id, super::notify::silent(&d.notify_settings, chrono::Utc::now().timestamp()));
+        }
         // Nothing unread there, as Telegram counts it: the window need not call it unread either.
         if matches!(&dialog.raw, tl::enums::Dialog::Dialog(d) if d.unread_count == 0) {
             state.events.emit("bufferRead", serde_json::json!({ "accountId": account_id, "bufferId": buffer.id }));

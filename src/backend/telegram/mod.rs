@@ -22,6 +22,9 @@
 //! - `search` - searching on Telegram's side
 //! - `polls` - a poll as the conversation's card, voted in from it
 //! - `threads` - replies in a thread, and a channel post's comments
+//! - `membership` - joining by @name or link, leaving
+//! - `admin` - what an administrator may do to a member
+//! - `notify` - muting a chat on the account
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -38,6 +41,7 @@
 //! and says what this is: the device is "moho" on this operating system, the version is moho's own. A session is
 //! saved and reused; nothing here signs in afresh to get over a hiccup.
 
+pub mod admin;
 pub mod connect;
 pub mod dialogs;
 pub mod history;
@@ -46,7 +50,9 @@ pub mod login;
 pub mod markup;
 pub mod media;
 pub mod members;
+pub mod membership;
 pub mod messages;
+pub mod notify;
 pub mod peers;
 pub mod pins;
 pub mod polls;

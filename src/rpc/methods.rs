@@ -1028,6 +1028,12 @@ pub async fn dispatch(
             // Twitch is the same shape: a channel is a streamer, naming one is
             // the whole of joining it, and the connection remembers it once
             // Twitch has said it is there.
+            if id.starts_with("telegram:") {
+                return match backend::telegram::membership::join(state, id, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if id.starts_with("twitch:") {
                 let Some(channel) = backend::twitch::connect::normalise_login(name) else {
                     return (None, Some(format!("\"{name}\" is not a Twitch channel")));
@@ -1169,6 +1175,16 @@ pub async fn dispatch(
         // Muting a room for the account rather than for this window. Matrix
         // keeps it server-side, so a room quietened here is quiet on a phone
         // too - which is what somebody means by muting a room.
+        "setTelegramChatMuted" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("setTelegramChatMuted requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::notify::set_muted(state, &buffer, p_bool(params, "muted", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "setMatrixRoomMuted" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("setMatrixRoomMuted requires \"bufferId\"".to_string()));
@@ -3299,6 +3315,10 @@ pub async fn dispatch(
                                 let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
                             }
                             let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
+                        } else if buffer.account_id.starts_with("telegram:") {
+                            if let Err(e) = backend::telegram::membership::leave(state, &buffer).await {
+                                return (None, Some(e));
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -5692,6 +5712,23 @@ pub async fn dispatch(
         // bufferId (not roomId) throughout, matching every other message-
         // scoped Matrix method - the buffer->room_id lookup happens inside
         // moderation.rs itself, same as sendMessage/editMessage/etc.
+        // What this Telegram account may do to others in a conversation, and doing it.
+        "telegramPermissions" | "moderateTelegramMember" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            if method == "telegramPermissions" {
+                return match backend::telegram::admin::permissions(state, &buffer).await {
+                    Ok(permissions) => (Some(permissions), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::telegram::admin::moderate(state, &buffer, p_str(params, "userId", ""), p_str(params, "action", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "getMatrixRoomPermissions" => {
             let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
                 (Some(a), Some(b)) => (a, b),
