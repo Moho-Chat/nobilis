@@ -813,7 +813,7 @@ where
     let reply = match (&parent, reply_to) {
         (Some(p), _) => {
             let root = p.reply_to.as_ref().and_then(|r| r.thread_root.clone()).unwrap_or_else(|| p.id.clone());
-            Some(crate::model::ReplyPreview { id: p.id.clone(), from: p.from.clone(), body: p.body.clone(), thread: false, forwarded: false, thread_root: Some(root) })
+            Some(crate::model::ReplyPreview { id: p.id.clone(), from: p.from.clone(), body: p.body.clone(), thread: false, forwarded: false, thread_root: Some(root), chat: None })
         }
         _ => None,
     };

@@ -4872,6 +4872,15 @@ impl Runtime {
         }
     }
 
+    /// Says who and what a reply answered, once it has been looked up (a reply to something not read here yet).
+    pub fn fill_reply_preview(&self, state: &AppState, buffer_id: &str, msg_id: &str, from: &str, body: &str) {
+        match state.store.set_reply_text(buffer_id, msg_id, from, body) {
+            Ok(true) => state.events.emit("messageReplyRenamed", json!({ "bufferId": buffer_id, "id": msg_id, "from": from, "body": body })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to fill in a reply: {e}"),
+        }
+    }
+
     /// Discord's MESSAGE_DELETE - removes the row and tells clients to
     /// drop it from view, same as Discord's own clients (no tombstone).
     /// A message the service took down, kept and marked as taken down. Quiet

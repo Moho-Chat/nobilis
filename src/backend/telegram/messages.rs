@@ -246,17 +246,8 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     }
 
     let topic_only = matches!(&message.raw, tl::enums::Message::Message(m) if m.reply_to.as_ref().is_some_and(is_topic_root));
-    let reply = message.reply_to_message_id().filter(|_| !topic_only).map(|reply_id| {
-        let stored = state.store.get_message(&buffer.id, &reply_id.to_string()).ok().flatten();
-        ReplyPreview {
-            id: reply_id.to_string(),
-            from: stored.as_ref().map(|m| m.from.clone()).unwrap_or_default(),
-            body: stored.map(|m| m.body).unwrap_or_default(),
-            thread: false,
-            forwarded: false,
-            thread_root: None,
-        }
-    });
+    let reply = if topic_only { None } else { reply_preview(state, account_id, &buffer, message) };
+    let ask_for_reply = reply.as_ref().filter(|r| r.body.is_empty()).map(|r| (r.id.clone(), r.chat.clone()));
     let body = body_of(message);
     let html = message.fmt_entities().and_then(|e| entities_html(message.text(), e)).filter(|h| !h.is_empty());
     // The first line of a forward is words of our own, so the html (made from the text alone) would lose it: a
@@ -268,6 +259,11 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
         media::prefetch_preview(state, account_id, own.user_id, remote, message);
     }
     let again = attachments.clone();
+    let reply_target = ask_for_reply.map(|(reply_id, chat)| {
+        // Where the answered message is: the other conversation if it is one, else this.
+        let remote = chat.and_then(|c| state.runtime.get_buffer(&c)).and_then(|b| b.remote_id).or_else(|| buffer.remote_id.clone());
+        (remote, reply_id)
+    });
     let cards = buffer.remote_id.as_deref().map(|remote| media::embeds_of(own.user_id, remote, message)).unwrap_or_default();
     let cards_again = cards.clone();
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, cards, attachments, sender_id, Some(ts), html, None);
@@ -285,6 +281,10 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
                 state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer.id, "id": id, "body": stored.body, "edited": false, "embeds": stored.embeds, "attachments": again }));
             }
         }
+    }
+    // What a reply answered, when it was not in hand: asked of Telegram, and the row is filled in when it comes.
+    if let Some((Some(remote), reply_id)) = reply_target {
+        fill_reply_later(state, account_id, &buffer.id, &id, &remote, &reply_id);
     }
     // A poll that is still open is the conversation's card.
     if let tl::enums::Message::Message(raw) = &message.raw {
@@ -309,6 +309,54 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
         }
     }
     recorded
+}
+
+/// What a message answers, as the quote above it: the words quoted (or the message answered), who said them, and - when
+/// it was said in another conversation - where, so the reader can go there.
+fn reply_preview(state: &AppState, account_id: &str, buffer: &crate::model::Buffer, message: &Message) -> Option<ReplyPreview> {
+    let reply_id = message.reply_to_message_id()?;
+    let header = match &message.raw {
+        tl::enums::Message::Message(m) => match &m.reply_to {
+            Some(tl::enums::MessageReplyHeader::Header(h)) => Some(h.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let elsewhere = header
+        .as_ref()
+        .and_then(|h| h.reply_to_peer_id.clone())
+        .map(|p| peers::remote_id(grammers_session::types::PeerId::from(p)))
+        .filter(|remote| buffer.remote_id.as_deref() != Some(remote.as_str()));
+    let other = elsewhere.as_ref().and_then(|remote| state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())));
+    let source = other.as_ref().map(|b| b.id.clone()).unwrap_or_else(|| buffer.id.clone());
+    // A message in a conversation this account has not got open is not one to look for here.
+    let stored = if elsewhere.is_some() && other.is_none() { None } else { state.store.get_message(&source, &reply_id.to_string()).ok().flatten() };
+    let quote = header.as_ref().and_then(|h| h.quote_text.clone()).filter(|t| !t.trim().is_empty());
+    let named = header.as_ref().and_then(|h| h.reply_from.as_ref()).and_then(|f| {
+        let tl::enums::MessageFwdHeader::Header(f) = f;
+        f.from_name.clone().or_else(|| f.post_author.clone())
+    });
+    let shown_media = header.as_ref().and_then(|h| h.reply_media.as_ref()).and_then(media_label);
+    let from = other.as_ref().map(|b| b.name.clone()).or(named).or_else(|| stored.as_ref().map(|m| m.from.clone())).unwrap_or_default();
+    let body = quote.or_else(|| stored.map(|m| m.body)).or(shown_media).unwrap_or_default();
+    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None, chat: other.map(|b| b.id) })
+}
+
+/// Asks Telegram what a reply answered and fills the quote in.
+fn fill_reply_later(state: &AppState, account_id: &str, buffer_id: &str, msg_id: &str, remote: &str, reply_id: &str) {
+    let (Some(handle), Some(id), Ok(reply)) = (state.runtime.telegram_handle(account_id), peers::peer_id_of(remote), reply_id.parse::<i32>()) else { return };
+    let (state, buffer_id, msg_id) = (state.clone(), buffer_id.to_string(), msg_id.to_string());
+    tokio::spawn(async move {
+        use grammers_session::Session;
+        let Some(peer) = handle.session.peer_ref(id).await.ok().flatten() else { return };
+        let Ok(found) = handle.client.get_messages_by_id(peer, &[reply]).await else { return };
+        let Some(Some(original)) = found.into_iter().next() else { return };
+        let body = body_of(&original);
+        let from = original.sender().map(name_of).unwrap_or_else(|| original.peer().map(peers::title_of).unwrap_or_default());
+        if !body.is_empty() {
+            state.runtime.fill_reply_preview(&state, &buffer_id, &msg_id, &from, &body);
+        }
+    });
 }
 
 /// In a group with topics every message "replies" to its topic's first message; that is where it is, not who it

@@ -486,6 +486,12 @@ pub struct ReplyPreview {
     /// above it, the second for a thread to open.
     #[serde(rename = "threadRoot", default, skip_serializing_if = "Option::is_none")]
     pub thread_root: Option<String>,
+    /// The conversation the message answered lives in, when it is not this one.
+    ///
+    /// Telegram can answer a post in another channel; the quote then names where it came from, and a client can
+    /// take the reader there. A buffer id, present only when that conversation is one the account has open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
 }
 
 /// Why a message the service took down is gone, kept with the message.

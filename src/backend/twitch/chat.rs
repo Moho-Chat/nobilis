@@ -345,6 +345,7 @@ pub fn reply_of(line: &Line, text: &str) -> (Option<ReplyPreview>, String) {
             thread: false,
             forwarded: false,
             thread_root: Some(root.to_string()),
+            chat: None,
         }),
         body,
     )

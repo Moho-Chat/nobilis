@@ -910,6 +910,7 @@ pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
             thread: false,
             forwarded: true,
             thread_root: None,
+            chat: None,
         });
     }
     let referenced = &d["referenced_message"];
@@ -921,7 +922,7 @@ pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
     let author = &referenced["author"];
     let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown").to_string();
     let body = extract_body(referenced).unwrap_or_default();
-    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None })
+    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None, chat: None })
 }
 
 /// Shared by both the initial backfill and extend_history - Discord
