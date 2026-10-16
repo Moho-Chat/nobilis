@@ -5121,6 +5121,12 @@ pub async fn dispatch(
             // running tally is what most people mean by a poll, and a hidden
             // one is the deliberate choice.
             let disclosed = params.get("disclosed").and_then(Value::as_bool).unwrap_or(true);
+            if buffer.account_id.starts_with("telegram:") {
+                return match backend::telegram::polls::start(state, &buffer, question, &answers, disclosed).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             match backend::matrix::start_poll(state, &buffer.account_id, buffer_id, question, &answers, disclosed).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),

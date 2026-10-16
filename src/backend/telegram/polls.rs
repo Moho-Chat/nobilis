@@ -150,6 +150,62 @@ pub async fn vote(state: &AppState, buffer: &Buffer, answer: &str) -> Result<(),
     Ok(())
 }
 
+/// Telegram's limits on a poll: a question of 255 characters, answers of 100, two to ten of them.
+const QUESTION_MAX: usize = 255;
+const ANSWER_MAX: usize = 100;
+const ANSWERS: std::ops::RangeInclusive<usize> = 2..=10;
+
+/// What a poll somebody is starting is, checked and as Telegram's own type. `disclosed` is whether the running
+/// count shows before it closes.
+pub fn build(question: &str, answers: &[String], disclosed: bool) -> Result<tl::types::Poll, String> {
+    let question = question.trim();
+    let answers: Vec<&str> = answers.iter().map(|a| a.trim()).filter(|a| !a.is_empty()).collect();
+    if question.is_empty() {
+        return Err("A poll needs a question".to_string());
+    }
+    if question.chars().count() > QUESTION_MAX {
+        return Err(format!("The question can be at most {QUESTION_MAX} characters"));
+    }
+    if !ANSWERS.contains(&answers.len()) {
+        return Err("Telegram polls have between 2 and 10 answers".to_string());
+    }
+    if answers.iter().any(|a| a.chars().count() > ANSWER_MAX) {
+        return Err(format!("An answer can be at most {ANSWER_MAX} characters"));
+    }
+    let plain = |t: &str| tl::enums::TextWithEntities::Entities(tl::types::TextWithEntities { text: t.to_string(), entities: Vec::new() });
+    Ok(tl::types::Poll {
+        id: 0,
+        closed: false,
+        // Anonymous, as Telegram's own apps start one.
+        public_voters: false,
+        multiple_choice: false,
+        quiz: false,
+        open_answers: false,
+        revoting_disabled: false,
+        shuffle_answers: false,
+        hide_results_until_close: !disclosed,
+        creator: false,
+        subscribers_only: false,
+        question: plain(question),
+        answers: answers.iter().enumerate().map(|(i, a)| tl::enums::PollAnswer::Answer(tl::types::PollAnswer { text: plain(a), option: vec![i as u8], media: None, added_by: None, date: None })).collect(),
+        close_period: None,
+        close_date: None,
+        hash: 0,
+        countries_iso2: None,
+    })
+}
+
+/// Starts a poll in a conversation.
+pub async fn start(state: &AppState, buffer: &Buffer, question: &str, answers: &[String], disclosed: bool) -> Result<(), String> {
+    let poll = build(question, answers, disclosed)?;
+    let (handle, peer) = peer_for(state, buffer).await?;
+    let media = tl::types::InputMediaPoll { poll: tl::enums::Poll::Poll(poll), correct_answers: None, attached_media: None, solution: None, solution_entities: None, solution_media: None };
+    let input = grammers_client::message::InputMessage::new().media(tl::enums::InputMedia::Poll(Box::new(media)));
+    let sent = handle.client.send_message(peer, input).await.map_err(|e| explain(&e))?;
+    super::messages::record(state, &buffer.account_id, &handle.own, &sent);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +242,20 @@ mod tests {
 
     fn voters(option: &[u8], n: i32, chosen: bool) -> tl::enums::PollAnswerVoters {
         tl::enums::PollAnswerVoters::Voters(tl::types::PollAnswerVoters { chosen, correct: false, option: option.to_vec(), voters: Some(n), recent_voters: None })
+    }
+
+    #[test]
+    fn a_poll_that_is_started_is_checked() {
+        let a = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ok = build(" Lunch? ", &a(&["Pizza", " Soup ", ""]), false).unwrap();
+        assert_eq!(ok.answers.len(), 2, "an empty answer is not one");
+        assert!(ok.hide_results_until_close);
+        assert!(!ok.public_voters);
+        assert!(build("", &a(&["a", "b"]), true).is_err());
+        assert!(build("Q", &a(&["only"]), true).is_err());
+        assert!(build("Q", &a(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]), true).is_err());
+        assert!(build(&"x".repeat(256), &a(&["a", "b"]), true).is_err());
+        assert!(!build("Q", &a(&["a", "b"]), true).unwrap().hide_results_until_close);
     }
 
     #[test]

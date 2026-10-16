@@ -238,7 +238,8 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
         return state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, "Telegram", &text, false, "system", None, Some(id), false, None, Vec::new(), Vec::new(), None, Some(ts), None, None);
     }
 
-    let reply = message.reply_to_message_id().map(|reply_id| {
+    let topic_only = matches!(&message.raw, tl::enums::Message::Message(m) if m.reply_to.as_ref().is_some_and(is_topic_root));
+    let reply = message.reply_to_message_id().filter(|_| !topic_only).map(|reply_id| {
         let stored = state.store.get_message(&buffer.id, &reply_id.to_string()).ok().flatten();
         ReplyPreview {
             id: reply_id.to_string(),
@@ -282,6 +283,12 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
     recorded
 }
 
+/// In a group with topics every message "replies" to its topic's first message; that is where it is, not who it
+/// answers. A real reply names a message and the topic it is in as well.
+fn is_topic_root(header: &tl::enums::MessageReplyHeader) -> bool {
+    matches!(header, tl::enums::MessageReplyHeader::Header(h) if h.forum_topic && h.reply_to_top_id.is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +299,32 @@ mod tests {
     }
     fn italic(offset: i32, length: i32) -> tl::enums::MessageEntity {
         tl::enums::MessageEntity::Italic(t::MessageEntityItalic { offset, length })
+    }
+
+    fn header(forum_topic: bool, msg: i32, top: Option<i32>) -> tl::enums::MessageReplyHeader {
+        tl::enums::MessageReplyHeader::Header(t::MessageReplyHeader {
+            reply_to_scheduled: false,
+            forum_topic,
+            quote: false,
+            reply_to_ephemeral: false,
+            reply_to_msg_id: Some(msg),
+            reply_to_peer_id: None,
+            reply_from: None,
+            reply_media: None,
+            reply_to_top_id: top,
+            quote_text: None,
+            quote_entities: None,
+            quote_offset: None,
+            todo_item_id: None,
+            poll_option: None,
+        })
+    }
+
+    #[test]
+    fn a_message_in_a_topic_is_not_a_reply_to_the_topic() {
+        assert!(is_topic_root(&header(true, 10, None)));
+        assert!(!is_topic_root(&header(true, 55, Some(10))), "answering a message inside the topic");
+        assert!(!is_topic_root(&header(false, 10, None)), "an ordinary reply");
     }
 
     #[test]
