@@ -300,6 +300,47 @@ async fn download_thumb(client: &grammers_client::Client, document: &Document, p
     download_to(client, size, path, false).await
 }
 
+/// The previews being fetched now, so a message read twice at once fetches its preview once.
+fn fetching() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static F: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = std::sync::OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+/// Fetches the small preview of a message's picture or video in the background, as the message is recorded.
+///
+/// Previews are a few kilobytes and are what the list draws, so they are not left to be asked for one by one when the
+/// window finds them missing (which asks Telegram for the message again each time). The message is in hand here, so
+/// nothing more is asked. Whole files are still fetched only when looked at.
+pub fn prefetch_preview(state: &AppState, account_id: &str, account: i64, remote: &str, message: &Message) {
+    let Some(media) = message.media() else { return };
+    let path = crate::media_cache::dir(MEDIA).join(media_name(account, remote, message.id(), Variant::Thumb, "jpg"));
+    if path.exists() || !matches!(media, Media::Photo(_) | Media::Document(_) | Media::Sticker(_)) {
+        return;
+    }
+    if !fetching().lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
+        return;
+    }
+    let Some(handle) = state.runtime.telegram_handle(account_id) else {
+        fetching().lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+        return;
+    };
+    tokio::spawn(async move {
+        let done = match &media {
+            Media::Photo(photo) => match pick(&photo.thumbs(), 320) {
+                Some(size) => download_to(&handle.client, size, &path, false).await,
+                None => download_to(&handle.client, photo, &path, false).await,
+            },
+            Media::Document(document) => download_thumb(&handle.client, document, &path).await,
+            Media::Sticker(sticker) => download_thumb(&handle.client, &sticker.document, &path).await,
+            _ => Ok(()),
+        };
+        if let Err(e) = done {
+            tracing::debug!("telegram: preview {}: {e:#}", path.display());
+        }
+        fetching().lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
+    });
+}
+
 /// Fetches a cached Telegram file again, after it expired, was cleared, or was named before it was ever fetched.
 pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
     let name = path.file_name().and_then(|n| n.to_str()).context("not a cached file")?;

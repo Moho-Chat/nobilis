@@ -264,6 +264,9 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     let html = if message.forward_header().is_some() { None } else { html };
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
     let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
+    if let Some(remote) = buffer.remote_id.as_deref() {
+        media::prefetch_preview(state, account_id, own.user_id, remote, message);
+    }
     let again = attachments.clone();
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None);
     // Read again, a message already kept without its picture or file gets it: earlier builds kept the text alone.
