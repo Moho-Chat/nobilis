@@ -16,6 +16,7 @@ use grammers_client::tl;
 use grammers_session::types::PeerId;
 
 pub const DIRECT_MESSAGES: &str = "Direct Messages";
+pub const BOTS: &str = "Bots";
 pub const GROUPS: &str = "Groups";
 pub const CHANNELS: &str = "Channels";
 
@@ -39,6 +40,8 @@ pub fn kind_of(peer: &Peer) -> &'static str {
 
 pub fn category_of(peer: &Peer) -> &'static str {
     match peer {
+        // A bot is a conversation with a program, not a person: its own heading (it is still a direct chat).
+        Peer::User(user) if user.is_bot() => BOTS,
         Peer::User(_) => DIRECT_MESSAGES,
         Peer::Channel(_) => CHANNELS,
         _ => GROUPS,
