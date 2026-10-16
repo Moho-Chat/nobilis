@@ -1257,6 +1257,7 @@ pub async fn dispatch(
                         "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
                         "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1854,6 +1855,15 @@ pub async fn dispatch(
                             false
                         }
                     }
+                    Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                        let (state, buffer) = (state.clone(), buffer);
+                        tokio::spawn(async move {
+                            if let Err(e) = backend::telegram::members::refresh(&state, &buffer).await {
+                                tracing::debug!("telegram members: {e}");
+                            }
+                        });
+                        true
+                    }
                     _ => backend::discord::request_member_list(state, buffer_id),
                 };
                 (Some(serde_json::json!({ "requested": asked })), None)
@@ -2334,6 +2344,8 @@ pub async fn dispatch(
                 backend::discord::load_context(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::load_context(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::history::context(state, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2374,6 +2386,8 @@ pub async fn dispatch(
                 backend::discord::load_newer(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::load_newer(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::history::newer(state, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -2399,6 +2413,8 @@ pub async fn dispatch(
                 backend::discord::list_pinned(state, &buffer.account_id, buffer_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::pins::list(state, &buffer).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2448,12 +2464,33 @@ pub async fn dispatch(
                 backend::discord::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
             match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The same question asked of Telegram's own index, for what this client never read.
+        "searchTelegramMessages" => {
+            let (buffer_id, query) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "query")) {
+                (Some(b), Some(q)) => (b, q),
+                _ => return (None, Some("searchTelegramMessages requires \"bufferId\" and \"query\"".to_string())),
+            };
+            if query.trim().is_empty() {
+                return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("that conversation is not on Telegram".to_string()));
+            };
+            let account_wide = p_str_opt(params, "scope") == Some("account");
+            match backend::telegram::search::run(state, &buffer, query, account_wide, p_i64(params, "limit", 25) as usize).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
             }
         }
 
@@ -3705,6 +3742,10 @@ pub async fn dispatch(
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
+                },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("steam:") && backend::steam::chatgroups::is_room(&buffer) => match backend::steam::chatgroups::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),

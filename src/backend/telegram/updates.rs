@@ -42,6 +42,15 @@ fn read_up_to(state: &AppState, account_id: &str, remote: &str, max_id: i32) {
     }
 }
 
+/// The pins of a conversation changed: read them again, which says so to every window.
+fn pins_changed(state: &AppState, account_id: &str, _handle: &Handle, remote: &str) {
+    let Some(buffer) = buffer_of(state, account_id, remote) else { return };
+    let state = state.clone();
+    tokio::spawn(async move {
+        let _ = super::pins::list(&state, &buffer).await;
+    });
+}
+
 /// Handles one raw update.
 pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enums::Update) {
     use tl::enums::Update as U;
@@ -63,6 +72,9 @@ pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enu
                 say_typing(state, account_id, &buffer, name);
             }
         }
+        U::MessageReactions(u) => super::reactions::update(state, account_id, &peers::remote_id(PeerId::from(u.peer.clone())), u.msg_id, &u.reactions),
+        U::PinnedMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::from(u.peer.clone()))),
+        U::PinnedChannelMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::channel_unchecked(u.channel_id))),
         U::ReadHistoryInbox(u) => read_up_to(state, account_id, &peers::remote_id(PeerId::from(u.peer.clone())), u.max_id),
         U::ReadChannelInbox(u) => read_up_to(state, account_id, &peers::remote_id(PeerId::channel_unchecked(u.channel_id)), u.max_id),
         _ => {}

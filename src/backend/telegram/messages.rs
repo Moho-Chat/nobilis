@@ -256,7 +256,17 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
     let html = if message.forward_header().is_some() { None } else { html };
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
     let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
-    state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None)
+    let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None);
+    // What people have reacted with, which a message arrives carrying.
+    if let tl::enums::Message::Message(m) = &message.raw {
+        if let Some(reactions) = &m.reactions {
+            let list = super::reactions::from_tl(reactions);
+            if !list.is_empty() {
+                super::reactions::apply(state, &buffer.id, &id, &list);
+            }
+        }
+    }
+    recorded
 }
 
 #[cfg(test)]

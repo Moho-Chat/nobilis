@@ -15,6 +15,11 @@
 //! - `updates` - what Telegram sends that is not a message: typing, reads on other apps
 //! - `send` - saying things: send, answer, edit, delete, typing, read
 //! - `media` - pictures, video, files and voice: what a message carries, fetched when it is looked at
+//! - `reactions` - the emoji on a message, and the account's own
+//! - `pins` - a conversation's pinned messages
+//! - `members` - who is in a group
+//! - `profile` - the card for a person
+//! - `search` - searching on Telegram's side
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -38,8 +43,13 @@ pub mod link;
 pub mod login;
 pub mod markup;
 pub mod media;
+pub mod members;
 pub mod messages;
 pub mod peers;
+pub mod pins;
+pub mod profile;
+pub mod reactions;
+pub mod search;
 pub mod send;
 pub mod updates;
 pub mod session;
