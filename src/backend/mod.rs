@@ -16,4 +16,5 @@ pub mod kick;
 pub mod matrix;
 pub mod sneedchat;
 pub mod steam;
+pub mod telegram;
 pub mod twitch;

@@ -112,6 +112,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addKickAccount" => Some("kick"),
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
+        "addTelegramAccount" => Some("telegram"),
         _ => None,
     }
 }
@@ -426,6 +427,7 @@ pub async fn dispatch(
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
                 { "id": "twitch", "name": "Twitch", "available": true },
+                { "id": "telegram", "name": "Telegram", "available": true },
             ])),
             None,
         ),
@@ -781,8 +783,14 @@ pub async fn dispatch(
                 // hours and a refresh token good for thirty days. Best effort:
                 // the account is removed either way.
                 let twitch_tokens = state.accounts.get_twitch(id).filter(|a| a.is_signed_in()).map(|a| (a.access_token, a.refresh_token));
+                // A Telegram session is ended at Telegram too, and its file taken away.
+                let telegram_account = state.accounts.get_telegram(id);
                 match state.accounts.remove(id) {
                     Ok(true) => {
+                        if let Some(config) = telegram_account {
+                            let state = state.clone();
+                            tokio::spawn(async move { backend::telegram::connect::sign_out(&state, &config).await });
+                        }
                         if let Some((access, refresh)) = twitch_tokens {
                             tokio::spawn(async move {
                                 if let Ok(http) = backend::twitch::client() {
@@ -4417,6 +4425,39 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // Signing in to Telegram takes place over time - Telegram sends a code, and may then ask for the account's
+        // cloud password - so this answers with an id and the rest is events: see backend/telegram/login.rs.
+        "addTelegramAccount" => {
+            let (Some(api_id), Some(api_hash), Some(phone)) = (params.get("apiId").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))), p_str_opt(params, "apiHash"), p_str_opt(params, "phone")) else {
+                return (None, Some("addTelegramAccount requires \"apiId\", \"apiHash\" and \"phone\"".to_string()));
+            };
+            let Ok(api_id) = i32::try_from(api_id) else {
+                return (None, Some("that api_id is not a number Telegram would have given".to_string()));
+            };
+            let login_id = format!("telegram-{}", crate::model::next_message_id());
+            backend::telegram::login::start(state.clone(), login_id.clone(), api_id, api_hash.trim().to_string(), phone.to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The code Telegram sent, and the cloud password it may ask for next, for a sign-in that is waiting.
+        "submitTelegramCode" | "submitTelegramPassword" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some(format!("{method} requires \"loginId\" and \"value\"")));
+            };
+            let given = if method == "submitTelegramCode" { backend::telegram::login::submit_code(login_id, value) } else { backend::telegram::login::submit_password(login_id, value) };
+            match given {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelTelegramLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::telegram::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
         }
 
         // The form was closed with a sign-in still waiting.

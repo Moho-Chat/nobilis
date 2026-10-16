@@ -1256,6 +1256,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::twitch_account_to_json(cfg, conn)
         }));
+        out.extend(state.accounts.all_telegram().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::telegram_account_to_json(cfg, conn)
+        }));
         out
     }
 

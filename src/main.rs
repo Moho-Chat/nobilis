@@ -343,6 +343,9 @@ async fn run() -> Result<()> {
     for cfg in state.accounts.all_twitch() {
         backend::twitch::spawn(state.clone(), cfg);
     }
+    for cfg in state.accounts.all_telegram() {
+        backend::telegram::connect::spawn(state.clone(), cfg);
+    }
 
     // What was going on last time, before anything is served: a window that
     // connects immediately should see the same list it was looking at.
