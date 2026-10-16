@@ -264,7 +264,16 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     let html = if message.forward_header().is_some() { None } else { html };
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
     let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
+    let again = attachments.clone();
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None);
+    // Read again, a message already kept without its picture or file gets it: earlier builds kept the text alone.
+    if !recorded && !again.is_empty() {
+        if let Ok(Some(stored)) = state.store.get_message(&buffer.id, &id) {
+            if stored.attachments.is_empty() && state.store.update_message_attachments(&buffer.id, &id, &again).unwrap_or(false) {
+                state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer.id, "id": id, "body": stored.body, "edited": false, "embeds": stored.embeds, "attachments": again }));
+            }
+        }
+    }
     // A poll that is still open is the conversation's card.
     if let tl::enums::Message::Message(raw) = &message.raw {
         if let Some(tl::enums::MessageMedia::Poll(p)) = &raw.media {
