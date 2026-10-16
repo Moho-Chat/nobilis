@@ -20,6 +20,8 @@
 //! - `members` - who is in a group
 //! - `profile` - the card for a person
 //! - `search` - searching on Telegram's side
+//! - `polls` - a poll as the conversation's card, voted in from it
+//! - `threads` - replies in a thread, and a channel post's comments
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -47,10 +49,12 @@ pub mod members;
 pub mod messages;
 pub mod peers;
 pub mod pins;
+pub mod polls;
 pub mod profile;
 pub mod reactions;
 pub mod search;
 pub mod send;
+pub mod threads;
 pub mod updates;
 pub mod session;
 

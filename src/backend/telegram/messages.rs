@@ -257,8 +257,21 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
     let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None);
+    // A poll that is still open is the conversation's card.
+    if let tl::enums::Message::Message(raw) = &message.raw {
+        if let Some(tl::enums::MessageMedia::Poll(p)) = &raw.media {
+            let (tl::enums::Poll::Poll(poll), tl::enums::PollResults::Results(results)) = (&p.poll, &p.results);
+            super::polls::announce(state, &buffer.id, message.id(), poll, results);
+        }
+    }
     // What people have reacted with, which a message arrives carrying.
     if let tl::enums::Message::Message(m) = &message.raw {
+        // How many have answered it, or commented under it if it is a channel's post.
+        if let Some(tl::enums::MessageReplies::Replies(r)) = &m.replies {
+            if r.replies > 0 {
+                state.events.emit("threadCount", serde_json::json!({ "bufferId": buffer.id, "id": id, "count": r.replies }));
+            }
+        }
         if let Some(reactions) = &m.reactions {
             let list = super::reactions::from_tl(reactions);
             if !list.is_empty() {

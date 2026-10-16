@@ -1283,6 +1283,12 @@ pub async fn dispatch(
                     Ok(messages) => messages,
                     Err(e) => return (None, Some(format!("{e:#}"))),
                 }
+            } else if account_id.starts_with("telegram:") {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
+                return match backend::telegram::threads::fetch(state, &buffer, root_id).await {
+                    Ok(messages) => (Some(serde_json::json!({ "messages": messages })), None),
+                    Err(e) => (None, Some(e)),
+                };
             } else {
                 state.store.thread_messages(buffer_id, root_id).unwrap_or_default()
             };
@@ -3485,6 +3491,12 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") && params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false) && attachment_path.is_none() && reply_to_id.is_some() => {
+                    match backend::telegram::threads::reply(state, &buffer, reply_to_id.unwrap_or_default(), body).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -5138,6 +5150,15 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
+            }
+            if channel_account(state, buffer_id).starts_with("telegram:") {
+                let (Some(choice), Some(buffer)) = (p_str_opt(params, "answerId"), state.runtime.get_buffer(buffer_id)) else {
+                    return (None, Some("votePoll requires \"answerId\"".to_string()));
+                };
+                return match backend::telegram::polls::vote(state, &buffer, choice).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
             }
             if channel_account(state, buffer_id).starts_with("twitch:") {
                 // Twitch's choices are named by ids of their own, which the window hands back as text.

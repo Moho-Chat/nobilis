@@ -73,6 +73,7 @@ pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enu
             }
         }
         U::MessageReactions(u) => super::reactions::update(state, account_id, &peers::remote_id(PeerId::from(u.peer.clone())), u.msg_id, &u.reactions),
+        U::MessagePoll(u) => super::polls::update(state, u),
         U::PinnedMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::from(u.peer.clone()))),
         U::PinnedChannelMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::channel_unchecked(u.channel_id))),
         U::ReadHistoryInbox(u) => read_up_to(state, account_id, &peers::remote_id(PeerId::from(u.peer.clone())), u.max_id),
