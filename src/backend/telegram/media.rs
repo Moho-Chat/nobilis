@@ -253,8 +253,14 @@ async fn download_to<D: Downloadable>(client: &grammers_client::Client, what: &D
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let part = path.with_extension("part");
-    client.download_media(what, &part).await.map_err(|e| anyhow!("{}", super::send::explain(&e)))?;
+    // Its own name for the half-written file: two fetches of one picture (a preview being fetched as the message was
+    // recorded, and the window asking for it) must not write into the same one.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let part = path.with_extension(format!("{}.part", SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    if let Err(e) = client.download_media(what, &part).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(anyhow!("{}", super::send::explain(&e)));
+    }
     tokio::fs::rename(&part, path).await.with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
@@ -352,6 +358,16 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
     let (account, remote, message, variant) = parse_media_name(name).context("not a cached Telegram file")?;
+    // A preview already on its way is waited for, not fetched a second time.
+    for _ in 0..120 {
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+        if !fetching().lock().unwrap_or_else(|e| e.into_inner()).contains(path) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
     let handle = state.runtime.telegram_handle(&format!("telegram:{account}")).context("that Telegram account is not connected")?;
     fetch(&handle, &remote, message, variant, path).await?;
     Ok(path.to_path_buf())
