@@ -273,7 +273,7 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.clone()), message.mentioned(), avatar, cards, attachments, sender_id, Some(ts), html, None);
     if !recorded && !cards_again.is_empty() {
         if let Ok(Some(stored)) = state.store.get_message(&buffer.id, &id) {
-            if stored.embeds.is_empty() && state.store.set_message_embeds(&buffer.id, &id, &cards_again).unwrap_or(false) {
+            if stored.embeds != cards_again && state.store.set_message_embeds(&buffer.id, &id, &cards_again).unwrap_or(false) {
                 state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer.id, "id": id, "body": stored.body, "edited": false, "embeds": cards_again, "attachments": stored.attachments }));
             }
         }

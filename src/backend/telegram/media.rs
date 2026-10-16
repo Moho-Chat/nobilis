@@ -155,7 +155,7 @@ fn dimensions(size: &PhotoSize) -> Option<(i32, i32)> {
 }
 
 /// The version of a photo to draw in the list (about 320 wide) and the one to show in the viewer (about 1280).
-fn pick(sizes: &[PhotoSize], target: i32) -> Option<&PhotoSize> {
+pub(super) fn pick(sizes: &[PhotoSize], target: i32) -> Option<&PhotoSize> {
     let sized: Vec<(&PhotoSize, i32)> = sizes.iter().filter_map(|s| dimensions(s).map(|(w, h)| (s, w.max(h)))).collect();
     choose(&sized, target).copied()
 }
@@ -195,6 +195,9 @@ pub fn embeds_of(account: i64, remote: &str, message: &Message) -> Vec<Embed> {
         provider: non_empty(&page.site_name),
         author: non_empty(&page.author),
         image_url: has_picture.then(|| local(MEDIA, &media_name(account, remote, message.id(), Variant::Thumb, "jpg"))),
+        // A page Telegram has made an article of opens as one: the card says so, as Telegram's own does.
+        kind: page.cached_page.is_some().then(|| "instant".to_string()),
+        cta: page.cached_page.is_some().then(|| crate::model::EmbedLink { label: "Instant View".to_string(), url: None }),
         ..Default::default()
     }]
 }
@@ -280,7 +283,7 @@ fn is_voice(document: &Document) -> bool {
 }
 
 /// Downloads to a file, whole and renamed into place so a half-written one is never taken for a picture.
-async fn download_to<D: Downloadable>(client: &grammers_client::Client, what: &D, path: &Path, big: bool) -> Result<()> {
+pub(super) async fn download_to<D: Downloadable>(client: &grammers_client::Client, what: &D, path: &Path, big: bool) -> Result<()> {
     let _permit = permits(big).acquire().await?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -334,7 +337,7 @@ async fn fetch(handle: &Handle, remote: &str, message: i32, variant: Variant, pa
     }
 }
 
-async fn download_thumb(client: &grammers_client::Client, document: &Document, path: &Path) -> Result<()> {
+pub(super) async fn download_thumb(client: &grammers_client::Client, document: &Document, path: &Path) -> Result<()> {
     let sizes = document.thumbs();
     let size = pick(&sizes, 320).or(sizes.first()).ok_or_else(|| anyhow!("Telegram sent no preview of that"))?;
     // A tiny inline preview carries its own bytes; the rest are downloaded.

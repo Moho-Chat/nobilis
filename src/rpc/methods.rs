@@ -1175,6 +1175,17 @@ pub async fn dispatch(
         // Muting a room for the account rather than for this window. Matrix
         // keeps it server-side, so a room quietened here is quiet on a phone
         // too - which is what somebody means by muting a room.
+        // The article a Telegram link preview carries, as a document for a window of its own.
+        "telegramInstantView" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("telegramInstantView requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::instant::article(state, &buffer, p_str(params, "messageId", "")).await {
+                Ok(article) => (Some(serde_json::json!({ "title": article.title, "url": article.url, "html": article.html })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "setTelegramChatMuted" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
                 return (None, Some("setTelegramChatMuted requires a Telegram \"bufferId\"".to_string()));
