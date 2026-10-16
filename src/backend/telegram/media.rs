@@ -11,7 +11,7 @@
 
 use super::peers;
 use super::Handle;
-use crate::model::Attachment;
+use crate::model::{Attachment, Embed};
 use crate::state::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use grammers_client::media::{Document, Downloadable, Media, PhotoSize};
@@ -167,6 +167,38 @@ fn choose<T>(items: &[(T, i32)], target: i32) -> Option<&T> {
     by_size.iter().find(|(_, longest)| *longest >= target).or(by_size.last()).map(|(item, _)| item)
 }
 
+/// The width a link card's picture is fetched at: it is drawn larger than a list thumbnail.
+const CARD: i32 = 800;
+
+/// The picture of the web page a message links to, if the page has one.
+fn page_photo(media: &Media) -> Option<grammers_client::media::Photo> {
+    let Media::WebPage(page) = media else { return None };
+    let tl::enums::WebPage::Page(page) = &page.raw.webpage else { return None };
+    page.photo.clone().map(grammers_client::media::Photo::from_raw)
+}
+
+/// The link preview a message carries (what Telegram calls a web page, with or without an Instant View): a card with
+/// the site, title, description and picture. Its picture is named in the cache and fetched like any preview.
+pub fn embeds_of(account: i64, remote: &str, message: &Message) -> Vec<Embed> {
+    let Some(media) = message.media() else { return Vec::new() };
+    let Media::WebPage(page) = &media else { return Vec::new() };
+    let tl::enums::WebPage::Page(page) = &page.raw.webpage else { return Vec::new() };
+    let has_picture = page_photo(&media).is_some();
+    if page.title.is_none() && page.description.is_none() && !has_picture {
+        return Vec::new();
+    }
+    let non_empty = |t: &Option<String>| t.clone().filter(|t| !t.trim().is_empty());
+    vec![Embed {
+        title: non_empty(&page.title),
+        description: non_empty(&page.description),
+        url: Some(page.url.clone()),
+        provider: non_empty(&page.site_name),
+        author: non_empty(&page.author),
+        image_url: has_picture.then(|| local(MEDIA, &media_name(account, remote, message.id(), Variant::Thumb, "jpg"))),
+        ..Default::default()
+    }]
+}
+
 /// What the message carries, as attachments naming files in the cache. Nothing is downloaded here.
 pub fn attachments_of(account: i64, remote: &str, message: &Message) -> Vec<Attachment> {
     let id = message.id();
@@ -291,6 +323,13 @@ async fn fetch(handle: &Handle, remote: &str, message: i32, variant: Variant, pa
             Variant::Full => download_to(&handle.client, &document, path, true).await,
             Variant::Thumb => download_thumb(&handle.client, &document, path).await,
         },
+        media @ Media::WebPage(_) => {
+            let photo = page_photo(&media).ok_or_else(|| anyhow!("that link has no picture"))?;
+            match pick(&photo.thumbs(), CARD) {
+                Some(size) => download_to(&handle.client, size, path, false).await,
+                None => download_to(&handle.client, &photo, path, false).await,
+            }
+        }
         _ => bail!("that kind of media cannot be fetched"),
     }
 }
@@ -320,7 +359,7 @@ fn fetching() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
 pub fn prefetch_preview(state: &AppState, account_id: &str, account: i64, remote: &str, message: &Message) {
     let Some(media) = message.media() else { return };
     let path = crate::media_cache::dir(MEDIA).join(media_name(account, remote, message.id(), Variant::Thumb, "jpg"));
-    if path.exists() || !matches!(media, Media::Photo(_) | Media::Document(_) | Media::Sticker(_)) {
+    if path.exists() || !matches!(media, Media::Photo(_) | Media::Document(_) | Media::Sticker(_) | Media::WebPage(_)) {
         return;
     }
     if !fetching().lock().unwrap_or_else(|e| e.into_inner()).insert(path.clone()) {
@@ -338,6 +377,13 @@ pub fn prefetch_preview(state: &AppState, account_id: &str, account: i64, remote
             },
             Media::Document(document) => download_thumb(&handle.client, document, &path).await,
             Media::Sticker(sticker) => download_thumb(&handle.client, &sticker.document, &path).await,
+            Media::WebPage(_) => match page_photo(&media) {
+                Some(photo) => match pick(&photo.thumbs(), CARD) {
+                    Some(size) => download_to(&handle.client, size, &path, false).await,
+                    None => download_to(&handle.client, &photo, &path, false).await,
+                },
+                None => Ok(()),
+            },
             _ => Ok(()),
         };
         if let Err(e) = done {
