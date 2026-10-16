@@ -61,7 +61,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 # Telegram backend (MTProto, pure Rust). `grammers-session` without its default `sqlite-storage` (libsql would sit
 # beside rusqlite and matrix-sdk-sqlite): the session is serialized into the account instead - see backend/telegram.
-grammers-client = { version = "=0.11.0", default-features = false, features = ["proxy"] }
+grammers-client = { version = "=0.11.0", default-features = false, features = ["proxy", "fs"] }
 grammers-mtsender = { version = "=0.11.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
 

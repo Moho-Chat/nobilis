@@ -1493,6 +1493,8 @@ pub async fn dispatch(
                     &finished.waveform,
                 )
                 .await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
                 backend::matrix::send_voice_message(
                     state,
@@ -3447,12 +3449,19 @@ pub async fn dispatch(
                     }
                 },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
-                    // Files are Round 4's; what arrives that Telegram cannot use yet is refused in words rather
-                    // than dropped, because a message with its picture silently missing is the worse trade.
-                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
-                        return (None, Some("files cannot be sent to Telegram from here yet".to_string()));
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                    let sent = backend::telegram::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
                     }
-                    match backend::telegram::send::send(state, &buffer, body, reply_to_id).await {
+                    match sent {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }

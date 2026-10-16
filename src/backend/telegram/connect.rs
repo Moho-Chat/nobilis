@@ -203,7 +203,8 @@ fn handle_update(state: &AppState, account_id: &str, handle: &Handle, update: gr
             if let Some(peer) = message.peer() {
                 let buffer = peers::buffer_for(state, account_id, peer);
                 let body = messages::body_of(&message);
-                state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &[]);
+                let attachments = buffer.remote_id.as_deref().map(|remote| super::media::attachments_of(handle.own.user_id, remote, &message)).unwrap_or_default();
+                state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &attachments);
             }
         }
         Update::MessageDeleted(deleted) => {

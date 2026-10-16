@@ -4,6 +4,7 @@
 //! become the message's `html` (bold, italic, underline, strike, code, a quote, a link, a spoiler) beside its plain
 //! `body`. Media is not drawn until Round 4; a message that carries some says what it is in words, after its caption.
 
+use super::media;
 use super::peers;
 use crate::model::ReplyPreview;
 use crate::state::AppState;
@@ -253,7 +254,9 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
     // The first line of a forward is words of our own, so the html (made from the text alone) would lose it: a
     // forwarded message is shown as plain text.
     let html = if message.forward_header().is_some() { None } else { html };
-    state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id), message.mentioned(), None, Vec::new(), Vec::new(), sender_id, Some(ts), html, None)
+    let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
+    let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
+    state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id), message.mentioned(), avatar, Vec::new(), attachments, sender_id, Some(ts), html, None)
 }
 
 #[cfg(test)]

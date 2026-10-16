@@ -10,6 +10,8 @@ use super::peers;
 use super::Handle;
 use crate::model::Buffer;
 use crate::state::AppState;
+use crate::upload::{Phase, Progress};
+use grammers_client::media::{InputMedia, Uploaded};
 use grammers_client::message::InputMessage;
 use grammers_client::{tl, InvocationError};
 use grammers_session::types::PeerRef;
@@ -123,6 +125,142 @@ pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> 
     handle.client.mark_as_read(peer).await.map_err(|e| explain(&e))
 }
 
+
+/// A reader that says how much of it has been read, so an upload can show a ring that fills.
+struct Counting<'a, R> {
+    inner: R,
+    done: u64,
+    said: u64,
+    base: u64,
+    total: u64,
+    report: &'a (dyn Fn(u64, u64) + Send + Sync),
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counting<'_, R> {
+    fn poll_read(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            self.done += (buf.filled().len() - before) as u64;
+            if self.done - self.said >= 128 * 1024 {
+                self.said = self.done;
+                (self.report)(self.base + self.done, self.total);
+            }
+        }
+        polled
+    }
+}
+
+/// What a file is, for choosing how Telegram is told about it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Sort {
+    Photo,
+    Video,
+    Other,
+}
+
+pub fn sort_of(name: &str) -> Sort {
+    match name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).as_deref() {
+        Some("jpg" | "jpeg" | "png" | "webp" | "bmp") => Sort::Photo,
+        Some("mp4" | "mov" | "webm" | "mkv" | "m4v") => Sort::Video,
+        _ => Sort::Other,
+    }
+}
+
+async fn upload(client: &grammers_client::Client, path: &str, base: u64, total: u64, report: &(dyn Fn(u64, u64) + Send + Sync)) -> Result<(Uploaded, String), String> {
+    let file = tokio::fs::File::open(path).await.map_err(|e| format!("could not read {path}: {e}"))?;
+    let size = file.metadata().await.map_err(|e| e.to_string())?.len();
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".to_string());
+    let mut reader = Counting { inner: file, done: 0, said: 0, base, total, report };
+    let up = client.upload_stream(&mut reader, size as usize, name.clone()).await.map_err(|e| format!("Telegram would not take {name}: {e}"))?;
+    Ok((up, name))
+}
+
+/// A picture or a video as media. Anything else is sent as a plain file (see `send_files`).
+fn media_for(up: Uploaded, sort: Sort, spoiler: bool) -> Option<tl::enums::InputMedia> {
+    match sort {
+        Sort::Photo => Some(tl::types::InputMediaUploadedPhoto { spoiler, file: up.raw, stickers: None, ttl_seconds: None, live_photo: false, video: None }.into()),
+        Sort::Video => Some(grammers_client::media::InputVideo::new(up).supports_streaming(true).spoiler(spoiler).into()),
+        Sort::Other => None,
+    }
+}
+
+/// Sends files, with the caption on the first: one message each, or an album where there are several pictures and
+/// videos. `progress` names the ring the window draws.
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&Progress>) -> Result<(), String> {
+    if files.is_empty() {
+        return send(state, buffer, caption, reply_to).await;
+    }
+    let (text, entities) = if caption.trim().is_empty() { (String::new(), Vec::new()) } else { checked(caption)? };
+    // Telegram's limit on a caption is much smaller than on a message.
+    if units(&text) > 1024 {
+        return Err(format!("A caption can be at most 1024 characters, and this has {}", units(&text)));
+    }
+    let (handle, peer) = peer_for(state, buffer).await?;
+    let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
+    let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+    if let Some(p) = progress {
+        p.at(Phase::Preparing, total as usize, "Telegram");
+    }
+    let report = |sent: u64, all: u64| {
+        if let Some(p) = progress {
+            p.sent(sent, all, "Telegram");
+        }
+    };
+    let mut uploaded: Vec<(Uploaded, Sort, bool)> = Vec::new();
+    let mut base = 0u64;
+    for (path, spoiler) in files {
+        let (up, name) = upload(&handle.client, path, base, total, &report).await?;
+        base += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        uploaded.push((up, sort_of(&name), *spoiler));
+    }
+    if let Some(p) = progress {
+        p.at(Phase::Waiting, total as usize, "Telegram");
+    }
+    let album = uploaded.len() >= 2 && uploaded.len() <= 10 && uploaded.iter().all(|(_, sort, _)| *sort != Sort::Other);
+    if album {
+        let medias: Vec<InputMedia> = uploaded
+            .into_iter()
+            .enumerate()
+            .map(|(i, (up, sort, spoiler))| {
+                let mut m = InputMedia::new().media(media_for(up, sort, spoiler).expect("an album is only pictures and videos"));
+                if i == 0 {
+                    m = m.caption(text.clone()).fmt_entities(entities.clone()).reply_to(reply);
+                }
+                m
+            })
+            .collect();
+        for sent in handle.client.send_album(peer, medias).await.map_err(|e| explain(&e))?.into_iter().flatten() {
+            messages::record(state, &buffer.account_id, &handle.own, &sent);
+        }
+        return Ok(());
+    }
+    for (i, (up, sort, spoiler)) in uploaded.into_iter().enumerate() {
+        let mut input = match media_for(up.clone(), sort, spoiler) {
+            Some(media) => InputMessage::new().media(media),
+            None => InputMessage::new().file(up),
+        }
+        .reply_to(reply);
+        if i == 0 {
+            input = input.text(text.clone()).fmt_entities(entities.clone());
+        }
+        let sent = handle.client.send_message(peer, input).await.map_err(|e| explain(&e))?;
+        messages::record(state, &buffer.account_id, &handle.own, &sent);
+    }
+    Ok(())
+}
+
+/// Sends a recording as a voice message (an Ogg file of Opus, which is what the recorder writes).
+pub async fn send_voice(state: &AppState, buffer: &Buffer, path: &std::path::Path, duration_secs: f64) -> Result<(), String> {
+    let (handle, peer) = peer_for(state, buffer).await?;
+    let none = |_: u64, _: u64| {};
+    let (up, _) = upload(&handle.client, &path.to_string_lossy(), 0, 0, &none).await?;
+    let voice = grammers_client::media::InputAudio::new(up).voice(true).duration(std::time::Duration::from_secs_f64(duration_secs.max(0.0))).mime_type("audio/ogg");
+    let sent = handle.client.send_message(peer, InputMessage::new().media(voice)).await.map_err(|e| explain(&e))?;
+    messages::record(state, &buffer.account_id, &handle.own, &sent);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +277,16 @@ mod tests {
         assert_eq!(explain(&rpc(403, "CHAT_WRITE_FORBIDDEN", None)), peers::NO_SEND_PERMISSION);
         assert!(explain(&rpc(400, "MESSAGE_TOO_LONG", None)).contains("4096"));
         assert_eq!(explain(&rpc(400, "SOMETHING_NEW_HAPPENED", None)), "Telegram refused: something new happened");
+    }
+
+    #[test]
+    fn a_file_is_sent_as_a_picture_a_video_or_a_file_by_its_extension() {
+        assert_eq!(sort_of("Holiday.JPG"), Sort::Photo);
+        assert_eq!(sort_of("clip.mp4"), Sort::Video);
+        assert_eq!(sort_of("report.pdf"), Sort::Other);
+        assert_eq!(sort_of("noextension"), Sort::Other);
+        // A GIF is sent as a file so Telegram keeps it moving.
+        assert_eq!(sort_of("cat.gif"), Sort::Other);
     }
 
     #[test]

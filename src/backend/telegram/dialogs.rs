@@ -4,6 +4,7 @@
 //! request gives the list its names, kinds and recent activity without opening any of them. History proper is read
 //! when a conversation is opened (see `history`).
 
+use super::media;
 use super::messages;
 use super::Handle;
 use super::peers;
@@ -30,6 +31,9 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result
         // Nothing unread there, as Telegram counts it: the window need not call it unread either.
         if matches!(&dialog.raw, tl::enums::Dialog::Dialog(d) if d.unread_count == 0) {
             state.events.emit("bufferRead", serde_json::json!({ "accountId": account_id, "bufferId": buffer.id }));
+        }
+        if let Some(avatar) = media::avatar_url(handle.own.user_id, dialog.peer()) {
+            state.runtime.set_buffer_avatar(state, &buffer.id, &avatar);
         }
         // Whether the account may write there, read off the dialog's own copy of the chat (which carries its rights):
         // where it may not, the window shows why in place of the message box.

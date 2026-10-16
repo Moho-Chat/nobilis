@@ -14,6 +14,7 @@
 //! - `markup` - what the message box holds, as plain text and entities
 //! - `updates` - what Telegram sends that is not a message: typing, reads on other apps
 //! - `send` - saying things: send, answer, edit, delete, typing, read
+//! - `media` - pictures, video, files and voice: what a message carries, fetched when it is looked at
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -36,6 +37,7 @@ pub mod history;
 pub mod link;
 pub mod login;
 pub mod markup;
+pub mod media;
 pub mod messages;
 pub mod peers;
 pub mod send;
