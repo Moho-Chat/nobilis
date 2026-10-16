@@ -1705,6 +1705,7 @@ impl Runtime {
             favourite: false,
             low_priority: false,
             service_room: false,
+            name_icon: None,
             topic: None,
             read_only: None,
             forum: false,
@@ -1771,6 +1772,23 @@ impl Runtime {
     /// One way only. A homeserver does not un-designate its notices room, and
     /// a client that cleared the mark because one sync happened not to carry
     /// the tag would offer a Leave that the server refuses.
+    /// Draws a glyph in front of a conversation's name in the list (see `Buffer::name_icon`), said once it changes.
+    pub fn set_buffer_name_icon(&self, state: &AppState, buffer_id: &str, icon: Option<&str>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.name_icon.as_deref() != icon => {
+                    b.name_icon = icon.map(String::from);
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn set_buffer_service_room(&self, state: &AppState, buffer_id: &str) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();

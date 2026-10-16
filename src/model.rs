@@ -379,6 +379,10 @@ pub struct Buffer {
     /// thing - so it is named for what it is rather than after the tag.
     #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
     pub service_room: bool,
+    /// A small glyph drawn in front of the name in the list, for what kind of conversation it is where the service
+    /// has kinds a person looks for: Telegram's broadcast channels ("campaign", a horn) and bots ("smart_toy").
+    #[serde(rename = "nameIcon", default, skip_serializing_if = "Option::is_none")]
+    pub name_icon: Option<String>,
     /// What the conversation says it is for: an IRC channel's topic, a Matrix
     /// room's, a Discord channel's. Absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1032,6 +1036,7 @@ mod tests {
             favourite: false,
             low_priority: false,
             service_room: false,
+            name_icon: None,
             topic: None,
             read_only: None,
             forum: false,

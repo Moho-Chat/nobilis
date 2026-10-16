@@ -48,6 +48,15 @@ pub fn category_of(peer: &Peer) -> &'static str {
     }
 }
 
+/// The glyph in front of a conversation's name: a horn for a broadcast channel, a robot for a bot.
+pub fn name_icon_of(peer: &Peer) -> Option<&'static str> {
+    match peer {
+        Peer::Channel(channel) if channel.raw.broadcast => Some("campaign"),
+        Peer::User(user) if user.is_bot() => Some("smart_toy"),
+        _ => None,
+    }
+}
+
 /// What the conversation is called: the person's name, the group's title, or "Saved Messages" for the account's own.
 pub fn title_of(peer: &Peer) -> String {
     match peer {
@@ -95,6 +104,7 @@ pub fn buffer_for(state: &AppState, account_id: &str, peer: &Peer) -> Buffer {
     let buffer = state.runtime.ensure_buffer(state, account_id, &name, kind_of(peer));
     state.runtime.set_buffer_remote_id(state, &buffer.id, &remote);
     state.runtime.set_buffer_category(state, &buffer.id, Some(category_of(peer)), 0);
+    state.runtime.set_buffer_name_icon(state, &buffer.id, name_icon_of(peer));
     state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
 }
 

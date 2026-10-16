@@ -24,6 +24,7 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result
         let buffer = peers::buffer_for(state, account_id, dialog.peer());
         // Filed again each time: a bot read before bots had a heading of their own was filed with the people.
         state.runtime.set_buffer_category(state, &buffer.id, Some(peers::category_of(dialog.peer())), buffer.position);
+        state.runtime.set_buffer_name_icon(state, &buffer.id, peers::name_icon_of(dialog.peer()));
         if let grammers_client::peer::Peer::User(user) = dialog.peer() {
             handle.names.lock().unwrap_or_else(|e| e.into_inner()).insert(user.id().bare_id_unchecked(), peers::title_of(dialog.peer()));
         }
