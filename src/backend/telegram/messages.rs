@@ -190,14 +190,10 @@ pub fn name_of(peer: &Peer) -> String {
     peers::title_of(peer)
 }
 
-/// Everything about a message that is words: the caption or text, what came with it, and where it was forwarded from.
+/// Everything about a message that is words: the caption or text and what came with it. Where it was forwarded from is
+/// said above it (see `forward_preview`), not in it.
 pub fn body_of(message: &Message) -> String {
     let mut parts: Vec<String> = Vec::new();
-    if let Some(header) = message.forward_header() {
-        let tl::enums::MessageFwdHeader::Header(h) = header;
-        let from = h.from_name.clone().or_else(|| h.post_author.clone()).unwrap_or_else(|| "somebody".to_string());
-        parts.push(format!("↪ Forwarded from {from}"));
-    }
     let text = message.text();
     if !text.is_empty() {
         parts.push(text.to_string());
@@ -246,13 +242,24 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     }
 
     let topic_only = matches!(&message.raw, tl::enums::Message::Message(m) if m.reply_to.as_ref().is_some_and(is_topic_root));
-    let reply = if topic_only { None } else { reply_preview(state, account_id, &buffer, message) };
-    let ask_for_reply = reply.as_ref().filter(|r| r.body.is_empty()).map(|r| (r.id.clone(), r.chat.clone()));
-    let body = body_of(message);
+    let answered = if topic_only { None } else { reply_preview(state, account_id, &buffer, message) };
+    let forward = message.forward_header().map(|h| forward_preview(state, account_id, &h));
+    // One slot above a message: an answer wins, and says it was forwarded in its text.
+    let (reply, forward_line) = match (answered, forward) {
+        (Some(answer), Some(forwarded)) => (Some(answer), Some(format!("↪ Forwarded from {}", forwarded.from))),
+        (Some(answer), None) => (Some(answer), None),
+        (None, forwarded) => (forwarded, None),
+    };
+    let ask_for_reply = reply.as_ref().filter(|r| r.body.is_empty() && !r.forwarded).map(|r| (r.id.clone(), r.chat.clone()));
+    let has_forward_line = forward_line.is_some();
+    let body = match forward_line {
+        Some(line) => format!("{line}\n{}", body_of(message)),
+        None => body_of(message),
+    };
     let html = message.fmt_entities().and_then(|e| entities_html(message.text(), e)).filter(|h| !h.is_empty());
     // The first line of a forward is words of our own, so the html (made from the text alone) would lose it: a
     // forwarded message is shown as plain text.
-    let html = if message.forward_header().is_some() { None } else { html };
+    let html = if has_forward_line { None } else { html };
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
     let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
     if let Some(remote) = buffer.remote_id.as_deref() {
@@ -309,6 +316,21 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
         }
     }
     recorded
+}
+
+/// Where a forwarded message came from, as the line above it: the name of the source and, when it was a post in a
+/// channel this account has open, where to find it.
+fn forward_preview(state: &AppState, account_id: &str, header: &tl::enums::MessageFwdHeader) -> ReplyPreview {
+    let tl::enums::MessageFwdHeader::Header(h) = header;
+    let source = h.from_id.clone().map(|p| peers::remote_id(grammers_session::types::PeerId::from(p)));
+    let origin = source.as_ref().and_then(|remote| state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote.as_str())));
+    let from = origin.as_ref().map(|b| b.name.clone()).or_else(|| h.from_name.clone()).or_else(|| h.post_author.clone()).unwrap_or_else(|| "somebody".to_string());
+    // Only a post in a channel can be gone to: a person's forward has no message of theirs to point at.
+    let (chat, id) = match (&origin, h.channel_post) {
+        (Some(b), Some(post)) if b.kind == "channel" => (Some(b.id.clone()), post.to_string()),
+        _ => (None, String::new()),
+    };
+    ReplyPreview { id, from, body: String::new(), thread: false, forwarded: true, thread_root: None, chat }
 }
 
 /// What a message answers, as the quote above it: the words quoted (or the message answered), who said them, and - when
