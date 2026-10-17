@@ -1422,7 +1422,8 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }
             } else {
-                match backend::discord::accept_member_verification(state, account_id, guild_id).await {
+                let answers: Vec<Value> = params.get("responses").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                match backend::discord::accept_member_verification(state, account_id, guild_id, &answers).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }

@@ -107,6 +107,27 @@ pub async fn member_verification(state: &AppState, account_id: &str, guild_id: &
     serde_json::from_str(&text).context("parsing this server's rules")
 }
 
+/// The form's fields with the answers filled in: the rules are agreed to, and every other field takes what the person
+/// gave for it (their text, or the number of the choice), by its place in the form. A field nobody answered is sent
+/// without a response, which Discord accepts only where the server did not require one.
+pub fn responses_for(form: &Value, answers: &[Value]) -> Vec<Value> {
+    form["form_fields"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(i, f)| {
+            let mut field = f.clone();
+            if f["field_type"] == "TERMS" {
+                field["response"] = Value::Bool(true);
+            } else if let Some(answer) = answers.get(i).filter(|a| !a.is_null()) {
+                field["response"] = answer.clone();
+            }
+            field
+        })
+        .collect()
+}
+
 /// Agrees to them, which is what lifts the gate.
 ///
 /// The form is fetched again rather than taken from the caller: what is
@@ -114,20 +135,11 @@ pub async fn member_verification(state: &AppState, account_id: &str, guild_id: &
 /// captured when the dialog opened may not still be it. Every field is
 /// returned as sent with its response set - Discord rejects a form that has
 /// been reshaped, and it is the server's form, not ours to edit.
-pub async fn accept_member_verification(state: &AppState, account_id: &str, guild_id: &str) -> Result<()> {
+pub async fn accept_member_verification(state: &AppState, account_id: &str, guild_id: &str, answers: &[Value]) -> Result<()> {
     let cfg = state.accounts.get_discord(account_id).context("account not connected")?;
     let form = member_verification(state, account_id, guild_id).await?;
     let version = form["version"].clone();
-    let fields: Vec<Value> = form["form_fields"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|f| {
-            let mut field = f.clone();
-            field["response"] = Value::Bool(true);
-            field
-        })
-        .collect();
+    let fields = responses_for(&form, answers);
 
     let resp = send_write(
         http_client_for(&cfg.token)
@@ -1215,5 +1227,31 @@ mod system_dm_tests {
     fn an_ordinary_person_or_a_group_is_not() {
         assert!(!is_system_dm(&json!({ "recipients": [{ "id": "2", "username": "alice" }] })));
         assert!(!is_system_dm(&json!({ "recipients": [{ "id": "1", "system": true }, { "id": "2" }] })));
+    }
+}
+
+#[cfg(test)]
+mod verification_tests {
+    use super::*;
+
+    #[test]
+    fn the_rules_are_agreed_to_and_other_fields_take_the_persons_answers() {
+        let form = json!({
+            "version": "2026-01-01",
+            "form_fields": [
+                { "field_type": "TERMS", "label": "Read and agree to the server rules", "values": ["Be kind"], "required": true },
+                { "field_type": "TEXT_INPUT", "label": "Why are you joining?", "required": true },
+                { "field_type": "MULTIPLE_CHOICE", "label": "Pick one", "values": ["a", "b"], "required": false },
+            ]
+        });
+        let sent = responses_for(&form, &[Value::Null, json!("to talk"), json!(1)]);
+        assert_eq!(sent[0]["response"], true);
+        assert_eq!(sent[1]["response"], "to talk");
+        assert_eq!(sent[2]["response"], 1);
+        assert_eq!(sent[0]["values"], json!(["Be kind"]), "the server's own form is not reshaped");
+        // Nothing answered: no response key at all, not a made-up one.
+        let bare = responses_for(&form, &[]);
+        assert!(bare[1].get("response").is_none() && bare[2].get("response").is_none());
+        assert_eq!(bare[0]["response"], true);
     }
 }
