@@ -199,7 +199,10 @@ pub fn body_of(message: &Message) -> String {
         parts.push(text.to_string());
     }
     if let tl::enums::Message::Message(m) = &message.raw {
-        if let Some(label) = m.media.as_ref().and_then(media_label) {
+        // A picture, a video, a file, a voice message or a sticker is drawn from its attachment: saying it again in
+        // words (with the file's name) is noise. Everything else with no picture of its own keeps its label.
+        let drawn = matches!(m.media, Some(tl::enums::MessageMedia::Photo(_)) | Some(tl::enums::MessageMedia::Document(_)));
+        if let Some(label) = m.media.as_ref().filter(|_| !drawn).and_then(media_label) {
             parts.push(label);
         }
     }
@@ -261,7 +264,8 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
     // forwarded message is shown as plain text.
     let html = if has_forward_line { None } else { html };
     let attachments = buffer.remote_id.as_deref().map(|remote| media::attachments_of(own.user_id, remote, message)).unwrap_or_default();
-    let avatar = if outgoing { None } else { sender.and_then(|p| media::avatar_url(own.user_id, p)) };
+    // A post in a channel has no sender but the channel, whose picture it is.
+    let avatar = if outgoing { None } else { sender.or(Some(peer)).and_then(|p| media::avatar_url(own.user_id, p)) };
     if let Some(remote) = buffer.remote_id.as_deref() {
         media::prefetch_preview(state, account_id, own.user_id, remote, message);
     }
@@ -278,6 +282,15 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
         if let Ok(Some(stored)) = state.store.get_message(&buffer.id, &id) {
             if stored.embeds != cards_again && state.store.set_message_embeds(&buffer.id, &id, &cards_again).unwrap_or(false) {
                 state.events.emit("messageUpdated", serde_json::json!({ "bufferId": buffer.id, "id": id, "body": stored.body, "edited": false, "embeds": cards_again, "attachments": stored.attachments }));
+            }
+        }
+    }
+    // Read again, a message kept with a label for its picture in its text (earlier builds wrote "[Photo]") loses it.
+    if !recorded {
+        if let Ok(Some(stored)) = state.store.get_message(&buffer.id, &id) {
+            let clean = body.trim_end();
+            if stored.body != body && stored.body.starts_with(clean) && stored.body[clean.len()..].trim_start().starts_with('[') && !again.is_empty() {
+                state.runtime.update_message_body_only(state, &buffer.id, &id, &body);
             }
         }
     }
@@ -362,8 +375,20 @@ fn reply_preview(state: &AppState, account_id: &str, buffer: &crate::model::Buff
     });
     let shown_media = header.as_ref().and_then(|h| h.reply_media.as_ref()).and_then(media_label);
     let from = other.as_ref().map(|b| b.name.clone()).or(named).or_else(|| stored.as_ref().map(|m| m.from.clone())).unwrap_or_default();
-    let body = quote.or_else(|| stored.map(|m| m.body)).or(shown_media).unwrap_or_default();
+    let body = quote.or_else(|| stored.map(|m| if m.body.trim().is_empty() { attachment_words(&m.attachments) } else { m.body })).filter(|b| !b.is_empty()).or(shown_media).unwrap_or_default();
     Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None, chat: other.map(|b| b.id) })
+}
+
+/// What a message with only a picture or a file says in a quote, from what it carries.
+fn attachment_words(attachments: &[crate::model::Attachment]) -> String {
+    let Some(first) = attachments.first() else { return String::new() };
+    match (first.kind.as_str(), first.voice) {
+        (_, true) => "Voice message".to_string(),
+        ("image", _) => "Photo".to_string(),
+        ("video", _) => "Video".to_string(),
+        ("audio", _) => "Audio".to_string(),
+        _ => first.filename.clone().unwrap_or_else(|| "File".to_string()),
+    }
 }
 
 /// Asks Telegram what a reply answered and fills the quote in.
