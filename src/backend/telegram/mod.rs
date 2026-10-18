@@ -27,6 +27,7 @@
 //! - `notify` - muting a chat on the account
 //! - `instant` - an Instant View article as a page of its own
 //! - `keyboards` - a bot's inline buttons
+//! - `bots` - a bot's command menu
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -44,6 +45,7 @@
 //! saved and reused; nothing here signs in afresh to get over a hiccup.
 
 pub mod admin;
+pub mod bots;
 pub mod connect;
 pub mod dialogs;
 pub mod history;

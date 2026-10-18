@@ -2275,6 +2275,24 @@ pub async fn dispatch(
                     Err(e) => tracing::debug!("discord: listing commands: {e:#}"),
                 }
             }
+            // A Telegram bot's own menu, in a conversation with that bot: what its profile lists, as Telegram's apps
+            // offer it beside the message box and while a slash is typed.
+            if service == "telegram" {
+                match backend::telegram::bots::commands(state, &buffer).await {
+                    Ok(list) => {
+                        for c in list.into_iter().filter(|c| query.is_empty() || crate::commands::score(query, &c.name).is_some()) {
+                            out.push(serde_json::json!({
+                                "name": c.name,
+                                "usage": "",
+                                "description": c.description,
+                                "source": buffer.name,
+                                "kind": "bot",
+                            }));
+                        }
+                    }
+                    Err(e) => tracing::debug!("telegram: listing a bot's commands: {e}"),
+                }
+            }
             (Some(serde_json::json!({ "commands": out })), None)
         }
 
