@@ -964,9 +964,17 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &[]) {
-            tracing::warn!("discord: storing history message: {e}");
-            continue;
+        let badges = author_badges(author);
+        match state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &badges) {
+            Err(e) => {
+                tracing::warn!("discord: storing history message: {e}");
+                continue;
+            }
+            // Read again, a message kept before bots were marked gets its mark.
+            Ok(false) if !badges.is_empty() => {
+                let _ = state.store.set_badges(buffer_id, msg_id, &badges);
+            }
+            Ok(_) => {}
         }
         note_components(state, buffer_id, msg_id, msg);
         // A poll in the history may still be running - Discord's last hours
@@ -1017,6 +1025,22 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
             Some(Reaction { emoji, count, me, animated })
         })
         .collect()
+}
+
+/// What Discord marks an author as, beside their name: "APP" for a bot or an application, with a check when Discord has
+/// verified it. Read off the author the message carries, so it is there for history and for live messages alike.
+pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
+    // Bit 16 of the public flags: a verified bot.
+    const VERIFIED_BOT: u64 = 1 << 16;
+    if author["bot"].as_bool() != Some(true) {
+        return Vec::new();
+    }
+    let verified = author["public_flags"].as_u64().unwrap_or(0) & VERIFIED_BOT != 0;
+    vec![crate::backend::kick::api::Badge {
+        kind: if verified { "verified-app" } else { "app" }.to_string(),
+        text: if verified { "Verified App" } else { "App" }.to_string(),
+        ..Default::default()
+    }]
 }
 
 /// The buttons and menus on a message, in this client's own shape.
@@ -1917,5 +1941,25 @@ mod layout_tests {
         let msg = json!({ "content": "hi", "components": [{ "type": 1, "components": [{ "type": 2, "label": "x", "custom_id": "x", "style": 1 }] }] });
         assert!(extract_embeds(&msg).is_empty());
         assert_eq!(extract_components(&msg).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod app_badge_tests {
+    use super::author_badges;
+    use serde_json::json;
+
+    #[test]
+    fn a_bot_is_an_app_and_a_verified_one_says_so() {
+        let plain = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 0 }));
+        assert_eq!((plain[0].kind.as_str(), plain[0].text.as_str()), ("app", "App"));
+        let verified = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 65536 }));
+        assert_eq!((verified[0].kind.as_str(), verified[0].text.as_str()), ("verified-app", "Verified App"));
+    }
+
+    #[test]
+    fn a_person_has_no_badge() {
+        assert!(author_badges(&json!({ "id": "2", "username": "someone" })).is_empty());
+        assert!(author_badges(&json!({ "id": "2", "bot": false })).is_empty());
     }
 }

@@ -522,6 +522,17 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Puts a sender's badges on a message already stored without them, without marking it changed.
+    pub fn set_badges(&self, buffer_id: &str, msg_id: &str, badges: &[crate::backend::kick::api::Badge]) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let json = serde_json::to_string(badges)?;
+        let changed = conn.execute(
+            "UPDATE messages SET badges = ?1 WHERE buffer_id = ?2 AND msg_id = ?3 AND (badges IS NULL OR badges = '[]')",
+            params![json, buffer_id, msg_id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Fills in who and what a reply answered, once that has been looked up.
     pub fn set_reply_text(&self, buffer_id: &str, msg_id: &str, from: &str, body: &str) -> Result<bool> {
         let conn = self.conn.lock().unwrap();
