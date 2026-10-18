@@ -1032,6 +1032,10 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
 pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
     // Bit 16 of the public flags: a verified bot.
     const VERIFIED_BOT: u64 = 1 << 16;
+    // Discord's own account: what it sends is the platform speaking, and says so with the OFFICIAL mark.
+    if author["system"].as_bool() == Some(true) {
+        return vec![crate::backend::kick::api::Badge { kind: "official".to_string(), text: "Official Discord Message".to_string(), ..Default::default() }];
+    }
     if author["bot"].as_bool() != Some(true) {
         return Vec::new();
     }
@@ -1955,6 +1959,12 @@ mod app_badge_tests {
         assert_eq!((plain[0].kind.as_str(), plain[0].text.as_str()), ("app", "App"));
         let verified = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 65536 }));
         assert_eq!((verified[0].kind.as_str(), verified[0].text.as_str()), ("verified-app", "Verified App"));
+    }
+
+    #[test]
+    fn discords_own_account_is_official_even_though_it_is_not_an_app() {
+        let official = author_badges(&json!({ "id": "643945264868098049", "system": true, "bot": true }));
+        assert_eq!((official[0].kind.as_str(), official[0].text.as_str()), ("official", "Official Discord Message"));
     }
 
     #[test]
