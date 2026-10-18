@@ -96,7 +96,7 @@ pub fn after_change(stored: &[Reaction], emoji: &str, add: bool) -> Vec<Reaction
 
 /// A reactions update from Telegram.
 pub fn update(state: &AppState, account_id: &str, remote: &str, msg_id: i32, reactions: &tl::enums::MessageReactions) {
-    let Some(buffer) = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && b.remote_id.as_deref() == Some(remote)) else { return };
+    let Some(buffer) = super::topics::holding(state, account_id, remote, msg_id) else { return };
     apply(state, &buffer.id, &msg_id.to_string(), &from_tl(reactions));
 }
 

@@ -214,12 +214,12 @@ async fn handle_update(state: &AppState, account_id: &str, handle: &Handle, upda
                 None => resolve(handle, &message).await,
             };
             if let Some(peer) = peer {
-                let buffer = peers::buffer_for(state, account_id, &peer);
+                let inner: &grammers_client::message::Message = &message;
+                let buffer = super::topics::buffer_of_message(state, account_id, &peer, &inner.raw);
                 let body = messages::body_of(&message);
                 let attachments = buffer.remote_id.as_deref().map(|remote| super::media::attachments_of(handle.own.user_id, remote, &message)).unwrap_or_default();
                 state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &attachments);
                 // A bot changes or removes its buttons by editing the message they are under.
-                let inner: &grammers_client::message::Message = &message;
                 super::keyboards::note(state, &buffer.id, &message.id().to_string(), &inner.raw, true);
             }
         }
@@ -257,7 +257,11 @@ fn forget_message(state: &AppState, account_id: &str, channel: Option<i64>, id: 
         .into_iter()
         .filter(|b| b.account_id == account_id)
         .filter(|b| match (channel, b.remote_id.as_deref()) {
-            (Some(c), Some(remote)) => remote == peers::remote_id(grammers_session::types::PeerId::channel_unchecked(c)),
+            // A group with topics keeps each topic's conversation under the group's name and a colon.
+            (Some(c), Some(remote)) => {
+                let channel = peers::remote_id(grammers_session::types::PeerId::channel_unchecked(c));
+                remote == channel || remote.strip_prefix(channel.as_str()).is_some_and(|rest| rest.starts_with(':'))
+            }
             (Some(_), None) => false,
             (None, Some(remote)) => !remote.starts_with("-100"),
             (None, None) => false,

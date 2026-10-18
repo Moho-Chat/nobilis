@@ -28,7 +28,8 @@ pub fn remote_id(peer: PeerId) -> String {
 
 /// The peer a buffer's `remote_id` names.
 pub fn peer_id_of(remote_id: &str) -> Option<PeerId> {
-    PeerId::from_bot_api_dialog_id(remote_id.parse().ok()?)
+    // A topic's conversation names its group first and the topic after a colon.
+    PeerId::from_bot_api_dialog_id(remote_id.split(':').next()?.parse().ok()?)
 }
 
 pub fn kind_of(peer: &Peer) -> &'static str {
@@ -58,11 +59,11 @@ pub fn rail_id(account_id: &str, remote: &str) -> String {
     format!("{account_id}|tggroup:{remote}")
 }
 
-/// Gives a group its place on the rail, with its own name and picture, and files its conversation under it. Nothing
-/// for anything that is not a group: people, bots and channels stay in the account's own list.
-pub fn file_in_rail(state: &AppState, account_id: &str, buffer: &Buffer, peer: &Peer, position: i64) {
+/// Gives a group its place on the rail, with its own name and picture. Answers its rail id; nothing for anything that
+/// is not a group.
+pub fn rail_for(state: &AppState, account_id: &str, peer: &Peer, position: i64) -> Option<String> {
     if !is_group(peer) {
-        return;
+        return None;
     }
     let remote = remote_id(peer.id());
     let rail = rail_id(account_id, &remote);
@@ -80,6 +81,13 @@ pub fn file_in_rail(state: &AppState, account_id: &str, buffer: &Buffer, peer: &
             pending: false,
         },
     );
+    Some(rail)
+}
+
+/// Gives a group its place on the rail and files its conversation under it. Nothing for anything that is not a group:
+/// people, bots and channels stay in the account's own list.
+pub fn file_in_rail(state: &AppState, account_id: &str, buffer: &Buffer, peer: &Peer, position: i64) {
+    let Some(rail) = rail_for(state, account_id, peer, position) else { return };
     state.runtime.set_buffer_group(state, &buffer.id, &rail);
     state.runtime.set_buffer_category(state, &buffer.id, None, 0);
 }

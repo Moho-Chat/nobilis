@@ -3350,12 +3350,14 @@ pub async fn dispatch(
                                 let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
                             }
                             let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
+                        } else if buffer.account_id.starts_with("telegram:") && backend::telegram::topics::topic_of_buffer(&buffer).is_some() {
+                            // Closing one topic of a group only stops showing it: the group is left from its rail entry.
                         } else if buffer.account_id.starts_with("telegram:") {
                             if let Err(e) = backend::telegram::membership::leave(state, &buffer).await {
                                 return (None, Some(e));
                             }
                             // A group's own entry on the rail goes with it.
-                            if let Some(remote) = buffer.remote_id.as_deref() {
+                            if let Some(remote) = buffer.remote_id.as_deref().and_then(|r| r.split(':').next()) {
                                 let rail = backend::telegram::peers::rail_id(&buffer.account_id, remote);
                                 if buffer.group_id.as_deref() == Some(rail.as_str()) {
                                     state.runtime.remove_buffer_group(state, &rail);
@@ -3447,14 +3449,11 @@ pub async fn dispatch(
             } else if rest.starts_with("tggroup:") {
                 // A Telegram group is its rail entry and the one conversation under it: leaving is leaving that.
                 let under: Vec<crate::model::Buffer> = state.runtime.list_buffers().into_iter().filter(|b| b.group_id.as_deref() == Some(group_id)).collect();
-                let mut left = Ok(());
-                for buffer in &under {
-                    if let Err(e) = backend::telegram::membership::leave(state, buffer).await {
-                        left = Err(anyhow::anyhow!(e));
-                        break;
-                    }
+                // One leave covers the group, however many topics it has.
+                match under.first() {
+                    Some(buffer) => backend::telegram::membership::leave(state, buffer).await.map_err(anyhow::Error::msg),
+                    None => Ok(()),
                 }
-                left
             } else {
                 return (None, Some("that is not something you can leave".to_string()));
             };

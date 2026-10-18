@@ -81,12 +81,79 @@ pub fn input_for(body: &str) -> Result<InputMessage, String> {
 
 /// Sends a message, as an answer to another if `reply_to` names one.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
+    if let Some(topic) = super::topics::topic_of_buffer(buffer) {
+        return send_in_topic(state, buffer, body, reply_to, topic).await;
+    }
     let input = input_for(body)?;
     let (handle, peer) = peer_for(state, buffer).await?;
     let input = input.reply_to(reply_to.and_then(|id| id.parse::<i32>().ok()));
     let sent = handle.client.send_message(peer, input).await.map_err(|e| explain(&e))?;
     messages::record(state, &buffer.account_id, &handle.own, &sent);
     Ok(())
+}
+
+/// Sends a message into a forum topic. An answer to a message in a topic has to name the topic as well, which the
+/// library's own send cannot say, so the request is made directly and the message it made is read back by its id.
+async fn send_in_topic(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>, topic: i32) -> Result<(), String> {
+    let (text, entities) = checked(body)?;
+    let (handle, peer) = peer_for(state, buffer).await?;
+    let reply = reply_to.and_then(|id| id.parse::<i32>().ok()).unwrap_or(topic);
+    let random_id: i64 = rand::random();
+    let updates = handle
+        .client
+        .invoke(&tl::functions::messages::SendMessage {
+            no_webpage: false,
+            silent: false,
+            background: false,
+            clear_draft: false,
+            noforwards: false,
+            update_stickersets_order: false,
+            invert_media: false,
+            allow_paid_floodskip: false,
+            peer: peer.into(),
+            reply_to: Some(
+                tl::types::InputReplyToMessage { reply_to_msg_id: reply, top_msg_id: Some(topic), reply_to_peer_id: None, quote_text: None, quote_entities: None, quote_offset: None, monoforum_peer_id: None, todo_item_id: None, poll_option: None }
+                    .into(),
+            ),
+            message: text,
+            random_id,
+            reply_markup: None,
+            entities: Some(entities).filter(|e| !e.is_empty()),
+            schedule_date: None,
+            schedule_repeat_period: None,
+            send_as: None,
+            quick_reply_shortcut: None,
+            effect: None,
+            allow_paid_stars: None,
+            suggested_post: None,
+            rich_message: None,
+        })
+        .await
+        .map_err(|e| explain(&e))?;
+    if let Some(id) = sent_id(&updates, random_id) {
+        if let Ok(found) = handle.client.get_messages_by_id(peer, &[id]).await {
+            if let Some(Some(sent)) = found.into_iter().next() {
+                messages::record(state, &buffer.account_id, &handle.own, &sent);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The id Telegram gave a message that was sent with `random_id`, from what it answered.
+fn sent_id(updates: &tl::enums::Updates, random_id: i64) -> Option<i32> {
+    use tl::enums::Updates as U;
+    let list: &[tl::enums::Update] = match updates {
+        U::Updates(u) => &u.updates,
+        U::Combined(u) => &u.updates,
+        U::UpdateShort(u) => std::slice::from_ref(&u.update),
+        U::UpdateShortSentMessage(u) => return Some(u.id),
+        _ => return None,
+    };
+    list.iter().find_map(|u| match u {
+        tl::enums::Update::MessageId(m) if m.random_id == random_id => Some(m.id),
+        _ => None,
+    })
 }
 
 /// Changes what one of the account's own messages says.
@@ -122,6 +189,14 @@ pub async fn typing(state: &AppState, buffer: &Buffer) -> Result<(), String> {
 /// Says everything in the conversation has been read, so its unread count goes down on the account's other apps.
 pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     let (handle, peer) = peer_for(state, buffer).await?;
+    // A topic is read on its own: to the newest message of it that is here.
+    if let Some(topic) = super::topics::topic_of_buffer(buffer) {
+        let newest = state.store.newest_message_id(&buffer.id).ok().flatten().and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
+        if newest > 0 {
+            handle.client.invoke(&tl::functions::messages::ReadDiscussion { peer: peer.into(), msg_id: topic, read_max_id: newest }).await.map_err(|e| explain(&e))?;
+        }
+        return Ok(());
+    }
     handle.client.mark_as_read(peer).await.map_err(|e| explain(&e))
 }
 
@@ -197,7 +272,8 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
         return Err(format!("A caption can be at most 1024 characters, and this has {}", units(&text)));
     }
     let (handle, peer) = peer_for(state, buffer).await?;
-    let reply = reply_to.and_then(|id| id.parse::<i32>().ok());
+    // In a topic, a message with nothing to answer answers the topic's first message, which is how it is sent there.
+    let reply = reply_to.and_then(|id| id.parse::<i32>().ok()).or_else(|| super::topics::topic_of_buffer(buffer));
     let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
     if let Some(p) = progress {
         p.at(Phase::Preparing, total as usize, "Telegram");

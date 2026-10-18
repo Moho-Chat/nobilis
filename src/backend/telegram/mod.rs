@@ -28,6 +28,7 @@
 //! - `instant` - an Instant View article as a page of its own
 //! - `keyboards` - a bot's inline buttons
 //! - `bots` - a bot's command menu
+//! - `topics` - a group with Topics as several conversations
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -67,6 +68,7 @@ pub mod reactions;
 pub mod search;
 pub mod send;
 pub mod threads;
+pub mod topics;
 pub mod updates;
 pub mod session;
 

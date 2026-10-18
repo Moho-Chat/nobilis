@@ -21,6 +21,18 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result
     let mut count = 0;
     while count < LIMIT {
         let Some(dialog) = dialogs.next().await.map_err(|e| anyhow::anyhow!("{e}"))? else { break };
+        // A group with Topics is a conversation for each topic, found by asking the group.
+        if super::topics::is_forum(dialog.peer()) {
+            peers::rail_for(state, account_id, dialog.peer(), count as i64);
+            if let Err(e) = super::topics::sync(state, account_id, handle, dialog.peer()).await {
+                tracing::warn!("telegram[{account_id}]: reading a group's topics: {e:#}");
+            }
+            if let Some(last) = &dialog.last_message {
+                messages::record_named(state, account_id, &handle.own, last, Some(&handle.names));
+            }
+            count += 1;
+            continue;
+        }
         let buffer = peers::buffer_for(state, account_id, dialog.peer());
         // Filed again each time: a bot read before bots had a heading of their own was filed with the people.
         // A group is its own entry on the rail and has no heading in the account's list.

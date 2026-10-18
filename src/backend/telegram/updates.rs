@@ -68,7 +68,10 @@ pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enu
         }
         U::ChannelUserTyping(u) if is_typing(&u.action) => {
             let user = PeerId::from(u.from_id.clone()).bare_id();
-            if let (Some(buffer), Some(name)) = (buffer_of(state, account_id, &peers::remote_id(PeerId::channel_unchecked(u.channel_id))), user.and_then(|id| who(handle, id))) {
+            // In a group with topics somebody types in one of them.
+            let group = peers::remote_id(PeerId::channel_unchecked(u.channel_id));
+            let found = buffer_of(state, account_id, &group).or_else(|| buffer_of(state, account_id, &super::topics::remote_of(&group, u.top_msg_id.unwrap_or(super::topics::GENERAL))));
+            if let (Some(buffer), Some(name)) = (found, user.and_then(|id| who(handle, id))) {
                 say_typing(state, account_id, &buffer, name);
             }
         }

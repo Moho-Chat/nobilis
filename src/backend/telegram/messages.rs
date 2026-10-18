@@ -221,7 +221,7 @@ pub fn record_named(state: &AppState, account_id: &str, own: &Own, message: &Mes
 /// a short update that names no one, so the library cannot say who it is from or where it is: the caller asks
 /// Telegram, and the other person in a private chat is the sender of everything not sent by the account.
 pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Message, peer: &Peer, sender: Option<&Peer>, names: Option<&std::sync::Mutex<std::collections::HashMap<i64, String>>>) -> bool {
-    let buffer = peers::buffer_for(state, account_id, peer);
+    let buffer = super::topics::buffer_of_message(state, account_id, peer, &message.raw);
     let outgoing = message.outgoing();
     let sender = sender.or_else(|| (!outgoing && matches!(peer, Peer::User(_))).then_some(peer));
     if let (Some(names), Some(Peer::User(user))) = (names, sender) {
