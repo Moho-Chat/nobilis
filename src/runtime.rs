@@ -1670,7 +1670,9 @@ impl Runtime {
         if let Some(existing) = buffers.get_mut(&id) {
             // A Twitch account's list is always headed the same two ways (see `fixed_category`), including
             // for what was open before it was.
-            if existing.category.is_none() {
+            // Only in the account's own list: a conversation filed under a rail entry of its own (a Telegram group)
+            // is the whole of that entry and has no heading to sit under.
+            if existing.category.is_none() && existing.group_id.as_deref().is_none_or(|g| g == model::account_group_id(account_id)) {
                 existing.category = fixed_category(account_id, kind);
             }
             return existing.clone();

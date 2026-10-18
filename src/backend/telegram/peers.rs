@@ -48,6 +48,42 @@ pub fn category_of(peer: &Peer) -> &'static str {
     }
 }
 
+/// Whether a conversation is a group (small, or a supergroup): each has an entry of its own on the rail, as a server does.
+pub fn is_group(peer: &Peer) -> bool {
+    matches!(peer, Peer::Group(_))
+}
+
+/// The rail entry of a group.
+pub fn rail_id(account_id: &str, remote: &str) -> String {
+    format!("{account_id}|tggroup:{remote}")
+}
+
+/// Gives a group its place on the rail, with its own name and picture, and files its conversation under it. Nothing
+/// for anything that is not a group: people, bots and channels stay in the account's own list.
+pub fn file_in_rail(state: &AppState, account_id: &str, buffer: &Buffer, peer: &Peer, position: i64) {
+    if !is_group(peer) {
+        return;
+    }
+    let remote = remote_id(peer.id());
+    let rail = rail_id(account_id, &remote);
+    let account: i64 = account_id.strip_prefix("telegram:").and_then(|a| a.parse().ok()).unwrap_or(0);
+    state.runtime.upsert_buffer_group(
+        state,
+        crate::model::BufferGroup {
+            id: rail.clone(),
+            account_id: account_id.to_string(),
+            service: "telegram".to_string(),
+            kind: "guild".to_string(),
+            name: title_of(peer),
+            icon_url: super::media::avatar_url(account, peer),
+            position,
+            pending: false,
+        },
+    );
+    state.runtime.set_buffer_group(state, &buffer.id, &rail);
+    state.runtime.set_buffer_category(state, &buffer.id, None, 0);
+}
+
 /// The glyph in front of a conversation's name: a horn for a broadcast channel, a robot for a bot.
 pub fn name_icon_of(peer: &Peer) -> Option<&'static str> {
     match peer {
@@ -105,6 +141,7 @@ pub fn buffer_for(state: &AppState, account_id: &str, peer: &Peer) -> Buffer {
     state.runtime.set_buffer_remote_id(state, &buffer.id, &remote);
     state.runtime.set_buffer_category(state, &buffer.id, Some(category_of(peer)), 0);
     state.runtime.set_buffer_name_icon(state, &buffer.id, name_icon_of(peer));
+    file_in_rail(state, account_id, &buffer, peer, 1000);
     state.runtime.get_buffer(&buffer.id).unwrap_or(buffer)
 }
 

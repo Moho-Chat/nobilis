@@ -3354,6 +3354,14 @@ pub async fn dispatch(
                             if let Err(e) = backend::telegram::membership::leave(state, &buffer).await {
                                 return (None, Some(e));
                             }
+                            // A group's own entry on the rail goes with it.
+                            if let Some(remote) = buffer.remote_id.as_deref() {
+                                let rail = backend::telegram::peers::rail_id(&buffer.account_id, remote);
+                                if buffer.group_id.as_deref() == Some(rail.as_str()) {
+                                    state.runtime.remove_buffer_group(state, &rail);
+                                    return (Some(ok_node()), None);
+                                }
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -3436,6 +3444,17 @@ pub async fn dispatch(
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
                 backend::matrix::leave_room(state, account_id, room_id).await
+            } else if rest.starts_with("tggroup:") {
+                // A Telegram group is its rail entry and the one conversation under it: leaving is leaving that.
+                let under: Vec<crate::model::Buffer> = state.runtime.list_buffers().into_iter().filter(|b| b.group_id.as_deref() == Some(group_id)).collect();
+                let mut left = Ok(());
+                for buffer in &under {
+                    if let Err(e) = backend::telegram::membership::leave(state, buffer).await {
+                        left = Err(anyhow::anyhow!(e));
+                        break;
+                    }
+                }
+                left
             } else {
                 return (None, Some("that is not something you can leave".to_string()));
             };
