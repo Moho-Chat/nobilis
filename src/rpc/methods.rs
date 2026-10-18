@@ -2278,6 +2278,11 @@ pub async fn dispatch(
             // A Telegram bot's own menu, in a conversation with that bot: what its profile lists, as Telegram's apps
             // offer it beside the message box and while a slash is typed.
             if service == "telegram" {
+                // In a conversation with a bot only the bot's own commands are offered: this client's built-ins are
+                // things said to a chat, and a bot is not asked to /shrug.
+                if buffer.name_icon.as_deref() == Some("smart_toy") {
+                    out.clear();
+                }
                 match backend::telegram::bots::commands(state, &buffer).await {
                     Ok(list) => {
                         for c in list.into_iter().filter(|c| query.is_empty() || crate::commands::score(query, &c.name).is_some()) {
