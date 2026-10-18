@@ -218,6 +218,9 @@ async fn handle_update(state: &AppState, account_id: &str, handle: &Handle, upda
                 let body = messages::body_of(&message);
                 let attachments = buffer.remote_id.as_deref().map(|remote| super::media::attachments_of(handle.own.user_id, remote, &message)).unwrap_or_default();
                 state.runtime.update_message(state, &buffer.id, &message.id().to_string(), &body, &[], &attachments);
+                // A bot changes or removes its buttons by editing the message they are under.
+                let inner: &grammers_client::message::Message = &message;
+                super::keyboards::note(state, &buffer.id, &message.id().to_string(), &inner.raw, true);
             }
         }
         Update::MessageDeleted(deleted) => {

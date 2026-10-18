@@ -26,6 +26,7 @@
 //! - `admin` - what an administrator may do to a member
 //! - `notify` - muting a chat on the account
 //! - `instant` - an Instant View article as a page of its own
+//! - `keyboards` - a bot's inline buttons
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -47,6 +48,7 @@ pub mod connect;
 pub mod dialogs;
 pub mod history;
 pub mod instant;
+pub mod keyboards;
 pub mod link;
 pub mod login;
 pub mod markup;

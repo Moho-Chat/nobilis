@@ -289,6 +289,8 @@ pub fn record_in(state: &AppState, account_id: &str, own: &Own, message: &Messag
             }
         }
     }
+    // The buttons a bot put under it.
+    super::keyboards::note(state, &buffer.id, &id, &message.raw, false);
     // What a reply answered, when it was not in hand: asked of Telegram, and the row is filled in when it comes.
     if let Some((Some(remote), reply_id)) = reply_target {
         fill_reply_later(state, account_id, &buffer.id, &id, &remote, &reply_id);

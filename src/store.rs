@@ -879,6 +879,13 @@ impl Store {
         Ok(())
     }
 
+    /// Takes the buttons off a message, for an edit that removed them.
+    pub fn clear_components(&self, buffer_id: &str, msg_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE messages SET components = '[]' WHERE buffer_id = ?1 AND msg_id = ?2", params![buffer_id, msg_id])?;
+        Ok(())
+    }
+
     /// The names that have spoken here lately, most recent first.
     ///
     /// Wanted because a roster is not always there to ask: a service may not

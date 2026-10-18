@@ -5730,6 +5730,17 @@ pub async fn dispatch(
         // bufferId (not roomId) throughout, matching every other message-
         // scoped Matrix method - the buffer->room_id lookup happens inside
         // moderation.rs itself, same as sendMessage/editMessage/etc.
+        // Pressing a button under a bot's message; answers what the bot said back, for the window to show.
+        "pressTelegramButton" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("pressTelegramButton requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::keyboards::press(state, &buffer, p_str(params, "messageId", ""), p_str(params, "customId", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // What this Telegram account may do to others in a conversation, and doing it.
         "telegramPermissions" | "moderateTelegramMember" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
