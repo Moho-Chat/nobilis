@@ -79,6 +79,11 @@ pub fn components_of(markup: &tl::enums::ReplyMarkup) -> Vec<Component> {
 pub fn note(state: &AppState, buffer_id: &str, msg_id: &str, raw: &tl::enums::Message, edited: bool) {
     let tl::enums::Message::Message(m) = raw else { return };
     let components = m.reply_markup.as_ref().map(components_of).unwrap_or_default();
+    // Said when a message has markup that gave no buttons, so what the bot sent is on record rather than guessed at.
+    if let Some(markup) = m.reply_markup.as_ref().filter(|_| components.is_empty()) {
+        let text = format!("{markup:?}");
+        tracing::info!("telegram: message {msg_id} carries markup with no buttons this client draws: {}", text.chars().take(400).collect::<String>());
+    }
     if components.is_empty() && !edited {
         return;
     }
