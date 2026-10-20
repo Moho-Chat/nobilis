@@ -938,7 +938,7 @@ mod service_tests {
         assert_eq!(service_of("kick:someone"), "kick");
         assert_eq!(service_of("sneedchat:Ancient Pioneer"), "sneedchat");
         assert_eq!(service_of("steam:someone"), "steam");
-        assert_eq!(service_of("telegram:5173409493"), "telegram", "it was read as IRC, the service with no prefix");
+        assert_eq!(service_of("telegram:1234567890"), "telegram", "it was read as IRC, the service with no prefix");
         // IRC is the one without a prefix, and a host with a port in it must
         // not be read as one.
         assert_eq!(service_of("Salastil@irc.libera.chat"), "irc");

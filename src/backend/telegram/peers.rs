@@ -301,9 +301,9 @@ mod tests {
 
     #[test]
     fn an_id_goes_to_the_buffer_and_back() {
-        let user = PeerId::user_unchecked(5173409493);
-        assert_eq!(remote_id(user), "5173409493");
-        assert_eq!(peer_id_of("5173409493"), Some(user));
+        let user = PeerId::user_unchecked(1234567890);
+        assert_eq!(remote_id(user), "1234567890");
+        assert_eq!(peer_id_of("1234567890"), Some(user));
         let channel = PeerId::channel_unchecked(1234567890);
         assert_eq!(remote_id(channel), "-1001234567890");
         assert_eq!(peer_id_of("-1001234567890"), Some(channel));

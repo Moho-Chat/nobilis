@@ -447,9 +447,9 @@ mod tests {
 
     #[test]
     fn a_cached_files_name_says_what_it_is_and_is_read_back() {
-        let name = media_name(5173409493, "-1001179270258", 21910, Variant::Full, "mp4");
-        assert_eq!(name, "tg_5173409493_n1001179270258_21910_full.mp4");
-        assert_eq!(parse_media_name(&name), Some((5173409493, "-1001179270258".to_string(), 21910, Variant::Full)));
+        let name = media_name(1234567890, "-1001234567890", 21910, Variant::Full, "mp4");
+        assert_eq!(name, "tg_1234567890_n1001234567890_21910_full.mp4");
+        assert_eq!(parse_media_name(&name), Some((1234567890, "-1001234567890".to_string(), 21910, Variant::Full)));
         let person = media_name(1, "6576171495", 7, Variant::Thumb, "jpg");
         assert_eq!(parse_media_name(&person), Some((1, "6576171495".to_string(), 7, Variant::Thumb)));
         assert_eq!(parse_media_name("not_ours.jpg"), None);
