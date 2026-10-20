@@ -5771,6 +5771,23 @@ pub async fn dispatch(
         // bufferId (not roomId) throughout, matching every other message-
         // scoped Matrix method - the buffer->room_id lookup happens inside
         // moderation.rs itself, same as sendMessage/editMessage/etc.
+        // The GIFs a Telegram account can send: its saved ones, or what Telegram's GIF search finds; and sending one.
+        "listTelegramGifs" | "sendTelegramGif" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            if method == "listTelegramGifs" {
+                return match backend::telegram::gifs::list(state, &buffer, p_str(params, "query", "")).await {
+                    Ok(list) => (Some(list), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::telegram::gifs::send(state, &buffer, p_str(params, "id", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // Pressing a button under a bot's message; answers what the bot said back, for the window to show.
         "pressTelegramButton" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
