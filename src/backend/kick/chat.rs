@@ -589,6 +589,7 @@ pub(super) fn reply_preview(metadata: Option<&ReplyMetadata>, thread_parent: Opt
         thread: false,
         forwarded: false,
         thread_root: Some(thread_root),
+        chat: None,
     })
 }
 

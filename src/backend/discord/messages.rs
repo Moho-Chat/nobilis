@@ -703,6 +703,12 @@ pub(super) fn extract_attachments(d: &Value) -> Vec<Attachment> {
 /// represented by extract_body's own media-URL handling above, so
 /// including it here too would just render an empty box under the media.
 pub(super) fn extract_embeds(d: &Value) -> Vec<Embed> {
+    let mut out = ordinary_embeds(d);
+    out.extend(layout_cards(d));
+    out
+}
+
+fn ordinary_embeds(d: &Value) -> Vec<Embed> {
     let Some(embeds) = d["embeds"].as_array() else { return Vec::new() };
     embeds
         .iter()
@@ -910,6 +916,7 @@ pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
             thread: false,
             forwarded: true,
             thread_root: None,
+            chat: None,
         });
     }
     let referenced = &d["referenced_message"];
@@ -921,7 +928,7 @@ pub(super) fn extract_reply(d: &Value) -> Option<ReplyPreview> {
     let author = &referenced["author"];
     let from = author["global_name"].as_str().filter(|s| !s.is_empty()).or_else(|| author["username"].as_str()).unwrap_or("unknown").to_string();
     let body = extract_body(referenced).unwrap_or_default();
-    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None })
+    Some(ReplyPreview { id: reply_id.to_string(), from, body, thread: false, forwarded: false, thread_root: None, chat: None })
 }
 
 /// Shared by both the initial backfill and extend_history - Discord
@@ -957,9 +964,17 @@ pub(super) fn store_history_messages(state: &AppState, buffer_id: &str, messages
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        if let Err(e) = state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &[]) {
-            tracing::warn!("discord: storing history message: {e}");
-            continue;
+        let badges = author_badges(author);
+        match state.store.append_message(buffer_id, msg_id, from, &body, ts, false, false, "chat", reply_to.as_ref(), &reactions, is_own, avatar_url.as_deref(), &embeds, &attachments, author["id"].as_str(), None, &state.runtime.buffer_kind_of(buffer_id), None, &badges) {
+            Err(e) => {
+                tracing::warn!("discord: storing history message: {e}");
+                continue;
+            }
+            // Read again, a message kept before bots were marked gets its mark.
+            Ok(false) if !badges.is_empty() => {
+                let _ = state.store.set_badges(buffer_id, msg_id, &badges);
+            }
+            Ok(_) => {}
         }
         note_components(state, buffer_id, msg_id, msg);
         // A poll in the history may still be running - Discord's last hours
@@ -1012,6 +1027,26 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
         .collect()
 }
 
+/// What Discord marks an author as, beside their name: "APP" for a bot or an application, with a check when Discord has
+/// verified it. Read off the author the message carries, so it is there for history and for live messages alike.
+pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
+    // Bit 16 of the public flags: a verified bot.
+    const VERIFIED_BOT: u64 = 1 << 16;
+    // Discord's own account: what it sends is the platform speaking, and says so with the OFFICIAL mark.
+    if author["system"].as_bool() == Some(true) {
+        return vec![crate::backend::kick::api::Badge { kind: "official".to_string(), text: "Official Discord Message".to_string(), ..Default::default() }];
+    }
+    if author["bot"].as_bool() != Some(true) {
+        return Vec::new();
+    }
+    let verified = author["public_flags"].as_u64().unwrap_or(0) & VERIFIED_BOT != 0;
+    vec![crate::backend::kick::api::Badge {
+        kind: if verified { "verified-app" } else { "app" }.to_string(),
+        text: if verified { "Verified App" } else { "App" }.to_string(),
+        ..Default::default()
+    }]
+}
+
 /// The buttons and menus on a message, in this client's own shape.
 ///
 /// Discord lays them out in rows of up to five; the row is kept so a client
@@ -1021,63 +1056,188 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
 pub(super) fn extract_components(msg: &Value) -> Vec<model::Component> {
     let Some(rows) = msg["components"].as_array() else { return Vec::new() };
     let mut out = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        // A row is itself a component (type 1) holding the real ones. A
-        // message whose top level is already a control is not a shape Discord
-        // sends, but reading it either way costs nothing.
-        let children = row["components"].as_array().cloned().unwrap_or_else(|| vec![row.clone()]);
-        for child in children {
-            let kind = match child["type"].as_i64() {
-                Some(2) => "button",
-                // 3 is the plain string select; 5 through 8 are the ones that
-                // pick users, roles, mentionables and channels. They are all
-                // menus, and all of them answer the same way.
-                Some(3) | Some(5) | Some(6) | Some(7) | Some(8) => "select",
-                _ => continue,
-            };
-            let style = child["style"].as_i64().map(|s| match s {
-                1 => "primary",
-                2 => "secondary",
-                3 => "success",
-                4 => "danger",
-                5 => "link",
-                _ => "secondary",
-            });
-            let options = child["options"]
-                .as_array()
-                .map(|opts| {
-                    opts.iter()
-                        .filter_map(|o| {
-                            Some(model::ComponentOption {
-                                value: o["value"].as_str()?.to_string(),
-                                label: o["label"].as_str().unwrap_or_default().to_string(),
-                                description: o["description"].as_str().map(str::to_string),
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            out.push(model::Component {
-                kind: kind.to_string(),
-                custom_id: child["custom_id"].as_str().map(str::to_string),
-                label: child["label"].as_str().filter(|l| !l.is_empty()).map(str::to_string),
-                style: style.map(str::to_string),
-                url: child["url"].as_str().map(str::to_string),
-                disabled: child["disabled"].as_bool().unwrap_or(false),
-                // Written the way this client writes emoji everywhere else, so
-                // a button's picture renders like one in a message does.
-                emoji: match (child["emoji"]["name"].as_str(), child["emoji"]["id"].as_str()) {
-                    (Some(name), Some(id)) => Some(format!("<:{name}:{id}>")),
-                    (Some(name), None) => Some(name.to_string()),
-                    _ => None,
-                },
-                options,
-                placeholder: child["placeholder"].as_str().map(str::to_string),
-                row: row_index as i64,
-            });
-        }
+    let mut row_index = 0i64;
+    for row in rows {
+        controls_in(row, &mut row_index, &mut out);
     }
     out
+}
+
+/// The buttons and menus inside one component, however deep the layout puts them.
+///
+/// An ordinary message has rows (type 1) of controls. A message made with Discord's newer layout components wraps
+/// them: a container (17) holds rows, sections (9) - whose accessory may itself be a button - and text, and a control
+/// may sit anywhere in it. Each row, and each section's accessory, is one line of controls in the order met.
+fn controls_in(node: &Value, row_index: &mut i64, out: &mut Vec<model::Component>) {
+    match node["type"].as_i64() {
+        // An action row: its children are the controls.
+        Some(1) => {
+            for child in node["components"].as_array().into_iter().flatten() {
+                push_control(child, *row_index, out);
+            }
+            *row_index += 1;
+        }
+        // A container, or anything else that holds components: look inside.
+        Some(17) => {
+            for child in node["components"].as_array().into_iter().flatten() {
+                controls_in(child, row_index, out);
+            }
+        }
+        // A section's accessory is a thumbnail or a button; the text beside it holds no controls.
+        Some(9) => {
+            if node["accessory"]["type"].as_i64() == Some(2) {
+                push_control(&node["accessory"], *row_index, out);
+                *row_index += 1;
+            }
+        }
+        // A control with no row around it is not a shape Discord sends, but reading it costs nothing.
+        _ => push_control(node, *row_index, out),
+    }
+}
+
+fn push_control(child: &Value, row_index: i64, out: &mut Vec<model::Component>) {
+    let kind = match child["type"].as_i64() {
+        Some(2) => "button",
+        // 3 is the plain string select; 5 through 8 are the ones that
+        // pick users, roles, mentionables and channels. They are all
+        // menus, and all of them answer the same way.
+        Some(3) | Some(5) | Some(6) | Some(7) | Some(8) => "select",
+        _ => return,
+    };
+    let style = child["style"].as_i64().map(|s| match s {
+        1 => "primary",
+        2 => "secondary",
+        3 => "success",
+        4 => "danger",
+        5 => "link",
+        _ => "secondary",
+    });
+    let options = child["options"]
+        .as_array()
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    Some(model::ComponentOption {
+                        value: o["value"].as_str()?.to_string(),
+                        label: o["label"].as_str().unwrap_or_default().to_string(),
+                        description: o["description"].as_str().map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.push(model::Component {
+        kind: kind.to_string(),
+        custom_id: child["custom_id"].as_str().map(str::to_string),
+        label: child["label"].as_str().filter(|l| !l.is_empty()).map(str::to_string),
+        style: style.map(str::to_string),
+        url: child["url"].as_str().map(str::to_string),
+        disabled: child["disabled"].as_bool().unwrap_or(false),
+        // Written the way this client writes emoji everywhere else, so
+        // a button's picture renders like one in a message does.
+        emoji: match (child["emoji"]["name"].as_str(), child["emoji"]["id"].as_str()) {
+            (Some(name), Some(id)) => Some(format!("<:{name}:{id}>")),
+            (Some(name), None) => Some(name.to_string()),
+            _ => None,
+        },
+        options,
+        placeholder: child["placeholder"].as_str().map(str::to_string),
+        row: row_index,
+    });
+}
+
+/// What a message made with Discord's layout components says, as cards.
+///
+/// Those messages carry no text of their own: a container (type 17) holds text displays (10), sections (9) pairing text
+/// with a picture or a button, galleries of pictures (12), files (13) and separators (14). Each container becomes one
+/// card - its text as the description, a leading heading line as the title, its first picture as the card's picture and
+/// its accent colour - and text or pictures outside any container become one more. The buttons in them are read apart
+/// (see `controls_in`).
+fn layout_cards(d: &Value) -> Vec<Embed> {
+    let Some(top) = d["components"].as_array() else { return Vec::new() };
+    let mut cards = Vec::new();
+    let mut loose = Card::default();
+    for node in top {
+        if node["type"].as_i64() == Some(17) {
+            let mut card = Card::default();
+            card.take(node);
+            if let Some(embed) = card.into_embed(node["accent_color"].as_i64()) {
+                cards.push(embed);
+            }
+        } else {
+            loose.take(node);
+        }
+    }
+    if let Some(embed) = loose.into_embed(None) {
+        cards.insert(0, embed);
+    }
+    cards
+}
+
+#[derive(Default)]
+struct Card {
+    texts: Vec<String>,
+    picture: Option<String>,
+}
+
+impl Card {
+    fn take(&mut self, node: &Value) {
+        match node["type"].as_i64() {
+            Some(10) => {
+                if let Some(text) = node["content"].as_str().filter(|t| !t.trim().is_empty()) {
+                    self.texts.push(text.to_string());
+                }
+            }
+            // A thumbnail, or a gallery of pictures: the first is the card's.
+            Some(11) => self.picture_of(&node["media"]),
+            Some(12) => {
+                for item in node["items"].as_array().into_iter().flatten() {
+                    self.picture_of(&item["media"]);
+                }
+            }
+            Some(13) => {
+                if let Some(url) = node["file"]["url"].as_str() {
+                    self.texts.push(format!("[{}]({url})", node["name"].as_str().unwrap_or("Attached file")));
+                }
+            }
+            // A section: its text, and its accessory when that is a picture.
+            Some(9) | Some(17) => {
+                for child in node["components"].as_array().into_iter().flatten() {
+                    self.take(child);
+                }
+                if node["accessory"]["type"].as_i64() == Some(11) {
+                    self.picture_of(&node["accessory"]["media"]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn picture_of(&mut self, media: &Value) {
+        if self.picture.is_none() {
+            self.picture = media["url"].as_str().map(str::to_string);
+        }
+    }
+
+    fn into_embed(self, accent: Option<i64>) -> Option<Embed> {
+        if self.texts.is_empty() && self.picture.is_none() {
+            return None;
+        }
+        let joined = self.texts.join("\n\n");
+        // A first line that is a markdown heading is what the card is called.
+        let (title, description) = match joined.split_once('\n') {
+            Some((first, rest)) if first.starts_with('#') => (Some(first.trim_start_matches('#').trim().to_string()), rest.trim().to_string()),
+            None if joined.starts_with('#') => (Some(joined.trim_start_matches('#').trim().to_string()), String::new()),
+            _ => (None, joined),
+        };
+        Some(Embed {
+            title: title.filter(|t| !t.is_empty()),
+            description: Some(description).filter(|d| !d.is_empty()),
+            color: accent,
+            image_url: self.picture,
+            ..Default::default()
+        })
+    }
 }
 
 /// Stores a message's buttons and tells the client, if it has any.
@@ -1723,5 +1883,93 @@ mod gif_tests {
         let mut quiet = gifv();
         quiet["content"] = json!("");
         assert_eq!(extract_body(&quiet), None);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{extract_components, extract_embeds};
+    use serde_json::json;
+
+    /// What a bot's message built with Discord's layout components looks like: no text of its own, a container with
+    /// a section (text and a picture) and a row holding one button.
+    fn honeypot() -> serde_json::Value {
+        json!({
+            "content": "",
+            "flags": 32768,
+            "components": [{
+                "type": 17,
+                "accent_color": 0x5865f2,
+                "components": [
+                    { "type": 9,
+                      "components": [{ "type": 10, "content": "## DO NOT SEND MESSAGES IN THIS CHANNEL\nThis channel is used to catch spam bots. Any messages sent here will result in **an immediate ban**." }],
+                      "accessory": { "type": 11, "media": { "url": "https://cdn.discordapp.com/attachments/1/2/honeypot.png" } } },
+                    { "type": 14, "divider": true },
+                    { "type": 1, "components": [{ "type": 2, "style": 2, "label": "Bans: 19", "custom_id": "bans", "disabled": true, "emoji": { "name": "🍯" } }] }
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn a_container_is_one_card_with_a_title_its_text_and_its_picture() {
+        let cards = extract_embeds(&honeypot());
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].title.as_deref(), Some("DO NOT SEND MESSAGES IN THIS CHANNEL"));
+        assert!(cards[0].description.as_deref().unwrap().starts_with("This channel is used to catch spam bots."));
+        assert_eq!(cards[0].image_url.as_deref(), Some("https://cdn.discordapp.com/attachments/1/2/honeypot.png"));
+        assert_eq!(cards[0].color, Some(0x5865f2));
+    }
+
+    #[test]
+    fn the_buttons_inside_a_container_are_found() {
+        let controls = extract_components(&honeypot());
+        assert_eq!(controls.len(), 1);
+        assert_eq!((controls[0].label.as_deref(), controls[0].kind.as_str(), controls[0].disabled), (Some("Bans: 19"), "button", true));
+        assert_eq!(controls[0].emoji.as_deref(), Some("🍯"));
+    }
+
+    #[test]
+    fn a_sections_button_accessory_is_a_control_and_its_picture_accessory_is_not() {
+        let msg = json!({ "components": [{ "type": 17, "components": [
+            { "type": 9, "components": [{ "type": 10, "content": "Pick" }], "accessory": { "type": 2, "style": 1, "label": "Go", "custom_id": "go" } },
+        ] }] });
+        let controls = extract_components(&msg);
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].label.as_deref(), Some("Go"));
+        assert_eq!(extract_embeds(&msg)[0].description.as_deref(), Some("Pick"));
+    }
+
+    #[test]
+    fn an_ordinary_message_has_no_layout_card() {
+        let msg = json!({ "content": "hi", "components": [{ "type": 1, "components": [{ "type": 2, "label": "x", "custom_id": "x", "style": 1 }] }] });
+        assert!(extract_embeds(&msg).is_empty());
+        assert_eq!(extract_components(&msg).len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod app_badge_tests {
+    use super::author_badges;
+    use serde_json::json;
+
+    #[test]
+    fn a_bot_is_an_app_and_a_verified_one_says_so() {
+        let plain = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 0 }));
+        assert_eq!((plain[0].kind.as_str(), plain[0].text.as_str()), ("app", "App"));
+        let verified = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 65536 }));
+        assert_eq!((verified[0].kind.as_str(), verified[0].text.as_str()), ("verified-app", "Verified App"));
+    }
+
+    #[test]
+    fn discords_own_account_is_official_even_though_it_is_not_an_app() {
+        let official = author_badges(&json!({ "id": "643945264868098049", "system": true, "bot": true }));
+        assert_eq!((official[0].kind.as_str(), official[0].text.as_str()), ("official", "Official Discord Message"));
+    }
+
+    #[test]
+    fn a_person_has_no_badge() {
+        assert!(author_badges(&json!({ "id": "2", "username": "someone" })).is_empty());
+        assert!(author_badges(&json!({ "id": "2", "bot": false })).is_empty());
     }
 }

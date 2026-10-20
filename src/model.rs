@@ -379,6 +379,10 @@ pub struct Buffer {
     /// thing - so it is named for what it is rather than after the tag.
     #[serde(rename = "serviceRoom", default, skip_serializing_if = "std::ops::Not::not")]
     pub service_room: bool,
+    /// A small glyph drawn in front of the name in the list, for what kind of conversation it is where the service
+    /// has kinds a person looks for: Telegram's broadcast channels ("campaign", a horn) and bots ("smart_toy").
+    #[serde(rename = "nameIcon", default, skip_serializing_if = "Option::is_none")]
+    pub name_icon: Option<String>,
     /// What the conversation says it is for: an IRC channel's topic, a Matrix
     /// room's, a Discord channel's. Absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -482,6 +486,12 @@ pub struct ReplyPreview {
     /// above it, the second for a thread to open.
     #[serde(rename = "threadRoot", default, skip_serializing_if = "Option::is_none")]
     pub thread_root: Option<String>,
+    /// The conversation the message answered lives in, when it is not this one.
+    ///
+    /// Telegram can answer a post in another channel; the quote then names where it came from, and a client can
+    /// take the reader there. A buffer id, present only when that conversation is one the account has open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<String>,
 }
 
 /// Why a message the service took down is gone, kept with the message.
@@ -910,6 +920,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("sneedchat") => "sneedchat",
         Some("steam") => "steam",
         Some("twitch") => "twitch",
+        Some("telegram") => "telegram",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
@@ -927,6 +938,7 @@ mod service_tests {
         assert_eq!(service_of("kick:someone"), "kick");
         assert_eq!(service_of("sneedchat:Ancient Pioneer"), "sneedchat");
         assert_eq!(service_of("steam:someone"), "steam");
+        assert_eq!(service_of("telegram:1234567890"), "telegram", "it was read as IRC, the service with no prefix");
         // IRC is the one without a prefix, and a host with a port in it must
         // not be read as one.
         assert_eq!(service_of("Salastil@irc.libera.chat"), "irc");
@@ -1032,6 +1044,7 @@ mod tests {
             favourite: false,
             low_priority: false,
             service_room: false,
+            name_icon: None,
             topic: None,
             read_only: None,
             forum: false,

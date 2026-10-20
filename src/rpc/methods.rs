@@ -112,6 +112,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addKickAccount" => Some("kick"),
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
+        "addTelegramAccount" => Some("telegram"),
         _ => None,
     }
 }
@@ -426,6 +427,7 @@ pub async fn dispatch(
                 { "id": "kick", "name": "Kick", "available": true },
                 { "id": "steam", "name": "Steam", "available": true },
                 { "id": "twitch", "name": "Twitch", "available": true },
+                { "id": "telegram", "name": "Telegram", "available": true },
             ])),
             None,
         ),
@@ -488,6 +490,14 @@ pub async fn dispatch(
                         };
                         if let Err(e) = fetched {
                             tracing::debug!("steam history: {e}");
+                        }
+                    }
+                    // Telegram keeps every message too: opening a conversation asks for its recent end, scrolling to
+                    // the top for the part before. Best-effort, like Steam's.
+                    if buffer.account_id.starts_with("telegram:") {
+                        let fetched = if before > 0 { backend::telegram::history::older(state, &buffer, before).await } else { backend::telegram::history::open(state, &buffer).await };
+                        if let Err(e) = fetched {
+                            tracing::debug!("telegram history: {e:#}");
                         }
                     }
                     // Kick pages back through its own history endpoint,
@@ -781,8 +791,14 @@ pub async fn dispatch(
                 // hours and a refresh token good for thirty days. Best effort:
                 // the account is removed either way.
                 let twitch_tokens = state.accounts.get_twitch(id).filter(|a| a.is_signed_in()).map(|a| (a.access_token, a.refresh_token));
+                // A Telegram session is ended at Telegram too, and its file taken away.
+                let telegram_account = state.accounts.get_telegram(id);
                 match state.accounts.remove(id) {
                     Ok(true) => {
+                        if let Some(config) = telegram_account {
+                            let state = state.clone();
+                            tokio::spawn(async move { backend::telegram::connect::sign_out(&state, &config).await });
+                        }
                         if let Some((access, refresh)) = twitch_tokens {
                             tokio::spawn(async move {
                                 if let Ok(http) = backend::twitch::client() {
@@ -1012,6 +1028,12 @@ pub async fn dispatch(
             // Twitch is the same shape: a channel is a streamer, naming one is
             // the whole of joining it, and the connection remembers it once
             // Twitch has said it is there.
+            if id.starts_with("telegram:") {
+                return match backend::telegram::membership::join(state, id, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             if id.starts_with("twitch:") {
                 let Some(channel) = backend::twitch::connect::normalise_login(name) else {
                     return (None, Some(format!("\"{name}\" is not a Twitch channel")));
@@ -1080,6 +1102,15 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    // It lapses by itself, so only "typing" is said.
+                    if typing {
+                        if let Err(e) = backend::telegram::send::typing(state, &buffer).await {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 // IRC says it with a client-only tag on an empty TAGMSG,
                 // and says nothing at all where the server has no
                 // message-tags to carry one - see send_typing.
@@ -1144,6 +1175,27 @@ pub async fn dispatch(
         // Muting a room for the account rather than for this window. Matrix
         // keeps it server-side, so a room quietened here is quiet on a phone
         // too - which is what somebody means by muting a room.
+        // The article a Telegram link preview carries, as a document for a window of its own.
+        "telegramInstantView" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("telegramInstantView requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::instant::article(state, &buffer, p_str(params, "messageId", "")).await {
+                Ok(article) => (Some(serde_json::json!({ "title": article.title, "url": article.url, "html": article.html })), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        "setTelegramChatMuted" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("setTelegramChatMuted requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::notify::set_muted(state, &buffer, p_bool(params, "muted", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "setMatrixRoomMuted" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("setMatrixRoomMuted requires \"bufferId\"".to_string()));
@@ -1232,6 +1284,7 @@ pub async fn dispatch(
                         "kick" => backend::kick::profile(&state, &account_id, &buffer_id, &who).await,
                         "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1257,6 +1310,12 @@ pub async fn dispatch(
                     Ok(messages) => messages,
                     Err(e) => return (None, Some(format!("{e:#}"))),
                 }
+            } else if account_id.starts_with("telegram:") {
+                let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return (None, Some("no such conversation".to_string())) };
+                return match backend::telegram::threads::fetch(state, &buffer, root_id).await {
+                    Ok(messages) => (Some(serde_json::json!({ "messages": messages })), None),
+                    Err(e) => (None, Some(e)),
+                };
             } else {
                 state.store.thread_messages(buffer_id, root_id).unwrap_or_default()
             };
@@ -1304,6 +1363,13 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // Telegram keeps a read position for each conversation too, and tells the account's other apps.
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    if let Err(e) = backend::telegram::send::mark_read(state, &buffer).await {
+                        tracing::debug!("telegram read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1356,7 +1422,8 @@ pub async fn dispatch(
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }
             } else {
-                match backend::discord::accept_member_verification(state, account_id, guild_id).await {
+                let answers: Vec<Value> = params.get("responses").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                match backend::discord::accept_member_verification(state, account_id, guild_id, &answers).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
                 }
@@ -1461,6 +1528,8 @@ pub async fn dispatch(
                     &finished.waveform,
                 )
                 .await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::send::send_voice(state, &buffer, &finished.path, finished.duration_secs).await.map_err(|e| anyhow::anyhow!(e))
             } else if let Some(cfg) = state.accounts.get_matrix(&buffer.account_id) {
                 backend::matrix::send_voice_message(
                     state,
@@ -1819,6 +1888,15 @@ pub async fn dispatch(
                         } else {
                             false
                         }
+                    }
+                    Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                        let (state, buffer) = (state.clone(), buffer);
+                        tokio::spawn(async move {
+                            if let Err(e) = backend::telegram::members::refresh(&state, &buffer).await {
+                                tracing::debug!("telegram members: {e}");
+                            }
+                        });
+                        true
                     }
                     _ => backend::discord::request_member_list(state, buffer_id),
                 };
@@ -2197,6 +2275,29 @@ pub async fn dispatch(
                     Err(e) => tracing::debug!("discord: listing commands: {e:#}"),
                 }
             }
+            // A Telegram bot's own menu, in a conversation with that bot: what its profile lists, as Telegram's apps
+            // offer it beside the message box and while a slash is typed.
+            if service == "telegram" {
+                // In a conversation with a bot only the bot's own commands are offered: this client's built-ins are
+                // things said to a chat, and a bot is not asked to /shrug.
+                if buffer.name_icon.as_deref() == Some("smart_toy") {
+                    out.clear();
+                }
+                match backend::telegram::bots::commands(state, &buffer).await {
+                    Ok(list) => {
+                        for c in list.into_iter().filter(|c| query.is_empty() || crate::commands::score(query, &c.name).is_some()) {
+                            out.push(serde_json::json!({
+                                "name": c.name,
+                                "usage": "",
+                                "description": c.description,
+                                "source": buffer.name,
+                                "kind": "bot",
+                            }));
+                        }
+                    }
+                    Err(e) => tracing::debug!("telegram: listing a bot's commands: {e}"),
+                }
+            }
             (Some(serde_json::json!({ "commands": out })), None)
         }
 
@@ -2300,6 +2401,8 @@ pub async fn dispatch(
                 backend::discord::load_context(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::load_context(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::history::context(state, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2340,6 +2443,8 @@ pub async fn dispatch(
                 backend::discord::load_newer(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::load_newer(state, &buffer.account_id, buffer_id, message_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::history::newer(state, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -2365,6 +2470,8 @@ pub async fn dispatch(
                 backend::discord::list_pinned(state, &buffer.account_id, buffer_id).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::pins::list(state, &buffer).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2414,12 +2521,33 @@ pub async fn dispatch(
                 backend::discord::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
             } else if buffer.account_id.starts_with("matrix:") {
                 backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
+            } else if buffer.account_id.starts_with("telegram:") {
+                backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
             match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The same question asked of Telegram's own index, for what this client never read.
+        "searchTelegramMessages" => {
+            let (buffer_id, query) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "query")) {
+                (Some(b), Some(q)) => (b, q),
+                _ => return (None, Some("searchTelegramMessages requires \"bufferId\" and \"query\"".to_string())),
+            };
+            if query.trim().is_empty() {
+                return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("that conversation is not on Telegram".to_string()));
+            };
+            let account_wide = p_str_opt(params, "scope") == Some("account");
+            match backend::telegram::search::run(state, &buffer, query, account_wide, p_i64(params, "limit", 25) as usize).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
             }
         }
 
@@ -3222,6 +3350,20 @@ pub async fn dispatch(
                                 let _ = sender.send(backend::twitch::Command::Part(buffer.name.clone()));
                             }
                             let _ = state.accounts.mutate_twitch(&buffer.account_id, |a| a.channels.retain(|c| *c != buffer.name));
+                        } else if buffer.account_id.starts_with("telegram:") && backend::telegram::topics::topic_of_buffer(&buffer).is_some() {
+                            // Closing one topic of a group only stops showing it: the group is left from its rail entry.
+                        } else if buffer.account_id.starts_with("telegram:") {
+                            if let Err(e) = backend::telegram::membership::leave(state, &buffer).await {
+                                return (None, Some(e));
+                            }
+                            // A group's own entry on the rail goes with it.
+                            if let Some(remote) = buffer.remote_id.as_deref().and_then(|r| r.split(':').next()) {
+                                let rail = backend::telegram::peers::rail_id(&buffer.account_id, remote);
+                                if buffer.group_id.as_deref() == Some(rail.as_str()) {
+                                    state.runtime.remove_buffer_group(state, &rail);
+                                    return (Some(ok_node()), None);
+                                }
+                            }
                         } else if buffer.account_id.starts_with("matrix:") {
                             if let Some(room_id) = state.runtime.get_matrix_room(buffer_id) {
                                 if let Err(e) = backend::matrix::leave_room(state, &buffer.account_id, &room_id).await {
@@ -3304,6 +3446,14 @@ pub async fn dispatch(
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
                 backend::matrix::leave_room(state, account_id, room_id).await
+            } else if rest.starts_with("tggroup:") {
+                // A Telegram group is its rail entry and the one conversation under it: leaving is leaving that.
+                let under: Vec<crate::model::Buffer> = state.runtime.list_buffers().into_iter().filter(|b| b.group_id.as_deref() == Some(group_id)).collect();
+                // One leave covers the group, however many topics it has.
+                match under.first() {
+                    Some(buffer) => backend::telegram::membership::leave(state, buffer).await.map_err(anyhow::Error::msg),
+                    None => Ok(()),
+                }
             } else {
                 return (None, Some("that is not something you can leave".to_string()));
             };
@@ -3414,6 +3564,30 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") && params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false) && attachment_path.is_none() && reply_to_id.is_some() => {
+                    match backend::telegram::threads::reply(state, &buffer, reply_to_id.unwrap_or_default(), body).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                    let sent = backend::telegram::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
+                    }
+                    match sent {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("steam:") => {
                     // Steam has no replies or edits for a direct message in
                     // this client yet: what arrives that it cannot use is
@@ -3610,6 +3784,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("sneedchat:") => match backend::sneedchat::edit_message(state, &buffer.account_id, &buffer.name, msg_id, body) {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(format!("{e:#}"))),
@@ -3650,6 +3828,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("steam:") && backend::steam::chatgroups::is_room(&buffer) => match backend::steam::chatgroups::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3676,6 +3858,14 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("telegram:") => {
+                    // For everyone unless the window says it is only to be removed from this account's view.
+                    let everyone = params.get("forEveryone").and_then(|v| v.as_bool()).unwrap_or(true);
+                    match backend::telegram::send::delete(state, &buffer, msg_id, everyone).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("kick:") => {
                     match (kick_credential(state, &buffer.account_id), state.runtime.kick_channel(buffer_id)) {
                         (Err(e), _) => (None, Some(e)),
@@ -4419,6 +4609,39 @@ pub async fn dispatch(
             }
         }
 
+        // Signing in to Telegram takes place over time - Telegram sends a code, and may then ask for the account's
+        // cloud password - so this answers with an id and the rest is events: see backend/telegram/login.rs.
+        "addTelegramAccount" => {
+            let (Some(api_id), Some(api_hash), Some(phone)) = (params.get("apiId").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))), p_str_opt(params, "apiHash"), p_str_opt(params, "phone")) else {
+                return (None, Some("addTelegramAccount requires \"apiId\", \"apiHash\" and \"phone\"".to_string()));
+            };
+            let Ok(api_id) = i32::try_from(api_id) else {
+                return (None, Some("that api_id is not a number Telegram would have given".to_string()));
+            };
+            let login_id = format!("telegram-{}", crate::model::next_message_id());
+            backend::telegram::login::start(state.clone(), login_id.clone(), api_id, api_hash.trim().to_string(), phone.to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The code Telegram sent, and the cloud password it may ask for next, for a sign-in that is waiting.
+        "submitTelegramCode" | "submitTelegramPassword" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some(format!("{method} requires \"loginId\" and \"value\"")));
+            };
+            let given = if method == "submitTelegramCode" { backend::telegram::login::submit_code(login_id, value) } else { backend::telegram::login::submit_password(login_id, value) };
+            match given {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelTelegramLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::telegram::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
+        }
+
         // The form was closed with a sign-in still waiting.
         "cancelSteamLogin" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
@@ -4951,6 +5174,12 @@ pub async fn dispatch(
             // running tally is what most people mean by a poll, and a hidden
             // one is the deliberate choice.
             let disclosed = params.get("disclosed").and_then(Value::as_bool).unwrap_or(true);
+            if buffer.account_id.starts_with("telegram:") {
+                return match backend::telegram::polls::start(state, &buffer, question, &answers, disclosed).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
             match backend::matrix::start_poll(state, &buffer.account_id, buffer_id, question, &answers, disclosed).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
@@ -5000,6 +5229,15 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     };
                 }
+            }
+            if channel_account(state, buffer_id).starts_with("telegram:") {
+                let (Some(choice), Some(buffer)) = (p_str_opt(params, "answerId"), state.runtime.get_buffer(buffer_id)) else {
+                    return (None, Some("votePoll requires \"answerId\"".to_string()));
+                };
+                return match backend::telegram::polls::vote(state, &buffer, choice).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                };
             }
             if channel_account(state, buffer_id).starts_with("twitch:") {
                 // Twitch's choices are named by ids of their own, which the window hands back as text.
@@ -5533,6 +5771,34 @@ pub async fn dispatch(
         // bufferId (not roomId) throughout, matching every other message-
         // scoped Matrix method - the buffer->room_id lookup happens inside
         // moderation.rs itself, same as sendMessage/editMessage/etc.
+        // Pressing a button under a bot's message; answers what the bot said back, for the window to show.
+        "pressTelegramButton" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some("pressTelegramButton requires a Telegram \"bufferId\"".to_string()));
+            };
+            match backend::telegram::keyboards::press(state, &buffer, p_str(params, "messageId", ""), p_str(params, "customId", "")).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // What this Telegram account may do to others in a conversation, and doing it.
+        "telegramPermissions" | "moderateTelegramMember" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            if method == "telegramPermissions" {
+                return match backend::telegram::admin::permissions(state, &buffer).await {
+                    Ok(permissions) => (Some(permissions), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::telegram::admin::moderate(state, &buffer, p_str(params, "userId", ""), p_str(params, "action", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "getMatrixRoomPermissions" => {
             let (account_id, buffer_id) = match (p_str_opt(params, "accountId"), p_str_opt(params, "bufferId")) {
                 (Some(a), Some(b)) => (a, b),

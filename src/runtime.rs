@@ -543,6 +543,8 @@ pub struct Runtime {
     /// Each connected Steam account's connection, by account id: how a message
     /// or a status change reaches Steam from outside the connection's own task.
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
+    /// A connected Telegram account's client, by account id (see backend/telegram).
+    telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -1058,6 +1060,10 @@ fn cap_cache<K: std::hash::Hash + Eq, V>(map: &mut HashMap<K, V>, limit: usize) 
 /// "Channels" and "Direct Messages" (whispers), the second drawn only while there is a whisper to put under it.
 /// They are the service's own headings, so they cannot be renamed, removed or filled by hand.
 fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
+    if account_id.starts_with("telegram:") {
+        // Groups are the usual channel; a broadcast channel moves to its own heading when its buffer is made.
+        return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
+    }
     account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
 }
 
@@ -1106,6 +1112,7 @@ impl Runtime {
             twitch_senders: Mutex::new(HashMap::new()),
             twitch_rights: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
+            telegram_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -1255,6 +1262,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::twitch_account_to_json(cfg, conn)
+        }));
+        out.extend(state.accounts.all_telegram().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::telegram_account_to_json(cfg, conn)
         }));
         out
     }
@@ -1658,7 +1670,9 @@ impl Runtime {
         if let Some(existing) = buffers.get_mut(&id) {
             // A Twitch account's list is always headed the same two ways (see `fixed_category`), including
             // for what was open before it was.
-            if existing.category.is_none() {
+            // Only in the account's own list: a conversation filed under a rail entry of its own (a Telegram group)
+            // is the whole of that entry and has no heading to sit under.
+            if existing.category.is_none() && existing.group_id.as_deref().is_none_or(|g| g == model::account_group_id(account_id)) {
                 existing.category = fixed_category(account_id, kind);
             }
             return existing.clone();
@@ -1693,6 +1707,7 @@ impl Runtime {
             favourite: false,
             low_priority: false,
             service_room: false,
+            name_icon: None,
             topic: None,
             read_only: None,
             forum: false,
@@ -1759,6 +1774,23 @@ impl Runtime {
     /// One way only. A homeserver does not un-designate its notices room, and
     /// a client that cleared the mark because one sync happened not to carry
     /// the tag would offer a Leave that the server refuses.
+    /// Draws a glyph in front of a conversation's name in the list (see `Buffer::name_icon`), said once it changes.
+    pub fn set_buffer_name_icon(&self, state: &AppState, buffer_id: &str, icon: Option<&str>) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.name_icon.as_deref() != icon => {
+                    b.name_icon = icon.map(String::from);
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn set_buffer_service_room(&self, state: &AppState, buffer_id: &str) {
         let updated = {
             let mut buffers = self.buffers.lock().unwrap();
@@ -4345,6 +4377,18 @@ impl Runtime {
     }
 
     /// Registers a signed-in Steam connection.
+    pub fn set_telegram_handle(&self, account_id: &str, handle: crate::backend::telegram::Handle) {
+        self.telegram_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_telegram_handle(&self, account_id: &str) {
+        self.telegram_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn telegram_handle(&self, account_id: &str) -> Option<crate::backend::telegram::Handle> {
+        self.telegram_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
         self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
     }
@@ -4827,6 +4871,15 @@ impl Runtime {
             ),
             Ok(false) => {}
             Err(e) => tracing::warn!("failed to name a forwarded message: {e}"),
+        }
+    }
+
+    /// Says who and what a reply answered, once it has been looked up (a reply to something not read here yet).
+    pub fn fill_reply_preview(&self, state: &AppState, buffer_id: &str, msg_id: &str, from: &str, body: &str) {
+        match state.store.set_reply_text(buffer_id, msg_id, from, body) {
+            Ok(true) => state.events.emit("messageReplyRenamed", json!({ "bufferId": buffer_id, "id": msg_id, "from": from, "body": body })),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("failed to fill in a reply: {e}"),
         }
     }
 
@@ -5619,7 +5672,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

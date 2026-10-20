@@ -891,7 +891,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // The author's id travels with the message. It is what a profile
                         // lookup asks Discord about - a display name is not something
                         // the API accepts - and what a moderation action would need.
-                        state.runtime.record_message(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id.clone(), is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string));
+                        let badges = author_badges(author);
+                        let style = if badges.is_empty() { None } else { Some(model::SenderStyle { color: None, badges }) };
+                        state.runtime.record_message_at(state, &account_id, &buffer_name, &kind, &from, &body, false, "chat", reply_to, real_msg_id.clone(), is_mention, avatar_url, embeds, attachments, author["id"].as_str().map(str::to_string), None, None, style);
                         // Who wrote a forwarded message, which the snapshot
                         // does not say. A read of the original, so it happens
                         // after the message is already on screen rather than

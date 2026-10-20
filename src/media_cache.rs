@@ -38,6 +38,8 @@ pub const CACHES: &[Cache] = &[
     Cache { dir: "matrix-media", group: "media", max_bytes: 250 * MB },
     Cache { dir: "sneedchat-attachments", group: "media", max_bytes: 250 * MB },
     Cache { dir: "discord-thumbnails", group: "media", max_bytes: 100 * MB },
+    Cache { dir: "telegram-media", group: "media", max_bytes: 500 * MB },
+    Cache { dir: "telegram-avatars", group: "avatars", max_bytes: 64 * MB },
     Cache { dir: "sneedchat-avatars", group: "avatars", max_bytes: 100 * MB },
     Cache { dir: "discord-icons", group: "avatars", max_bytes: 16 * MB },
     Cache { dir: "kick-emotes", group: "emotes", max_bytes: 64 * MB },
@@ -209,6 +211,13 @@ pub async fn restore(state: &AppState, path: &str, buffer_id: Option<&str>, mess
         }
         "discord-icons" => crate::backend::discord::restore_guild_icon(&path).await?,
         "kick-emotes" => crate::backend::kick::emotecache::restore_cached(&path).await?,
+        "telegram-media" | "telegram-avatars" => match crate::backend::telegram::media::restore_cached(state, &path).await {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!("telegram: fetching {} again: {e:#}", path.display());
+                return Err(e);
+            }
+        },
         _ => bail!("{} is fetched again by what uses it, not by name", cache.dir),
     };
     Ok(format!("file://{}", restored.display()))

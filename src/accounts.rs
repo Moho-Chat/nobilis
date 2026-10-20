@@ -489,6 +489,54 @@ impl TwitchAccountConfig {
     }
 }
 
+/// A Telegram account: a phone number's, signed in over MTProto (see backend/telegram).
+///
+/// Telegram gives the owner of a phone number one `api_id` and `api_hash`, and a client sends them with every
+/// connection. Moho carries none of its own: the ones the person typed into the sign-in form are kept here, with
+/// the account, and are as private as the session is. The session itself (the authorization key Telegram issued,
+/// and what a client caches to catch up on updates) is large and changes often, so it is a file of its own in the
+/// daemon's data directory (see backend/telegram/session.rs), not a field of this one.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TelegramAccountConfig {
+    #[serde(default)]
+    pub api_id: i32,
+    #[serde(default)]
+    pub api_hash: String,
+    /// The number the account was signed in with, in international form (`+15551234567`).
+    #[serde(default)]
+    pub phone: String,
+    /// Telegram's number for the account, which survives the number or the name being changed. The account's id here
+    /// is built from it.
+    #[serde(default)]
+    pub user_id: i64,
+    /// The `@name`, if the account has one. Telegram's, not ours.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// The account's own name in Telegram (first and last), for the sidebar.
+    #[serde(default)]
+    pub name: String,
+    /// What to call this account here. Local: Telegram is never told about it.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Whether this account's connections go through Tor or the SOCKS5 proxy set in the network settings.
+    #[serde(default)]
+    pub use_tor: bool,
+    /// Strict routing: everything the window loads for this account's conversations goes through the route too.
+    #[serde(default)]
+    pub strict_route: bool,
+}
+
+impl TelegramAccountConfig {
+    pub fn account_id(&self) -> String {
+        format!("telegram:{}", self.user_id)
+    }
+
+    /// Whether there is a sign-in behind this account: one that has been through is what has an id.
+    pub fn is_signed_in(&self) -> bool {
+        self.user_id != 0 && self.api_id != 0 && !self.api_hash.is_empty()
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct AccountsFile {
     #[serde(default, rename = "account")]
@@ -509,6 +557,8 @@ struct AccountsFile {
     steam: Vec<SteamAccountConfig>,
     #[serde(default, rename = "twitch_account")]
     twitch: Vec<TwitchAccountConfig>,
+    #[serde(default, rename = "telegram_account")]
+    telegram: Vec<TelegramAccountConfig>,
 }
 
 /// Account/credential persistence at ~/.config/nobilis/accounts.toml,
@@ -528,6 +578,8 @@ pub struct AccountStore {
     steam: Mutex<HashMap<String, SteamAccountConfig>>,
     /// Read by `persist` the same way, for the same reason.
     twitch: Mutex<HashMap<String, TwitchAccountConfig>>,
+    /// And this one.
+    telegram: Mutex<HashMap<String, TelegramAccountConfig>>,
 }
 
 impl AccountStore {
@@ -538,7 +590,7 @@ impl AccountStore {
     }
 
     pub fn open(path: PathBuf) -> Result<Self> {
-        let (irc, discord, sneedchat, matrix, kick, steam, twitch) = if path.exists() {
+        let (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram) = if path.exists() {
             let text = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             let file: AccountsFile = toml::from_str(&text)
@@ -550,9 +602,10 @@ impl AccountStore {
             let kick = file.kick.into_iter().map(|a| (a.account_id(), a)).collect();
             let steam = file.steam.into_iter().map(|a| (a.account_id(), a)).collect();
             let twitch = file.twitch.into_iter().map(|a| (a.account_id(), a)).collect();
-            (irc, discord, sneedchat, matrix, kick, steam, twitch)
+            let telegram = file.telegram.into_iter().map(|a| (a.account_id(), a)).collect();
+            (irc, discord, sneedchat, matrix, kick, steam, twitch, telegram)
         } else {
-            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new(), HashMap::new())
         };
         Ok(Self {
             path,
@@ -563,6 +616,7 @@ impl AccountStore {
             kick: Mutex::new(kick),
             steam: Mutex::new(steam),
             twitch: Mutex::new(twitch),
+            telegram: Mutex::new(telegram),
         })
     }
 
@@ -585,6 +639,7 @@ impl AccountStore {
             kick: kick.values().cloned().collect(),
             steam: self.steam.lock().unwrap().values().cloned().collect(),
             twitch: self.twitch.lock().unwrap().values().cloned().collect(),
+            telegram: self.telegram.lock().unwrap().values().cloned().collect(),
         };
         let text = toml::to_string_pretty(&file)?;
         // Atomic write-temp-then-rename, same spirit as libpurple's periodic
@@ -822,6 +877,48 @@ impl AccountStore {
         Ok(true)
     }
 
+    pub fn get_telegram(&self, account_id: &str) -> Option<TelegramAccountConfig> {
+        self.telegram.lock().unwrap().get(account_id).cloned()
+    }
+
+    pub fn all_telegram(&self) -> Vec<TelegramAccountConfig> {
+        self.telegram.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Upserts: signing in again as the same account is how a session Telegram has ended gets replaced. What the
+    /// person set up on the account - its route, its name here - stays.
+    pub fn add_telegram(&self, mut config: TelegramAccountConfig) -> Result<TelegramAccountConfig> {
+        let id = config.account_id();
+        {
+            let mut telegram = self.telegram.lock().unwrap();
+            if let Some(old) = telegram.get(&id) {
+                config.strict_route |= old.strict_route;
+                config.use_tor |= old.use_tor;
+                if config.display_name.is_none() {
+                    config.display_name = old.display_name.clone();
+                }
+            }
+            telegram.insert(id, config.clone());
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(config)
+    }
+
+    /// Changes one Telegram account, and writes the file. `false` when there is no such account.
+    ///
+    /// The lock is let go before the write: `persist` takes it again.
+    pub fn mutate_telegram(&self, account_id: &str, change: impl FnOnce(&mut TelegramAccountConfig)) -> Result<bool> {
+        {
+            let mut telegram = self.telegram.lock().unwrap();
+            match telegram.get_mut(account_id) {
+                None => return Ok(false),
+                Some(account) => change(account),
+            }
+        }
+        self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+        Ok(true)
+    }
+
     /// Upserts, like the others: signing in to Kick again with the same
     /// username is how a rejected token gets replaced.
     pub fn add_kick(&self, mut config: KickAccountConfig) -> Result<KickAccountConfig> {
@@ -964,6 +1061,10 @@ impl AccountStore {
             a.use_tor = routed;
             a.strict_route = strict;
             true
+        } else if let Some(a) = self.telegram.lock().unwrap().get_mut(account_id) {
+            a.use_tor = routed;
+            a.strict_route = strict;
+            true
         } else {
             false
         };
@@ -992,6 +1093,9 @@ impl AccountStore {
             return pick(a.use_tor, a.strict_route);
         }
         if let Some(a) = self.get_twitch(account_id) {
+            return pick(a.use_tor, a.strict_route);
+        }
+        if let Some(a) = self.get_telegram(account_id) {
             return pick(a.use_tor, a.strict_route);
         }
         self.get_kick(account_id).and_then(|a| pick(a.use_tor, a.strict_route))
@@ -1076,6 +1180,13 @@ impl AccountStore {
         }
         {
             let removed = self.twitch.lock().unwrap().remove(account_id).is_some();
+            if removed {
+                self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
+                return Ok(true);
+            }
+        }
+        {
+            let removed = self.telegram.lock().unwrap().remove(account_id).is_some();
             if removed {
                 self.persist(&self.irc.lock().unwrap(), &self.discord.lock().unwrap(), &self.sneedchat.lock().unwrap(), &self.matrix.lock().unwrap(), &self.kick.lock().unwrap())?;
                 return Ok(true);
@@ -1245,6 +1356,9 @@ impl AccountStore {
         if self.mutate_twitch(account_id, |a| a.display_name = value.clone())? {
             return Ok(true);
         }
+        if self.mutate_telegram(account_id, |a| a.display_name = value.clone())? {
+            return Ok(true);
+        }
         let mut kick = self.kick.lock().unwrap();
         match kick.get_mut(account_id) {
             None => Ok(false),
@@ -1279,6 +1393,9 @@ impl AccountStore {
             return named(&a.display_name);
         }
         if let Some(a) = self.twitch.lock().unwrap().get(account_id) {
+            return named(&a.display_name);
+        }
+        if let Some(a) = self.telegram.lock().unwrap().get(account_id) {
             return named(&a.display_name);
         }
         self.kick.lock().unwrap().get(account_id).and_then(|a| named(&a.display_name))
@@ -1626,6 +1743,50 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
     }
 }
 
+/// Telegram has none of IRC's concepts either. `has_password` says there is a sign-in behind the account, which is
+/// what "signed in" means for one that never keeps a password.
+pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Account {
+    Account {
+        id: a.account_id(),
+        service: "telegram".to_string(),
+        status: "online".to_string(),
+        status_text: String::new(),
+        auto_idle: false,
+        display_name: a
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(a.name.clone()).filter(|s| !s.is_empty()))
+            .or_else(|| a.username.clone().filter(|s| !s.is_empty()))
+            .unwrap_or_else(|| a.phone.clone()),
+        state: state.to_string(),
+        autojoin: String::new(),
+        has_nickserv_password: false,
+        sasl_enabled: false,
+        sasl_username: String::new(),
+        allow_plaintext_sasl: false,
+        reconnect_for_sasl: false,
+        sasl_mechanism: String::new(),
+        has_sasl_certificate: false,
+        current_nick: String::new(),
+        highlight_keywords: Vec::new(),
+        ssl: true,
+        has_password: a.is_signed_in(),
+        avatar_url: None,
+        sneedchat_rooms: Vec::new(),
+        tor_mode: None,
+        tor_proxy: None,
+        use_tor: a.use_tor,
+        route_level: route_level(a.use_tor, a.strict_route),
+        has_key_backup: false,
+        rtc_focus_url: None,
+        sliding_sync: false,
+        dehydration: false,
+        web_session: false,
+        moderation: false,
+    }
+}
+
 /// Matrix has none of IRC's autojoin/SASL/NickServ concepts either - same
 /// zero-value convention as discord_account_to_json/sneedchat_account_to_json.
 /// `has_key_backup` comes from the caller (Runtime::list_accounts) rather
@@ -1878,5 +2039,61 @@ mod twitch_account_tests {
         assert!(s.get_twitch("twitch:someone").is_none());
         let reopened = AccountStore::open(s.path_for_tests().to_path_buf()).unwrap();
         assert!(reopened.all_twitch().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod telegram_account_tests {
+    use super::*;
+
+    fn store(name: &str) -> (AccountStore, PathBuf) {
+        let path = std::env::temp_dir().join(format!("nobilis-telegram-accounts-{name}-{}.toml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        (AccountStore::open(path.clone()).unwrap(), path)
+    }
+
+    fn account(user_id: i64) -> TelegramAccountConfig {
+        TelegramAccountConfig { api_id: 12345, api_hash: "abcdef".into(), phone: "+15551234567".into(), user_id, name: "Some One".into(), username: Some("someone".into()), ..Default::default() }
+    }
+
+    #[test]
+    fn a_telegram_account_survives_a_restart_without_its_session_in_the_file() {
+        let (s, path) = store("restart");
+        s.add_telegram(account(777)).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[[telegram_account]]"), "{text}");
+        assert!(!text.contains("session"), "the session is a file of its own, not a field here: {text}");
+        let reopened = AccountStore::open(path.clone()).unwrap();
+        let got = reopened.get_telegram("telegram:777").expect("found under the id built from Telegram's number");
+        assert_eq!((got.api_id, got.api_hash.as_str(), got.phone.as_str(), got.username.as_deref()), (12345, "abcdef", "+15551234567", Some("someone")));
+        assert!(got.is_signed_in());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn signing_in_again_keeps_what_the_person_set_up_and_removing_takes_only_that_account() {
+        let (s, path) = store("again");
+        s.add_telegram(account(1)).unwrap();
+        s.add_telegram(account(2)).unwrap();
+        s.set_route_level("telegram:1", "strict").unwrap();
+        s.set_display_name("telegram:1", "Me on Telegram").unwrap();
+        s.add_telegram(TelegramAccountConfig { name: "Renamed".into(), ..account(1) }).unwrap();
+        let got = s.get_telegram("telegram:1").unwrap();
+        assert_eq!((got.name.as_str(), got.display_name.as_deref(), got.strict_route), ("Renamed", Some("Me on Telegram"), true));
+        assert_eq!(s.route_level_of("telegram:1").as_deref(), Some("strict"));
+        assert_eq!(s.all_telegram().len(), 2);
+        assert!(s.remove("telegram:1").unwrap());
+        assert!(!s.remove("telegram:1").unwrap());
+        assert!(s.get_telegram("telegram:2").is_some());
+        assert!(AccountStore::open(path.clone()).unwrap().get_telegram("telegram:1").is_none(), "the file forgot too");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn the_listed_account_is_named_for_the_person_and_says_it_is_signed_in() {
+        let listed = telegram_account_to_json(&account(5), "connected");
+        assert_eq!((listed.service.as_str(), listed.id.as_str(), listed.display_name.as_str(), listed.has_password), ("telegram", "telegram:5", "Some One", true));
+        let unnamed = telegram_account_to_json(&TelegramAccountConfig { name: String::new(), username: None, ..account(5) }, "connected");
+        assert_eq!(unnamed.display_name, "+15551234567");
     }
 }
