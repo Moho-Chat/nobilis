@@ -188,6 +188,11 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
     let mut session = GatewaySession::default();
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
+        // A connection that will log in afresh (not pick a session back up) is counted, and held when the account has
+        // made too many lately: see identify_budget.
+        if session.resume.is_none() {
+            hold_for_login_budget(state, account_id).await;
+        }
         let result = std::panic::AssertUnwindSafe(run_gateway(state, config, &mut session)).catch_unwind().await;
         let requested_reconnect =
             matches!(&result, Ok(Err(e)) if e.downcast_ref::<ReconnectRequested>().is_some());
@@ -226,6 +231,22 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
         state.runtime.report_retry(state, account_id, &detail, wait);
         tokio::time::sleep(wait).await;
+    }
+}
+
+/// Waits until the account may make a fresh login, saying in the window why it is waiting.
+async fn hold_for_login_budget(state: &AppState, account_id: &str) {
+    loop {
+        match super::identify_budget::ask(account_id) {
+            Ok(()) => return,
+            Err(wait) => {
+                let detail = super::identify_budget::explain(wait);
+                tracing::warn!("discord[{account_id}]: {detail}");
+                state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+                state.runtime.report_retry(state, account_id, &detail, Duration::from_secs(wait.max(1) as u64));
+                tokio::time::sleep(Duration::from_secs(wait.max(1) as u64)).await;
+            }
+        }
     }
 }
 
