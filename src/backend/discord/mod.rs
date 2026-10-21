@@ -54,6 +54,7 @@ pub mod dave;
 pub mod golive;
 pub mod guilds;
 pub mod history;
+pub mod install_headers;
 pub mod session_store;
 pub mod http;
 pub mod login;

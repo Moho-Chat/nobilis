@@ -125,7 +125,7 @@ fn pause_for(seconds: Option<&str>) -> Duration {
 /// The client for requests made under `key` - the account's token, or its
 /// id - routed through Tor or the configured proxy when that account is.
 pub(super) fn http_client_for(key: &str) -> reqwest::Client {
-    discord_client(crate::net::route::router().routed(key))
+    discord_client(crate::net::route::router().routed(key), true)
 }
 
 /// The client for requests that belong to no account yet - the sign-in - or
@@ -133,14 +133,17 @@ pub(super) fn http_client_for(key: &str) -> reqwest::Client {
 /// when the add form's switch says so, or when any Discord account is.
 pub(super) fn anonymous_client() -> reqwest::Client {
     let router = crate::net::route::router();
-    discord_client(router.routed(&crate::net::route::pending_key("discord")) || router.wanted(SHARED_KEY))
+    discord_client(router.routed(&crate::net::route::pending_key("discord")) || router.wanted(SHARED_KEY), false)
 }
 
 /// Marked while any Discord account is routed.
 pub(super) const SHARED_KEY: &str = "discord:any-routed";
 
-fn discord_client(routed: bool) -> reqwest::Client {
-    crate::net::route::router().client_if("discord", routed, |builder| {
+/// `api` clients say which install, language and timezone they are (see `install_headers`); the others - the CDN,
+/// the sign-in before there is an account - do not, since nothing there asks.
+fn discord_client(routed: bool, api: bool) -> reqwest::Client {
+    crate::net::route::router().client_if(if api { "discord-api" } else { "discord" }, routed, |builder| {
+        let builder = if api { builder.default_headers(super::install_headers::headers().clone()) } else { builder };
         // Pinned to HTTP/1.1. Enabling reqwest's http2 feature (which the
         // file-upload path needs - see upload::http_client) would otherwise
         // let every client here negotiate h2 as a side effect, changing the

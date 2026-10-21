@@ -207,6 +207,15 @@ pub(super) struct Resume {
     seq: u64,
 }
 
+/// What IDENTIFY says this client is: moho, on Linux, in this machine's language.
+fn identify_properties() -> Value {
+    let mut properties = json!({ "os": "linux", "browser": "nobilis", "device": "nobilis" });
+    if let Some(locale) = super::install_headers::locale() {
+        properties["system_locale"] = Value::from(locale);
+    }
+    properties
+}
+
 pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
     let mut session = GatewaySession {
@@ -393,7 +402,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             "op": 2,
             "d": {
                 "token": config.token,
-                "properties": { "os": "linux", "browser": "nobilis", "device": "nobilis" },
+                "properties": identify_properties(),
                 "compress": false,
                 "large_threshold": 50,
                 // Carried in IDENTIFY as well as pushed live, so a status set
