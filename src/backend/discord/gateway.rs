@@ -59,6 +59,22 @@ impl std::fmt::Display for GatewayRateLimited {
 
 impl std::error::Error for GatewayRateLimited {}
 
+/// Close codes that say the session is gone and cannot be resumed: not authenticated, an invalid sequence number, a
+/// session that timed out. The next connection logs in afresh.
+const SESSION_LOST_CODES: [u16; 3] = [4003, 4007, 4009];
+
+/// The gateway closed the connection and ended the session with it.
+#[derive(Debug)]
+pub(super) struct SessionLost(u16);
+
+impl std::fmt::Display for SessionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the gateway ended the session (close code {})", self.0)
+    }
+}
+
+impl std::error::Error for SessionLost {}
+
 /// Discord's op 7: move to another server, resuming where this left off.
 /// Its own type so the retry loop can tell it from a failure.
 #[derive(Debug)]
@@ -85,6 +101,9 @@ where
                 }
                 if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_RATE_LIMITED) {
                     return Err(GatewayRateLimited.into());
+                }
+                if let Some(code) = frame.as_ref().map(|f| u16::from(f.code)).filter(|c| SESSION_LOST_CODES.contains(c)) {
+                    return Err(SessionLost(code).into());
                 }
                 bail!("connection closed: {frame:?}")
             }
@@ -173,6 +192,11 @@ pub(super) struct GatewaySession {
     channel_map: HashMap<String, (String, String)>,
     /// Each guild's payload as GUILD_CREATE delivered it.
     guild_context: HashMap<String, Value>,
+    /// The session as kept on disk, for a restart to resume.
+    persist: super::session_store::SessionFile,
+    /// What a resumed session is not sent again - READY and the GUILD_CREATEs saved from the last run - to be handled
+    /// as though they had just arrived, before anything is read from the socket.
+    pending: std::collections::VecDeque<Value>,
 }
 
 /// Enough to pick a session back up: what it was called, where to reconnect,
@@ -185,7 +209,17 @@ pub(super) struct Resume {
 
 pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig, account_id: &str) {
     let mut delay = RECONNECT_INITIAL_DELAY;
-    let mut session = GatewaySession::default();
+    let mut session = GatewaySession {
+        persist: super::session_store::SessionFile::new(account_id, &config.user_id, &config.token),
+        ..Default::default()
+    };
+    // A restart within a few minutes of the last session picks it up, as Discord's own client does, rather than
+    // logging in afresh: see session_store.
+    if let Some((position, replay)) = session.persist.load(&config.token, chrono::Utc::now().timestamp()) {
+        tracing::info!("discord[{account_id}]: resuming the session from before the restart");
+        session.resume = Some(Resume { session_id: position.session_id, url: position.url, seq: position.seq });
+        session.pending = replay.into();
+    }
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         // A connection that will log in afresh (not pick a session back up) is counted, and held when the account has
@@ -197,6 +231,14 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         let requested_reconnect =
             matches!(&result, Ok(Err(e)) if e.downcast_ref::<ReconnectRequested>().is_some());
         let rate_limited = matches!(&result, Ok(Err(e)) if e.downcast_ref::<GatewayRateLimited>().is_some());
+        // A session Discord has ended is not resumed, here or after a restart: the next connection is a login.
+        if matches!(&result, Ok(Err(e)) if e.downcast_ref::<SessionLost>().is_some()) {
+            session.resume = None;
+            session.persist.clear();
+            session.pending.clear();
+            session.channel_map.clear();
+            session.guild_context.clear();
+        }
         let detail = match result {
             Ok(Ok(())) => "gateway session ended".to_string(),
             Ok(Err(e)) => {
@@ -264,7 +306,7 @@ async fn hold_for_login_budget(state: &AppState, account_id: &str) {
 pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig, session: &mut GatewaySession) -> Result<()> {
     // Disjoint borrows, so the resume state can be updated while the maps
     // are being passed around mutably.
-    let GatewaySession { resume, channel_map, guild_context } = session;
+    let GatewaySession { resume, channel_map, guild_context, persist, pending } = session;
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
     let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());
@@ -379,9 +421,19 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     let mut tally_since = std::time::Instant::now();
 
     loop {
-        let msg = tokio::select! {
-            result = next_json(&mut stream) => result?,
-            _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
+        // What a resume does not send comes first, from the last run; `replaying` says so to the handlers.
+        let (msg, replaying) = match pending.front().cloned() {
+            Some(saved) => {
+                pending.pop_front();
+                (saved, true)
+            }
+            None => {
+                let msg = tokio::select! {
+                    result = next_json(&mut stream) => result?,
+                    _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
+                };
+                (msg, false)
+            }
         };
         let op = msg.get("op").and_then(|v| v.as_i64()).unwrap_or(-1);
         // Every dispatch is numbered, and a resume says how far it got.
@@ -443,14 +495,19 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             // Also what an interaction has to name - see
                             // Runtime::set_discord_gateway_session.
                             state.runtime.set_discord_gateway_session(&account_id, session_id);
-                            *resume = Some(Resume {
+                            let next = Resume {
                                 session_id: session_id.to_string(),
                                 url: d["resume_gateway_url"]
                                     .as_str()
                                     .map(|u| format!("{u}/?v=10&encoding=json"))
                                     .unwrap_or_else(|| GATEWAY_URL.to_string()),
                                 seq: msg.get("s").and_then(|v| v.as_u64()).unwrap_or(0),
-                            });
+                            };
+                            // A new session replaces what was kept; the saved one handled again is that same one.
+                            if !replaying {
+                                persist.ready(&next.session_id, &next.url, next.seq, d.clone());
+                            }
+                            *resume = Some(next);
                         }
                         if let Some(hash) = d["user"]["avatar"].as_str() {
                             let url = format!("https://cdn.discordapp.com/avatars/{}/{hash}.png", config.user_id);
@@ -507,8 +564,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         }
 
                         let mut new_dm_buffers: Vec<(String, String)> = Vec::new();
+                        // What Discord says each conversation's newest message
+                        // is, so catching up asks only about the ones that
+                        // have something newer than is stored.
+                        let mut newest_in: HashMap<String, Option<String>> = HashMap::new();
                         if let Some(dms) = d["private_channels"].as_array() {
                             for ch in dms {
+                                note_newest(&mut newest_in, ch);
                                 if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
                                     new_dm_buffers.push(pair);
                                 }
@@ -524,15 +586,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 update_presence_in_rosters(state, user_id, p["status"].as_str().unwrap_or("offline"), Some(activity));
                             }
                         }
-                        // Conversations are the ones people notice a gap in,
-                        // and there are few enough of them to ask about
-                        // directly. Channels wait until opened - a few hundred
-                        // requests on every connect would be rate-limited and
-                        // mostly wasted.
-                        spawn_dm_catch_up(state.clone(), config.clone(), channel_map.clone());
-
-                        state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
-                        tracing::info!("discord[{account_id}]: ready as {username}");
+                        // Saved ready is not yet accepted by Discord: RESUMED says when it is.
+                        if !replaying {
+                            state.runtime.set_conn_state(state, &account_id, ConnState::Connected, None);
+                        }
+                        tracing::info!("discord[{account_id}]: ready as {username}{}", if replaying { " (from the last run)" } else { "" });
 
                         // For an account in relatively few guilds, READY's own
                         // `guilds` array already carries full guild objects
@@ -558,30 +616,61 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // traffic for channel ids that never appeared there) -
                         // fetch the full list over REST as a follow-up rather
                         // than trusting the gateway snapshot alone.
-                        match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
-                            Ok(resp) => {
-                                let body = resp.text().await.unwrap_or_default();
-                                match serde_json::from_str::<Vec<Value>>(&body) {
-                                    Ok(channels) => {
-                                        for ch in &channels {
-                                            if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
-                                                new_dm_buffers.push(pair);
-                                            }
+                        //
+                        // A session picked up again after a restart already
+                        // has that list, kept with the rest of it - asking
+                        // again is a request for nothing.
+                        let listed: Option<Vec<Value>> = if replaying {
+                            d["moho_dms"].as_array().cloned()
+                        } else {
+                            match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
+                                Ok(resp) => {
+                                    let body = resp.text().await.unwrap_or_default();
+                                    match serde_json::from_str::<Vec<Value>>(&body) {
+                                        Ok(channels) => Some(channels),
+                                        Err(e) => {
+                                            tracing::warn!("discord[{account_id}]: parsing /users/@me/channels: {e}");
+                                            None
                                         }
                                     }
-                                    Err(e) => tracing::warn!("discord[{account_id}]: parsing /users/@me/channels: {e}"),
+                                }
+                                Err(e) => {
+                                    tracing::warn!("discord[{account_id}]: fetching /users/@me/channels: {e}");
+                                    None
                                 }
                             }
-                            Err(e) => tracing::warn!("discord[{account_id}]: fetching /users/@me/channels: {e}"),
+                        };
+                        for ch in listed.iter().flatten() {
+                            note_newest(&mut newest_in, ch);
+                            if let Some(pair) = register_dm_channel(state, &account_id, ch, channel_map, &presences) {
+                                new_dm_buffers.push(pair);
+                            }
+                        }
+                        if !replaying {
+                            persist.dms(listed.unwrap_or_default());
                         }
 
                         // The direct messages now exist, so the settings
                         // read at the top of READY have somewhere to land.
                         mutes::apply(state, &account_id);
 
+                        // Conversations are the ones people notice a gap in,
+                        // and there are few enough of them to ask about
+                        // directly - and only the ones Discord says have
+                        // moved on. Channels wait until opened: a few hundred
+                        // requests on every connect would be rate-limited and
+                        // mostly wasted.
+                        // (A resumed session is replayed what it missed.)
+                        if !replaying {
+                            spawn_dm_catch_up(state.clone(), config.clone(), channel_map.clone(), newest_in);
+                        }
+
                         spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_dm_buffers);
                     }
                     "GUILD_CREATE" => {
+                        if let (false, Some(id)) = (replaying, d["id"].as_str()) {
+                            persist.guild(id, d);
+                        }
                         register_guild_channels(state, config, d, channel_map).await;
                         // The channels this guild's settings were about now
                         // exist. READY carried the mutes before any of them
@@ -851,6 +940,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
 
                     "GUILD_DELETE" => {
+                        if let Some(id) = d["id"].as_str() {
+                            persist.guild_gone(id);
+                        }
                         let Some(guild_id) = d["id"].as_str() else { continue };
                         if d["unavailable"].as_bool() == Some(true) {
                             continue;
@@ -1392,6 +1484,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             // holding buffers for channels this account may no longer be in.
             9 => {
                 *resume = None;
+                persist.clear();
+                pending.clear();
                 channel_map.clear();
                 guild_context.clear();
                 bail!("session invalidated by gateway")
@@ -1400,7 +1494,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             // sending the *next* one, so a real ack landing between ticks
             // is exactly what keeps this connection from ever being
             // declared zombied in the first place.
-            11 => ack_pending.store(false, Ordering::SeqCst),
+            11 => {
+                ack_pending.store(false, Ordering::SeqCst);
+                // Alive as of now: what a restart soon enough will resume.
+                if let Some(r) = resume.as_ref() {
+                    persist.acked(r.seq);
+                }
+            }
             _ => {}
         }
     }

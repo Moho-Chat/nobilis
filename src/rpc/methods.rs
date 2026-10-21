@@ -756,6 +756,9 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                // And the Discord session kept for a restart to resume: a removed account must not leave its
+                // servers and friends in a file.
+                backend::discord::session_store::forget(id);
                 // And everything else this process is holding about it: the
                 // seventy-odd maps keyed by the account or by one of its
                 // buffers. In memory only, so it mattered exactly when

@@ -795,6 +795,12 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    // The window repeats its notice every few seconds for every service, and
+    // a Discord indicator stands for ten, so most of those would only be
+    // noise on the wire: one a channel per `TYPING_EVERY` is plenty.
+    if !typing_due(&channel_id) {
+        return Ok(());
+    }
     send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/typing"))
@@ -804,6 +810,24 @@ pub async fn send_typing(state: &AppState, buffer_id: &str, token: &str) -> Resu
     .await
         .context("sending a Discord typing notice")?;
     Ok(())
+}
+
+/// Shortest gap between two typing notices to the same channel. Short of the
+/// ten seconds an indicator lasts, so it never lapses mid-sentence.
+const TYPING_EVERY: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Whether a typing notice to this channel is due, noting it if so.
+fn typing_due(channel_id: &str) -> bool {
+    static LAST: std::sync::Mutex<Option<HashMap<String, std::time::Instant>>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    let last = last.get_or_insert_with(HashMap::new);
+    let now = std::time::Instant::now();
+    if last.get(channel_id).is_some_and(|at| now.duration_since(*at) < TYPING_EVERY) {
+        return false;
+    }
+    last.retain(|_, at| now.duration_since(*at) < TYPING_EVERY);
+    last.insert(channel_id.to_string(), now);
+    true
 }
 
 /// Tells Discord this conversation has been read up to its newest message.
@@ -824,6 +848,10 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
+    // Reading a channel again with nothing new in it says nothing new.
+    if !ack_due(&channel_id, &msg_id) {
+        return Ok(());
+    }
     let resp = send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
@@ -831,13 +859,37 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .json(&json!({ "token": serde_json::Value::Null }))
         )
     .await
+        .inspect_err(|_| forget_ack(&channel_id))
         .context("acking Discord read state")?;
     if !resp.status().is_success() {
+        forget_ack(&channel_id);
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         bail!("{}", refusal_text(status, &text));
     }
     Ok(())
+}
+
+/// The newest message each channel was last acked up to, this run.
+static ACKED: std::sync::Mutex<Option<HashMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// Whether acking `msg_id` in this channel would say anything new, noting it
+/// if so.
+fn ack_due(channel_id: &str, msg_id: &str) -> bool {
+    let mut acked = ACKED.lock().unwrap();
+    let acked = acked.get_or_insert_with(HashMap::new);
+    if acked.get(channel_id).is_some_and(|id| id == msg_id) {
+        return false;
+    }
+    acked.insert(channel_id.to_string(), msg_id.to_string());
+    true
+}
+
+/// A refused ack must be tried again, not remembered as done.
+fn forget_ack(channel_id: &str) {
+    if let Some(acked) = ACKED.lock().unwrap().as_mut() {
+        acked.remove(channel_id);
+    }
 }
 
 pub async fn delete_message(state: &AppState, buffer_id: &str, token: &str, msg_id: &str) -> Result<()> {
