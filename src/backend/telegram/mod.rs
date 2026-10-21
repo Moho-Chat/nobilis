@@ -29,6 +29,7 @@
 //! - `keyboards` - a bot's inline buttons
 //! - `bots` - a bot's command menu
 //! - `topics` - a group with Topics as several conversations
+//! - `gifs` - saved GIFs and the GIF search
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -49,6 +50,7 @@ pub mod admin;
 pub mod bots;
 pub mod connect;
 pub mod dialogs;
+pub mod gifs;
 pub mod history;
 pub mod instant;
 pub mod keyboards;

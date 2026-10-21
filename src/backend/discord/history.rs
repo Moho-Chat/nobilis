@@ -164,12 +164,36 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
     Ok(missing.len())
 }
 
-/// Asks every open conversation what it missed, one at a time.
+/// Notes what a channel object says its newest message is: `None` for a
+/// conversation with no messages, nothing at all when it does not say.
+pub(super) fn note_newest(into: &mut HashMap<String, Option<String>>, channel: &Value) {
+    let (Some(id), Some(last)) = (channel["id"].as_str(), channel.get("last_message_id")) else { return };
+    into.insert(id.to_string(), last.as_str().map(String::from));
+}
+
+/// Whether Discord's newest message is newer than the newest stored. Ids are
+/// snowflakes, which grow with time; one that will not parse is taken as
+/// newer, since asking is the safe answer.
+fn has_newer(theirs: Option<&str>, ours: Option<&str>) -> bool {
+    let Some(theirs) = theirs else { return false };
+    let Some(ours) = ours else { return true };
+    match (theirs.parse::<u64>(), ours.parse::<u64>()) {
+        (Ok(t), Ok(o)) => t > o,
+        _ => true,
+    }
+}
+
+/// Asks the open conversations that moved on what they missed, one at a time.
 ///
 /// Spaced out deliberately: this runs right after connecting, alongside
 /// everything else a fresh connection does, and a burst of requests is the
 /// quickest way to be rate-limited by a service that has just let us in.
-pub(super) fn spawn_dm_catch_up(state: AppState, config: DiscordAccountConfig, channels: HashMap<String, (String, String)>) {
+pub(super) fn spawn_dm_catch_up(
+    state: AppState,
+    config: DiscordAccountConfig,
+    channels: HashMap<String, (String, String)>,
+    newest_in: HashMap<String, Option<String>>,
+) {
     tokio::spawn(async move {
         let account_id = config.account_id();
         let dms: Vec<(String, String)> = channels
@@ -177,6 +201,14 @@ pub(super) fn spawn_dm_catch_up(state: AppState, config: DiscordAccountConfig, c
             .filter(|(_, (_, kind))| kind == "dm")
             .filter_map(|(channel_id, (name, _))| {
                 let buffer = state.runtime.list_buffers().into_iter().find(|b| b.account_id == account_id && &b.name == name)?;
+                // Discord's word for the newest message, when it gave one:
+                // nothing newer than what is stored means nothing missed.
+                if let Some(theirs) = newest_in.get(channel_id) {
+                    let ours = state.store.newest_msg_id(&buffer.id).ok().flatten();
+                    if !has_newer(theirs.as_deref(), ours.as_deref()) {
+                        return None;
+                    }
+                }
                 Some((buffer.id, channel_id.clone()))
             })
             .collect();
@@ -317,4 +349,36 @@ pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, m
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.timestamp())
         .context("Discord did not return that message")
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_conversation_is_asked_about_only_when_discord_has_a_newer_message() {
+        assert!(has_newer(Some("200"), Some("100")));
+        assert!(!has_newer(Some("100"), Some("100")));
+        assert!(!has_newer(Some("99"), Some("100")));
+        // Nothing stored, but something said: a first sight is the backfill's, yet asking is harmless.
+        assert!(has_newer(Some("5"), None));
+        // An empty conversation has nothing to miss.
+        assert!(!has_newer(None, Some("100")));
+        // Ids that are not numbers are not compared.
+        assert!(has_newer(Some("abc"), Some("100")));
+        // Snowflakes outgrow 32 bits.
+        assert!(has_newer(Some("1500000000000000001"), Some("1500000000000000000")));
+    }
+
+    #[test]
+    fn what_a_channel_says_of_its_newest_message_is_noted_as_it_says_it() {
+        let mut into = HashMap::new();
+        note_newest(&mut into, &json!({ "id": "1", "last_message_id": "10" }));
+        note_newest(&mut into, &json!({ "id": "2", "last_message_id": null }));
+        note_newest(&mut into, &json!({ "id": "3" }));
+        assert_eq!(into.get("1"), Some(&Some("10".to_string())));
+        assert_eq!(into.get("2"), Some(&None));
+        assert!(!into.contains_key("3"));
+    }
 }

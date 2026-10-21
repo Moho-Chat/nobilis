@@ -1,6 +1,6 @@
 [package]
 name = "nobilis"
-version = "1.2.1"
+version = "1.3.0"
 edition = "2021"
 description = "Chat daemon: IRC, Discord, Sneedchat and Matrix behind one unified JSON model over a Unix socket"
 license = "GPL-3.0-or-later"
@@ -127,6 +127,7 @@ sonora = "0.2"
 # Soundboard sounds are MP3 or Ogg Vorbis, decoded here to be mixed into a call.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "ogg", "vorbis"] }
 imagesize = "0.13"
+iana-time-zone = "0.1.65"
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

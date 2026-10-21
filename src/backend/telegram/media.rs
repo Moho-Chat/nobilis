@@ -406,6 +406,10 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
         fetch_avatar(&handle, &peer, photo, path).await?;
         return Ok(path.to_path_buf());
     }
+    // A GIF the picker listed is fetched from what the picker remembered of it.
+    if name.starts_with("tgif_") {
+        return super::gifs::restore(state, name, path).await?.context("not a cached Telegram GIF");
+    }
     let (account, remote, message, variant) = parse_media_name(name).context("not a cached Telegram file")?;
     // A preview already on its way is waited for, not fetched a second time.
     for _ in 0..120 {

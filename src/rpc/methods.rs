@@ -756,6 +756,9 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                // And the Discord session kept for a restart to resume: a removed account must not leave its
+                // servers and friends in a file.
+                backend::discord::session_store::forget(id);
                 // And everything else this process is holding about it: the
                 // seventy-odd maps keyed by the account or by one of its
                 // buffers. In memory only, so it mattered exactly when
@@ -5771,6 +5774,35 @@ pub async fn dispatch(
         // bufferId (not roomId) throughout, matching every other message-
         // scoped Matrix method - the buffer->room_id lookup happens inside
         // moderation.rs itself, same as sendMessage/editMessage/etc.
+        // The GIFs a Telegram account can send: its saved ones, or what Telegram's GIF search finds; and sending one.
+        "listTelegramGifs" | "sendTelegramGif" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            if method == "listTelegramGifs" {
+                return match backend::telegram::gifs::list(state, &buffer, p_str(params, "query", "")).await {
+                    Ok(list) => (Some(list), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::telegram::gifs::send(state, &buffer, p_str(params, "id", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // Lets a Discord connection that is being held for having logged in too often through now.
+        "connectDiscordAnyway" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("discord:")) else {
+                return (None, Some("connectDiscordAnyway requires a Discord \"accountId\"".to_string()));
+            };
+            if backend::discord::identify_budget::connect_anyway(account_id) {
+                (Some(ok_node()), None)
+            } else {
+                (None, Some("That account is not being held".to_string()))
+            }
+        }
+
         // Pressing a button under a bot's message; answers what the bot said back, for the window to show.
         "pressTelegramButton" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
