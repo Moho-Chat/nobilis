@@ -5788,6 +5788,18 @@ pub async fn dispatch(
             }
         }
 
+        // Lets a Discord connection that is being held for having logged in too often through now.
+        "connectDiscordAnyway" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("discord:")) else {
+                return (None, Some("connectDiscordAnyway requires a Discord \"accountId\"".to_string()));
+            };
+            if backend::discord::identify_budget::connect_anyway(account_id) {
+                (Some(ok_node()), None)
+            } else {
+                (None, Some("That account is not being held".to_string()))
+            }
+        }
+
         // Pressing a button under a bot's message; answers what the bot said back, for the window to show.
         "pressTelegramButton" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {

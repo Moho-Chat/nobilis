@@ -73,6 +73,49 @@ pub fn ask(account_id: &str) -> Result<(), i64> {
     answer
 }
 
+/// The accounts whose login is being held now, each with the way to let it through.
+type Held = Mutex<HashMap<String, std::sync::Arc<tokio::sync::Notify>>>;
+
+fn waiting() -> &'static Held {
+    static W: std::sync::OnceLock<Held> = std::sync::OnceLock::new();
+    W.get_or_init(Default::default)
+}
+
+/// Marks an account as being held, answering what to wait on besides the clock.
+pub fn begin_hold(account_id: &str) -> std::sync::Arc<tokio::sync::Notify> {
+    waiting().lock().unwrap_or_else(|e| e.into_inner()).entry(account_id.to_string()).or_default().clone()
+}
+
+/// The hold is over, by the clock or by the person.
+pub fn end_hold(account_id: &str) {
+    waiting().lock().unwrap_or_else(|e| e.into_inner()).remove(account_id);
+}
+
+/// Lets a held login through now. `false` when nothing was being held, so that pressing the button twice, or after the
+/// hold ended, cannot leave a pass waiting for some later hold.
+pub fn connect_anyway(account_id: &str) -> bool {
+    match waiting().lock().unwrap_or_else(|e| e.into_inner()).get(account_id) {
+        Some(note) => {
+            note.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Counts a login that was let through past the limit: it still counts towards the next ones.
+pub fn record(account_id: &str) {
+    let now = chrono::Utc::now().timestamp();
+    let mut slot = held().lock().unwrap_or_else(|e| e.into_inner());
+    let saved = slot.get_or_insert_with(|| std::fs::read_to_string(file()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default());
+    let history = saved.accounts.entry(account_id.to_string()).or_default();
+    history.retain(|t| now - t < DAY);
+    history.push(now);
+    if let Ok(text) = serde_json::to_string(saved) {
+        let _ = std::fs::write(file(), text);
+    }
+}
+
 /// What the window says while a login is held.
 pub fn explain(wait: i64) -> String {
     let at = chrono::Local::now() + chrono::Duration::seconds(wait);
@@ -116,6 +159,15 @@ mod tests {
         assert_eq!(made, PER_DAY);
         let wait = admit(&mut history, start + 3 * HOUR).unwrap_err();
         assert_eq!(wait, DAY - 3 * HOUR);
+    }
+
+    #[test]
+    fn a_pass_is_only_given_to_a_login_that_is_being_held() {
+        assert!(!connect_anyway("discord:test-never-held"), "nothing is held, so nothing is let through");
+        let _pass = begin_hold("discord:test-held");
+        assert!(connect_anyway("discord:test-held"));
+        end_hold("discord:test-held");
+        assert!(!connect_anyway("discord:test-held"), "after the hold ends there is nothing to let through");
     }
 
     #[test]

@@ -234,7 +234,8 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
     }
 }
 
-/// Waits until the account may make a fresh login, saying in the window why it is waiting.
+/// Waits until the account may make a fresh login, saying in the window why it is waiting. The person may let it
+/// through sooner ("Connect anyway"); that login is still counted.
 async fn hold_for_login_budget(state: &AppState, account_id: &str) {
     loop {
         match super::identify_budget::ask(account_id) {
@@ -244,7 +245,17 @@ async fn hold_for_login_budget(state: &AppState, account_id: &str) {
                 tracing::warn!("discord[{account_id}]: {detail}");
                 state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
                 state.runtime.report_retry(state, account_id, &detail, Duration::from_secs(wait.max(1) as u64));
-                tokio::time::sleep(Duration::from_secs(wait.max(1) as u64)).await;
+                let pass = super::identify_budget::begin_hold(account_id);
+                let let_through = tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(wait.max(1) as u64)) => false,
+                    _ = pass.notified() => true,
+                };
+                super::identify_budget::end_hold(account_id);
+                if let_through {
+                    tracing::warn!("discord[{account_id}]: connecting past the login limit, as asked");
+                    super::identify_budget::record(account_id);
+                    return;
+                }
             }
         }
     }
