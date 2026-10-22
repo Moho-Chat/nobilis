@@ -28,26 +28,20 @@ impl Drop for HistoryFetch<'_> {
     }
 }
 
-/// Fires off history backfill for a batch of newly-registered buffers as a
-/// background task, sequentially with a small delay between requests - a
-/// guild can easily have 30+ channels (confirmed live), and firing that
-/// many REST requests at once risks Discord's rate limiter; a one-time
-/// startup cost taking a few extra seconds in the background is a fine
-/// trade for not tripping it.
-pub(super) fn spawn_backfill(state: AppState, token: String, user_id: String, display_name: Option<String>, targets: Vec<(String, String)>) {
-    if targets.is_empty() {
-        return;
-    }
-    tokio::spawn(async move {
-        for (buffer_id, channel_id) in targets {
-            backfill_channel_history(&state, &token, &user_id, display_name.as_deref(), &buffer_id, &channel_id).await;
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    });
+/// How many messages a conversation is first opened with. Few: the rest is a scroll away (`extend_history`), and a
+/// client that asks for fifty of every conversation it is shown is asking for what nobody reads.
+const FIRST_PAGE: &str = "30";
+
+/// The time a message was sent, from its id: a snowflake's top bits are milliseconds since Discord's epoch. How a
+/// conversation's last activity is known without fetching anything of it.
+pub(super) fn snowflake_secs(id: &str) -> Option<i64> {
+    const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
+    let id: u64 = id.parse().ok()?;
+    Some(((id >> 22) + DISCORD_EPOCH_MS) as i64 / 1000)
 }
 
-/// Backfills up to 50 recent messages for a channel/DM with no scrollback
-/// yet. Unlike IRC (which has no server-side history at all - nobilis only
+/// Backfills the most recent messages for a channel/DM with no scrollback
+/// yet - when it is first opened, and not before. Unlike IRC (which has no server-side history at all - nobilis only
 /// ever knows what it's personally seen live), Discord actually retains
 /// and exposes history, so starting every buffer blank here would look
 /// broken compared to Discord's own client. Seed-once, not sync: a buffer
@@ -61,7 +55,7 @@ pub(super) fn spawn_backfill(state: AppState, token: String, user_id: String, di
 /// "notification" event, neither of which should fire for messages from
 /// potentially weeks ago just because this is the first time nobilis has
 /// seen the channel.
-pub(super) async fn backfill_channel_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
+pub async fn backfill_channel_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
     match state.store.has_messages(buffer_id) {
         Ok(true) => return,
         Ok(false) => {}
@@ -73,9 +67,9 @@ pub(super) async fn backfill_channel_history(state: &AppState, token: &str, user
 
     let resp = match http_client_for(token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
-        .query(&[("limit", "50")])
+        .query(&[("limit", FIRST_PAGE)])
         .header("Authorization", token)
-        .send()
+        .send_paced()
         .await
     {
         Ok(r) => r,
@@ -127,7 +121,7 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", limit.clamp(1, 100).to_string().as_str())])
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .context("re-reading history")?;
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -250,7 +244,7 @@ pub async fn catch_up_channel(
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("after", after_id.as_str())])
             .header("Authorization", token)
-            .send()
+            .send_paced()
             .await
             .context("fetching missed messages")?;
         if resp.status().is_success() {
@@ -278,7 +272,7 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("before", before_id.as_str())])
             .header("Authorization", token)
-            .send()
+            .send_paced()
             .await
             .context("fetching more history")?;
         if resp.status().is_success() {
@@ -311,7 +305,7 @@ pub async fn load_newer(state: &AppState, account_id: &str, buffer_id: &str, mes
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("after", message_id)])
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading the rest of the channel")?;
     if !resp.status().is_success() {
@@ -331,7 +325,7 @@ pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, m
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50"), ("around", message_id)])
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading that part of the channel")?;
     if !resp.status().is_success() {
@@ -355,6 +349,15 @@ pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, m
 mod catch_up_tests {
     use super::*;
     use serde_json::json;
+
+    /// Discord's own documentation's example: 175928847299117063 was made at 2016-04-30 11:18:25.796 UTC.
+    #[test]
+    fn the_time_of_a_message_is_read_from_its_id() {
+        assert_eq!(snowflake_secs("175928847299117063"), Some(1_462_015_105));
+        assert_eq!(snowflake_secs("not a number"), None);
+        // What `search::snowflake_at` makes of a time reads back as that time.
+        assert_eq!(snowflake_secs(&super::search::snowflake_at(1_700_000_000)), Some(1_700_000_000));
+    }
 
     #[test]
     fn a_conversation_is_asked_about_only_when_discord_has_a_newer_message() {

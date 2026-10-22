@@ -249,7 +249,7 @@ pub(super) async fn run_resign(state: &AppState, buffer_id: &str, mut stale: Vec
             .get(format!("{API_BASE}/channels/{channel_id}/messages"))
             .query(&[("limit", "50"), ("around", anchor.as_str())])
             .header("Authorization", &config.token)
-            .send()
+            .send_paced()
             .await
             .context("fetching a page to re-sign")?;
         if !resp.status().is_success() {
@@ -358,7 +358,7 @@ pub async fn refresh_attachments(state: &AppState, buffer_id: &str, message_id: 
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "1"), ("around", message_id)])
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .context("re-fetching the message")?;
     if !resp.status().is_success() {

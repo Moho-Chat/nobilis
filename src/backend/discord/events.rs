@@ -135,7 +135,7 @@ pub async fn list(state: &AppState, account_id: &str, guild_id: &str) -> Result<
         .get(format!("{API_BASE}/guilds/{guild_id}/scheduled-events"))
         .query(&[("with_user_count", "true")])
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading the events")?;
     if resp.status().is_success() {
@@ -153,7 +153,7 @@ pub async fn list(state: &AppState, account_id: &str, guild_id: &str) -> Result<
             .get(format!("{API_BASE}/guilds/{guild_id}/scheduled-events/{id}/users"))
             .query(&[("limit", "100")])
             .header("Authorization", &cfg.token)
-            .send()
+            .send_paced()
             .await
         {
             if let Ok(users) = resp.json::<Value>().await {
@@ -380,7 +380,7 @@ pub async fn share_targets(state: &AppState, account_id: &str, guild_id: &str) -
                 .get(format!("{API_BASE}/users/{user_id}/profile"))
                 .query(&[("with_mutual_guilds", "true")])
                 .header("Authorization", &token)
-                .send()
+                .send_paced()
                 .await
             {
                 if let Ok(profile) = resp.json::<Value>().await {

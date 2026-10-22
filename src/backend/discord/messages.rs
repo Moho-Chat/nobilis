@@ -23,7 +23,7 @@ pub async fn list_pinned(state: &AppState, account_id: &str, buffer_id: &str) ->
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/pins"))
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading the pins")?;
     if !resp.status().is_success() {
@@ -96,7 +96,7 @@ pub async fn set_pinned(state: &AppState, account_id: &str, buffer_id: &str, mes
     let http = http_client_for(&cfg.token);
     let request = if pinned { http.put(url) } else { http.delete(url) };
     let doing = if pinned { "pinning the message" } else { "unpinning the message" };
-    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    let resp = request.header("Authorization", &cfg.token).send_paced().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -601,7 +601,7 @@ pub async fn name_forward(state: &AppState, account_id: &str, buffer_id: &str, m
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{source_channel}/messages?limit=1&around={source_message}"))
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await;
     // A source this account cannot see is the ordinary case for a forward
     // out of somebody else's server, and not worth a word to anybody.
@@ -1680,7 +1680,7 @@ pub async fn list_reactors(state: &AppState, account_id: &str, buffer_id: &str, 
     let resp = http_client_for(&cfg.token)
         .get(url)
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading who reacted")?;
     if !resp.status().is_success() {
@@ -1743,7 +1743,7 @@ pub async fn reread_embeds(state: &AppState, buffer_id: &str) -> Result<usize> {
         .get(format!("{API_BASE}/channels/{channel_id}/messages"))
         .query(&[("limit", "50")])
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .context("re-reading the conversation")?;
     if !resp.status().is_success() {

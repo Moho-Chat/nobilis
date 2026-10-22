@@ -151,7 +151,7 @@ pub fn spawn(state: AppState, config: DiscordAccountConfig) {
     state.runtime.insert_task_handle(&account_id, join_handle.abort_handle());
 }
 
-pub(super) const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(3);
+pub(super) const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(4);
 
 pub(super) const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
@@ -206,6 +206,18 @@ pub(super) struct Resume {
     url: String,
     seq: u64,
 }
+
+/// The gateway capabilities this client declares in IDENTIFY, as a user client does (Dissent's `ningen` sends the same
+/// five of the seven it knows): notes fetched lazily, read states and guild settings in their versioned form, guild
+/// experiments as populations, and read states for things that are not channels. Each changes only the shape of a
+/// field READY carries and this client either ignores (`read_state`, notes, experiments) or reads in both shapes
+/// (`user_guild_settings`, see `mutes::note_settings`).
+///
+/// Not declared: DEDUPE_USER_OBJECTS (16) and PRIORITIZED_READY_PAYLOAD (32). They move users out of READY into a
+/// table by id and split the rest into a second event, and the friends list, the names of conversations and the
+/// presences here are built from the objects that would no longer be there. They need a real READY to be written
+/// against, not a guess at one.
+pub(super) const CAPABILITIES: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7);
 
 /// What IDENTIFY says this client is: moho, on Linux, in this machine's language.
 fn identify_properties() -> Value {
@@ -382,6 +394,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // Exposed so setAccountStatus can push a presence update onto this
     // connection rather than waiting for a reconnect to carry it.
     let account_id = config.account_id();
+    // A connection starts with no subscriptions.
+    super::presence::forget_member_subscriptions(&account_id);
     state.runtime.set_discord_gateway_sender(&account_id, out_tx.clone());
     struct ClearSenderOnDrop<'a>(&'a AppState, String);
     impl Drop for ClearSenderOnDrop<'_> {
@@ -403,6 +417,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             "d": {
                 "token": config.token,
                 "properties": identify_properties(),
+                "capabilities": CAPABILITIES,
                 "compress": false,
                 "large_threshold": 50,
                 // Carried in IDENTIFY as well as pushed live, so a status set
@@ -614,8 +629,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // harmlessly on a guild it's already seen via either
                         // path (channel_map dedup).
                         if let Some(guilds) = d["guilds"].as_array() {
-                            for g in guilds {
-                                register_guild_channels(state, config, g, channel_map).await;
+                            // Our own membership of each, from READY's list of them, so that no guild is asked about.
+                            let merged = d["merged_members"].as_array();
+                            for (i, g) in guilds.iter().enumerate() {
+                                let with_me = guild_with_own_member(g, merged.and_then(|m| m.get(i)), &config.user_id);
+                                register_guild_channels(state, config, with_me.as_ref().unwrap_or(g), channel_map).await;
                             }
                         }
 
@@ -632,7 +650,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let listed: Option<Vec<Value>> = if replaying {
                             d["moho_dms"].as_array().cloned()
                         } else {
-                            match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send().await {
+                            match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send_paced().await {
                                 Ok(resp) => {
                                     let body = resp.text().await.unwrap_or_default();
                                     match serde_json::from_str::<Vec<Value>>(&body) {
@@ -674,7 +692,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             spawn_dm_catch_up(state.clone(), config.clone(), channel_map.clone(), newest_in);
                         }
 
-                        spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_dm_buffers);
+                        // Nor is any conversation's history fetched here: it is read when it is opened (see getBacklog).
+                        let _ = new_dm_buffers;
                     }
                     "GUILD_CREATE" => {
                         if let (false, Some(id)) = (replaying, d["id"].as_str()) {
@@ -846,6 +865,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     // own state rather than needing to guess.
                     "MESSAGE_ACK" => {
                         let Some(channel_id) = d["channel_id"].as_str() else { continue };
+                        // Remembered, so what is read here to the same point is not told to Discord a second time.
+                        if let Some(message_id) = d["message_id"].as_str() {
+                            super::send::acked_elsewhere(channel_id, message_id);
+                        }
                         let Some((name, _)) = channel_map.get(channel_id) else { continue };
                         state.events.emit(
                             "bufferRead",
@@ -1270,12 +1293,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         mutes::note_settings(state, &account_id, d);
                     }
 
-                    "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {
-                        let Some(guild_id) = d["guild_id"].as_str() else { continue };
-                        if let Some(buffer_id) = state.runtime.discord_member_list_target(&account_id, guild_id) {
-                            request_member_list(state, &buffer_id);
-                        }
-                    }
+                    // Not a reason to ask for the list again: the list is subscribed to, and Discord sends what changes in
+                    // it. Asking at every join and leave of a busy server was a request for what was already coming.
+                    "GUILD_MEMBER_ADD" | "GUILD_MEMBER_REMOVE" => {}
+
 
                     // A purge. Without this every message in it stayed on
                     // screen, since the per-message deletes are not sent.

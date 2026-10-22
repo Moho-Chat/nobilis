@@ -42,6 +42,11 @@ pub(super) fn register_dm_channel(
             }
         });
     }
+    // When it was last spoken in, from the id of its last message - which is all that ordering the list by activity
+    // needs, so nothing is fetched for it.
+    if let Some(at) = ch["last_message_id"].as_str().and_then(super::history::snowflake_secs) {
+        state.runtime.raise_buffer_activity(state, &buf.id, at);
+    }
     if let Some(avatar) = dm_avatar_url(ch) {
         state.runtime.set_buffer_avatar(state, &buf.id, &avatar);
     }
@@ -168,7 +173,7 @@ pub async fn profile(state: &AppState, account_id: &str, buffer_id: &str, user_i
         }
     }
 
-    let response = http_client_for(&config.token).get(&url).header("Authorization", &config.token).send().await;
+    let response = http_client_for(&config.token).get(&url).header("Authorization", &config.token).send_paced().await;
     let Ok(body) = response else { return profile };
     let Ok(body) = body.json::<Value>().await else { return profile };
 
@@ -297,7 +302,7 @@ pub async fn adopt_dm_channel(state: &AppState, account_id: &str, channel_id: &s
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/channels/{channel_id}"))
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .context("asking about that conversation")?;
     if !resp.status().is_success() {
@@ -381,7 +386,7 @@ pub async fn answer_friend_request(state: &AppState, account_id: &str, user_id: 
     let url = format!("{API_BASE}/users/@me/relationships/{user_id}");
     let request = if accept { http.put(url).json(&json!({})) } else { http.delete(url) };
     let doing = if accept { "accepting the friend request" } else { "declining the friend request" };
-    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    let resp = request.header("Authorization", &cfg.token).send_paced().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();

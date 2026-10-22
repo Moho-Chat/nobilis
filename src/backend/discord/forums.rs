@@ -125,7 +125,7 @@ async fn search_page(token: &str, channel_id: &str, sort_by: &str, archived: boo
             .get(format!("{API_BASE}/channels/{channel_id}/threads/search"))
             .query(&query)
             .header("Authorization", token)
-            .send()
+            .send_paced()
             .await
             .context("reading the forum")?;
         if !resp.status().is_success() {
@@ -216,7 +216,7 @@ pub async fn list_forum_posts(state: &AppState, account_id: &str, buffer_id: &st
                 .get(format!("{API_BASE}/channels/{id}/messages"))
                 .query(&[("limit", "1"), ("after", "0")])
                 .header("Authorization", token)
-                .send()
+                .send_paced()
                 .await
                 .ok()?;
             if !resp.status().is_success() {

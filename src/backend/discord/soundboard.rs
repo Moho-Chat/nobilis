@@ -95,7 +95,7 @@ async fn default_sounds(token: &str) -> Vec<Sound> {
         let resp = http_client_for(token)
             .get(format!("{API_BASE}/soundboard-default-sounds"))
             .header("Authorization", token)
-            .send()
+            .send_paced()
             .await
             .ok()?;
         resp.status().is_success().then_some(())?;
@@ -229,7 +229,7 @@ async fn fetch(token: &str, id: &str) -> Result<Vec<u8>> {
     }
     let resp = http_client_for(token)
         .get(format!("https://cdn.discordapp.com/soundboard-sounds/{id}"))
-        .send()
+        .send_paced()
         .await
         .context("fetching the sound")?;
     if !resp.status().is_success() {

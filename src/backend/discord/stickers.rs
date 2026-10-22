@@ -74,7 +74,7 @@ pub async fn lottie_file(token: &str, id: &str) -> Result<String> {
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         let resp = http_client_for(token)
             .get(lottie_url(id))
-            .send()
+            .send_paced()
             .await
             .context("fetching the sticker")?;
         if !resp.status().is_success() {
@@ -157,7 +157,7 @@ async fn standard_packs(token: &str) -> Vec<(String, Vec<Sticker>)> {
         let resp = http_client_for(token)
             .get(format!("{API_BASE}/sticker-packs"))
             .header("Authorization", token)
-            .send()
+            .send_paced()
             .await
             .ok()?;
         if !resp.status().is_success() {

@@ -1544,6 +1544,24 @@ impl Runtime {
         }
     }
 
+    /// Says a conversation was active at `ts`, if that is later than what is known: for a service that tells when its
+    /// last message was without sending it.
+    pub fn raise_buffer_activity(&self, state: &AppState, buffer_id: &str, ts: i64) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if b.last_activity_ts < ts => {
+                    b.last_activity_ts = ts;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
     pub fn is_server_buffer(&self, buffer_id: &str) -> bool {
         self.buffers
             .lock()

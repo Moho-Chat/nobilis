@@ -87,7 +87,7 @@ pub async fn list_gifs(state: &AppState, query: &str) -> Result<Value> {
     let resp = http_client_for(&config.token)
         .get(url)
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .context("asking Discord for GIFs")?;
     if !resp.status().is_success() {
