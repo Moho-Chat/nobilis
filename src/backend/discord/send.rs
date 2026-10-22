@@ -262,6 +262,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     super::send_guard::ensure_may_speak(state, buffer_id)?;
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    super::send_guard::check_text(&content, state.runtime.discord_premium(&account_id), false)?;
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
     super::send_guard::stamp(&mut payload);
@@ -403,6 +404,7 @@ pub async fn send_attachments(
     // mention like any other.
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
+    super::send_guard::check_text(&content, state.runtime.discord_premium(&account_id), true)?;
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
     super::send_guard::stamp(&mut payload);
@@ -868,7 +870,12 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    let Some(msg_id) = state.store.newest_msg_id(buffer_id)? else { return Ok(()) };
+    let Some((msg_id, own)) = state.store.newest_msg(buffer_id)? else { return Ok(()) };
+    // Nothing to tell Discord about a conversation whose last word is the account's own: sending a message reads
+    // everything before it, on every device, and Discord's own clients do not ack what they sent.
+    if own {
+        return Ok(());
+    }
     // Reading a channel again with nothing new in it says nothing new.
     if !ack_due(&channel_id, &msg_id) {
         return Ok(());
@@ -904,6 +911,22 @@ fn ack_due(channel_id: &str, msg_id: &str) -> bool {
     }
     acked.insert(channel_id.to_string(), msg_id.to_string());
     true
+}
+
+/// Another client of the account read this far: no need to say it again from here.
+pub(super) fn acked_elsewhere(channel_id: &str, msg_id: &str) {
+    let mut acked = ACKED.lock().unwrap();
+    // Never backwards: an ack from a device that is behind does not make this one's later ack redundant.
+    let newer = match acked.get_or_insert_with(HashMap::new).get(channel_id) {
+        Some(known) => match (known.parse::<u64>(), msg_id.parse::<u64>()) {
+            (Ok(k), Ok(m)) => m > k,
+            _ => true,
+        },
+        None => true,
+    };
+    if newer {
+        acked.get_or_insert_with(HashMap::new).insert(channel_id.to_string(), msg_id.to_string());
+    }
 }
 
 /// A refused ack must be tried again, not remembered as done.
@@ -1020,5 +1043,21 @@ mod refusal_tests {
         assert_eq!(describe_seconds(600), "10 minutes");
         assert_eq!(describe_seconds(3600), "1 hour");
         assert_eq!(describe_seconds(45), "45 seconds");
+    }
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+
+    #[test]
+    fn an_ack_made_elsewhere_is_not_made_again_and_never_moves_backwards() {
+        // Own ids for this test: the table is shared by the process.
+        let channel = "ack-test-channel";
+        acked_elsewhere(channel, "200");
+        assert!(!ack_due(channel, "200"), "read this far on another device");
+        assert!(ack_due(channel, "300"), "something newer is still to be told");
+        acked_elsewhere(channel, "250");
+        assert!(!ack_due(channel, "300"), "an older ack from elsewhere does not undo what was told");
     }
 }

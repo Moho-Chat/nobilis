@@ -54,21 +54,98 @@ async fn pace() {
     }
 }
 
+/// Where every read waits its turn: when Discord has said how long to hold off - a 429, or a bucket that ran out - no
+/// request of any kind goes out before then.
+static HOLD_UNTIL: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// What is added to a bucket's reset time, as in arikawa's limiter: Discord's own clock and ours do not agree to the
+/// millisecond, and arriving on the boundary is arriving early.
+const BUCKET_SLACK: Duration = Duration::from_millis(250);
+
+/// How many times a read that was rate limited is made again, waiting as long as it was told to.
+const READ_RETRIES: usize = 2;
+
+fn hold_for(wait: Duration) {
+    let until = std::time::Instant::now() + wait;
+    let mut held = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_none_or(|at| at < until) {
+        *held = Some(until);
+    }
+}
+
+async fn wait_out_hold() {
+    loop {
+        let wait = {
+            let held = HOLD_UNTIL.lock().unwrap_or_else(|e| e.into_inner());
+            held.map(|at| at.saturating_duration_since(std::time::Instant::now())).unwrap_or_default()
+        };
+        if wait.is_zero() {
+            return;
+        }
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// Notes what a response says about the bucket it counted against: with none left, nothing goes out until it resets.
+fn note_bucket(resp: &reqwest::Response) {
+    let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    if header("x-ratelimit-remaining") == Some("0") {
+        if let Some(reset) = header("x-ratelimit-reset-after").and_then(|v| v.parse::<f64>().ok()) {
+            hold_for(Duration::from_secs_f64(reset.clamp(0.0, 30.0)) + BUCKET_SLACK);
+        }
+    }
+}
+
+/// Sending that behaves as a client of an API with rate limits should: waits out any hold Discord has put on this
+/// client, notes how much of a bucket is left and waits for it to refill rather than running into the limit, and when
+/// it is told to slow down anyway waits as long as it was told and asks again - instead of reading a refusal as an
+/// answer. Reads were sent plain, so a 429 was a silent "nothing found" and the next request followed straight on.
+pub(super) trait SendPaced {
+    fn send_paced(self) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send;
+}
+
+impl SendPaced for reqwest::RequestBuilder {
+    async fn send_paced(self) -> reqwest::Result<reqwest::Response> {
+        wait_out_hold().await;
+        let mut pending = Some(self);
+        for attempt in 0..=READ_RETRIES {
+            let Some(current) = pending.take() else { break };
+            // A body that cannot be copied is sent once.
+            let again = current.try_clone();
+            let resp = current.send().await?;
+            note_bucket(&resp);
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == READ_RETRIES {
+                return Ok(resp);
+            }
+            let Some(again) = again else { return Ok(resp) };
+            let pause = retry_after(&resp);
+            tracing::debug!("discord: rate limited on a read, waiting {}ms", pause.as_millis());
+            hold_for(pause);
+            wait_out_hold().await;
+            pending = Some(again);
+        }
+        unreachable!("the last attempt returns")
+    }
+}
+
 /// Like `send_write`, for a request whose body cannot be copied - a file
 /// streamed from disk - and so is built again for every try.
 pub(super) async fn send_write_rebuilt<F>(mut build: F) -> Result<reqwest::Response>
 where
     F: FnMut() -> Result<reqwest::RequestBuilder>,
 {
+    wait_out_hold().await;
     pace().await;
     for attempt in 0..=RATE_LIMIT_RETRIES {
         let resp = build()?.send().await.context("talking to Discord")?;
+        note_bucket(&resp);
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
         let pause = retry_after(&resp);
         tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
-        tokio::time::sleep(pause).await;
+        hold_for(pause);
+        wait_out_hold().await;
     }
     bail!("Discord kept rate-limiting that request")
 }
@@ -85,6 +162,7 @@ where
 /// history quickly would be a slow client, and what Discord judges an account
 /// on is what it sends.
 pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    wait_out_hold().await;
     pace().await;
 
     let mut pending = Some(request);
@@ -94,13 +172,15 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
         // that cannot be cloned is one this cannot retry, and is sent once.
         let again = current.try_clone();
         let resp = current.send().await.context("talking to Discord")?;
+        note_bucket(&resp);
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
         let Some(again) = again else { return Ok(resp) };
         let pause = retry_after(&resp);
         tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
-        tokio::time::sleep(pause).await;
+        hold_for(pause);
+        wait_out_hold().await;
         pending = Some(again);
     }
     bail!("Discord kept rate-limiting that request")
@@ -284,5 +364,41 @@ mod error_tests {
         let junk = "<html>gateway timeout</html>";
         let text = discord_error_text(reqwest::StatusCode::BAD_GATEWAY, junk, "adding a friend");
         assert!(text.contains("502"), "got {text}");
+    }
+
+    /// What a client of an API with rate limits does: told to slow down, it waits as long as it was told and asks
+    /// again; told a bucket is empty, it lets it refill before anything else goes out. Asked of a local listener.
+    #[tokio::test]
+    async fn a_read_waits_out_a_rate_limit_and_a_bucket_that_has_run_dry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // 1: refused with a one-second wait. 2: answered, saying the bucket is empty for one second. 3: answered.
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for reply in [
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await.unwrap();
+                seen.push(std::time::Instant::now());
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            seen
+        });
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let first = client.get(&url).send_paced().await.unwrap();
+        assert_eq!(first.status(), 200, "the refusal was waited out and the read made again");
+        assert!(started.elapsed() >= Duration::from_millis(950), "it waited the second it was told to: {:?}", started.elapsed());
+        let second_started = std::time::Instant::now();
+        let second = client.get(&url).send_paced().await.unwrap();
+        assert_eq!(second.status(), 200);
+        assert!(second_started.elapsed() >= Duration::from_millis(950), "the empty bucket was let refill first: {:?}", second_started.elapsed());
+        let seen = server.await.unwrap();
+        assert_eq!(seen.len(), 3);
     }
 }

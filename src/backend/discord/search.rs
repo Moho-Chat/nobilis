@@ -103,7 +103,7 @@ pub async fn search_messages(
         .get(url)
         .query(&query)
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("searching")?;
     // Discord answers a search of a server it is still indexing with 202 and

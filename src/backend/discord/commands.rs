@@ -31,7 +31,7 @@ pub async fn list_commands(state: &AppState, account_id: &str, buffer_id: &str, 
         .get(format!("{API_BASE}/channels/{channel_id}/application-commands/search"))
         .query(&params)
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("reading the commands")?;
     if !resp.status().is_success() {
@@ -243,7 +243,7 @@ pub async fn use_component(
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/channels/{channel_id}/messages/{message_id}"))
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("finding out whose button that is")?;
     if !resp.status().is_success() {

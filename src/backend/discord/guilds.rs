@@ -96,7 +96,7 @@ pub async fn member_verification(state: &AppState, account_id: &str, guild_id: &
     let resp = http_client_for(&cfg.token)
         .get(format!("{API_BASE}/guilds/{guild_id}/member-verification"))
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("asking Discord for this server's rules")?;
     let status = resp.status();
@@ -201,7 +201,7 @@ pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountC
         http_client_for(&config.token)
             .get(format!("{API_BASE}/{path}"))
             .header("Authorization", &config.token)
-            .send()
+            .send_paced()
             .await
             .ok()?
             .json::<Value>()
@@ -243,6 +243,32 @@ pub(super) async fn resync_guild_once(state: &AppState, config: &DiscordAccountC
     }
 }
 
+/// This account's own member object out of READY's `merged_members`, which lists, for each guild in the order READY
+/// names them, the account's own membership of it (with a `user_id` where a member elsewhere has a `user`). Handed to
+/// `register_guild_channels` inside the guild's own payload, where it is looked for first, so that a guild whose
+/// payload leaves the account out costs no request of its own - one request a guild, at every fresh login, was the
+/// alternative.
+pub(super) fn guild_with_own_member(guild: &Value, merged: Option<&Value>, user_id: &str) -> Option<Value> {
+    let has = |list: &Value| list.as_array().is_some_and(|l| l.iter().any(|m| m["user"]["id"].as_str() == Some(user_id)));
+    if has(&guild["members"]) {
+        return None;
+    }
+    let mut me = merged?
+        .as_array()?
+        .iter()
+        .find(|m| m["user_id"].as_str() == Some(user_id) || m["user"]["id"].as_str() == Some(user_id))?
+        .clone();
+    if me["user"]["id"].is_null() {
+        me["user"] = json!({ "id": user_id });
+    }
+    let mut guild = guild.clone();
+    match guild["members"].as_array_mut() {
+        Some(list) => list.push(me),
+        None => guild["members"] = json!([me]),
+    }
+    Some(guild)
+}
+
 /// This account's own membership of a guild.
 ///
 /// From the payload when it is there, and asked for when it is not. The
@@ -269,7 +295,7 @@ pub(super) async fn own_member(config: &DiscordAccountConfig, guild: &Value) -> 
     let resp = http_client_for(&config.token)
         .get(format!("{API_BASE}/users/@me/guilds/{guild_id}/member"))
         .header("Authorization", &config.token)
-        .send()
+        .send_paced()
         .await
         .ok()?;
     if !resp.status().is_success() {
@@ -707,7 +733,9 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         },
     );
 
-    spawn_backfill(state.clone(), config.token.clone(), config.user_id.clone(), config.display_name.clone(), new_channels);
+    // No history is fetched for these: a channel is read when it is opened (see getBacklog), which is the only time
+    // anyone looks at it. Fetching the latest of every channel of every server when it is first seen was a request a
+    // channel, at the moment of a fresh login, for conversations nobody was about to read.
     visible
 }
 
@@ -785,7 +813,7 @@ pub async fn list_threads(state: &AppState, account_id: &str, buffer_id: &str) -
     requests.push(format!("{API_BASE}/channels/{channel_id}/threads/archived/public?limit=25"));
 
     for url in requests {
-        let resp = match http_client_for(&cfg.token).get(&url).header("Authorization", &cfg.token).send().await {
+        let resp = match http_client_for(&cfg.token).get(&url).header("Authorization", &cfg.token).send_paced().await {
             Ok(resp) if resp.status().is_success() => resp,
             // A channel with no archive, or one this account may not read the
             // archive of, is not a failure worth refusing the whole list for.
@@ -956,7 +984,7 @@ pub async fn moderate_member(
     if let Some(reason) = reason.filter(|r| !r.trim().is_empty()) {
         request = request.header("X-Audit-Log-Reason", reason);
     }
-    let resp = request.send().await.context(doing)?;
+    let resp = request.send_paced().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -980,7 +1008,7 @@ pub async fn set_member_role(
     let http = http_client_for(&cfg.token);
     let request = if give { http.put(url).json(&json!({})) } else { http.delete(url) };
     let doing = if give { "giving them the role" } else { "taking the role away" };
-    let resp = request.header("Authorization", &cfg.token).send().await.context(doing)?;
+    let resp = request.header("Authorization", &cfg.token).send_paced().await.context(doing)?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -1014,7 +1042,7 @@ pub async fn open_thread(state: &AppState, account_id: &str, buffer_id: &str, th
     let resp = http
         .get(format!("{API_BASE}/channels/{thread_id}"))
         .header("Authorization", &cfg.token)
-        .send()
+        .send_paced()
         .await
         .context("opening the thread")?;
     if !resp.status().is_success() {
@@ -1256,5 +1284,32 @@ mod verification_tests {
         let bare = responses_for(&form, &[]);
         assert!(bare[1].get("response").is_none() && bare[2].get("response").is_none());
         assert_eq!(bare[0]["response"], true);
+    }
+}
+
+#[cfg(test)]
+mod merged_member_tests {
+    use super::*;
+
+    #[test]
+    fn a_guild_that_leaves_the_account_out_is_given_the_membership_ready_listed() {
+        let guild = json!({ "id": "g", "members": [{ "user": { "id": "other" } }] });
+        let merged = json!([{ "user_id": "me", "roles": ["r1"], "pending": true }, { "user_id": "x" }]);
+        let with = guild_with_own_member(&guild, Some(&merged), "me").expect("added");
+        let mine = with["members"].as_array().unwrap().iter().find(|m| m["user"]["id"] == "me").expect("the member is there");
+        assert_eq!(mine["roles"], json!(["r1"]));
+        assert!(member_is_pending(Some(mine)), "what the account's membership says survives");
+        assert_eq!(with["members"].as_array().unwrap().len(), 2, "the others stay");
+        // And it is what `own_member` would find first, without a request.
+        assert!(guild_with_own_member(&with, Some(&merged), "me").is_none());
+    }
+
+    #[test]
+    fn nothing_is_made_up_when_there_is_nothing_to_add() {
+        let guild = json!({ "id": "g" });
+        assert!(guild_with_own_member(&guild, None, "me").is_none());
+        assert!(guild_with_own_member(&guild, Some(&json!([{ "user_id": "someone-else" }])), "me").is_none());
+        let with = guild_with_own_member(&guild, Some(&json!([{ "user_id": "me" }])), "me").unwrap();
+        assert_eq!(with["members"][0]["user"]["id"], "me");
     }
 }

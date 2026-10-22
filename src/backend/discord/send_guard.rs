@@ -148,6 +148,29 @@ pub(super) async fn note_sent(resp: reqwest::Response) {
     }
 }
 
+/// The most characters a message may hold: 4,000 with Nitro, 2,000 without.
+pub fn message_limit(premium: u8) -> usize {
+    if premium == 2 {
+        4000
+    } else {
+        2000
+    }
+}
+
+/// Refuses text Discord would refuse, or nothing at all, before it is sent. A request that is bound to be turned down
+/// is one more request from an account that is being watched, and says nothing a sentence here does not say better.
+pub fn check_text(content: &str, premium: u8, may_be_empty: bool) -> Result<()> {
+    let limit = message_limit(premium);
+    let length = content.chars().count();
+    if length > limit {
+        bail!("That message is {length} characters long and Discord takes {limit}{}", if premium == 2 { "" } else { " (4,000 with Nitro)" });
+    }
+    if !may_be_empty && content.trim().is_empty() {
+        bail!("There is nothing to send");
+    }
+    Ok(())
+}
+
 /// The most a file may be where it is sent: what the account's Nitro allows, or what the server's boosts do, whichever
 /// is more.
 pub fn upload_limit(premium: u8, guild_tier: u8) -> u64 {
@@ -582,6 +605,20 @@ mod tests {
         assert_eq!(gap_needed(Some((s(1), true)), true), s(4));
         // Messages one after the other are talking, and are not slowed here.
         assert_eq!(gap_needed(Some((Duration::ZERO, false)), false), Duration::ZERO);
+    }
+
+    #[test]
+    fn text_discord_would_refuse_is_refused_here() {
+        assert!(check_text("hello", 0, false).is_ok());
+        assert!(check_text(&"a".repeat(2000), 0, false).is_ok());
+        let long = check_text(&"a".repeat(2001), 0, false).unwrap_err().to_string();
+        assert!(long.contains("2001") && long.contains("2000") && long.contains("Nitro"), "{long}");
+        assert!(check_text(&"a".repeat(4000), 2, false).is_ok(), "Nitro takes more");
+        assert!(check_text(&"a".repeat(4001), 2, false).is_err());
+        // Counted in characters, not bytes.
+        assert!(check_text(&"é".repeat(2000), 0, false).is_ok());
+        assert!(check_text("  \n ", 0, false).is_err(), "nothing is nothing");
+        assert!(check_text("", 0, true).is_ok(), "a caption may be empty");
     }
 
     #[test]

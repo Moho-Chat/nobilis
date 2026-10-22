@@ -117,6 +117,46 @@ fn settings_body(status: &str, text: Option<&str>) -> serde_json::Value {
 /// does when you open a channel, which is also why the roster only exists for
 /// channels somebody is actually looking at.
 pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
+    subscribe_member_list(state, buffer_id, false)
+}
+
+/// The window the list is kept in no longer matches what Discord holds, so it is asked for again - but not more often
+/// than every few seconds, which is the most a roster that keeps falling out of step deserves.
+pub(super) fn resync_member_list(state: &AppState, buffer_id: &str) -> bool {
+    subscribe_member_list(state, buffer_id, true)
+}
+
+/// What each server has been subscribed to this session: the channel, and when.
+type Subscribed = HashMap<(String, String), (String, std::time::Instant)>;
+static SUBSCRIBED: std::sync::Mutex<Option<Subscribed>> = std::sync::Mutex::new(None);
+
+/// The least time between two subscriptions to one server's list that are not a change of channel.
+const RESYNC_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a subscription to this channel's list is to be sent: not if it already was, this session, and not a
+/// repeat of one sent a moment ago. A connection is subscribed once - as Dissent's is, once a server - and a new one
+/// starts again (`forget_member_subscriptions`).
+fn subscription_due(account: &str, guild: &str, channel: &str, resync: bool, now: std::time::Instant) -> bool {
+    let mut slot = SUBSCRIBED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = slot.get_or_insert_with(HashMap::new);
+    let key = (account.to_string(), guild.to_string());
+    match map.get(&key) {
+        Some((was, at)) if was == channel && (!resync || now.duration_since(*at) < RESYNC_EVERY) => false,
+        _ => {
+            map.insert(key, (channel.to_string(), now));
+            true
+        }
+    }
+}
+
+/// A new connection holds none of what the last one subscribed to.
+pub(super) fn forget_member_subscriptions(account: &str) {
+    if let Some(map) = SUBSCRIBED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.retain(|(a, _), _| a != account);
+    }
+}
+
+fn subscribe_member_list(state: &AppState, buffer_id: &str, resync: bool) -> bool {
     let Some(buffer) = state.runtime.get_buffer(buffer_id) else { return false };
     let account_id = buffer.account_id;
     let Some(sender) = state.runtime.discord_gateway_sender(&account_id) else { return false };
@@ -130,6 +170,11 @@ pub fn request_member_list(state: &AppState, buffer_id: &str) -> bool {
     // The reply names the guild and a permissions-derived list id, never the
     // channel, so remember which buffer this was for.
     state.runtime.set_discord_member_list_target(&account_id, &guild_id, buffer_id);
+
+    // Asked for once. Whoever asked is told it is being sent: the roster arrives, or is already arriving.
+    if !subscription_due(&account_id, &guild_id, &channel_id, resync, std::time::Instant::now()) {
+        return true;
+    }
 
     // Ranges are 100-member windows; one covers any channel we would show.
     sender
@@ -370,7 +415,7 @@ pub(super) fn update_member_list(state: &AppState, buffer_id: &str, d: &Value) {
             Applied::Stale => {
                 tracing::debug!("discord: member window for {buffer_id} is out of step; resyncing");
                 state.runtime.set_discord_member_window(buffer_id, Vec::new());
-                request_member_list(state, buffer_id);
+                resync_member_list(state, buffer_id);
                 return;
             }
         }
@@ -627,5 +672,32 @@ mod status_tests {
         assert_eq!(settings_body("idle", Some(""))["custom_status"], serde_json::Value::Null);
         assert_eq!(settings_body("idle", Some("brb"))["custom_status"]["text"], "brb");
         assert_eq!(settings_body("idle", None)["status"], "idle");
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_list_is_subscribed_to_once_a_connection_and_again_for_another_channel() {
+        let t = Instant::now();
+        assert!(subscription_due("a1", "g", "c1", false, t));
+        assert!(!subscription_due("a1", "g", "c1", false, t + Duration::from_secs(1)), "the same again is nothing");
+        assert!(!subscription_due("a1", "g", "c1", false, t + Duration::from_secs(600)), "however long after");
+        assert!(subscription_due("a1", "g", "c2", false, t + Duration::from_secs(2)), "another channel is a change");
+        assert!(subscription_due("a1", "g2", "c1", false, t), "another server is its own");
+        forget_member_subscriptions("a1");
+        assert!(subscription_due("a1", "g", "c2", false, t), "a new connection starts again");
+    }
+
+    #[test]
+    fn a_resync_is_not_sent_again_within_a_few_seconds() {
+        let t = Instant::now();
+        assert!(subscription_due("a2", "g", "c1", false, t));
+        assert!(!subscription_due("a2", "g", "c1", true, t + Duration::from_secs(3)));
+        assert!(subscription_due("a2", "g", "c1", true, t + Duration::from_secs(11)));
+        assert!(!subscription_due("a2", "g", "c1", true, t + Duration::from_secs(12)));
     }
 }

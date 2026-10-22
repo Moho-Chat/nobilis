@@ -473,7 +473,13 @@ pub async fn dispatch(
                             // connect: a few hundred channels would mean a few
                             // hundred requests, most for conversations nobody
                             // is about to read.
-                            backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
+                            // A conversation never read here is read for the first time now; one that has been is asked
+                            // only about what came after.
+                            if state.store.has_messages(buffer_id).unwrap_or(true) {
+                                backend::discord::catch_up_channel(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
+                            } else {
+                                backend::discord::backfill_channel_history(state, &cfg.token, &cfg.user_id, cfg.display_name.as_deref(), buffer_id, &channel_id).await;
+                            }
                         }
                     }
                     // Steam keeps every conversation: opening one asks for its

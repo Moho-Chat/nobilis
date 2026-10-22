@@ -777,6 +777,19 @@ impl Store {
         Ok(id)
     }
 
+    /// The most recent message this buffer holds, and whether it is the account's own.
+    pub fn newest_msg(&self, buffer_id: &str) -> Result<Option<(String, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT msg_id, is_own FROM messages WHERE buffer_id = ?1 AND msg_id IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                params![buffer_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+            )
+            .optional()?;
+        Ok(row)
+    }
+
     /// The ids of the account's own messages in these buffers from `since` (Unix seconds) on, newest first, at most
     /// `limit`.
     pub fn own_message_ids_since(&self, buffer_ids: &[String], since: i64, limit: usize) -> Result<Vec<String>> {
@@ -1882,6 +1895,18 @@ mod tests {
     fn append_own_at(s: &Store, buffer: &str, id: &str, ts: i64) {
         s.append_message(buffer, id, "me", "hi", ts, false, false, "chat", None, &[], true, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    #[test]
+    fn finds_the_newest_message_and_whether_it_is_the_accounts_own() {
+        let (s, _dir) = store();
+        assert_eq!(s.newest_msg("b").unwrap(), None);
+        append_at(&s, "b", "m1", 100);
+        assert_eq!(s.newest_msg("b").unwrap(), Some(("m1".to_string(), false)));
+        append_own_at(&s, "b", "m2", 200);
+        assert_eq!(s.newest_msg("b").unwrap(), Some(("m2".to_string(), true)));
+        append_at(&s, "b", "m3", 300);
+        assert_eq!(s.newest_msg("b").unwrap(), Some(("m3".to_string(), false)));
     }
 
     #[test]
