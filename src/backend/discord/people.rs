@@ -27,7 +27,9 @@ pub(super) fn register_dm_channel(
     state.runtime.set_discord_channel(state, &buf.id, channel_id);
     // Discord's own notices come from an account flagged `system`, and nothing
     // sent back to it goes anywhere.
-    state.runtime.set_buffer_read_only(state, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
+    super::send_guard::set_permission(state, account_id, &buf.id, is_system_dm(ch).then_some(OFFICIAL_ONLY));
+    // A conversation with nothing in it yet is not started from here: see send_guard.
+    super::send_guard::note_dm(state, account_id, &buf.id, ch);
     // Its notices were saved before their cards could be read whole, and saved
     // history is not fetched again, so they are read once a run, a little after
     // connecting - one request, for the latest page.

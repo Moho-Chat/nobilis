@@ -951,6 +951,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     "GUILD_DELETE" => {
                         if let Some(id) = d["id"].as_str() {
                             persist.guild_gone(id);
+                            if d["unavailable"].as_bool() != Some(true) {
+                                super::send_guard::forget_guild(&account_id, id);
+                            }
                         }
                         let Some(guild_id) = d["id"].as_str() else { continue };
                         if d["unavailable"].as_bool() == Some(true) {
@@ -971,6 +974,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             tracing::info!("discord[{account_id}]: a message in {channel_id} was dropped - that channel is not one this connection knows ({} are)", channel_map.len());
                             continue;
                         };
+                        super::send_guard::heard(state, config, d, &model::buffer_id(&account_id, &buffer_name), kind == "dm");
                         let author = &d["author"];
                         let from = author["global_name"]
                             .as_str()
@@ -995,7 +999,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         let real_msg_id = d["id"].as_str().map(|s| s.to_string());
                         let avatar_url = author_avatar_url(author);
                         if author["system"].as_bool() == Some(true) && kind == "dm" {
-                            state.runtime.set_buffer_read_only(state, &model::buffer_id(&account_id, &buffer_name), Some(super::people::OFFICIAL_ONLY));
+                            super::send_guard::set_permission(state, &account_id, &model::buffer_id(&account_id, &buffer_name), Some(super::people::OFFICIAL_ONLY));
                         }
                         // Kept against their id as well as put on the message.
                         // A direct call's voice states carry no member object,

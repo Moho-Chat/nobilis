@@ -777,6 +777,31 @@ impl Store {
         Ok(id)
     }
 
+    /// The ids of the account's own messages in these buffers from `since` (Unix seconds) on, newest first, at most
+    /// `limit`.
+    pub fn own_message_ids_since(&self, buffer_ids: &[String], since: i64, limit: usize) -> Result<Vec<String>> {
+        let mut found = Vec::new();
+        if buffer_ids.is_empty() {
+            return Ok(found);
+        }
+        let conn = self.conn.lock().unwrap();
+        for chunk in buffer_ids.chunks(200) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let sql = format!("SELECT msg_id FROM messages WHERE is_own = 1 AND ts >= ? AND msg_id IS NOT NULL AND buffer_id IN ({marks}) ORDER BY ts DESC LIMIT {limit}");
+            let mut args: Vec<&dyn rusqlite::ToSql> = vec![&since];
+            args.extend(chunk.iter().map(|b| b as &dyn rusqlite::ToSql));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(args.as_slice(), |row| row.get::<_, String>(0))?;
+            for id in rows {
+                found.push(id?);
+            }
+            if found.len() >= limit {
+                break;
+            }
+        }
+        Ok(found)
+    }
+
     /// The most recent message this buffer holds, for asking a service what
     /// has happened since.
     pub fn newest_msg_id(&self, buffer_id: &str) -> Result<Option<String>> {
@@ -1851,6 +1876,30 @@ mod tests {
     fn append_at(s: &Store, buffer: &str, id: &str, ts: i64) {
         s.append_message(buffer, id, "someone", "hi", ts, false, false, "chat", None, &[], false, None, &[], &[], None, None, "channel", None, &[])
             .expect("appending");
+    }
+
+    /// Like `append_at`, but the account's own.
+    fn append_own_at(s: &Store, buffer: &str, id: &str, ts: i64) {
+        s.append_message(buffer, id, "me", "hi", ts, false, false, "chat", None, &[], true, None, &[], &[], None, None, "channel", None, &[])
+            .expect("appending");
+    }
+
+    #[test]
+    fn finds_what_the_account_has_said_in_a_set_of_rooms_since_a_time() {
+        let (s, _dir) = store();
+        let rooms = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(s.own_message_ids_since(&[], 0, 5).unwrap().is_empty(), "no rooms is no message");
+        append_at(&s, "a", "m1", 500);
+        assert!(s.own_message_ids_since(&rooms(&["a"]), 0, 5).unwrap().is_empty(), "somebody else's message is not the account's");
+        append_own_at(&s, "b", "m2", 100);
+        append_own_at(&s, "b", "m3", 200);
+        assert_eq!(s.own_message_ids_since(&rooms(&["a", "b"]), 0, 5).unwrap(), vec!["m3", "m2"], "newest first");
+        assert!(s.own_message_ids_since(&rooms(&["a"]), 0, 5).unwrap().is_empty(), "in another room");
+        assert!(s.own_message_ids_since(&rooms(&["b"]), 201, 5).unwrap().is_empty(), "before the account joined");
+        assert_eq!(s.own_message_ids_since(&rooms(&["b"]), 0, 1).unwrap(), vec!["m3"], "no more than asked for");
+        // More rooms than one query holds.
+        let many: Vec<String> = (0..450).map(|i| format!("r{i}")).chain(std::iter::once("b".to_string())).collect();
+        assert_eq!(s.own_message_ids_since(&many, 0, 5).unwrap().len(), 2);
     }
 
     #[test]
