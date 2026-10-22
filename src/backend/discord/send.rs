@@ -220,6 +220,7 @@ pub async fn forward_message(
         .runtime
         .get_discord_channel(to_buffer)
         .ok_or_else(|| anyhow!("there is no Discord conversation to send it to"))?;
+    super::send_guard::ensure_may_speak(state, to_buffer)?;
     let mut reference = json!({
         // 1 is Discord's own number for a forward, as against 0 for a reply.
         "type": 1,
@@ -235,7 +236,11 @@ pub async fn forward_message(
         http_client_for(token)
             .post(format!("{API_BASE}/channels/{target_channel}/messages"))
             .header("Authorization", token)
-            .json(&json!({ "content": "", "message_reference": reference })),
+            .json(&{
+                let mut payload = json!({ "content": "", "message_reference": reference });
+                super::send_guard::stamp(&mut payload);
+                payload
+            }),
     )
     .await
     .context("forwarding the message")?;
@@ -244,6 +249,7 @@ pub async fn forward_message(
         let text = resp.text().await.unwrap_or_default();
         bail!("{}", discord_error_text(status, &text, "forwarding that message"));
     }
+    super::send_guard::note_sent(resp).await;
     Ok(())
 }
 
@@ -252,10 +258,14 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    // Nothing is said anywhere the account has not spoken before: see send_guard.
+    super::send_guard::ensure_may_speak(state, buffer_id)?;
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
+    super::send_guard::stamp(&mut payload);
+    super::send_guard::take_turn(&account_id, false).await;
     let resp = send_write(
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -269,6 +279,7 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         let text = resp.text().await.unwrap_or_default();
         bail!("{}", refusal_text(status, &text));
     }
+    super::send_guard::note_sent(resp).await;
     Ok(())
 }
 
@@ -371,6 +382,7 @@ pub async fn send_attachments(
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    super::send_guard::ensure_may_speak(state, buffer_id)?;
     if let Some(p) = progress {
         p.at(Phase::Preparing, 0, Meter::HOST);
     }
@@ -385,12 +397,17 @@ pub async fn send_attachments(
         total += len;
         files.push((path.clone(), name, len));
     }
+    // What Discord would refuse is refused here, before any of it is sent.
+    super::send_guard::ensure_fits(state, buffer_id, &files)?;
     // A caption is a message like any other, so a name typed in one is a
     // mention like any other.
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
+    super::send_guard::stamp(&mut payload);
+    // A file does not follow straight on from a message.
+    super::send_guard::take_turn(&account_id, true).await;
     if let Some(p) = progress {
         p.sent(0, total, Meter::HOST);
     }
@@ -420,6 +437,7 @@ pub async fn send_attachments(
         let text = resp.text().await.unwrap_or_default();
         bail!("{}", refusal_text(status, &text));
     }
+    super::send_guard::note_sent(resp).await;
     Ok(())
 }
 
@@ -452,6 +470,7 @@ pub async fn send_voice_message(
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
+    super::send_guard::ensure_may_speak(state, buffer_id)?;
     let bytes = tokio::fs::read(file_path)
         .await
         .with_context(|| format!("reading {}", file_path.display()))?;
@@ -459,7 +478,7 @@ pub async fn send_voice_message(
     // than on this, but a file that arrives anywhere else should say what it
     // is - and an unnamed part is rejected outright.
     let file_name = "voice-message.ogg";
-    let payload = json!({
+    let mut payload = json!({
         "content": "",
         "flags": IS_VOICE_MESSAGE,
         "attachments": [{
@@ -469,6 +488,7 @@ pub async fn send_voice_message(
             "waveform": waveform,
         }],
     });
+    super::send_guard::stamp(&mut payload);
     let form = reqwest::multipart::Form::new()
         .text("payload_json", payload.to_string())
         .part(
@@ -491,6 +511,7 @@ pub async fn send_voice_message(
         let text = resp.text().await.unwrap_or_default();
         bail!("{}", refusal_text(status, &text));
     }
+    super::send_guard::note_sent(resp).await;
     Ok(())
 }
 

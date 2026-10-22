@@ -394,6 +394,8 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
     // the way the roles-only version could.
     let me = own_member(config, guild).await;
     let own_roles = member_role_ids(me.as_ref());
+    // The account may not have spoken here: see send_guard. Begun before any channel is registered, so they open locked.
+    super::send_guard::open_guild(state, config, guild);
 
 
     // Kept where every path that registers a guild passes, rather than in the
@@ -551,13 +553,14 @@ pub(super) async fn register_guild_channels(state: &AppState, config: &DiscordAc
         // permissions change under a channel that is already registered.
         let read_only = (!can_send_in_channel(is_owner, guild_id, &roles, &member_role_ids, &config.user_id, ch)).then_some(NO_SEND_PERMISSION);
         if channel_map.contains_key(channel_id) {
-            state.runtime.set_buffer_read_only(state, &crate::model::buffer_id(&account_id, &name), read_only);
+            super::send_guard::set_permission(state, &account_id, &crate::model::buffer_id(&account_id, &name), read_only);
             continue;
         }
         let buf = state.runtime.ensure_buffer(state, &account_id, &name, "channel");
-        state.runtime.set_buffer_read_only(state, &buf.id, read_only);
+        // The guild is known before the reason is worked out: the lock is the guild's.
         state.runtime.set_discord_channel(state, &buf.id, channel_id);
         state.runtime.set_discord_guild(&buf.id, guild_id);
+        super::send_guard::set_permission(state, &account_id, &buf.id, read_only);
         state.runtime.set_buffer_group(state, &buf.id, &group_id);
 
         // Where Discord itself puts this channel. Uncategorised channels sit
