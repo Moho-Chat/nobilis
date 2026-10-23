@@ -7,6 +7,7 @@
 //! - this file - the identity moho gives Telegram, and what every other file shares
 //! - `session` - what the library remembers between runs, in a private file of its own per account
 //! - `link` - one connection to Telegram: the sender pool, the client and the stream of updates
+//! - `links` - what a t.me or tg:// link points at, and opening it
 //! - `login` - adding an account: phone, code, cloud password
 //! - `connect` - an account's connection, kept up and reconnected
 //! - `dialogs` - the account's conversations, read when it connects
@@ -58,6 +59,7 @@ pub mod history;
 pub mod instant;
 pub mod keyboards;
 pub mod link;
+pub mod links;
 pub mod login;
 pub mod markup;
 pub mod media;

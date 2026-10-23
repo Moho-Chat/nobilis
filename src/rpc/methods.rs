@@ -5812,6 +5812,17 @@ pub async fn dispatch(
             }
         }
 
+        // A t.me or tg:// link followed: the conversation it points into (joined if need be) and the message to go to.
+        "openTelegramLink" => {
+            let Some(url) = p_str_opt(params, "url") else {
+                return (None, Some("openTelegramLink requires \"url\"".to_string()));
+            };
+            match backend::telegram::links::open(state, p_str_opt(params, "accountId"), url).await {
+                Ok(opened) => (Some(backend::telegram::links::answer(&opened)), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         // The stickers a Telegram account can send, and sending one.
         "listTelegramStickers" | "sendTelegramSticker" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
