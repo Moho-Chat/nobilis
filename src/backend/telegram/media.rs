@@ -410,6 +410,10 @@ pub async fn restore_cached(state: &AppState, path: &Path) -> Result<PathBuf> {
     if name.starts_with("tgif_") {
         return super::gifs::restore(state, name, path).await?.context("not a cached Telegram GIF");
     }
+    // So is a sticker's picture.
+    if name.starts_with("tstk_") {
+        return super::stickers::restore(state, name, path).await?.context("not a cached Telegram sticker");
+    }
     let (account, remote, message, variant) = parse_media_name(name).context("not a cached Telegram file")?;
     // A preview already on its way is waited for, not fetched a second time.
     for _ in 0..120 {

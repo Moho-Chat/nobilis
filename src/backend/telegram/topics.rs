@@ -131,6 +131,28 @@ pub fn holding(state: &AppState, account_id: &str, remote: &str, msg_id: i32) ->
     topics.iter().find(|b| state.store.get_message(&b.id, &msg_id.to_string()).ok().flatten().is_some()).or(topics.first()).map(|b| (*b).clone())
 }
 
+/// The newest message of each topic as Telegram last said, by the topic's conversation: what reading it reads up to,
+/// since this client may not have kept the messages that are unread.
+fn tops() -> &'static std::sync::Mutex<std::collections::HashMap<String, i32>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, i32>>> = std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+/// The newest message Telegram has told of in a topic's conversation, if it has.
+pub fn top_of(buffer_id: &str) -> Option<i32> {
+    tops().lock().unwrap_or_else(|e| e.into_inner()).get(buffer_id).copied()
+}
+
+/// How many messages in a topic are unread, and how many of those mention this account.
+fn counts(topic: &tl::types::ForumTopic) -> (u32, u32) {
+    (topic.unread_count.max(0) as u32, topic.unread_mentions_count.max(0) as u32)
+}
+
+/// Whether a read position reaches everything the topic is known to hold.
+pub fn read_all(read_max: i32, newest_here: i32, top: Option<i32>) -> bool {
+    read_max >= newest_here.max(top.unwrap_or(0))
+}
+
 /// Reads the group's topics and makes a conversation of each, named as the group names it. The one conversation the
 /// group had before it had topics is removed: its messages are in the topics now.
 pub async fn sync(state: &AppState, account_id: &str, handle: &Handle, peer: &Peer) -> Result<usize> {
@@ -156,6 +178,10 @@ pub async fn sync(state: &AppState, account_id: &str, handle: &Handle, peer: &Pe
         let now = chrono::Utc::now().timestamp();
         let reason = if topic.closed { Some("This topic is closed.") } else { peers::read_only_for(peer, now) };
         state.runtime.set_buffer_read_only(state, &buffer.id, reason);
+        // The number Telegram shows beside the topic: a topic never opened here has no messages to count.
+        let (unread, mentions) = counts(topic);
+        state.runtime.set_buffer_unread(state, &buffer.id, unread, mentions);
+        tops().lock().unwrap_or_else(|e| e.into_inner()).insert(buffer.id.clone(), topic.top_message);
         count += 1;
     }
     Ok(count)
@@ -196,5 +222,56 @@ mod tests {
         assert_eq!(remote_of("-1001234", 45), "-1001234:45");
         assert_eq!(display_name("Chasm", " Support "), "Chasm/#Support");
         assert_eq!(peers::peer_id_of("-1001234:45"), peers::peer_id_of("-1001234"));
+    }
+
+    #[test]
+    fn a_topics_unread_numbers_are_what_telegram_counts() {
+        let mut topic = tl::types::ForumTopic {
+            my: false,
+            closed: false,
+            pinned: false,
+            short: false,
+            hidden: false,
+            title_missing: false,
+            id: 45,
+            date: 0,
+            peer: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            title: "Support".into(),
+            icon_color: 0,
+            icon_emoji_id: None,
+            top_message: 90,
+            read_inbox_max_id: 80,
+            read_outbox_max_id: 0,
+            unread_count: 7,
+            unread_mentions_count: 2,
+            unread_reactions_count: 0,
+            unread_poll_votes_count: 0,
+            from_id: tl::enums::Peer::Channel(tl::types::PeerChannel { channel_id: 1 }),
+            notify_settings: tl::enums::PeerNotifySettings::Settings(tl::types::PeerNotifySettings {
+                show_previews: None,
+                silent: None,
+                mute_until: None,
+                ios_sound: None,
+                android_sound: None,
+                other_sound: None,
+                stories_muted: None,
+                stories_hide_sender: None,
+                stories_ios_sound: None,
+                stories_android_sound: None,
+                stories_other_sound: None,
+            }),
+            draft: None,
+        };
+        assert_eq!(counts(&topic), (7, 2));
+        topic.unread_count = -1;
+        assert_eq!(counts(&topic).0, 0, "a count below nothing is nothing");
+    }
+
+    #[test]
+    fn a_topic_is_read_when_the_position_reaches_what_is_known_of_it() {
+        assert!(read_all(90, 85, Some(90)));
+        assert!(!read_all(80, 85, Some(90)), "the position is short of the newest Telegram has told of");
+        assert!(!read_all(80, 85, None), "and of the newest kept here");
+        assert!(read_all(0, 0, None), "a topic holding nothing is read");
     }
 }

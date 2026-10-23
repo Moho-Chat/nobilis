@@ -29,7 +29,9 @@
 //! - `keyboards` - a bot's inline buttons
 //! - `bots` - a bot's command menu
 //! - `topics` - a group with Topics as several conversations
+//! - `folders` - the account's chat folders, kept in step with moho's categories
 //! - `gifs` - saved GIFs and the GIF search
+//! - `stickers` - the account's sticker packs, and sending one
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -50,6 +52,7 @@ pub mod admin;
 pub mod bots;
 pub mod connect;
 pub mod dialogs;
+pub mod folders;
 pub mod gifs;
 pub mod history;
 pub mod instant;
@@ -69,6 +72,7 @@ pub mod profile;
 pub mod reactions;
 pub mod search;
 pub mod send;
+pub mod stickers;
 pub mod threads;
 pub mod topics;
 pub mod updates;

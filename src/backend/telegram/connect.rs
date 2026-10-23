@@ -164,6 +164,10 @@ async fn stay(state: &AppState, config: &TelegramAccountConfig, account_id: &str
             if let Err(e) = super::dialogs::sync(&state, &account_id, &handle).await {
                 tracing::warn!("telegram[{account_id}]: reading the conversations: {e:#}");
             }
+            // After the conversations: what a folder holds by its rules is worked out from them.
+            if let Err(e) = super::folders::sync(&state, &account_id, &handle).await {
+                tracing::warn!("telegram[{account_id}]: reading the folders: {e:#}");
+            }
         }
     });
 

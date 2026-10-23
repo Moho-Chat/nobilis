@@ -806,6 +806,7 @@ pub async fn dispatch(
                 match state.accounts.remove(id) {
                     Ok(true) => {
                         if let Some(config) = telegram_account {
+                            backend::telegram::folders::forget(&config.account_id());
                             let state = state.clone();
                             tokio::spawn(async move { backend::telegram::connect::sign_out(&state, &config).await });
                         }
@@ -2300,7 +2301,7 @@ pub async fn dispatch(
                                 "name": c.name,
                                 "usage": "",
                                 "description": c.description,
-                                "source": buffer.name,
+                                "source": c.source.clone().unwrap_or_else(|| buffer.name.clone()),
                                 "kind": "bot",
                             }));
                         }
@@ -4633,6 +4634,19 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // The same sign-in without a number: a QR code to scan with Telegram on a phone that is signed in already.
+        "addTelegramAccountQr" => {
+            let (Some(api_id), Some(api_hash)) = (params.get("apiId").and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))), p_str_opt(params, "apiHash")) else {
+                return (None, Some("addTelegramAccountQr requires \"apiId\" and \"apiHash\"".to_string()));
+            };
+            let Ok(api_id) = i32::try_from(api_id) else {
+                return (None, Some("that api_id is not a number Telegram would have given".to_string()));
+            };
+            let login_id = format!("telegram-{}", crate::model::next_message_id());
+            backend::telegram::login::start_qr(state.clone(), login_id.clone(), api_id, api_hash.trim().to_string());
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
         // The code Telegram sent, and the cloud password it may ask for next, for a sign-in that is waiting.
         "submitTelegramCode" | "submitTelegramPassword" => {
             let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
@@ -5793,6 +5807,64 @@ pub async fn dispatch(
                 };
             }
             match backend::telegram::gifs::send(state, &buffer, p_str(params, "id", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // The stickers a Telegram account can send, and sending one.
+        "listTelegramStickers" | "sendTelegramSticker" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            if method == "listTelegramStickers" {
+                return match backend::telegram::stickers::list(state, &buffer).await {
+                    Ok(list) => (Some(list), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::telegram::stickers::send(state, &buffer, p_str(params, "id", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
+        // An account's chat folders, which the window shows as categories on the account's page, and the changes it
+        // makes to them: see backend/telegram/folders.rs.
+        "telegramFolders" => match p_str_opt(params, "accountId") {
+            Some(account_id) if account_id.starts_with("telegram:") => (Some(backend::telegram::folders::current(account_id)), None),
+            _ => (None, Some("telegramFolders requires a Telegram \"accountId\"".to_string())),
+        },
+        "createTelegramFolder" | "fileTelegramChat" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"bufferId\"")));
+            };
+            let done = if method == "createTelegramFolder" {
+                backend::telegram::folders::create(state, &buffer, p_str(params, "name", "")).await
+            } else {
+                let to = params.get("folderId").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+                backend::telegram::folders::file(state, &buffer, to).await
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+        "renameTelegramFolder" | "deleteTelegramFolder" | "reorderTelegramFolders" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("telegram:")) else {
+                return (None, Some(format!("{method} requires a Telegram \"accountId\"")));
+            };
+            let folder = params.get("folderId").and_then(|v| v.as_i64()).and_then(|n| i32::try_from(n).ok());
+            let done = match (method, folder) {
+                ("renameTelegramFolder", Some(id)) => backend::telegram::folders::rename(state, account_id, id, p_str(params, "name", "")).await,
+                ("deleteTelegramFolder", Some(id)) => backend::telegram::folders::delete(state, account_id, id).await,
+                ("reorderTelegramFolders", _) => {
+                    let order: Vec<i32> = params.get("order").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|n| n.as_i64().and_then(|n| i32::try_from(n).ok())).collect()).unwrap_or_default();
+                    backend::telegram::folders::reorder(state, account_id, &order).await
+                }
+                _ => Err(format!("{method} requires a \"folderId\"")),
+            };
+            match done {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
             }

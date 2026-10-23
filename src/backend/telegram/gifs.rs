@@ -73,7 +73,7 @@ fn title_of(doc: &tl::types::Document) -> String {
         .unwrap_or_else(|| "GIF".to_string())
 }
 
-fn wrapper(doc: &tl::types::Document) -> Document {
+pub(super) fn wrapper(doc: &tl::types::Document) -> Document {
     Document::from_raw_media(tl::types::MessageMediaDocument {
         nopremium: false,
         spoiler: false,

@@ -15,12 +15,35 @@ use grammers_client::tl;
 /// How many conversations are read on connect. Telegram pages them a hundred at a time.
 const LIMIT: usize = 200;
 
+/// What the account's folders look at in a conversation, noted for working out what each folder holds.
+fn note_for_folders(account_id: &str, dialog: &grammers_client::peer::Dialog) {
+    use super::folders::{Facts, Kind};
+    use grammers_client::peer::Peer;
+    let (kind, contact) = match dialog.peer() {
+        Peer::User(user) if user.is_bot() => (Kind::Bot, false),
+        Peer::User(user) => (Kind::Person, user.contact()),
+        Peer::Group(_) | Peer::Community(_) => (Kind::Group, false),
+        Peer::Channel(_) => (Kind::Broadcast, false),
+    };
+    let tl::enums::Dialog::Dialog(d) = &dialog.raw else { return };
+    let facts = Facts {
+        kind,
+        contact,
+        muted: super::notify::silent(&d.notify_settings, chrono::Utc::now().timestamp()),
+        unread: d.unread_count > 0 || d.unread_mark,
+        // Telegram keeps its archive as the folder numbered 1.
+        archived: d.folder_id == Some(1),
+    };
+    super::folders::note(account_id, peers::remote_id(dialog.peer().id()), facts);
+}
+
 /// Makes a buffer of each of the account's conversations, newest activity first, and records the last message of each.
 pub async fn sync(state: &AppState, account_id: &str, handle: &Handle) -> Result<usize> {
     let mut dialogs = handle.client.iter_dialogs();
     let mut count = 0;
     while count < LIMIT {
         let Some(dialog) = dialogs.next().await.map_err(|e| anyhow::anyhow!("{e}"))? else { break };
+        note_for_folders(account_id, &dialog);
         // A group with Topics is a conversation for each topic, found by asking the group.
         if super::topics::is_forum(dialog.peer()) {
             peers::rail_for(state, account_id, dialog.peer(), count as i64);
