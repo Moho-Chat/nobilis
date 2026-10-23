@@ -29,11 +29,29 @@ pub const FIRST_WORD: &str =
     "Send your first message in this server from Discord's own app or website. Discord flags accounts that start talking in a server from another client.";
 
 /// Shown while that is being found out.
-pub const CHECKING: &str = "Checking whether you have spoken in this server before…";
+pub const CHECKING: &str = "Checking whether you have spoken here before…";
 
 /// Shown in a conversation with no messages in it.
 pub const EMPTY_DM: &str =
     "Start this conversation from Discord's own app or website. Discord flags accounts that send the first message to somebody from another client.";
+
+/// Shown where Discord has asked for a captcha, which this client does not answer.
+pub const CAPTCHA: &str =
+    "Discord asked for a captcha here, and moho does not answer those - doing so is what gets an account flagged. Say something here from Discord's own app; this opens again then, or in half an hour.";
+
+/// Shown in a server channel that nobody has ever written in.
+pub const EMPTY_CHANNEL: &str = "Nobody has said anything in this channel yet. Send the first message from Discord's own app.";
+
+/// Shown in a conversation that has few messages of the account's own.
+pub const NEW_CONVERSATION: &str =
+    "This conversation is new. Send at least 5 messages in it from Discord's own app first - Discord flags accounts that start talking to somebody from another client.";
+
+pub const MESSAGE_REQUEST: &str = "This is a message request, not yet a conversation. Accept it in Discord's own app first.";
+
+pub const SPAM_DM: &str = "Discord has marked this conversation as spam.";
+
+/// How long a captcha closes the place it came from, unless the account speaks there from Discord's own app.
+const CAPTCHA_HOLD: Duration = Duration::from_secs(30 * 60);
 
 /// Why a place is closed to this client, and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +60,13 @@ pub enum Lock {
     Checking,
     FirstWord,
     EmptyDm,
+    NewConversation,
+    MessageRequest,
+    SpamDm,
+    EmptyChannel,
+    Captcha,
+    /// The server asks something of the account that it has not done, and will not do by waiting.
+    Participation(&'static str),
 }
 
 impl Lock {
@@ -51,8 +76,34 @@ impl Lock {
             Lock::Checking => Some(CHECKING),
             Lock::FirstWord => Some(FIRST_WORD),
             Lock::EmptyDm => Some(EMPTY_DM),
+            Lock::NewConversation => Some(NEW_CONVERSATION),
+            Lock::MessageRequest => Some(MESSAGE_REQUEST),
+            Lock::SpamDm => Some(SPAM_DM),
+            Lock::EmptyChannel => Some(EMPTY_CHANNEL),
+            Lock::Captcha => Some(CAPTCHA),
+            Lock::Participation(r) => Some(r),
         }
     }
+}
+
+/// What is known of a channel, by its buffer.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelFacts {
+    /// Seconds between messages, the channel's slowmode.
+    pub slowmode: u64,
+    /// Whether the account's permissions are not held to it.
+    pub bypass_slowmode: bool,
+    /// Every permission: the owner, an administrator.
+    pub full: bool,
+}
+
+/// What is known of a direct message.
+#[derive(Debug, Clone, Default)]
+pub struct DmFacts {
+    pub request: bool,
+    pub spam: bool,
+    /// The account's own messages in it that were not sent from here.
+    pub own: usize,
 }
 
 /// What is known, per process. Plain data and plain methods so it can be tested without a connection.
@@ -78,11 +129,35 @@ pub struct Guard {
     /// it wants a first word from Discord's own client.
     sent: HashSet<String>,
     sent_order: std::collections::VecDeque<String>,
+    /// The nonces of messages sent from here: the echo of one is not the account speaking from elsewhere.
+    nonces: HashSet<String>,
+    nonce_order: std::collections::VecDeque<String>,
+    /// Where a captcha closed a place: (account, server or conversation) -> until when.
+    captcha: HashMap<(String, String), Instant>,
+    /// Each server's rules and our membership of it.
+    guilds: HashMap<(String, String), (rules::GuildFacts, Option<rules::MemberFacts>)>,
+    /// What the server's onboarding said of itself, where it was asked: enabled or not, and when it was asked.
+    onboarding: HashMap<(String, String), (Option<bool>, Instant)>,
+    accounts: HashMap<String, rules::AccountFacts>,
+    channels: HashMap<String, ChannelFacts>,
+    /// Server channels nobody has written in.
+    empty_channels: HashSet<String>,
+    dms: HashMap<String, DmFacts>,
+    /// Conversations that have enough of the account's own messages in them, kept once reached.
+    established: HashSet<String>,
+    /// Conversations being counted now, and counted this run.
+    dm_checking: HashSet<String>,
+    dm_checked: HashSet<String>,
+    /// When the account last spoke in each channel, from here or from anywhere.
+    last_own: HashMap<String, Instant>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Saved {
     accounts: HashMap<String, Vec<String>>,
+    /// Conversations that have been begun for good.
+    #[serde(default)]
+    established: Vec<String>,
     /// Ids of messages this client sent, oldest first.
     #[serde(default)]
     sent: Vec<String>,
@@ -97,14 +172,66 @@ impl Guard {
         self.spoken.get(account).is_some_and(|g| g.contains(guild))
     }
 
+    fn captcha_held(&self, account: &str, scope: &str, now: Instant) -> bool {
+        self.captcha.get(&(account.to_string(), scope.to_string())).is_some_and(|until| *until > now)
+    }
+
+    /// Whether the server's rules hold the account back, as of `now` (Unix seconds).
+    pub fn restriction(&self, account: &str, guild: &str, buffer: &str, now: i64) -> Option<rules::Restriction> {
+        let key = (account.to_string(), guild.to_string());
+        let (facts, member) = self.guilds.get(&key)?;
+        let account_facts = self.accounts.get(account)?;
+        let full = self.channels.get(buffer).is_some_and(|c| c.full);
+        let onboarding = self.onboarding.get(&key).and_then(|(enabled, _)| *enabled);
+        rules::participation(facts, member.as_ref(), account_facts, full, onboarding, now)
+    }
+
     /// What closes a place: `guild` is None for a conversation.
     pub fn lock_of(&self, account: &str, guild: Option<&str>, buffer: &str) -> Lock {
+        let now = Instant::now();
         match guild {
-            Some(guild) if self.is_spoken(account, guild) => Lock::None,
-            Some(guild) if self.checking.contains(&(account.to_string(), guild.to_string())) => Lock::Checking,
-            Some(_) => Lock::FirstWord,
-            None if self.empty_dms.contains(buffer) => Lock::EmptyDm,
-            None => Lock::None,
+            Some(guild) => {
+                let secs = chrono::Utc::now().timestamp();
+                if let Some(reason) = self.restriction(account, guild, buffer, secs).and_then(|r| r.banner()) {
+                    return Lock::Participation(reason);
+                }
+                if self.captcha_held(account, guild, now) {
+                    return Lock::Captcha;
+                }
+                if !self.is_spoken(account, guild) {
+                    return if self.checking.contains(&(account.to_string(), guild.to_string())) { Lock::Checking } else { Lock::FirstWord };
+                }
+                if self.empty_channels.contains(buffer) {
+                    return Lock::EmptyChannel;
+                }
+                Lock::None
+            }
+            None => {
+                if let Some(dm) = self.dms.get(buffer) {
+                    if dm.spam {
+                        return Lock::SpamDm;
+                    }
+                    if dm.request {
+                        return Lock::MessageRequest;
+                    }
+                }
+                if self.captcha_held(account, buffer, now) {
+                    return Lock::Captcha;
+                }
+                if self.established.contains(buffer) {
+                    return Lock::None;
+                }
+                if self.dm_checking.contains(buffer) {
+                    return Lock::Checking;
+                }
+                if self.empty_dms.contains(buffer) {
+                    return Lock::EmptyDm;
+                }
+                match self.dms.get(buffer) {
+                    Some(dm) if dm.own < rules::ESTABLISHED_DM_MESSAGES => Lock::NewConversation,
+                    _ => Lock::None,
+                }
+            }
         }
     }
 
@@ -203,6 +330,7 @@ fn with<R>(f: impl FnOnce(&mut Guard) -> R) -> R {
             spoken: saved.accounts.into_iter().map(|(a, g)| (a, g.into_iter().collect())).collect(),
             sent: saved.sent.iter().cloned().collect(),
             sent_order: saved.sent.into_iter().collect(),
+            established: saved.established.into_iter().collect(),
             ..Default::default()
         }
     });
@@ -213,6 +341,7 @@ fn save(guard: &Guard) {
     let saved = Saved {
         accounts: guard.spoken.iter().map(|(a, g)| (a.clone(), g.iter().cloned().collect())).collect(),
         sent: guard.sent_order.iter().cloned().collect(),
+        established: guard.established.iter().cloned().collect(),
     };
     if let Ok(text) = serde_json::to_string(&saved) {
         if let Some(dir) = file().parent() {
@@ -313,15 +442,39 @@ pub fn forget_account(account: &str) {
 pub(super) fn note_dm(state: &AppState, account: &str, buffer: &str, channel: &Value) {
     // Only a channel that says it has no messages: one that does not say is not known to be empty.
     let empty = channel.get("last_message_id").is_some_and(Value::is_null) && state.store.newest_msg_id(buffer).ok().flatten().is_none();
+    // How many of the account's own messages are in it that were not sent from here.
+    let kept = state.store.own_message_ids_since(&[buffer.to_string()], 0, 50).unwrap_or_default();
     with(|g| {
+        let own = kept.iter().filter(|id| !g.sent.contains(id.as_str())).count();
+        g.dms.insert(
+            buffer.to_string(),
+            DmFacts { request: channel["is_message_request"].as_bool() == Some(true), spam: channel["is_spam"].as_bool() == Some(true), own },
+        );
+        if own >= rules::ESTABLISHED_DM_MESSAGES && g.established.insert(buffer.to_string()) {
+            save(g);
+        }
         if empty {
             g.empty_dms.insert(buffer.to_string());
         } else {
             g.empty_dms.remove(buffer);
         }
     });
+    // Not enough of the account's own messages here to know it has talked in it: asked of Discord, once a run.
+    let start = with(|g| {
+        let counted = g.dms.get(buffer).is_some_and(|f| f.own >= rules::ESTABLISHED_DM_MESSAGES);
+        if counted || g.established.contains(buffer) || empty || g.dm_checked.contains(buffer) || g.dm_checking.contains(buffer) {
+            return false;
+        }
+        g.dm_checking.insert(buffer.to_string());
+        true
+    });
     let effective = with(|g| g.effective(account, None, buffer));
     state.runtime.set_buffer_read_only(state, buffer, effective);
+    if start {
+        if let (Some(config), Some(channel)) = (state.accounts.get_discord(account), channel["id"].as_str()) {
+            spawn_dm_count(state.clone(), config, buffer.to_string(), channel.to_string());
+        }
+    }
 }
 
 /// A message has arrived in a conversation, so it is not empty any more.
@@ -331,6 +484,100 @@ pub(super) fn dm_has_messages(state: &AppState, account: &str, buffer: &str) {
         let effective = with(|g| g.effective(account, None, buffer));
         state.runtime.set_buffer_read_only(state, buffer, effective);
     }
+}
+
+/// The account itself, from READY's `user`: what it can say of itself to a server's rules.
+pub(super) fn note_account(account: &str, user: &Value) {
+    let id = user["id"].as_str().and_then(|i| i.parse::<u64>().ok()).unwrap_or(0);
+    let created_at = if id == 0 { 0 } else { (((id >> 22) + 1_420_070_400_000) / 1000) as i64 };
+    with(|g| {
+        g.accounts.insert(
+            account.to_string(),
+            rules::AccountFacts {
+                email_verified: user["verified"].as_bool(),
+                // A phone is a verified one: Discord does not keep an unverified number on an account.
+                phone_verified: Some(user["phone"].as_str().is_some_and(|p| !p.is_empty())),
+                created_at,
+            },
+        );
+    });
+}
+
+/// A server's rules, from its payload.
+pub(super) fn note_guild(account: &str, guild: &Value, user_id: &str) {
+    let Some(id) = guild["id"].as_str() else { return };
+    // Some payloads keep the server's own fields under `properties`.
+    let own = guild.get("properties").filter(|p| p.is_object()).unwrap_or(guild);
+    let facts = rules::GuildFacts {
+        verification: own["verification_level"].as_u64().unwrap_or(0).min(4) as u8,
+        community: own["features"].as_array().is_some_and(|f| f.iter().any(|x| x.as_str() == Some("COMMUNITY"))),
+        owner: own["owner_id"].as_str() == Some(user_id),
+    };
+    with(|g| {
+        let key = (account.to_string(), id.to_string());
+        let member = g.guilds.remove(&key).and_then(|(_, m)| m);
+        g.guilds.insert(key, (facts, member));
+    });
+}
+
+/// The account's own membership of a server, as its member object says (at login, and when it changes).
+pub(super) fn note_member(state: &AppState, account: &str, guild_id: &str, member: Option<&Value>) {
+    let Some(member) = member else { return };
+    let when = |v: &Value| v.as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp());
+    let facts = rules::MemberFacts {
+        pending: member["pending"].as_bool(),
+        flags: member["flags"].as_u64(),
+        has_roles: member["roles"].as_array().is_some_and(|r| !r.is_empty()),
+        joined_at: when(&member["joined_at"]),
+        timed_out_until: when(&member["communication_disabled_until"]),
+    };
+    let changed = with(|g| {
+        let key = (account.to_string(), guild_id.to_string());
+        match g.guilds.get_mut(&key) {
+            Some((_, slot)) => {
+                let changed = slot.as_ref().map(|m| (m.pending, m.flags, m.has_roles, m.timed_out_until)) != Some((facts.pending, facts.flags, facts.has_roles, facts.timed_out_until));
+                *slot = Some(facts);
+                changed
+            }
+            None => false,
+        }
+    });
+    if changed {
+        reapply_guild(state, account, guild_id);
+    }
+}
+
+/// A server channel, as it is registered: its slowmode, whether the account's permissions are held to it, whether it
+/// has ever been written in.
+pub(super) fn note_channel(state: &AppState, buffer: &str, channel: &Value, permissions: u64, is_owner: bool) {
+    const ADMINISTRATOR: u64 = 1 << 3;
+    const MANAGE_CHANNELS: u64 = 1 << 4;
+    const MANAGE_MESSAGES: u64 = 1 << 13;
+    let empty = channel.get("last_message_id").is_some_and(Value::is_null) && state.store.newest_msg_id(buffer).ok().flatten().is_none();
+    with(|g| {
+        g.channels.insert(
+            buffer.to_string(),
+            ChannelFacts {
+                slowmode: channel["rate_limit_per_user"].as_u64().unwrap_or(0),
+                bypass_slowmode: is_owner || permissions & (ADMINISTRATOR | MANAGE_CHANNELS | MANAGE_MESSAGES) != 0,
+                full: is_owner || permissions & ADMINISTRATOR != 0,
+            },
+        );
+        if empty {
+            g.empty_channels.insert(buffer.to_string());
+        } else {
+            g.empty_channels.remove(buffer);
+        }
+    });
+}
+
+/// A channel's slowmode changed.
+pub(super) fn set_slowmode(buffer: &str, seconds: u64) {
+    with(|g| {
+        if let Some(facts) = g.channels.get_mut(buffer) {
+            facts.slowmode = seconds;
+        }
+    });
 }
 
 /// Whether a message is somebody speaking, and not Discord saying something about them. A system message carries its
@@ -344,23 +591,117 @@ pub fn is_speech(message: &Value) -> bool {
 /// A dispatch for a message was received in a place this connection knows: whatever it means for the locks.
 pub(super) fn heard(state: &AppState, config: &DiscordAccountConfig, d: &Value, buffer: &str, is_dm: bool) {
     let account = config.account_id();
+    let own = d["author"]["id"].as_str() == Some(config.user_id.as_str()) && is_speech(d);
+    // The echo of a message sent from here carries the nonce it was sent with: it is not the account speaking from
+    // another client, whatever else it is.
+    let from_here = d["nonce"].as_str().is_some_and(|n| with(|g| g.nonces.contains(n)));
+    if own {
+        with(|g| g.last_own.insert(buffer.to_string(), Instant::now()));
+    }
+    // Something has been said in a channel that nobody had written in.
+    let was_empty = with(|g| g.empty_channels.remove(buffer));
+    if was_empty {
+        let effective = with(|g| g.effective(&account, state.runtime.get_discord_guild(buffer).as_deref(), buffer));
+        state.runtime.set_buffer_read_only(state, buffer, effective);
+    }
     if is_dm {
         dm_has_messages(state, &account, buffer);
-    } else if d["author"]["id"].as_str() == Some(config.user_id.as_str()) && is_speech(d) {
+        if own && !from_here {
+            let reached = with(|g| {
+                let own = {
+                    let facts = g.dms.entry(buffer.to_string()).or_default();
+                    facts.own += 1;
+                    facts.own
+                };
+                let reached = own >= rules::ESTABLISHED_DM_MESSAGES && g.established.insert(buffer.to_string());
+                if reached {
+                    save(g);
+                }
+                // Said from another client, here: a captcha that held this conversation is over.
+                g.captcha.remove(&(account.clone(), buffer.to_string()));
+                reached
+            });
+            if reached {
+                let effective = with(|g| g.effective(&account, None, buffer));
+                state.runtime.set_buffer_read_only(state, buffer, effective);
+            }
+        }
+    } else if own && !from_here {
         if let Some(guild) = d["guild_id"].as_str() {
+            with(|g| g.captcha.remove(&(account.clone(), guild.to_string())));
             spoke_in_guild(state, &account, guild);
         }
     }
 }
 
-/// Refuses a send to a place the account has not spoken in.
-pub(super) fn ensure_may_speak(state: &AppState, buffer: &str) -> Result<()> {
+/// Discord asked for a captcha where this was sent: that place is closed to this client for a while.
+pub(super) fn hold_captcha(state: &AppState, buffer: &str) {
+    let account = state.runtime.get_buffer(buffer).map(|b| b.account_id).unwrap_or_default();
+    let scope = state.runtime.get_discord_guild(buffer).unwrap_or_else(|| buffer.to_string());
+    with(|g| g.captcha.insert((account.clone(), scope.clone()), Instant::now() + CAPTCHA_HOLD));
+    match state.runtime.get_discord_guild(buffer) {
+        Some(guild) => reapply_guild(state, &account, &guild),
+        None => {
+            let effective = with(|g| g.effective(&account, None, buffer));
+            state.runtime.set_buffer_read_only(state, buffer, effective);
+        }
+    }
+}
+
+/// A message was sent from here: the slowmode counts from now, and its echo is told from another client's.
+pub(super) fn record_own_send(buffer: &str) {
+    with(|g| g.last_own.insert(buffer.to_string(), Instant::now()));
+}
+
+/// Refuses a send to a place this client does not speak first in, or where the server's own rules (a level, a
+/// timeout, a slowmode) say the account may not speak yet. Asked of every send; it makes no request unless a server
+/// has never been asked whether it has onboarding.
+pub(super) async fn ensure_may_speak(state: &AppState, buffer: &str) -> Result<()> {
     let account = state.runtime.get_buffer(buffer).map(|b| b.account_id).unwrap_or_default();
     let guild = state.runtime.get_discord_guild(buffer);
-    match with(|g| g.lock_of(&account, guild.as_deref(), buffer)).reason() {
-        Some(reason) => bail!("{reason}"),
-        None => Ok(()),
+    if let Some(reason) = with(|g| g.lock_of(&account, guild.as_deref(), buffer)).reason() {
+        bail!("{reason}");
     }
+    if let Some(guild) = guild.as_deref() {
+        learn_onboarding(state, &account, guild, buffer).await;
+        let now = chrono::Utc::now().timestamp();
+        if let Some(restriction) = with(|g| g.restriction(&account, guild, buffer, now)) {
+            bail!("{}", restriction.sentence());
+        }
+    }
+    let slowmode = with(|g| g.channels.get(buffer).map(|c| rules::slowmode_remaining(c.slowmode, g.last_own.get(buffer).copied(), c.bypass_slowmode, Instant::now())));
+    if let Some(Some(wait)) = slowmode {
+        bail!("This channel has slowmode on: wait {} more seconds.", wait.as_secs().max(1) + 1);
+    }
+    Ok(())
+}
+
+/// Asks a server whether it has onboarding on, once, but only where it could matter: a community server whose
+/// onboarding this member has not completed. Everywhere else the answer is no request at all.
+async fn learn_onboarding(state: &AppState, account: &str, guild: &str, buffer: &str) {
+    const COMPLETED_ONBOARDING: u64 = 1 << 1;
+    let key = (account.to_string(), guild.to_string());
+    let needed = with(|g| {
+        let Some((facts, member)) = g.guilds.get(&key) else { return false };
+        let completed = member.as_ref().and_then(|m| m.flags).is_some_and(|f| f & COMPLETED_ONBOARDING != 0);
+        let full = g.channels.get(buffer).is_some_and(|c| c.full);
+        let recent = g.onboarding.get(&key).is_some_and(|(_, at)| at.elapsed() < Duration::from_secs(3600));
+        facts.community && !facts.owner && !completed && !full && !recent
+    });
+    if !needed {
+        return;
+    }
+    let Some(config) = state.accounts.get_discord(account) else { return };
+    let enabled = async {
+        let resp = http_client_for(&config.token).get(format!("{API_BASE}/guilds/{guild}/onboarding")).header("Authorization", &config.token).send_paced().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()?["enabled"].as_bool()
+    }
+    .await;
+    with(|g| g.onboarding.insert(key, (enabled, Instant::now())));
+    reapply_guild(state, account, guild);
 }
 
 /// Refuses a file Discord would refuse, before any of it is sent. What Discord does with one that is too big is cut
@@ -410,6 +751,19 @@ pub(super) async fn take_turn(account: &str, attachment: bool) {
     }
 }
 
+type ChannelLocks = HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+static CHANNEL_LOCKS: Mutex<Option<ChannelLocks>> = Mutex::new(None);
+
+/// Waits until nothing else is being sent to this channel, and holds the channel until it is dropped: two messages
+/// to one channel do not overlap, as they cannot from a person at a keyboard.
+pub(super) async fn channel_turn(channel_id: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let lock = {
+        let mut slot = CHANNEL_LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+        slot.get_or_insert_with(HashMap::new).entry(channel_id.to_string()).or_default().clone()
+    };
+    lock.lock_owned().await
+}
+
 /// A fresh message id, as Discord's clients make one: a snowflake from now, so it sorts with the messages around it
 /// and cannot repeat.
 pub fn nonce() -> String {
@@ -422,7 +776,24 @@ pub fn nonce() -> String {
 /// What every message carries beyond its words: the nonce, and who may be mentioned, said outright.
 pub(super) fn stamp(payload: &mut Value) {
     if payload.get("nonce").is_none() {
-        payload["nonce"] = Value::from(nonce());
+        let nonce = nonce();
+        with(|g| {
+            g.nonces.insert(nonce.clone());
+            g.nonce_order.push_back(nonce.clone());
+            while g.nonce_order.len() > 500 {
+                if let Some(old) = g.nonce_order.pop_front() {
+                    g.nonces.remove(&old);
+                }
+            }
+        });
+        payload["nonce"] = Value::from(nonce);
+    }
+    // Said outright, as Discord's own clients say them.
+    if payload.get("tts").is_none() {
+        payload["tts"] = Value::Bool(false);
+    }
+    if payload.get("flags").is_none() {
+        payload["flags"] = Value::from(0);
     }
     if payload.get("allowed_mentions").is_none() {
         let mut allowed = json!({ "parse": ["users", "roles", "everyone"] });
@@ -530,6 +901,67 @@ fn spawn_check(state: AppState, config: DiscordAccountConfig, guild_id: String) 
         }
         tokio::time::sleep(SPACING).await;
     });
+}
+
+/// Counts the account's own messages in a conversation by asking Discord's search - the store holds only what has been
+/// read here - so a conversation of years is not taken for a new one. One request, queued behind the others.
+fn spawn_dm_count(state: AppState, config: DiscordAccountConfig, buffer: String, channel_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _turn = TURN.lock().await;
+        let account = config.account_id();
+        let mut own = None;
+        for _ in 0..INDEXING_TRIES {
+            let resp = http_client_for(&config.token)
+                .get(format!("{API_BASE}/channels/{channel_id}/messages/search"))
+                .query(&[("author_id", config.user_id.as_str())])
+                .header("Authorization", &config.token)
+                .send_paced()
+                .await;
+            let Ok(resp) = resp else { break };
+            let status = resp.status().as_u16();
+            let retry = resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<f64>().ok());
+            let body: Value = resp.json().await.unwrap_or(Value::Null);
+            match status {
+                200 => {
+                    own = Some(count_own(&body, &with(|g| g.sent.clone())));
+                    break;
+                }
+                202 | 429 => {
+                    let wait = retry.or_else(|| body["retry_after"].as_f64()).unwrap_or(5.0).clamp(1.0, 60.0);
+                    tokio::time::sleep(Duration::from_secs_f64(wait)).await;
+                }
+                _ => break,
+            }
+        }
+        with(|g| {
+            g.dm_checking.remove(&buffer);
+            g.dm_checked.insert(buffer.clone());
+            if let Some(own) = own {
+                g.dms.entry(buffer.clone()).or_default().own = own;
+                if own >= rules::ESTABLISHED_DM_MESSAGES && g.established.insert(buffer.clone()) {
+                    save(g);
+                }
+            }
+        });
+        let effective = with(|g| g.effective(&account, None, &buffer));
+        state.runtime.set_buffer_read_only(&state, &buffer, effective);
+        tokio::time::sleep(SPACING).await;
+    });
+}
+
+/// How many of the account's own messages a conversation's search answer says there are, not counting any that this
+/// client sent (of those shown): the total is Discord's, the sent ones are known by id.
+pub fn count_own(body: &Value, sent_here: &HashSet<String>) -> usize {
+    let total = body["total_results"].as_u64().unwrap_or(0) as usize;
+    let ours = body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.as_array()?.iter().find(|m| m["hit"].as_bool() == Some(true)).or_else(|| group.as_array()?.first()))
+        .filter(|m| m["id"].as_str().is_some_and(|id| sent_here.contains(id)))
+        .count();
+    total.saturating_sub(ours)
 }
 
 /// Asks Discord whether the account has any message in a server since it joined.
@@ -649,6 +1081,8 @@ mod tests {
         let mut plain = json!({ "content": "hi" });
         stamp(&mut plain);
         assert!(plain["nonce"].as_str().is_some());
+        assert_eq!(plain["tts"], json!(false));
+        assert_eq!(plain["flags"], json!(0));
         assert_eq!(plain["allowed_mentions"]["parse"], json!(["users", "roles", "everyone"]));
         assert!(plain["allowed_mentions"].get("replied_user").is_none());
 
@@ -708,6 +1142,62 @@ mod tests {
         assert_eq!(read_search(200, None, &joined, &sent).unwrap(), Searched::Never);
         let spoke = json!({ "total_results": 2, "messages": [[{ "id": "5", "type": 7, "hit": true }], [{ "id": "6", "type": 0, "hit": true }]] });
         assert_eq!(read_search(200, None, &spoke, &sent).unwrap(), Searched::Spoke);
+    }
+
+    #[test]
+    fn a_conversations_own_messages_are_counted_without_the_ones_sent_here() {
+        let sent: HashSet<String> = ["2".to_string()].into();
+        let body = json!({ "total_results": 7, "messages": [[{ "id": "1", "hit": true }], [{ "id": "2", "hit": true }]] });
+        assert_eq!(count_own(&body, &sent), 6);
+        assert_eq!(count_own(&json!({ "total_results": 0, "messages": [] }), &sent), 0);
+        assert_eq!(count_own(&Value::Null, &sent), 0);
+    }
+
+    #[test]
+    fn a_new_conversation_is_locked_until_enough_is_the_accounts_own_and_then_for_good() {
+        let mut g = guard();
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::None, "nothing known of it");
+        g.dms.insert("dm".into(), DmFacts { own: 2, ..Default::default() });
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::NewConversation);
+        g.dm_checking.insert("dm".into());
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::Checking);
+        g.dm_checking.clear();
+        g.dms.insert("dm".into(), DmFacts { own: 5, ..Default::default() });
+        g.established.insert("dm".into());
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::None);
+        // Established is for good, but a message request or spam mark is Discord's word on it.
+        g.dms.insert("dm".into(), DmFacts { own: 9, request: true, ..Default::default() });
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::MessageRequest);
+        g.dms.insert("dm".into(), DmFacts { own: 9, spam: true, ..Default::default() });
+        assert_eq!(g.lock_of("a", None, "dm"), Lock::SpamDm);
+    }
+
+    #[test]
+    fn an_empty_channel_and_a_captcha_close_a_server_the_account_has_spoken_in() {
+        let mut g = guard();
+        g.spoken.entry("a".into()).or_default().insert("g".into());
+        assert_eq!(g.lock_of("a", Some("g"), "b"), Lock::None);
+        g.empty_channels.insert("b".into());
+        assert_eq!(g.lock_of("a", Some("g"), "b"), Lock::EmptyChannel);
+        g.empty_channels.clear();
+        g.captcha.insert(("a".into(), "g".into()), Instant::now() + Duration::from_secs(60));
+        assert_eq!(g.lock_of("a", Some("g"), "b"), Lock::Captcha);
+        g.captcha.insert(("a".into(), "g".into()), Instant::now() - Duration::from_secs(1));
+        assert_eq!(g.lock_of("a", Some("g"), "b"), Lock::None, "it ends");
+    }
+
+    #[test]
+    fn a_server_that_asks_for_a_phone_closes_its_channels_until_there_is_one() {
+        let mut g = guard();
+        g.spoken.entry("a".into()).or_default().insert("g".into());
+        g.accounts.insert("a".into(), rules::AccountFacts { email_verified: Some(true), phone_verified: Some(false), created_at: 1 });
+        g.guilds.insert(
+            ("a".into(), "g".into()),
+            (rules::GuildFacts { verification: 4, ..Default::default() }, Some(rules::MemberFacts { pending: Some(false), flags: Some(0), ..Default::default() })),
+        );
+        assert!(matches!(g.lock_of("a", Some("g"), "b"), Lock::Participation(r) if r.contains("phone")));
+        g.accounts.get_mut("a").unwrap().phone_verified = Some(true);
+        assert_eq!(g.lock_of("a", Some("g"), "b"), Lock::None);
     }
 
     #[test]

@@ -241,7 +241,8 @@ fn guild_list(state: &AppState, account_id: &str, buffer_id: &str) -> Vec<Value>
 /// Sends a sticker as a message of its own.
 pub async fn send(state: &AppState, buffer_id: &str, token: &str, sticker_id: &str) -> Result<()> {
     let channel_id = state.runtime.get_discord_channel(buffer_id).ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    super::send_guard::ensure_may_speak(state, buffer_id)?;
+    super::send_guard::ensure_may_speak(state, buffer_id).await?;
+    let _turn = super::send_guard::channel_turn(&channel_id).await;
     let resp = send_write(
         http_client_for(token)
             .post(format!("{API_BASE}/channels/{channel_id}/messages"))
@@ -257,8 +258,9 @@ pub async fn send(state: &AppState, buffer_id: &str, token: &str, sticker_id: &s
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("Discord API error {status}: {text}");
+        bail!("{}", super::send::refused(state, buffer_id, status, &text));
     }
+    super::send_guard::record_own_send(buffer_id);
     super::send_guard::note_sent(resp).await;
     Ok(())
 }

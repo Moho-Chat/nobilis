@@ -67,6 +67,17 @@ impl Inflater {
 }
 
 #[cfg(test)]
+mod heartbeat_tests {
+    use super::heartbeat_message;
+
+    #[test]
+    fn a_heartbeat_says_how_far_the_connection_has_got() {
+        assert_eq!(heartbeat_message(0), r#"{"d":null,"op":1}"#);
+        assert_eq!(heartbeat_message(42), r#"{"d":42,"op":1}"#);
+    }
+}
+
+#[cfg(test)]
 mod inflate_tests {
     use super::*;
 
@@ -336,6 +347,11 @@ pub(super) struct Resume {
     seq: u64,
 }
 
+/// A heartbeat: its data is the number of the last dispatch received, and null before there has been one.
+pub(super) fn heartbeat_message(seq: u64) -> String {
+    json!({ "op": 1, "d": if seq == 0 { Value::Null } else { Value::from(seq) } }).to_string()
+}
+
 /// The gateway capabilities this client declares in IDENTIFY, as a user client does (Dissent's `ningen` sends the same
 /// six of the seven it knows): notes fetched lazily, read states and guild settings in their versioned form, user
 /// objects deduplicated, guild experiments as populations, and read states for things that are not channels. Each
@@ -394,6 +410,11 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         session.resume = Some(Resume { session_id: position.session_id, url: position.url, seq: position.seq });
         session.pending = replay.into();
     }
+    // A login Discord has already refused is not tried again: the person signs in afresh, which is a new token.
+    if token_is_halted(&config.token) {
+        state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some("Discord has refused this account's login - sign in again from Accounts"));
+        return;
+    }
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
         // A connection that will log in afresh (not pick a session back up) is counted, and held when the account has
@@ -418,6 +439,8 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
             Ok(Err(e)) => {
                 if e.downcast_ref::<GatewayAuthFailed>().is_some() {
                     tracing::warn!("discord[{account_id}]: {e} - giving up, needs a fresh login");
+                    // Every other request with it stops too: see http::Safety.
+                    halt_token(&config.token);
                     state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some(&e.to_string()));
                     return;
                 }
@@ -524,6 +547,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // false-positive as a missed ack.
     let ack_pending = Arc::new(AtomicBool::new(false));
     let stale_notify = Arc::new(Notify::new());
+    // The number of the last dispatch received, which a heartbeat says: it tells Discord how far this connection has
+    // got, as it does for every client. (A resume starts from where the saved session had got to.)
+    let last_seq = Arc::new(std::sync::atomic::AtomicU64::new(resume.as_ref().map(|r| r.seq).unwrap_or(0)));
+    let hb_seq = last_seq.clone();
     let hb_tx = out_tx.clone();
     let hb_ack_pending = ack_pending.clone();
     let hb_stale_notify = stale_notify.clone();
@@ -536,7 +563,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 hb_stale_notify.notify_one();
                 break;
             }
-            if hb_tx.send(json!({ "op": 1, "d": Value::Null }).to_string()).is_err() {
+            if hb_tx.send(heartbeat_message(hb_seq.load(Ordering::SeqCst))).is_err() {
                 break;
             }
         }
@@ -619,8 +646,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
         // Tracked before the match so it counts events this client chose
         // not to handle - the server's count includes them either way, and
         // resuming from a lower number would replay what was already seen.
-        if let (Some(seq), Some(r)) = (msg.get("s").and_then(|v| v.as_u64()), resume.as_mut()) {
-            r.seq = seq;
+        if let Some(seq) = msg.get("s").and_then(|v| v.as_u64()) {
+            last_seq.store(seq, Ordering::SeqCst);
+            if let Some(r) = resume.as_mut() {
+                r.seq = seq;
+            }
         }
         match op {
             0 => {
@@ -649,6 +679,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         tracing::info!("discord[{account_id}]: resumed");
                     }
                     "READY" => {
+                        // A new login has missed what the last one did not: what was asked about is asked afresh.
+                        if !replaying {
+                            super::history::forget_asked(&account_id);
+                        }
                         // Kept as it came (it is what a resume replays), and read with its users put back: see
                         // ready_shape. A READY that was not dehydrated is read as it is.
                         let raw = d;
@@ -661,6 +695,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             .unwrap_or("me")
                             .to_string();
                         state.runtime.set_own_identity(&account_id, &username);
+                        // What the account can say of itself to a server's rules: a verified email or phone, how old.
+                        super::send_guard::note_account(&account_id, &d["user"]);
                         // Nitro, which is what lets this account's emoji be
                         // used away from the guild they belong to. Read here
                         // because READY is the only place the payload carries
@@ -954,6 +990,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                         if let Some(topic) = d.get("topic") {
                                             state.runtime.set_buffer_topic(state, &crate::model::buffer_id(&account_id, &old_name), topic.as_str().unwrap_or_default());
                                         }
+                                        // And so is a channel's slowmode.
+                                        if let Some(seconds) = d["rate_limit_per_user"].as_u64() {
+                                            super::send_guard::set_slowmode(&crate::model::buffer_id(&account_id, &old_name), seconds);
+                                        }
                                         continue;
                                     }
                                     state.runtime.remove_buffer(state, &crate::model::buffer_id(&account_id, &old_name));
@@ -1119,6 +1159,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         if d["user"]["id"].as_str() != Some(config.user_id.as_str()) {
                             continue;
                         }
+                        // What the server's rules ask of the account: pending, flags, roles, a timeout.
+                        super::send_guard::note_member(state, &account_id, guild_id, Some(d));
                         if d["pending"].as_bool().unwrap_or(false) {
                             continue;
                         }
@@ -1679,6 +1721,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         }
                     }
                 }
+            }
+            // Discord asking for a heartbeat now: answered at once, as its own clients answer.
+            1 => {
+                let _ = out_tx.send(heartbeat_message(last_seq.load(Ordering::SeqCst)));
             }
             7 => return Err(ReconnectRequested.into()),
             // The resume was refused, or the session is gone. Everything
