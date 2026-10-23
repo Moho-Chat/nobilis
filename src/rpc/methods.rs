@@ -113,6 +113,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addSteamAccount" | "addSteamAccountQr" => Some("steam"),
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
+        "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
         _ => None,
     }
 }
@@ -428,6 +429,7 @@ pub async fn dispatch(
                 { "id": "steam", "name": "Steam", "available": true },
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
+                { "id": "stoat", "name": "Stoat", "available": true },
             ])),
             None,
         ),
@@ -504,6 +506,16 @@ pub async fn dispatch(
                         let fetched = if before > 0 { backend::telegram::history::older(state, &buffer, before).await } else { backend::telegram::history::open(state, &buffer).await };
                         if let Err(e) = fetched {
                             tracing::debug!("telegram history: {e:#}");
+                        }
+                    }
+                    // Stoat keeps every message: opening a conversation asks for its recent end, and scrolling to the
+                    // top asks for the page before the oldest one held (its paging is by message id, not by time).
+                    if buffer.account_id.starts_with("stoat:") {
+                        if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) {
+                            let cursor = if before > 0 { state.store.oldest_msg_id(buffer_id).ok().flatten() } else { None };
+                            if let Err(e) = backend::stoat::messages::history(state, &handle, &buffer, cursor.as_deref()).await {
+                                tracing::debug!("stoat history: {e:#}");
+                            }
                         }
                     }
                     // Kick pages back through its own history endpoint,
@@ -803,8 +815,18 @@ pub async fn dispatch(
                 let twitch_tokens = state.accounts.get_twitch(id).filter(|a| a.is_signed_in()).map(|a| (a.access_token, a.refresh_token));
                 // A Telegram session is ended at Telegram too, and its file taken away.
                 let telegram_account = state.accounts.get_telegram(id);
+                // A Stoat session this client made is ended at Stoat; a token that was pasted belongs to another app
+                // of the person's, which ending would sign out.
+                let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
                 match state.accounts.remove(id) {
                     Ok(true) => {
+                        if let Some(config) = stoat_session {
+                            tokio::spawn(async move {
+                                let api = backend::stoat::api::Api::new(&config.account_id(), &config.instance, Some(config.token.clone()));
+                                let _ = api.post("/auth/session/logout", &serde_json::json!({})).await;
+                            });
+                        }
+                        state.runtime.clear_stoat_handle(id);
                         if let Some(config) = telegram_account {
                             backend::telegram::folders::forget(&config.account_id());
                             let state = state.clone();
@@ -1113,6 +1135,15 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => {
+                    // It lapses by itself, so only "typing" is said.
+                    if typing {
+                        if let Err(e) = backend::stoat::send::typing(state, &buffer) {
+                            tracing::debug!("sendTyping: {e}");
+                        }
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     // It lapses by itself, so only "typing" is said.
                     if typing {
@@ -1374,6 +1405,13 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // Stoat keeps one too.
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => {
+                    if let Err(e) = backend::stoat::send::mark_read(state, &buffer).await {
+                        tracing::debug!("stoat read position: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -3575,6 +3613,15 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => {
+                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
+                        return (None, Some("Sending files to Stoat is not built yet".to_string()));
+                    }
+                    match backend::stoat::send::send(state, &buffer, body, reply_to_id).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") && params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false) && attachment_path.is_none() && reply_to_id.is_some() => {
                     match backend::telegram::threads::reply(state, &buffer, reply_to_id.unwrap_or_default(), body).await {
                         Ok(()) => (Some(ok_node()), None),
@@ -3795,6 +3842,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3839,6 +3890,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3868,6 +3923,10 @@ pub async fn dispatch(
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
+                },
+                Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     // For everyone unless the window says it is only to be removed from this account's view.
@@ -4645,6 +4704,43 @@ pub async fn dispatch(
             let login_id = format!("telegram-{}", crate::model::next_message_id());
             backend::telegram::login::start_qr(state.clone(), login_id.clone(), api_id, api_hash.trim().to_string());
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Signing in to Stoat: an id now and the rest as events (backend/stoat/login.rs). The instance is optional and
+        // is the official one when it is left out.
+        "addStoatAccount" | "addStoatAccountToken" => {
+            let instance = p_str(params, "instance", "").to_string();
+            let login_id = format!("stoat-{}", crate::model::next_message_id());
+            if method == "addStoatAccount" {
+                let (Some(email), Some(password)) = (p_str_opt(params, "email"), p_str_opt(params, "password")) else {
+                    return (None, Some("addStoatAccount requires \"email\" and \"password\"".to_string()));
+                };
+                backend::stoat::login::start(state.clone(), login_id.clone(), instance, email.to_string(), password.to_string());
+            } else {
+                let Some(token) = p_str_opt(params, "token") else {
+                    return (None, Some("addStoatAccountToken requires \"token\"".to_string()));
+                };
+                backend::stoat::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
+            }
+            (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // The second factor Stoat asked for, for a sign-in that is waiting.
+        "submitStoatCode" => {
+            let (Some(login_id), Some(value)) = (p_str_opt(params, "loginId"), p_str_opt(params, "value")) else {
+                return (None, Some("submitStoatCode requires \"loginId\" and \"value\"".to_string()));
+            };
+            match backend::stoat::login::submit_code(login_id, value) {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        "cancelStoatLogin" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::stoat::login::cancel(login_id);
+            }
+            (Some(ok_node()), None)
         }
 
         // The code Telegram sent, and the cloud password it may ask for next, for a sign-in that is waiting.
