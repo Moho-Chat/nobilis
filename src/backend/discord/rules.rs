@@ -14,6 +14,9 @@ use std::time::{Duration, Instant};
 const FLAG_COMPLETED_ONBOARDING: u64 = 1 << 1;
 const FLAG_BYPASSES_VERIFICATION: u64 = 1 << 2;
 
+/// How long a member of a server wears Discord's green "new member" badge by their name: the first week.
+pub const NEW_MEMBER_SECS: i64 = 7 * 24 * 60 * 60;
+
 const ACCOUNT_AGE_SECS: i64 = 5 * 60;
 const MEMBER_AGE_SECS: i64 = 10 * 60;
 
@@ -56,6 +59,8 @@ pub enum Restriction {
     AccountTooNew(i64),
     MemberTooNew(i64),
     TimedOut(i64),
+    /// Wearing the green new-member badge: for as many more seconds.
+    NewMember(i64),
 }
 
 impl Restriction {
@@ -69,6 +74,10 @@ impl Restriction {
             Restriction::AccountTooNew(s) => format!("This server asks for an account more than five minutes old: {}.", wait(*s)),
             Restriction::MemberTooNew(s) => format!("This server asks you to have been a member for ten minutes before you talk: {}.", wait(*s)),
             Restriction::TimedOut(s) => format!("You are timed out in this server: {}.", wait(*s)),
+            Restriction::NewMember(s) => format!(
+                "You joined this server recently, so Discord shows the green new-member badge by your name here, for about {} more. Messages from another client while it shows are treated as spam: use Discord's own app until it is gone.",
+                long_wait(*s)
+            ),
         }
     }
 
@@ -79,8 +88,21 @@ impl Restriction {
             Restriction::Onboarding => Some("This server asks you to finish its onboarding first - do that in Discord's own app."),
             Restriction::EmailRequired => Some("This server needs a verified email on your Discord account before you can talk here."),
             Restriction::PhoneRequired => Some("This server needs a verified phone number on your Discord account before you can talk here."),
+            Restriction::NewMember(_) => Some("You are a new member of this server: Discord shows a green badge by your name for the first week, and treats messages from another client as spam while it shows. Use Discord's own app until it is gone; this opens again then."),
             _ => None,
         }
+    }
+}
+
+/// A wait counted in days or hours, for one that is long.
+fn long_wait(seconds: i64) -> String {
+    let hours = (seconds.max(0) + 3599) / 3600;
+    if hours >= 48 {
+        format!("{} days", (hours + 23) / 24)
+    } else if hours > 1 {
+        format!("{hours} hours")
+    } else {
+        "an hour".to_string()
     }
 }
 
@@ -147,6 +169,19 @@ pub fn participation(
         }
     }
     None
+}
+
+/// Whether the account still wears the green new-member badge: it joined the server in the last week. Discord treats
+/// what a person says from another client in that time as spam, so it is a reason not to speak from here, whatever
+/// else the server allows. The owner has no such badge; `joined` is when the account joined if the member does not say.
+pub fn new_member(guild: &GuildFacts, member: Option<&MemberFacts>, joined: Option<i64>, now: i64) -> Option<Restriction> {
+    if guild.owner {
+        return None;
+    }
+    let joined = member.and_then(|m| m.joined_at).or(joined)?;
+    let age = now - joined;
+    // A join time in the future is a clock that is wrong, and not a reason to lock anything.
+    (0..NEW_MEMBER_SECS).contains(&age).then_some(Restriction::NewMember(NEW_MEMBER_SECS - age))
 }
 
 /// How long until a channel's slowmode lets the account speak again: `seconds` is the channel's setting, `last` the
@@ -241,6 +276,36 @@ mod tests {
         let member = MemberFacts { pending: Some(false), flags: Some(0), joined_at: Some(NOW - 5), ..Default::default() };
         assert_eq!(participation(&guild(4), Some(&member), &unknown, false, None, NOW), None);
         assert_eq!(participation(&guild(1), Some(&member), &unknown, false, None, NOW), None);
+    }
+
+    #[test]
+    fn a_member_of_under_a_week_wears_the_badge_until_the_week_is_up() {
+        let day = 24 * 60 * 60;
+        let member = |ago: i64| MemberFacts { joined_at: Some(NOW - ago), ..Default::default() };
+        assert_eq!(new_member(&guild(0), Some(&member(60)), None, NOW), Some(Restriction::NewMember(7 * day - 60)));
+        assert_eq!(new_member(&guild(0), Some(&member(6 * day)), None, NOW), Some(Restriction::NewMember(day)));
+        assert_eq!(new_member(&guild(0), Some(&member(7 * day)), None, NOW), None, "gone at a week");
+        assert_eq!(new_member(&guild(0), Some(&member(90 * day)), None, NOW), None);
+    }
+
+    #[test]
+    fn the_badge_is_not_worn_by_the_owner_or_by_a_member_nothing_is_known_of() {
+        let fresh = MemberFacts { joined_at: Some(NOW - 5), ..Default::default() };
+        assert_eq!(new_member(&GuildFacts { owner: true, ..guild(0) }, Some(&fresh), None, NOW), None);
+        assert_eq!(new_member(&guild(0), None, None, NOW), None, "not known is not blocked");
+        assert_eq!(new_member(&guild(0), Some(&MemberFacts::default()), None, NOW), None);
+        // The server's own join time stands in for a member object that does not carry one.
+        assert!(new_member(&guild(0), Some(&MemberFacts::default()), Some(NOW - 5), NOW).is_some());
+        assert_eq!(new_member(&guild(0), Some(&MemberFacts { joined_at: Some(NOW + 500), ..Default::default() }), None, NOW), None, "a join in the future is a wrong clock");
+    }
+
+    #[test]
+    fn the_badge_says_how_long_in_days_and_is_a_lock_over_the_box() {
+        let day = 24 * 60 * 60;
+        assert!(Restriction::NewMember(3 * day).sentence().contains("3 days"));
+        assert!(Restriction::NewMember(5 * 3600).sentence().contains("5 hours"));
+        assert!(Restriction::NewMember(600).sentence().contains("an hour"));
+        assert!(Restriction::NewMember(day).banner().is_some(), "it lasts days, so it is a lock and not a thing said when a send is tried");
     }
 
     #[test]

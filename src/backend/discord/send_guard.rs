@@ -183,7 +183,9 @@ impl Guard {
         let account_facts = self.accounts.get(account)?;
         let full = self.channels.get(buffer).is_some_and(|c| c.full);
         let onboarding = self.onboarding.get(&key).and_then(|(enabled, _)| *enabled);
-        rules::participation(facts, member.as_ref(), account_facts, full, onboarding, now)
+        // Discord's green new-member badge, for the first week: what the server asks comes first, as it is the more
+        // actionable thing to be told.
+        rules::participation(facts, member.as_ref(), account_facts, full, onboarding, now).or_else(|| rules::new_member(facts, member.as_ref(), self.joined.get(&key).copied(), now))
     }
 
     /// What closes a place: `guild` is None for a conversation.
@@ -369,6 +371,31 @@ fn reapply_guild(state: &AppState, account: &str, guild: &str) {
     }
 }
 
+/// Servers whose new-member badge has a task waiting for its end.
+static BADGE_WAITS: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+/// Opens the places the green new-member badge closed when the week is up. Re-evaluating is all it does: the lock is
+/// worked out from the clock each time, so what is needed is only a moment at which to look again.
+fn watch_badge_end(state: &AppState, account: &str, guild: &str, joined: i64) {
+    let left = joined + rules::NEW_MEMBER_SECS - chrono::Utc::now().timestamp();
+    if left <= 0 {
+        return;
+    }
+    let key = (account.to_string(), guild.to_string());
+    let fresh = BADGE_WAITS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(key.clone());
+    if !fresh {
+        return;
+    }
+    // Said so that the week can be checked against the day the badge actually goes.
+    tracing::info!("discord[{account}]: joined server {guild} {} days ago: the new-member lock lasts until {}", (chrono::Utc::now().timestamp() - joined) / 86_400, chrono::DateTime::from_timestamp(joined + rules::NEW_MEMBER_SECS, 0).map(|t| t.to_rfc3339()).unwrap_or_default());
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(left as u64 + 5)).await;
+        BADGE_WAITS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).remove(&key);
+        reapply_guild(&state, &key.0, &key.1);
+    });
+}
+
 /// A server is being registered: note what is wanted of it, and start finding out whether the account has spoken in
 /// it. Called before its channels are registered, so they begin locked rather than open.
 pub(super) fn open_guild(state: &AppState, config: &DiscordAccountConfig, guild: &Value) {
@@ -376,6 +403,9 @@ pub(super) fn open_guild(state: &AppState, config: &DiscordAccountConfig, guild:
     let account = config.account_id();
     let key = (account.clone(), guild_id.to_string());
     let joined = guild["joined_at"].as_str().and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.timestamp());
+    if let Some(at) = joined {
+        watch_badge_end(state, &account, guild_id, at);
+    }
     let start = with(|g| {
         if let Some(at) = joined {
             g.joined.insert(key.clone(), at);
@@ -531,6 +561,9 @@ pub(super) fn note_member(state: &AppState, account: &str, guild_id: &str, membe
         joined_at: when(&member["joined_at"]),
         timed_out_until: when(&member["communication_disabled_until"]),
     };
+    if let Some(at) = facts.joined_at {
+        watch_badge_end(state, account, guild_id, at);
+    }
     let changed = with(|g| {
         let key = (account.to_string(), guild_id.to_string());
         match g.guilds.get_mut(&key) {
