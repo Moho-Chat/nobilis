@@ -507,7 +507,7 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
             }
             // A conversation with them may now be one that can be written in, or no longer.
             let other = event["user"]["_id"].as_str().or(event["user"].as_str()).unwrap_or("").to_string();
-            let direct: Vec<Channel> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.values().filter(|c| c.kind == Kind::Direct && c.recipients.iter().any(|r| *r == other)).cloned().collect();
+            let direct: Vec<Channel> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.values().filter(|c| c.kind == Kind::Direct && c.recipients.contains(&other)).cloned().collect();
             for channel in direct {
                 register_channel(state, handle, &channel, 0, None);
             }
