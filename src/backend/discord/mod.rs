@@ -55,6 +55,7 @@ pub mod golive;
 pub mod guilds;
 pub mod history;
 pub mod install_headers;
+pub mod ready_shape;
 pub mod send_guard;
 pub mod session_store;
 pub mod http;
