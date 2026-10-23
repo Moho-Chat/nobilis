@@ -1327,6 +1327,7 @@ pub async fn dispatch(
                         "sneedchat" => backend::sneedchat::profile(&state, &account_id, &buffer_id, &who),
                         "steam" => backend::steam::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         "telegram" => backend::telegram::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
+                        "stoat" => backend::stoat::profile::build(&state, &account_id, &buffer_id, &who, &user_id).await,
                         // A service with nothing to add still answers, so the
                         // card stops waiting and shows the name.
                         other => {
@@ -1938,6 +1939,18 @@ pub async fn dispatch(
                             false
                         }
                     }
+                    Some(buffer) if buffer.account_id.starts_with("stoat:") => match state.runtime.stoat_handle(&buffer.account_id) {
+                        Some(handle) => {
+                            let state = state.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = backend::stoat::members::refresh(&state, &handle, &buffer).await {
+                                    tracing::debug!("stoat members: {e}");
+                                }
+                            });
+                            true
+                        }
+                        None => false,
+                    },
                     Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                         let (state, buffer) = (state.clone(), buffer);
                         tokio::spawn(async move {
@@ -3614,10 +3627,19 @@ pub async fn dispatch(
                     }
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
-                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
-                        return (None, Some("Sending files to Stoat is not built yet".to_string()));
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let spoilers: Vec<&str> = params.get("spoilerPaths").and_then(|v| v.as_array()).map(|list| list.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+                    let files: Vec<(String, bool)> = paths.iter().map(|p| (p.clone(), spoilers.contains(&p.as_str()))).collect();
+                    let sent = backend::stoat::send::send_files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
                     }
-                    match backend::stoat::send::send(state, &buffer, body, reply_to_id).await {
+                    match sent {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }

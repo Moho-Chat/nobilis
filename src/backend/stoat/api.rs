@@ -125,6 +125,31 @@ impl Api {
         self.request(Method::DELETE, path, &[], None).await
     }
 
+    /// Puts a file on the instance's file server, and answers the id to name it by in a message.
+    pub async fn upload(&self, server: &str, tag: &str, name: &str, content_type: &str, bytes: Vec<u8>) -> Result<String, ApiError> {
+        if self.halted() {
+            return Err(ApiError::Unauthorized);
+        }
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(name.to_string()).mime_str(content_type).map_err(|e| ApiError::Network(e.to_string()))?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let mut request = self.http.post(format!("{}/{tag}", server.trim_end_matches('/'))).multipart(form);
+        if let Some(token) = &self.token {
+            request = request.header("X-Session-Token", token);
+        }
+        let response = request.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let status = response.status();
+        let text = response.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
+        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if status.as_u16() == 401 {
+            self.halted.store(true, Ordering::Relaxed);
+            return Err(ApiError::Unauthorized);
+        }
+        if !status.is_success() {
+            return Err(ApiError::Refused { status: status.as_u16(), kind: json["type"].as_str().unwrap_or("").to_string(), detail: json });
+        }
+        json["id"].as_str().map(str::to_string).ok_or_else(|| ApiError::Refused { status: status.as_u16(), kind: "NoFileId".to_string(), detail: json })
+    }
+
     /// Waits for the route's window if it has run dry.
     async fn pace(&self, key: &str) {
         let wait = {

@@ -15,6 +15,8 @@
 //! - `events` - what the websocket says as it happens
 //! - `messages` - a message as moho's, and a channel's history
 //! - `send` - saying things: send, edit, delete, typing, read
+//! - `members` - who is in a conversation, and who is online
+//! - `profile` - the card for a person
 //! - `media` - avatars, icons, pictures and files, fetched from the file server when looked at
 //!
 //! # What moho tells Stoat about itself
@@ -28,7 +30,9 @@ pub mod connect;
 pub mod events;
 pub mod login;
 pub mod media;
+pub mod members;
 pub mod messages;
+pub mod profile;
 pub mod send;
 pub mod world;
 

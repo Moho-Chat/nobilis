@@ -1361,10 +1361,12 @@ fn drop_missing_local_copies(attachments: &mut [Attachment]) {
     let gone = |p: &Option<String>| -> bool {
         let Some(p) = p.as_deref() else { return false };
         let Some(rest) = p.strip_prefix("file://") else { return false };
-        // Telegram's are named before they are fetched, and fetched when the window asks (see backend/telegram/media.rs):
-        // a file that is not there yet is the usual state of one, not a sign it was swept.
+        // Telegram's and Stoat's are named before they are fetched, and fetched when the window asks (see
+        // backend/telegram/media.rs and backend/stoat/media.rs): a file that is not there yet is the usual state of one,
+        // not a sign it was swept.
         let path = std::path::Path::new(rest);
-        if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| n == crate::backend::telegram::media::MEDIA || n == crate::backend::telegram::media::AVATARS) {
+        let named_first = [crate::backend::telegram::media::MEDIA, crate::backend::telegram::media::AVATARS, crate::backend::stoat::media::MEDIA, crate::backend::stoat::media::AVATARS];
+        if path.parent().and_then(|d| d.file_name()).and_then(|n| n.to_str()).is_some_and(|n| named_first.contains(&n)) {
             return false;
         }
         !path.exists()

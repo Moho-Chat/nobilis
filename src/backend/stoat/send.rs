@@ -42,6 +42,92 @@ fn words(e: super::api::ApiError) -> String {
     e.to_string()
 }
 
+/// What a file is called when it is sent: a spoiler is a name Stoat reads as one.
+pub fn sent_name(path: &str, spoiler: bool) -> String {
+    let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".to_string());
+    if spoiler && !name.starts_with("SPOILER_") {
+        format!("SPOILER_{name}")
+    } else {
+        name
+    }
+}
+
+/// What a file's kind of content is, from its name, for the file server.
+pub fn content_type_of(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" | "opus" => "audio/ogg",
+        "wav" => "audio/wav",
+        "txt" => "text/plain",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// How many files a message may carry and how large each may be, for this account now.
+pub fn file_limits(handle: &Handle, now_ms: i64) -> (usize, u64) {
+    let own = handle.world.lock().unwrap_or_else(|e| e.into_inner()).own_id.clone();
+    let made = messages::ulid_ms(&own).unwrap_or(0);
+    let new = made > 0 && now_ms - made < (handle.instance.new_user_hours as i64) * 3_600_000;
+    if new {
+        (handle.instance.new_message_attachments, handle.instance.new_attachment_bytes)
+    } else {
+        (handle.instance.message_attachments, handle.instance.attachment_bytes)
+    }
+}
+
+/// Sends files with a message: each is put on the file server and named in the message.
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+    if files.is_empty() {
+        return send(state, buffer, caption, reply_to).await;
+    }
+    let (handle, channel) = handle_for(state, buffer)?;
+    let (most, biggest) = file_limits(&handle, chrono::Utc::now().timestamp_millis());
+    if files.len() > most {
+        return Err(format!("Stoat takes at most {most} files in a message here, and this has {}", files.len()));
+    }
+    if !caption.trim().is_empty() {
+        check(caption, message_limit(&handle, chrono::Utc::now().timestamp_millis()))?;
+    }
+    let server = handle.instance.autumn.clone().ok_or("this instance has no file server")?;
+    let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+    if let Some(p) = progress {
+        p.at(crate::upload::Phase::Preparing, total as usize, "Stoat");
+    }
+    let mut ids = Vec::new();
+    let mut done = 0u64;
+    for (path, spoiler) in files {
+        let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if size > biggest {
+            return Err(format!("{} is {} MB and Stoat takes at most {} MB here", sent_name(path, false), size / 1_000_000, biggest / 1_000_000));
+        }
+        let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {path}: {e}"))?;
+        let name = sent_name(path, *spoiler);
+        if let Some(p) = progress {
+            p.sent(done, total, "Stoat");
+        }
+        let id = handle.api.upload(&server, "attachments", &name, content_type_of(&name), bytes).await.map_err(words)?;
+        done += size;
+        ids.push(id);
+    }
+    if let Some(p) = progress {
+        p.at(crate::upload::Phase::Waiting, total as usize, "Stoat");
+    }
+    let mut payload = json!({ "content": caption, "attachments": ids, "nonce": format!("moho-{}", crate::model::next_message_id()) });
+    if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
+        payload["replies"] = json!([{ "id": reply, "mention": false }]);
+    }
+    let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(words)?;
+    messages::record(state, &handle, &sent);
+    Ok(())
+}
+
 /// Sends a message, in answer to another if `reply_to` names one.
 pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
@@ -133,6 +219,15 @@ mod tests {
         assert!(check("   ", 2000).unwrap_err().contains("nothing to send"));
         assert!(check(&"a".repeat(2001), 2000).unwrap_err().contains("at most 2000"));
         assert!(check(&"é".repeat(2000), 2000).is_ok(), "a limit of characters, not of bytes");
+    }
+
+    #[test]
+    fn a_file_is_sent_under_its_own_name_and_a_spoiler_under_the_name_stoat_reads_as_one() {
+        assert_eq!(sent_name("/home/me/cat.png", false), "cat.png");
+        assert_eq!(sent_name("/home/me/cat.png", true), "SPOILER_cat.png");
+        assert_eq!(sent_name("/home/me/SPOILER_cat.png", true), "SPOILER_cat.png", "not twice");
+        assert_eq!(content_type_of("a.JPG"), "image/jpeg");
+        assert_eq!(content_type_of("a.unknown"), "application/octet-stream");
     }
 
     #[test]

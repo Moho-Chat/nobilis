@@ -49,8 +49,13 @@ pub struct Instance {
     pub january: Option<String>,
     /// Longest message, in characters, for an account of ordinary standing.
     pub message_length: usize,
+    pub message_attachments: usize,
+    /// The most a file attached to a message may weigh, in bytes.
+    pub attachment_bytes: u64,
     /// For a new account, until `new_user_hours` have passed.
     pub new_message_length: usize,
+    pub new_message_attachments: usize,
+    pub new_attachment_bytes: u64,
     pub new_user_hours: u64,
 }
 
@@ -64,6 +69,10 @@ impl Instance {
             autumn: url(&root["features"]["autumn"]),
             january: url(&root["features"]["january"]),
             message_length: number(&limits["default"]["message_length"], 2000),
+            message_attachments: number(&limits["default"]["message_attachments"], 5),
+            attachment_bytes: limits["default"]["file_upload_size_limits"]["attachments"].as_u64().unwrap_or(20_000_000),
+            new_message_attachments: number(&limits["new_user"]["message_attachments"], 5),
+            new_attachment_bytes: limits["new_user"]["file_upload_size_limits"]["attachments"].as_u64().unwrap_or(20_000_000),
             new_message_length: number(&limits["new_user"]["message_length"], 2000),
             new_user_hours: limits["global"]["new_user_hours"].as_u64().unwrap_or(72),
         }
@@ -75,6 +84,11 @@ pub struct User {
     pub name: String,
     /// The avatar's file id.
     pub avatar: Option<String>,
+    pub bot: bool,
+    /// What they chose to be shown as: `Online`, `Idle`, `Focus`, `Busy`, `Invisible`.
+    pub presence: String,
+    /// The words they put beside it.
+    pub status_text: Option<String>,
     /// What this account is to them: `Friend`, `Blocked`, `BlockedOther`, `Incoming`, `Outgoing`, `User`, `None`.
     pub relationship: String,
     pub online: bool,
@@ -134,6 +148,8 @@ pub struct Channel {
     pub name: String,
     pub server: Option<String>,
     pub description: Option<String>,
+    /// A text channel that can also be joined for a call: Stoat's voice channels are text channels with a `voice` part.
+    pub voice: bool,
     pub recipients: Vec<String>,
     pub owner: Option<String>,
     /// A server channel's default override, and its overrides by role.
@@ -153,6 +169,7 @@ impl Default for Channel {
             name: String::new(),
             server: None,
             description: None,
+            voice: false,
             recipients: Vec::new(),
             owner: None,
             default: (0, 0),
@@ -197,6 +214,9 @@ pub fn parse_user(v: &Value) -> Option<(String, User)> {
         User {
             name,
             avatar: file_id(&v["avatar"]),
+            bot: v.get("bot").is_some_and(|b| b.is_object()),
+            presence: v["status"]["presence"].as_str().unwrap_or("Online").to_string(),
+            status_text: v["status"]["text"].as_str().filter(|t| !t.is_empty()).map(str::to_string),
             relationship: v["relationship"].as_str().unwrap_or("None").to_string(),
             online: v["online"].as_bool().unwrap_or(false),
         },
@@ -252,6 +272,7 @@ pub fn parse_channel(v: &Value) -> Option<Channel> {
         name: v["name"].as_str().unwrap_or("").to_string(),
         server: v["server"].as_str().map(str::to_string),
         description: v["description"].as_str().filter(|d| !d.is_empty()).map(str::to_string),
+        voice: v.get("voice").is_some_and(|x| x.is_object()),
         recipients: v["recipients"].as_array().map(|l| l.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         owner: v["owner"].as_str().map(str::to_string),
         default: pair(&v["default_permissions"]),
@@ -455,6 +476,14 @@ mod tests {
     }
 
     #[test]
+    fn a_text_channel_with_a_voice_part_is_still_a_conversation_and_can_be_called_into() {
+        let voice = parse_channel(&json!({ "_id": "V", "channel_type": "TextChannel", "server": "S1", "name": "Hangout", "voice": {} })).unwrap();
+        assert!(voice.voice && voice.kind == Kind::Text);
+        let plain = parse_channel(&json!({ "_id": "T", "channel_type": "TextChannel", "server": "S1", "name": "talk" })).unwrap();
+        assert!(!plain.voice);
+    }
+
+    #[test]
     fn a_channel_is_named_for_what_it_is() {
         let w = world();
         assert_eq!(w.title_of(&w.channels["C1"]), "Chasm/#general");
@@ -528,7 +557,7 @@ mod tests {
             "ws": "wss://events.example", "features": {
                 "autumn": { "enabled": true, "url": "https://cdn.example/" },
                 "january": { "enabled": false, "url": "https://proxy.example" },
-                "limits": { "global": { "new_user_hours": 72 }, "default": { "message_length": 2000, "message_attachments": 5 }, "new_user": { "message_length": 1500, "message_attachments": 3 } }
+                "limits": { "global": { "new_user_hours": 72 }, "default": { "message_length": 2000, "message_attachments": 5 }, "new_user": { "message_length": 1500, "message_attachments": 3, "file_upload_size_limits": { "attachments": 5000000 } } }
             }
         });
         let i = Instance::from_root(&root);
@@ -536,5 +565,6 @@ mod tests {
         assert_eq!(i.autumn.as_deref(), Some("https://cdn.example"));
         assert_eq!(i.january, None, "a disabled service has no address");
         assert_eq!((i.message_length, i.new_message_length, i.new_user_hours), (2000, 1500, 72));
+        assert_eq!((i.message_attachments, i.new_message_attachments, i.attachment_bytes, i.new_attachment_bytes), (5, 3, 20_000_000, 5_000_000));
     }
 }

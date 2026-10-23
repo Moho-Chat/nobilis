@@ -60,7 +60,7 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, or
         };
         (world.title_of(channel), world.read_only(channel, now()), avatar)
     };
-    // Voice channels are not conversations: they are joined, which is a later round.
+    // The older kind of voice channel has no text: it is joined, which is a later round.
     if channel.kind == Kind::Voice {
         return;
     }
@@ -94,6 +94,8 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, or
     if let Some(topic) = &channel.description {
         state.runtime.set_buffer_topic(state, &buffer.id, topic);
     }
+    // A channel that can also be called into is marked, as a horn marks a Telegram channel.
+    state.runtime.set_buffer_name_icon(state, &buffer.id, channel.voice.then_some("volume_up"));
     if let Some(url) = avatar {
         state.runtime.set_buffer_avatar(state, &buffer.id, &media::cached(account_id, media::AVATARS, &url, None, None));
     }
@@ -444,6 +446,34 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
                 }
                 if data.get("avatar").is_some() {
                     user.avatar = data["avatar"]["_id"].as_str().map(str::to_string);
+                }
+                if let Some(presence) = data["status"]["presence"].as_str() {
+                    user.presence = presence.to_string();
+                }
+                if data["status"].get("text").is_some() {
+                    user.status_text = data["status"]["text"].as_str().filter(|t| !t.is_empty()).map(str::to_string);
+                }
+                if let Some(clear) = event["clear"].as_array() {
+                    if clear.iter().any(|c| c.as_str() == Some("StatusText")) {
+                        user.status_text = None;
+                    }
+                }
+            }
+            drop(world);
+            super::members::update_status(state, handle, id);
+        }
+        "ServerMemberJoin" | "ServerMemberLeave" => {
+            // Whoever's list is open for the server is read again.
+            let Some(server) = event["id"].as_str() else { return };
+            let channels: Vec<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server).map(|s| s.channels.clone()).unwrap_or_default();
+            for channel in channels {
+                if let Some(buffer) = messages::buffer_of(state, account_id, &channel) {
+                    if state.runtime.get_presence(&buffer.id).is_some() {
+                        let (state, handle) = (state.clone(), handle.clone());
+                        tokio::spawn(async move {
+                            let _ = super::members::refresh(&state, &handle, &buffer).await;
+                        });
+                    }
                 }
             }
         }

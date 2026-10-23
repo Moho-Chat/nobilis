@@ -92,10 +92,14 @@ async fn run_with_retry(state: &AppState, account_id: &str) {
     }
 }
 
-/// The address of the events socket: the instance's own, asking for what is wanted of `Ready` and nothing else.
-fn socket_address(instance: &Instance) -> String {
-    let base = instance.ws.trim_end_matches('/');
-    format!("{base}/?version=1&format=json&ready=users&ready=servers&ready=channels&ready=members&ready=emojis&ready=channel_unreads")
+/// The address of the events socket: the instance's own, asking for what is wanted of `Ready` and nothing else. The
+/// path is the instance's own and no slash is added to it: a self-hosted instance serves its events at `/ws` exactly,
+/// and `/ws/` is somewhere else. An address with no path at all (the official one's) is written with the `/` a request
+/// line needs.
+fn socket_address(instance: &Instance) -> Result<String> {
+    let mut url = url::Url::parse(instance.ws.trim_end_matches('/')).context("the instance's events address")?;
+    url.set_query(Some("version=1&format=json&ready=users&ready=servers&ready=channels&ready=members&ready=emojis&ready=channel_unreads"));
+    Ok(url.to_string())
 }
 
 /// One go at being connected.
@@ -187,7 +191,7 @@ async fn run(state: &AppState, config: &StoatAccountConfig, account_id: &str) ->
 }
 
 async fn route_socket(account_id: &str, instance: &Instance) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<crate::net::route::TcpOrSocks>>> {
-    let (socket, _) = crate::net::route::websocket(account_id, socket_address(instance)).await.context("connecting to the events")?;
+    let (socket, _) = crate::net::route::websocket(account_id, socket_address(instance)?).await.context("connecting to the events")?;
     Ok(socket)
 }
 
@@ -206,12 +210,23 @@ mod tests {
 
     #[test]
     fn the_socket_asks_for_what_ready_is_needed_for_and_has_no_token_in_it() {
-        let instance = Instance { ws: "wss://events.example/".into(), ..Default::default() };
-        let address = socket_address(&instance);
-        assert!(address.starts_with("wss://events.example/?version=1&format=json"), "{address}");
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let path_and_query = |ws: &str| -> String {
+            let address = socket_address(&Instance { ws: ws.into(), ..Default::default() }).unwrap();
+            // As the websocket library writes it in the request line.
+            address.as_str().into_client_request().unwrap().uri().path_and_query().unwrap().to_string()
+        };
+        // The official instance has no path, and a request line needs one.
+        let official = path_and_query("wss://events.example/");
+        assert!(official.starts_with("/?version=1&format=json"), "{official}");
+        assert!(path_and_query("wss://events.example").starts_with("/?version=1"));
+        // A self-hosted one serves its events at /ws, and /ws/ is somewhere else.
+        let hosted = path_and_query("ws://localhost:8880/ws");
+        assert!(hosted.starts_with("/ws?version=1&format=json"), "{hosted}");
         for want in ["ready=users", "ready=servers", "ready=channels", "ready=members", "ready=emojis", "ready=channel_unreads"] {
-            assert!(address.contains(want), "{address} lacks {want}");
+            assert!(official.contains(want), "{official} lacks {want}");
         }
-        assert!(!address.contains("token"), "the token goes in a message");
+        assert!(!official.contains("token"), "the token goes in a message");
+        assert!(socket_address(&Instance::default()).is_err(), "an instance that did not say where its events are has no address");
     }
 }
