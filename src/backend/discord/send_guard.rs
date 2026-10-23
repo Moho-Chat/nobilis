@@ -333,12 +333,20 @@ pub(super) fn dm_has_messages(state: &AppState, account: &str, buffer: &str) {
     }
 }
 
+/// Whether a message is somebody speaking, and not Discord saying something about them. A system message carries its
+/// subject as its author - "the account joined this server" (type 7) is authored by the account - and is no word of
+/// theirs: counting it unlocked a server the moment it was joined. Only an ordinary message (0) and a reply (19) are
+/// what a person wrote.
+pub fn is_speech(message: &Value) -> bool {
+    matches!(message["type"].as_u64().unwrap_or(0), 0 | 19)
+}
+
 /// A dispatch for a message was received in a place this connection knows: whatever it means for the locks.
 pub(super) fn heard(state: &AppState, config: &DiscordAccountConfig, d: &Value, buffer: &str, is_dm: bool) {
     let account = config.account_id();
     if is_dm {
         dm_has_messages(state, &account, buffer);
-    } else if d["author"]["id"].as_str() == Some(config.user_id.as_str()) {
+    } else if d["author"]["id"].as_str() == Some(config.user_id.as_str()) && is_speech(d) {
         if let Some(guild) = d["guild_id"].as_str() {
             spoke_in_guild(state, &account, guild);
         }
@@ -454,10 +462,16 @@ pub fn read_search(status: u16, retry_after: Option<f64>, body: &Value, sent_her
                 .into_iter()
                 .flatten()
                 .filter_map(|group| group.as_array()?.iter().find(|m| m["hit"].as_bool() == Some(true)).or_else(|| group.as_array()?.first()))
+                .filter(|m| is_speech(m))
                 .filter_map(|m| m["id"].as_str())
                 .collect();
             let elsewhere = hits.iter().any(|id| !sent_here.contains(*id));
-            Ok(if total > 0 && (elsewhere || total as usize > hits.len()) { Searched::Spoke } else { Searched::Never })
+            // A hit that is not speech (a join message) is not a word of theirs, and does not count among the results
+            // either: only when more were found than the hits shown, and the shown ones are all speech, can the rest
+            // be taken for speech too.
+            let shown = body["messages"].as_array().map(|g| g.len()).unwrap_or(0);
+            let all_speech = hits.len() == shown;
+            Ok(if total > 0 && (elsewhere || (all_speech && total as usize > hits.len())) { Searched::Spoke } else { Searched::Never })
         }
         202 | 429 => {
             let seconds = retry_after.or_else(|| body["retry_after"].as_f64()).unwrap_or(5.0).clamp(1.0, 60.0);
@@ -677,6 +691,23 @@ mod tests {
         // More results than hits shown: they cannot all be the one this client sent.
         let many = json!({ "total_results": 40, "messages": [hit("9")] });
         assert_eq!(read_search(200, None, &many, &sent).unwrap(), Searched::Spoke);
+    }
+
+    #[test]
+    fn a_system_message_about_the_account_is_not_the_account_speaking() {
+        assert!(is_speech(&json!({ "type": 0 })));
+        assert!(is_speech(&json!({ "type": 19 })), "a reply is");
+        assert!(is_speech(&json!({})), "no type is the ordinary one");
+        // User join (7), boosts (8-11), pins (6), thread created (18), automod (24): Discord's, not theirs.
+        for t in [1, 3, 4, 6, 7, 8, 18, 20, 21, 24] {
+            assert!(!is_speech(&json!({ "type": t })), "type {t}");
+        }
+        // The same in a search: the join message of the account is a hit and is not a word of theirs.
+        let sent = HashSet::new();
+        let joined = json!({ "total_results": 1, "messages": [[{ "id": "5", "type": 7, "hit": true }]] });
+        assert_eq!(read_search(200, None, &joined, &sent).unwrap(), Searched::Never);
+        let spoke = json!({ "total_results": 2, "messages": [[{ "id": "5", "type": 7, "hit": true }], [{ "id": "6", "type": 0, "hit": true }]] });
+        assert_eq!(read_search(200, None, &spoke, &sent).unwrap(), Searched::Spoke);
     }
 
     #[test]
