@@ -384,7 +384,8 @@ async fn save(handle: &Handle, id: i32, filter: Option<tl::enums::DialogFilter>)
 
 /// Telegram's refusals about folders, said so a person can act on them.
 fn folder_words(raw: &str) -> String {
-    let upper = raw.to_uppercase();
+    // Telegram's codes arrive as FILTER_INCLUDE_EMPTY or, once worded for a person, as "filter include empty".
+    let upper = raw.to_uppercase().replace(' ', "_");
     for (code, words) in [
         ("FILTER_INCLUDE_EMPTY", "Telegram does not keep an empty folder: it needs at least one chat in it. Delete the folder instead"),
         ("FILTER_TITLE_EMPTY", "A folder needs a name"),
@@ -726,6 +727,8 @@ mod tests {
     fn telegrams_refusals_about_folders_are_said_in_words() {
         assert!(folder_words("rpc error 400: FILTER_INCLUDE_EMPTY").contains("empty folder"));
         assert!(folder_words("DIALOG_FILTERS_TOO_MUCH").contains("as many folders"));
+        // As the library words it after `explain`: seen from the real account.
+        assert!(folder_words("Telegram refused: filter include empty").contains("empty folder"));
         assert_eq!(folder_words("SOMETHING_ELSE"), "SOMETHING_ELSE");
     }
 }
