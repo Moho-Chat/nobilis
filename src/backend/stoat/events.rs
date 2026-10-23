@@ -101,6 +101,12 @@ pub fn register_channel(state: &AppState, handle: &Handle, channel: &Channel, or
     }
 }
 
+/// A server and its channels, made at once: one just joined.
+pub fn register_server_entry(state: &AppState, handle: &Handle, server: &world::Server) {
+    register_server(state, handle, server, 0);
+    register_server_channels(state, handle, server);
+}
+
 /// A server's channels under its headings.
 fn register_server_channels(state: &AppState, handle: &Handle, server: &world::Server) {
     let channels: Vec<Channel> = {
@@ -478,11 +484,34 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
             }
         }
         "UserRelationship" => {
-            if let (Some(id), Some(status)) = (event["id"].as_str().or(event["user"]["_id"].as_str()), event["status"].as_str()) {
-                if let Some(user) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).users.get_mut(id) {
-                    user.relationship = status.to_string();
+            // The other person, as Stoat sees them (with what they are to this account in `relationship`); an older
+            // instance says it beside, in `status`, and names the person by id.
+            {
+                let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+                match world::parse_user(&event["user"]) {
+                    Some((id, parsed)) => {
+                        let status = event["status"].as_str().map(str::to_string).unwrap_or_else(|| parsed.relationship.clone());
+                        let entry = world.users.entry(id).or_insert_with(|| parsed.clone());
+                        entry.name = parsed.name;
+                        entry.avatar = parsed.avatar;
+                        entry.relationship = status;
+                    }
+                    None => {
+                        if let (Some(id), Some(status)) = (event["user"].as_str(), event["status"].as_str()) {
+                            if let Some(user) = world.users.get_mut(id) {
+                                user.relationship = status.to_string();
+                            }
+                        }
+                    }
                 }
             }
+            // A conversation with them may now be one that can be written in, or no longer.
+            let other = event["user"]["_id"].as_str().or(event["user"].as_str()).unwrap_or("").to_string();
+            let direct: Vec<Channel> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.values().filter(|c| c.kind == Kind::Direct && c.recipients.iter().any(|r| *r == other)).cloned().collect();
+            for channel in direct {
+                register_channel(state, handle, &channel, 0, None);
+            }
+            super::people::tell_requests(state, handle);
         }
         "EmojiCreate" => {
             if let (Some(id), Some(name)) = (event["_id"].as_str(), event["name"].as_str()) {
@@ -505,4 +534,20 @@ pub fn ready(state: &AppState, handle: &Handle, own_id: &str, event: &Value) {
         world.absorb_ready(own_id, event);
     }
     register_all(state, handle, event);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_relationship_event_names_the_other_person_and_what_they_are_to_this_account() {
+        let state = crate::backend::kick::testkit::simulated_daemon("stoat-relationship");
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        h.world.lock().unwrap().own_id = "ME".into();
+        handle(&state, &h, &json!({ "type": "UserRelationship", "id": "ME", "user": { "_id": "ERIN", "username": "erin", "relationship": "Incoming" } }));
+        assert_eq!(super::super::people::incoming(&h).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>(), vec!["erin"]);
+        handle(&state, &h, &json!({ "type": "UserRelationship", "id": "ME", "user": { "_id": "ERIN", "username": "erin", "relationship": "Friend" } }));
+        assert!(super::super::people::incoming(&h).is_empty(), "answered: no longer waiting");
+    }
 }

@@ -32,6 +32,7 @@ pub mod login;
 pub mod media;
 pub mod members;
 pub mod messages;
+pub mod people;
 pub mod profile;
 pub mod send;
 pub mod world;

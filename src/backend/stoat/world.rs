@@ -37,6 +37,7 @@ pub const DIRECT_MESSAGE: u64 = DEFAULT_PERMISSION | MANAGE_CHANNEL | REACT | MA
 /// Said in place of the message box where the account may not write.
 pub const NO_SEND_PERMISSION: &str = "You do not have permission to send messages in this channel.";
 pub const BLOCKED_DM: &str = "You cannot message this person: one of you has blocked the other.";
+pub const NOT_FRIENDS: &str = "Stoat only lets you message people who are your friends, or bots. Add them as a friend first.";
 pub const TIMED_OUT: &str = "You are timed out in this server.";
 
 /// What the instance said of itself at its root.
@@ -359,11 +360,15 @@ impl World {
         match channel.kind {
             Kind::Saved => GRANT_ALL_SAFE,
             Kind::Direct => {
-                let blocked = channel.recipients.iter().find(|r| **r != self.own_id).and_then(|r| self.users.get(r)).is_some_and(|u| u.relationship == "Blocked" || u.relationship == "BlockedOther");
-                if blocked {
-                    VIEW_ONLY
-                } else {
+                // Stoat's own rule: a direct message may be written in with a friend, or where either side is a bot;
+                // between anybody else it can be read and not written in, and a block closes it.
+                let other = channel.recipients.iter().find(|r| **r != self.own_id).and_then(|r| self.users.get(r));
+                let relationship = other.map(|u| u.relationship.as_str()).unwrap_or("None");
+                let a_bot = other.is_some_and(|u| u.bot) || self.users.get(&self.own_id).is_some_and(|u| u.bot);
+                if relationship == "Friend" || relationship == "User" || (a_bot && relationship != "Blocked" && relationship != "BlockedOther") {
                     DIRECT_MESSAGE
+                } else {
+                    VIEW_ONLY
                 }
             }
             Kind::Group => {
@@ -420,10 +425,13 @@ impl World {
             return None;
         }
         let timed_out = channel.server.as_ref().and_then(|s| self.members.get(s)).is_some_and(|m| m.timeout.is_some_and(|t| t > now));
+        let blocked = channel.kind == Kind::Direct && channel.recipients.iter().find(|r| **r != self.own_id).and_then(|r| self.users.get(r)).is_some_and(|u| u.relationship == "Blocked" || u.relationship == "BlockedOther");
         Some(if timed_out {
             TIMED_OUT
-        } else if channel.kind == Kind::Direct {
+        } else if blocked {
             BLOCKED_DM
+        } else if channel.kind == Kind::Direct {
+            NOT_FRIENDS
         } else {
             NO_SEND_PERMISSION
         })
@@ -544,9 +552,15 @@ mod tests {
 
     #[test]
     fn direct_messages_groups_and_saved_notes() {
-        let w = world();
+        let mut w = world();
         assert_eq!(w.read_only(&w.channels["D1"], 0), None);
         assert_eq!(w.read_only(&w.channels["D2"], 0), Some(BLOCKED_DM));
+        // Somebody who is neither a friend nor a bot can be read and not written to.
+        w.users.get_mut("U3").unwrap().relationship = "None".into();
+        assert_eq!(w.read_only(&w.channels["D1"], 0), Some(NOT_FRIENDS));
+        w.users.get_mut("U3").unwrap().bot = true;
+        assert_eq!(w.read_only(&w.channels["D1"], 0), None, "a bot may be written to");
+        w.users.get_mut("U3").unwrap().relationship = "Friend".into();
         assert_eq!(w.read_only(&w.channels["G1"], 0), None);
         assert_eq!(w.permissions(&w.channels["N1"], 0), GRANT_ALL_SAFE);
     }

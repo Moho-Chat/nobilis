@@ -13,6 +13,18 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as Ws;
 
+/// A handle with nothing behind it, for what only reads and keeps what it is told.
+pub(super) fn bare_handle(account_id: &str) -> Handle {
+    let (socket, _) = tokio::sync::mpsc::unbounded_channel();
+    Handle {
+        account_id: account_id.to_string(),
+        api: Arc::new(api::Api::new(account_id, "http://127.0.0.1:9", Some("token".into()))),
+        world: Arc::new(Mutex::new(world::World::default())),
+        instance: Arc::new(world::Instance::default()),
+        socket,
+    }
+}
+
 fn id(name: &str) -> String {
     format!("01H{name:0<23}")
 }

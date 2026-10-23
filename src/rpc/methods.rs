@@ -1061,6 +1061,16 @@ pub async fn dispatch(
             // Twitch is the same shape: a channel is a streamer, naming one is
             // the whole of joining it, and the connection remembers it once
             // Twitch has said it is there.
+            // A Stoat server is joined by an invite link or code.
+            if id.starts_with("stoat:") {
+                let Some(handle) = state.runtime.stoat_handle(id) else {
+                    return (None, Some("that Stoat account is not connected".to_string()));
+                };
+                return match backend::stoat::people::join_invite(state, &handle, name).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                };
+            }
             if id.starts_with("telegram:") {
                 return match backend::telegram::membership::join(state, id, name).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -3508,6 +3518,11 @@ pub async fn dispatch(
                 backend::discord::leave_guild(state, account_id, guild_id).await
             } else if let Some(room_id) = rest.strip_prefix("space:") {
                 backend::matrix::leave_room(state, account_id, room_id).await
+            } else if let Some(server_id) = rest.strip_prefix("server:").filter(|_| account_id.starts_with("stoat:")) {
+                match state.runtime.stoat_handle(account_id) {
+                    Some(handle) => backend::stoat::people::leave_server(state, &handle, server_id).await,
+                    None => Err(anyhow::anyhow!("that Stoat account is not connected")),
+                }
             } else if rest.starts_with("tggroup:") {
                 // A Telegram group is its rail entry and the one conversation under it: leaving is leaving that.
                 let under: Vec<crate::model::Buffer> = state.runtime.list_buffers().into_iter().filter(|b| b.group_id.as_deref() == Some(group_id)).collect();
@@ -4713,6 +4728,24 @@ pub async fn dispatch(
             let login_id = format!("telegram-{}", crate::model::next_message_id());
             backend::telegram::login::start(state.clone(), login_id.clone(), api_id, api_hash.trim().to_string(), phone.to_string());
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // Stoat's friends: who has asked, answering, asking, and blocking.
+        "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" => {
+            let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
+                return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "stoatFriendRequests" => return (Some(serde_json::json!({ "incoming": backend::stoat::people::incoming(&handle) })), None),
+                "answerStoatFriendRequest" => backend::stoat::people::answer_friend(state, &handle, user, p_bool(params, "accept", true)).await,
+                "addStoatFriend" => backend::stoat::people::add_friend(&handle, p_str(params, "username", "")).await,
+                _ => backend::stoat::people::block(state, &handle, user, p_bool(params, "block", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // The same sign-in without a number: a QR code to scan with Telegram on a phone that is signed in already.
@@ -6177,6 +6210,11 @@ pub async fn dispatch(
                         Ok(state.runtime.ensure_buffer(state, account_id, &backend::twitch::chat::whisper_buffer(&who), "dm").id)
                     }
                 }
+                "stoat" => match (state.runtime.stoat_handle(account_id), user_id.is_empty()) {
+                    (None, _) => Err(anyhow::anyhow!("that Stoat account is not connected")),
+                    (_, true) => Err(anyhow::anyhow!("Stoat needs the person's id, not their name")),
+                    (Some(handle), false) => backend::stoat::people::open_dm(state, &handle, user_id).await,
+                },
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };
             match opened {
