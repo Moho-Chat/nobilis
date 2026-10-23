@@ -15,6 +15,11 @@ pub const MANAGE_CHANNEL: u64 = 1 << 0;
 pub const VIEW_CHANNEL: u64 = 1 << 20;
 pub const READ_MESSAGE_HISTORY: u64 = 1 << 21;
 pub const SEND_MESSAGE: u64 = 1 << 22;
+pub const KICK_MEMBERS: u64 = 1 << 6;
+pub const BAN_MEMBERS: u64 = 1 << 7;
+pub const TIMEOUT_MEMBERS: u64 = 1 << 8;
+pub const ASSIGN_ROLES: u64 = 1 << 9;
+pub const MANAGE_MESSAGES: u64 = 1 << 23;
 pub const INVITE_OTHERS: u64 = 1 << 25;
 pub const SEND_EMBEDS: u64 = 1 << 26;
 pub const UPLOAD_FILES: u64 = 1 << 27;
@@ -44,6 +49,8 @@ pub const TIMED_OUT: &str = "You are timed out in this server.";
 #[derive(Debug, Clone, Default)]
 pub struct Instance {
     pub ws: String,
+    /// The instance's own web app, where an invite link lives.
+    pub app: Option<String>,
     /// The file server (Autumn).
     pub autumn: Option<String>,
     /// The link proxy (January).
@@ -67,6 +74,7 @@ impl Instance {
         let number = |v: &Value, d: usize| v.as_u64().map(|n| n as usize).unwrap_or(d);
         Self {
             ws: root["ws"].as_str().unwrap_or("").to_string(),
+            app: root["app"].as_str().filter(|a| !a.is_empty()).map(|a| a.trim_end_matches('/').to_string()),
             autumn: url(&root["features"]["autumn"]),
             january: url(&root["features"]["january"]),
             message_length: number(&limits["default"]["message_length"], 2000),
@@ -182,14 +190,33 @@ impl Default for Channel {
     }
 }
 
+/// A custom emoji: what it is called, the server it belongs to (none for one that stands alone), and whether it moves.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EmojiInfo {
+    pub name: String,
+    pub server: Option<String>,
+    pub animated: bool,
+}
+
+pub fn parse_emoji(v: &Value) -> Option<(String, EmojiInfo)> {
+    Some((
+        v["_id"].as_str()?.to_string(),
+        EmojiInfo {
+            name: v["name"].as_str()?.to_string(),
+            server: (v["parent"]["type"].as_str() == Some("Server")).then(|| v["parent"]["id"].as_str().map(str::to_string)).flatten(),
+            animated: v["animated"].as_bool().unwrap_or(false),
+        },
+    ))
+}
+
 #[derive(Debug, Default)]
 pub struct World {
     pub own_id: String,
     pub users: HashMap<String, User>,
     pub servers: HashMap<String, Server>,
     pub channels: HashMap<String, Channel>,
-    /// Custom emoji by id: its name.
-    pub emojis: HashMap<String, String>,
+    /// Custom emoji by id.
+    pub emojis: HashMap<String, EmojiInfo>,
     /// This account's membership of each server, by server id.
     pub members: HashMap<String, Member>,
 }
@@ -301,6 +328,11 @@ pub fn parse_member(v: &Value) -> Option<(String, String, Member)> {
 }
 
 impl World {
+    /// What is written in the box, as Stoat reads it (see `messages::outgoing`).
+    pub fn pipe_outgoing(&self, text: &str) -> String {
+        super::messages::outgoing(self, text)
+    }
+
     /// Takes in what `Ready` carries.
     pub fn absorb_ready(&mut self, own_id: &str, ready: &Value) {
         self.own_id = own_id.to_string();
@@ -330,8 +362,8 @@ impl World {
             }
         }
         for e in ready["emojis"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(name)) = (e["_id"].as_str(), e["name"].as_str()) {
-                self.emojis.insert(id.to_string(), name.to_string());
+            if let Some((id, info)) = parse_emoji(e) {
+                self.emojis.insert(id, info);
             }
         }
     }
@@ -416,6 +448,16 @@ impl World {
                 permissions
             }
         }
+    }
+
+    /// How powerful the account's best role in a server is, as Stoat ranks them (a lower number is more powerful), or
+    /// `None` where it holds none; the owner outranks everything.
+    pub fn own_rank(&self, server: &Server) -> Option<i64> {
+        if server.owner == self.own_id {
+            return Some(i64::MIN);
+        }
+        let member = self.members.get(&server.id)?;
+        member.roles.iter().filter_map(|r| server.roles.get(r)).map(|r| r.rank).min()
     }
 
     /// Why a channel is read-only, or nothing where it is not.

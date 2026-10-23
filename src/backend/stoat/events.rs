@@ -119,6 +119,57 @@ fn register_server_channels(state: &AppState, handle: &Handle, server: &world::S
     }
 }
 
+/// The custom emoji the account can use, as the picker's sections: one for each server that has some, and one for the
+/// rest. Said again whenever an emoji is made or deleted.
+pub fn register_emoji(state: &AppState, handle: &Handle) {
+    /// Each server's emoji (the ones with no server together), by server, and what each server is called and shown as.
+    type ByServer = std::collections::BTreeMap<Option<String>, Vec<(String, world::EmojiInfo)>>;
+    type Names = std::collections::HashMap<String, (String, Option<String>)>;
+    let account_id = &handle.account_id;
+    let (groups, names): (ByServer, Names) = {
+        let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut groups: ByServer = Default::default();
+        for (id, info) in &world.emojis {
+            groups.entry(info.server.clone()).or_default().push((id.clone(), info.clone()));
+        }
+        let names = world.servers.iter().map(|(id, s)| (id.clone(), (s.name.clone(), s.icon.clone()))).collect();
+        (groups, names)
+    };
+    state.runtime.clear_emoji_sources(account_id, "stoat");
+    for (server, mut list) in groups {
+        list.sort_by_key(|(_, e)| e.name.to_lowercase());
+        let (name, icon) = server.as_ref().and_then(|s| names.get(s).cloned()).unwrap_or_else(|| ("Your emoji".to_string(), None));
+        let buffers: Vec<String> = match &server {
+            Some(s) => state.runtime.list_buffers().into_iter().filter(|b| b.account_id == *account_id && b.group_id.as_deref() == Some(rail_id(account_id, s).as_str())).map(|b| b.id).collect(),
+            None => Vec::new(),
+        };
+        let entries = list
+            .into_iter()
+            .map(|(id, info)| crate::model::EmojiEntry {
+                url: media::file_url(&handle.instance, "emojis", &id).map(|u| media::cached(account_id, media::MEDIA, &u, None, Some(if info.animated { "image/gif" } else { "image/png" }))),
+                id,
+                name: info.name,
+                animated: info.animated,
+                locked: false,
+            })
+            .collect();
+        state.runtime.set_emoji_source(
+            account_id,
+            crate::model::EmojiSource {
+                id: format!("stoat:{}", server.as_deref().unwrap_or("detached")),
+                name,
+                service: "stoat".to_string(),
+                kind: "text".to_string(),
+                icon_url: icon.as_deref().and_then(|f| media::file_url(&handle.instance, "icons", f)).map(|u| media::cached(account_id, media::AVATARS, &u, None, None)),
+                buffers,
+                // Stoat lets an account use an emoji from another of its servers.
+                sendable_anywhere: true,
+                emoji: entries,
+            },
+        );
+    }
+}
+
 /// Everything `Ready` carries, made into the rail and the conversations.
 pub fn register_all(state: &AppState, handle: &Handle, ready: &Value) {
     let (servers, others, name) = {
@@ -139,6 +190,7 @@ pub fn register_all(state: &AppState, handle: &Handle, ready: &Value) {
     for channel in &others {
         register_channel(state, handle, channel, 0, None);
     }
+    register_emoji(state, handle);
     // Gone since the last time: a server left, a channel closed.
     let present: HashSet<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.keys().cloned().collect();
     for buffer in state.runtime.list_buffers() {
@@ -188,7 +240,7 @@ fn edited(state: &AppState, handle: &Handle, event: &Value) {
         let body = {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
             let server = world.channels.get(channel).and_then(|c| c.server.clone());
-            messages::words(&world, server.as_deref(), content)
+            messages::words(&world, Some((&handle.instance, &handle.account_id)), server.as_deref(), content)
         };
         state.runtime.update_message_body_only(state, &buffer.id, id, &body);
     }
@@ -199,7 +251,7 @@ fn reaction(state: &AppState, handle: &Handle, event: &Value, add: bool) {
     let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
     let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
     let me = user == world.own_id;
-    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|n| format!(":{n}:")).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.to_string() };
+    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|e| format!(":{}:", e.name)).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.to_string() };
     drop(world);
     state.runtime.update_reaction(state, &buffer.id, id, &shown, me, add);
 }
@@ -402,7 +454,9 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
                     }
                 }
             }
-            if let Some(server) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server_id).cloned() {
+            // Looked up first, and the lock let go: making the channels takes it again.
+            let server = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server_id).cloned();
+            if let Some(server) = server {
                 register_server_channels(state, handle, &server);
             }
         }
@@ -428,7 +482,9 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
                     }
                 }
             }
-            if let Some(server) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server_id).cloned() {
+            // Looked up first, and the lock let go: making the channels takes it again.
+            let server = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server_id).cloned();
+            if let Some(server) = server {
                 register_server_channels(state, handle, &server);
             }
         }
@@ -514,13 +570,15 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
             super::people::tell_requests(state, handle);
         }
         "EmojiCreate" => {
-            if let (Some(id), Some(name)) = (event["_id"].as_str(), event["name"].as_str()) {
-                handle.world.lock().unwrap_or_else(|e| e.into_inner()).emojis.insert(id.to_string(), name.to_string());
+            if let Some((id, info)) = world::parse_emoji(event) {
+                handle.world.lock().unwrap_or_else(|e| e.into_inner()).emojis.insert(id, info);
+                register_emoji(state, handle);
             }
         }
         "EmojiDelete" => {
             if let Some(id) = event["id"].as_str() {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).emojis.remove(id);
+                register_emoji(state, handle);
             }
         }
         _ => {}
@@ -549,5 +607,29 @@ mod tests {
         assert_eq!(super::super::people::incoming(&h).iter().map(|r| r["name"].as_str().unwrap().to_string()).collect::<Vec<_>>(), vec!["erin"]);
         handle(&state, &h, &json!({ "type": "UserRelationship", "id": "ME", "user": { "_id": "ERIN", "username": "erin", "relationship": "Friend" } }));
         assert!(super::super::people::incoming(&h).is_empty(), "answered: no longer waiting");
+    }
+
+    /// A role changing or an own membership changing makes the server's channels again, which takes the world's lock: an
+    /// event handled while still holding it would never come back (found against a real instance, where it stopped the
+    /// whole connection).
+    #[test]
+    fn a_role_or_membership_change_does_not_wait_on_itself() {
+        let state = crate::backend::kick::testkit::simulated_daemon("stoat-deadlock");
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        {
+            let mut w = h.world.lock().unwrap();
+            w.own_id = "ME".into();
+            w.servers.insert("S".into(), world::parse_server(&json!({ "_id": "S", "owner": "ME", "name": "Hall", "channels": ["C"] })).unwrap());
+            w.channels.insert("C".into(), world::parse_channel(&json!({ "_id": "C", "channel_type": "TextChannel", "server": "S", "name": "general" })).unwrap());
+        }
+        let (done, heard) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            handle(&state, &h, &json!({ "type": "ServerRoleUpdate", "id": "S", "role_id": "R", "data": { "name": "Mods", "rank": 1 } }));
+            handle(&state, &h, &json!({ "type": "ServerMemberUpdate", "id": { "server": "S", "user": "ME" }, "data": { "roles": ["R"] } }));
+            handle(&state, &h, &json!({ "type": "ServerUpdate", "id": "S", "data": { "name": "Hall 2" } }));
+            handle(&state, &h, &json!({ "type": "ChannelUpdate", "id": "C", "data": { "name": "lobby" } }));
+            let _ = done.send(());
+        });
+        assert!(heard.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "an event took the world's lock twice");
     }
 }

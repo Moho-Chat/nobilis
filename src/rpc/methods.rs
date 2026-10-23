@@ -4730,6 +4730,33 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // What a Stoat account may do to a server's members, and doing it; and an invite to the server.
+        "getStoatPowers" | "moderateStoatMember" | "setStoatMemberRole" | "createStoatInvite" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some(format!("{method} requires a Stoat \"bufferId\"")));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            let user = p_str_opt(params, "userId").unwrap_or("");
+            let done = match method {
+                "getStoatPowers" => return (Some(backend::stoat::moderation::powers(&handle, &buffer)), None),
+                "createStoatInvite" => {
+                    let web = state.accounts.get_stoat(&buffer.account_id).map(|a| a.instance).unwrap_or_default();
+                    return match backend::stoat::moderation::invite(&handle, &buffer, &handle.instance.app.clone().unwrap_or(web)).await {
+                        Ok(link) => (Some(serde_json::json!({ "link": link })), None),
+                        Err(e) => (None, Some(format!("{e:#}"))),
+                    };
+                }
+                "moderateStoatMember" => backend::stoat::moderation::moderate(&handle, &buffer, user, p_str(params, "action", ""), params.get("minutes").and_then(|v| v.as_i64()), p_str_opt(params, "reason")).await,
+                _ => backend::stoat::moderation::set_role(&handle, &buffer, user, p_str(params, "roleId", ""), p_bool(params, "give", true)).await,
+            };
+            match done {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Stoat's friends: who has asked, answering, asking, and blocking.
         "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {

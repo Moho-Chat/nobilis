@@ -48,7 +48,7 @@ fn regexes() -> &'static (Regex, Regex, Regex, Regex, Regex, Regex) {
 
 /// A message's words as this client shows them: who and what is named said by name, spoilers in Discord's marks (the
 /// window draws those), timestamps as a date.
-pub fn words(world: &World, server: Option<&str>, content: &str) -> String {
+pub fn words(world: &World, files: Option<(&Instance, &str)>, server: Option<&str>, content: &str) -> String {
     let (user, channel, role, emoji, spoiler, time) = regexes();
     let out = user.replace_all(content, |c: &regex::Captures| format!("@{}", world.name_of(&c[1])));
     let out = channel.replace_all(&out, |c: &regex::Captures| world.channels.get(&c[1]).map(|ch| format!("#{}", ch.name)).unwrap_or_else(|| "#channel".to_string()));
@@ -56,15 +56,47 @@ pub fn words(world: &World, server: Option<&str>, content: &str) -> String {
         let name = server.and_then(|s| world.servers.get(s)).and_then(|s| s.roles.get(&c[1])).map(|r| r.name.clone());
         format!("@{}", name.unwrap_or_else(|| "role".to_string()))
     });
-    let out = emoji.replace_all(&out, |c: &regex::Captures| match world.emojis.get(&c[1]) {
-        Some(name) => format!(":{name}:"),
-        None => c[0].to_string(),
+    // A custom emoji is drawn: its picture is named in the cache and fetched when the window looks, and the line says so
+    // in the form the window reads (`[stoat:emoji:name:file]`). Without a file server it is its name.
+    let out = emoji.replace_all(&out, |c: &regex::Captures| match (world.emojis.get(&c[1]), files) {
+        (Some(info), Some((instance, account))) => match media::file_url(instance, "emojis", &c[1]) {
+            Some(url) => format!("[stoat:emoji:{}:{}]", token_name(&info.name), media::cached(account, media::MEDIA, &url, None, Some(if info.animated { "image/gif" } else { "image/png" }))),
+            None => format!(":{}:", info.name),
+        },
+        (Some(info), None) => format!(":{}:", info.name),
+        (None, _) => c[0].to_string(),
     });
     let out = spoiler.replace_all(&out, "||$1||");
     let out = time.replace_all(&out, |c: &regex::Captures| {
         c[1].parse::<i64>().ok().and_then(|t| chrono::DateTime::from_timestamp(t, 0)).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| c[0].to_string())
     });
     out.into_owned()
+}
+
+/// What is written in the box turned into what Stoat reads: an emoji named between colons becomes the id it is known by.
+/// A name no custom emoji has is left alone, and so is an id.
+pub fn outgoing(world: &World, text: &str) -> String {
+    static NAMED: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED.get_or_init(|| Regex::new(r":([A-Za-z0-9_]{2,32}):").expect("a fixed pattern parses"));
+    named
+        .replace_all(text, |c: &regex::Captures| {
+            let word = &c[1];
+            if world.emojis.contains_key(word) {
+                return c[0].to_string();
+            }
+            let mut found: Vec<&String> = world.emojis.iter().filter(|(_, e)| e.name == word).map(|(id, _)| id).collect();
+            found.sort();
+            match found.first() {
+                Some(id) => format!(":{id}:"),
+                None => c[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
+/// A name as the emoji token carries it: the letters, digits and underscores a name is made of.
+fn token_name(name: &str) -> String {
+    name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_').take(32).collect()
 }
 
 /// What a system message says: somebody joining, leaving, being removed, a channel renamed.
@@ -165,7 +197,7 @@ pub fn reactions_of(world: &World, reactions: &Value) -> Vec<Reaction> {
                 .filter_map(|(emoji, who)| {
                     let who = who.as_array()?;
                     // A custom emoji is named by its id, which means nothing to a reader.
-                    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|n| format!(":{n}:")).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.clone() };
+                    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|e| format!(":{}:", e.name)).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.clone() };
                     Some(Reaction { emoji: shown, count: who.len() as i64, me: who.iter().any(|u| u.as_str() == Some(world.own_id.as_str())), animated: false })
                 })
                 .collect()
@@ -224,7 +256,7 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
         .or_else(|| message["webhook"]["avatar"].as_str().and_then(|f| media::file_url(&handle.instance, "avatars", f)).map(|u| media::cached(account_id, media::AVATARS, &u, None, None)))
         .or_else(|| world.users.get(author).and_then(|u| u.avatar.clone()).and_then(|f| media::file_url(&handle.instance, "avatars", &f)).map(|u| media::cached(account_id, media::AVATARS, &u, None, None)));
     let content = message["content"].as_str().unwrap_or("");
-    let body = words(&world, server.as_deref(), content);
+    let body = words(&world, Some((&handle.instance, account_id)), server.as_deref(), content);
     let highlight = message["mentions"].as_array().is_some_and(|m| m.iter().any(|u| u.as_str() == Some(own.as_str())))
         || server.as_ref().and_then(|s| world.members.get(s)).zip(message["role_mentions"].as_array()).is_some_and(|(m, roles)| roles.iter().any(|r| r.as_str().is_some_and(|r| m.roles.iter().any(|mine| mine == r))));
     let attachments: Vec<Attachment> = message["attachments"].as_array().into_iter().flatten().filter_map(|f| attachment_of(account_id, &handle.instance, f)).collect();
@@ -267,7 +299,7 @@ fn fill_reply_later(state: &AppState, handle: &Handle, buffer_id: &str, channel_
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let from = original["masquerade"]["name"].as_str().map(str::to_string).unwrap_or_else(|| world.name_of(original["author"].as_str().unwrap_or("")));
         let server = world.channels.get(&channel_id).and_then(|c| c.server.clone());
-        let body = words(&world, server.as_deref(), original["content"].as_str().unwrap_or(""));
+        let body = words(&world, Some((&handle.instance, &handle.account_id)), server.as_deref(), original["content"].as_str().unwrap_or(""));
         drop(world);
         let body = if body.trim().is_empty() { "Attachment".to_string() } else { body };
         state.runtime.fill_reply_preview(&state, &buffer_id, &msg_id, &from, &body);
@@ -336,17 +368,33 @@ mod tests {
     #[test]
     fn who_and_what_is_named_is_said_by_name() {
         let w = world();
-        assert_eq!(words(&w, Some("S1"), "hi <@01PAL00000000000000000000A>, see <#01CHAN0000000000000000000A>"), "hi @Pal, see #general");
-        assert_eq!(words(&w, Some("S1"), "calling <%01ROLE0000000000000000000A>"), "calling @Mods");
-        assert_eq!(words(&w, None, "yay :01EMOJ000000000000000000AA: and :01NONE000000000000000000AA:"), "yay :party: and :01NONE000000000000000000AA:");
-        assert_eq!(words(&w, None, "nobody <@01GONE0000000000000000000>"), "nobody <@01GONE0000000000000000000>", "an id that is not 26 characters is not a mention");
+        assert_eq!(words(&w, None, Some("S1"), "hi <@01PAL00000000000000000000A>, see <#01CHAN0000000000000000000A>"), "hi @Pal, see #general");
+        assert_eq!(words(&w, None, Some("S1"), "calling <%01ROLE0000000000000000000A>"), "calling @Mods");
+        assert_eq!(words(&w, None, None, "yay :01EMOJ000000000000000000AA: and :01NONE000000000000000000AA:"), "yay :party: and :01NONE000000000000000000AA:");
+        assert_eq!(words(&w, None, None, "nobody <@01GONE0000000000000000000>"), "nobody <@01GONE0000000000000000000>", "an id that is not 26 characters is not a mention");
+    }
+
+    #[test]
+    fn an_emoji_named_in_the_box_goes_out_as_its_id_and_what_is_not_one_is_left_alone() {
+        let w = world();
+        assert_eq!(outgoing(&w, "yay :party: :nobody: 12:30:45 and :01EMOJ000000000000000000AA:"), "yay :01EMOJ000000000000000000AA: :nobody: 12:30:45 and :01EMOJ000000000000000000AA:");
+        assert_eq!(outgoing(&w, "no colons"), "no colons");
+    }
+
+    #[test]
+    fn an_emoji_in_a_message_is_a_picture_named_in_the_cache_where_there_is_a_file_server() {
+        let w = world();
+        let instance = Instance { autumn: Some("https://cdn.example".into()), ..Default::default() };
+        let said = words(&w, Some((&instance, "stoat:me")), None, "yay :01EMOJ000000000000000000AA:");
+        assert!(said.starts_with("yay [stoat:emoji:party:file://") && said.contains("/stoat-media/") && said.ends_with(".png]"), "{said}");
+        assert_eq!(words(&w, Some((&Instance::default(), "stoat:me")), None, "yay :01EMOJ000000000000000000AA:"), "yay :party:", "without a file server it is its name");
     }
 
     #[test]
     fn spoilers_and_times_are_written_as_the_window_reads_them() {
         let w = world();
-        assert_eq!(words(&w, None, "the end is !!a twist!! really"), "the end is ||a twist|| really");
-        assert_eq!(words(&w, None, "at <t:1469918176:R> sharp"), "at 2016-07-30 22:36 UTC sharp");
+        assert_eq!(words(&w, None, None, "the end is !!a twist!! really"), "the end is ||a twist|| really");
+        assert_eq!(words(&w, None, None, "at <t:1469918176:R> sharp"), "at 2016-07-30 22:36 UTC sharp");
     }
 
     #[test]

@@ -119,6 +119,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
     if let Some(p) = progress {
         p.at(crate::upload::Phase::Waiting, total as usize, "Stoat");
     }
+    let caption = handle.world.lock().unwrap_or_else(|e| e.into_inner()).pipe_outgoing(caption);
     let mut payload = json!({ "content": caption, "attachments": ids, "nonce": format!("moho-{}", crate::model::next_message_id()) });
     if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
         payload["replies"] = json!([{ "id": reply, "mention": false }]);
@@ -140,6 +141,7 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         }
     }
     check(body, message_limit(&handle, chrono::Utc::now().timestamp_millis()))?;
+    let body = &handle.world.lock().unwrap_or_else(|e| e.into_inner()).pipe_outgoing(body);
     let mut payload = json!({ "content": body, "nonce": format!("moho-{}", crate::model::next_message_id()) });
     if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
         payload["replies"] = json!([{ "id": reply, "mention": false }]);
@@ -153,11 +155,12 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
 pub async fn edit(state: &AppState, buffer: &Buffer, message_id: &str, body: &str) -> Result<(), String> {
     let (handle, channel) = handle_for(state, buffer)?;
     check(body, message_limit(&handle, chrono::Utc::now().timestamp_millis()))?;
-    handle.api.patch(&format!("/channels/{channel}/messages/{message_id}"), &json!({ "content": body })).await.map_err(words)?;
+    let wire = handle.world.lock().unwrap_or_else(|e| e.into_inner()).pipe_outgoing(body);
+    handle.api.patch(&format!("/channels/{channel}/messages/{message_id}"), &json!({ "content": wire })).await.map_err(words)?;
     let text = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let server = world.channels.get(&channel).and_then(|c| c.server.clone());
-        messages::words(&world, server.as_deref(), body)
+        messages::words(&world, Some((&handle.instance, &handle.account_id)), server.as_deref(), body)
     };
     state.runtime.update_message_body_only(state, &buffer.id, message_id, &text);
     Ok(())
@@ -193,7 +196,7 @@ pub async fn react(state: &AppState, buffer: &Buffer, message_id: &str, emoji: &
     let wire = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let name = emoji.trim_matches(':');
-        world.emojis.iter().find(|(_, n)| n.as_str() == name).map(|(id, _)| id.clone()).unwrap_or_else(|| emoji.to_string())
+        world.emojis.iter().find(|(_, e)| e.name == name).map(|(id, _)| id.clone()).unwrap_or_else(|| emoji.to_string())
     };
     let path = format!("/channels/{channel}/messages/{message_id}/reactions/{}", urlencode(&wire));
     if add {
