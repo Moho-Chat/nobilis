@@ -191,10 +191,12 @@ pub async fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> 
     let (handle, peer) = peer_for(state, buffer).await?;
     // A topic is read on its own: to the newest message of it that is here.
     if let Some(topic) = super::topics::topic_of_buffer(buffer) {
-        let newest = state.store.newest_message_id(&buffer.id).ok().flatten().and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
+        // Or to the newest Telegram said it has, which may be a message this client never kept.
+        let newest = state.store.newest_message_id(&buffer.id).ok().flatten().and_then(|id| id.parse::<i32>().ok()).unwrap_or(0).max(super::topics::top_of(&buffer.id).unwrap_or(0));
         if newest > 0 {
             handle.client.invoke(&tl::functions::messages::ReadDiscussion { peer: peer.into(), msg_id: topic, read_max_id: newest }).await.map_err(|e| explain(&e))?;
         }
+        state.runtime.set_buffer_unread(state, &buffer.id, 0, 0);
         return Ok(());
     }
     handle.client.mark_as_read(peer).await.map_err(|e| explain(&e))

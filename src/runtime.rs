@@ -1729,6 +1729,8 @@ impl Runtime {
             topic: None,
             read_only: None,
             forum: false,
+            unread_seed: 0,
+            mentions_seed: 0,
         };
         buffers.insert(id, buffer.clone());
         state.events.emit("bufferListChange", serde_json::to_value(&buffer).unwrap());
@@ -3287,6 +3289,25 @@ impl Runtime {
             match buffers.get_mut(buffer_id) {
                 Some(b) if b.read_only != new => {
                     b.read_only = new;
+                    Some(b.clone())
+                }
+                _ => None,
+            }
+        };
+        if let Some(b) = updated {
+            state.events.emit("bufferListChange", serde_json::to_value(&b).unwrap());
+        }
+    }
+
+    /// What the service counts as unread in a conversation, and how many of those mention this account: see
+    /// `Buffer::unread_seed`. Said to the windows when it changes, which set their own count to it.
+    pub fn set_buffer_unread(&self, state: &AppState, buffer_id: &str, unread: u32, mentions: u32) {
+        let updated = {
+            let mut buffers = self.buffers.lock().unwrap();
+            match buffers.get_mut(buffer_id) {
+                Some(b) if (b.unread_seed, b.mentions_seed) != (unread, mentions) => {
+                    b.unread_seed = unread;
+                    b.mentions_seed = mentions;
                     Some(b.clone())
                 }
                 _ => None,

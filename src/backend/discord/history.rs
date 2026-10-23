@@ -158,6 +158,69 @@ pub async fn refill_history(state: &AppState, buffer_id: &str, limit: u32) -> Re
     Ok(missing.len())
 }
 
+/// What has been asked of Discord about each conversation's history this connection, so it is not asked again for what
+/// it has already said. A conversation is caught up once in a while, not at every opening of it (its messages arrive
+/// live); older history is asked for until its start is reached and never after; a failed ask waits before the next.
+#[derive(Default)]
+pub struct Asked {
+    caught_up: HashMap<String, std::time::Instant>,
+    exhausted: std::collections::HashSet<String>,
+    failed: HashMap<String, std::time::Instant>,
+}
+
+/// How long after a catch-up another is not made for the same conversation.
+const CATCH_UP_EVERY: Duration = Duration::from_secs(10 * 60);
+/// How long after a failed request for older history the next one waits.
+const FAILED_WAIT: Duration = Duration::from_secs(60);
+
+impl Asked {
+    pub fn catch_up_due(&mut self, buffer: &str, now: std::time::Instant) -> bool {
+        if self.caught_up.get(buffer).is_some_and(|at| now.duration_since(*at) < CATCH_UP_EVERY) {
+            return false;
+        }
+        self.caught_up.insert(buffer.to_string(), now);
+        true
+    }
+
+    /// The catch-up did not come to anything: the next opening asks again.
+    pub fn catch_up_failed(&mut self, buffer: &str) {
+        self.caught_up.remove(buffer);
+    }
+
+    pub fn older_due(&mut self, buffer: &str, now: std::time::Instant) -> bool {
+        !self.exhausted.contains(buffer) && !self.failed.get(buffer).is_some_and(|at| now.duration_since(*at) < FAILED_WAIT)
+    }
+
+    /// Asked for `limit` and got `got`: fewer than asked for is the start of the conversation.
+    pub fn older_answered(&mut self, buffer: &str, got: usize, limit: usize) {
+        self.failed.remove(buffer);
+        if got < limit {
+            self.exhausted.insert(buffer.to_string());
+        }
+    }
+
+    pub fn older_failed(&mut self, buffer: &str, now: std::time::Instant) {
+        self.failed.insert(buffer.to_string(), now);
+    }
+
+    /// A new login has missed what the last one did not: everything of the account's is asked about afresh.
+    pub fn forget_account(&mut self, account: &str) {
+        let prefix = format!("{account}|");
+        self.caught_up.retain(|b, _| !b.starts_with(&prefix));
+        self.failed.retain(|b, _| !b.starts_with(&prefix));
+    }
+}
+
+static ASKED: std::sync::Mutex<Option<Asked>> = std::sync::Mutex::new(None);
+
+fn asked<R>(f: impl FnOnce(&mut Asked) -> R) -> R {
+    f(ASKED.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Asked::default))
+}
+
+pub(super) fn forget_asked(account: &str) {
+    asked(|a| a.forget_account(account));
+}
+
 /// Notes what a channel object says its newest message is: `None` for a
 /// conversation with no messages, nothing at all when it does not say.
 pub(super) fn note_newest(into: &mut HashMap<String, Option<String>>, channel: &Value) {
@@ -232,8 +295,12 @@ pub async fn catch_up_channel(
     buffer_id: &str,
     channel_id: &str,
 ) {
+    if !asked(|a| a.catch_up_due(buffer_id, std::time::Instant::now())) {
+        return;
+    }
     let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else {
         tracing::info!("discord: catching up {buffer_id} skipped - a fetch for it is already under way");
+        asked(|a| a.catch_up_failed(buffer_id));
         return;
     };
     let result: Result<()> = async {
@@ -255,16 +322,22 @@ pub async fn catch_up_channel(
             store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
         } else {
             tracing::info!("discord: catching up {buffer_id}: Discord answered {}", resp.status());
+            asked(|a| a.catch_up_failed(buffer_id));
         }
         Ok(())
     }
     .await;
     if let Err(e) = result {
         tracing::warn!("discord: catching up {buffer_id}: {e}");
+        asked(|a| a.catch_up_failed(buffer_id));
     }
 }
 
 pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_display_name: Option<&str>, buffer_id: &str, channel_id: &str) {
+    // The start of a conversation is asked for once: after it is reached, nothing is older.
+    if !asked(|a| a.older_due(buffer_id, std::time::Instant::now())) {
+        return;
+    }
     let Some(_fetch) = HistoryFetch::begin(state, buffer_id) else { return };
     let result: Result<()> = async {
         let Some(before_id) = state.store.oldest_msg_id(buffer_id)? else { return Ok(()) };
@@ -277,13 +350,17 @@ pub async fn extend_history(state: &AppState, token: &str, user_id: &str, own_di
             .context("fetching more history")?;
         if resp.status().is_success() {
             let messages: Vec<Value> = resp.json().await.context("parsing more history")?;
+            asked(|a| a.older_answered(buffer_id, messages.len(), 50));
             store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
+        } else {
+            asked(|a| a.older_failed(buffer_id, std::time::Instant::now()));
         }
         Ok(())
     }
     .await;
     if let Err(e) = result {
         tracing::warn!("discord: extending history for {buffer_id}: {e}");
+        asked(|a| a.older_failed(buffer_id, std::time::Instant::now()));
     }
 }
 
@@ -385,3 +462,48 @@ mod catch_up_tests {
         assert!(!into.contains_key("3"));
     }
 }
+
+#[cfg(test)]
+mod asked_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn a_conversation_is_caught_up_once_in_a_while_and_again_after_a_failure() {
+        let mut a = Asked::default();
+        let t = Instant::now();
+        assert!(a.catch_up_due("b", t));
+        assert!(!a.catch_up_due("b", t + Duration::from_secs(60)), "opened again a minute later");
+        assert!(a.catch_up_due("other", t));
+        assert!(a.catch_up_due("b", t + Duration::from_secs(601)), "ten minutes on");
+        a.catch_up_failed("b");
+        assert!(a.catch_up_due("b", t + Duration::from_secs(602)), "a failed one is asked again");
+    }
+
+    #[test]
+    fn older_history_is_asked_for_until_the_start_is_reached_and_not_after() {
+        let mut a = Asked::default();
+        let t = Instant::now();
+        assert!(a.older_due("b", t));
+        a.older_answered("b", 50, 50);
+        assert!(a.older_due("b", t), "a full page means more");
+        a.older_answered("b", 12, 50);
+        assert!(!a.older_due("b", t + Duration::from_secs(9999)), "the start was reached");
+        assert!(a.older_due("c", t));
+        a.older_failed("c", t);
+        assert!(!a.older_due("c", t + Duration::from_secs(30)));
+        assert!(a.older_due("c", t + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn a_new_login_asks_about_its_own_conversations_afresh() {
+        let mut a = Asked::default();
+        let t = Instant::now();
+        a.catch_up_due("discord:1|chat", t);
+        a.catch_up_due("discord:2|chat", t);
+        a.forget_account("discord:1");
+        assert!(a.catch_up_due("discord:1|chat", t));
+        assert!(!a.catch_up_due("discord:2|chat", t));
+    }
+}
+

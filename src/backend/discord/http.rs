@@ -96,24 +96,175 @@ fn note_bucket(resp: &reqwest::Response) {
     }
 }
 
+/// What this client has learned about where it is no longer welcome, and so does not ask again: a token Discord has
+/// refused (every request stops until the person signs in again - a revoked login that keeps asking is a client
+/// hammering a dead door), and a route that keeps answering 403 (three times in five minutes closes it for five, so a
+/// channel that cannot be read is not asked about at every opening).
+#[derive(Default)]
+pub struct Safety {
+    halted: std::collections::HashSet<String>,
+    circuits: HashMap<(String, String, String), Circuit>,
+}
+
+struct Circuit {
+    refusals: u8,
+    last: std::time::Instant,
+    open_until: Option<std::time::Instant>,
+}
+
+/// Why a request was not made.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Blocked {
+    /// The token was refused (401): nothing more is sent with it.
+    Refused,
+    /// The route was refused (403) repeatedly: not for this long.
+    Closed(Duration),
+}
+
+impl std::fmt::Display for Blocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Blocked::Refused => write!(f, "Discord has refused this account's login, so nothing more is sent for it - sign in again from Accounts"),
+            Blocked::Closed(wait) => write!(f, "Discord has refused this three times; not asking again for {} minutes", wait.as_secs().div_ceil(60).max(1)),
+        }
+    }
+}
+
+impl std::error::Error for Blocked {}
+
+const CIRCUIT_REFUSALS: u8 = 3;
+const CIRCUIT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const CIRCUIT_OPEN_FOR: Duration = Duration::from_secs(5 * 60);
+/// Routes remembered: they include ids, so a few refusals on many messages must not be kept all run.
+const MAX_CIRCUITS: usize = 512;
+
+impl Safety {
+    pub fn preflight_at(&mut self, token: &str, method: &str, path: &str, now: std::time::Instant) -> Result<(), Blocked> {
+        if self.halted.contains(token) {
+            return Err(Blocked::Refused);
+        }
+        self.circuits.retain(|_, c| match c.open_until {
+            Some(until) => until > now,
+            None => now.saturating_duration_since(c.last) < CIRCUIT_WINDOW,
+        });
+        let key = (token.to_string(), method.to_string(), path.to_string());
+        match self.circuits.get(&key).and_then(|c| c.open_until) {
+            Some(until) => Err(Blocked::Closed(until.saturating_duration_since(now))),
+            None => Ok(()),
+        }
+    }
+
+    pub fn record_at(&mut self, token: &str, method: &str, path: &str, status: u16, now: std::time::Instant) {
+        let key = (token.to_string(), method.to_string(), path.to_string());
+        if status == 401 {
+            self.halted.insert(token.to_string());
+            return;
+        }
+        if status != 403 {
+            self.circuits.remove(&key);
+            return;
+        }
+        if !self.circuits.contains_key(&key) && self.circuits.len() >= MAX_CIRCUITS {
+            if let Some(oldest) = self.circuits.iter().min_by_key(|(_, c)| c.last).map(|(k, _)| k.clone()) {
+                self.circuits.remove(&oldest);
+            }
+        }
+        let circuit = self.circuits.entry(key).or_insert(Circuit { refusals: 0, last: now, open_until: None });
+        if now.saturating_duration_since(circuit.last) >= CIRCUIT_WINDOW {
+            circuit.refusals = 0;
+            circuit.open_until = None;
+        }
+        circuit.refusals = circuit.refusals.saturating_add(1);
+        circuit.last = now;
+        if circuit.refusals >= CIRCUIT_REFUSALS {
+            circuit.open_until = Some(now + CIRCUIT_OPEN_FOR);
+        }
+    }
+
+    pub fn halt(&mut self, token: &str) {
+        self.halted.insert(token.to_string());
+    }
+
+    pub fn is_halted(&self, token: &str) -> bool {
+        self.halted.contains(token)
+    }
+}
+
+static SAFETY: std::sync::Mutex<Option<Safety>> = std::sync::Mutex::new(None);
+
+fn safety<R>(f: impl FnOnce(&mut Safety) -> R) -> R {
+    let mut slot = SAFETY.lock().unwrap_or_else(|e| e.into_inner());
+    f(slot.get_or_insert_with(Safety::default))
+}
+
+/// Nothing more is sent with this token: Discord has said it is no good.
+pub(super) fn halt_token(token: &str) {
+    safety(|s| s.halt(token));
+}
+
+pub(super) fn token_is_halted(token: &str) -> bool {
+    safety(|s| s.is_halted(token))
+}
+
+/// Which token, method and path a request is for, where it can be told without sending it.
+fn inspect(request: &reqwest::RequestBuilder) -> Option<(String, String, String)> {
+    let built = request.try_clone()?.build().ok()?;
+    let token = built.headers().get("authorization")?.to_str().ok()?.to_string();
+    Some((token, built.method().as_str().to_string(), built.url().path().to_string()))
+}
+
+/// Asked before a request is sent, told after: see `Safety`.
+fn preflight(who: &Option<(String, String, String)>) -> Result<()> {
+    if let Some((token, method, path)) = who {
+        safety(|s| s.preflight_at(token, method, path, std::time::Instant::now())).map_err(anyhow::Error::from)?;
+    }
+    Ok(())
+}
+
+fn note_status(who: &Option<(String, String, String)>, status: reqwest::StatusCode) {
+    if let Some((token, method, path)) = who {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            tracing::warn!("discord: a request was refused as unauthorised: nothing more is sent with this login");
+        }
+        safety(|s| s.record_at(token, method, path, status.as_u16(), std::time::Instant::now()));
+    }
+}
+
+/// Whether a 429's body is a channel's slowmode (code 20016): the wait is the person's, and sending again when it is
+/// over is not for this client to do on their behalf.
+fn is_slowmode(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body).ok().and_then(|v| v["code"].as_u64()) == Some(20016)
+}
+
+/// A response put back together once its body has been read, so a caller that reads it again finds it whole.
+fn rebuilt(status: reqwest::StatusCode, headers: reqwest::header::HeaderMap, body: bytes::Bytes) -> reqwest::Response {
+    let mut response = tokio_tungstenite::tungstenite::http::Response::new(body);
+    *response.status_mut() = status;
+    *response.headers_mut() = headers;
+    reqwest::Response::from(response)
+}
+
 /// Sending that behaves as a client of an API with rate limits should: waits out any hold Discord has put on this
 /// client, notes how much of a bucket is left and waits for it to refill rather than running into the limit, and when
 /// it is told to slow down anyway waits as long as it was told and asks again - instead of reading a refusal as an
 /// answer. Reads were sent plain, so a 429 was a silent "nothing found" and the next request followed straight on.
 pub(super) trait SendPaced {
-    fn send_paced(self) -> impl std::future::Future<Output = reqwest::Result<reqwest::Response>> + Send;
+    fn send_paced(self) -> impl std::future::Future<Output = Result<reqwest::Response>> + Send;
 }
 
 impl SendPaced for reqwest::RequestBuilder {
-    async fn send_paced(self) -> reqwest::Result<reqwest::Response> {
+    async fn send_paced(self) -> Result<reqwest::Response> {
+        let who = inspect(&self);
+        preflight(&who)?;
         wait_out_hold().await;
         let mut pending = Some(self);
         for attempt in 0..=READ_RETRIES {
             let Some(current) = pending.take() else { break };
             // A body that cannot be copied is sent once.
             let again = current.try_clone();
-            let resp = current.send().await?;
+            let resp = current.send().await.context("talking to Discord")?;
             note_bucket(&resp);
+            note_status(&who, resp.status());
             if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == READ_RETRIES {
                 return Ok(resp);
             }
@@ -162,6 +313,8 @@ where
 /// history quickly would be a slow client, and what Discord judges an account
 /// on is what it sends.
 pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    let who = inspect(&request);
+    preflight(&who)?;
     wait_out_hold().await;
     pace().await;
 
@@ -173,11 +326,19 @@ pub(super) async fn send_write(request: reqwest::RequestBuilder) -> Result<reqwe
         let again = current.try_clone();
         let resp = current.send().await.context("talking to Discord")?;
         note_bucket(&resp);
+        note_status(&who, resp.status());
         if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS || attempt == RATE_LIMIT_RETRIES {
             return Ok(resp);
         }
-        let Some(again) = again else { return Ok(resp) };
-        let pause = retry_after(&resp);
+        // A channel's slowmode is answered with a 429 too. It is the person's wait, and a message they have not seen
+        // refused is not one to send again for them when it ends.
+        let (status, headers) = (resp.status(), resp.headers().clone());
+        let body = resp.bytes().await.context("reading Discord's answer")?;
+        if is_slowmode(&body) {
+            return Ok(rebuilt(status, headers, body));
+        }
+        let pause = pause_for(headers.get("retry-after").and_then(|v| v.to_str().ok()));
+        let Some(again) = again else { return Ok(rebuilt(status, headers, body)) };
         tracing::debug!("discord: rate limited, waiting {}ms", pause.as_millis());
         hold_for(pause);
         wait_out_hold().await;
@@ -206,6 +367,12 @@ fn pause_for(seconds: Option<&str>) -> Duration {
 /// id - routed through Tor or the configured proxy when that account is.
 pub(super) fn http_client_for(key: &str) -> reqwest::Client {
     discord_client(crate::net::route::router().routed(key), true)
+}
+
+/// The client for a request that is not for Discord's API but is made on an account's behalf - an upload to the storage
+/// address Discord hands out - routed as the account is, and carrying none of the headers that belong to the API.
+pub(super) fn bare_client_for(key: &str) -> reqwest::Client {
+    discord_client(crate::net::route::router().routed(key), false)
 }
 
 /// The client for requests that belong to no account yet - the sign-in - or
@@ -400,5 +567,43 @@ mod error_tests {
         assert!(second_started.elapsed() >= Duration::from_millis(950), "the empty bucket was let refill first: {:?}", second_started.elapsed());
         let seen = server.await.unwrap();
         assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn a_refused_login_stops_everything_and_repeated_403s_close_their_route() {
+        use std::time::Instant;
+        let mut s = Safety::default();
+        let t = Instant::now();
+        let at = |secs: u64| t + Duration::from_secs(secs);
+        assert!(s.preflight_at("tok", "GET", "/channels/1/messages", t).is_ok());
+        // Two refusals are not three.
+        s.record_at("tok", "GET", "/channels/1/messages", 403, at(1));
+        s.record_at("tok", "GET", "/channels/1/messages", 403, at(2));
+        assert!(s.preflight_at("tok", "GET", "/channels/1/messages", at(3)).is_ok());
+        s.record_at("tok", "GET", "/channels/1/messages", 403, at(4));
+        let closed = s.preflight_at("tok", "GET", "/channels/1/messages", at(5)).unwrap_err();
+        assert!(matches!(closed, Blocked::Closed(w) if w > Duration::from_secs(290)));
+        // Other routes, other methods and other accounts are unaffected.
+        assert!(s.preflight_at("tok", "GET", "/channels/2/messages", at(5)).is_ok());
+        assert!(s.preflight_at("tok", "POST", "/channels/1/messages", at(5)).is_ok());
+        assert!(s.preflight_at("other", "GET", "/channels/1/messages", at(5)).is_ok());
+        // It opens again after the five minutes, and a success clears the count.
+        assert!(s.preflight_at("tok", "GET", "/channels/1/messages", at(4 + 301)).is_ok());
+        s.record_at("tok", "GET", "/channels/9/messages", 403, at(10));
+        s.record_at("tok", "GET", "/channels/9/messages", 200, at(11));
+        s.record_at("tok", "GET", "/channels/9/messages", 403, at(12));
+        s.record_at("tok", "GET", "/channels/9/messages", 403, at(13));
+        assert!(s.preflight_at("tok", "GET", "/channels/9/messages", at(14)).is_ok(), "403, 200, 403, 403 is not three in a row");
+        // A 401 ends all of it for that token, for good.
+        s.record_at("tok", "GET", "/users/@me", 401, at(20));
+        assert_eq!(s.preflight_at("tok", "POST", "/anything", at(21)), Err(Blocked::Refused));
+        assert!(s.preflight_at("fresh", "POST", "/anything", at(21)).is_ok(), "a new login is a new token");
+    }
+
+    #[test]
+    fn a_slowmode_answer_is_told_from_any_other_429() {
+        assert!(is_slowmode(br#"{"message":"The resource is being rate limited.","retry_after":3.5,"code":20016}"#));
+        assert!(!is_slowmode(br#"{"message":"You are being rate limited.","retry_after":1.2,"global":false}"#));
+        assert!(!is_slowmode(b"not json"));
     }
 }

@@ -7,6 +7,7 @@
 //! - this file - the identity moho gives Telegram, and what every other file shares
 //! - `session` - what the library remembers between runs, in a private file of its own per account
 //! - `link` - one connection to Telegram: the sender pool, the client and the stream of updates
+//! - `links` - what a t.me or tg:// link points at, and opening it
 //! - `login` - adding an account: phone, code, cloud password
 //! - `connect` - an account's connection, kept up and reconnected
 //! - `dialogs` - the account's conversations, read when it connects
@@ -29,7 +30,9 @@
 //! - `keyboards` - a bot's inline buttons
 //! - `bots` - a bot's command menu
 //! - `topics` - a group with Topics as several conversations
+//! - `folders` - the account's chat folders, kept in step with moho's categories
 //! - `gifs` - saved GIFs and the GIF search
+//! - `stickers` - the account's sticker packs, and sending one
 //! - `peers` - a conversation as a buffer: its name, its kind, its heading in the list
 //! - `messages` - a message as moho's, with its entities as html
 //!
@@ -50,11 +53,13 @@ pub mod admin;
 pub mod bots;
 pub mod connect;
 pub mod dialogs;
+pub mod folders;
 pub mod gifs;
 pub mod history;
 pub mod instant;
 pub mod keyboards;
 pub mod link;
+pub mod links;
 pub mod login;
 pub mod markup;
 pub mod media;
@@ -69,6 +74,7 @@ pub mod profile;
 pub mod reactions;
 pub mod search;
 pub mod send;
+pub mod stickers;
 pub mod threads;
 pub mod topics;
 pub mod updates;

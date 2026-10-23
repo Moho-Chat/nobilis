@@ -7,7 +7,134 @@
 
 use super::*;
 
-pub(super) const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
+pub(super) const GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json&compress=zlib-stream";
+
+/// The same address asking for the stream compressed, as Discord's web client and Dissent do: what a session was last
+/// given to resume at (kept on disk) may not say so, and a gateway that is not asked to compress does not.
+fn compressed(url: &str) -> String {
+    if url.contains("compress=zlib-stream") {
+        url.to_string()
+    } else if url.contains('?') {
+        format!("{url}&compress=zlib-stream")
+    } else {
+        format!("{url}?compress=zlib-stream")
+    }
+}
+
+/// Discord's `zlib-stream`: every message is a piece of one zlib stream that lasts as long as the connection, each
+/// ending in the four bytes of a sync flush (`00 00 FF FF`) - a message may arrive in several frames, and is whole when
+/// the last of them ends so. Inflating needs the whole stream so far, not the frame alone.
+pub(super) struct Inflater {
+    inflate: flate2::Decompress,
+    pending: Vec<u8>,
+}
+
+impl Inflater {
+    const SYNC_FLUSH: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
+
+    pub(super) fn new() -> Self {
+        Inflater { inflate: flate2::Decompress::new(true), pending: Vec::new() }
+    }
+
+    /// Takes a frame; hands back the message it completes, if it does.
+    pub(super) fn push(&mut self, frame: &[u8]) -> Result<Option<String>> {
+        self.pending.extend_from_slice(frame);
+        if !self.pending.ends_with(&Self::SYNC_FLUSH) {
+            return Ok(None);
+        }
+        let input = std::mem::take(&mut self.pending);
+        let mut out: Vec<u8> = Vec::with_capacity(input.len() * 4);
+        let start = self.inflate.total_in();
+        loop {
+            let consumed = (self.inflate.total_in() - start) as usize;
+            if out.capacity() == out.len() {
+                out.reserve(input.len().max(4096));
+            }
+            let (before_in, before_out) = (self.inflate.total_in(), out.len());
+            self.inflate.decompress_vec(&input[consumed..], &mut out, flate2::FlushDecompress::Sync).context("inflating the gateway's stream")?;
+            let all_in = (self.inflate.total_in() - start) as usize >= input.len();
+            // Done when everything given has been taken and the output stopped for want of input, not of room: while
+            // the buffer is full there may be more to come out of what was taken.
+            if all_in && out.len() < out.capacity() {
+                break;
+            }
+            if self.inflate.total_in() == before_in && out.len() == before_out {
+                bail!("the gateway's stream stopped making sense");
+            }
+        }
+        Ok(Some(String::from_utf8(out).context("the gateway's message was not text")?))
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::heartbeat_message;
+
+    #[test]
+    fn a_heartbeat_says_how_far_the_connection_has_got() {
+        assert_eq!(heartbeat_message(0), r#"{"d":null,"op":1}"#);
+        assert_eq!(heartbeat_message(42), r#"{"d":42,"op":1}"#);
+    }
+}
+
+#[cfg(test)]
+mod inflate_tests {
+    use super::*;
+
+    /// A zlib stream the way Discord makes one: one compressor, each message flushed (sync) at its end.
+    fn frames(messages: &[&str]) -> Vec<Vec<u8>> {
+        let mut compress = flate2::Compress::new(flate2::Compression::default(), true);
+        messages
+            .iter()
+            .map(|m| {
+                let mut out = Vec::with_capacity(m.len() + 64);
+                let start = compress.total_in();
+                while ((compress.total_in() - start) as usize) < m.len() {
+                    let done = (compress.total_in() - start) as usize;
+                    compress.compress_vec(&m.as_bytes()[done..], &mut out, flate2::FlushCompress::None).unwrap();
+                    if out.capacity() == out.len() {
+                        out.reserve(64);
+                    }
+                }
+                loop {
+                    compress.compress_vec(&[], &mut out, flate2::FlushCompress::Sync).unwrap();
+                    if out.ends_with(&Inflater::SYNC_FLUSH) {
+                        break;
+                    }
+                    out.reserve(64);
+                }
+                out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn messages_of_one_stream_are_read_in_turn() {
+        let big = format!(r#"{{"op":0,"t":"READY","d":{{"name":"{}"}}}}"#, "x".repeat(50_000));
+        let sent = [r#"{"op":10,"d":{"heartbeat_interval":41250}}"#, big.as_str(), r#"{"op":11}"#];
+        let mut inflater = Inflater::new();
+        for (frame, want) in frames(&sent).iter().zip(sent) {
+            assert_eq!(inflater.push(frame).unwrap().as_deref(), Some(want));
+        }
+    }
+
+    #[test]
+    fn a_message_in_two_frames_is_whole_when_the_second_arrives() {
+        let sent = [r#"{"op":0,"t":"MESSAGE_CREATE","d":{"content":"hello hello hello hello"}}"#];
+        let all = &frames(&sent)[0];
+        let (first, second) = all.split_at(all.len() / 2);
+        let mut inflater = Inflater::new();
+        assert_eq!(inflater.push(first).unwrap(), None, "not yet");
+        assert_eq!(inflater.push(second).unwrap().as_deref(), Some(sent[0]));
+    }
+
+    #[test]
+    fn the_address_asks_for_the_stream_compressed_once() {
+        assert_eq!(compressed("wss://x/?v=10&encoding=json"), "wss://x/?v=10&encoding=json&compress=zlib-stream");
+        assert_eq!(compressed(GATEWAY_URL), GATEWAY_URL);
+        assert_eq!(compressed("wss://x"), "wss://x?compress=zlib-stream");
+    }
+}
 
 /// Discord's gateway close code for "the token in your IDENTIFY payload is
 /// invalid/revoked" - documented at discord.com/developers/docs/topics/
@@ -92,9 +219,22 @@ pub(super) async fn next_json<S>(stream: &mut S) -> Result<Value>
 where
     S: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    next_json_inflating(stream, None).await
+}
+
+/// `next_json` for a connection that was asked to compress its stream: binary frames are pieces of it.
+pub(super) async fn next_json_inflating<S>(stream: &mut S, mut inflater: Option<&mut Inflater>) -> Result<Value>
+where
+    S: futures::Stream<Item = std::result::Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     loop {
         match stream.next().await {
             Some(Ok(WsMessage::Text(text))) => return serde_json::from_str(&text).context("parsing gateway JSON"),
+            Some(Ok(WsMessage::Binary(frame))) if inflater.is_some() => {
+                if let Some(text) = inflater.as_mut().expect("checked").push(&frame)? {
+                    return serde_json::from_str(&text).context("parsing gateway JSON");
+                }
+            }
             Some(Ok(WsMessage::Close(frame))) => {
                 if frame.as_ref().is_some_and(|f| u16::from(f.code) == CLOSE_CODE_AUTH_FAILED) {
                     return Err(GatewayAuthFailed.into());
@@ -207,17 +347,23 @@ pub(super) struct Resume {
     seq: u64,
 }
 
+/// A heartbeat: its data is the number of the last dispatch received, and null before there has been one.
+pub(super) fn heartbeat_message(seq: u64) -> String {
+    json!({ "op": 1, "d": if seq == 0 { Value::Null } else { Value::from(seq) } }).to_string()
+}
+
 /// The gateway capabilities this client declares in IDENTIFY, as a user client does (Dissent's `ningen` sends the same
-/// five of the seven it knows): notes fetched lazily, read states and guild settings in their versioned form, guild
-/// experiments as populations, and read states for things that are not channels. Each changes only the shape of a
-/// field READY carries and this client either ignores (`read_state`, notes, experiments) or reads in both shapes
-/// (`user_guild_settings`, see `mutes::note_settings`).
+/// six of the seven it knows): notes fetched lazily, read states and guild settings in their versioned form, user
+/// objects deduplicated, guild experiments as populations, and read states for things that are not channels. Each
+/// changes only the shape of a field READY carries and this client either ignores (`read_state`, notes, experiments),
+/// reads in both shapes (`user_guild_settings`, see `mutes::note_settings`) or has put back (the deduplicated users,
+/// see `ready_shape`).
 ///
-/// Not declared: DEDUPE_USER_OBJECTS (16) and PRIORITIZED_READY_PAYLOAD (32). They move users out of READY into a
-/// table by id and split the rest into a second event, and the friends list, the names of conversations and the
-/// presences here are built from the objects that would no longer be there. They need a real READY to be written
-/// against, not a guess at one.
-pub(super) const CAPABILITIES: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 6) | (1 << 7);
+/// Not declared: PRIORITIZED_READY_PAYLOAD (32). It splits what READY carries in two, the second part (presences, the
+/// rest of each guild's members, who is in which voice channel) arriving as READY_SUPPLEMENTAL after the guilds are
+/// registered, and every one of those is read at the moment of registering here. It buys the client a faster first
+/// event; the identity it adds is the one bit.
+pub(super) const CAPABILITIES: u32 = (1 << 0) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 6) | (1 << 7);
 
 /// What IDENTIFY says this client is: moho, on Linux, in this machine's language.
 fn identify_properties() -> Value {
@@ -226,6 +372,29 @@ fn identify_properties() -> Value {
         properties["system_locale"] = Value::from(locale);
     }
     properties
+}
+
+/// Conversations asked about this run, found or not: one that Discord will not describe is not asked about again for
+/// every message in it.
+static ASKED_ABOUT: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+
+/// Looks up a direct message that READY did not list - the one request it costs is made when somebody speaks in it,
+/// which is the moment it matters - and registers it like any other.
+async fn unknown_dm(state: &AppState, config: &DiscordAccountConfig, channel_id: &str, channel_map: &mut HashMap<String, (String, String)>) {
+    let first = ASKED_ABOUT.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(format!("{}:{channel_id}", config.user_id));
+    if !first {
+        return;
+    }
+    let resp = http_client_for(&config.token).get(format!("{API_BASE}/channels/{channel_id}")).header("Authorization", &config.token).send_paced().await;
+    let Ok(resp) = resp else { return };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(channel) = resp.json::<Value>().await else { return };
+    // 1 is a direct message and 3 a group.
+    if matches!(channel["type"].as_i64(), Some(1) | Some(3)) {
+        register_dm_channel(state, &config.account_id(), &channel, channel_map, &HashMap::new());
+    }
 }
 
 pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAccountConfig, account_id: &str) {
@@ -240,6 +409,11 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
         tracing::info!("discord[{account_id}]: resuming the session from before the restart");
         session.resume = Some(Resume { session_id: position.session_id, url: position.url, seq: position.seq });
         session.pending = replay.into();
+    }
+    // A login Discord has already refused is not tried again: the person signs in afresh, which is a new token.
+    if token_is_halted(&config.token) {
+        state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some("Discord has refused this account's login - sign in again from Accounts"));
+        return;
     }
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     loop {
@@ -265,6 +439,8 @@ pub(super) async fn run_gateway_with_retry(state: &AppState, config: &DiscordAcc
             Ok(Err(e)) => {
                 if e.downcast_ref::<GatewayAuthFailed>().is_some() {
                     tracing::warn!("discord[{account_id}]: {e} - giving up, needs a fresh login");
+                    // Every other request with it stops too: see http::Safety.
+                    halt_token(&config.token);
                     state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some(&e.to_string()));
                     return;
                 }
@@ -330,7 +506,9 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     let GatewaySession { resume, channel_map, guild_context, persist, pending } = session;
     // Discord asks that a resume go to the url it handed out with the
     // session rather than to the front door.
-    let connect_url = resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string());
+    let connect_url = compressed(&resume.as_ref().map(|r| r.url.clone()).unwrap_or_else(|| GATEWAY_URL.to_string()));
+    // One stream for the whole connection, and a new one for the next: the compressor at the far end starts afresh.
+    let mut inflater = Inflater::new();
     let (ws, _resp) = tokio::time::timeout(CONNECT_TIMEOUT, crate::net::route::websocket(&config.token, connect_url.as_str()))
         .await
         .map_err(|_| anyhow!("timed out connecting to Discord's gateway"))?
@@ -354,7 +532,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     }
     let _forwarder_guard = AbortOnDrop(forwarder);
 
-    let hello = next_json(&mut stream).await.context("waiting for gateway hello")?;
+    let hello = next_json_inflating(&mut stream, Some(&mut inflater)).await.context("waiting for gateway hello")?;
     let heartbeat_interval = hello["d"]["heartbeat_interval"].as_u64().unwrap_or(41_250).max(1);
 
     // Discord's own documented client contract: if an ack (op 11) hasn't
@@ -369,6 +547,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
     // false-positive as a missed ack.
     let ack_pending = Arc::new(AtomicBool::new(false));
     let stale_notify = Arc::new(Notify::new());
+    // The number of the last dispatch received, which a heartbeat says: it tells Discord how far this connection has
+    // got, as it does for every client. (A resume starts from where the saved session had got to.)
+    let last_seq = Arc::new(std::sync::atomic::AtomicU64::new(resume.as_ref().map(|r| r.seq).unwrap_or(0)));
+    let hb_seq = last_seq.clone();
     let hb_tx = out_tx.clone();
     let hb_ack_pending = ack_pending.clone();
     let hb_stale_notify = stale_notify.clone();
@@ -381,7 +563,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                 hb_stale_notify.notify_one();
                 break;
             }
-            if hb_tx.send(json!({ "op": 1, "d": Value::Null }).to_string()).is_err() {
+            if hb_tx.send(heartbeat_message(hb_seq.load(Ordering::SeqCst))).is_err() {
                 break;
             }
         }
@@ -453,7 +635,7 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
             }
             None => {
                 let msg = tokio::select! {
-                    result = next_json(&mut stream) => result?,
+                    result = next_json_inflating(&mut stream, Some(&mut inflater)) => result?,
                     _ = stale_notify.notified() => bail!("no heartbeat ack received - connection is zombied"),
                 };
                 (msg, false)
@@ -464,8 +646,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
         // Tracked before the match so it counts events this client chose
         // not to handle - the server's count includes them either way, and
         // resuming from a lower number would replay what was already seen.
-        if let (Some(seq), Some(r)) = (msg.get("s").and_then(|v| v.as_u64()), resume.as_mut()) {
-            r.seq = seq;
+        if let Some(seq) = msg.get("s").and_then(|v| v.as_u64()) {
+            last_seq.store(seq, Ordering::SeqCst);
+            if let Some(r) = resume.as_mut() {
+                r.seq = seq;
+            }
         }
         match op {
             0 => {
@@ -494,6 +679,15 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         tracing::info!("discord[{account_id}]: resumed");
                     }
                     "READY" => {
+                        // A new login has missed what the last one did not: what was asked about is asked afresh.
+                        if !replaying {
+                            super::history::forget_asked(&account_id);
+                        }
+                        // Kept as it came (it is what a resume replays), and read with its users put back: see
+                        // ready_shape. A READY that was not dehydrated is read as it is.
+                        let raw = d;
+                        let hydrated = super::ready_shape::rehydrate(raw);
+                        let d = hydrated.as_ref().unwrap_or(raw);
                         let username = d["user"]["global_name"]
                             .as_str()
                             .filter(|s| !s.is_empty())
@@ -501,6 +695,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                             .unwrap_or("me")
                             .to_string();
                         state.runtime.set_own_identity(&account_id, &username);
+                        // What the account can say of itself to a server's rules: a verified email or phone, how old.
+                        super::send_guard::note_account(&account_id, &d["user"]);
                         // Nitro, which is what lets this account's emoji be
                         // used away from the guild they belong to. Read here
                         // because READY is the only place the payload carries
@@ -523,13 +719,13 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                 session_id: session_id.to_string(),
                                 url: d["resume_gateway_url"]
                                     .as_str()
-                                    .map(|u| format!("{u}/?v=10&encoding=json"))
+                                    .map(|u| format!("{u}/?v=10&encoding=json&compress=zlib-stream"))
                                     .unwrap_or_else(|| GATEWAY_URL.to_string()),
                                 seq: msg.get("s").and_then(|v| v.as_u64()).unwrap_or(0),
                             };
                             // A new session replaces what was kept; the saved one handled again is that same one.
                             if !replaying {
-                                persist.ready(&next.session_id, &next.url, next.seq, d.clone());
+                                persist.ready(&next.session_id, &next.url, next.seq, raw.clone());
                             }
                             *resume = Some(next);
                         }
@@ -649,6 +845,11 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         // again is a request for nothing.
                         let listed: Option<Vec<Value>> = if replaying {
                             d["moho_dms"].as_array().cloned()
+                        } else if d["private_channels"].as_array().is_some_and(|l| !l.is_empty()) {
+                            // READY names the account's conversations, as it does for Discord's own clients, and
+                            // any it leaves out is found when somebody speaks in it (see `unknown_dm`): no request
+                            // for a list that was just sent.
+                            None
                         } else {
                             match http_client_for(&config.token).get(format!("{API_BASE}/users/@me/channels")).header("Authorization", &config.token).send_paced().await {
                                 Ok(resp) => {
@@ -788,6 +989,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                                         // in place and arrives this way.
                                         if let Some(topic) = d.get("topic") {
                                             state.runtime.set_buffer_topic(state, &crate::model::buffer_id(&account_id, &old_name), topic.as_str().unwrap_or_default());
+                                        }
+                                        // And so is a channel's slowmode.
+                                        if let Some(seconds) = d["rate_limit_per_user"].as_u64() {
+                                            super::send_guard::set_slowmode(&crate::model::buffer_id(&account_id, &old_name), seconds);
                                         }
                                         continue;
                                     }
@@ -954,6 +1159,8 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         if d["user"]["id"].as_str() != Some(config.user_id.as_str()) {
                             continue;
                         }
+                        // What the server's rules ask of the account: pending, flags, roles, a timeout.
+                        super::send_guard::note_member(state, &account_id, guild_id, Some(d));
                         if d["pending"].as_bool().unwrap_or(false) {
                             continue;
                         }
@@ -993,6 +1200,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                     }
                     "MESSAGE_CREATE" => {
                         let channel_id = d["channel_id"].as_str().unwrap_or_default();
+                        // A conversation READY did not name: asked about, once, when it first speaks.
+                        if !channel_map.contains_key(channel_id) && d["guild_id"].is_null() {
+                            unknown_dm(state, config, channel_id, channel_map).await;
+                        }
                         let Some((buffer_name, kind)) = channel_map.get(channel_id).cloned() else {
                             tracing::info!("discord[{account_id}]: a message in {channel_id} was dropped - that channel is not one this connection knows ({} are)", channel_map.len());
                             continue;
@@ -1510,6 +1721,10 @@ pub(super) async fn run_gateway(state: &AppState, config: &DiscordAccountConfig,
                         }
                     }
                 }
+            }
+            // Discord asking for a heartbeat now: answered at once, as its own clients answer.
+            1 => {
+                let _ = out_tx.send(heartbeat_message(last_seq.load(Ordering::SeqCst)));
             }
             7 => return Err(ReconnectRequested.into()),
             // The resume was refused, or the session is gone. Everything

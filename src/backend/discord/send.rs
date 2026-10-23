@@ -35,6 +35,33 @@ pub(super) fn put_reply(payload: &mut Value, reply_to_id: Option<&str>, ping_aut
     }
 }
 
+/// Says where the message answered is, as Discord's clients do: the channel, and the server where there is one. The id
+/// alone is enough for the API, and is not what its own clients send.
+pub(super) fn put_reply_place(payload: &mut Value, channel_id: &str, guild_id: Option<&str>) {
+    if payload["message_reference"].is_object() {
+        payload["message_reference"]["channel_id"] = Value::from(channel_id);
+        if let Some(guild) = guild_id {
+            payload["message_reference"]["guild_id"] = Value::from(guild);
+        }
+    }
+}
+
+/// Said when Discord refuses a message that creates one: a captcha closes the place for a while (moho does not answer
+/// those, and trying again is what escalates), a channel's slowmode says how long is left, anything else is as
+/// `refusal_text` has it.
+pub(super) fn refused(state: &AppState, buffer_id: &str, status: reqwest::StatusCode, text: &str) -> String {
+    let parsed: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    if parsed.get("captcha_key").is_some() {
+        super::send_guard::hold_captcha(state, buffer_id);
+        return "Discord asked for a captcha before this message. moho does not answer Discord's captchas - trying again is what gets an account blocked - so this place is closed to it for a while: say something here from Discord's own app.".to_string();
+    }
+    if parsed["code"].as_u64() == Some(20016) {
+        let seconds = parsed["retry_after"].as_f64().unwrap_or(0.0).ceil() as u64;
+        return format!("This channel has slowmode on: wait {} more seconds.", seconds.max(1));
+    }
+    refusal_text(status, text)
+}
+
 /// REST message send - Discord's gateway is receive-only from the client's
 /// perspective for user accounts; sending is always a plain HTTP POST.
 /// Turns the names somebody typed into the mentions Discord understands.
@@ -220,7 +247,8 @@ pub async fn forward_message(
         .runtime
         .get_discord_channel(to_buffer)
         .ok_or_else(|| anyhow!("there is no Discord conversation to send it to"))?;
-    super::send_guard::ensure_may_speak(state, to_buffer)?;
+    super::send_guard::ensure_may_speak(state, to_buffer).await?;
+    let _turn = super::send_guard::channel_turn(&target_channel).await;
     let mut reference = json!({
         // 1 is Discord's own number for a forward, as against 0 for a reply.
         "type": 1,
@@ -247,8 +275,9 @@ pub async fn forward_message(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}", discord_error_text(status, &text, "forwarding that message"));
+        bail!("{}", refused(state, to_buffer, status, &text));
     }
+    super::send_guard::record_own_send(to_buffer);
     super::send_guard::note_sent(resp).await;
     Ok(())
 }
@@ -259,13 +288,16 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
     // Nothing is said anywhere the account has not spoken before: see send_guard.
-    super::send_guard::ensure_may_speak(state, buffer_id)?;
+    super::send_guard::ensure_may_speak(state, buffer_id).await?;
     let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
     let content = resolve_outgoing_mentions(body, mention_candidates(state, &account_id, buffer_id));
     super::send_guard::check_text(&content, state.runtime.discord_premium(&account_id), false)?;
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
+    put_reply_place(&mut payload, &channel_id, state.runtime.get_discord_guild(buffer_id).as_deref());
     super::send_guard::stamp(&mut payload);
+    // One send at a time to a channel, and each a moment after the last.
+    let _turn = super::send_guard::channel_turn(&channel_id).await;
     super::send_guard::take_turn(&account_id, false).await;
     let resp = send_write(
         http_client_for(token)
@@ -278,8 +310,9 @@ pub async fn send_message(state: &AppState, buffer_id: &str, token: &str, body: 
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}", refusal_text(status, &text));
+        bail!("{}", refused(state, buffer_id, status, &text));
     }
+    super::send_guard::record_own_send(buffer_id);
     super::send_guard::note_sent(resp).await;
     Ok(())
 }
@@ -383,7 +416,8 @@ pub async fn send_attachments(
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    super::send_guard::ensure_may_speak(state, buffer_id)?;
+    super::send_guard::ensure_may_speak(state, buffer_id).await?;
+    let _turn = super::send_guard::channel_turn(&channel_id).await;
     if let Some(p) = progress {
         p.at(Phase::Preparing, 0, Meter::HOST);
     }
@@ -407,6 +441,7 @@ pub async fn send_attachments(
     super::send_guard::check_text(&content, state.runtime.discord_premium(&account_id), true)?;
     let mut payload = json!({ "content": content });
     put_reply(&mut payload, reply_to_id, reply_ping);
+    put_reply_place(&mut payload, &channel_id, state.runtime.get_discord_guild(buffer_id).as_deref());
     super::send_guard::stamp(&mut payload);
     // A file does not follow straight on from a message.
     super::send_guard::take_turn(&account_id, true).await;
@@ -414,33 +449,178 @@ pub async fn send_attachments(
         p.sent(0, total, Meter::HOST);
     }
 
-    let client = http_client_for(token);
-    let url = format!("{API_BASE}/channels/{channel_id}/messages");
-    let resp = send_write_rebuilt(|| {
-        // Built afresh for every try: a streamed body is used up by sending
-        // it, so a rate-limited request has to open its files again.
-        let meter = std::sync::Arc::new(Meter {
-            sent: std::sync::atomic::AtomicU64::new(0),
-            total,
-            last: std::sync::Mutex::new((std::time::Instant::now(), 0)),
-            progress: progress.cloned(),
-            gap: Meter::GAP,
-        });
-        let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
-        for (i, (path, name, len)) in files.iter().enumerate() {
-            form = form.part(format!("files[{i}]"), counted_part(path, name, *len, meter.clone())?);
+    let meter = std::sync::Arc::new(Meter {
+        sent: std::sync::atomic::AtomicU64::new(0),
+        total,
+        last: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+        progress: progress.cloned(),
+        gap: Meter::GAP,
+    });
+    let uploads: Vec<Upload> = files.iter().map(|(path, name, len)| Upload { path: path.clone(), name: name.clone(), len: *len, voice: None }).collect();
+    let resp = match upload_in_steps(state, token, &channel_id, &uploads, &mut payload, &meter).await? {
+        Some(resp) => resp,
+        // Where the way Discord's own apps send files is not there, the one bots use is.
+        None => {
+            let client = http_client_for(token);
+            let url = format!("{API_BASE}/channels/{channel_id}/messages");
+            for key in ["attachments", "type", "sticker_ids", "channel_id"] {
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove(key);
+                }
+            }
+            send_write_rebuilt(|| {
+                // Built afresh for every try: a streamed body is used up by sending it, so a rate-limited request has
+                // to open its files again.
+                let meter = std::sync::Arc::new(Meter {
+                    sent: std::sync::atomic::AtomicU64::new(0),
+                    total,
+                    last: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+                    progress: progress.cloned(),
+                    gap: Meter::GAP,
+                });
+                let mut form = reqwest::multipart::Form::new().text("payload_json", payload.to_string());
+                for (i, (path, name, len)) in files.iter().enumerate() {
+                    form = form.part(format!("files[{i}]"), counted_part(path, name, *len, meter.clone())?);
+                }
+                Ok(client.post(&url).header("Authorization", token).multipart(form))
+            })
+            .await
+            .context("uploading Discord attachment")?
         }
-        Ok(client.post(&url).header("Authorization", token).multipart(form))
-    })
-    .await
-    .context("uploading Discord attachment")?;
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}", refusal_text(status, &text));
+        bail!("{}", refused(state, buffer_id, status, &text));
     }
+    super::send_guard::record_own_send(buffer_id);
     super::send_guard::note_sent(resp).await;
     Ok(())
+}
+
+/// A file on its way, and what it is when it is a voice message.
+struct Upload {
+    path: String,
+    name: String,
+    len: u64,
+    /// A voice message's duration and waveform.
+    voice: Option<(f64, String)>,
+}
+
+/// What Discord answered to a request for somewhere to put the files: for each, by its place in the request, where to
+/// send its bytes and the name to give the message. None when the answer is not that.
+fn parse_slots(body: &Value, count: usize) -> Option<Vec<(String, String)>> {
+    let list = body["attachments"].as_array()?;
+    let mut slots: Vec<Option<(String, String)>> = vec![None; count];
+    for slot in list {
+        let id = slot["id"].as_u64().or_else(|| slot["id"].as_str().and_then(|s| s.parse().ok()))? as usize;
+        let url = slot["upload_url"].as_str().filter(|u| u.starts_with("https://"))?;
+        let name = slot["upload_filename"].as_str().filter(|n| !n.is_empty())?;
+        *slots.get_mut(id)? = Some((url.to_string(), name.to_string()));
+    }
+    slots.into_iter().collect()
+}
+
+/// The `attachments` a message names once its files are uploaded.
+fn attachments_named(uploads: &[Upload], slots: &[(String, String)]) -> Value {
+    Value::Array(
+        uploads
+            .iter()
+            .zip(slots)
+            .enumerate()
+            .map(|(i, (upload, (_, uploaded)))| {
+                let mut entry = json!({ "id": i.to_string(), "filename": upload.name, "uploaded_filename": uploaded });
+                if let Some((duration, waveform)) = &upload.voice {
+                    entry["duration_secs"] = json!(duration);
+                    entry["waveform"] = json!(waveform);
+                }
+                entry
+            })
+            .collect(),
+    )
+}
+
+/// The body of an upload: the file, read from disk as it goes, counted by `meter`.
+fn counted_body(path: &str, meter: std::sync::Arc<Meter>) -> Result<reqwest::Body> {
+    let file = std::fs::File::open(path).with_context(|| format!("reading {path}"))?;
+    let stream = tokio_util::io::ReaderStream::with_capacity(tokio::fs::File::from_std(file), 64 * 1024);
+    let counted = futures::StreamExt::map(stream, move |chunk| {
+        if let Ok(bytes) = &chunk {
+            meter.add(bytes.len());
+        }
+        chunk
+    });
+    Ok(reqwest::Body::wrap_stream(counted))
+}
+
+/// Sends files the way Discord's own apps do: ask where to put them (a file too big is refused here, before a byte
+/// goes), put each there, then send the message with the files named - not the way bots do, with the bytes inside the
+/// message. Returns the answer to the message, or `None` when Discord has no such way to offer (the endpoint is
+/// missing, or answers something that is not slots) and the old one is to be used.
+async fn upload_in_steps(
+    state: &AppState,
+    token: &str,
+    channel_id: &str,
+    uploads: &[Upload],
+    payload: &mut Value,
+    meter: &std::sync::Arc<Meter>,
+) -> Result<Option<reqwest::Response>> {
+    let _ = state;
+    let request = json!({
+        "files": uploads.iter().enumerate().map(|(i, u)| json!({ "filename": u.name, "file_size": u.len, "id": i.to_string() })).collect::<Vec<_>>(),
+    });
+    let resp = send_write(
+        http_client_for(token).post(format!("{API_BASE}/channels/{channel_id}/attachments")).header("Authorization", token).json(&request),
+    )
+    .await
+    .context("asking Discord where to put the files")?;
+    let status = resp.status();
+    if matches!(status.as_u16(), 404 | 405 | 501) {
+        return Ok(None);
+    }
+    if status.as_u16() == 413 {
+        bail!("Discord says a file is too big to send here");
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        bail!("{}", discord_error_text(status, &text, "asking where to put the files"));
+    }
+    let body: Value = resp.json().await.context("reading where Discord said to put the files")?;
+    let Some(slots) = parse_slots(&body, uploads.len()) else { return Ok(None) };
+
+    // The bytes go to the address Discord gave, which is another host: none of Discord's headers go with them.
+    let storage = bare_client_for(token);
+    for (upload, (url, _)) in uploads.iter().zip(&slots) {
+        let put = storage
+            .put(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .header(reqwest::header::CONTENT_LENGTH, upload.len)
+            .body(counted_body(&upload.path, meter.clone())?)
+            .send()
+            .await
+            .with_context(|| format!("uploading {}", upload.name))?;
+        if !put.status().is_success() {
+            bail!("Discord's storage refused {} ({})", upload.name, put.status());
+        }
+    }
+
+    payload["attachments"] = attachments_named(uploads, &slots);
+    payload["type"] = json!(0);
+    payload["sticker_ids"] = json!([]);
+    payload["channel_id"] = json!(channel_id);
+    // A message that names its files is not sent as a bare one.
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("tts");
+        if object.get("flags") == Some(&json!(0)) {
+            object.remove("flags");
+        }
+    }
+    let sent = send_write(
+        http_client_for(token).post(format!("{API_BASE}/channels/{channel_id}/messages")).header("Authorization", token).json(&*payload),
+    )
+    .await
+    .context("sending the message with the files")?;
+    Ok(Some(sent))
 }
 
 /// Sending a recording as a voice message rather than as a sound file.
@@ -472,7 +652,7 @@ pub async fn send_voice_message(
         .runtime
         .get_discord_channel(buffer_id)
         .ok_or_else(|| anyhow!("no known Discord channel for this buffer"))?;
-    super::send_guard::ensure_may_speak(state, buffer_id)?;
+    super::send_guard::ensure_may_speak(state, buffer_id).await?;
     let bytes = tokio::fs::read(file_path)
         .await
         .with_context(|| format!("reading {}", file_path.display()))?;
@@ -491,28 +671,53 @@ pub async fn send_voice_message(
         }],
     });
     super::send_guard::stamp(&mut payload);
-    let form = reqwest::multipart::Form::new()
-        .text("payload_json", payload.to_string())
-        .part(
-            "files[0]",
-            reqwest::multipart::Part::bytes(bytes)
-                .file_name(file_name)
-                .mime_str("audio/ogg")
-                .context("audio/ogg is a valid mime type")?,
-        );
-    let resp = send_write(
-        http_client_for(token)
-            .post(format!("{API_BASE}/channels/{channel_id}/messages"))
-            .header("Authorization", token)
-            .multipart(form),
-    )
-    .await
-    .context("uploading the voice message")?;
+    let _turn = super::send_guard::channel_turn(&channel_id).await;
+    let account_id = state.runtime.get_buffer(buffer_id).map(|b| b.account_id).unwrap_or_default();
+    super::send_guard::take_turn(&account_id, true).await;
+    // Sent the way Discord's own apps send a recording, with the old way (the bytes inside the message) where that is
+    // not there.
+    let meter = std::sync::Arc::new(Meter {
+        sent: std::sync::atomic::AtomicU64::new(0),
+        total: bytes.len() as u64,
+        last: std::sync::Mutex::new((std::time::Instant::now(), 0)),
+        progress: None,
+        gap: Meter::GAP,
+    });
+    let upload = Upload { path: file_path.to_string_lossy().into_owned(), name: file_name.to_string(), len: bytes.len() as u64, voice: Some((duration_secs, waveform.to_string())) };
+    let resp = match upload_in_steps(state, token, &channel_id, std::slice::from_ref(&upload), &mut payload, &meter).await? {
+        Some(resp) => resp,
+        None => {
+            for key in ["type", "sticker_ids", "channel_id"] {
+                if let Some(object) = payload.as_object_mut() {
+                    object.remove(key);
+                }
+            }
+            payload["attachments"] = json!([{ "id": "0", "filename": file_name, "duration_secs": duration_secs, "waveform": waveform }]);
+            let form = reqwest::multipart::Form::new()
+                .text("payload_json", payload.to_string())
+                .part(
+                    "files[0]",
+                    reqwest::multipart::Part::bytes(bytes)
+                        .file_name(file_name)
+                        .mime_str("audio/ogg")
+                        .context("audio/ogg is a valid mime type")?,
+                );
+            send_write(
+                http_client_for(token)
+                    .post(format!("{API_BASE}/channels/{channel_id}/messages"))
+                    .header("Authorization", token)
+                    .multipart(form),
+            )
+            .await
+            .context("uploading the voice message")?
+        }
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        bail!("{}", refusal_text(status, &text));
+        bail!("{}", refused(state, buffer_id, status, &text));
     }
+    super::send_guard::record_own_send(buffer_id);
     super::send_guard::note_sent(resp).await;
     Ok(())
 }
@@ -884,7 +1089,7 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         http_client_for(token)
         .post(format!("{API_BASE}/channels/{channel_id}/messages/{msg_id}/ack"))
         .header("Authorization", token)
-        .json(&json!({ "token": serde_json::Value::Null }))
+        .json(&json!({ "token": serde_json::Value::Null, "last_viewed": last_viewed_day() }))
         )
     .await
         .inspect_err(|_| forget_ack(&channel_id))
@@ -896,6 +1101,17 @@ pub async fn ack_read(state: &AppState, buffer_id: &str, token: &str) -> Result<
         bail!("{}", refusal_text(status, &text));
     }
     Ok(())
+}
+
+/// The day, counted from Discord's epoch (2015-01-01) and rounded up, that a read mark says the channel was last
+/// looked at: Discord's own clients send it with every ack.
+pub(super) fn last_viewed_day() -> i64 {
+    last_viewed_day_at(chrono::Utc::now().timestamp())
+}
+
+pub(super) fn last_viewed_day_at(unix_secs: i64) -> i64 {
+    const DISCORD_EPOCH_SECS: i64 = 1_420_070_400;
+    (unix_secs - DISCORD_EPOCH_SECS + 86_399) / 86_400
 }
 
 /// The newest message each channel was last acked up to, this run.
@@ -1061,3 +1277,64 @@ mod ack_tests {
         assert!(!ack_due(channel, "300"), "an older ack from elsewhere does not undo what was told");
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_says_where_the_message_it_answers_is() {
+        let mut payload = json!({ "content": "hi" });
+        put_reply(&mut payload, Some("42"), true);
+        put_reply_place(&mut payload, "7", Some("9"));
+        assert_eq!(payload["message_reference"], json!({ "message_id": "42", "channel_id": "7", "guild_id": "9" }));
+        let mut dm = json!({ "content": "hi" });
+        put_reply(&mut dm, Some("42"), true);
+        put_reply_place(&mut dm, "7", None);
+        assert_eq!(dm["message_reference"], json!({ "message_id": "42", "channel_id": "7" }));
+        // Not a reply: nothing is added.
+        let mut plain = json!({ "content": "hi" });
+        put_reply_place(&mut plain, "7", Some("9"));
+        assert!(plain.get("message_reference").is_none());
+    }
+
+    #[test]
+    fn a_read_mark_counts_days_from_discords_epoch_rounded_up() {
+        assert_eq!(last_viewed_day_at(1_420_070_400), 0);
+        assert_eq!(last_viewed_day_at(1_420_070_401), 1);
+        // 2026-10-22 00:00 UTC is 4,191 days after 2015-01-01.
+        assert_eq!(last_viewed_day_at(1_420_070_400 + 4_191 * 86_400), 4_191);
+    }
+
+    #[test]
+    fn where_to_put_the_files_is_read_from_the_answer() {
+        let body = json!({ "attachments": [
+            { "id": 1, "upload_url": "https://storage.example/b?sig=2", "upload_filename": "u/b.png" },
+            { "id": "0", "upload_url": "https://storage.example/a?sig=1", "upload_filename": "u/a.png" }
+        ] });
+        let slots = parse_slots(&body, 2).unwrap();
+        assert_eq!(slots[0], ("https://storage.example/a?sig=1".to_string(), "u/a.png".to_string()));
+        assert_eq!(slots[1].1, "u/b.png");
+        // Anything that is not a slot for every file is not an answer to use.
+        assert!(parse_slots(&body, 3).is_none(), "one missing");
+        assert!(parse_slots(&json!({ "attachments": [{ "id": 0, "upload_url": "http://insecure/x", "upload_filename": "n" }] }), 1).is_none(), "plain http");
+        assert!(parse_slots(&json!({ "message": "no" }), 1).is_none());
+        assert!(parse_slots(&json!({ "attachments": [{ "id": 5, "upload_url": "https://x/y", "upload_filename": "n" }] }), 1).is_none(), "an id out of range");
+    }
+
+    #[test]
+    fn the_message_names_each_file_and_a_voice_message_says_how_long_it_is() {
+        let uploads = vec![
+            Upload { path: "/a".into(), name: "a.png".into(), len: 3, voice: None },
+            Upload { path: "/v".into(), name: "voice-message.ogg".into(), len: 9, voice: Some((2.5, "AAAA".into())) },
+        ];
+        let slots = vec![("https://s/1".to_string(), "u/a.png".to_string()), ("https://s/2".to_string(), "u/v.ogg".to_string())];
+        let named = attachments_named(&uploads, &slots);
+        assert_eq!(named[0], json!({ "id": "0", "filename": "a.png", "uploaded_filename": "u/a.png" }));
+        assert_eq!(named[1]["id"], "1");
+        assert_eq!(named[1]["uploaded_filename"], "u/v.ogg");
+        assert_eq!(named[1]["duration_secs"], json!(2.5));
+        assert_eq!(named[1]["waveform"], "AAAA");
+    }
+}
+

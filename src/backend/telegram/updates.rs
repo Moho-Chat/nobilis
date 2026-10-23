@@ -42,6 +42,16 @@ fn read_up_to(state: &AppState, account_id: &str, remote: &str, max_id: i32) {
     }
 }
 
+/// A topic was read on another of the account's apps: up to the message it names.
+fn topic_read(state: &AppState, account_id: &str, group: &str, topic: i32, max_id: i32) {
+    let Some(buffer) = buffer_of(state, account_id, &super::topics::remote_of(group, topic)) else { return };
+    let newest = state.store.newest_message_id(&buffer.id).ok().flatten().and_then(|id| id.parse::<i32>().ok()).unwrap_or(0);
+    if super::topics::read_all(max_id, newest, super::topics::top_of(&buffer.id)) {
+        state.runtime.set_buffer_unread(state, &buffer.id, 0, 0);
+        state.events.emit("bufferRead", serde_json::json!({ "accountId": account_id, "bufferId": buffer.id }));
+    }
+}
+
 /// The pins of a conversation changed: read them again, which says so to every window.
 fn pins_changed(state: &AppState, account_id: &str, _handle: &Handle, remote: &str) {
     let Some(buffer) = buffer_of(state, account_id, remote) else { return };
@@ -81,6 +91,9 @@ pub fn raw(state: &AppState, account_id: &str, handle: &Handle, update: &tl::enu
         U::PinnedMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::from(u.peer.clone()))),
         U::PinnedChannelMessages(u) => pins_changed(state, account_id, handle, &peers::remote_id(PeerId::channel_unchecked(u.channel_id))),
         U::ReadHistoryInbox(u) => read_up_to(state, account_id, &peers::remote_id(PeerId::from(u.peer.clone())), u.max_id),
+        // The account's folders were made, changed, deleted or put in another order, on this client or another.
+        U::DialogFilter(_) | U::DialogFilters | U::DialogFilterOrder(_) => super::folders::changed(state, account_id, handle),
+        U::ReadChannelDiscussionInbox(u) => topic_read(state, account_id, &peers::remote_id(PeerId::channel_unchecked(u.channel_id)), u.top_msg_id, u.read_max_id),
         U::ReadChannelInbox(u) => read_up_to(state, account_id, &peers::remote_id(PeerId::channel_unchecked(u.channel_id)), u.max_id),
         _ => {}
     }
