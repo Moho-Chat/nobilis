@@ -231,7 +231,8 @@ pub async fn react(state: &AppState, buffer: &Buffer, message_id: &str, emoji: &
     } else {
         handle.api.delete(&path).await.map_err(words)?;
     }
-    state.runtime.update_reaction(state, &buffer.id, message_id, emoji, true, add);
+    // Not counted here: Stoat says it to everybody in the channel, this account included, and the event is what counts it. Counting
+    // it in both places showed every reaction of this account twice.
     Ok(())
 }
 
