@@ -36,6 +36,7 @@ pub mod moderation;
 pub mod people;
 pub mod profile;
 pub mod send;
+pub mod voice;
 pub mod world;
 
 #[cfg(test)]

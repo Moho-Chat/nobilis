@@ -49,6 +49,9 @@ pub const TIMED_OUT: &str = "You are timed out in this server.";
 #[derive(Debug, Clone, Default)]
 pub struct Instance {
     pub ws: String,
+    /// The media server to join calls on: the first the instance lists (the official one lists one; a self-hosted one,
+    /// "worldwide").
+    pub voice_node: Option<String>,
     /// The instance's own web app, where an invite link lives.
     pub app: Option<String>,
     /// The file server (Autumn).
@@ -74,6 +77,7 @@ impl Instance {
         let number = |v: &Value, d: usize| v.as_u64().map(|n| n as usize).unwrap_or(d);
         Self {
             ws: root["ws"].as_str().unwrap_or("").to_string(),
+            voice_node: root["features"]["livekit"]["nodes"][0]["name"].as_str().map(str::to_string),
             app: root["app"].as_str().filter(|a| !a.is_empty()).map(|a| a.trim_end_matches('/').to_string()),
             autumn: url(&root["features"]["autumn"]),
             january: url(&root["features"]["january"]),
@@ -209,8 +213,31 @@ pub fn parse_emoji(v: &Value) -> Option<(String, EmojiInfo)> {
     ))
 }
 
+/// Somebody in a voice channel, and what they are sending.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VoiceMember {
+    pub user: String,
+    pub camera: bool,
+    pub screen: bool,
+    /// Whether they are sending sound: not muted.
+    pub publishing: bool,
+}
+
+pub fn parse_voice_member(v: &Value) -> Option<VoiceMember> {
+    Some(VoiceMember {
+        user: v["id"].as_str()?.to_string(),
+        camera: v["camera"].as_bool().unwrap_or(false),
+        screen: v["screensharing"].as_bool().unwrap_or(false),
+        publishing: v["is_publishing"].as_bool().unwrap_or(true),
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct World {
+    /// Who is in each voice channel, by channel id.
+    pub voice: HashMap<String, Vec<VoiceMember>>,
+    /// Until when (Unix seconds) a channel's slowmode keeps this account from sending, as Stoat last said.
+    pub slow_until: HashMap<String, i64>,
     pub own_id: String,
     pub users: HashMap<String, User>,
     pub servers: HashMap<String, Server>,
@@ -358,6 +385,15 @@ impl World {
             if let Some((server, user, member)) = parse_member(m) {
                 if user == self.own_id {
                     self.members.insert(server, member);
+                }
+            }
+        }
+        self.voice.clear();
+        for state in ready["voice_states"].as_array().into_iter().flatten() {
+            if let Some(channel) = state["id"].as_str() {
+                let members: Vec<VoiceMember> = state["participants"].as_array().into_iter().flatten().filter_map(parse_voice_member).collect();
+                if !members.is_empty() {
+                    self.voice.insert(channel.to_string(), members);
                 }
             }
         }
@@ -612,6 +648,7 @@ mod tests {
         let root = json!({
             "ws": "wss://events.example", "features": {
                 "autumn": { "enabled": true, "url": "https://cdn.example/" },
+                "livekit": { "enabled": true, "nodes": [{ "name": "hel1", "public_url": "wss://livekit.example" }] },
                 "january": { "enabled": false, "url": "https://proxy.example" },
                 "limits": { "global": { "new_user_hours": 72 }, "default": { "message_length": 2000, "message_attachments": 5 }, "new_user": { "message_length": 1500, "message_attachments": 3, "file_upload_size_limits": { "attachments": 5000000 } } }
             }
@@ -619,6 +656,7 @@ mod tests {
         let i = Instance::from_root(&root);
         assert_eq!(i.ws, "wss://events.example");
         assert_eq!(i.autumn.as_deref(), Some("https://cdn.example"));
+        assert_eq!(i.voice_node.as_deref(), Some("hel1"));
         assert_eq!(i.january, None, "a disabled service has no address");
         assert_eq!((i.message_length, i.new_message_length, i.new_user_hours), (2000, 1500, 72));
         assert_eq!((i.message_attachments, i.new_message_attachments, i.attachment_bytes, i.new_attachment_bytes), (5, 3, 20_000_000, 5_000_000));

@@ -38,6 +38,27 @@ pub fn check(body: &str, limit: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a send while a slowmode Stoat told of is still running.
+fn slowed(handle: &Handle, channel: &str) -> Result<(), String> {
+    let until = handle.world.lock().unwrap_or_else(|e| e.into_inner()).slow_until.get(channel).copied().unwrap_or(0);
+    let left = until - chrono::Utc::now().timestamp();
+    if left > 0 {
+        return Err(format!("This channel has slowmode on: wait {left} more seconds before sending again"));
+    }
+    Ok(())
+}
+
+/// What a refused send says, and, if it was a slowmode, when the next one may be made.
+fn noted_slowmode(handle: &Handle, channel: &str, e: super::api::ApiError) -> String {
+    if let super::api::ApiError::Refused { kind, detail, .. } = &e {
+        if kind == "InSlowmode" {
+            let wait = detail["retry_after"].as_i64().unwrap_or(1).max(1);
+            handle.world.lock().unwrap_or_else(|e| e.into_inner()).slow_until.insert(channel.to_string(), chrono::Utc::now().timestamp() + wait);
+        }
+    }
+    words(e)
+}
+
 fn words(e: super::api::ApiError) -> String {
     e.to_string()
 }
@@ -141,12 +162,13 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         }
     }
     check(body, message_limit(&handle, chrono::Utc::now().timestamp_millis()))?;
+    slowed(&handle, &channel)?;
     let body = &handle.world.lock().unwrap_or_else(|e| e.into_inner()).pipe_outgoing(body);
     let mut payload = json!({ "content": body, "nonce": format!("moho-{}", crate::model::next_message_id()) });
     if let Some(reply) = reply_to.filter(|r| !r.is_empty()) {
         payload["replies"] = json!([{ "id": reply, "mention": false }]);
     }
-    let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(words)?;
+    let sent = handle.api.post(&format!("/channels/{channel}/messages"), &payload).await.map_err(|e| noted_slowmode(&handle, &channel, e))?;
     // At once rather than when the event comes back: the echo finds it kept already.
     messages::record(state, &handle, &sent);
     Ok(())
@@ -231,6 +253,17 @@ mod tests {
         assert_eq!(sent_name("/home/me/SPOILER_cat.png", true), "SPOILER_cat.png", "not twice");
         assert_eq!(content_type_of("a.JPG"), "image/jpeg");
         assert_eq!(content_type_of("a.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_slowmode_stoat_told_of_is_kept_to_and_not_asked_about_again() {
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        assert!(slowed(&h, "C").is_ok());
+        let said = noted_slowmode(&h, "C", super::super::api::ApiError::Refused { status: 429, kind: "InSlowmode".into(), detail: json!({ "type": "InSlowmode", "retry_after": 20 }) });
+        assert!(said.contains("slowmode") && said.contains("20"), "{said}");
+        let wait = slowed(&h, "C").unwrap_err();
+        assert!(wait.contains("slowmode on: wait"), "{wait}");
+        assert!(slowed(&h, "other").is_ok(), "only that channel");
     }
 
     #[test]

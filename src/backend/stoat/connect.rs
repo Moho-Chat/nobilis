@@ -98,7 +98,7 @@ async fn run_with_retry(state: &AppState, account_id: &str) {
 /// line needs.
 fn socket_address(instance: &Instance) -> Result<String> {
     let mut url = url::Url::parse(instance.ws.trim_end_matches('/')).context("the instance's events address")?;
-    url.set_query(Some("version=1&format=json&ready=users&ready=servers&ready=channels&ready=members&ready=emojis&ready=channel_unreads"));
+    url.set_query(Some("version=1&format=json&ready=users&ready=servers&ready=channels&ready=members&ready=emojis&ready=voice_states&ready=channel_unreads"));
     Ok(url.to_string())
 }
 
@@ -223,7 +223,7 @@ mod tests {
         // A self-hosted one serves its events at /ws, and /ws/ is somewhere else.
         let hosted = path_and_query("ws://localhost:8880/ws");
         assert!(hosted.starts_with("/ws?version=1&format=json"), "{hosted}");
-        for want in ["ready=users", "ready=servers", "ready=channels", "ready=members", "ready=emojis", "ready=channel_unreads"] {
+        for want in ["ready=users", "ready=servers", "ready=channels", "ready=members", "ready=emojis", "ready=voice_states", "ready=channel_unreads"] {
             assert!(official.contains(want), "{official} lacks {want}");
         }
         assert!(!official.contains("token"), "the token goes in a message");

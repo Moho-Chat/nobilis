@@ -4757,6 +4757,32 @@ pub async fn dispatch(
             }
         }
 
+        // A Stoat call: the token and address of the media server to join (what is done with them is the window's, as for
+        // a Matrix call on a media server), and who is in each channel's call.
+        "joinStoatCall" | "listStoatVoice" => {
+            if method == "listStoatVoice" {
+                let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.stoat_handle(a)) else {
+                    return (None, Some("listStoatVoice requires a connected Stoat \"accountId\"".to_string()));
+                };
+                let channels: Vec<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).voice.keys().cloned().collect();
+                let out: serde_json::Map<String, serde_json::Value> = channels
+                    .into_iter()
+                    .filter_map(|c| backend::stoat::messages::buffer_of(state, &handle.account_id, &c).map(|b| (b.id, serde_json::Value::Array(backend::stoat::events::voice_members(&handle, &c)))))
+                    .collect();
+                return (Some(serde_json::Value::Object(out)), None);
+            }
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some("joinStoatCall requires a Stoat \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            match backend::stoat::voice::join(&handle, &buffer).await {
+                Ok(joined) => (Some(joined), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // Stoat's friends: who has asked, answering, asking, and blocking.
         "stoatFriendRequests" | "answerStoatFriendRequest" | "addStoatFriend" | "stoatBlock" => {
             let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {

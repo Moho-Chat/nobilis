@@ -61,6 +61,7 @@ pub fn words(status: u16, kind: &str, detail: &Value) -> String {
         "PayloadTooLarge" => "That is too large for Stoat".to_string(),
         "TooManyAttachments" | "TooManyEmbeds" | "TooManyReplies" => "That has more than Stoat allows in one message".to_string(),
         "Blocked" | "BlockedByOther" => "Stoat will not allow that between you and this person".to_string(),
+        "InSlowmode" => format!("This channel has slowmode on: wait {} more seconds before sending again", detail["retry_after"].as_u64().unwrap_or(1)),
         "TooManyRequests" | "RateLimited" => "Stoat says too many requests were made. Wait a moment".to_string(),
         "FailedValidation" => format!("Stoat refused that: {}", detail["error"].as_str().unwrap_or("it is not valid")),
         other if !other.is_empty() => format!("Stoat refused that ({other})"),
@@ -187,6 +188,11 @@ impl Api {
             let status = response.status();
             let text = response.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
             let json: Value = if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::Null) };
+            // A channel's slowmode is told in the same status, in seconds, and is not a rate limit to wait out and try again:
+            // it is the answer, and the account is not to ask again until it is over.
+            if status.as_u16() == 429 && json["type"].as_str() == Some("InSlowmode") {
+                return Err(ApiError::Refused { status: 429, kind: "InSlowmode".into(), detail: json });
+            }
             if status.as_u16() == 429 {
                 let wait = Duration::from_millis(json["retry_after"].as_u64().unwrap_or(1000)).min(LONGEST_WAIT);
                 tracing::info!("stoat: told to wait {} ms on {key}", wait.as_millis());

@@ -119,6 +119,85 @@ fn register_server_channels(state: &AppState, handle: &Handle, server: &world::S
     }
 }
 
+/// Keeps who is in each voice channel as an event says, and tells the window of the channels it touched.
+fn voice_changed(state: &AppState, handle: &Handle, event: &Value) {
+    let mut touched: Vec<String> = Vec::new();
+    {
+        let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        match event["type"].as_str().unwrap_or("") {
+            "VoiceChannelJoin" => {
+                if let (Some(channel), Some(member)) = (event["id"].as_str(), world::parse_voice_member(&event["state"])) {
+                    let list = world.voice.entry(channel.to_string()).or_default();
+                    list.retain(|m| m.user != member.user);
+                    list.push(member);
+                    touched.push(channel.to_string());
+                }
+            }
+            "VoiceChannelLeave" => {
+                if let (Some(channel), Some(user)) = (event["id"].as_str(), event["user"].as_str()) {
+                    if let Some(list) = world.voice.get_mut(channel) {
+                        list.retain(|m| m.user != user);
+                    }
+                    touched.push(channel.to_string());
+                }
+            }
+            "VoiceChannelMove" => {
+                if let (Some(from), Some(to), Some(member)) = (event["from"].as_str(), event["to"].as_str(), world::parse_voice_member(&event["state"])) {
+                    if let Some(list) = world.voice.get_mut(from) {
+                        list.retain(|m| m.user != member.user);
+                    }
+                    let list = world.voice.entry(to.to_string()).or_default();
+                    list.retain(|m| m.user != member.user);
+                    list.push(member);
+                    touched.extend([from.to_string(), to.to_string()]);
+                }
+            }
+            _ => {
+                if let (Some(channel), Some(user)) = (event["channel_id"].as_str(), event["id"].as_str()) {
+                    if let Some(member) = world.voice.get_mut(channel).and_then(|l| l.iter_mut().find(|m| m.user == user)) {
+                        let data = &event["data"];
+                        if let Some(v) = data["camera"].as_bool() {
+                            member.camera = v;
+                        }
+                        if let Some(v) = data["screensharing"].as_bool() {
+                            member.screen = v;
+                        }
+                        if let Some(v) = data["is_publishing"].as_bool() {
+                            member.publishing = v;
+                        }
+                        touched.push(channel.to_string());
+                    }
+                }
+            }
+        }
+        world.voice.retain(|_, l| !l.is_empty());
+    }
+    for channel in touched {
+        tell_voice(state, handle, &channel);
+    }
+}
+
+/// Says who is in a channel's call, in the words the window draws.
+pub fn tell_voice(state: &AppState, handle: &Handle, channel: &str) {
+    let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
+    state.events.emit("stoatVoice", json!({ "accountId": handle.account_id, "bufferId": buffer.id, "members": voice_members(handle, channel) }));
+}
+
+/// The people in a channel's call.
+pub fn voice_members(handle: &Handle, channel: &str) -> Vec<Value> {
+    let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+    world
+        .voice
+        .get(channel)
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            let avatar = world.users.get(&m.user).and_then(|u| u.avatar.clone()).and_then(|f| media::file_url(&handle.instance, "avatars", &f)).map(|u| media::cached(&handle.account_id, media::AVATARS, &u, None, None));
+            json!({ "userId": m.user, "name": world.name_of(&m.user), "avatarUrl": avatar, "camera": m.camera, "screen": m.screen, "muted": !m.publishing })
+        })
+        .collect()
+}
+
 /// The custom emoji the account can use, as the picker's sections: one for each server that has some, and one for the
 /// rest. Said again whenever an emoji is made or deleted.
 pub fn register_emoji(state: &AppState, handle: &Handle) {
@@ -191,6 +270,10 @@ pub fn register_all(state: &AppState, handle: &Handle, ready: &Value) {
         register_channel(state, handle, channel, 0, None);
     }
     register_emoji(state, handle);
+    let in_calls: Vec<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).voice.keys().cloned().collect();
+    for channel in in_calls {
+        tell_voice(state, handle, &channel);
+    }
     // Gone since the last time: a server left, a channel closed.
     let present: HashSet<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.keys().cloned().collect();
     for buffer in state.runtime.list_buffers() {
@@ -569,6 +652,8 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
             }
             super::people::tell_requests(state, handle);
         }
+        // Who is in a voice channel: told as they come, go, move, and mute or turn a camera on.
+        "VoiceChannelJoin" | "VoiceChannelLeave" | "VoiceChannelMove" | "UserVoiceStateUpdate" => voice_changed(state, handle, event),
         "EmojiCreate" => {
             if let Some((id, info)) = world::parse_emoji(event) {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).emojis.insert(id, info);
@@ -631,5 +716,25 @@ mod tests {
             let _ = done.send(());
         });
         assert!(heard.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "an event took the world's lock twice");
+    }
+
+    #[test]
+    fn who_is_in_a_call_follows_the_events_and_leaves_with_the_last_one() {
+        let state = crate::backend::kick::testkit::simulated_daemon("stoat-voice");
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        h.world.lock().unwrap().absorb_ready("ME", &json!({ "voice_states": [{ "id": "C", "participants": [{ "id": "U1", "is_publishing": true, "camera": false, "screensharing": false }] }] }));
+        assert_eq!(h.world.lock().unwrap().voice["C"].len(), 1, "who was already in it when the account connected");
+        handle(&state, &h, &json!({ "type": "VoiceChannelJoin", "id": "C", "state": { "id": "U2", "is_publishing": true } }));
+        handle(&state, &h, &json!({ "type": "UserVoiceStateUpdate", "id": "U2", "channel_id": "C", "data": { "camera": true, "is_publishing": false } }));
+        {
+            let w = h.world.lock().unwrap();
+            let two = w.voice["C"].iter().find(|m| m.user == "U2").unwrap();
+            assert!(two.camera && !two.publishing, "a camera on and a microphone off");
+        }
+        handle(&state, &h, &json!({ "type": "VoiceChannelMove", "user": "U2", "from": "C", "to": "D", "state": { "id": "U2" } }));
+        assert!(h.world.lock().unwrap().voice["D"].iter().any(|m| m.user == "U2") && h.world.lock().unwrap().voice["C"].iter().all(|m| m.user != "U2"));
+        handle(&state, &h, &json!({ "type": "VoiceChannelLeave", "id": "C", "user": "U1" }));
+        assert!(!h.world.lock().unwrap().voice.contains_key("C"), "an empty call is not kept");
+        assert_eq!(voice_members(&h, "D").len(), 1);
     }
 }
