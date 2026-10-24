@@ -15,8 +15,13 @@
 //! - `events` - what the websocket says as it happens
 //! - `messages` - a message as moho's, and a channel's history
 //! - `send` - saying things: send, edit, delete, typing, read
+//! - `limits` - the instance's stated limits, kept to before a request is made
+//! - `manage` - looking after a server: channels, roles, permissions, webhooks, the audit log
 //! - `members` - who is in a conversation, and who is online
 //! - `profile` - the card for a person
+//! - `own` - the account's own profile and presence
+//! - `settings` - what the account has muted, kept on the account
+//! - `search` - searching a channel, its pins, and reading around a message
 //! - `media` - avatars, icons, pictures and files, fetched from the file server when looked at
 //!
 //! # What moho tells Stoat about itself
@@ -28,13 +33,18 @@
 pub mod api;
 pub mod connect;
 pub mod events;
+pub mod limits;
 pub mod login;
+pub mod manage;
 pub mod media;
 pub mod members;
 pub mod messages;
 pub mod moderation;
+pub mod own;
 pub mod people;
 pub mod profile;
+pub mod search;
+pub mod settings;
 pub mod send;
 pub mod voice;
 pub mod world;
@@ -61,4 +71,22 @@ pub struct Handle {
 /// The name Stoat shows for this app's sessions.
 pub fn session_name() -> String {
     format!("moho ({})", std::env::consts::OS)
+}
+
+impl Handle {
+    /// Whether the account is still held to the tighter limits of a new one: its id says when it was made.
+    pub fn is_new(&self, now_ms: i64) -> bool {
+        let own = self.world.lock().unwrap_or_else(|e| e.into_inner()).own_id.clone();
+        let made = messages::ulid_ms(&own).unwrap_or(0);
+        made > 0 && now_ms - made < (self.instance.new_user_hours as i64) * 3_600_000
+    }
+
+    /// What this account may do now, by its standing.
+    pub fn limits(&self) -> &world::UserLimits {
+        if self.is_new(chrono::Utc::now().timestamp_millis()) {
+            &self.instance.fresh
+        } else {
+            &self.instance.standing
+        }
+    }
 }

@@ -18,7 +18,7 @@ pub const AVATARS: &str = "stoat-avatars";
 /// `emojis` or `backgrounds`.
 pub fn file_url(instance: &Instance, tag: &str, id: &str) -> Option<String> {
     let base = instance.autumn.as_deref()?;
-    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("{base}/{tag}/{id}"))
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).then(|| format!("{base}/{tag}/{id}"))
 }
 
 /// A stable short name for an address (FNV-1a), so the same file is the same cache entry on every run.
@@ -98,7 +98,9 @@ mod tests {
     #[test]
     fn a_file_is_on_the_file_server_by_its_tag_and_id() {
         assert_eq!(file_url(&instance(), "avatars", "01ABC"), Some("https://cdn.example/avatars/01ABC".to_string()));
-        assert_eq!(file_url(&instance(), "avatars", "../x"), None, "an id is letters and digits only");
+        assert_eq!(file_url(&instance(), "avatars", "../x"), None, "an id is letters, digits, and the dash and underscore the file server uses");
+        assert_eq!(file_url(&instance(), "attachments", "6YhKheJ5c9Ir9J8LXS8KbaGL3JnY2ox3a9vCWpPMo-").as_deref(), Some("https://cdn.example/attachments/6YhKheJ5c9Ir9J8LXS8KbaGL3JnY2ox3a9vCWpPMo-"), "ids from the file server may end in a dash");
+        assert_eq!(file_url(&instance(), "attachments", "a_b/../c"), None);
         assert_eq!(file_url(&Instance::default(), "avatars", "01ABC"), None, "an instance with no file server has none");
     }
 

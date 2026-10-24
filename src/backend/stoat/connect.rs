@@ -150,6 +150,9 @@ async fn run(state: &AppState, config: &StoatAccountConfig, account_id: &str) ->
                         state.runtime.set_stoat_handle(account_id, handle.clone());
                         state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
                         tracing::info!("stoat[{account_id}]: connected as {own_id}");
+                        // What the account has muted lives in its settings, which are asked for once it is up.
+                        let (state, handle) = (state.clone(), handle.clone());
+                        tokio::spawn(async move { super::settings::load(&state, &handle).await });
                     }
                     Some("Error") => {
                         let error = event["error"].as_str().unwrap_or("");

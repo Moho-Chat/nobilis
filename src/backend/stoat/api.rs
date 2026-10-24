@@ -101,6 +101,11 @@ impl Api {
         Self { http, base: instance.trim_end_matches('/').to_string(), token, buckets: Mutex::new(HashMap::new()), halted: AtomicBool::new(false) }
     }
 
+    /// The instance's address, as requests are made to it.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
+
     /// Whether the session was refused.
     pub fn halted(&self) -> bool {
         self.halted.load(Ordering::Relaxed)

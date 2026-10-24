@@ -53,6 +53,14 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
             state.ignores.set(account_id, target, ignored);
             Ok("account")
         }
+        // Stoat has a real block too, told as well as recorded for the same reason: a blocked person's messages in a
+        // server still arrive, and this client has to stop showing them.
+        "stoat" => {
+            let handle = state.runtime.stoat_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Stoat account is not connected"))?;
+            backend::stoat::people::block(state, &handle, target, ignored).await?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         _ => {
             state.ignores.set(account_id, target, ignored);
             Ok("window")
@@ -1267,6 +1275,20 @@ pub async fn dispatch(
 
         // The same for a Discord channel or direct message: set on the
         // account, so it is quiet on a phone as well.
+        // The same for a Stoat conversation, set in the account's synced settings.
+        "setStoatChannelMuted" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some("setStoatChannelMuted requires a Stoat \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            match backend::stoat::settings::set_muted(state, &handle, &buffer, p_bool(params, "muted", true)).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "setDiscordChannelMuted" => {
             let Some(buffer_id) = p_str_opt(params, "bufferId") else {
                 return (None, Some("setDiscordChannelMuted requires \"bufferId\"".to_string()));
@@ -1859,6 +1881,8 @@ pub async fn dispatch(
             } else if state.accounts.get_steam(account_id).is_some() {
                 // A choice, as against stepping away: Steam keeps the two apart.
                 backend::steam::apply_status(state, account_id, status, true)
+            } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
+                backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
                 // IRC has only away and back.
                 let result = match status {
@@ -1908,6 +1932,11 @@ pub async fn dispatch(
                     backend::discord::apply_session_presence(state, id, &shown)
                 } else if state.accounts.get_steam(id).is_some() {
                     backend::steam::apply_status(state, id, &shown, false)
+                } else if let Some(handle) = state.runtime.stoat_handle(id).filter(|_| id.starts_with("stoat:")) {
+                    let handle = handle.clone();
+                    let shown = shown.clone();
+                    tokio::spawn(async move { backend::stoat::own::apply_status(&handle, &shown, None).await });
+                    true
                 } else if let Some(sender) = state.runtime.irc_sender(id) {
                     let away = if shown == "idle" { Some("Idle".to_string()) } else { None };
                     sender.send(irc::proto::Command::AWAY(away)).is_ok()
@@ -2102,6 +2131,28 @@ pub async fn dispatch(
             }
             match backend::matrix::set_own_avatar(state, account_id, path).await {
                 Ok(url) => (Some(serde_json::json!({ "avatarUrl": url })), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The account's own profile on Stoat, and changing it. What is not given is left as it is.
+        "stoatOwnProfile" | "setStoatProfile" | "setStoatProfileAvatar" => {
+            let Some(handle) = p_str_opt(params, "accountId").filter(|a| a.starts_with("stoat:")).and_then(|a| state.runtime.stoat_handle(a)) else {
+                return (None, Some(format!("{method} requires a connected Stoat \"accountId\"")));
+            };
+            let done = match method {
+                "stoatOwnProfile" => return match backend::stoat::own::get(&handle).await {
+                    Ok(profile) => (Some(profile), None),
+                    Err(e) => (None, Some(format!("{e:#}"))),
+                },
+                "setStoatProfile" => backend::stoat::own::set(&handle, p_str_opt(params, "displayName"), p_str_opt(params, "pronouns"), p_str_opt(params, "bio"), p_str_opt(params, "statusText")).await.map(|_| serde_json::json!({ "ok": true })),
+                _ => match p_str_opt(params, "path").filter(|p| !p.is_empty()) {
+                    Some(path) => backend::stoat::own::set_avatar(&handle, path).await.map(|url| serde_json::json!({ "avatarUrl": url })),
+                    None => backend::stoat::own::clear_avatar(&handle).await.map(|_| serde_json::json!({ "avatarUrl": null })),
+                },
+            };
+            match done {
+                Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
@@ -2475,6 +2526,8 @@ pub async fn dispatch(
                 backend::matrix::load_context(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::history::context(state, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
+                backend::stoat::search::context(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be asked for one message"))
             };
@@ -2517,6 +2570,8 @@ pub async fn dispatch(
                 backend::matrix::load_newer(state, &buffer.account_id, buffer_id, message_id).await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::history::newer(state, &buffer, message_id).await
+            } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
+                backend::stoat::search::newer(state, &handle, &buffer, message_id).await
             } else {
                 Err(anyhow::anyhow!("this service cannot be read forward"))
             };
@@ -2544,6 +2599,8 @@ pub async fn dispatch(
                 backend::matrix::list_pinned(state, &buffer.account_id, buffer_id).await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::pins::list(state, &buffer).await.map_err(|e| anyhow::anyhow!(e))
+            } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
+                backend::stoat::search::pins(&handle, &buffer).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
@@ -2595,11 +2652,34 @@ pub async fn dispatch(
                 backend::matrix::set_pinned(state, &buffer.account_id, buffer_id, message_id, pinned).await
             } else if buffer.account_id.starts_with("telegram:") {
                 backend::telegram::pins::set(state, &buffer, message_id, pinned).await.map_err(|e| anyhow::anyhow!(e))
+            } else if let Some(handle) = state.runtime.stoat_handle(&buffer.account_id).filter(|_| buffer.account_id.starts_with("stoat:")) {
+                backend::stoat::search::set_pinned(&handle, &buffer, message_id, pinned).await
             } else {
                 Err(anyhow::anyhow!("this service has no pinned messages"))
             };
             match done {
                 Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The same question asked of Stoat's own index, for what this client never read: one channel at a time.
+        "searchStoatMessages" => {
+            let (buffer_id, query) = match (p_str_opt(params, "bufferId"), p_str_opt(params, "query")) {
+                (Some(b), Some(q)) => (b, q),
+                _ => return (None, Some("searchStoatMessages requires \"bufferId\" and \"query\"".to_string())),
+            };
+            if query.trim().is_empty() {
+                return (Some(serde_json::json!({ "results": [], "roomNames": {}, "count": 0 })), None);
+            }
+            let Some(buffer) = state.runtime.get_buffer(buffer_id).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some("that conversation is not on Stoat".to_string()));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            match backend::stoat::search::run(&handle, &buffer, query.trim(), p_i64(params, "limit", 25) as usize).await {
+                Ok(answer) => (Some(answer), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
@@ -2736,6 +2816,7 @@ pub async fn dispatch(
                         "ringing": true
                     })
                 })
+                .chain(state.runtime.all_stoat_handles().into_iter().flat_map(|h| backend::stoat::events::ringing(state, &h)))
                 .collect();
             (Some(Value::Array(calls)), None)
         }
@@ -4730,6 +4811,20 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": login_id })), None)
         }
 
+        // Looking after the Stoat server a conversation is in (backend/stoat/manage.rs): one call, with the action to run.
+        "stoatManage" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some("stoatManage requires a Stoat \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            match backend::stoat::manage::run(&handle, &buffer, p_str(params, "action", ""), params).await {
+                Ok(answer) => (Some(answer), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         // What a Stoat account may do to a server's members, and doing it; and an invite to the server.
         "getStoatPowers" | "moderateStoatMember" | "setStoatMemberRole" | "createStoatInvite" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
@@ -4759,6 +4854,19 @@ pub async fn dispatch(
 
         // A Stoat call: the token and address of the media server to join (what is done with them is the window's, as for
         // a Matrix call on a media server), and who is in each channel's call.
+        "declineStoatCall" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
+                return (None, Some("declineStoatCall requires a Stoat \"bufferId\"".to_string()));
+            };
+            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
+                return (None, Some("that Stoat account is not connected".to_string()));
+            };
+            match backend::stoat::voice::decline(state, &handle, &buffer).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
         "joinStoatCall" | "listStoatVoice" => {
             if method == "listStoatVoice" {
                 let Some(handle) = p_str_opt(params, "accountId").and_then(|a| state.runtime.stoat_handle(a)) else {

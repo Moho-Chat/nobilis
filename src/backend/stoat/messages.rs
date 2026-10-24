@@ -189,7 +189,26 @@ fn embed_of(account_id: &str, instance: &Instance, embed: &Value) -> Option<Embe
 }
 
 /// The reactions on a message as moho's: `{ emoji: [user ids] }`.
-pub fn reactions_of(world: &World, reactions: &Value) -> Vec<Reaction> {
+/// How a reaction is held and shown: a custom emoji by its picture (the form a message draws one in) where there is a
+/// file server, else by its name between colons; anything else as it is.
+pub fn reaction_key(world: &World, files: Option<(&Instance, &str)>, emoji: &str) -> String {
+    if !(emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric())) {
+        return emoji.to_string();
+    }
+    let Some(info) = world.emojis.get(emoji) else { return ":emoji:".to_string() };
+    match files.and_then(|(instance, account)| media::file_url(instance, "emojis", emoji).map(|url| (account, url))) {
+        Some((account, url)) => format!("[stoat:emoji:{}:{}]", token_name(&info.name), media::cached(account, media::MEDIA, &url, None, Some(if info.animated { "image/gif" } else { "image/png" }))),
+        None => format!(":{}:", info.name),
+    }
+}
+
+/// The name in a reaction as it is held: `party` from `:party:` or from the picture's form.
+pub fn reaction_name(held: &str) -> String {
+    let inner = held.strip_prefix("[stoat:emoji:").and_then(|s| s.split(':').next()).unwrap_or(held);
+    inner.trim_matches(':').to_string()
+}
+
+pub fn reactions_of(world: &World, files: Option<(&Instance, &str)>, reactions: &Value) -> Vec<Reaction> {
     let mut out: Vec<Reaction> = reactions
         .as_object()
         .map(|o| {
@@ -197,13 +216,32 @@ pub fn reactions_of(world: &World, reactions: &Value) -> Vec<Reaction> {
                 .filter_map(|(emoji, who)| {
                     let who = who.as_array()?;
                     // A custom emoji is named by its id, which means nothing to a reader.
-                    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|e| format!(":{}:", e.name)).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.clone() };
+                    let shown = reaction_key(world, files, emoji);
                     Some(Reaction { emoji: shown, count: who.len() as i64, me: who.iter().any(|u| u.as_str() == Some(world.own_id.as_str())), animated: false })
                 })
                 .collect()
         })
         .unwrap_or_default();
     out.sort_by(|a, b| b.count.cmp(&a.count).then(a.emoji.cmp(&b.emoji)));
+    out
+}
+
+/// The marks beside a sender's name: that it is a bot, a webhook, or somebody speaking under another name and picture
+/// (a bridge, a bot relaying) - which would otherwise pass for the person it says it is.
+pub fn badges_of(world: &World, message: &Value) -> Vec<crate::backend::kick::api::Badge> {
+    use crate::backend::kick::api::Badge;
+    let author = message["author"].as_str().unwrap_or("");
+    if message["webhook"].is_object() {
+        return vec![Badge { kind: "webhook".into(), text: "Webhook".into(), ..Default::default() }];
+    }
+    let mut out = Vec::new();
+    if message["masquerade"]["name"].as_str().is_some_and(|n| !n.is_empty()) {
+        // The first three letters of the words are what is drawn beside the name.
+        out.push(Badge { kind: "via".into(), text: format!("Via {}: it is sent under another name", world.name_of(author)), ..Default::default() });
+    }
+    if world.users.get(author).is_some_and(|u| u.bot) {
+        out.push(Badge { kind: "app".into(), text: "Bot".into(), ..Default::default() });
+    }
     out
 }
 
@@ -261,7 +299,8 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
         || server.as_ref().and_then(|s| world.members.get(s)).zip(message["role_mentions"].as_array()).is_some_and(|(m, roles)| roles.iter().any(|r| r.as_str().is_some_and(|r| m.roles.iter().any(|mine| mine == r))));
     let attachments: Vec<Attachment> = message["attachments"].as_array().into_iter().flatten().filter_map(|f| attachment_of(account_id, &handle.instance, f)).collect();
     let embeds: Vec<Embed> = message["embeds"].as_array().into_iter().flatten().filter_map(|e| embed_of(account_id, &handle.instance, e)).collect();
-    let reactions = reactions_of(&world, &message["reactions"]);
+    let reactions = reactions_of(&world, Some((&handle.instance, account_id)), &message["reactions"]);
+    let badges = badges_of(&world, message);
     let reply_id = message["replies"].as_array().and_then(|r| r.first()).and_then(|r| r.as_str()).map(str::to_string);
     drop(world);
 
@@ -278,7 +317,8 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
         }
     });
     let needs_fill = reply.as_ref().is_some_and(|r| r.body.is_empty());
-    let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.to_string()), highlight, avatar, embeds, attachments, Some(author.to_string()), Some(ts), None, None);
+    let style = (!badges.is_empty()).then_some(crate::model::SenderStyle { color: None, badges });
+    let recorded = state.runtime.record_message_at(state, account_id, &buffer.name, &buffer.kind, &from, &body, false, "chat", reply, Some(id.to_string()), highlight, avatar, embeds, attachments, Some(author.to_string()), Some(ts), None, style);
     if recorded && !reactions.is_empty() && state.store.set_reactions(&buffer.id, id, &reactions).unwrap_or(false) {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": reactions }));
     }
@@ -412,9 +452,27 @@ mod tests {
     #[test]
     fn reactions_are_counted_and_the_accounts_own_is_marked() {
         let w = world();
-        let got = reactions_of(&w, &json!({ "🔥": ["01PAL00000000000000000000A"], "👍": [ME, "01PAL00000000000000000000A"], "01EMOJ000000000000000000AA": [ME] }));
+        let got = reactions_of(&w, None, &json!({ "🔥": ["01PAL00000000000000000000A"], "👍": [ME, "01PAL00000000000000000000A"], "01EMOJ000000000000000000AA": [ME] }));
         assert_eq!(got.iter().map(|r| (r.emoji.as_str(), r.count, r.me)).collect::<Vec<_>>(), vec![("👍", 2, true), (":party:", 1, true), ("🔥", 1, false)]);
-        assert!(reactions_of(&w, &Value::Null).is_empty());
+        assert!(reactions_of(&w, None, &Value::Null).is_empty());
+        let with_files = Instance { autumn: Some("https://cdn.example".into()), ..Default::default() };
+        let drawn = reactions_of(&w, Some((&with_files, "stoat:me")), &json!({ "01EMOJ000000000000000000AA": [ME] }));
+        assert!(drawn[0].emoji.starts_with("[stoat:emoji:party:file://") && drawn[0].emoji.ends_with(".png]"), "{}", drawn[0].emoji);
+        assert_eq!(reaction_name(&drawn[0].emoji), "party");
+        assert_eq!(reaction_name(":party:"), "party");
+        assert_eq!(reaction_name("👍"), "👍");
+    }
+
+    #[test]
+    fn a_sender_who_is_a_bot_a_webhook_or_a_bridge_is_marked() {
+        let mut w = world();
+        w.users.insert("01BOT00000000000000000000A".into(), super::super::world::User { name: "Relay".into(), bot: true, ..Default::default() });
+        let kinds = |m: Value| badges_of(&w, &m).into_iter().map(|b| b.kind).collect::<Vec<_>>();
+        assert_eq!(kinds(json!({ "author": ME })), Vec::<String>::new());
+        assert_eq!(kinds(json!({ "author": "01BOT00000000000000000000A" })), vec!["app"]);
+        assert_eq!(kinds(json!({ "author": "01BOT00000000000000000000A", "masquerade": { "name": "Ada" } })), vec!["via", "app"]);
+        assert_eq!(kinds(json!({ "author": ME, "webhook": { "name": "CI" } })), vec!["webhook"]);
+        assert!(badges_of(&w, &json!({ "author": "01BOT00000000000000000000A", "masquerade": { "name": "Ada" } }))[0].text.starts_with("Via Relay"));
     }
 
     #[test]

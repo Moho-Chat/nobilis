@@ -4448,6 +4448,11 @@ impl Runtime {
         self.stoat_handles.lock().unwrap().get(account_id).cloned()
     }
 
+    /// Every connected Stoat account.
+    pub fn all_stoat_handles(&self) -> Vec<crate::backend::stoat::Handle> {
+        self.stoat_handles.lock().unwrap().values().cloned().collect()
+    }
+
     pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
         self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
     }

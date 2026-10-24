@@ -71,6 +71,9 @@ pub async fn build(state: &AppState, account_id: &str, buffer_id: &str, who: &st
                 profile::note(&mut card, "Account", "A bot");
             }
         }
+        if let Some(pronouns) = super::own::text(&user["pronouns"]) {
+            profile::note(&mut card, "Pronouns", pronouns);
+        }
         let badges = badge_names(user["badges"].as_u64().unwrap_or(0));
         if !badges.is_empty() {
             profile::note(&mut card, "Badges", badges.join(", "));

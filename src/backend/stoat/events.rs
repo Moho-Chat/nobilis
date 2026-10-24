@@ -119,24 +119,42 @@ fn register_server_channels(state: &AppState, handle: &Handle, server: &world::S
     }
 }
 
-/// Keeps who is in each voice channel as an event says, and tells the window of the channels it touched.
+/// Keeps who is in each voice channel as an event says, and tells the window of the channels it touched. A call that
+/// begins in a direct message or a group, with somebody else in it and this account not, is ringing; it stops when this
+/// account joins (from anywhere) or when the last person leaves.
 fn voice_changed(state: &AppState, handle: &Handle, event: &Value) {
     let mut touched: Vec<String> = Vec::new();
+    let mut rings: Vec<(String, bool)> = Vec::new();
     {
         let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
+        let own = world.own_id.clone();
+        let personal = |world: &World, channel: &str| world.channels.get(channel).is_some_and(|c| matches!(c.kind, Kind::Direct | Kind::Group));
         match event["type"].as_str().unwrap_or("") {
             "VoiceChannelJoin" => {
                 if let (Some(channel), Some(member)) = (event["id"].as_str(), world::parse_voice_member(&event["state"])) {
+                    let calling = personal(&world, channel);
                     let list = world.voice.entry(channel.to_string()).or_default();
+                    let first = list.is_empty();
+                    let joiner = member.user.clone();
                     list.retain(|m| m.user != member.user);
                     list.push(member);
                     touched.push(channel.to_string());
+                    if calling {
+                        if joiner == own {
+                            rings.push((channel.to_string(), false));
+                        } else if first {
+                            rings.push((channel.to_string(), true));
+                        }
+                    }
                 }
             }
             "VoiceChannelLeave" => {
                 if let (Some(channel), Some(user)) = (event["id"].as_str(), event["user"].as_str()) {
                     if let Some(list) = world.voice.get_mut(channel) {
                         list.retain(|m| m.user != user);
+                        if list.is_empty() || user == own {
+                            rings.push((channel.to_string(), false));
+                        }
                     }
                     touched.push(channel.to_string());
                 }
@@ -171,10 +189,33 @@ fn voice_changed(state: &AppState, handle: &Handle, event: &Value) {
             }
         }
         world.voice.retain(|_, l| !l.is_empty());
+        for (channel, ringing) in &rings {
+            if *ringing {
+                world.ringing.insert(channel.clone());
+            } else {
+                world.ringing.remove(channel);
+            }
+        }
     }
     for channel in touched {
         tell_voice(state, handle, &channel);
     }
+    for (channel, ringing) in rings {
+        tell_ring(state, handle, &channel, ringing);
+    }
+}
+
+/// Says a conversation started or stopped ringing.
+fn tell_ring(state: &AppState, handle: &Handle, channel: &str, ringing: bool) {
+    if let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) {
+        state.events.emit("incomingCall", json!({ "accountId": handle.account_id, "bufferId": buffer.id, "channelId": channel, "ringing": ringing }));
+    }
+}
+
+/// The conversations ringing now, for a window that opens in the middle of it.
+pub fn ringing(state: &AppState, handle: &Handle) -> Vec<Value> {
+    let channels: Vec<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).ringing.iter().cloned().collect();
+    channels.into_iter().filter_map(|c| messages::buffer_of(state, &handle.account_id, &c).map(|b| json!({ "accountId": handle.account_id, "bufferId": b.id, "channelId": c, "ringing": true }))).collect()
 }
 
 /// Says who is in a channel's call, in the words the window draws.
@@ -319,6 +360,9 @@ fn edited(state: &AppState, handle: &Handle, event: &Value) {
     let (Some(id), Some(channel)) = (event["id"].as_str(), event["channel"].as_str()) else { return };
     let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
     let data = &event["data"];
+    if data.get("pinned").is_some() {
+        super::search::announce(state, handle, &buffer);
+    }
     if let Some(content) = data["content"].as_str() {
         let body = {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
@@ -334,7 +378,7 @@ fn reaction(state: &AppState, handle: &Handle, event: &Value, add: bool) {
     let Some(buffer) = messages::buffer_of(state, &handle.account_id, channel) else { return };
     let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
     let me = user == world.own_id;
-    let shown = if emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric()) { world.emojis.get(emoji).map(|e| format!(":{}:", e.name)).unwrap_or_else(|| ":emoji:".to_string()) } else { emoji.to_string() };
+    let shown = messages::reaction_key(&world, Some((&handle.instance, &handle.account_id)), emoji);
     drop(world);
     state.runtime.update_reaction(state, &buffer.id, id, &shown, me, add);
 }
@@ -654,6 +698,53 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
         }
         // Who is in a voice channel: told as they come, go, move, and mute or turn a camera on.
         "VoiceChannelJoin" | "VoiceChannelLeave" | "VoiceChannelMove" | "UserVoiceStateUpdate" => voice_changed(state, handle, event),
+        "ChannelGroupJoin" | "ChannelGroupLeave" => {
+            let (Some(id), Some(user)) = (event["id"].as_str(), event["user"].as_str()) else { return };
+            let own = handle.world.lock().unwrap_or_else(|e| e.into_inner()).own_id.clone();
+            if kind == "ChannelGroupLeave" && user == own {
+                // This account was taken out of the group, or left it elsewhere.
+                handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.remove(id);
+                if let Some(buffer) = messages::buffer_of(state, account_id, id) {
+                    state.runtime.remove_buffer(state, &buffer.id);
+                }
+                return;
+            }
+            if let Some(channel) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).channels.get_mut(id) {
+                channel.recipients.retain(|r| r != user);
+                if kind == "ChannelGroupJoin" {
+                    channel.recipients.push(user.to_string());
+                }
+            }
+            if let Some(buffer) = messages::buffer_of(state, account_id, id) {
+                if state.runtime.get_presence(&buffer.id).is_some() {
+                    let (state, handle) = (state.clone(), handle.clone());
+                    tokio::spawn(async move {
+                        let _ = super::members::refresh(&state, &handle, &buffer).await;
+                    });
+                }
+            }
+        }
+        "ServerRoleRanksUpdate" => {
+            if let (Some(server), Some(ranks)) = (event["id"].as_str(), event["ranks"].as_array()) {
+                if let Some(server) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get_mut(server) {
+                    for (place, id) in ranks.iter().filter_map(Value::as_str).enumerate() {
+                        if let Some(role) = server.roles.get_mut(id) {
+                            role.rank = place as i64;
+                        }
+                    }
+                }
+            }
+        }
+        "UserSettingsUpdate" => super::settings::changed(state, handle, &event["update"]),
+        "ChannelStopTyping" => {}
+        "UserPresence" => {
+            if let (Some(id), Some(online)) = (event["id"].as_str(), event["online"].as_bool()) {
+                if let Some(user) = handle.world.lock().unwrap_or_else(|e| e.into_inner()).users.get_mut(id) {
+                    user.online = online;
+                }
+                super::members::update_status(state, handle, id);
+            }
+        }
         "EmojiCreate" => {
             if let Some((id, info)) = world::parse_emoji(event) {
                 handle.world.lock().unwrap_or_else(|e| e.into_inner()).emojis.insert(id, info);
@@ -716,6 +807,29 @@ mod tests {
             let _ = done.send(());
         });
         assert!(heard.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "an event took the world's lock twice");
+    }
+
+    #[test]
+    fn a_call_begun_in_a_direct_message_rings_until_this_account_joins_or_it_ends() {
+        let state = crate::backend::kick::testkit::simulated_daemon("stoat-ring");
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        {
+            let mut w = h.world.lock().unwrap();
+            w.own_id = "ME".into();
+            w.channels.insert("DM".into(), world::parse_channel(&json!({ "_id": "DM", "channel_type": "DirectMessage", "recipients": ["ME", "PAL"] })).unwrap());
+            w.channels.insert("VC".into(), world::parse_channel(&json!({ "_id": "VC", "channel_type": "TextChannel", "server": "S", "name": "v", "voice": {} })).unwrap());
+        }
+        handle(&state, &h, &json!({ "type": "VoiceChannelJoin", "id": "VC", "state": { "id": "PAL" } }));
+        assert!(h.world.lock().unwrap().ringing.is_empty(), "a server's voice channel never rings");
+        handle(&state, &h, &json!({ "type": "VoiceChannelJoin", "id": "DM", "state": { "id": "PAL" } }));
+        assert!(h.world.lock().unwrap().ringing.contains("DM"));
+        handle(&state, &h, &json!({ "type": "VoiceChannelJoin", "id": "DM", "state": { "id": "ME" } }));
+        assert!(h.world.lock().unwrap().ringing.is_empty(), "answered, from here or another app");
+        handle(&state, &h, &json!({ "type": "VoiceChannelLeave", "id": "DM", "user": "ME" }));
+        handle(&state, &h, &json!({ "type": "VoiceChannelLeave", "id": "DM", "user": "PAL" }));
+        handle(&state, &h, &json!({ "type": "VoiceChannelJoin", "id": "DM", "state": { "id": "PAL" } }));
+        handle(&state, &h, &json!({ "type": "VoiceChannelLeave", "id": "DM", "user": "PAL" }));
+        assert!(h.world.lock().unwrap().ringing.is_empty(), "the caller gave up");
     }
 
     #[test]

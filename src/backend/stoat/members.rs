@@ -57,6 +57,7 @@ pub fn entry(world: &World, handle: &Handle, user_id: &str, member: Option<&Valu
         "status": status,
         "activity": user.status_text.as_ref().map(|t| json!({ "kind": "custom", "text": t })).unwrap_or(Value::Null),
         "bot": user.bot,
+        "relationship": user.relationship,
         "avatarUrl": avatar,
         "roles": roles,
     })

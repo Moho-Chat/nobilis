@@ -45,6 +45,44 @@ pub const BLOCKED_DM: &str = "You cannot message this person: one of you has blo
 pub const NOT_FRIENDS: &str = "Stoat only lets you message people who are your friends, or bots. Add them as a friend first.";
 pub const TIMED_OUT: &str = "You are timed out in this server.";
 
+/// What an account of one standing may do, as the instance states it.
+#[derive(Debug, Clone, Default)]
+pub struct UserLimits {
+    pub message_length: usize,
+    pub message_attachments: usize,
+    pub outgoing_friend_requests: usize,
+    pub servers: usize,
+    /// The audio rate calls are held to, in hertz.
+    pub voice_quality: u64,
+    pub video: bool,
+    /// The most each kind of file may weigh, in bytes.
+    pub attachment_bytes: u64,
+    pub avatar_bytes: u64,
+    pub icon_bytes: u64,
+    pub banner_bytes: u64,
+    pub emoji_bytes: u64,
+}
+
+impl UserLimits {
+    fn from_json(v: &Value) -> Self {
+        let n = |x: &Value, d: usize| x.as_u64().map(|n| n as usize).unwrap_or(d);
+        let bytes = |key: &str, d: u64| v["file_upload_size_limits"][key].as_u64().unwrap_or(d);
+        Self {
+            message_length: n(&v["message_length"], 2000),
+            message_attachments: n(&v["message_attachments"], 5),
+            outgoing_friend_requests: n(&v["outgoing_friend_requests"], 10),
+            servers: n(&v["servers"], 100),
+            voice_quality: v["voice_quality"].as_u64().unwrap_or(16_000),
+            video: v["video"].as_bool().unwrap_or(true),
+            attachment_bytes: bytes("attachments", 20_000_000),
+            avatar_bytes: bytes("avatars", 4_000_000),
+            icon_bytes: bytes("icons", 2_500_000),
+            banner_bytes: bytes("banners", 6_000_000),
+            emoji_bytes: bytes("emojis", 500_000),
+        }
+    }
+}
+
 /// What the instance said of itself at its root.
 #[derive(Debug, Clone, Default)]
 pub struct Instance {
@@ -68,6 +106,14 @@ pub struct Instance {
     pub new_message_attachments: usize,
     pub new_attachment_bytes: u64,
     pub new_user_hours: u64,
+    /// The same, whole, for an account of ordinary standing and for a new one.
+    pub standing: UserLimits,
+    pub fresh: UserLimits,
+    /// What holds for everybody: how many roles and channels a server may have, how many different reactions a
+    /// message.
+    pub server_roles: usize,
+    pub server_channels: usize,
+    pub message_reactions: usize,
 }
 
 impl Instance {
@@ -75,19 +121,25 @@ impl Instance {
         let url = |v: &Value| v["enabled"].as_bool().unwrap_or(false).then(|| v["url"].as_str().map(|u| u.trim_end_matches('/').to_string())).flatten();
         let limits = &root["features"]["limits"];
         let number = |v: &Value, d: usize| v.as_u64().map(|n| n as usize).unwrap_or(d);
+        let (standing, fresh) = (UserLimits::from_json(&limits["default"]), UserLimits::from_json(&limits["new_user"]));
         Self {
             ws: root["ws"].as_str().unwrap_or("").to_string(),
             voice_node: root["features"]["livekit"]["nodes"][0]["name"].as_str().map(str::to_string),
             app: root["app"].as_str().filter(|a| !a.is_empty()).map(|a| a.trim_end_matches('/').to_string()),
             autumn: url(&root["features"]["autumn"]),
             january: url(&root["features"]["january"]),
-            message_length: number(&limits["default"]["message_length"], 2000),
-            message_attachments: number(&limits["default"]["message_attachments"], 5),
-            attachment_bytes: limits["default"]["file_upload_size_limits"]["attachments"].as_u64().unwrap_or(20_000_000),
-            new_message_attachments: number(&limits["new_user"]["message_attachments"], 5),
-            new_attachment_bytes: limits["new_user"]["file_upload_size_limits"]["attachments"].as_u64().unwrap_or(20_000_000),
-            new_message_length: number(&limits["new_user"]["message_length"], 2000),
+            message_length: standing.message_length,
+            message_attachments: standing.message_attachments,
+            attachment_bytes: standing.attachment_bytes,
+            new_message_attachments: fresh.message_attachments,
+            new_attachment_bytes: fresh.attachment_bytes,
+            new_message_length: fresh.message_length,
             new_user_hours: limits["global"]["new_user_hours"].as_u64().unwrap_or(72),
+            server_roles: number(&limits["global"]["server_roles"], 200),
+            server_channels: number(&limits["global"]["server_channels"], 200),
+            message_reactions: number(&limits["global"]["message_reactions"], 20),
+            standing,
+            fresh,
         }
     }
 }
@@ -238,6 +290,10 @@ pub struct World {
     pub voice: HashMap<String, Vec<VoiceMember>>,
     /// Until when (Unix seconds) a channel's slowmode keeps this account from sending, as Stoat last said.
     pub slow_until: HashMap<String, i64>,
+    /// The direct messages and groups a call has begun in without this account: ringing, until it joins or the call ends.
+    pub ringing: std::collections::HashSet<String>,
+    /// The account's notification settings, as Stoat keeps them (see `settings`).
+    pub notifications: Value,
     pub own_id: String,
     pub users: HashMap<String, User>,
     pub servers: HashMap<String, Server>,
@@ -484,6 +540,22 @@ impl World {
                 permissions
             }
         }
+    }
+
+    /// What the account may do in a server as a whole: its default, then the account's roles, the most powerful last.
+    pub fn server_permissions(&self, server: &Server) -> u64 {
+        if server.owner == self.own_id {
+            return GRANT_ALL_SAFE;
+        }
+        let Some(member) = self.members.get(&server.id) else { return 0 };
+        let mut permissions = server.default_permissions;
+        let mut mine: Vec<&Role> = server.roles.iter().filter(|(id, _)| member.roles.contains(id)).map(|(_, r)| r).collect();
+        mine.sort_by_key(|r| std::cmp::Reverse(r.rank));
+        for role in mine {
+            permissions |= role.allow;
+            permissions &= !role.deny;
+        }
+        permissions
     }
 
     /// How powerful the account's best role in a server is, as Stoat ranks them (a lower number is more powerful), or

@@ -217,9 +217,13 @@ pub async fn react(state: &AppState, buffer: &Buffer, message_id: &str, emoji: &
     // A custom emoji is named by its id on the wire, and by its name in what the window shows.
     let wire = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
-        let name = emoji.trim_matches(':');
+        let name = messages::reaction_name(emoji);
         world.emojis.iter().find(|(_, e)| e.name == name).map(|(id, _)| id.clone()).unwrap_or_else(|| emoji.to_string())
     };
+    if add {
+        let already: Vec<String> = state.store.get_message(&buffer.id, message_id).ok().flatten().map(|m| m.reactions.iter().map(|r| r.emoji.clone()).collect()).unwrap_or_default();
+        super::limits::may_react(&handle.instance, &already, emoji)?;
+    }
     let path = format!("/channels/{channel}/messages/{message_id}/reactions/{}", urlencode(&wire));
     if add {
         handle.api.put(&path, None).await.map_err(words)?;

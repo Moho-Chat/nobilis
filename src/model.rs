@@ -1102,7 +1102,7 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:"),
         _ => false,
     }
 }

@@ -52,6 +52,8 @@ pub async fn open_dm(state: &AppState, handle: &Handle, user: &str) -> Result<St
 /// Joins a server by its invite and makes its conversations.
 pub async fn join_invite(state: &AppState, handle: &Handle, typed: &str) -> Result<()> {
     let code = invite_code(typed).ok_or_else(|| anyhow!("\"{}\" is not a Stoat invite link or code", typed.trim()))?;
+    let held = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.len();
+    super::limits::may_join(handle.limits(), held).map_err(|e| anyhow!(e))?;
     let joined = handle.api.post(&format!("/invites/{code}"), &json!({})).await.map_err(|e| anyhow!("{e}"))?;
     match joined["type"].as_str() {
         Some("Server") => {
@@ -118,6 +120,7 @@ pub async fn add_friend(handle: &Handle, username: &str) -> Result<()> {
     if !name.contains('#') || name.len() < 3 {
         bail!("Type their name with the number after it, like name#1234");
     }
+    super::limits::may_ask(handle.limits(), &handle.world.lock().unwrap_or_else(|e| e.into_inner())).map_err(|e| anyhow!(e))?;
     handle.api.post("/users/friend", &json!({ "username": name })).await.map_err(|e| anyhow!("{e}"))?;
     Ok(())
 }
