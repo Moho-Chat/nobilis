@@ -15,6 +15,7 @@ use crate::model::Buffer;
 use crate::state::AppState;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 /// A status as the window's words have it, from Stoat's presence: not online at all is offline, whatever the
 /// presence word says.
@@ -69,6 +70,44 @@ pub fn subscribe(handle: &Handle, server: &str) {
     let _ = handle.socket.send(json!({ "type": "Subscribe", "server_id": server }).to_string());
 }
 
+/// The most people drawn in one list. A server can have a hundred thousand; nobody scrolls that, and drawing it (every name,
+/// every picture) is what stopped the window.
+pub const LISTED: usize = 1000;
+/// A server with this many people online or more is too big to ask for its offline ones as well.
+const SMALL: usize = 300;
+/// The most that is read of a server's whole list of people before it is given up on.
+const WHOLE_BYTES: usize = 6_000_000;
+/// How long the list of a large server is kept before it is made again.
+const KEEP_LARGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The people of a server: those online, and - where that is few enough for the whole to be small - everybody. The
+/// answer says whether it is everybody.
+async fn server_people(handle: &Handle, server_id: &str) -> Result<(Value, bool)> {
+    let online = handle.api.get(&format!("/servers/{server_id}/members"), &[("exclude_offline", "true".to_string())]).await.map_err(|e| anyhow!("{e}"))?;
+    if online["members"].as_array().map_or(0, Vec::len) >= SMALL {
+        return Ok((online, false));
+    }
+    match handle.api.get_capped(&format!("/servers/{server_id}/members"), &[("exclude_offline", "false".to_string())], WHOLE_BYTES).await {
+        Ok(everybody) => Ok((everybody, true)),
+        // Too many to read, or not to be had: those online are who is shown.
+        Err(_) => Ok((online, false)),
+    }
+}
+
+/// The members to draw out of an answer, the most senior first and no more than `LISTED`: by the rank of the best role each
+/// holds, then by name.
+pub fn most_senior(world: &World, server: Option<&Server>, members: &[Value]) -> Vec<Value> {
+    let rank = |m: &Value| -> i64 {
+        server
+            .map(|s| m["roles"].as_array().into_iter().flatten().filter_map(|r| r.as_str()).filter_map(|r| s.roles.get(r)).map(|r| r.rank).min().unwrap_or(i64::MAX))
+            .unwrap_or(i64::MAX)
+    };
+    let name = |m: &Value| m["_id"]["user"].as_str().map(|id| world.name_of(id).to_lowercase()).unwrap_or_default();
+    let mut keyed: Vec<(i64, String, &Value)> = members.iter().map(|m| (rank(m), name(m), m)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    keyed.into_iter().take(LISTED).map(|(_, _, m)| m.clone()).collect()
+}
+
 /// Lists the people of a conversation and tells the window.
 pub async fn refresh(state: &AppState, handle: &Handle, buffer: &Buffer) -> Result<usize> {
     let channel_id = buffer.remote_id.as_deref().ok_or_else(|| anyhow!("this is not a Stoat conversation"))?;
@@ -76,20 +115,32 @@ pub async fn refresh(state: &AppState, handle: &Handle, buffer: &Buffer) -> Resu
     let list: Vec<Value> = match (&channel.kind, &channel.server) {
         (Kind::Text | Kind::Voice, Some(server_id)) => {
             subscribe(handle, server_id);
-            let answer = handle.api.get(&format!("/servers/{server_id}/members"), &[("exclude_offline", "false".to_string())]).await.map_err(|e| anyhow!("{e}"))?;
+            // A large server's list was made a moment ago: it is the same list, and making it again is thousands of people read.
+            let kept = handle.world.lock().unwrap_or_else(|e| e.into_inner()).large.get(server_id).filter(|(at, _, _)| at.elapsed() < KEEP_LARGE).map(|(_, list, total)| (list.clone(), *total));
+            if let Some((list, total)) = kept {
+                return Ok(publish(state, buffer, list, total));
+            }
+            let (answer, everybody) = server_people(handle, server_id).await?;
             let mut world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
-            for u in answer["users"].as_array().into_iter().flatten() {
-                if let Some((id, user)) = super::world::parse_user(u) {
+            let members: Vec<Value> = answer["members"].as_array().cloned().unwrap_or_default();
+            let found = members.len();
+            let users: HashMap<&str, &Value> = answer["users"].as_array().into_iter().flatten().filter_map(|u| u["_id"].as_str().map(|id| (id, u))).collect();
+            // Only the people to be drawn are taken into the world: the rest are names nobody will see.
+            for m in &members {
+                if let Some((id, user)) = m["_id"]["user"].as_str().and_then(|id| users.get(id)).and_then(|u| super::world::parse_user(u)) {
                     world.users.insert(id, user);
                 }
             }
             let server = world.servers.get(server_id).cloned();
-            answer["members"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|m| m["_id"]["user"].as_str().map(|id| entry(&world, handle, id, Some(m), server.as_ref())))
-                .collect()
+            let shown = most_senior(&world, server.as_ref(), &members);
+            let list: Vec<Value> = shown.iter().filter_map(|m| m["_id"]["user"].as_str().map(|id| entry(&world, handle, id, Some(m), server.as_ref()))).collect();
+            if everybody && found <= LISTED {
+                world.large.remove(server_id);
+            } else {
+                world.large.insert(server_id.to_string(), (std::time::Instant::now(), list.clone(), found));
+            }
+            drop(world);
+            return Ok(publish(state, buffer, list, found));
         }
         (Kind::Direct | Kind::Group, _) => {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
@@ -98,11 +149,17 @@ pub async fn refresh(state: &AppState, handle: &Handle, buffer: &Buffer) -> Resu
         _ => Vec::new(),
     };
     let total = list.len();
+    Ok(publish(state, buffer, list, total))
+}
+
+/// Gives the window a conversation's list of people, and how many people it is of (which is more than are listed where
+/// the server is large).
+fn publish(state: &AppState, buffer: &Buffer, list: Vec<Value>, total: usize) -> usize {
     let list = Value::Array(list);
     state.runtime.set_presence(&buffer.id, list.clone());
     state.runtime.set_presence_total(&buffer.id, total);
     state.events.emit("presenceChange", json!({ "bufferId": buffer.id, "members": list, "total": total }));
-    Ok(total)
+    total
 }
 
 /// Somebody's status changed: wherever they are listed, so they are now.
@@ -144,6 +201,27 @@ mod tests {
 
     fn user(online: bool, presence: &str) -> User {
         User { online, presence: presence.to_string(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_huge_server_is_listed_by_rank_then_name_and_no_further_than_the_limit() {
+        let mut w = World::default();
+        w.absorb_ready("ME", &json!({ "servers": [{ "_id": "S", "owner": "O", "name": "S", "roles": { "R1": { "name": "Mods", "rank": 1 }, "R9": { "name": "Fans", "rank": 9 } } }] }));
+        let mut members: Vec<Value> = (0..(LISTED + 50)).map(|i| json!({ "_id": { "server": "S", "user": format!("U{i:05}") }, "roles": [] })).collect();
+        for m in &members {
+            let id = m["_id"]["user"].as_str().unwrap().to_string();
+            w.users.insert(id.clone(), User { name: format!("name{id}"), ..Default::default() });
+        }
+        members.push(json!({ "_id": { "server": "S", "user": "BOSS" }, "roles": ["R1"] }));
+        members.push(json!({ "_id": { "server": "S", "user": "FAN" }, "roles": ["R9"] }));
+        w.users.insert("BOSS".into(), User { name: "zed".into(), ..Default::default() });
+        w.users.insert("FAN".into(), User { name: "amy".into(), ..Default::default() });
+        let server = w.servers.get("S").cloned();
+        let shown = most_senior(&w, server.as_ref(), &members);
+        assert_eq!(shown.len(), LISTED);
+        assert_eq!(shown[0]["_id"]["user"], "BOSS", "a moderator before anybody, whatever their name");
+        assert_eq!(shown[1]["_id"]["user"], "FAN", "then a role, then those with none by name");
+        assert_eq!(shown[2]["_id"]["user"], "U00000");
     }
 
     #[test]

@@ -654,6 +654,10 @@ pub fn handle(state: &AppState, handle: &Handle, event: &Value) {
         "ServerMemberJoin" | "ServerMemberLeave" => {
             // Whoever's list is open for the server is read again.
             let Some(server) = event["id"].as_str() else { return };
+            // A large server has people coming and going all the time; its list is made again after a while, not at each.
+            if handle.world.lock().unwrap_or_else(|e| e.into_inner()).large.contains_key(server) {
+                return;
+            }
             let channels: Vec<String> = handle.world.lock().unwrap_or_else(|e| e.into_inner()).servers.get(server).map(|s| s.channels.clone()).unwrap_or_default();
             for channel in channels {
                 if let Some(buffer) = messages::buffer_of(state, account_id, &channel) {

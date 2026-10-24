@@ -174,7 +174,17 @@ impl Api {
         }
     }
 
+    /// A read that gives up on an answer larger than `most` bytes, which is said as `TooLarge` rather than held in memory:
+    /// a server's whole list of members may be a hundred thousand long.
+    pub async fn get_capped(&self, path: &str, query: &[(&str, String)], most: usize) -> Result<Value, ApiError> {
+        self.request_capped(Method::GET, path, query, None, Some(most)).await
+    }
+
     pub async fn request(&self, method: Method, path: &str, query: &[(&str, String)], body: Option<&Value>) -> Result<Value, ApiError> {
+        self.request_capped(method, path, query, body, None).await
+    }
+
+    async fn request_capped(&self, method: Method, path: &str, query: &[(&str, String)], body: Option<&Value>, most: Option<usize>) -> Result<Value, ApiError> {
         let key = route_key(&method, path);
         for attempt in 0..=RETRIES {
             if self.halted() {
@@ -188,10 +198,23 @@ impl Api {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
+            let mut response = request.send().await.map_err(|e| ApiError::Network(e.to_string()))?;
             self.learn(&key, response.headers());
             let status = response.status();
-            let text = response.text().await.map_err(|e| ApiError::Network(e.to_string()))?;
+            let text = match most {
+                None => response.text().await.map_err(|e| ApiError::Network(e.to_string()))?,
+                Some(most) => {
+                    // Read as it comes, and stopped the moment it is more than was wanted.
+                    let mut held: Vec<u8> = Vec::new();
+                    while let Some(chunk) = response.chunk().await.map_err(|e| ApiError::Network(e.to_string()))? {
+                        held.extend_from_slice(&chunk);
+                        if held.len() > most {
+                            return Err(ApiError::Refused { status: status.as_u16(), kind: "TooLarge".into(), detail: Value::Null });
+                        }
+                    }
+                    String::from_utf8_lossy(&held).into_owned()
+                }
+            };
             let json: Value = if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap_or(Value::Null) };
             // A channel's slowmode is told in the same status, in seconds, and is not a rate limit to wait out and try again:
             // it is the answer, and the account is not to ask again until it is over.
@@ -242,6 +265,40 @@ mod tests {
         assert_eq!(route_key(&Method::GET, "/users/@me"), "GET /users/@me");
         assert_eq!(route_key(&Method::GET, "/"), "GET /");
         assert_eq!(route_key(&Method::DELETE, &format!("/channels/{id}/messages/{id}")), "DELETE /channels/:id/messages/:id");
+    }
+
+    /// A made-up server that answers every request with this body.
+    async fn serving(body: String) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut seen = [0u8; 2048];
+                    let _ = socket.read(&mut seen).await;
+                    let head = format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn an_answer_larger_than_was_wanted_is_given_up_on_and_a_smaller_one_is_read() {
+        let big = format!("{{\"members\":[{}]}}", vec!["\"0123456789abcdef\""; 5000].join(","));
+        let api = Api::new("stoat:test-capped", &serving(big).await, Some("t".into()));
+        match api.get_capped("/servers/X/members", &[], 10_000).await {
+            Err(ApiError::Refused { kind, .. }) => assert_eq!(kind, "TooLarge"),
+            other => panic!("expected the answer to be given up on, got {other:?}"),
+        }
+        let small = Api::new("stoat:test-capped-small", &serving("{\"members\":[1,2,3]}".to_string()).await, Some("t".into()));
+        assert_eq!(small.get_capped("/servers/X/members", &[], 10_000).await.unwrap()["members"].as_array().unwrap().len(), 3);
     }
 
     #[test]

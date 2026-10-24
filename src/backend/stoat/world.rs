@@ -290,6 +290,9 @@ pub struct World {
     pub voice: HashMap<String, Vec<VoiceMember>>,
     /// Until when (Unix seconds) a channel's slowmode keeps this account from sending, as Stoat last said.
     pub slow_until: HashMap<String, i64>,
+    /// A server too large to list whole: when its list of people was last made, the list, and how many people it is of.
+    /// Asked again only after a while, and not at every joining and leaving.
+    pub large: HashMap<String, (std::time::Instant, Vec<Value>, usize)>,
     /// The direct messages and groups a call has begun in without this account: ringing, until it joins or the call ends.
     pub ringing: std::collections::HashSet<String>,
     /// The account's notification settings, as Stoat keeps them (see `settings`).
