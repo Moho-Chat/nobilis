@@ -166,7 +166,7 @@ fn attachment_of(account_id: &str, instance: &Instance, file: &Value) -> Option<
     })
 }
 
-fn embed_of(account_id: &str, instance: &Instance, embed: &Value) -> Option<Embed> {
+pub fn embed_of(account_id: &str, instance: &Instance, embed: &Value) -> Option<Embed> {
     let picture = |v: &Value| v["url"].as_str().and_then(|u| proxied(instance, u)).map(|u| media::cached(account_id, media::MEDIA, &u, None, None));
     match embed["type"].as_str()? {
         "Website" => Some(Embed {
@@ -192,6 +192,22 @@ fn embed_of(account_id: &str, instance: &Instance, embed: &Value) -> Option<Embe
         }),
         _ => None,
     }
+}
+
+/// A message's cards after Stoat has said something of them: what was appended is added to what is held (a link is not
+/// drawn twice), and a whole new list replaces what Stoat made - but not the cards moho made itself, which Stoat knows
+/// nothing of (a link to a server, drawn as a card to join it).
+pub fn merged_embeds(held: Vec<Embed>, appended: Vec<Embed>, replaced: Option<Vec<Embed>>) -> Vec<Embed> {
+    let mut out: Vec<Embed> = match replaced {
+        Some(list) => held.into_iter().filter(|e| e.kind.as_deref() == Some("invite")).chain(list).collect(),
+        None => held,
+    };
+    for e in appended {
+        if !out.iter().any(|x| x.url.is_some() && x.url == e.url && x.kind == e.kind) {
+            out.push(e);
+        }
+    }
+    out
 }
 
 /// The reactions on a message as moho's: `{ emoji: [user ids] }`.
@@ -498,6 +514,26 @@ mod tests {
         assert_eq!(kinds(json!({ "author": "01BOT00000000000000000000A", "masquerade": { "name": "Ada" } })), vec!["via", "app"]);
         assert_eq!(kinds(json!({ "author": ME, "webhook": { "name": "CI" } })), vec!["webhook"]);
         assert!(badges_of(&w, &json!({ "author": "01BOT00000000000000000000A", "masquerade": { "name": "Ada" } }))[0].text.starts_with("Via Relay"));
+    }
+
+    #[test]
+    fn the_cards_stoat_draws_later_are_added_and_not_doubled_and_ours_survive_an_edit() {
+        let card = |url: &str| Embed { title: Some("T".into()), url: Some(url.into()), ..Default::default() };
+        let invite = Embed { kind: Some("invite".into()), url: Some("https://stt.gg/x".into()), ..Default::default() };
+        let held = vec![invite.clone()];
+        let after_append = merged_embeds(held.clone(), vec![card("https://x.com/a")], None);
+        assert_eq!(after_append.len(), 2);
+        assert_eq!(merged_embeds(after_append.clone(), vec![card("https://x.com/a")], None).len(), 2, "not twice");
+        let after_edit = merged_embeds(after_append, Vec::new(), Some(vec![card("https://x.com/b")]));
+        assert_eq!(after_edit.iter().map(|e| e.url.clone().unwrap()).collect::<Vec<_>>(), vec!["https://stt.gg/x", "https://x.com/b"]);
+    }
+
+    #[test]
+    fn a_page_stoat_described_is_a_card_with_its_site_picture_and_words() {
+        let i = Instance { january: Some("https://proxy.example".into()), ..Default::default() };
+        let card = embed_of("stoat:me", &i, &json!({ "type": "Website", "url": "https://x.com/e/status/1", "title": "Elon Musk (@elonmusk) on X", "description": "Correct.", "site_name": "X (formerly Twitter)", "image": { "url": "https://pbs.twimg.com/a.jpg", "width": 1, "height": 1 } })).unwrap();
+        assert_eq!((card.title.as_deref(), card.provider.as_deref(), card.url.as_deref()), (Some("Elon Musk (@elonmusk) on X"), Some("X (formerly Twitter)"), Some("https://x.com/e/status/1")));
+        assert!(card.image_url.is_some_and(|p| p.contains("/stoat-media/")), "its picture comes through the proxy and the cache");
     }
 
     #[test]

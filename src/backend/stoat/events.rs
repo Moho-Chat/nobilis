@@ -363,6 +363,15 @@ fn edited(state: &AppState, handle: &Handle, event: &Value) {
     if data.get("pinned").is_some() {
         super::search::announce(state, handle, &buffer);
     }
+    // The cards Stoat draws for a link come after the message: it fetches the page, and then appends what it found (or, for an
+    // edit, says the whole list again). Without taking them in a link to X, a video or an article stayed a bare address.
+    let appended: Vec<crate::model::Embed> = event["append"]["embeds"].as_array().into_iter().flatten().filter_map(|e| messages::embed_of(&handle.account_id, &handle.instance, e)).collect();
+    let replaced: Option<Vec<crate::model::Embed>> = data["embeds"].as_array().map(|list| list.iter().filter_map(|e| messages::embed_of(&handle.account_id, &handle.instance, e)).collect());
+    if !appended.is_empty() || replaced.is_some() {
+        let held = state.store.get_message(&buffer.id, id).ok().flatten().map(|m| m.embeds).unwrap_or_default();
+        let next = messages::merged_embeds(held, appended, replaced);
+        state.runtime.set_message_embeds(state, &buffer.id, id, &next);
+    }
     if let Some(content) = data["content"].as_str() {
         let body = {
             let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
@@ -811,6 +820,29 @@ mod tests {
             let _ = done.send(());
         });
         assert!(heard.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "an event took the world's lock twice");
+    }
+
+    #[test]
+    fn a_link_stoat_describes_after_the_message_is_drawn_as_a_card_under_it() {
+        let state = crate::backend::kick::testkit::simulated_daemon("stoat-append");
+        let h = crate::backend::stoat::tests::bare_handle("stoat:ME");
+        let channel = world::parse_channel(&json!({ "_id": "01CHAN0000000000000000000A", "channel_type": "TextChannel", "server": "S", "name": "general" })).unwrap();
+        {
+            let mut w = h.world.lock().unwrap();
+            w.own_id = "ME".into();
+            w.servers.insert("S".into(), world::parse_server(&json!({ "_id": "S", "owner": "ME", "name": "Hall", "channels": ["01CHAN0000000000000000000A"] })).unwrap());
+            w.channels.insert(channel.id.clone(), channel.clone());
+        }
+        register_channel(&state, &h, &channel, 0, None);
+        let message = json!({ "_id": "01MSG00000000000000000000A", "channel": "01CHAN0000000000000000000A", "author": "ME", "content": "https://x.com/a/status/1" });
+        assert!(messages::record(&state, &h, &message));
+        let buffer = messages::buffer_of(&state, "stoat:ME", "01CHAN0000000000000000000A").unwrap();
+        let embeds = || state.store.get_message(&buffer.id, "01MSG00000000000000000000A").unwrap().unwrap().embeds;
+        assert!(embeds().is_empty());
+        let append = json!({ "type": "MessageAppend", "id": "01MSG00000000000000000000A", "channel": "01CHAN0000000000000000000A", "append": { "embeds": [{ "type": "Website", "url": "https://x.com/a/status/1", "title": "A post", "site_name": "X" }] } });
+        handle(&state, &h, &append);
+        handle(&state, &h, &append);
+        assert_eq!(embeds().iter().map(|e| e.title.clone().unwrap_or_default()).collect::<Vec<_>>(), vec!["A post"], "added once");
     }
 
     #[test]
