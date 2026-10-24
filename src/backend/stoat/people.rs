@@ -22,7 +22,7 @@ pub fn invite_code(typed: &str) -> Option<String> {
             let parts: Vec<&str> = url.path_segments()?.filter(|p| !p.is_empty()).collect();
             match parts.as_slice() {
                 [.., "invite", code] => (*code).to_string(),
-                [code] if url.host_str().is_some_and(|h| h.ends_with("rvlt.gg") || h.ends_with("stoat.gg")) => (*code).to_string(),
+                [code] if url.host_str().is_some_and(|h| h.ends_with("rvlt.gg") || h.ends_with("stoat.gg") || h.ends_with("stt.gg")) => (*code).to_string(),
                 _ => return None,
             }
         }

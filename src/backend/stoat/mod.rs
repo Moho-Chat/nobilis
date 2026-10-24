@@ -15,6 +15,7 @@
 //! - `events` - what the websocket says as it happens
 //! - `messages` - a message as moho's, and a channel's history
 //! - `send` - saying things: send, edit, delete, typing, read
+//! - `invites` - a link to a server drawn as a card to join it
 //! - `limits` - the instance's stated limits, kept to before a request is made
 //! - `manage` - looking after a server: channels, roles, permissions, webhooks, the audit log
 //! - `members` - who is in a conversation, and who is online
@@ -33,6 +34,7 @@
 pub mod api;
 pub mod connect;
 pub mod events;
+pub mod invites;
 pub mod limits;
 pub mod login;
 pub mod manage;

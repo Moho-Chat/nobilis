@@ -624,6 +624,10 @@ pub struct Embed {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// What the card is about, for the kinds that are about one thing: an invite's server (its id), so a window can say
+    /// whether the person is in it already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// A link with its words.

@@ -334,6 +334,9 @@ pub fn record(state: &AppState, handle: &Handle, message: &Value) -> bool {
     if recorded && !reactions.is_empty() && state.store.set_reactions(&buffer.id, id, &reactions).unwrap_or(false) {
         state.events.emit("reactionsChanged", json!({ "bufferId": buffer.id, "id": id, "reactions": reactions }));
     }
+    if recorded {
+        super::invites::cards_later(state, handle, &buffer.id, id, content);
+    }
     if needs_fill {
         if let Some(reply_id) = reply_id {
             fill_reply_later(state, handle, &buffer.id, channel_id, id, &reply_id);
@@ -383,7 +386,13 @@ pub async fn history(state: &AppState, handle: &Handle, buffer: &crate::model::B
     ordered.sort_by(|a, b| a["_id"].as_str().cmp(&b["_id"].as_str()));
     let count = ordered.len();
     for message in &ordered {
-        record(state, handle, message);
+        // One already kept may not have had its links drawn yet (they arrived before this was built, or the preview was
+        // not to be had); a card already under it is not added twice.
+        if !record(state, handle, message) {
+            if let (Some(id), Some(content)) = (message["_id"].as_str(), message["content"].as_str()) {
+                super::invites::cards_later(state, handle, &buffer.id, id, content);
+            }
+        }
     }
     Ok(count)
 }
