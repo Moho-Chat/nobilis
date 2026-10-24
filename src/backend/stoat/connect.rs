@@ -116,6 +116,14 @@ async fn run(state: &AppState, config: &StoatAccountConfig, account_id: &str) ->
     let own_id = me["_id"].as_str().ok_or_else(|| anyhow!("Stoat did not say who this is"))?.to_string();
     let username = format!("{}#{}", me["username"].as_str().unwrap_or(""), me["discriminator"].as_str().unwrap_or(""));
     let _ = state.accounts.mutate_stoat(account_id, |a| a.username = username);
+    // How the account stands on Stoat's side is the truth, set from another app as well as from here: moho shows it,
+    // and does not put its own recollection over it. An invisible account says nothing, so what was chosen is kept.
+    if let Some(status) = me["status"]["presence"].as_str().and_then(super::own::status_from) {
+        state.runtime.set_account_status(account_id, status);
+    }
+    if let Some(text) = me["status"]["text"].as_str() {
+        state.runtime.set_account_status_text(account_id, text);
+    }
 
     let (mut sink, mut stream) = route_socket(account_id, &instance).await?.split();
     let (socket, mut outgoing) = tokio::sync::mpsc::unbounded_channel::<String>();

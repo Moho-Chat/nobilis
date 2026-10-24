@@ -25,6 +25,7 @@ pub fn status_of(user: &User) -> &'static str {
     match user.presence.as_str() {
         "Idle" => "idle",
         "Busy" => "dnd",
+        "Focus" => "focus",
         "Invisible" => "offline",
         _ => "online",
     }
@@ -151,7 +152,7 @@ mod tests {
         assert_eq!(status_of(&user(true, "Online")), "online");
         assert_eq!(status_of(&user(true, "Idle")), "idle");
         assert_eq!(status_of(&user(true, "Busy")), "dnd");
-        assert_eq!(status_of(&user(true, "Focus")), "online");
+        assert_eq!(status_of(&user(true, "Focus")), "focus");
         assert_eq!(status_of(&user(true, "Invisible")), "offline", "somebody invisible is not shown as here");
         assert_eq!(status_of(&user(true, "")), "online");
     }

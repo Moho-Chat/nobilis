@@ -1103,6 +1103,8 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
         "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:"),
+        // Stoat's own: only mentions reach the account.
+        "focus" => account_id.starts_with("stoat:"),
         _ => false,
     }
 }
@@ -1133,6 +1135,8 @@ mod status_tests {
 
     #[test]
     fn steam_has_online_idle_and_invisible() {
+        assert!(status_supported("stoat:01ABC", "focus"));
+        assert!(!status_supported("discord:1", "focus") && !status_supported("matrix:@me:poa.st", "focus"));
         for s in ["online", "idle", "invisible", "dnd"] {
             assert!(status_supported("steam:someone", s), "{s}");
         }

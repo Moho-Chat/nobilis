@@ -1851,8 +1851,8 @@ pub async fn dispatch(
             //
             // Every service is told whatever it can make of them: Matrix has
             // no such distinction and maps them itself.
-            if !matches!(status, "online" | "idle" | "dnd" | "invisible") {
-                return (None, Some("status must be online, idle, dnd or invisible".to_string()));
+            if !matches!(status, "online" | "idle" | "focus" | "dnd" | "invisible") {
+                return (None, Some("status must be online, idle, focus, dnd or invisible".to_string()));
             }
             // What the service has no such state for is left alone: nothing is
             // recorded and nothing is sent, so an account stays what it was.

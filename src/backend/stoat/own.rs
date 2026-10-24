@@ -24,10 +24,23 @@ pub fn text(v: &Value) -> Option<String> {
 pub fn presence_of(status: &str) -> &'static str {
     match status {
         "idle" => "Idle",
+        "focus" => "Focus",
         "dnd" => "Busy",
         "invisible" => "Invisible",
         _ => "Online",
     }
+}
+
+/// moho's word for a presence Stoat says of the account.
+pub fn status_from(presence: &str) -> Option<&'static str> {
+    Some(match presence {
+        "Online" => "online",
+        "Idle" => "idle",
+        "Focus" => "focus",
+        "Busy" => "dnd",
+        "Invisible" => "invisible",
+        _ => return None,
+    })
 }
 
 /// How the account looks to others, with what may be changed.
@@ -134,6 +147,11 @@ mod tests {
     #[test]
     fn moho_s_statuses_are_stoat_s() {
         assert_eq!((presence_of("online"), presence_of("idle"), presence_of("dnd"), presence_of("invisible")), ("Online", "Idle", "Busy", "Invisible"));
+        assert_eq!(presence_of("focus"), "Focus");
+        for word in ["online", "idle", "focus", "dnd", "invisible"] {
+            assert_eq!(status_from(presence_of(word)), Some(word), "{word} comes back as itself");
+        }
+        assert_eq!(status_from("Something"), None);
     }
 
     #[test]

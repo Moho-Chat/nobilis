@@ -4825,8 +4825,12 @@ impl Runtime {
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
+        // Not what an account on Stoat's Focus asked for: it hears only of mentions, and a direct message that mentions
+        // nobody is not one.
+        let focused = is_dm && !is_highlight && self.account_status(account_id) == "focus";
         if spoken && from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
             && !self.is_silenced(&buffer.id)
+            && !focused
         {
             state.events.emit(
                 "notification",
