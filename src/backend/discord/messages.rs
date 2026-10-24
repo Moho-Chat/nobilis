@@ -1027,7 +1027,7 @@ pub(super) fn extract_reactions(msg: &Value) -> Vec<Reaction> {
         .collect()
 }
 
-/// What Discord marks an author as, beside their name: "APP" for a bot or an application, with a check when Discord has
+/// What Discord marks an author as, beside their name: "BOT" for a bot or an application, with a check when Discord has
 /// verified it. Read off the author the message carries, so it is there for history and for live messages alike.
 pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Badge> {
     // Bit 16 of the public flags: a verified bot.
@@ -1042,7 +1042,7 @@ pub(super) fn author_badges(author: &Value) -> Vec<crate::backend::kick::api::Ba
     let verified = author["public_flags"].as_u64().unwrap_or(0) & VERIFIED_BOT != 0;
     vec![crate::backend::kick::api::Badge {
         kind: if verified { "verified-app" } else { "app" }.to_string(),
-        text: if verified { "Verified App" } else { "App" }.to_string(),
+        text: if verified { "Verified Bot" } else { "Bot" }.to_string(),
         ..Default::default()
     }]
 }
@@ -1956,9 +1956,9 @@ mod app_badge_tests {
     #[test]
     fn a_bot_is_an_app_and_a_verified_one_says_so() {
         let plain = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 0 }));
-        assert_eq!((plain[0].kind.as_str(), plain[0].text.as_str()), ("app", "App"));
+        assert_eq!((plain[0].kind.as_str(), plain[0].text.as_str()), ("app", "Bot"));
         let verified = author_badges(&json!({ "id": "1", "bot": true, "public_flags": 65536 }));
-        assert_eq!((verified[0].kind.as_str(), verified[0].text.as_str()), ("verified-app", "Verified App"));
+        assert_eq!((verified[0].kind.as_str(), verified[0].text.as_str()), ("verified-app", "Verified Bot"));
     }
 
     #[test]
