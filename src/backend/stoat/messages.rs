@@ -64,7 +64,13 @@ pub fn words(world: &World, files: Option<(&Instance, &str)>, server: Option<&st
             None => format!(":{}:", info.name),
         },
         (Some(info), None) => format!(":{}:", info.name),
-        (None, _) => c[0].to_string(),
+        // One from a server this account is not in: Stoat lets anybody use an emoji anywhere, so it is drawn all the same, from
+        // its address, and called by its id since nothing here says a name.
+        (None, Some((instance, account))) => match media::file_url(instance, "emojis", &c[1]) {
+            Some(url) => format!("[stoat:emoji:{}:{}]", &c[1], media::cached(account, media::MEDIA, &url, None, Some("image/png"))),
+            None => c[0].to_string(),
+        },
+        (None, None) => c[0].to_string(),
     });
     let out = spoiler.replace_all(&out, "||$1||");
     let out = time.replace_all(&out, |c: &regex::Captures| {
@@ -195,7 +201,13 @@ pub fn reaction_key(world: &World, files: Option<(&Instance, &str)>, emoji: &str
     if !(emoji.len() == 26 && emoji.chars().all(|c| c.is_ascii_alphanumeric())) {
         return emoji.to_string();
     }
-    let Some(info) = world.emojis.get(emoji) else { return ":emoji:".to_string() };
+    let Some(info) = world.emojis.get(emoji) else {
+        // From a server this account is not in: drawn from its address and named by its id.
+        return match files.and_then(|(instance, account)| media::file_url(instance, "emojis", emoji).map(|url| (account, url))) {
+            Some((account, url)) => format!("[stoat:emoji:{emoji}:{}]", media::cached(account, media::MEDIA, &url, None, Some("image/png"))),
+            None => ":emoji:".to_string(),
+        };
+    };
     match files.and_then(|(instance, account)| media::file_url(instance, "emojis", emoji).map(|url| (account, url))) {
         Some((account, url)) => format!("[stoat:emoji:{}:{}]", token_name(&info.name), media::cached(account, media::MEDIA, &url, None, Some(if info.animated { "image/gif" } else { "image/png" }))),
         None => format!(":{}:", info.name),
@@ -411,6 +423,10 @@ mod tests {
         assert_eq!(words(&w, None, Some("S1"), "hi <@01PAL00000000000000000000A>, see <#01CHAN0000000000000000000A>"), "hi @Pal, see #general");
         assert_eq!(words(&w, None, Some("S1"), "calling <%01ROLE0000000000000000000A>"), "calling @Mods");
         assert_eq!(words(&w, None, None, "yay :01EMOJ000000000000000000AA: and :01NONE000000000000000000AA:"), "yay :party: and :01NONE000000000000000000AA:");
+        // An emoji from a server this account is not in is still a picture, named by its id.
+        let instance = Instance { autumn: Some("https://cdn.example".into()), ..Default::default() };
+        let said = words(&w, Some((&instance, "stoat:me")), None, ":01NONE000000000000000000AA:");
+        assert!(said.starts_with("[stoat:emoji:01NONE000000000000000000AA:file://") && said.contains("/stoat-media/"), "{said}");
         assert_eq!(words(&w, None, None, "nobody <@01GONE0000000000000000000>"), "nobody <@01GONE0000000000000000000>", "an id that is not 26 characters is not a mention");
     }
 

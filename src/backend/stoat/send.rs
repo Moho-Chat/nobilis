@@ -218,7 +218,8 @@ pub async fn react(state: &AppState, buffer: &Buffer, message_id: &str, emoji: &
     let wire = {
         let world = handle.world.lock().unwrap_or_else(|e| e.into_inner());
         let name = messages::reaction_name(emoji);
-        world.emojis.iter().find(|(_, e)| e.name == name).map(|(id, _)| id.clone()).unwrap_or_else(|| emoji.to_string())
+        // An emoji from a server this account is not in is held under its id.
+        world.emojis.iter().find(|(_, e)| e.name == name).map(|(id, _)| id.clone()).unwrap_or_else(|| if name.len() == 26 && name.chars().all(|c| c.is_ascii_alphanumeric()) { name } else { emoji.to_string() })
     };
     if add {
         let already: Vec<String> = state.store.get_message(&buffer.id, message_id).ok().flatten().map(|m| m.reactions.iter().map(|r| r.emoji.clone()).collect()).unwrap_or_default();
