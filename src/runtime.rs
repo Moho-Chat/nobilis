@@ -545,6 +545,8 @@ pub struct Runtime {
     steam_links: Mutex<HashMap<String, crate::backend::steam::link::Link>>,
     /// A connected Telegram account's client, by account id (see backend/telegram).
     telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
+    /// A connected Stoat account's client, by account id (see backend/stoat).
+    stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -1113,6 +1115,7 @@ impl Runtime {
             twitch_rights: Mutex::new(HashMap::new()),
             steam_links: Mutex::new(HashMap::new()),
             telegram_handles: Mutex::new(HashMap::new()),
+            stoat_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -1267,6 +1270,11 @@ impl Runtime {
             let id = cfg.account_id();
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::telegram_account_to_json(cfg, conn)
+        }));
+        out.extend(state.accounts.all_stoat().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::stoat_account_to_json(cfg, conn)
         }));
         out
     }
@@ -4428,6 +4436,23 @@ impl Runtime {
         self.telegram_handles.lock().unwrap().get(account_id).cloned()
     }
 
+    pub fn set_stoat_handle(&self, account_id: &str, handle: crate::backend::stoat::Handle) {
+        self.stoat_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_stoat_handle(&self, account_id: &str) {
+        self.stoat_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn stoat_handle(&self, account_id: &str) -> Option<crate::backend::stoat::Handle> {
+        self.stoat_handles.lock().unwrap().get(account_id).cloned()
+    }
+
+    /// Every connected Stoat account.
+    pub fn all_stoat_handles(&self) -> Vec<crate::backend::stoat::Handle> {
+        self.stoat_handles.lock().unwrap().values().cloned().collect()
+    }
+
     pub fn set_steam_link(&self, account_id: &str, link: crate::backend::steam::link::Link) {
         self.steam_links.lock().unwrap().insert(account_id.to_string(), link);
     }
@@ -4800,8 +4825,12 @@ impl Runtime {
         // Notify on every inbound DM regardless of content, or on a
         // highlighted channel message - two distinct rules (see
         // daemon/nobilis/uiops_conv.c's should_notify/is_highlight split).
+        // Not what an account on Stoat's Focus asked for: it hears only of mentions, and a direct message that mentions
+        // nobody is not one.
+        let focused = is_dm && !is_highlight && self.account_status(account_id) == "focus";
         if spoken && from != own_nick && (is_dm || is_highlight) && !self.is_replaying(&buffer.id)
             && !self.is_silenced(&buffer.id)
+            && !focused
         {
             state.events.emit(
                 "notification",
@@ -5711,7 +5740,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,

@@ -624,6 +624,10 @@ pub struct Embed {
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub height: Option<u32>,
+    /// What the card is about, for the kinds that are about one thing: an invite's server (its id), so a window can say
+    /// whether the person is in it already.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// A link with its words.
@@ -933,6 +937,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("steam") => "steam",
         Some("twitch") => "twitch",
         Some("telegram") => "telegram",
+        Some("stoat") => "stoat",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
@@ -1101,7 +1106,9 @@ pub fn status_supported(account_id: &str, status: &str) -> bool {
     match status {
         "online" | "dnd" => true,
         "idle" => account_id.starts_with("discord:") || !(account_id.starts_with("matrix:") || account_id.starts_with("kick:") || account_id.starts_with("sneedchat:")),
-        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:"),
+        "invisible" => account_id.starts_with("discord:") || account_id.starts_with("matrix:") || account_id.starts_with("steam:") || account_id.starts_with("stoat:"),
+        // Stoat's own: only mentions reach the account.
+        "focus" => account_id.starts_with("stoat:"),
         _ => false,
     }
 }
@@ -1132,6 +1139,8 @@ mod status_tests {
 
     #[test]
     fn steam_has_online_idle_and_invisible() {
+        assert!(status_supported("stoat:01ABC", "focus"));
+        assert!(!status_supported("discord:1", "focus") && !status_supported("matrix:@me:poa.st", "focus"));
         for s in ["online", "idle", "invisible", "dnd"] {
             assert!(status_supported("steam:someone", s), "{s}");
         }
