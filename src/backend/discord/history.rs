@@ -320,6 +320,7 @@ pub async fn catch_up_channel(
                 tracing::info!("discord: {} message(s) missed in {buffer_id}", messages.len());
             }
             store_history_messages(state, buffer_id, &messages, user_id, own_display_name);
+            announce_caught_up(state, buffer_id, &messages);
         } else {
             tracing::info!("discord: catching up {buffer_id}: Discord answered {}", resp.status());
             asked(|a| a.catch_up_failed(buffer_id));
@@ -330,6 +331,22 @@ pub async fn catch_up_channel(
     if let Err(e) = result {
         tracing::warn!("discord: catching up {buffer_id}: {e}");
         asked(|a| a.catch_up_failed(buffer_id));
+    }
+}
+
+/// Tells the window of the messages that were caught up. They are kept in the scrollback like any other, but a window that
+/// opened the conversation a moment before - which one restarted with moho does, a second ahead of the account's connection
+/// - read the scrollback before they were in it, and nothing said they had come: the message was in the store and not on the
+/// screen until the conversation was opened again. Said as a message arriving, which is what it is; one the window already
+/// holds is not drawn twice.
+fn announce_caught_up(state: &AppState, buffer_id: &str, messages: &[Value]) {
+    for msg in messages.iter().rev() {
+        let Some(id) = msg["id"].as_str() else { continue };
+        if let Ok(Some(kept)) = state.store.get_message(buffer_id, id) {
+            if let Ok(wire) = serde_json::to_value(&kept) {
+                state.events.emit("message", wire);
+            }
+        }
     }
 }
 
@@ -426,6 +443,28 @@ pub async fn load_context(state: &AppState, account_id: &str, buffer_id: &str, m
 mod catch_up_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn what_was_caught_up_is_said_to_the_window_oldest_first_and_only_if_it_was_kept() {
+        let state = crate::backend::kick::testkit::simulated_daemon("discord-caught-up");
+        let buffer = "discord:1|Alex";
+        let mut heard = state.events.subscribe();
+        // Discord answers newest first. The second has nothing in it, which is not kept.
+        let answer = vec![
+            json!({ "id": "30", "author": { "id": "2", "username": "alex" }, "content": "newer", "timestamp": "2026-10-30T19:12:51Z" }),
+            json!({ "id": "20", "author": { "id": "2", "username": "alex" }, "content": "", "timestamp": "2026-10-30T19:12:50Z" }),
+            json!({ "id": "10", "author": { "id": "2", "username": "alex" }, "content": "older", "timestamp": "2026-10-30T19:12:49Z" }),
+        ];
+        store_history_messages(&state, buffer, &answer, "1", None);
+        announce_caught_up(&state, buffer, &answer);
+        let mut said = Vec::new();
+        while let Ok(event) = heard.try_recv() {
+            if event.name == "message" {
+                said.push(event.data["body"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        assert_eq!(said, vec!["older", "newer"]);
+    }
 
     /// Discord's own documentation's example: 175928847299117063 was made at 2016-04-30 11:18:25.796 UTC.
     #[test]
