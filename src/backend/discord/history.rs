@@ -335,10 +335,10 @@ pub async fn catch_up_channel(
 }
 
 /// Tells the window of the messages that were caught up. They are kept in the scrollback like any other, but a window that
-/// opened the conversation a moment before - which one restarted with moho does, a second ahead of the account's connection
-/// - read the scrollback before they were in it, and nothing said they had come: the message was in the store and not on the
-/// screen until the conversation was opened again. Said as a message arriving, which is what it is; one the window already
-/// holds is not drawn twice.
+/// opened the conversation a moment before (one restarted with moho does, a second ahead of the account's connection) read
+/// the scrollback before they were in it, and nothing said they had come: the message was in the store and not on the screen
+/// until the conversation was opened again. Said as a message arriving, which is what it is; one the window already holds is
+/// not drawn twice.
 fn announce_caught_up(state: &AppState, buffer_id: &str, messages: &[Value]) {
     for msg in messages.iter().rev() {
         let Some(id) = msg["id"].as_str() else { continue };
