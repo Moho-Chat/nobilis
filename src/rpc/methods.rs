@@ -4898,7 +4898,7 @@ pub async fn dispatch(
             };
             let user = p_str_opt(params, "userId").unwrap_or("");
             let done = match method {
-                "stoatFriendRequests" => return (Some(serde_json::json!({ "incoming": backend::stoat::people::incoming(&handle) })), None),
+                "stoatFriendRequests" => return (Some(backend::stoat::people::page(&handle)), None),
                 "answerStoatFriendRequest" => backend::stoat::people::answer_friend(state, &handle, user, p_bool(params, "accept", true)).await,
                 "addStoatFriend" => backend::stoat::people::add_friend(&handle, p_str(params, "username", "")).await,
                 _ => backend::stoat::people::block(state, &handle, user, p_bool(params, "block", true)).await,
