@@ -68,6 +68,7 @@ mod live {
             irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(data_dir.join("notify.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -196,6 +197,7 @@ mod live {
             irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(data_dir.join("notify.toml"))),
         };
 
         let config_a = MatrixAccountConfig {
@@ -361,6 +363,7 @@ mod live {
             irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(data_dir.join("notify.toml"))),
         };
 
         let config = MatrixAccountConfig {
@@ -525,6 +528,7 @@ mod live {
             irc_sts: std::sync::Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: std::sync::Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: std::sync::Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            notify_levels: std::sync::Arc::new(crate::notify::NotifyStore::open(data_dir.join("notify.toml"))),
         };
 
         let config = MatrixAccountConfig {

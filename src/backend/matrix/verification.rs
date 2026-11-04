@@ -806,6 +806,7 @@ mod tests {
             irc_sts: Arc::new(crate::backend::irc::sts::StsStore::open(data_dir.join("irc-sts.toml"))),
             highlights: Arc::new(crate::highlights::HighlightStore::open(data_dir.join("highlights.toml"))),
             ignores: Arc::new(crate::ignores::IgnoreStore::open(data_dir.join("ignores.toml"))),
+            notify_levels: Arc::new(crate::notify::NotifyStore::open(data_dir.join("notify.toml"))),
         };
         let config = MatrixAccountConfig {
             use_tor: false,

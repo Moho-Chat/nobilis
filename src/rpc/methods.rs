@@ -782,6 +782,7 @@ pub async fn dispatch(
                 // name later.
                 state.highlights.forget(id);
                 state.ignores.forget(id);
+                state.notify_levels.forget_account(id);
                 // And the Discord session kept for a restart to resume: a removed account must not leave its
                 // servers and friends in a file.
                 backend::discord::session_store::forget(id);
@@ -1246,63 +1247,20 @@ pub async fn dispatch(
             }
         }
 
-        "setTelegramChatMuted" => {
-            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("telegram:")) else {
-                return (None, Some("setTelegramChatMuted requires a Telegram \"bufferId\"".to_string()));
+        // How much a conversation may interrupt: default, all, mentions or mute.
+        // Set on the account where the service keeps it there (Matrix, Discord,
+        // Stoat, Steam, Telegram), so it is quiet on a phone as well and a
+        // change made on one arrives here - and kept by the daemon otherwise.
+        "setNotifyLevel" => {
+            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)) else {
+                return (None, Some("setNotifyLevel requires a known \"bufferId\"".to_string()));
             };
-            match backend::telegram::notify::set_muted(state, &buffer, p_bool(params, "muted", true)).await {
+            let Some(level) = p_str_opt(params, "level").and_then(crate::notify::NotifyLevel::parse) else {
+                return (None, Some("setNotifyLevel requires \"level\": default, all, mentions or mute".to_string()));
+            };
+            match crate::notify::set_level(state, &buffer, level).await {
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(e)),
-            }
-        }
-
-        "setMatrixRoomMuted" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("setMatrixRoomMuted requires \"bufferId\"".to_string()));
-            };
-            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            if !buffer.account_id.starts_with("matrix:") {
-                return (Some(ok_node()), None);
-            }
-            match backend::matrix::set_room_muted(state, &buffer.account_id, buffer_id, muted).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        // The same for a Discord channel or direct message: set on the
-        // account, so it is quiet on a phone as well.
-        // The same for a Stoat conversation, set in the account's synced settings.
-        "setStoatChannelMuted" => {
-            let Some(buffer) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("stoat:")) else {
-                return (None, Some("setStoatChannelMuted requires a Stoat \"bufferId\"".to_string()));
-            };
-            let Some(handle) = state.runtime.stoat_handle(&buffer.account_id) else {
-                return (None, Some("that Stoat account is not connected".to_string()));
-            };
-            match backend::stoat::settings::set_muted(state, &handle, &buffer, p_bool(params, "muted", true)).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
-            }
-        }
-
-        "setDiscordChannelMuted" => {
-            let Some(buffer_id) = p_str_opt(params, "bufferId") else {
-                return (None, Some("setDiscordChannelMuted requires \"bufferId\"".to_string()));
-            };
-            let muted = params.get("muted").and_then(|v| v.as_bool()).unwrap_or(true);
-            let Some(buffer) = state.runtime.get_buffer(buffer_id) else {
-                return (None, Some("no such conversation".to_string()));
-            };
-            if !buffer.account_id.starts_with("discord:") {
-                return (Some(ok_node()), None);
-            }
-            match backend::discord::mutes::set_muted(state, &buffer.account_id, buffer_id, muted).await {
-                Ok(()) => (Some(ok_node()), None),
-                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5278,7 +5236,7 @@ pub async fn dispatch(
 
         // What this account keeps about a friend - what it calls them, whether
         // their messages notify it - and blocking them. By the conversation.
-        "steamSetNickname" | "steamSetFriendMuted" | "steamBlockFriend" => {
+        "steamSetNickname" | "steamBlockFriend" => {
             let Some(buffer) = p_str_opt(params, "bufferId").and_then(|id| state.runtime.get_buffer(id)) else {
                 return (None, Some(format!("{method} requires a known \"bufferId\"")));
             };
@@ -5291,7 +5249,6 @@ pub async fn dispatch(
             let number = backend::steam::steamid::account_of(friend).unwrap_or_default();
             let done = match method {
                 "steamSetNickname" => backend::steam::prefs::set_nickname(&link, number, p_str(params, "nickname", "")).await,
-                "steamSetFriendMuted" => backend::steam::prefs::set_muted(&link, number, p_bool(params, "muted", true)).await,
                 _ => backend::steam::prefs::block(&link, friend, p_bool(params, "block", true)).await,
             };
             match done {
@@ -6808,6 +6765,7 @@ pub async fn dispatch(
             state.runtime.clear_buffer_groups_for_account(account_id);
             state.highlights.forget(account_id);
             state.ignores.forget(account_id);
+            state.notify_levels.forget_account(account_id);
             state.runtime.forget_account(account_id);
             if let Err(e) = state.store.forget_account(account_id) {
                 tracing::warn!("could not clear the scrollback for {account_id}: {e}");

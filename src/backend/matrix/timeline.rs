@@ -270,14 +270,14 @@ pub(super) async fn handle_timeline_event(
     // including for the nick match this client makes on its own - which is
     // why the mute is put on the buffer rather than folded into this one
     // message's answer.
-    let (muted, keyword, notices_quiet) = match state.runtime.matrix_push_rules(account_id) {
+    let (level, keyword, notices_quiet) = match state.runtime.matrix_push_rules(account_id) {
         Some(rules) => {
-            let (muted, keyword) = push_rule_verdict(&rules, room_id, &body);
-            (muted, keyword, notices_are_suppressed(&rules))
+            let (level, keyword) = push_rule_verdict(&rules, room_id, &body);
+            (level, keyword, notices_are_suppressed(&rules))
         }
-        None => (false, false, false),
+        None => (crate::notify::NotifyLevel::Default, false, false),
     };
-    state.runtime.set_silenced(state, buffer_id, muted);
+    state.runtime.set_notify_level(state, buffer_id, level, level);
     // A notice does not announce itself while the account's own override
     // rule says so - which is the state every homeserver ships. Without
     // this, a bridge relaying a room full of somebody's name would light up

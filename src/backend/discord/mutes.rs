@@ -19,7 +19,8 @@
 //! there is something new to apply it to.
 
 use super::*;
-use crate::runtime::DiscordMute;
+use crate::notify::NotifyLevel;
+use crate::runtime::{DiscordChannelNotify, DiscordMute};
 
 /// Direct messages have no guild, and Discord marks their settings entry with
 /// a null guild id. `@me` is what Discord's own API calls that scope.
@@ -36,9 +37,9 @@ pub(super) fn parse_entry(entry: &Value, now: i64) -> (String, DiscordMute) {
     let mut channels = HashMap::new();
     for over in entry["channel_overrides"].as_array().into_iter().flatten() {
         let Some(channel_id) = over["channel_id"].as_str() else { continue };
-        channels.insert(channel_id.to_string(), still_muted(over, now));
+        channels.insert(channel_id.to_string(), DiscordChannelNotify { muted: still_muted(over, now), level: over["message_notifications"].as_i64() });
     }
-    (guild, DiscordMute { muted: still_muted(entry, now), channels })
+    (guild, DiscordMute { muted: still_muted(entry, now), level: entry["message_notifications"].as_i64(), channels })
 }
 
 /// Whether a mute flag is a mute now.
@@ -82,18 +83,34 @@ pub(super) fn note_settings(state: &AppState, account_id: &str, settings: &Value
     apply(state, account_id);
 }
 
-/// What to send to mute or unmute one channel: its own setting inside its
+/// What to send to give one channel a level: its own setting inside its
 /// guild's, with no end time - a mute that does not expire.
-fn override_body(channel_id: &str, muted: bool) -> Value {
-    json!({ "channel_overrides": { channel_id: { "muted": muted, "mute_config": null } } })
+///
+/// Discord's own numbers: 0 for every message, 1 for mentions only, and 3 for
+/// "use the server's", which is how its client takes a channel's override off
+/// without deleting the entry. Muting is a separate switch from the number,
+/// and is left alone beyond turning it on - what a channel was set to before
+/// it was muted is what it goes back to.
+fn override_body(channel_id: &str, level: NotifyLevel) -> Value {
+    let mut over = json!({ "muted": level == NotifyLevel::Mute, "mute_config": null });
+    let number = match level {
+        NotifyLevel::All => Some(0),
+        NotifyLevel::Mentions => Some(1),
+        NotifyLevel::Default => Some(3),
+        NotifyLevel::Mute => None,
+    };
+    if let Some(number) = number {
+        over["message_notifications"] = json!(number);
+    }
+    json!({ "channel_overrides": { channel_id: over } })
 }
 
-/// Mutes or unmutes a conversation on the account itself.
+/// Sets how much a conversation may interrupt, on the account itself.
 ///
 /// A muted channel still counts what was said to its reader - Discord keeps
 /// the mention badge on one - and stops sounding on every device signed in to
 /// the account. Direct messages are the `@me` scope.
-pub async fn set_muted(state: &AppState, account_id: &str, buffer_id: &str, muted: bool) -> anyhow::Result<()> {
+pub async fn set_level(state: &AppState, account_id: &str, buffer_id: &str, level: NotifyLevel) -> anyhow::Result<()> {
     use anyhow::Context;
     let config = state.accounts.get_discord(account_id).context("no such account")?;
     let channel_id = state.runtime.get_discord_channel(buffer_id).context("not a Discord conversation")?;
@@ -102,12 +119,12 @@ pub async fn set_muted(state: &AppState, account_id: &str, buffer_id: &str, mute
         http_client_for(&config.token)
             .patch(format!("{API_BASE}/users/@me/guilds/{guild}/settings"))
             .header("Authorization", &config.token)
-            .json(&override_body(&channel_id, muted)),
+            .json(&override_body(&channel_id, level)),
     )
     .await?;
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("Discord refused to {} it (HTTP {})", if muted { "mute" } else { "unmute" }, status.as_u16());
+        anyhow::bail!("Discord refused to set it to {} (HTTP {})", level.as_str(), status.as_u16());
     }
     // The account's settings as they now are. The gateway says the same a
     // moment later; taking it here as well is what makes the change show
@@ -115,13 +132,19 @@ pub async fn set_muted(state: &AppState, account_id: &str, buffer_id: &str, mute
     if let Ok(now) = response.json::<Value>().await {
         note_settings(state, account_id, &now);
     }
+    // And judged by what Discord says, not by what was asked: a 200 with the
+    // channel unchanged is not a channel that was set.
+    let (shown, _) = state.runtime.discord_notify(account_id, &guild, &channel_id);
+    if shown != level {
+        anyhow::bail!("Discord accepted the change but still has this conversation on {}", shown.as_str());
+    }
     Ok(())
 }
 
 /// Puts what is known onto the buffers that exist.
 ///
 /// Cheap enough to run whenever anything might have changed - one pass over
-/// this account's conversations - and `set_silenced` only tells the client
+/// this account's conversations - and `set_notify_level` only tells the client
 /// about the ones that actually moved.
 pub(super) fn apply(state: &AppState, account_id: &str) {
     let prefix = format!("{account_id}|");
@@ -131,14 +154,10 @@ pub(super) fn apply(state: &AppState, account_id: &str) {
         }
         let Some(channel_id) = state.runtime.get_discord_channel(&buffer.id) else { continue };
         let guild = state.runtime.get_discord_guild(&buffer.id).unwrap_or_else(|| DM_SCOPE.to_string());
-        let muted = state.runtime.discord_muted(account_id, &guild, &channel_id);
-        // A local mute is still a local mute. This only ever says what
-        // Discord says, so a channel muted here and not there goes back to
-        // being quiet only because this window says so - which is the
-        // distinction the buffer carries and a client draws.
-        if muted != buffer.server_muted {
-            state.runtime.set_silenced(state, &buffer.id, muted);
-        }
+        // What Discord says, and only that: `set_notify_level` tells the
+        // clients about the conversations that actually moved.
+        let (shown, applies) = state.runtime.discord_notify(account_id, &guild, &channel_id);
+        state.runtime.set_notify_level(state, &buffer.id, shown, applies);
     }
 }
 
@@ -152,10 +171,69 @@ mod tests {
     #[test]
     fn muting_a_channel_is_its_own_setting_with_no_end() {
         assert_eq!(
-            override_body("100", true),
+            override_body("100", NotifyLevel::Mute),
             json!({ "channel_overrides": { "100": { "muted": true, "mute_config": null } } })
         );
-        assert_eq!(override_body("100", false)["channel_overrides"]["100"]["muted"], false);
+        assert_eq!(override_body("100", NotifyLevel::Default)["channel_overrides"]["100"]["muted"], false);
+    }
+
+    /// Discord's own numbers, and "use the server's" for taking an override off.
+    #[test]
+    fn each_level_is_written_as_discord_numbers_it() {
+        let number = |level| override_body("1", level)["channel_overrides"]["1"]["message_notifications"].clone();
+        assert_eq!(number(NotifyLevel::All), json!(0));
+        assert_eq!(number(NotifyLevel::Mentions), json!(1));
+        assert_eq!(number(NotifyLevel::Default), json!(3));
+        // A mute leaves the number where it was.
+        assert_eq!(number(NotifyLevel::Mute), json!(null));
+        // And never leaves a mute behind on the way to something else.
+        assert_eq!(override_body("1", NotifyLevel::All)["channel_overrides"]["1"]["muted"], json!(false));
+    }
+
+    /// What the menu ticks is the channel's own setting; what announces also
+    /// hears the server.
+    #[test]
+    fn a_channel_is_read_as_set_and_as_it_comes_to() {
+        let entry = json!({
+            "guild_id": "9", "message_notifications": 1,
+            "channel_overrides": [
+                { "channel_id": "a", "message_notifications": 0 },
+                { "channel_id": "b", "message_notifications": 1 },
+                { "channel_id": "c", "muted": true },
+                { "channel_id": "d", "message_notifications": 3 },
+                { "channel_id": "e", "message_notifications": 2 }
+            ]
+        });
+        let (_, mute) = parse_entry(&entry, NOW);
+        assert_eq!(mute.levels("a"), (NotifyLevel::All, NotifyLevel::All));
+        assert_eq!(mute.levels("b"), (NotifyLevel::Mentions, NotifyLevel::Mentions));
+        assert_eq!(mute.levels("c"), (NotifyLevel::Mute, NotifyLevel::Mute));
+        assert_eq!(mute.levels("d"), (NotifyLevel::Default, NotifyLevel::Default), "inherits, and the server only says mentions");
+        assert_eq!(mute.levels("e"), (NotifyLevel::Mute, NotifyLevel::Mute), "told of nothing");
+        assert_eq!(mute.levels("never-set"), (NotifyLevel::Default, NotifyLevel::Default));
+    }
+
+    /// A server that says everything is how Discord stores a server nobody
+    /// changed, so it must not turn a quiet client loud everywhere.
+    #[test]
+    fn a_server_set_to_everything_does_not_make_its_channels_loud() {
+        let (_, mute) = parse_entry(&json!({ "guild_id": "9", "message_notifications": 0 }), NOW);
+        assert_eq!(mute.levels("any"), (NotifyLevel::Default, NotifyLevel::Default));
+    }
+
+    /// A channel left on its default inside a server that is muted, or told
+    /// of nothing, is silent - and says so, because the row it is drawn on
+    /// cannot show it as an ordinary channel.
+    #[test]
+    fn a_server_that_is_quiet_quietens_a_channel_that_has_no_say() {
+        let (_, muted) = parse_entry(&json!({ "guild_id": "9", "muted": true }), NOW);
+        assert_eq!(muted.levels("any"), (NotifyLevel::Default, NotifyLevel::Mute));
+        let (_, nothing) = parse_entry(&json!({ "guild_id": "9", "message_notifications": 2 }), NOW);
+        assert_eq!(nothing.levels("any"), (NotifyLevel::Default, NotifyLevel::Mute));
+        // A channel that asked for mentions in a server told of nothing is
+        // still the channel's own say.
+        let (_, spoken) = parse_entry(&json!({ "guild_id": "9", "message_notifications": 2, "channel_overrides": [{ "channel_id": "a", "message_notifications": 1 }] }), NOW);
+        assert_eq!(spoken.levels("a"), (NotifyLevel::Mentions, NotifyLevel::Mentions));
     }
 
     /// A muted guild and, inside it, one channel muted on its own. Both are
@@ -173,8 +251,8 @@ mod tests {
         let (guild, mute) = parse_entry(&entry, NOW);
         assert_eq!(guild, "9");
         assert!(mute.muted);
-        assert_eq!(mute.channels.get("100"), Some(&true));
-        assert_eq!(mute.channels.get("101"), Some(&false));
+        assert!(mute.channels["100"].muted);
+        assert!(!mute.channels["101"].muted);
     }
 
     /// Direct messages arrive with a null guild id, which is a scope of its
@@ -189,7 +267,7 @@ mod tests {
         let (guild, mute) = parse_entry(&entry, NOW);
         assert_eq!(guild, DM_SCOPE);
         assert!(!mute.muted);
-        assert_eq!(mute.channels.get("55"), Some(&true));
+        assert!(mute.channels["55"].muted);
     }
 
     /// "Mute for 8 hours" leaves the flag set after the eight hours are up -
@@ -245,13 +323,14 @@ mod tests {
             42,
             { "guild_id": null, "muted": false, "channel_overrides": [{ "channel_id": "5", "muted": true }] }
         ]));
-        assert!(state.runtime.discord_muted(acct, "9", "anything"), "a muted guild mutes what is in it");
-        assert!(state.runtime.discord_muted(acct, DM_SCOPE, "5"), "a muted direct message");
-        assert!(!state.runtime.discord_muted(acct, DM_SCOPE, "6"));
+        let silent = |guild: &str, channel: &str| state.runtime.discord_notify(acct, guild, channel).1 == NotifyLevel::Mute;
+        assert!(silent("9", "anything"), "a muted guild mutes what is in it");
+        assert!(silent(DM_SCOPE, "5"), "a muted direct message");
+        assert!(!silent(DM_SCOPE, "6"));
         // One entry on its own, as an update sends it, and the wrapped form.
         note_settings(&state, acct, &json!({ "guild_id": "9", "muted": false }));
-        assert!(!state.runtime.discord_muted(acct, "9", "anything"));
+        assert!(!silent("9", "anything"));
         note_settings(&state, acct, &json!({ "entries": [{ "guild_id": "9", "muted": true }] }));
-        assert!(state.runtime.discord_muted(acct, "9", "anything"));
+        assert!(silent("9", "anything"));
     }
 }
