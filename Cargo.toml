@@ -65,6 +65,12 @@ grammers-client = { version = "=0.11.0", default-features = false, features = ["
 grammers-mtsender = { version = "=0.11.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
 
+# Signal backend (linked secondary device): presage is Whisperfish's client library over libsignal-service-rs and Signal's
+# own libsignal. All AGPL-3.0, pinned to a commit (its libsignal-service-rs and libsignal pins ride with it). The store
+# crate presage-store-sqlite is NOT used - it wants libsqlite3-sys 0.36 + SQLCipher, rusqlite here brings 0.38 - the Store
+# trait is implemented in backend/signal/store.rs instead. No `cdsi` (BoringSSL).
+presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false }
+
 # Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }
 tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }
@@ -148,6 +154,17 @@ libc = "0.2"
 # which it has. Reported upstream; drop this once a release carries the fix.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+# DAVE (Discord voice, davey -> openmls -> hpke-rs) uses libcrux crates that pin hax-lib =0.3.6; libsignal's own, newer
+# libcrux crates want hax-lib ^0.3.7, and cargo keeps one hax-lib per 0.3 series. hax-lib is proof annotations only, so the
+# four older crates are vendored (vendor/libcrux-*, unchanged but for that one line, "=0.3.6" -> ">=0.3.6, <0.4").
+libcrux-intrinsics-0-0-6 = { path = "vendor/libcrux-intrinsics-0.0.6", package = "libcrux-intrinsics" }
+libcrux-ml-kem-0-0-8 = { path = "vendor/libcrux-ml-kem-0.0.8", package = "libcrux-ml-kem" }
+libcrux-secrets-0-0-5 = { path = "vendor/libcrux-secrets-0.0.5", package = "libcrux-secrets" }
+libcrux-sha3-0-0-8 = { path = "vendor/libcrux-sha3-0.0.8", package = "libcrux-sha3" }
+core-models-0-0-5 = { path = "vendor/core-models-0.0.5", package = "core-models" }
+# libsignal builds against Signal's own curve25519-dalek (extra functions it calls); a patch is global, so every other
+# crate here that uses dalek (Tor, Matrix) gets the fork too - same version number, checked by the build.
+curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
 
 # Local debug builds keep line numbers for backtraces and not the full debug
 # information, which made each one several times the size of the program. A
