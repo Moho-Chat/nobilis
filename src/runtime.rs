@@ -1329,6 +1329,11 @@ impl Runtime {
             let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
             crate::accounts::stoat_account_to_json(cfg, conn)
         }));
+        out.extend(state.accounts.all_signal().iter().map(|cfg| {
+            let id = cfg.account_id();
+            let conn = conn_states.get(&id).map(|s| s.as_str()).unwrap_or("disconnected");
+            crate::accounts::signal_account_to_json(cfg, conn)
+        }));
         out
     }
 

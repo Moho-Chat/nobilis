@@ -73,6 +73,34 @@ pub fn path_for_link(link_id: &str) -> PathBuf {
     folder().join(format!("link-{safe}.db"))
 }
 
+/// Gives a link's store the name of the account it turned out to be. Every handle on the store must be dropped first;
+/// what the new name replaces (an earlier link of the same account) is gone with the keys it held, which the account
+/// no longer has anyway.
+pub fn relocate(from: &Path, to: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut stale = to.as_os_str().to_owned();
+        stale.push(suffix);
+        let _ = std::fs::remove_file(stale);
+    }
+    std::fs::rename(from, to)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut old = from.as_os_str().to_owned();
+        old.push(suffix);
+        let _ = std::fs::remove_file(old);
+    }
+    crate::secure::restrict_file_to_owner(to)?;
+    Ok(())
+}
+
+/// Deletes an account's store and the files SQLite keeps beside it.
+pub fn delete_files(path: &Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let _ = std::fs::remove_file(file);
+    }
+}
+
 #[derive(Clone)]
 pub struct SignalStore {
     db: Arc<Mutex<Connection>>,
@@ -134,6 +162,14 @@ impl SignalStore {
             tx.commit()?;
         }
         Ok(())
+    }
+
+    /// Moves everything the write-ahead log holds into the main file, so the file alone is the store and can be renamed.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.read(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            Ok(())
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {

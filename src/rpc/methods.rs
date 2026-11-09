@@ -122,6 +122,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addSignalAccount" => Some("signal"),
         _ => None,
     }
 }
@@ -438,6 +439,7 @@ pub async fn dispatch(
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "signal", "name": "Signal", "available": true },
             ])),
             None,
         ),
@@ -827,6 +829,8 @@ pub async fn dispatch(
                 // A Stoat session this client made is ended at Stoat; a token that was pasted belongs to another app
                 // of the person's, which ending would sign out.
                 let stoat_session = state.accounts.get_stoat(id).filter(|a| !a.session_id.is_empty());
+                // A Signal device is taken off the account at Signal, and its file deleted.
+                let signal_account = state.accounts.get_signal(id);
                 match state.accounts.remove(id) {
                     Ok(true) => {
                         if let Some(config) = stoat_session {
@@ -836,6 +840,9 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        if let Some(config) = signal_account {
+                            backend::signal::unlink::start(config.aci);
+                        }
                         if let Some(config) = telegram_account {
                             backend::telegram::folders::forget(&config.account_id());
                             let state = state.clone();
@@ -4908,6 +4915,21 @@ pub async fn dispatch(
                 Ok(()) => (Some(ok_node()), None),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
+        }
+
+        // Linking Signal: a QR code to scan with Signal on the phone that has the account (backend/signal/link.rs). An id
+        // now and the rest as events.
+        "addSignalAccount" => {
+            let link_id = format!("signal-{}", crate::model::next_message_id());
+            backend::signal::link::start(state.clone(), link_id.clone());
+            (Some(serde_json::json!({ "loginId": link_id })), None)
+        }
+
+        "cancelSignalLink" => {
+            if let Some(login_id) = p_str_opt(params, "loginId") {
+                backend::signal::link::cancel(login_id);
+            }
+            (Some(ok_node()), None)
         }
 
         "cancelStoatLogin" => {
