@@ -70,6 +70,9 @@ grammers-session = { version = "=0.11.0", default-features = false, features = [
 # crate presage-store-sqlite is NOT used - it wants libsqlite3-sys 0.36 + SQLCipher, rusqlite here brings 0.38 - the Store
 # trait is implemented in backend/signal/store.rs instead. No `cdsi` (BoringSSL).
 presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c301cbd54d95f4dbd4cadd692af95e", default-features = false }
+# The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
+async-trait = "0.1"
+thiserror = "2"
 
 # Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }
@@ -165,6 +168,11 @@ core-models-0-0-5 = { path = "vendor/core-models-0.0.5", package = "core-models"
 # libsignal builds against Signal's own curve25519-dalek (extra functions it calls); a patch is global, so every other
 # crate here that uses dalek (Tor, Matrix) gets the fork too - same version number, checked by the build.
 curve25519-dalek = { git = "https://github.com/signalapp/curve25519-dalek", tag = "signal-curve25519-4.1.3" }
+
+[dev-dependencies]
+# libsignal's key generation takes the rand 0.9 generators; the daemon itself is on 0.8.
+rand09 = { package = "rand", version = "0.9" }
+tempfile = "3"
 
 # Local debug builds keep line numbers for backtraces and not the full debug
 # information, which made each one several times the size of the program. A
