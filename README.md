@@ -36,3 +36,5 @@ delivered to clients that called `subscribe` for that buffer; everything else br
 ## Licence
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
+
+The Signal backend uses Signal's `libsignal` and the Whisperfish crates built on it (`libsignal-service-rs`, `presage`), which are licensed **AGPL-3.0**. GPL-3.0 section 13 allows the two to be combined, and the combination as a whole is then offered under the terms of the AGPL as well: anyone who uses this daemon over a network must be able to get its source, which is this repository. Signal's fork of `curve25519-dalek` (BSD-3-Clause) replaces the upstream crate everywhere in the build, and a few `libcrux` crates are vendored in `vendor/` with one dependency pin loosened (see `Cargo.toml` for why).
