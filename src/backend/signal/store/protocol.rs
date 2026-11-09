@@ -479,6 +479,9 @@ impl IdentityKeyStore for SignalProtocolStore {
             // Replaced means a *different* key was there; the same key saved again is no change.
             Ok(existing.is_some_and(|old| old[..] != *bytes))
         })?;
+        if replaced && self.identity.as_str() == "aci" {
+            self.store.note_changed_identity(name);
+        }
         Ok(if replaced { IdentityChange::ReplacedExisting } else { IdentityChange::NewOrUnchanged })
     }
 

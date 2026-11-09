@@ -20,6 +20,7 @@ pub mod local;
 pub mod media;
 pub mod memory;
 pub mod people;
+pub mod profile;
 pub mod ranges;
 pub mod send;
 pub mod store;

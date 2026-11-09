@@ -107,6 +107,8 @@ pub fn delete_files(path: &Path) {
 pub struct SignalStore {
     db: Arc<Mutex<Connection>>,
     pub(crate) trust_new_identities: OnNewIdentity,
+    /// People (by ACI) whose identity key changed since last asked: the window says so in their conversation.
+    changed: Arc<Mutex<Vec<String>>>,
 }
 
 impl std::fmt::Debug for SignalStore {
@@ -145,7 +147,7 @@ impl SignalStore {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let store = Self { db: Arc::new(Mutex::new(conn)), trust_new_identities };
+        let store = Self { db: Arc::new(Mutex::new(conn)), trust_new_identities, changed: Arc::default() };
         store.migrate()?;
         Ok(store)
     }
@@ -170,6 +172,33 @@ impl SignalStore {
             tx.commit()?;
         }
         Ok(())
+    }
+
+    /// Whose identity key changed since this was last called.
+    pub fn take_changed_identities(&self) -> Vec<String> {
+        std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub(crate) fn note_changed_identity(&self, name: &str) {
+        let mut changed = self.changed.lock().unwrap_or_else(|e| e.into_inner());
+        if !changed.iter().any(|n| n == name) {
+            changed.push(name.to_string());
+        }
+    }
+
+    /// The account's own identity key (the public half of its ACI identity).
+    pub fn own_identity(&self) -> Result<Option<presage::libsignal_service::protocol::IdentityKey>> {
+        let bytes = self.read(|conn| kv_get(conn, IdentityType::Aci.identity_key_pair_key()))?;
+        let Some(bytes) = bytes else { return Ok(None) };
+        let pair = IdentityKeyPair::try_from(&*bytes).map_err(SignalStoreError::Protocol)?;
+        Ok(Some(*pair.identity_key()))
+    }
+
+    /// The identity key a person's account (by ACI) is known by, if a message from them or a session with them has
+    /// brought one.
+    pub fn identity_of(&self, aci: &str) -> Result<Option<presage::libsignal_service::protocol::IdentityKey>> {
+        let record: Option<Vec<u8>> = self.read(|conn| Ok(conn.query_row("SELECT record FROM identities WHERE address = ?1 AND identity = 'aci'", [aci], |row| row.get(0)).optional()?))?;
+        record.map(|bytes| presage::libsignal_service::protocol::IdentityKey::decode(&bytes)).transpose().map_err(SignalStoreError::Protocol)
     }
 
     /// A small named value the client keeps for itself (settings the phone synced, say), apart from the library's data.

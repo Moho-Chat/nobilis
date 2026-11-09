@@ -147,11 +147,13 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         // Somebody not in the address book is called what they call themselves, which takes their profile.
         want_profile(&ctx, handle, &sender).await;
     }
+    announce_changed_identities(&ctx, sent_at).await;
     match &content.body {
         ContentBody::DataMessage(dm) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
             data_message(&ctx, &thread, sender, sent_at, dm).await;
             delivered(handle, &content, dm.timestamp.unwrap_or(sent_at));
+            announce_changed_identities(&ctx, sent_at).await;
         }
         ContentBody::EditMessage(edit) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
@@ -165,6 +167,21 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         ContentBody::CallMessage(_) => tracing::debug!("signal[{}]: a call message (calls are not handled yet)", ctx.account_id),
         ContentBody::StoryMessage(_) => tracing::debug!("signal[{}]: a story (stories are not handled yet)", ctx.account_id),
         ContentBody::DecryptionErrorMessage(_) => {}
+    }
+}
+
+/// Says, in the conversation with them, that somebody's safety number changed. The library trusts the new key (as Signal's
+/// own clients do for anyone not marked verified), and what is owed is telling the person.
+async fn announce_changed_identities(ctx: &Ctx<'_>, at_ms: u64) {
+    for name in ctx.store.take_changed_identities() {
+        let Some(who) = ServiceId::parse_from_service_id_string(&name).map(|id| ids::uuid_of(&id)) else { continue };
+        if ctx.is_own(&who) {
+            continue;
+        }
+        let thread = Thread::Contact(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(who)));
+        let buffer = people::buffer_for(ctx, &thread).await;
+        let person = people::person(ctx, &who).await;
+        system(ctx, &buffer, &format!("Your safety number with {person} has changed. Check it in their profile if you want to be sure it is them"), at_ms);
     }
 }
 
@@ -869,5 +886,28 @@ mod tests {
         send::mark_read(&state, &buffer).unwrap();
         assert_eq!(store.expiry_due(expiry::now()).unwrap().len(), 0);
         assert_eq!(store.expiry_due(expiry::now() + 61).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_changed_safety_number_is_told_in_the_conversation_with_that_person() {
+        use presage::libsignal_service::protocol::{DeviceId, IdentityKeyPair, IdentityKeyStore, ProtocolAddress};
+        use presage::store::Store;
+        let (state, store) = world("safety").await;
+        let ctx = ctx(&state, &store);
+        let mut rng = rand09::rng();
+        let address = ProtocolAddress::new(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(uuid(ALICE))).service_id_string(), DeviceId::new(1).unwrap());
+        let mut protocol = store.aci_protocol_store();
+        protocol.save_identity(&address, IdentityKeyPair::generate(&mut rng).identity_key()).await.unwrap();
+        // Meeting somebody is not a change.
+        announce_changed_identities(&ctx, 1_700_000_200_000).await;
+        assert!(state.runtime.list_buffers().is_empty());
+        protocol.save_identity(&address, IdentityKeyPair::generate(&mut rng).identity_key()).await.unwrap();
+        announce_changed_identities(&ctx, 1_700_000_201_000).await;
+        let rows = backlog(&state, &only_buffer(&state));
+        assert_eq!(rows[0].kind, "system");
+        assert!(rows[0].body.contains("safety number with Alice has changed"), "{}", rows[0].body);
+        // And once told, not told again.
+        announce_changed_identities(&ctx, 1_700_000_202_000).await;
+        assert_eq!(backlog(&state, &only_buffer(&state)).len(), 1);
     }
 }
