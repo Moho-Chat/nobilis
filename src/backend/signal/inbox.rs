@@ -196,12 +196,51 @@ async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &
             synced.save(&ctx.store);
             tracing::info!("signal[{}]: the phone's settings arrived", ctx.account_id);
         }
+        Some(Sync::CallEvent(event)) => call_logged(ctx, content, event).await,
         // Blocked lists and the rest are taken up by the library or by later rounds.
         _ => {}
     }
     if !sync.read.is_empty() {
         read_on_phone(ctx, &sync.read).await;
     }
+}
+
+/// What the phone's call log says about a call, as a line in the conversation: moho cannot take part in a call, so what it
+/// can honestly show is that one happened and how it ended.
+pub fn call_words(kind: i32, direction: i32, event: i32) -> Option<String> {
+    use presage::proto::sync_message::call_event::{Direction, Event, Type};
+    let what = match Type::try_from(kind).unwrap_or(Type::UnknownType) {
+        Type::VideoCall => "video call",
+        Type::GroupCall | Type::AdHocCall => "group call",
+        Type::AudioCall | Type::UnknownType => "voice call",
+    };
+    let incoming = Direction::try_from(direction).ok() == Some(Direction::Incoming);
+    match Event::try_from(event).ok()? {
+        Event::Accepted if incoming => Some(format!("Incoming {what}")),
+        Event::Accepted => Some(format!("Outgoing {what}")),
+        Event::NotAccepted if incoming => Some(format!("Missed {what}")),
+        Event::NotAccepted => Some(format!("Outgoing {what}, not answered")),
+        Event::Delete | Event::Observed | Event::UnknownEvent => None,
+    }
+}
+
+async fn call_logged(ctx: &Ctx<'_>, content: &Content, event: &presage::proto::sync_message::CallEvent) {
+    let Some(words) = call_words(event.r#type.unwrap_or(0), event.direction.unwrap_or(0), event.event.unwrap_or(0)) else { return };
+    let thread = match &event.conversation_id {
+        // A person is named by a service id; a group by its identifier.
+        Some(id) if id.len() == 32 => match thread_of_group_id(ctx, id).await {
+            Some(thread) => thread,
+            None => return,
+        },
+        _ => match Thread::try_from(content) {
+            Ok(thread) => thread,
+            Err(_) => return,
+        },
+    };
+    let buffer = people::buffer_for(ctx, &thread).await;
+    let at = event.timestamp.unwrap_or_else(|| content.metadata.client_timestamp.timestamp_millis().max(0) as u64);
+    let id = format!("call-{}-{}", event.call_id.unwrap_or(at), event.event.unwrap_or(0));
+    ctx.state.runtime.record_message_at(ctx.state, ctx.account_id, &buffer.name, &buffer.kind, "Signal", &format!("{words}. Calls are answered in Signal on your phone"), false, "system", None, Some(id), false, None, Vec::new(), Vec::new(), None, Some(seconds(at)), None, None);
 }
 
 /// Tells the sender their message arrived, as every Signal client does. It says nothing about it having been read.
@@ -909,5 +948,18 @@ mod tests {
         // And once told, not told again.
         announce_changed_identities(&ctx, 1_700_000_202_000).await;
         assert_eq!(backlog(&state, &only_buffer(&state)).len(), 1);
+    }
+
+    #[test]
+    fn the_phones_call_log_becomes_words() {
+        use presage::proto::sync_message::call_event::{Direction, Event, Type};
+        let say = |t: Type, d: Direction, e: Event| call_words(t as i32, d as i32, e as i32);
+        assert_eq!(say(Type::AudioCall, Direction::Incoming, Event::NotAccepted).as_deref(), Some("Missed voice call"));
+        assert_eq!(say(Type::VideoCall, Direction::Incoming, Event::Accepted).as_deref(), Some("Incoming video call"));
+        assert_eq!(say(Type::AudioCall, Direction::Outgoing, Event::Accepted).as_deref(), Some("Outgoing voice call"));
+        assert_eq!(say(Type::VideoCall, Direction::Outgoing, Event::NotAccepted).as_deref(), Some("Outgoing video call, not answered"));
+        assert_eq!(say(Type::GroupCall, Direction::Incoming, Event::NotAccepted).as_deref(), Some("Missed group call"));
+        assert_eq!(say(Type::AudioCall, Direction::Incoming, Event::Delete), None);
+        assert_eq!(say(Type::AudioCall, Direction::Incoming, Event::Observed), None);
     }
 }
