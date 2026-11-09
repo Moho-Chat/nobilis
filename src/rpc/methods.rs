@@ -4974,6 +4974,23 @@ pub async fn dispatch(
             (Some(serde_json::json!({ "loginId": link_id })), None)
         }
 
+        // The devices linked to a Signal account, and renaming this one. Signal lets only the phone remove another device.
+        "signalDevices" | "renameSignalDevice" => {
+            let Some(account_id) = p_str_opt(params, "accountId").filter(|a| a.starts_with("signal:")) else {
+                return (None, Some(format!("{method} requires a Signal \"accountId\"")));
+            };
+            if method == "signalDevices" {
+                return match backend::signal::send::devices(state, account_id).await {
+                    Ok(rows) => (Some(serde_json::to_value(rows).unwrap_or_default()), None),
+                    Err(e) => (None, Some(e)),
+                };
+            }
+            match backend::signal::send::rename_device(state, account_id, p_str(params, "name", "")).await {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
+            }
+        }
+
         "cancelSignalLink" => {
             if let Some(login_id) = p_str_opt(params, "loginId") {
                 backend::signal::link::cancel(login_id);

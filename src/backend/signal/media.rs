@@ -141,13 +141,47 @@ pub fn data_message_of(content: &Content) -> Option<&DataMessage> {
     }
 }
 
-/// Every pointer a message carries: its attachments, and a sticker's picture.
+/// Every pointer a message carries, in a fixed order: its attachments, a sticker's picture, then the pictures of its link
+/// previews. A cached file is found again by its place in this list.
 pub fn pointers_of(dm: &DataMessage) -> Vec<AttachmentPointer> {
     let mut all: Vec<AttachmentPointer> = dm.attachments.clone();
     if let Some(data) = dm.sticker.as_ref().and_then(|s| s.data.clone()) {
         all.push(data);
     }
+    all.extend(dm.preview.iter().filter_map(|p| p.image.clone()));
     all
+}
+
+/// How many of a message's pointers are things to show as attachments (the rest are pictures on link cards).
+pub fn shown_count(dm: &DataMessage) -> usize {
+    dm.attachments.len() + usize::from(dm.sticker.as_ref().is_some_and(|s| s.data.is_some()))
+}
+
+/// The cards for the links a message carries: what Signal's sender fetched about the page, with its picture named in the
+/// cache like any other attachment.
+pub fn previews_of(account_id: &str, thread: &Thread, author: &Uuid, ts: u64, dm: &DataMessage) -> Vec<crate::model::Embed> {
+    let remote = ids::remote_id(thread);
+    let mut index = shown_count(dm);
+    dm.preview
+        .iter()
+        .filter(|p| p.url.as_deref().is_some_and(|u| !u.is_empty()))
+        .map(|p| {
+            let image = p.image.as_ref().map(|pointer| {
+                let content_type = pointer.content_type.clone().unwrap_or_default();
+                let path = cache_path(account_id, &remote, ts, author, index, None, Some(&content_type));
+                crate::media_cache::record(&path, json!({ "account": account_id, "thread": remote, "ts": ts, "author": author.to_string(), "index": index }));
+                index += 1;
+                format!("file://{}", path.display())
+            });
+            crate::model::Embed {
+                title: p.title.clone().filter(|t| !t.is_empty()),
+                description: p.description.clone().filter(|t| !t.is_empty()),
+                url: p.url.clone(),
+                image_url: image,
+                ..Default::default()
+            }
+        })
+        .collect()
 }
 
 /// Finds the stored message sent at `ts` in `thread`, whichever time the library filed it under.
@@ -218,6 +252,29 @@ mod tests {
         assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), 3, "each has a name of its own");
         // The same attachment is the same file on the next run.
         assert_eq!(attachments_of("signal:x", &thread, &author, 5, &[pointer("image/jpeg", 0, None)])[0].path, list[0].path);
+    }
+
+    #[test]
+    fn a_link_card_has_its_words_and_a_picture_fetched_like_any_other() {
+        let author = Uuid::nil();
+        let thread = Thread::Group([2u8; 32]);
+        let dm = DataMessage {
+            attachments: vec![pointer("image/png", 0, None)],
+            preview: vec![
+                presage::proto::Preview { url: Some("https://example.org/a".into()), title: Some("A page".into()), description: Some("About it".into()), image: Some(pointer("image/jpeg", 0, None)), date: None },
+                presage::proto::Preview { url: Some("https://example.org/b".into()), title: Some(String::new()), description: None, image: None, date: None },
+                presage::proto::Preview { url: None, title: Some("No link".into()), description: None, image: None, date: None },
+            ],
+            ..Default::default()
+        };
+        // The attachment is first, so the first card's picture is the second pointer.
+        assert_eq!(shown_count(&dm), 1);
+        assert_eq!(pointers_of(&dm).len(), 2);
+        let cards = previews_of("signal:x", &thread, &author, 9, &dm);
+        assert_eq!(cards.len(), 2, "a preview with no address is not a card");
+        assert_eq!((cards[0].title.as_deref(), cards[0].description.as_deref(), cards[0].url.as_deref()), (Some("A page"), Some("About it"), Some("https://example.org/a")));
+        assert!(cards[0].image_url.as_deref().is_some_and(|p| p.contains("/signal-media/") && p.ends_with(".jpg")));
+        assert_eq!((cards[1].title.as_deref(), cards[1].image_url.as_deref()), (None, None));
     }
 
     #[test]

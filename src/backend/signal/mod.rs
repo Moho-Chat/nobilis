@@ -40,6 +40,19 @@ pub struct Handle {
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
 }
 
+/// One of the account's devices, as the phone's list of linked devices shows it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceRow {
+    pub id: u8,
+    pub name: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+    #[serde(rename = "lastSeen")]
+    pub last_seen: i64,
+    #[serde(rename = "isThis")]
+    pub is_this: bool,
+}
+
 /// A file to put on Signal's servers.
 #[derive(Debug)]
 pub struct Upload {
@@ -66,6 +79,10 @@ pub enum Command {
     React { thread: presage::store::Thread, target_ms: u64, target_author: uuid::Uuid, emoji: String, remove: bool, done: Done },
     /// Tell somebody their messages were delivered, read or viewed.
     Receipt { to: presage::libsignal_service::protocol::ServiceId, kind: presage::proto::receipt_message::Type, timestamps: Vec<u64> },
+    /// List the account's devices.
+    Devices { done: tokio::sync::oneshot::Sender<Result<Vec<DeviceRow>, String>> },
+    /// Change the name this device has in the phone's list.
+    Rename { name: String, done: tokio::sync::oneshot::Sender<Result<(), String>> },
     /// Fetch a person's profile (name and picture), once their profile key is known.
     Profile { who: uuid::Uuid },
     /// Download and decrypt an attachment.

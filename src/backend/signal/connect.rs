@@ -35,6 +35,8 @@ pub enum Ending {
     LinkAgain(String),
     /// Something has to be done on the phone first (a challenge); try again after a long wait.
     Slow(Duration, String),
+    /// Something about how the account is set up stops it, and retrying will not change that.
+    Refused(String),
     /// The connection ended; try again after the usual wait.
     Closed(String),
 }
@@ -119,6 +121,11 @@ async fn run_with_retry(state: &AppState, account_id: &str) {
                 state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some(&format!("{why}. Link Signal again from Accounts.")));
                 return;
             }
+            Ending::Refused(why) => {
+                tracing::info!("signal[{account_id}]: not connecting: {why}");
+                state.runtime.set_conn_state(state, account_id, ConnState::AuthFailed, Some(&why));
+                return;
+            }
             Ending::Slow(wait, why) => {
                 // Said once in words, then waited out: a challenge is not something retrying clears.
                 tracing::info!("signal[{account_id}]: {why}");
@@ -139,6 +146,11 @@ async fn run_with_retry(state: &AppState, account_id: &str) {
 
 /// One go at being connected.
 async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, days_away: Option<i64>) -> Ending {
+    // The library makes its own connections and cannot be handed a route. An account set to go through Tor or a proxy
+    // must not quietly go out directly instead.
+    if crate::net::route::router().wanted(account_id) || config.use_tor {
+        return Ending::Refused("Signal cannot be routed through Tor or a proxy yet, because the library moho uses makes its own connections. Set this account's route to direct to connect it".to_string());
+    }
     let path = store::path_for(&config.aci);
     if !path.exists() {
         return Ending::LinkAgain("This account's keys are not on this computer".to_string());

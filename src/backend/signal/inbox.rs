@@ -358,8 +358,10 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
     let own = ctx.is_own(&author);
     let highlight = !own && shown.mentioned_me;
     // The pictures, files and stickers: named in the cache now, fetched when looked at (see `media`).
-    let pointers = if dm.is_view_once.unwrap_or(false) { Vec::new() } else { super::media::pointers_of(dm) };
-    let attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers);
+    let view_once = dm.is_view_once.unwrap_or(false);
+    let pointers = if view_once { Vec::new() } else { super::media::pointers_of(dm) };
+    let attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers[..super::media::shown_count(dm).min(pointers.len())]);
+    let cards = if view_once { Vec::new() } else { super::media::previews_of(ctx.account_id, thread, &author, at, dm) };
     let recorded = ctx.state.runtime.record_message_at(
         ctx.state,
         ctx.account_id,
@@ -373,7 +375,7 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
         Some(id),
         highlight,
         super::media::avatar_of(ctx.account_id, &author),
-        Vec::new(),
+        cards,
         attachments,
         Some(author.to_string()),
         Some(seconds(at)),

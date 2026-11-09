@@ -63,6 +63,25 @@ pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Comman
                     tracing::warn!("signal[{account_id}]: asking the phone for its contacts: {e}");
                 }
             }
+            Command::Devices { done } => {
+                let this = manager.registration_data().device_id.unwrap_or(0);
+                let result = manager.devices().await.map_err(|e| explain(&e)).map(|list| {
+                    list.into_iter()
+                        .map(|d| super::DeviceRow {
+                            id: u8::from(d.id),
+                            name: d.name.unwrap_or_default(),
+                            created_at: d.created_at.timestamp(),
+                            last_seen: d.last_seen.timestamp(),
+                            is_this: u32::from(u8::from(d.id)) == this,
+                        })
+                        .collect()
+                });
+                let _ = done.send(result);
+            }
+            Command::Rename { name, done } => {
+                let result = manager.update_device_name(&name).await.map_err(|e| explain(&e));
+                let _ = done.send(result);
+            }
             Command::Profile { who } => {
                 use presage::{libsignal_service::protocol::Aci, store::ContentsStore};
                 let id = ServiceId::Aci(Aci::from(who));

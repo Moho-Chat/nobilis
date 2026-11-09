@@ -250,6 +250,40 @@ pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     Ok(())
 }
 
+
+/// The account's devices, newest link last, as the phone lists them.
+pub async fn devices(state: &AppState, account_id: &str) -> Result<Vec<super::DeviceRow>, String> {
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::Devices { done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    let mut rows = match tokio::time::timeout(Duration::from_secs(60), answer).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => return Err("the connection ended before Signal answered".to_string()),
+        Err(_) => return Err("Signal did not answer in time".to_string()),
+    };
+    rows.sort_by_key(|d| d.created_at);
+    Ok(rows)
+}
+
+/// Changes the name the phone's list shows for this device.
+pub async fn rename_device(state: &AppState, account_id: &str, name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a device needs a name".to_string());
+    }
+    let handle = state.runtime.signal_handle(account_id).ok_or("that Signal account is not connected")?;
+    let (done, answer) = oneshot::channel();
+    handle.commands.send(Command::Rename { name: name.to_string(), done }).map_err(|_| "that Signal account is not connected".to_string())?;
+    match tokio::time::timeout(Duration::from_secs(60), answer).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => return Err("the connection ended before Signal answered".to_string()),
+        Err(_) => return Err("Signal did not answer in time".to_string()),
+    }
+    let owned = name.to_string();
+    let _ = state.accounts.mutate_signal(account_id, |a| a.device_name = owned);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
