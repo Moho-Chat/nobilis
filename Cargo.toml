@@ -73,6 +73,7 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "4b81740610c30
 # The library's protocol stores are async traits (`#[async_trait(?Send)]`), and its error types are thiserror 2.
 async-trait = "0.1"
 thiserror = "2"
+uuid = "1"
 
 # Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }

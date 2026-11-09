@@ -9,7 +9,47 @@
 // The store is built before the connection that uses it (issue 35, Round 0/2); each piece is used as it lands.
 #![allow(dead_code)]
 
+pub mod commands;
+pub mod compose;
+pub mod connect;
+pub mod ids;
+pub mod inbox;
 pub mod link;
 pub mod local;
+pub mod people;
+pub mod ranges;
+pub mod send;
 pub mod store;
 pub mod unlink;
+
+pub use connect::spawn;
+
+/// What the rest of the daemon needs to act on a connected account. The library's manager lives on the account's own
+/// thread (see `local`), so the daemon asks that thread to act by sending it a `Command`.
+#[derive(Clone)]
+pub struct Handle {
+    pub account_id: String,
+    /// The account's own ACI.
+    pub own: uuid::Uuid,
+    /// The account's store, for looking names up from outside its thread.
+    pub store: store::SignalStore,
+    pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
+}
+
+/// How a command says how it went: the time the message was sent, or why it was not.
+pub type Done = tokio::sync::oneshot::Sender<Result<u64, String>>;
+
+/// Something the daemon asks the account's thread to do.
+#[derive(Debug)]
+pub enum Command {
+    /// Ask the phone to send its contacts again.
+    RefreshContacts,
+    /// Say something. `body` is plain text and `ranges` the styles over it.
+    Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, done: Done },
+    /// React to a message, or take the reaction back.
+    React { thread: presage::store::Thread, target_ms: u64, target_author: uuid::Uuid, emoji: String, remove: bool, done: Done },
+    /// Take one of the account's own messages back for everyone.
+    Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
+    /// Change one of the account's own messages.
+    Edit { thread: presage::store::Thread, target_ms: u64, body: String, ranges: Vec<presage::proto::BodyRange>, done: Done },
+}

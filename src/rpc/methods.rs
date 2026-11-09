@@ -917,6 +917,14 @@ pub async fn dispatch(
                             }
                             None => (None, Some("no such account".to_string())),
                         }
+                    } else if id.starts_with("signal:") {
+                        match state.accounts.get_signal(id) {
+                            Some(cfg) => {
+                                backend::signal::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
                     } else {
                         match state.accounts.get_irc(id) {
                             Some(cfg) => {
@@ -3705,6 +3713,15 @@ pub async fn dispatch(
                         Err(e) => (None, Some(e)),
                     }
                 }
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
+                        return (None, Some("Sending files to Signal is not built yet".to_string()));
+                    }
+                    match backend::signal::send::text(state, &buffer, body, reply_to_id).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") && params.get("thread").and_then(|v| v.as_bool()).unwrap_or(false) && attachment_path.is_none() && reply_to_id.is_some() => {
                     match backend::telegram::threads::reply(state, &buffer, reply_to_id.unwrap_or_default(), body).await {
                         Ok(()) => (Some(ok_node()), None),
@@ -3929,6 +3946,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3977,6 +3998,10 @@ pub async fn dispatch(
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => match backend::telegram::reactions::toggle(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4008,6 +4033,10 @@ pub async fn dispatch(
                     },
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
+                Some(buffer) if buffer.account_id.starts_with("signal:") => match backend::signal::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
                 },
@@ -6354,6 +6383,10 @@ pub async fn dispatch(
                     (None, _) => Err(anyhow::anyhow!("that Stoat account is not connected")),
                     (_, true) => Err(anyhow::anyhow!("Stoat needs the person's id, not their name")),
                     (Some(handle), false) => backend::stoat::people::open_dm(state, &handle, user_id).await,
+                },
+                "signal" => match state.runtime.signal_handle(account_id) {
+                    None => Err(anyhow::anyhow!("that Signal account is not connected")),
+                    Some(handle) => backend::signal::inbox::open_dm(state, &handle, user_id).await,
                 },
                 other => Err(anyhow::anyhow!("{other} has no direct messages")),
             };

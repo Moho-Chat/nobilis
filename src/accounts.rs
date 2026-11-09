@@ -615,6 +615,10 @@ pub struct SignalAccountConfig {
     /// Strict routing: everything the window loads for this account's conversations goes through the route too.
     #[serde(default)]
     pub strict_route: bool,
+    /// When this device last held a connection to Signal (seconds since the epoch), `0` for never. Signal unlinks a
+    /// device it has not heard from for about thirty days, which is worth saying when that is what happened.
+    #[serde(default)]
+    pub last_connected: i64,
 }
 
 impl SignalAccountConfig {

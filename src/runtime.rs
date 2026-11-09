@@ -590,6 +590,8 @@ pub struct Runtime {
     telegram_handles: Mutex<HashMap<String, crate::backend::telegram::Handle>>,
     /// A connected Stoat account's client, by account id (see backend/stoat).
     stoat_handles: Mutex<HashMap<String, crate::backend::stoat::Handle>>,
+    /// A connected Signal account's way to its thread, by account id (see backend/signal).
+    signal_handles: Mutex<HashMap<String, crate::backend::signal::Handle>>,
     /// Who has asked to be a Steam account's friend, and who it has asked:
     /// what the window is shown on the account's page, kept so a window opened
     /// after the request arrived can still be told.
@@ -1119,6 +1121,9 @@ fn fixed_category(account_id: &str, kind: &str) -> Option<String> {
         // Groups are the usual channel; a broadcast channel moves to its own heading when its buffer is made.
         return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
     }
+    if account_id.starts_with("signal:") {
+        return Some(if kind == "dm" { "Direct Messages".to_string() } else { "Groups".to_string() });
+    }
     account_id.starts_with("twitch:").then(|| if kind == "dm" { "Direct Messages".to_string() } else { "Channels".to_string() })
 }
 
@@ -1169,6 +1174,7 @@ impl Runtime {
             steam_links: Mutex::new(HashMap::new()),
             telegram_handles: Mutex::new(HashMap::new()),
             stoat_handles: Mutex::new(HashMap::new()),
+            signal_handles: Mutex::new(HashMap::new()),
             steam_requests: Mutex::new(HashMap::new()),
             kick_channels: Mutex::new(HashMap::new()),
             kick_streams: Mutex::new(HashMap::new()),
@@ -4534,6 +4540,18 @@ impl Runtime {
         self.stoat_handles.lock().unwrap().get(account_id).cloned()
     }
 
+    pub fn set_signal_handle(&self, account_id: &str, handle: crate::backend::signal::Handle) {
+        self.signal_handles.lock().unwrap().insert(account_id.to_string(), handle);
+    }
+
+    pub fn clear_signal_handle(&self, account_id: &str) {
+        self.signal_handles.lock().unwrap().remove(account_id);
+    }
+
+    pub fn signal_handle(&self, account_id: &str) -> Option<crate::backend::signal::Handle> {
+        self.signal_handles.lock().unwrap().get(account_id).cloned()
+    }
+
     /// Every connected Stoat account.
     pub fn all_stoat_handles(&self) -> Vec<crate::backend::stoat::Handle> {
         self.stoat_handles.lock().unwrap().values().cloned().collect()
@@ -5827,7 +5845,7 @@ impl Runtime {
             discord_channels, discord_gateway_sessions, ringing_calls,
             discord_guild_id, discord_buffer_emojis, emoji_catalogue,
             kick_watching, matrix_emoticons, discord_friends,
-            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, steam_requests, kick_channels,
+            sneedchat_senders, kick_senders, twitch_senders, twitch_rights, steam_links, telegram_handles, stoat_handles, signal_handles, steam_requests, kick_channels,
             kick_streams, kick_stream_fetched, live_cards,
             irc_channel_lists, irc_channel_directory, irc_caps, irc_metadata,
             discord_last_interaction, matrix_room_creators, matrix_room_versions,
