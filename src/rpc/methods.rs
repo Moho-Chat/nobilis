@@ -1178,6 +1178,12 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    if let Err(e) = backend::signal::send::typing(state, &buffer, typing) {
+                        tracing::debug!("sendTyping: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     // It lapses by itself, so only "typing" is said.
                     if typing {
@@ -1422,6 +1428,12 @@ pub async fn dispatch(
                     (Some(ok_node()), None)
                 }
                 // Telegram keeps a read position for each conversation too, and tells the account's other apps.
+                Some(buffer) if buffer.account_id.starts_with("signal:") => {
+                    if let Err(e) = backend::signal::send::mark_read(state, &buffer) {
+                        tracing::debug!("signal read position: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("telegram:") => {
                     if let Err(e) = backend::telegram::send::mark_read(state, &buffer).await {
                         tracing::debug!("telegram read position: {e}");

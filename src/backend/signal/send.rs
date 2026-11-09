@@ -109,3 +109,44 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
     state.runtime.update_message(state, &buffer.id, msg_id, &plain, &embeds, &attachments);
     Ok(())
 }
+
+/// Says the account is typing. Only when the phone's privacy settings say typing indicators are on: until they are known,
+/// nothing is told.
+pub fn typing(state: &AppState, buffer: &Buffer, started: bool) -> Result<(), String> {
+    let (handle, thread) = target(state, buffer)?;
+    if handle.memory.synced().typing_indicators != Some(true) {
+        return Ok(());
+    }
+    handle.commands.send(Command::Typing { thread, started }).map_err(|_| "that Signal account is not connected".to_string())
+}
+
+/// The conversation was read here: the senders of what was new are told it was read (if read receipts are on), and the
+/// phone is told so it does not keep the conversation unread.
+pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
+    use presage::libsignal_service::protocol::{Aci, ServiceId};
+    let (handle, _) = target(state, buffer)?;
+    let rows = state.store.get_backlog(&buffer.id, i64::MAX, 100).map_err(|e| e.to_string())?;
+    let mut by_sender: std::collections::HashMap<uuid::Uuid, Vec<u64>> = std::collections::HashMap::new();
+    {
+        let mut done = handle.memory.receipted.lock().unwrap_or_else(|e| e.into_inner());
+        for row in rows.iter().filter(|m| !m.is_own && m.kind == "chat") {
+            let Some((ts, author)) = ids::parse_message_id(&row.id) else { continue };
+            if done.insert(row.id.clone()) {
+                by_sender.entry(author).or_default().push(ts);
+            }
+        }
+    }
+    if by_sender.is_empty() {
+        return Ok(());
+    }
+    let synced = handle.memory.synced();
+    // Read receipts are a promise to the other person about what is shown to them; only the phone's own setting decides.
+    if synced.read_receipts == Some(true) {
+        for (sender, timestamps) in &by_sender {
+            let _ = handle.commands.send(Command::Receipt { to: ServiceId::Aci(Aci::from(*sender)), kind: presage::proto::receipt_message::Type::Read, timestamps: timestamps.clone() });
+        }
+    }
+    let reads: Vec<(uuid::Uuid, u64)> = by_sender.into_iter().flat_map(|(sender, ts)| ts.into_iter().map(move |t| (sender, t))).collect();
+    let _ = handle.commands.send(Command::ReadSync { reads });
+    Ok(())
+}

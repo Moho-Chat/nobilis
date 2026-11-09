@@ -16,6 +16,7 @@ pub mod ids;
 pub mod inbox;
 pub mod link;
 pub mod local;
+pub mod memory;
 pub mod people;
 pub mod ranges;
 pub mod send;
@@ -33,6 +34,7 @@ pub struct Handle {
     pub own: uuid::Uuid,
     /// The account's store, for looking names up from outside its thread.
     pub store: store::SignalStore,
+    pub memory: std::sync::Arc<memory::Memory>,
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
 }
 
@@ -48,6 +50,14 @@ pub enum Command {
     Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, done: Done },
     /// React to a message, or take the reaction back.
     React { thread: presage::store::Thread, target_ms: u64, target_author: uuid::Uuid, emoji: String, remove: bool, done: Done },
+    /// Tell somebody their messages were delivered, read or viewed.
+    Receipt { to: presage::libsignal_service::protocol::ServiceId, kind: presage::proto::receipt_message::Type, timestamps: Vec<u64> },
+    /// Tell the account's other devices these messages were read here.
+    ReadSync { reads: Vec<(uuid::Uuid, u64)> },
+    /// Say the account is typing in a conversation, or has stopped.
+    Typing { thread: presage::store::Thread, started: bool },
+    /// Ask the phone to send something again: its settings, its contacts.
+    AskPhone(presage::proto::sync_message::request::Type),
     /// Take one of the account's own messages back for everyone.
     Delete { thread: presage::store::Thread, target_ms: u64, done: Done },
     /// Change one of the account's own messages.

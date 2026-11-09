@@ -10,6 +10,7 @@
 //! learns of in the store, and acknowledges an envelope when it has been handled. What is added here is the
 //! lifecycle around it, and the translation of what it hands back (`inbox`).
 
+use super::memory::{Memory, Synced};
 use super::store::{self, OnNewIdentity, SignalStore};
 use super::{inbox, local, Command, Handle};
 use crate::accounts::SignalAccountConfig;
@@ -162,7 +163,9 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
 
     let (commands, mut incoming) = tokio::sync::mpsc::unbounded_channel::<Command>();
     let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
-    let handle = Handle { account_id: account_id.to_string(), own, store: manager.store().clone(), commands };
+    let memory = std::sync::Arc::new(Memory::default());
+    memory.set_synced(Synced::load(manager.store()));
+    let handle = Handle { account_id: account_id.to_string(), own, store: manager.store().clone(), memory, commands };
     state.runtime.set_signal_handle(account_id, handle.clone());
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
     tracing::info!("signal[{account_id}]: connected");
@@ -181,6 +184,11 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
                         if !caught_up {
                             caught_up = true;
                             tracing::info!("signal[{account_id}]: caught up");
+                            // The phone's privacy settings decide whether receipts and typing notices go out; until they
+                            // are known nothing of the sort is sent.
+                            if !handle.memory.synced().known() {
+                                let _ = handle.commands.send(Command::AskPhone(presage::proto::sync_message::request::Type::Configuration));
+                            }
                         }
                     }
                     Received::Contacts => inbox::contacts_arrived(state, &handle, &manager).await,

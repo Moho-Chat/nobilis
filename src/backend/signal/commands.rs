@@ -8,7 +8,7 @@ use crate::state::AppState;
 use presage::{
     libsignal_service::{content::ContentBody, prelude::ServiceError, protocol::ServiceId},
     manager::Registered,
-    proto::{data_message, DataMessage, EditMessage},
+    proto::{data_message, sync_message, typing_message, DataMessage, EditMessage, ReceiptMessage, SyncMessage, TypingMessage},
     store::Thread,
     Error as PresageError, Manager,
 };
@@ -62,6 +62,46 @@ pub fn run(_state: &AppState, handle: &Handle, manager: &Library, command: Comma
                     tracing::warn!("signal[{account_id}]: asking the phone for its contacts: {e}");
                 }
             }
+            Command::Receipt { to, kind, timestamps } => {
+                let at = now_ms();
+                let receipt = ReceiptMessage { r#type: Some(kind as i32), timestamp: timestamps };
+                if let Err(e) = manager.send_message(to, receipt, at).await {
+                    tracing::debug!("signal[{account_id}]: a receipt was not sent: {e}");
+                }
+            }
+            Command::ReadSync { reads } => {
+                let at = now_ms();
+                let read = reads
+                    .into_iter()
+                    .map(|(sender, timestamp)| sync_message::Read { sender_aci: Some(sender.to_string()), timestamp: Some(timestamp), sender_aci_binary: Some(sender.as_bytes().to_vec()) })
+                    .collect();
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let sync = SyncMessage { read, ..Default::default() };
+                if let Err(e) = manager.send_message(own, sync, at).await {
+                    tracing::debug!("signal[{account_id}]: the read state was not shared with the other devices: {e}");
+                }
+            }
+            Command::Typing { thread, started } => {
+                let at = now_ms();
+                let action = if started { typing_message::Action::Started } else { typing_message::Action::Stopped };
+                let group_id = match &thread {
+                    Thread::Group(key) => Some(group_identifier(key)),
+                    Thread::Contact(_) => None,
+                };
+                let typing = TypingMessage { timestamp: Some(at), action: Some(action as i32), group_id };
+                // Typing is passing news: a failure to say it is not worth more than a line in the log.
+                if let Err(e) = deliver(&mut manager, &thread, typing, at).await {
+                    tracing::debug!("signal[{account_id}]: typing was not sent: {e}");
+                }
+            }
+            Command::AskPhone(kind) => {
+                let at = now_ms();
+                let own = ServiceId::Aci(manager.registration_data().service_ids.aci());
+                let ask = SyncMessage { content: Some(sync_message::Content::Request(sync_message::Request { r#type: Some(kind as i32) })), ..Default::default() };
+                if let Err(e) = manager.send_message(own, ask, at).await {
+                    tracing::debug!("signal[{account_id}]: the phone was not asked: {e}");
+                }
+            }
             Command::Send { thread, body, ranges, quote, done } => {
                 let at = now_ms();
                 let dm = DataMessage { body: Some(body), body_ranges: ranges, quote, timestamp: Some(at), ..Default::default() };
@@ -96,6 +136,12 @@ pub fn run(_state: &AppState, handle: &Handle, manager: &Library, command: Comma
             }
         }
     });
+}
+
+/// The identifier Signal's servers know a group by, which is not its master key: typing notices name the group this way.
+pub fn group_identifier(master_key: &[u8; 32]) -> Vec<u8> {
+    use presage::libsignal_service::zkgroup::groups::{GroupMasterKey, GroupSecretParams};
+    GroupSecretParams::derive_from_master_key(GroupMasterKey::new(*master_key)).get_group_identifier().to_vec()
 }
 
 /// The service id of a person's thread, for the places that want one.

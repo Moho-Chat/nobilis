@@ -18,7 +18,7 @@ use presage::{
         protocol::ServiceId,
     },
     manager::Registered,
-    proto::{sync_message::Sent, DataMessage, EditMessage, SyncMessage},
+    proto::{receipt_message, sync_message::Sent, typing_message, DataMessage, EditMessage, ReceiptMessage, SyncMessage, TypingMessage},
     store::{ContentsStore, Thread},
     Manager,
 };
@@ -113,24 +113,138 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
         ContentBody::DataMessage(dm) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
             data_message(&ctx, &thread, sender, sent_at, dm).await;
+            delivered(handle, &content, dm.timestamp.unwrap_or(sent_at));
         }
         ContentBody::EditMessage(edit) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
             edited(&ctx, &thread, sender, edit).await;
+            delivered(handle, &content, edit.data_message.as_ref().and_then(|d| d.timestamp).unwrap_or(sent_at));
         }
-        ContentBody::SynchronizeMessage(sync) => synchronized(&ctx, &content, sync).await,
-        ContentBody::TypingMessage(_) | ContentBody::ReceiptMessage(_) | ContentBody::NullMessage(_) => {}
+        ContentBody::SynchronizeMessage(sync) => synchronized(&ctx, handle, &content, sync).await,
+        ContentBody::TypingMessage(typing) => typing_seen(&ctx, handle, &content, typing).await,
+        ContentBody::ReceiptMessage(receipt) => receipt_seen(&ctx, handle, &content, receipt).await,
+        ContentBody::NullMessage(_) => {}
         ContentBody::CallMessage(_) => tracing::debug!("signal[{}]: a call message (calls are not handled yet)", ctx.account_id),
         ContentBody::StoryMessage(_) => tracing::debug!("signal[{}]: a story (stories are not handled yet)", ctx.account_id),
         ContentBody::DecryptionErrorMessage(_) => {}
     }
 }
 
-async fn synchronized(ctx: &Ctx<'_>, content: &Content, sync: &SyncMessage) {
+async fn synchronized(ctx: &Ctx<'_>, handle: &Handle, content: &Content, sync: &SyncMessage) {
     use presage::proto::sync_message::Content as Sync;
-    // Contacts, blocked lists, configuration and the rest are taken up by the library or by later rounds.
-    if let Some(Sync::Sent(sent)) = &sync.content {
-        sent_from_phone(ctx, content, sent).await;
+    match &sync.content {
+        Some(Sync::Sent(sent)) => sent_from_phone(ctx, content, sent).await,
+        Some(Sync::Configuration(said)) => {
+            // The phone's privacy settings: what decides whether receipts and typing notices are sent at all.
+            let synced = handle.memory.synced().with(said);
+            handle.memory.set_synced(synced);
+            synced.save(&ctx.store);
+            tracing::info!("signal[{}]: the phone's settings arrived", ctx.account_id);
+        }
+        // Blocked lists and the rest are taken up by the library or by later rounds.
+        _ => {}
+    }
+    if !sync.read.is_empty() {
+        read_on_phone(ctx, &sync.read).await;
+    }
+}
+
+/// Tells the sender their message arrived, as every Signal client does. It says nothing about it having been read.
+fn delivered(handle: &Handle, content: &Content, sent_ms: u64) {
+    if !content.metadata.needs_receipt {
+        return;
+    }
+    let to = content.metadata.sender;
+    if ids::uuid_of(&to) == handle.own {
+        return;
+    }
+    let _ = handle.commands.send(super::Command::Receipt { to, kind: receipt_message::Type::Delivery, timestamps: vec![sent_ms] });
+}
+
+/// The thread a group's identifier names: the one whose master key makes it.
+async fn thread_of_group_id(ctx: &Ctx<'_>, group_id: &[u8]) -> Option<Thread> {
+    let groups = ctx.store.groups().await.ok()?;
+    groups.filter_map(Result::ok).map(|(key, _)| key).find(|key| super::commands::group_identifier(key) == group_id).map(Thread::Group)
+}
+
+/// Somebody is typing, or stopped.
+async fn typing_seen(ctx: &Ctx<'_>, handle: &Handle, content: &Content, typing: &TypingMessage) {
+    let who = ids::uuid_of(&content.metadata.sender);
+    if who == handle.own {
+        return;
+    }
+    let thread = match &typing.group_id {
+        Some(group_id) => match thread_of_group_id(ctx, group_id).await {
+            Some(thread) => thread,
+            None => return,
+        },
+        None => Thread::Contact(content.metadata.sender),
+    };
+    // A typing notice does not open a conversation that is not there.
+    let remote = ids::remote_id(&thread);
+    let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { return };
+    let started = typing.action.is_none_or(|a| a == typing_message::Action::Started as i32);
+    if started {
+        let name = people::person(ctx, &who).await;
+        ctx.state.events.emit("typing", serde_json::json!({ "accountId": ctx.account_id, "bufferId": buffer.id, "nicks": [name], "expiresInMs": 15_000 }));
+    } else if matches!(thread, Thread::Contact(_)) {
+        ctx.state.events.emit("typing", serde_json::json!({ "accountId": ctx.account_id, "bufferId": buffer.id, "nicks": [], "expiresInMs": 0 }));
+    }
+}
+
+/// Somebody read (or viewed) messages of the account's.
+async fn receipt_seen(ctx: &Ctx<'_>, handle: &Handle, content: &Content, receipt: &ReceiptMessage) {
+    let kind = receipt.r#type.unwrap_or(0);
+    // Delivered is not drawn: there is nowhere in a conversation to put it yet.
+    if kind != receipt_message::Type::Read as i32 && kind != receipt_message::Type::Viewed as i32 {
+        return;
+    }
+    let reader = ids::uuid_of(&content.metadata.sender);
+    let mine = ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(ctx.own));
+    for &ts in &receipt.timestamp {
+        let Ok(Some(thread)) = ctx.store.thread_for_sender_and_timestamp(&mine, ts).await else { continue };
+        let remote = ids::remote_id(&thread);
+        let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { continue };
+        note_read(ctx, handle, &buffer, reader, ts).await;
+    }
+}
+
+/// Moves a reader's marker in a conversation to message `ts`, if that is further than it was, and tells the window.
+async fn note_read(ctx: &Ctx<'_>, handle: &Handle, buffer: &Buffer, reader: Uuid, ts: u64) {
+    let readers = {
+        let mut marks = handle.memory.read_marks.lock().unwrap_or_else(|e| e.into_inner());
+        let here = marks.entry(buffer.id.clone()).or_default();
+        let at = here.entry(reader).or_insert(0);
+        if *at >= ts {
+            return;
+        }
+        *at = ts;
+        here.clone()
+    };
+    let mut list = Vec::new();
+    for (who, at) in readers {
+        list.push(serde_json::json!({ "userId": who.to_string(), "nick": people::person(ctx, &who).await, "messageId": ids::message_id(at, &ctx.own) }));
+    }
+    ctx.state.events.emit("readReceipts", serde_json::json!({ "accountId": ctx.account_id, "bufferId": buffer.id, "readers": list }));
+}
+
+/// Messages read on the phone: if that was everything in the conversation, it is not unread here either.
+async fn read_on_phone(ctx: &Ctx<'_>, reads: &[presage::proto::sync_message::Read]) {
+    for read in reads {
+        let (Some(from), Some(ts)) = (ids::aci_of(read.sender_aci.as_deref(), read.sender_aci_binary.as_deref()), read.timestamp) else { continue };
+        let sender = ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(from));
+        let Ok(Some(thread)) = ctx.store.thread_for_sender_and_timestamp(&sender, ts).await else { continue };
+        let remote = ids::remote_id(&thread);
+        let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) else { continue };
+        let newer = ctx
+            .state
+            .store
+            .get_backlog(&buffer.id, i64::MAX, 50)
+            .map(|rows| rows.iter().any(|m| !m.is_own && m.kind == "chat" && ids::parse_message_id(&m.id).is_some_and(|(sent, _)| sent > ts)))
+            .unwrap_or(true);
+        if !newer {
+            ctx.state.events.emit("bufferRead", serde_json::json!({ "accountId": ctx.account_id, "bufferId": buffer.id }));
+        }
     }
 }
 
@@ -582,6 +696,125 @@ mod tests {
 
     fn pointer(kind: &str, flags: u32, name: Option<&str>) -> AttachmentPointer {
         AttachmentPointer { content_type: Some(kind.to_string()), flags: Some(flags), file_name: name.map(String::from), ..Default::default() }
+    }
+
+    fn handle(own: &str) -> (Handle, tokio::sync::mpsc::UnboundedReceiver<super::super::Command>) {
+        let (commands, rx) = tokio::sync::mpsc::unbounded_channel();
+        let store = SignalStore::open_in_memory(presage::model::identity::OnNewIdentity::Trust).unwrap();
+        (Handle { account_id: ACCOUNT.to_string(), own: uuid(own), store, memory: Default::default(), commands }, rx)
+    }
+
+    fn content_from(sender: &str, body: ContentBody, needs_receipt: bool) -> Content {
+        content_at(sender, body, needs_receipt, 1_700_000_100_000)
+    }
+
+    fn content_at(sender: &str, body: ContentBody, needs_receipt: bool, at_ms: i64) -> Content {
+        use presage::libsignal_service::{content::Metadata, protocol::Aci};
+        let at = chrono::DateTime::from_timestamp_millis(at_ms).unwrap();
+        Content {
+            metadata: Metadata {
+                sender: ServiceId::Aci(Aci::from(uuid(sender))),
+                destination: ServiceId::Aci(Aci::from(uuid(ME))),
+                sender_device: presage::libsignal_service::protocol::DeviceId::new(1).unwrap(),
+                pni_verified: None,
+                client_timestamp: at,
+                server_timestamp: at,
+                needs_receipt,
+                unidentified_sender: false,
+                was_plaintext: false,
+                server_guid: None,
+            },
+            body,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_receipt_moves_the_readers_marker_forward_only() {
+        let (state, store) = world("receipt").await;
+        let ctx = ctx(&state, &store);
+        let (handle, _rx) = handle(ME);
+        state.runtime.set_signal_handle(ACCOUNT, handle.clone());
+        // Two messages the account sent to Alice, kept in the library's store as it keeps what it sends.
+        for at in [1_700_000_020_000u64, 1_700_000_030_000] {
+            data_message(&ctx, &person(ALICE), uuid(ME), at, &text("x", at)).await;
+            let saved = content_at(ME, ContentBody::DataMessage(text("x", at)), false, at as i64);
+            store.save_message(&person(ALICE), saved).await.unwrap();
+        }
+        let mut events = state.events.subscribe();
+        let read = |ts: u64| content_from(ALICE, ContentBody::ReceiptMessage(ReceiptMessage { r#type: Some(receipt_message::Type::Read as i32), timestamp: vec![ts] }), false);
+        let receipt = |ts: u64| ReceiptMessage { r#type: Some(receipt_message::Type::Read as i32), timestamp: vec![ts] };
+        receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &receipt(1_700_000_030_000)).await;
+        let event = events.try_recv().expect("a marker");
+        assert_eq!(event.name, "readReceipts");
+        assert_eq!(event.data["readers"][0]["nick"], "Alice");
+        assert_eq!(event.data["readers"][0]["messageId"], format!("1700000030000-{ME}"));
+        // An older receipt arriving late does not move it back, and says nothing.
+        receipt_seen(&ctx, &handle, &read(1_700_000_020_000), &receipt(1_700_000_020_000)).await;
+        assert!(events.try_recv().is_err());
+        // A delivery receipt is not a reading.
+        let delivered = ReceiptMessage { r#type: Some(receipt_message::Type::Delivery as i32), timestamp: vec![1_700_000_030_000] };
+        receipt_seen(&ctx, &handle, &read(1_700_000_030_000), &delivered).await;
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn typing_is_shown_for_an_open_conversation_and_ends() {
+        let (state, store) = world("typing").await;
+        let ctx = ctx(&state, &store);
+        let (handle, _rx) = handle(ME);
+        let started = TypingMessage { timestamp: Some(1), action: Some(typing_message::Action::Started as i32), group_id: None };
+        // Nobody is typing in a conversation that is not open.
+        let mut events = state.events.subscribe();
+        typing_seen(&ctx, &handle, &content_from(ALICE, ContentBody::TypingMessage(started.clone()), false), &started).await;
+        assert!(events.try_recv().is_err());
+        data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_040_000, &text("hi", 1_700_000_040_000)).await;
+        while events.try_recv().is_ok() {}
+        typing_seen(&ctx, &handle, &content_from(ALICE, ContentBody::TypingMessage(started.clone()), false), &started).await;
+        let event = events.try_recv().expect("typing");
+        assert_eq!((event.name, event.data["nicks"][0].as_str()), ("typing", Some("Alice")));
+        let stopped = TypingMessage { timestamp: Some(2), action: Some(typing_message::Action::Stopped as i32), group_id: None };
+        typing_seen(&ctx, &handle, &content_from(ALICE, ContentBody::TypingMessage(stopped.clone()), false), &stopped).await;
+        assert_eq!(events.try_recv().expect("cleared").data["nicks"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_message_that_asks_for_a_receipt_gets_a_delivery_receipt_and_nothing_more() {
+        let (handle, mut rx) = handle(ME);
+        let asking = content_from(ALICE, ContentBody::DataMessage(text("hi", 5)), true);
+        delivered(&handle, &asking, 5);
+        match rx.try_recv().expect("a receipt") {
+            super::super::Command::Receipt { kind, timestamps, .. } => assert_eq!((kind, timestamps), (receipt_message::Type::Delivery, vec![5])),
+            other => panic!("{other:?}"),
+        }
+        delivered(&handle, &content_from(ALICE, ContentBody::DataMessage(text("hi", 6)), false), 6);
+        // The account's own messages from another device are not receipted to itself.
+        delivered(&handle, &content_from(ME, ContentBody::DataMessage(text("hi", 7)), true), 7);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reading_a_conversation_tells_its_senders_only_if_the_phone_says_read_receipts_are_on() {
+        use super::super::{send, Command};
+        let (state, store) = world("reading").await;
+        let ctx = ctx(&state, &store);
+        let (handle, mut rx) = handle(ME);
+        state.runtime.set_signal_handle(ACCOUNT, handle.clone());
+        data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_050_000, &text("one", 1_700_000_050_000)).await;
+        data_message(&ctx, &person(ALICE), uuid(ME), 1_700_000_051_000, &text("two", 1_700_000_051_000)).await;
+        let buffer = only_buffer(&state);
+        // Unknown settings: the phone is told, Alice is not.
+        send::mark_read(&state, &buffer).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Command::ReadSync { reads }) if reads == vec![(uuid(ALICE), 1_700_000_050_000)]));
+        assert!(rx.try_recv().is_err());
+        // Reading again sends nothing.
+        send::mark_read(&state, &buffer).unwrap();
+        assert!(rx.try_recv().is_err());
+        // With receipts on, a new message from Alice is receipted as read.
+        handle.memory.set_synced(crate::backend::signal::memory::Synced { read_receipts: Some(true), ..Default::default() });
+        data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_052_000, &text("three", 1_700_000_052_000)).await;
+        send::mark_read(&state, &buffer).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(Command::Receipt { kind: receipt_message::Type::Read, timestamps, .. }) if timestamps == vec![1_700_000_052_000]));
+        assert!(matches!(rx.try_recv(), Ok(Command::ReadSync { .. })));
     }
 
     #[test]

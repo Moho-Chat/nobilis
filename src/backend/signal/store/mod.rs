@@ -164,6 +164,15 @@ impl SignalStore {
         Ok(())
     }
 
+    /// A small named value the client keeps for itself (settings the phone synced, say), apart from the library's data.
+    pub fn blob(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.read(|conn| kv_get(conn, &format!("moho:{name}")))
+    }
+
+    pub fn set_blob(&self, name: &str, value: &[u8]) -> Result<()> {
+        self.write(|tx| kv_set(tx, &format!("moho:{name}"), value))
+    }
+
     /// Moves everything the write-ahead log holds into the main file, so the file alone is the store and can be renamed.
     pub fn checkpoint(&self) -> Result<()> {
         self.read(|conn| {
