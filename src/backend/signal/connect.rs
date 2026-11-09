@@ -170,6 +170,8 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
     state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
     tracing::info!("signal[{account_id}]: connected");
     let _ = state.accounts.mutate_signal(account_id, |a| a.last_connected = now_seconds());
+    // The account's own name, for what it says from here.
+    let _ = handle.commands.send(Command::Profile { who: own });
     let mut caught_up = false;
     let mut last_stamp = now_seconds();
     // What fell due while the daemon was away goes first, then the clock keeps watch.

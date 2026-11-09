@@ -3726,10 +3726,18 @@ pub async fn dispatch(
                     }
                 }
                 Some(buffer) if buffer.account_id.starts_with("signal:") => {
-                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
-                        return (None, Some("Sending files to Signal is not built yet".to_string()));
+                    let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
+                        Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+                        None => attachment_path.map(|p| vec![p.to_string()]).unwrap_or_default(),
+                    };
+                    let files: Vec<(String, bool)> = paths.into_iter().map(|p| (p, false)).collect();
+                    let sent = backend::signal::send::files(state, &buffer, body, &files, reply_to_id, progress).await;
+                    if let Some(p) = progress {
+                        if !files.is_empty() {
+                            p.done(sent.as_ref().err().map(String::as_str));
+                        }
                     }
-                    match backend::signal::send::text(state, &buffer, body, reply_to_id).await {
+                    match sent {
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(e)),
                     }

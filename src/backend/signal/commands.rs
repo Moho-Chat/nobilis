@@ -52,14 +52,37 @@ fn finish(done: super::Done, result: Result<(), String>, at: u64) {
     let _ = done.send(result.map(|()| at));
 }
 
-pub fn run(_state: &AppState, handle: &Handle, manager: &Library, command: Command) {
+pub fn run(state: &AppState, handle: &Handle, manager: &Library, command: Command) {
     let account_id = handle.account_id.clone();
+    let state = state.clone();
     let mut manager = manager.clone();
     tokio::task::spawn_local(async move {
         match command {
             Command::RefreshContacts => {
                 if let Err(e) = manager.request_contacts().await {
                     tracing::warn!("signal[{account_id}]: asking the phone for its contacts: {e}");
+                }
+            }
+            Command::Profile { who } => {
+                use presage::{libsignal_service::protocol::Aci, store::ContentsStore};
+                let id = ServiceId::Aci(Aci::from(who));
+                let own = uuid::Uuid::from(manager.registration_data().service_ids.aci());
+                // The account's own key is part of its registration; everybody else's is what their messages brought.
+                let key = if who == own { Some(manager.registration_data().profile_key()) } else { manager.store().profile_key(&id).await.ok().flatten() };
+                let Some(key) = key else { return };
+                match manager.retrieve_profile_by_uuid(Aci::from(who), key).await {
+                    Ok(profile) => {
+                        if profile.avatar.is_some() {
+                            if let Ok(Some(bytes)) = manager.retrieve_profile_avatar_by_uuid(who, key).await {
+                                if let Err(e) = super::media::keep_avatar(&account_id, &who, &bytes).await {
+                                    tracing::debug!("signal[{account_id}]: a picture was not kept: {e}");
+                                }
+                            }
+                        }
+                        let ctx = super::people::Ctx::new(&state, &account_id, manager.store().clone(), own);
+                        super::inbox::profile_arrived(&ctx, &who).await;
+                    }
+                    Err(e) => tracing::debug!("signal[{account_id}]: a profile was not fetched: {e}"),
                 }
             }
             Command::Fetch { pointer, done } => {
@@ -109,9 +132,37 @@ pub fn run(_state: &AppState, handle: &Handle, manager: &Library, command: Comma
                     tracing::debug!("signal[{account_id}]: the phone was not asked: {e}");
                 }
             }
-            Command::Send { thread, body, ranges, quote, done } => {
+            Command::Upload { files, done } => {
+                let specs = files
+                    .into_iter()
+                    .map(|f| {
+                        let spec = presage::libsignal_service::sender::AttachmentSpec {
+                            content_type: f.content_type,
+                            length: f.bytes.len(),
+                            file_name: Some(f.name),
+                            preview: None,
+                            voice_note: None,
+                            borderless: None,
+                            width: f.width,
+                            height: f.height,
+                            caption: None,
+                            blur_hash: None,
+                        };
+                        (spec, f.bytes)
+                    })
+                    .collect();
+                let result = match manager.upload_attachments(specs).await {
+                    Ok(results) => results.into_iter().collect::<Result<Vec<_>, _>>().map_err(|e| format!("Signal did not take the file: {e}")),
+                    Err(e) => Err(explain(&e)),
+                };
+                if let Err(e) = &result {
+                    tracing::info!("signal[{account_id}]: an upload failed: {e}");
+                }
+                let _ = done.send(result);
+            }
+            Command::Send { thread, body, ranges, quote, attachments, done } => {
                 let at = now_ms();
-                let dm = DataMessage { body: Some(body), body_ranges: ranges, quote, timestamp: Some(at), ..Default::default() };
+                let dm = DataMessage { body: Some(body).filter(|b| !b.is_empty()), body_ranges: ranges, quote, attachments, timestamp: Some(at), ..Default::default() };
                 let result = deliver(&mut manager, &thread, dm, at).await;
                 finish(done, result, at);
             }

@@ -54,6 +54,8 @@ pub struct Memory {
     pub read_marks: Mutex<HashMap<String, HashMap<Uuid, u64>>>,
     /// Messages a read receipt has been dealt with for, so reading a conversation twice sends nothing twice.
     pub receipted: Mutex<HashSet<String>>,
+    /// People whose profile has been asked for on this connection, so it is asked for once.
+    pub asked_profiles: Mutex<HashSet<Uuid>>,
 }
 
 impl Memory {

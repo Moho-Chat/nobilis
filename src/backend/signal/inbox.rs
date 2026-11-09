@@ -50,6 +50,40 @@ pub async fn announce_self(state: &AppState, config: &crate::accounts::SignalAcc
     state.runtime.set_own_identity(&config.account_id(), &label);
 }
 
+/// A person's profile has been fetched: what they are called and what they look like may have changed.
+pub async fn profile_arrived(ctx: &Ctx<'_>, who: &Uuid) {
+    if ctx.is_own(who) {
+        // The account's own name, for what it says from here.
+        let key = presage::libsignal_service::protocol::ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(*who));
+        if let Ok(Some(k)) = ctx.store.profile_key(&key).await {
+            if let Ok(Some(profile)) = ctx.store.profile(*who, k).await {
+                if let Some(name) = profile.name.map(|n| n.to_string()).filter(|n| !n.trim().is_empty()) {
+                    ctx.state.runtime.set_own_identity(ctx.account_id, &name);
+                }
+            }
+        }
+        return;
+    }
+    rename_known(ctx).await;
+    let remote = ids::remote_id(&Thread::Contact(ServiceId::Aci(presage::libsignal_service::protocol::Aci::from(*who))));
+    if let Some(avatar) = super::media::avatar_of(ctx.account_id, who) {
+        if let Some(buffer) = ctx.state.runtime.list_buffers().into_iter().find(|b| b.account_id == ctx.account_id && b.remote_id.as_deref() == Some(remote.as_str())) {
+            ctx.state.runtime.set_buffer_avatar(ctx.state, &buffer.id, &avatar);
+        }
+    }
+}
+
+/// Asks for the profile of a person the account cannot name yet, once per connection.
+pub async fn want_profile(ctx: &Ctx<'_>, handle: &Handle, who: &Uuid) {
+    if ctx.is_own(who) || people::has_name(ctx, who).await {
+        return;
+    }
+    let first = handle.memory.asked_profiles.lock().unwrap_or_else(|e| e.into_inner()).insert(*who);
+    if first {
+        let _ = handle.commands.send(super::Command::Profile { who: *who });
+    }
+}
+
 /// Opens (or finds) the conversation with a person, named by their ACI.
 pub async fn open_dm(state: &AppState, handle: &Handle, user_id: &str) -> anyhow::Result<String> {
     let who = Uuid::parse_str(user_id.trim()).map_err(|_| anyhow::anyhow!("Signal needs the person's id, not their name"))?;
@@ -109,6 +143,10 @@ pub async fn content(state: &AppState, handle: &Handle, manager: &Manager<Signal
     let ctx = ctx(state, handle, manager);
     let sender = ids::uuid_of(&content.metadata.sender);
     let sent_at = content.metadata.client_timestamp.timestamp_millis().max(0) as u64;
+    if matches!(content.body, ContentBody::DataMessage(_) | ContentBody::EditMessage(_)) {
+        // Somebody not in the address book is called what they call themselves, which takes their profile.
+        want_profile(&ctx, handle, &sender).await;
+    }
     match &content.body {
         ContentBody::DataMessage(dm) => {
             let Ok(thread) = Thread::try_from(&content) else { return };
@@ -334,7 +372,7 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
         reply,
         Some(id),
         highlight,
-        None,
+        super::media::avatar_of(ctx.account_id, &author),
         Vec::new(),
         attachments,
         Some(author.to_string()),

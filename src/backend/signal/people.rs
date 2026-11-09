@@ -73,6 +73,25 @@ pub async fn person(ctx: &Ctx<'_>, who: &Uuid) -> String {
     format!("Signal user ·{}", stub(who))
 }
 
+/// Whether the account knows what to call this person: a contact name, or a profile it has fetched.
+pub async fn has_name(ctx: &Ctx<'_>, who: &Uuid) -> bool {
+    if ctx.is_own(who) {
+        return true;
+    }
+    let id = ServiceId::Aci(Aci::from(*who));
+    if let Ok(Some(contact)) = ctx.store.contact_by_id(&id).await {
+        if !contact.name.trim().is_empty() {
+            return true;
+        }
+    }
+    if let Ok(Some(key)) = ctx.store.profile_key(&id).await {
+        if let Ok(Some(profile)) = ctx.store.profile(*who, key).await {
+            return profile.name.is_some();
+        }
+    }
+    false
+}
+
 /// A group's title.
 pub async fn group_title(ctx: &Ctx<'_>, key: &[u8; 32]) -> String {
     match ctx.store.group(*key).await {

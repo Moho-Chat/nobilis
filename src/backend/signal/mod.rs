@@ -40,6 +40,16 @@ pub struct Handle {
     pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
 }
 
+/// A file to put on Signal's servers.
+#[derive(Debug)]
+pub struct Upload {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
 /// How a command says how it went: the time the message was sent, or why it was not.
 pub type Done = tokio::sync::oneshot::Sender<Result<u64, String>>;
 
@@ -49,11 +59,15 @@ pub enum Command {
     /// Ask the phone to send its contacts again.
     RefreshContacts,
     /// Say something. `body` is plain text and `ranges` the styles over it.
-    Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, done: Done },
+    Send { thread: presage::store::Thread, body: String, ranges: Vec<presage::proto::BodyRange>, quote: Option<presage::proto::data_message::Quote>, attachments: Vec<presage::proto::AttachmentPointer>, done: Done },
+    /// Encrypt files and put them on Signal's file servers; the answer is the pointers a message carries.
+    Upload { files: Vec<Upload>, done: tokio::sync::oneshot::Sender<Result<Vec<presage::proto::AttachmentPointer>, String>> },
     /// React to a message, or take the reaction back.
     React { thread: presage::store::Thread, target_ms: u64, target_author: uuid::Uuid, emoji: String, remove: bool, done: Done },
     /// Tell somebody their messages were delivered, read or viewed.
     Receipt { to: presage::libsignal_service::protocol::ServiceId, kind: presage::proto::receipt_message::Type, timestamps: Vec<u64> },
+    /// Fetch a person's profile (name and picture), once their profile key is known.
+    Profile { who: uuid::Uuid },
     /// Download and decrypt an attachment.
     Fetch { pointer: Box<presage::proto::AttachmentPointer>, done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
     /// Tell the account's other devices these messages were read here.

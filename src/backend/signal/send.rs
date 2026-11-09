@@ -31,11 +31,90 @@ async fn ask(handle: &Handle, make: impl FnOnce(Done) -> Command) -> Result<u64,
 
 /// Sends text, optionally as a reply to the message `reply_to`.
 pub async fn text(state: &AppState, buffer: &Buffer, body: &str, reply_to: Option<&str>) -> Result<(), String> {
+    files(state, buffer, body, &[], reply_to, None).await
+}
+
+/// The most Signal takes in one attachment, and in one message.
+const BIGGEST: u64 = 100 * 1024 * 1024;
+const MOST: usize = 32;
+
+fn content_type_of(path: &str) -> &'static str {
+    match std::path::Path::new(path).extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("heic") => "image/heic",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("mov") => "video/quicktime",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a" | "aac") => "audio/aac",
+        Some("ogg" | "oga" | "opus") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+/// The pixel size of a picture, if it can be read without decoding the whole of it.
+fn dimensions_of(path: &str, content_type: &str) -> (Option<u32>, Option<u32>) {
+    if !content_type.starts_with("image/") {
+        return (None, None);
+    }
+    match image::ImageReader::open(path).and_then(|r| r.with_guessed_format()).map(|r| r.into_dimensions()) {
+        Ok(Ok((w, h))) => (Some(w), Some(h)),
+        _ => (None, None),
+    }
+}
+
+/// Sends text and files: `paths` are put on Signal's servers first, then the message carries them.
+pub async fn files(state: &AppState, buffer: &Buffer, body: &str, paths: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
     let (handle, thread) = target(state, buffer)?;
     let (plain, styles) = compose::parse(body);
-    if plain.trim().is_empty() {
+    if plain.trim().is_empty() && paths.is_empty() {
         return Err("there is nothing to send".to_string());
     }
+    if paths.len() > MOST {
+        return Err(format!("Signal takes at most {MOST} files in a message, and this has {}", paths.len()));
+    }
+    let mut uploads = Vec::new();
+    let mut local = Vec::new();
+    let total: u64 = paths.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+    if let Some(p) = progress {
+        p.at(crate::upload::Phase::Preparing, total as usize, "Signal");
+    }
+    for (path, _) in paths {
+        let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if size > BIGGEST {
+            return Err(format!("{path} is {} MB and Signal takes at most {} MB", size / 1_000_000, BIGGEST / 1_000_000));
+        }
+        let bytes = tokio::fs::read(path).await.map_err(|e| format!("reading {path}: {e}"))?;
+        let content_type = content_type_of(path);
+        let (width, height) = dimensions_of(path, content_type);
+        let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+        local.push(path.clone());
+        uploads.push(super::Upload { name, content_type: content_type.to_string(), bytes, width, height });
+    }
+    let pointers = if uploads.is_empty() {
+        Vec::new()
+    } else {
+        if let Some(p) = progress {
+            p.at(crate::upload::Phase::Sending, total as usize, "Signal");
+        }
+        let (done, answer) = oneshot::channel();
+        handle.commands.send(Command::Upload { files: uploads, done }).map_err(|_| "that Signal account is not connected".to_string())?;
+        let pointers = match tokio::time::timeout(Duration::from_secs(600), answer).await {
+            Ok(Ok(result)) => result?,
+            Ok(Err(_)) => return Err("the connection ended before Signal took the files".to_string()),
+            Err(_) => return Err("Signal did not take the files in time".to_string()),
+        };
+        if let Some(p) = progress {
+            p.at(crate::upload::Phase::Waiting, total as usize, "Signal");
+        }
+        pointers
+    };
     let quote = reply_to.and_then(|id| commands::quote_of(state, &buffer.id, id));
     let reply = reply_to.zip(quote.as_ref()).map(|(id, q)| crate::model::ReplyPreview {
         id: id.to_string(),
@@ -49,11 +128,22 @@ pub async fn text(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     let (plain_for_wire, ranges_for_wire) = (plain.clone(), styles.clone());
     let timer = presage::store::ContentsStore::expire_timer(&handle.store, &thread).await.ok().flatten().map(|(seconds, _)| seconds).filter(|s| *s > 0);
     let noted_thread = thread.clone();
-    let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, done }).await?;
+    let sent_pointers = pointers.clone();
+    let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, attachments: sent_pointers, done }).await?;
     let drawn = ranges::render(&plain, &styles, |_| "someone".to_string());
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
+    // The files are on hand already: they go into the cache under the names the attachments will be looked for by.
+    let attachments = super::media::attachments_of(&buffer.account_id, &noted_thread, &handle.own, at, &pointers);
+    for (attachment, from) in attachments.iter().zip(&local) {
+        if let Some(to) = attachment.path.as_deref().and_then(|p| p.strip_prefix("file://")) {
+            if let Some(parent) = std::path::Path::new(to).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(from, to);
+        }
+    }
     state.runtime.record_message_at(
-        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
+        state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), attachments, Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
     );
     // The conversation has a disappearing timer, which the library put on the message: it runs from now.
     if let Some(seconds) = timer {
@@ -158,4 +248,24 @@ pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     let reads: Vec<(uuid::Uuid, u64)> = by_sender.into_iter().flat_map(|(sender, ts)| ts.into_iter().map(move |t| (sender, t))).collect();
     let _ = handle.commands.send(Command::ReadSync { reads });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_is_sent_as_what_its_name_says_it_is() {
+        assert_eq!(content_type_of("/tmp/Cat.JPG"), "image/jpeg");
+        assert_eq!(content_type_of("a.webm"), "video/webm");
+        assert_eq!(content_type_of("voice.opus"), "audio/ogg");
+        assert_eq!(content_type_of("noext"), "application/octet-stream");
+        assert_eq!(content_type_of("archive.zip"), "application/octet-stream");
+    }
+
+    #[test]
+    fn only_a_picture_has_a_size_to_read() {
+        assert_eq!(dimensions_of("/nonexistent.png", "image/png"), (None, None));
+        assert_eq!(dimensions_of("/nonexistent.mp4", "video/mp4"), (None, None));
+    }
 }

@@ -108,6 +108,29 @@ pub fn attachments_of(account_id: &str, thread: &Thread, author: &Uuid, ts: u64,
         .collect()
 }
 
+/// Where a person's picture is (or will be) in the cache.
+pub fn avatar_path(account_id: &str, who: &Uuid) -> PathBuf {
+    crate::media_cache::dir(AVATARS).join(format!("{}.jpg", hash(&format!("{account_id}|{who}"))))
+}
+
+/// The address of a person's picture if it has been fetched.
+pub fn avatar_of(account_id: &str, who: &Uuid) -> Option<String> {
+    let path = avatar_path(account_id, who);
+    path.exists().then(|| format!("file://{}", path.display()))
+}
+
+/// Keeps a person's picture, whole and renamed into place.
+pub async fn keep_avatar(account_id: &str, who: &Uuid, bytes: &[u8]) -> Result<()> {
+    let path = avatar_path(account_id, who);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let part = path.with_extension("part");
+    tokio::fs::write(&part, bytes).await?;
+    tokio::fs::rename(&part, &path).await.with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
 /// The data message a stored content carries, whichever way it came: from somebody, from the phone, or as an edit.
 pub fn data_message_of(content: &Content) -> Option<&DataMessage> {
     match &content.body {
