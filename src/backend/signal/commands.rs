@@ -62,6 +62,13 @@ pub fn run(_state: &AppState, handle: &Handle, manager: &Library, command: Comma
                     tracing::warn!("signal[{account_id}]: asking the phone for its contacts: {e}");
                 }
             }
+            Command::Fetch { pointer, done } => {
+                let result = manager.get_attachment(&pointer).await.map_err(|e| {
+                    tracing::info!("signal[{account_id}]: an attachment was not fetched: {e}");
+                    format!("Signal did not give the file: {e}")
+                });
+                let _ = done.send(result);
+            }
             Command::Receipt { to, kind, timestamps } => {
                 let at = now_ms();
                 let receipt = ReceiptMessage { r#type: Some(kind as i32), timestamp: timestamps };

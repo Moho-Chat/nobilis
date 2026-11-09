@@ -12,10 +12,12 @@
 pub mod commands;
 pub mod compose;
 pub mod connect;
+pub mod expiry;
 pub mod ids;
 pub mod inbox;
 pub mod link;
 pub mod local;
+pub mod media;
 pub mod memory;
 pub mod people;
 pub mod ranges;
@@ -52,6 +54,8 @@ pub enum Command {
     React { thread: presage::store::Thread, target_ms: u64, target_author: uuid::Uuid, emoji: String, remove: bool, done: Done },
     /// Tell somebody their messages were delivered, read or viewed.
     Receipt { to: presage::libsignal_service::protocol::ServiceId, kind: presage::proto::receipt_message::Type, timestamps: Vec<u64> },
+    /// Download and decrypt an attachment.
+    Fetch { pointer: Box<presage::proto::AttachmentPointer>, done: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>> },
     /// Tell the account's other devices these messages were read here.
     ReadSync { reads: Vec<(uuid::Uuid, u64)> },
     /// Say the account is typing in a conversation, or has stopped.

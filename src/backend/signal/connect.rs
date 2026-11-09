@@ -172,6 +172,10 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
     let _ = state.accounts.mutate_signal(account_id, |a| a.last_connected = now_seconds());
     let mut caught_up = false;
     let mut last_stamp = now_seconds();
+    // What fell due while the daemon was away goes first, then the clock keeps watch.
+    super::expiry::sweep(state, manager.store()).await;
+    let mut sweeping = tokio::time::interval(Duration::from_secs(20));
+    sweeping.tick().await;
 
     loop {
         tokio::select! {
@@ -201,6 +205,9 @@ async fn run(state: &AppState, config: &SignalAccountConfig, account_id: &str, d
                     last_stamp = now;
                     let _ = state.accounts.mutate_signal(account_id, |a| a.last_connected = now);
                 }
+            }
+            _ = sweeping.tick() => {
+                super::expiry::sweep(state, manager.store()).await;
             }
             command = incoming.recv() => {
                 match command {

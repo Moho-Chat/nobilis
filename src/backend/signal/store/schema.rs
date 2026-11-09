@@ -11,7 +11,22 @@
 //! `user_version` records which of these has been applied; a new step is added as a new constant and a new arm in
 //! `migrate`, never an edit of an old one.
 
-pub(super) const KNOWN_VERSION: i64 = 1;
+pub(super) const KNOWN_VERSION: i64 = 2;
+
+/// Messages that will disappear, and when. Kept in the account's own file so a daemon that was down when one fell due
+/// removes it as soon as it is up, instead of forgetting the promise made to the sender.
+pub(super) const V2: &str = "
+CREATE TABLE expiries (
+    buffer_id TEXT NOT NULL,
+    msg_id TEXT NOT NULL,
+    thread_remote TEXT NOT NULL,
+    sent_ms INTEGER NOT NULL,
+    seconds INTEGER NOT NULL,
+    deadline INTEGER,
+    PRIMARY KEY (buffer_id, msg_id)
+);
+CREATE INDEX expiries_deadline ON expiries (deadline);
+";
 
 pub(super) const V1: &str = "
 CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB NOT NULL);

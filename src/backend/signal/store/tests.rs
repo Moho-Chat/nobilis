@@ -539,3 +539,38 @@ fn an_account_file_name_cannot_leave_the_folder() {
     assert_eq!(path_for("../x").file_name().unwrap(), "x.db");
     assert!(path_for_link("a/../b").starts_with(folder()));
 }
+
+#[test]
+fn a_message_that_will_disappear_waits_to_be_read_then_runs_down_and_is_due() {
+    use super::Expiry;
+    let s = store();
+    let row = |id: &str, deadline: Option<i64>| Expiry { buffer_id: "b".into(), msg_id: id.into(), thread_remote: "p:x".into(), sent_ms: 5, seconds: 60, deadline };
+    s.expiry_add(&row("waiting", None)).unwrap();
+    s.expiry_add(&row("sent", Some(1_000))).unwrap();
+    // Noted twice, it keeps its first deadline.
+    s.expiry_add(&row("sent", Some(9_999))).unwrap();
+    assert_eq!(s.expiry_count().unwrap(), 2);
+    // Nothing waiting is due, however late it is.
+    assert_eq!(s.expiry_due(5_000).unwrap().iter().map(|e| e.msg_id.as_str()).collect::<Vec<_>>(), vec!["sent"]);
+    assert_eq!(s.expiry_start("b", 2_000).unwrap(), 1);
+    assert!(s.expiry_due(2_059).unwrap().iter().all(|e| e.msg_id != "waiting"));
+    assert_eq!(s.expiry_due(2_060).unwrap().len(), 2);
+    s.expiry_done("b", "sent").unwrap();
+    s.expiry_done("b", "waiting").unwrap();
+    assert_eq!(s.expiry_count().unwrap(), 0);
+}
+
+#[test]
+fn a_store_made_before_disappearing_messages_gets_the_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(schema::V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let s = SignalStore::open(&path, OnNewIdentity::Trust).unwrap();
+    assert_eq!(s.expiry_count().unwrap(), 0);
+    let version: i64 = s.read(|c| Ok(c.pragma_query_value(None, "user_version", |r| r.get(0))?)).unwrap();
+    assert_eq!(version, 2);
+}

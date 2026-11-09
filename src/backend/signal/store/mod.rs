@@ -23,12 +23,14 @@
 mod content;
 mod data;
 mod error;
+mod expiry;
 mod protocol;
 mod schema;
 #[cfg(test)]
 mod tests;
 
 pub use error::SignalStoreError;
+pub use expiry::Expiry;
 pub use presage::model::identity::OnNewIdentity;
 pub use protocol::SignalProtocolStore;
 
@@ -159,6 +161,12 @@ impl SignalStore {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute_batch(schema::V1)?;
             tx.pragma_update(None, "user_version", 1)?;
+            tx.commit()?;
+        }
+        if found < 2 {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute_batch(schema::V2)?;
+            tx.pragma_update(None, "user_version", 2)?;
             tx.commit()?;
         }
         Ok(())

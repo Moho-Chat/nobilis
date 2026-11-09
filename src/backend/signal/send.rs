@@ -47,12 +47,19 @@ pub async fn text(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         chat: None,
     });
     let (plain_for_wire, ranges_for_wire) = (plain.clone(), styles.clone());
+    let timer = presage::store::ContentsStore::expire_timer(&handle.store, &thread).await.ok().flatten().map(|(seconds, _)| seconds).filter(|s| *s > 0);
+    let noted_thread = thread.clone();
     let at = ask(&handle, |done| Command::Send { thread, body: plain_for_wire, ranges: ranges_for_wire, quote, done }).await?;
     let drawn = ranges::render(&plain, &styles, |_| "someone".to_string());
     let own = state.runtime.own_identity(&buffer.account_id).unwrap_or_else(|| "Me".to_string());
     state.runtime.record_message_at(
         state, &buffer.account_id, &buffer.name, &buffer.kind, &own, &drawn.body, false, "chat", reply, Some(ids::message_id(at, &handle.own)), false, None, Vec::new(), Vec::new(), Some(handle.own.to_string()), Some((at / 1000) as i64), drawn.html, None,
     );
+    // The conversation has a disappearing timer, which the library put on the message: it runs from now.
+    if let Some(seconds) = timer {
+        let ctx = super::people::Ctx::new(state, &buffer.account_id, handle.store.clone(), handle.own);
+        super::expiry::from_sent(&ctx, &buffer.id, &noted_thread, &ids::message_id(at, &handle.own), at, seconds);
+    }
     Ok(())
 }
 
@@ -125,6 +132,8 @@ pub fn typing(state: &AppState, buffer: &Buffer, started: bool) -> Result<(), St
 pub fn mark_read(state: &AppState, buffer: &Buffer) -> Result<(), String> {
     use presage::libsignal_service::protocol::{Aci, ServiceId};
     let (handle, _) = target(state, buffer)?;
+    // Looking at a conversation is what starts the clock on what was waiting to disappear in it.
+    super::expiry::started(&handle.store, &buffer.id);
     let rows = state.store.get_backlog(&buffer.id, i64::MAX, 100).map_err(|e| e.to_string())?;
     let mut by_sender: std::collections::HashMap<uuid::Uuid, Vec<u64>> = std::collections::HashMap::new();
     {

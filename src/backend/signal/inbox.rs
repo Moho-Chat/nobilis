@@ -319,6 +319,9 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
     };
     let own = ctx.is_own(&author);
     let highlight = !own && shown.mentioned_me;
+    // The pictures, files and stickers: named in the cache now, fetched when looked at (see `media`).
+    let pointers = if dm.is_view_once.unwrap_or(false) { Vec::new() } else { super::media::pointers_of(dm) };
+    let attachments = super::media::attachments_of(ctx.account_id, thread, &author, at, &pointers);
     let recorded = ctx.state.runtime.record_message_at(
         ctx.state,
         ctx.account_id,
@@ -333,7 +336,7 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
         highlight,
         None,
         Vec::new(),
-        Vec::new(),
+        attachments,
         Some(author.to_string()),
         Some(seconds(at)),
         shown.html,
@@ -341,6 +344,14 @@ async fn data_message(ctx: &Ctx<'_>, thread: &Thread, author: Uuid, at: u64, dm:
     );
     if !recorded {
         tracing::debug!("signal[{}]: a message was not new", ctx.account_id);
+    } else if let Some(seconds) = dm.expire_timer.filter(|s| *s > 0) {
+        // It will disappear: from when it was sent if it is the account's own, from when it is looked at otherwise.
+        let id = ids::message_id(at, &author);
+        if own {
+            super::expiry::from_sent(ctx, &buffer.id, thread, &id, at, seconds);
+        } else {
+            super::expiry::from_received(ctx, &buffer.id, thread, &id, at, seconds);
+        }
     }
 }
 
@@ -373,13 +384,8 @@ async fn describe(ctx: &Ctx<'_>, dm: &DataMessage) -> Shown {
         lines.push("[Reply to a story]".to_string());
     }
     if dm.is_view_once.unwrap_or(false) {
+        // Seen once and gone: moho does not keep or show it, so it says where it can be seen.
         lines.push("[View-once media: open it in Signal on your phone]".to_string());
-    } else {
-        lines.extend(dm.attachments.iter().map(attachment_label));
-    }
-    if let Some(sticker) = &dm.sticker {
-        let emoji = sticker.emoji.clone().unwrap_or_default();
-        lines.push(if emoji.is_empty() { "[Sticker]".to_string() } else { format!("[Sticker {emoji}]") });
     }
     for card in &dm.contact {
         let name = card.name.as_ref().map(|n| [n.given_name.as_deref(), n.family_name.as_deref()].iter().flatten().copied().collect::<Vec<_>>().join(" ")).unwrap_or_default();
@@ -404,25 +410,6 @@ async fn describe(ctx: &Ctx<'_>, dm: &DataMessage) -> Shown {
     // The html is only the styled text; the labels would be lost from it, so it is dropped when there are labels.
     let html = if lines.is_empty() { drawn.html } else { None };
     Shown { body, html, mentioned_me }
-}
-
-/// What an attachment is called in the line that stands for it until it can be drawn.
-pub fn attachment_label(pointer: &presage::proto::AttachmentPointer) -> String {
-    let kind = pointer.content_type.as_deref().unwrap_or("");
-    let flags = pointer.flags.unwrap_or(0);
-    let name = pointer.file_name.as_deref().filter(|n| !n.is_empty());
-    match kind.split('/').next().unwrap_or("") {
-        "image" if flags & GIF != 0 || kind == "image/gif" => "[GIF]".to_string(),
-        "image" => "[Photo]".to_string(),
-        "video" if flags & GIF != 0 => "[GIF]".to_string(),
-        "video" => "[Video]".to_string(),
-        "audio" if flags & VOICE_MESSAGE != 0 => "[Voice message]".to_string(),
-        "audio" => "[Audio]".to_string(),
-        _ => match name {
-            Some(name) => format!("[File: {name}]"),
-            None => "[File]".to_string(),
-        },
-    }
 }
 
 /// The quote a reply carries, as the window draws it.
@@ -690,12 +677,10 @@ mod tests {
         gift.gift_badge = Some(Default::default());
         data_message(&ctx, &person(ALICE), uuid(ALICE), 1_700_000_016_000, &gift).await;
         let rows = backlog(&state, &only_buffer(&state));
-        assert_eq!(rows[0].body, "look\n[Photo]");
+        assert_eq!(rows[0].body, "look");
+        assert_eq!((rows[0].attachments.len(), rows[0].attachments[0].kind.as_str()), (1, "image"));
+        assert!(rows[0].attachments[0].path.as_deref().is_some_and(|p| p.contains("/signal-media/")));
         assert!(rows[1].body.contains("not supported in moho"), "{}", rows[1].body);
-    }
-
-    fn pointer(kind: &str, flags: u32, name: Option<&str>) -> AttachmentPointer {
-        AttachmentPointer { content_type: Some(kind.to_string()), flags: Some(flags), file_name: name.map(String::from), ..Default::default() }
     }
 
     fn handle(own: &str) -> (Handle, tokio::sync::mpsc::UnboundedReceiver<super::super::Command>) {
@@ -817,15 +802,32 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Command::ReadSync { .. })));
     }
 
-    #[test]
-    fn an_attachment_is_named_for_what_it_is() {
-        assert_eq!(attachment_label(&pointer("image/jpeg", 0, None)), "[Photo]");
-        assert_eq!(attachment_label(&pointer("image/gif", 0, None)), "[GIF]");
-        assert_eq!(attachment_label(&pointer("video/mp4", GIF, None)), "[GIF]");
-        assert_eq!(attachment_label(&pointer("video/mp4", 0, None)), "[Video]");
-        assert_eq!(attachment_label(&pointer("audio/aac", VOICE_MESSAGE, None)), "[Voice message]");
-        assert_eq!(attachment_label(&pointer("audio/mpeg", 0, None)), "[Audio]");
-        assert_eq!(attachment_label(&pointer("application/pdf", 0, Some("a.pdf"))), "[File: a.pdf]");
-        assert_eq!(attachment_label(&pointer("application/zip", 0, None)), "[File]");
+    #[tokio::test]
+    async fn a_disappearing_message_goes_when_its_time_comes_and_not_before_it_was_seen() {
+        use super::super::{expiry, send};
+        let (state, store) = world("vanish").await;
+        let ctx = ctx(&state, &store);
+        let (handle, _rx) = handle(ME);
+        let handle = Handle { store: store.clone(), ..handle };
+        state.runtime.set_signal_handle(ACCOUNT, handle.clone());
+        let now_ms = (expiry::now() * 1000) as u64;
+        // A message received with a one-minute timer, and one the account sent with a timer that has already run out.
+        let mut incoming = text("secret", now_ms);
+        incoming.expire_timer = Some(60);
+        data_message(&ctx, &person(ALICE), uuid(ALICE), now_ms, &incoming).await;
+        let mut mine = text("mine", now_ms - 120_000);
+        mine.expire_timer = Some(60);
+        data_message(&ctx, &person(ALICE), uuid(ME), now_ms - 120_000, &mine).await;
+        let buffer = only_buffer(&state);
+        assert_eq!(backlog(&state, &buffer).len(), 2);
+        assert_eq!(store.expiry_count().unwrap(), 2);
+        // Only the account's own is due: the other has not been looked at.
+        assert_eq!(expiry::sweep(&state, &store).await, 1);
+        let rows = backlog(&state, &buffer);
+        assert_eq!(rows.iter().map(|m| m.body.as_str()).collect::<Vec<_>>(), vec!["secret"]);
+        // Looking at the conversation starts its clock; a minute later it is gone.
+        send::mark_read(&state, &buffer).unwrap();
+        assert_eq!(store.expiry_due(expiry::now()).unwrap().len(), 0);
+        assert_eq!(store.expiry_due(expiry::now() + 61).unwrap().len(), 1);
     }
 }
