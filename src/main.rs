@@ -351,6 +351,9 @@ async fn run() -> Result<()> {
     for cfg in state.accounts.all_stoat() {
         backend::stoat::spawn(state.clone(), cfg);
     }
+    for cfg in state.accounts.all_xmpp() {
+        backend::xmpp::spawn(state.clone(), cfg);
+    }
 
     // What was going on last time, before anything is served: a window that
     // connects immediately should see the same list it was looking at.

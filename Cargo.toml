@@ -65,6 +65,15 @@ grammers-client = { version = "=0.11.0", default-features = false, features = ["
 grammers-mtsender = { version = "=0.11.0", default-features = false, features = ["proxy"] }
 grammers-session = { version = "=0.11.0", default-features = false, features = ["serde"] }
 
+# XMPP backend: the xmpp-rs stack (MPL-2.0, which GPLv3 can include). `ring`, not the default aws-lc-rs, so the one TLS
+# provider main.rs installs is the one these use and no C compiler is needed - see backend/xmpp.
+tokio-xmpp = { version = "6.0", default-features = false, features = ["ring", "starttls", "direct-tls", "rustls-native-certs"] }
+xmpp-parsers = "0.23"
+# Named directly because the connector in backend/xmpp/transport.rs speaks their types: the same versions the library
+# already resolved.
+sasl = "0.5"
+rustls-native-certs = "0.8"
+
 # Sneedchat backend (SneedChat over embedded Tor)
 arti-client = { version = "0.47", default-features = false, features = ["tokio", "rustls", "onion-service-client", "compression"] }
 tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }

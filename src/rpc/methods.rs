@@ -94,6 +94,10 @@ fn respawn_account(state: &AppState, id: &str) {
         if let Some(cfg) = state.accounts.get_twitch(id) {
             backend::twitch::spawn(state.clone(), cfg);
         }
+    } else if id.starts_with("xmpp:") {
+        if let Some(cfg) = state.accounts.get_xmpp(id) {
+            backend::xmpp::spawn(state.clone(), cfg);
+        }
     } else if let Some(cfg) = state.accounts.get_irc(id) {
         backend::irc::spawn(state.clone(), cfg);
     }
@@ -122,6 +126,7 @@ fn adding_service(method: &str) -> Option<&'static str> {
         "addTwitchAccount" | "startTwitchLogin" => Some("twitch"),
         "addTelegramAccount" => Some("telegram"),
         "addStoatAccount" | "addStoatAccountToken" => Some("stoat"),
+        "addXmppAccount" => Some("xmpp"),
         _ => None,
     }
 }
@@ -438,6 +443,7 @@ pub async fn dispatch(
                 { "id": "twitch", "name": "Twitch", "available": true },
                 { "id": "telegram", "name": "Telegram", "available": true },
                 { "id": "stoat", "name": "Stoat", "available": true },
+                { "id": "xmpp", "name": "XMPP", "available": true },
             ])),
             None,
         ),
@@ -906,6 +912,14 @@ pub async fn dispatch(
                         match state.accounts.get_twitch(id) {
                             Some(cfg) => {
                                 backend::twitch::spawn(state.clone(), cfg);
+                                (Some(ok_node()), None)
+                            }
+                            None => (None, Some("no such account".to_string())),
+                        }
+                    } else if id.starts_with("xmpp:") {
+                        match state.accounts.get_xmpp(id) {
+                            Some(cfg) => {
+                                backend::xmpp::spawn(state.clone(), cfg);
                                 (Some(ok_node()), None)
                             }
                             None => (None, Some("no such account".to_string())),
@@ -4897,6 +4911,45 @@ pub async fn dispatch(
                 backend::stoat::login::start_token(state.clone(), login_id.clone(), instance, token.to_string());
             }
             (Some(serde_json::json!({ "loginId": login_id })), None)
+        }
+
+        // An XMPP account is its JID and password on a server of its own: no sign-in flow to wait on, so the account is
+        // made, kept and connected at once, and how the connection fares is the usual connection state. A server with its
+        // own certificate authority, or a self-signed certificate the person has looked at and pinned, is named here too.
+        "addXmppAccount" => {
+            let (Some(jid), Some(password)) = (p_str_opt(params, "jid"), p_str_opt(params, "password")) else {
+                return (None, Some("addXmppAccount requires \"jid\" and \"password\"".to_string()));
+            };
+            let jid = match backend::xmpp::connect::normalise_jid(jid) {
+                Ok(jid) => jid.to_string(),
+                Err(e) => return (None, Some(e)),
+            };
+            let security = match p_str(params, "security", "starttls") {
+                "direct" => "direct",
+                _ => "starttls",
+            };
+            let pin = p_str(params, "pinSha256", "");
+            if !pin.trim().is_empty() && backend::xmpp::transport::normalise_pin(pin).is_none() {
+                return (None, Some("the pinned certificate must be a SHA-256 fingerprint (64 hex digits)".to_string()));
+            }
+            let config = crate::accounts::XmppAccountConfig {
+                jid,
+                password: password.to_string(),
+                host: p_str(params, "host", "").trim().to_string(),
+                port: params.get("port").and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
+                security: security.to_string(),
+                ca_pem: p_str(params, "caPem", "").to_string(),
+                pin_sha256: backend::xmpp::transport::normalise_pin(pin).unwrap_or_default(),
+                ..Default::default()
+            };
+            match state.accounts.add_xmpp(config) {
+                Ok(config) => {
+                    let account_id = config.account_id();
+                    backend::xmpp::spawn(state.clone(), config);
+                    (Some(serde_json::json!({ "accountId": account_id })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
         }
 
         // The second factor Stoat asked for, for a sign-in that is waiting.

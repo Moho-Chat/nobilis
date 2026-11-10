@@ -944,6 +944,7 @@ pub fn service_of(account_id: &str) -> &'static str {
         Some("twitch") => "twitch",
         Some("telegram") => "telegram",
         Some("stoat") => "stoat",
+        Some("xmpp") => "xmpp",
         Some("jabber") => "jabber",
         Some("slack") => "slack",
         _ => "irc",
