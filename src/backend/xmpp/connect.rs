@@ -138,6 +138,10 @@ fn reconnector(state: AppState, account_id: String, connector: Connector, identi
                         let shown = seen.lock().unwrap().clone();
                         if let Some(why) = classify(&e, &shown) {
                             tracing::info!("xmpp[{account_id}]: stopped: {}", why.message());
+                            match (&why, shown) {
+                                (Stop::Certificate(_), Some(seen)) => super::transport::remember_refused(&account_id, seen),
+                                _ => super::transport::forget_refused(&account_id),
+                            }
                             let _ = stop.send(why);
                             // Hold the slot: dropping it would make the library treat the stream as failed. The account
                             // task drops the stream, which closes it.
@@ -175,6 +179,7 @@ pub fn spawn(state: AppState, config: XmppAccountConfig) {
 /// The account's connection for as long as it is wanted. Returns when it has stopped for good.
 async fn run(state: &AppState, account_id: &str) {
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
+    super::transport::forget_refused(account_id);
     let Some(config) = state.accounts.get_xmpp(account_id) else { return };
     let stopped = |stop: &Stop| {
         let (conn, advice) = match stop {

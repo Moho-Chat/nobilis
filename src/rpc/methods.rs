@@ -842,6 +842,7 @@ pub async fn dispatch(
                             });
                         }
                         state.runtime.clear_stoat_handle(id);
+                        backend::xmpp::transport::forget_refused(id);
                         if let Some(config) = telegram_account {
                             backend::telegram::folders::forget(&config.account_id());
                             let state = state.clone();
@@ -4948,6 +4949,59 @@ pub async fn dispatch(
                     backend::xmpp::spawn(state.clone(), config);
                     (Some(serde_json::json!({ "accountId": account_id })), None)
                 }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The certificate an XMPP account's server showed and was refused for, for the person to look at. Nothing is
+        // trusted by being asked about: `trustXmppCertificate` pins exactly the fingerprint it is given if, and only if,
+        // it is the one the server last showed.
+        "getXmppCertificate" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("getXmppCertificate requires \"accountId\"".to_string())) };
+            match backend::xmpp::transport::refused_by(account_id) {
+                Some(seen) => (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused })), None),
+                None => (Some(serde_json::json!({})), None),
+            }
+        }
+
+        "trustXmppCertificate" => {
+            let (Some(account_id), Some(fingerprint)) = (p_str_opt(params, "accountId"), p_str_opt(params, "sha256")) else {
+                return (None, Some("trustXmppCertificate requires \"accountId\" and \"sha256\"".to_string()));
+            };
+            let Some(seen) = backend::xmpp::transport::refused_by(account_id) else {
+                return (None, Some("the server has not shown a certificate that was refused".to_string()));
+            };
+            if backend::xmpp::transport::normalise_pin(fingerprint).as_deref() != Some(seen.sha256.as_str()) {
+                return (None, Some("that is not the certificate the server showed last; connect again and look at it".to_string()));
+            }
+            let pinned = seen.sha256.clone();
+            match state.accounts.mutate_xmpp(account_id, move |a| a.pin_sha256 = pinned) {
+                Ok(true) => {
+                    backend::xmpp::transport::forget_refused(account_id);
+                    if let Some(config) = state.accounts.get_xmpp(account_id) {
+                        backend::xmpp::spawn(state.clone(), config);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // A new password for an account the server stopped accepting one for.
+        "setXmppPassword" => {
+            let (Some(account_id), Some(password)) = (p_str_opt(params, "accountId"), p_str_opt(params, "password")) else {
+                return (None, Some("setXmppPassword requires \"accountId\" and \"password\"".to_string()));
+            };
+            let password = password.to_string();
+            match state.accounts.mutate_xmpp(account_id, move |a| a.password = password) {
+                Ok(true) => {
+                    if let Some(config) = state.accounts.get_xmpp(account_id) {
+                        backend::xmpp::spawn(state.clone(), config);
+                    }
+                    (Some(ok_node()), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
                 Err(e) => (None, Some(format!("{e:#}"))),
             }
         }

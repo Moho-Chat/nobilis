@@ -55,6 +55,25 @@ pub struct Seen {
 /// Where the last certificate seen is kept, shared between a connector and whoever reports on it.
 pub type SeenSlot = Arc<Mutex<Option<Seen>>>;
 
+/// The certificate each stopped account was refused by, so that the window can show it and the person can pin it. Only
+/// what the server showed is ever pinned from here: a fingerprint the window sends is compared with this one.
+fn refused() -> &'static Mutex<std::collections::HashMap<String, Seen>> {
+    static REFUSED: std::sync::OnceLock<Mutex<std::collections::HashMap<String, Seen>>> = std::sync::OnceLock::new();
+    REFUSED.get_or_init(Default::default)
+}
+
+pub fn remember_refused(account_id: &str, seen: Seen) {
+    refused().lock().unwrap().insert(account_id.to_string(), seen);
+}
+
+pub fn forget_refused(account_id: &str) {
+    refused().lock().unwrap().remove(account_id);
+}
+
+pub fn refused_by(account_id: &str) -> Option<Seen> {
+    refused().lock().unwrap().get(account_id).cloned()
+}
+
 /// The transport settings of one account.
 #[derive(Clone, Debug)]
 pub struct Settings {
