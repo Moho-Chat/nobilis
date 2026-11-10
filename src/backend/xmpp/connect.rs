@@ -17,20 +17,21 @@
 //! Once connected, stanzas arrive as [`Event`]s. Signing in is the whole of this file for now: what the stanzas mean
 //! (roster, presence, messages) comes in the milestones after it (Gitea issue #23).
 
+use super::session::{Handle, Session};
 use super::transport::{Connector, Seen, SeenSlot, Settings};
 use crate::accounts::XmppAccountConfig;
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use futures::StreamExt;
 use std::borrow::Cow;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_xmpp::jid::{BareJid, Jid};
-use tokio_xmpp::parsers::presence::{Presence, Type as PresenceType};
 use tokio_xmpp::parsers::sasl::DefinedCondition;
 use tokio_xmpp::stanzastream::{Connection, Event, StanzaStream, StreamEvent};
 use tokio_xmpp::xmlstream::{StreamHeader, Timeouts, XmppStream};
-use tokio_xmpp::{Error, Stanza};
+use tokio_xmpp::Error;
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -212,35 +213,47 @@ async fn run(state: &AppState, account_id: &str) {
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let stream = StanzaStream::new(reconnector(state.clone(), account_id.to_string(), connector, identity, config.password.clone(), seen.clone(), stop_tx), 32);
     let (sender, mut receiver) = stream.split();
+    let sender = Arc::new(sender);
+    let session = Arc::new(Mutex::new(Session::default()));
+    let mut current: Option<Handle> = None;
     loop {
         tokio::select! {
             stop = stop_rx.recv() => {
                 if let Some(stop) = stop {
+                    state.runtime.clear_xmpp_handle(account_id);
                     return stopped(&stop);
                 }
             }
             event = receiver.next() => {
                 let Some(event) = event else {
                     // The library only ends the stream when it has failed for good.
+                    state.runtime.clear_xmpp_handle(account_id);
                     state.runtime.set_conn_state(state, account_id, ConnState::Disconnected, Some("the connection ended"));
                     return;
                 };
                 match event {
                     Event::Stream(StreamEvent::Reset { bound_jid, .. }) => {
                         tracing::info!("xmpp[{account_id}]: signed in as {bound_jid}");
+                        // A stream that began afresh has lost what the server knew of this session: presence, carbons,
+                        // the roster's push subscription. Everything is set up again.
+                        session.lock().unwrap_or_else(|e| e.into_inner()).present = false;
+                        let handle = Handle::new(account_id, bound_jid, sender.clone(), session.clone());
+                        state.runtime.set_xmpp_handle(account_id, handle.clone());
+                        state.runtime.set_own_identity(account_id, handle.own().as_str());
                         state.runtime.set_conn_state(state, account_id, ConnState::Connected, None);
-                        // Until presence is sent the account is connected but not online: it receives messages and
-                        // nothing else, and contacts do not see it.
-                        let _ = sender.send(Box::new(Stanza::Presence(Presence::new(PresenceType::None)))).await;
+                        current = Some(handle.clone());
+                        tokio::spawn({
+                            let state = state.clone();
+                            async move { super::init::run(&state, &handle).await }
+                        });
                     }
                     Event::Stream(StreamEvent::Suspended) => state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None),
                     Event::Stream(StreamEvent::Resumed) => state.runtime.set_conn_state(state, account_id, ConnState::Connected, None),
-                    Event::Stanza(Stanza::Iq(request)) => {
-                        if let Some(reply) = super::iq::answer(&request) {
-                            let _ = sender.send(Box::new(Stanza::Iq(reply))).await;
+                    Event::Stanza(stanza) => {
+                        if let Some(handle) = &current {
+                            super::dispatch::stanza(state, handle, stanza).await;
                         }
                     }
-                    Event::Stanza(stanza) => tracing::trace!("xmpp[{account_id}]: {stanza:?}"),
                 }
             }
         }

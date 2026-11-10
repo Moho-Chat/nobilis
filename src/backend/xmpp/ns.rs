@@ -1,0 +1,33 @@
+//! The namespaces of the extensions this client speaks, in one place, named for the XEP that defines each.
+
+pub const CLIENT: &str = "jabber:client";
+pub const ROSTER: &str = "jabber:iq:roster";
+pub const ROSTER_VER: &str = "urn:xmpp:features:rosterver";
+pub const DISCO_INFO: &str = "http://jabber.org/protocol/disco#info";
+pub const DISCO_ITEMS: &str = "http://jabber.org/protocol/disco#items";
+pub const CAPS: &str = "http://jabber.org/protocol/caps";
+pub const DATA: &str = "jabber:x:data";
+pub const DELAY: &str = "urn:xmpp:delay";
+pub const DELAY_LEGACY: &str = "jabber:x:delay";
+pub const FORWARD: &str = "urn:xmpp:forward:0";
+pub const CARBONS: &str = "urn:xmpp:carbons:2";
+pub const MAM: &str = "urn:xmpp:mam:2";
+pub const RSM: &str = "http://jabber.org/protocol/rsm";
+pub const SID: &str = "urn:xmpp:sid:0";
+pub const RECEIPTS: &str = "urn:xmpp:receipts";
+pub const MARKERS: &str = "urn:xmpp:chat-markers:0";
+pub const CHATSTATES: &str = "http://jabber.org/protocol/chatstates";
+pub const CORRECT: &str = "urn:xmpp:message-correct:0";
+pub const RETRACT: &str = "urn:xmpp:message-retract:1";
+pub const RETRACT_OLD: &str = "urn:xmpp:message-retract:0";
+pub const FASTEN: &str = "urn:xmpp:fasten:0";
+pub const MODERATED: &str = "urn:xmpp:message-moderate:1";
+pub const REACTIONS: &str = "urn:xmpp:reactions:0";
+pub const REPLY: &str = "urn:xmpp:reply:0";
+pub const FALLBACK: &str = "urn:xmpp:fallback:0";
+pub const HINTS: &str = "urn:xmpp:hints";
+pub const OOB: &str = "jabber:x:oob";
+pub const PING: &str = "urn:xmpp:ping";
+pub const VERSION: &str = "jabber:iq:version";
+pub const TIME: &str = "urn:xmpp:time";
+pub const EME: &str = "urn:xmpp:eme:0";

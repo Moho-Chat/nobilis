@@ -532,6 +532,14 @@ pub async fn dispatch(
                             }
                         }
                     }
+                    // XMPP's archive is read for the person, going back from the oldest message held; what it returns
+                    // overlaps what is stored and the store ignores ids it has.
+                    if buffer.account_id.starts_with("xmpp:") {
+                        if let Some(handle) = state.runtime.xmpp_handle(&buffer.account_id) {
+                            let oldest = if before > 0 { state.store.oldest_ts(buffer_id).ok().flatten().unwrap_or(0) } else { 0 };
+                            backend::xmpp::mam::scrollback(state, &handle, &buffer, oldest).await;
+                        }
+                    }
                     // Kick pages back through its own history endpoint,
                     // continuing from where the last page stopped rather than
                     // by timestamp - the endpoint is cursor-based, and asking
@@ -1169,6 +1177,12 @@ pub async fn dispatch(
                     }
                     (Some(ok_node()), None)
                 }
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    if let Err(e) = backend::xmpp::send::typing(state, &buffer, typing).await {
+                        tracing::debug!("sendTyping: {e}");
+                    }
+                    (Some(ok_node()), None)
+                }
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     // It lapses by itself, so only "typing" is said.
                     if typing {
@@ -1411,6 +1425,13 @@ pub async fn dispatch(
                     let publicly = params.get("public").and_then(|v| v.as_bool()).unwrap_or(true);
                     if let Err(e) = backend::matrix::mark_read(state, &buffer.account_id, buffer_id, publicly).await {
                         tracing::debug!("matrix read markers: {e:#}");
+                    }
+                    (Some(ok_node()), None)
+                }
+                // XMPP tells the other side with a chat marker.
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    if let Err(e) = backend::xmpp::send::mark_read(state, &buffer).await {
+                        tracing::debug!("xmpp marker: {e}");
                     }
                     (Some(ok_node()), None)
                 }
@@ -1854,6 +1875,15 @@ pub async fn dispatch(
             } else if state.accounts.get_steam(account_id).is_some() {
                 // A choice, as against stepping away: Steam keeps the two apart.
                 backend::steam::apply_status(state, account_id, status, true)
+            } else if let Some(handle) = state.runtime.xmpp_handle(account_id).filter(|_| account_id.starts_with("xmpp:")) {
+                let show = match status {
+                    "idle" => "away",
+                    "dnd" => "dnd",
+                    _ => "online",
+                };
+                let words = text.clone().unwrap_or_else(|| state.runtime.account_status_text(account_id));
+                backend::xmpp::roster::set_own(&handle, show, &words).await;
+                true
             } else if let Some(handle) = state.runtime.stoat_handle(account_id).filter(|_| account_id.starts_with("stoat:")) {
                 backend::stoat::own::apply_status(&handle, status, text.as_deref()).await
             } else if let Some(sender) = state.runtime.irc_sender(account_id) {
@@ -3695,6 +3725,15 @@ pub async fn dispatch(
                         }
                     }
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => {
+                    if attachment_path.is_some() || params.get("attachmentPaths").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
+                        return (None, Some("Sending files over XMPP is not built yet".to_string()));
+                    }
+                    match backend::xmpp::send::send(state, &buffer, body, reply_to_id.map(str::to_string)).await {
+                        Ok(()) => (Some(ok_node()), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                }
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => {
                     let paths: Vec<String> = match params.get("attachmentPaths").and_then(|v| v.as_array()) {
                         Some(list) => list.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -3933,6 +3972,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::edit(state, &buffer, msg_id, body).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::edit(state, &buffer, msg_id, body).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -3981,6 +4024,10 @@ pub async fn dispatch(
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
                 },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::react(state, &buffer, msg_id, emoji, add).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
+                },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::react(state, &buffer, msg_id, emoji, add).await {
                     Ok(()) => (Some(ok_node()), None),
                     Err(e) => (None, Some(e)),
@@ -4014,6 +4061,10 @@ pub async fn dispatch(
                         Ok(()) => (Some(ok_node()), None),
                         Err(e) => (None, Some(format!("{e:#}"))),
                     },
+                },
+                Some(buffer) if buffer.account_id.starts_with("xmpp:") => match backend::xmpp::send::delete(state, &buffer, msg_id).await {
+                    Ok(()) => (Some(ok_node()), None),
+                    Err(e) => (None, Some(e)),
                 },
                 Some(buffer) if buffer.account_id.starts_with("stoat:") => match backend::stoat::send::delete(state, &buffer, msg_id).await {
                     Ok(()) => (Some(ok_node()), None),
@@ -4950,6 +5001,40 @@ pub async fn dispatch(
                     (Some(serde_json::json!({ "accountId": account_id })), None)
                 }
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // The people on an XMPP account's roster, and what can be done with them. A request for somebody's presence is
+        // what a contact is, so adding one sends it; the other side answers on its own time, and the answer arrives as a
+        // roster push.
+        "xmppAddContact" | "xmppRemoveContact" | "xmppSetContact" | "xmppRequests" | "xmppAnswerRequest" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            if method == "xmppRequests" {
+                return (Some(serde_json::json!({ "requests": backend::xmpp::roster::requests(&handle) })), None);
+            }
+            let jid = match p_str_opt(params, "jid").map(backend::xmpp::connect::normalise_jid) {
+                Some(Ok(jid)) => jid,
+                Some(Err(e)) => return (None, Some(e)),
+                None => return (None, Some(format!("{method} requires \"jid\""))),
+            };
+            let name = p_str_opt(params, "name").map(str::trim).filter(|n| !n.is_empty());
+            let result = match method {
+                "xmppAddContact" => backend::xmpp::roster::add_contact(&handle, &jid, name, p_str_opt(params, "group").map(str::trim).filter(|g| !g.is_empty())).await,
+                "xmppRemoveContact" => backend::xmpp::roster::remove_contact(&handle, &jid).await,
+                "xmppSetContact" => {
+                    let groups = params.get("groups").and_then(|v| v.as_array()).map(|l| l.iter().filter_map(|g| g.as_str().map(str::to_string)).collect::<Vec<_>>());
+                    backend::xmpp::roster::set_item(&handle, &jid, name, groups).await
+                }
+                _ => {
+                    backend::xmpp::roster::answer_subscription(&handle, &jid, p_bool(params, "accept", true)).await;
+                    backend::xmpp::roster::announce_requests(state, &handle);
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => (Some(ok_node()), None),
+                Err(e) => (None, Some(e)),
             }
         }
 
