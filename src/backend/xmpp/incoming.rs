@@ -88,6 +88,8 @@ pub struct Parsed {
     pub omemo: Option<super::omemo::Envelope>,
     /// The message carries a body that is only there for clients that cannot show what it points at.
     pub styling_disabled: bool,
+    /// The whole message is a spoiler (XEP-0382), with the hint the sender gave (empty when there is none).
+    pub spoiler: Option<String>,
 }
 
 /// A file somebody shared: where it is and what it says it is.
@@ -147,6 +149,7 @@ pub fn parse(message: &Message) -> Parsed {
 
 fn read_payload(p: &mut Parsed, e: &Element) {
     match (e.name(), e.ns().as_str()) {
+        ("spoiler", ns::SPOILER) => p.spoiler = Some(e.text().trim().to_string()),
         ("origin-id", ns::SID) => p.origin_id = e.attr("id").map(str::to_string),
         ("stanza-id", ns::SID) => {
             if let (Some(by), Some(id)) = (e.attr("by"), e.attr("id")) {

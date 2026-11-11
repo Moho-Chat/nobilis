@@ -40,6 +40,8 @@ pub struct Occupant {
     pub show: String,
     pub status: String,
     pub occupant_id: Option<String>,
+    /// The titles of the hats the room gave them (XEP-0317): what they are in this room, in its own words.
+    pub hats: Vec<String>,
 }
 
 /// A room this account is in, or is joining.
@@ -84,6 +86,11 @@ fn user_element(p_payloads: &[Element]) -> Option<&Element> {
 /// The occupant id a stanza carries, when it was stamped by `room`.
 pub fn occupant_id_of(payloads: &[Element], room: &BareJid) -> Option<String> {
     payloads.iter().filter(|e| e.is("occupant-id", OCCUPANT_ID)).find(|e| e.attr("by").and_then(|b| b.parse::<Jid>().ok()).is_some_and(|b| &b.to_bare() == room)).and_then(|e| e.attr("id").map(str::to_string))
+}
+
+/// The hats on a presence: the titles, which are what a person reads (the URI behind each is for software).
+pub fn hats_of(payloads: &[Element]) -> Vec<String> {
+    payloads.iter().filter(|e| e.is("hats", "urn:xmpp:hats:0")).flat_map(|h| h.children()).filter(|h| h.name() == "hat").filter_map(|h| h.attr("title").or_else(|| h.attr("uri")).map(|t| t.trim().to_string())).filter(|t| !t.is_empty()).take(5).collect()
 }
 
 pub fn is_room(handle: &Handle, jid: &BareJid) -> bool {
@@ -303,6 +310,7 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         show: show.into(),
         status: p.statuses.values().next().cloned().unwrap_or_default(),
         occupant_id: occupant_id_of(&p.payloads, &room),
+        hats: hats_of(&p.payloads),
     };
     let first_time = {
         let mut s = handle.session();
@@ -378,6 +386,7 @@ pub fn publish_occupants(state: &AppState, handle: &Handle, room: &BareJid) {
                     "relationship": "",
                     "avatarUrl": Value::Null,
                     "roles": [o.affiliation, o.role],
+                    "hats": o.hats,
                 })
             })
             .collect()
@@ -523,6 +532,14 @@ pub async fn list_rooms(handle: &Handle, service: &Jid) -> Result<Vec<(String, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hats_are_read_as_the_titles_a_room_gave() {
+        let presence: Element = "<presence xmlns='jabber:client'><hats xmlns='urn:xmpp:hats:0'><hat uri='http://example.org/hats#admin' title='Administrator'/><hat uri='http://example.org/hats#vip'/><hat title=' '/></hats></presence>".parse().unwrap();
+        let payloads: Vec<Element> = presence.children().cloned().collect();
+        assert_eq!(super::hats_of(&payloads), vec!["Administrator".to_string(), "http://example.org/hats#vip".to_string()]);
+        assert!(super::hats_of(&[]).is_empty());
+    }
+
     use super::*;
     use std::str::FromStr;
 

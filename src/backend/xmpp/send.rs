@@ -135,6 +135,15 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         }
         None => body.to_string(),
     };
+    // A message that is wholly a spoiler goes as one (XEP-0382): the words, and a mark that says to hide them.
+    let spoiler = if reply_to.as_deref().is_none_or(str::is_empty) { super::messages::unspoilered(&wire_body) } else { None };
+    let wire_body = match spoiler {
+        Some(words) => {
+            m.payloads.push(xml::empty("spoiler", ns::SPOILER));
+            words
+        }
+        None => wire_body,
+    };
     let encrypted = encrypting(&handle, &jid);
     if encrypted {
         m.payloads.extend(encrypt_for(&handle, &jid, &wire_body, in_room(buffer)).await?);

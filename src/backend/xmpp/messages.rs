@@ -407,7 +407,24 @@ fn readable(p: &Parsed, raw: &str) -> String {
         }
     }
     let understood = [ns::REPLY, ns::RETRACT, ns::RETRACT_OLD];
-    incoming::strip_fallbacks(raw, &p.fallbacks, &understood)
+    let text = incoming::strip_fallbacks(raw, &p.fallbacks, &understood);
+    match &p.spoiler {
+        Some(hint) if !text.trim().is_empty() => spoilered(hint, &text),
+        _ => text,
+    }
+}
+
+/// A spoiler as the window draws one: the hint in the open and the words behind a bar (the `||` convention every service here uses).
+pub fn spoilered(hint: &str, text: &str) -> String {
+    let hidden = format!("||{}||", text.trim().replace("||", "| |"));
+    if hint.is_empty() { hidden } else { format!("{hint}: {hidden}") }
+}
+
+/// What is sent for a message that is wholly a spoiler: the words, and the marks taken off them.
+pub fn unspoilered(body: &str) -> Option<String> {
+    let t = body.trim();
+    let inner = t.strip_prefix("||")?.strip_suffix("||")?;
+    (!inner.is_empty() && !inner.contains("||")).then(|| inner.to_string())
 }
 
 /// Tells a person their message arrived, if they asked and they are somebody this account has a relationship with:
@@ -462,6 +479,21 @@ fn retracted(state: &AppState, handle: &Handle, buffer: &crate::model::Buffer, s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_spoiler_is_drawn_behind_its_bar_with_the_hint_beside_it() {
+        assert_eq!(super::spoilered("", "he was the killer"), "||he was the killer||");
+        assert_eq!(super::spoilered("film ending", "the ship sinks"), "film ending: ||the ship sinks||");
+        assert_eq!(super::spoilered("", "a || b"), "||a | | b||");
+    }
+
+    #[test]
+    fn a_message_that_is_all_spoiler_is_sent_as_one_and_part_of_one_is_left_alone() {
+        assert_eq!(super::unspoilered(" ||the ship sinks|| ").as_deref(), Some("the ship sinks"));
+        assert_eq!(super::unspoilered("||a|| and ||b||"), None);
+        assert_eq!(super::unspoilered("plain"), None);
+        assert_eq!(super::unspoilered("||||"), None);
+    }
+
     use super::*;
     use std::str::FromStr;
 
