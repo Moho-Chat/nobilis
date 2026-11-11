@@ -173,6 +173,9 @@ pub struct Conv {
     pub key: String,
     /// A mention of this account by name in the message, which the room decides (its nickname there).
     pub mentioned: bool,
+    /// The speaker's own address, when it is known: what an encrypted message's keys are found by. A room that hides addresses
+    /// does not say.
+    pub real_jid: Option<String>,
 }
 
 /// One message, from wherever. `Archive` copies are replays: they are never answered with a receipt and never notify.
@@ -204,12 +207,20 @@ pub async fn handle_one(state: &AppState, handle: &Handle, message: Message, ori
     }
     let buffer = roster::ensure_buffer(state, handle, &peer);
     let name = if is_own { own.to_string() } else { handle.session().display_name(&from) };
-    let conv = Conv { buffer, kind: "dm", from_name: name, sender_id: from.to_string(), is_own, key: peer.to_string(), mentioned: false };
+    let conv = Conv { buffer, kind: "dm", from_name: name, sender_id: from.to_string(), is_own, key: peer.to_string(), mentioned: false, real_jid: Some(from.to_string()) };
     deliver(state, handle, &conv, p, origin).await;
 }
 
 /// What a parsed message does in its conversation: says something, changes something said, or says how things stand.
 pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Parsed, origin: Origin) {
+    // What this resource sent into a room it encrypted for is not read again from the room's copy: that copy has no key for it.
+    if conv.is_own && conv.kind == "channel" {
+        if let Some(id) = incoming::local_id(&p) {
+            if handle.session().sent.contains(&id) {
+                return;
+            }
+        }
+    }
     decrypt_in_place(state, handle, conv, &mut p).await;
     let replay = matches!(origin, Origin::Archive { .. });
     let sent_at = match &origin {
@@ -282,6 +293,12 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, mut p: Pars
     }
 
     let mut text = readable(&p, &raw);
+    // An encrypted file arrives as a link whose fragment is its key: the whole of the (decrypted) message.
+    if let Some((url, ..)) = super::omemo::parse_aesgcm(text.trim()).filter(|_| p.files.is_empty()) {
+        let name = url.split('#').next().and_then(|u| u.rsplit('/').next()).map(str::to_string);
+        p.files.push(incoming::FileRef { url: text.trim().to_string(), media_type: name.as_deref().map(|n| super::upload::content_type_of(n).to_string()).filter(|t| t != "application/octet-stream"), name, ..Default::default() });
+        p.oob.clear();
+    }
     // Files the sender shared: the stated description when there is one, else the address they sent as a link (XEP-0066).
     let mut attachments: Vec<crate::model::Attachment> = p.files.iter().map(|f| super::media::attachment(&handle.account_id, f)).collect();
     for (url, desc) in &p.oob {
@@ -333,7 +350,10 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
     let Some(envelope) = p.omemo.clone() else { return };
     let omemo = handle.session().omemo.clone();
     let result = match &omemo {
-        Some(o) => o.decrypt(conv.sender_id.split('/').next().unwrap_or_default(), &envelope),
+        Some(o) => match &conv.real_jid {
+            Some(jid) => o.decrypt(jid, &envelope),
+            None => Err(super::omemo::Error::NoRealJid),
+        },
         None => Err(super::omemo::Error::NoSession),
     };
     match result {
@@ -360,6 +380,7 @@ async fn decrypt_in_place(state: &AppState, handle: &Handle, conv: &Conv, p: &mu
             let why = match e {
                 super::omemo::Error::NotForUs => "it was not encrypted for this device".to_string(),
                 super::omemo::Error::NoSession => "there is no session with the device that sent it yet".to_string(),
+                super::omemo::Error::NoRealJid => "this room does not show who sent it".to_string(),
                 other => other.to_string(),
             };
             p.body = Some(format!("This message is encrypted with OMEMO and could not be read here: {why}"));

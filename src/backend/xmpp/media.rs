@@ -80,7 +80,7 @@ pub fn attachment(account_id: &str, f: &super::incoming::FileRef) -> Attachment 
     Attachment {
         kind: kind.to_string(),
         mimetype: f.media_type.clone(),
-        filename: f.name.clone().or_else(|| f.url.rsplit('/').next().map(|s| s.to_string()).filter(|s| !s.is_empty())),
+        filename: f.name.clone().or_else(|| f.url.split('#').next().and_then(|u| u.rsplit('/').next()).map(|s| s.to_string()).filter(|s| !s.is_empty())),
         size: f.size,
         width: f.width,
         height: f.height,
@@ -127,20 +127,26 @@ const MOST: u64 = 200 * 1024 * 1024;
 
 /// Fetches an address into a cache file, whole and renamed into place.
 async fn fetch(account_id: &str, ca_pem: &str, url: &str, path: &Path) -> Result<()> {
-    if !url.starts_with("https://") {
+    // An encrypted file (`aesgcm://`): fetched over https and decrypted with the key in the link's fragment.
+    let encrypted = super::omemo::parse_aesgcm(url);
+    let fetch_url = encrypted.as_ref().map(|e| e.0.as_str()).unwrap_or(url);
+    if !fetch_url.starts_with("https://") {
         bail!("only https addresses are fetched");
     }
     let client = http_client(account_id, ca_pem);
-    let response = client.get(url).send().await.with_context(|| format!("fetching {url}"))?;
+    let response = client.get(fetch_url).send().await.with_context(|| format!("fetching {url}"))?;
     if !response.status().is_success() {
         bail!("{} answered {}", url, response.status());
     }
     if response.content_length().is_some_and(|n| n > MOST) {
         bail!("that file is larger than {} MB", MOST / 1024 / 1024);
     }
-    let bytes = response.bytes().await.context("reading the file")?;
+    let mut bytes = response.bytes().await.context("reading the file")?.to_vec();
     if bytes.len() as u64 > MOST {
         bail!("that file is larger than {} MB", MOST / 1024 / 1024);
+    }
+    if let Some((_, iv, key)) = &encrypted {
+        bytes = super::omemo::decrypt_file(&bytes, iv, key).map_err(|_| anyhow!("that file could not be decrypted: it was changed, or the link's key is wrong"))?;
     }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;

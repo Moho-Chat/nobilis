@@ -5346,8 +5346,8 @@ pub async fn dispatch(
         "xmppSetEncryption" | "xmppOmemoDevices" | "xmppOmemoTrust" => {
             let (account_id, buffer) = match method {
                 "xmppSetEncryption" => {
-                    let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && b.kind == "dm") else {
-                        return (None, Some("encryption is turned on for a conversation with a person".to_string()));
+                    let Some(b) = p_str_opt(params, "bufferId").and_then(|b| state.runtime.get_buffer(b)).filter(|b| b.account_id.starts_with("xmpp:") && (b.kind == "dm" || b.kind == "channel")) else {
+                        return (None, Some("encryption is turned on for a conversation with a person, or a room".to_string()));
                     };
                     (b.account_id.clone(), Some(b))
                 }
@@ -5366,7 +5366,13 @@ pub async fn dispatch(
                     if on {
                         // Only if there is somebody to encrypt to: turning it on and then failing every send is worse than saying no now.
                         let Ok(bare) = jid.parse::<tokio_xmpp::jid::BareJid>() else { return (None, Some("not an address".to_string())) };
-                        if backend::xmpp::omemo::usable_devices(&handle, &omemo, &bare, false).await.is_empty() {
+                        if buffer.kind == "channel" {
+                            match backend::xmpp::send::room_recipients(&handle, &bare).await {
+                                Ok(people) if people.is_empty() => return (None, Some("there is nobody else in this room to encrypt to yet".to_string())),
+                                Ok(_) => {}
+                                Err(e) => return (None, Some(e)),
+                            }
+                        } else if backend::xmpp::omemo::usable_devices(&handle, &omemo, &bare, false).await.is_empty() {
                             return (None, Some(format!("{jid} has no device that can be encrypted to: they may not use OMEMO, or their devices are not trusted")));
                         }
                     }

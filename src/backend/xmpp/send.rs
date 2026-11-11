@@ -63,13 +63,48 @@ fn encrypting(handle: &Handle, jid: &BareJid) -> bool {
     handle.session().omemo.as_ref().is_some_and(|o| o.store().state.enabled.contains(jid.as_str()))
 }
 
+/// Who an encrypted message to a room is for: everybody in it whose address it shows, and its members who are not there. Only a room
+/// that shows addresses works: OMEMO needs to know whose devices to write to.
+pub async fn room_recipients(handle: &Handle, room: &BareJid) -> Result<Vec<BareJid>, String> {
+    super::muc::refresh(handle, room).await;
+    let (hidden, mut people): (bool, Vec<BareJid>) = {
+        let s = handle.session();
+        match s.rooms.get(room) {
+            Some(r) => (r.anonymous(), r.occupants.values().filter_map(|o| o.jid.clone()).collect()),
+            None => return Err("you are not in that room".to_string()),
+        }
+    };
+    if hidden {
+        return Err("This room does not show people's addresses, so it cannot be encrypted: OMEMO needs to know whose devices to write to".to_string());
+    }
+    for standing in ["owner", "admin", "member"] {
+        if let Ok(list) = super::muc_admin::affiliates(handle, room, standing).await {
+            people.extend(list.into_iter().filter_map(|(jid, _)| jid.parse::<BareJid>().ok()));
+        }
+    }
+    people.retain(|p| *p != handle.own());
+    people.sort();
+    people.dedup();
+    Ok(people)
+}
+
 /// What an encrypted message carries in place of its body: the encrypted element, the note that says what it is for clients
 /// that cannot read it, and the words they show. Fails if there is no device of the person to encrypt to.
-async fn encrypt_for(handle: &Handle, jid: &BareJid, plaintext: &str) -> Result<Vec<Element>, String> {
+async fn encrypt_for(handle: &Handle, jid: &BareJid, plaintext: &str, room: bool) -> Result<Vec<Element>, String> {
     let omemo = handle.session().omemo.clone().ok_or("OMEMO is not ready on this account yet")?;
-    let mut targets = super::omemo::usable_devices(handle, &omemo, jid, false).await;
-    if targets.is_empty() {
-        return Err(format!("None of {jid}'s devices can be encrypted to (they may use none that speak OMEMO, or have no device you trust). Nothing was sent"));
+    let mut targets = Vec::new();
+    if room {
+        for person in room_recipients(handle, jid).await? {
+            targets.extend(super::omemo::usable_devices(handle, &omemo, &person, false).await);
+        }
+        if targets.is_empty() {
+            return Err("None of the people in this room have a device that can be encrypted to. Nothing was sent".to_string());
+        }
+    } else {
+        targets = super::omemo::usable_devices(handle, &omemo, jid, false).await;
+        if targets.is_empty() {
+            return Err(format!("None of {jid}'s devices can be encrypted to (they may use none that speak OMEMO, or have no device you trust). Nothing was sent"));
+        }
     }
     targets.extend(super::omemo::usable_devices(handle, &omemo, &handle.own(), true).await);
     let encrypted = omemo.encrypt(&targets, plaintext.as_bytes()).map_err(|e| e.to_string())?;
@@ -100,8 +135,9 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
         }
         None => body.to_string(),
     };
-    if !in_room(buffer) && encrypting(&handle, &jid) {
-        m.payloads.extend(encrypt_for(&handle, &jid, &wire_body).await?);
+    let encrypted = encrypting(&handle, &jid);
+    if encrypted {
+        m.payloads.extend(encrypt_for(&handle, &jid, &wire_body, in_room(buffer)).await?);
         m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());
     } else {
         m.bodies.insert(Default::default(), wire_body);
@@ -111,15 +147,17 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     }
     m.payloads.push(xml::empty("markable", ns::MARKERS));
     m.payloads.push(xml::empty("active", ns::CHATSTATES));
-    if in_room(buffer) {
+    if in_room(buffer) && !encrypted {
         // The room sends it back to everybody including its sender, and that copy is what is shown: a message the room
         // refused (no voice, a ban) is then not shown as if it had been said.
         handle.send_message(m).await;
         return Ok(());
     }
+    // A direct message is shown at once; so is one encrypted into a room, whose copy from the room has no key for this device.
     handle.session().sent.insert(id.clone());
     let own = handle.own().to_string();
-    state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, "dm", &own, body, false, "chat", preview, Some(id), false, None, Vec::new(), Vec::new(), Some(own.clone()), None, None, None);
+    let kind = if in_room(buffer) { "channel" } else { "dm" };
+    state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, kind, &own, body, false, "chat", preview, Some(id), false, None, Vec::new(), Vec::new(), Some(own.clone()), None, None, None);
     handle.send_message(m).await;
     Ok(())
 }
@@ -131,9 +169,7 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
         return send(state, buffer, caption, reply_to.map(str::to_string)).await;
     }
     let (handle, jid) = target(state, buffer)?;
-    if !in_room(buffer) && encrypting(&handle, &jid) {
-        return Err("Files cannot be sent in an encrypted conversation yet: they would go unencrypted. Turn encryption off for this conversation to send one".to_string());
-    }
+    let encrypted = encrypting(&handle, &jid);
     let (service, most) = super::upload::service(&handle).await?;
     let ca = state.accounts.get_xmpp(&buffer.account_id).map(|c| c.ca_pem).unwrap_or_default();
     let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
@@ -157,19 +193,34 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
         if let Some(p) = progress {
             p.sent(done, total, "XMPP");
         }
-        let slot = super::upload::request_slot(&handle, &service, &name, size, content_type).await?;
-        super::upload::put(&buffer.account_id, &ca, &slot, path, content_type, size).await?;
-        done += size;
         let dims = if content_type.starts_with("image/") { imagesize::size(path).ok().map(|d| (d.width as u32, d.height as u32)) } else { None };
         let id = xml::new_id();
         let mut m = chat(&jid, &id, in_room(buffer));
-        m.bodies.insert(Default::default(), slot.get.clone());
-        m.payloads.extend(super::upload::file_payloads(&slot.get, &name, content_type, size, dims, None));
+        // What others are told the file is: its address (an encrypted file's carries the key, and is itself encrypted).
+        let link = if encrypted {
+            // The server sees only ciphertext, of a kind it cannot name.
+            let plain = tokio::fs::read(path).await.map_err(|e| format!("{path}: {e}"))?;
+            let (cipher, key, iv) = super::omemo::encrypt_file(&plain).map_err(|e| e.to_string())?;
+            let slot = super::upload::request_slot(&handle, &service, &name, cipher.len() as u64, "application/octet-stream").await?;
+            super::upload::put_bytes(&buffer.account_id, &ca, &slot, cipher, "application/octet-stream").await?;
+            let link = super::omemo::aesgcm_url(&slot.get, &key, &iv);
+            m.payloads.extend(encrypt_for(&handle, &jid, &link, in_room(buffer)).await?);
+            m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());
+            link
+        } else {
+            let slot = super::upload::request_slot(&handle, &service, &name, size, content_type).await?;
+            super::upload::put(&buffer.account_id, &ca, &slot, path, content_type, size).await?;
+            m.bodies.insert(Default::default(), slot.get.clone());
+            m.payloads.extend(super::upload::file_payloads(&slot.get, &name, content_type, size, dims, None));
+            slot.get
+        };
+        done += size;
+        let slot = super::upload::Slot { put: String::new(), get: link, headers: Vec::new() };
         if !in_room(buffer) {
             m.payloads.push(xml::empty("request", ns::RECEIPTS));
         }
         m.payloads.push(xml::empty("markable", ns::MARKERS));
-        if !in_room(buffer) {
+        if !in_room(buffer) || encrypted {
             handle.session().sent.insert(id.clone());
             let own = handle.own().to_string();
             let attachment = crate::model::Attachment {
@@ -187,7 +238,8 @@ pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files:
                 thumbnail_path: None,
                 url: Some(slot.get.clone()),
             };
-            state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, "dm", &own, "", false, "chat", None, Some(id), false, None, Vec::new(), vec![attachment], Some(own.clone()), None, None, None);
+            let kind = if in_room(buffer) { "channel" } else { "dm" };
+            state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, kind, &own, "", false, "chat", None, Some(id), false, None, Vec::new(), vec![attachment], Some(own.clone()), None, None, None);
         }
         handle.send_message(m).await;
     }
@@ -209,8 +261,9 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
     }
     let id = xml::new_id();
     let mut m = chat(&jid, &id, in_room(buffer));
-    if !in_room(buffer) && encrypting(&handle, &jid) {
-        m.payloads.extend(encrypt_for(&handle, &jid, body).await?);
+    let encrypted = encrypting(&handle, &jid);
+    if encrypted {
+        m.payloads.extend(encrypt_for(&handle, &jid, body, in_room(buffer)).await?);
         m.bodies.insert(Default::default(), super::omemo::FALLBACK_BODY.to_string());
     } else {
         m.bodies.insert(Default::default(), body.to_string());
@@ -218,8 +271,8 @@ pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -
     m.payloads.push(Element::builder("replace", ns::CORRECT).at("id", msg_id).build());
     handle.session().sent.insert(id.clone());
     handle.session().aliases.insert(id, msg_id.to_string());
-    // In a room the correction is shown when the room says it, like the message was.
-    if !in_room(buffer) {
+    // In a room the correction is shown when the room says it, like the message was (an encrypted room's copy has no key for this device).
+    if !in_room(buffer) || encrypted {
         state.runtime.update_message(state, &buffer.id, msg_id, body, &[], &[]);
     }
     handle.send_message(m).await;

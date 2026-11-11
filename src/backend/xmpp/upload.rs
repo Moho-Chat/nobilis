@@ -103,6 +103,23 @@ pub fn file_payloads(url: &str, name: &str, content_type: &str, size: u64, dims:
     vec![oob, sharing]
 }
 
+/// Puts bytes at a slot (an encrypted file, which is not the file on disk).
+pub async fn put_bytes(account_id: &str, ca_pem: &str, slot: &Slot, bytes: Vec<u8>, content_type: &str) -> Result<(), String> {
+    if !slot.put.starts_with("https://") {
+        return Err("the server asked for the file to be sent without encryption, which moho does not do".to_string());
+    }
+    let client = super::media::http_client(account_id, ca_pem);
+    let mut request = client.put(&slot.put).header("Content-Type", content_type).body(bytes);
+    for (n, v) in &slot.headers {
+        request = request.header(n.as_str(), v.as_str());
+    }
+    let response = request.timeout(std::time::Duration::from_secs(3600)).send().await.map_err(|e| format!("sending the file: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("the server refused the file ({})", response.status()));
+    }
+    Ok(())
+}
+
 /// Puts a file at a slot.
 pub async fn put(account_id: &str, ca_pem: &str, slot: &Slot, path: &str, content_type: &str, size: u64) -> Result<(), String> {
     if !slot.put.starts_with("https://") {

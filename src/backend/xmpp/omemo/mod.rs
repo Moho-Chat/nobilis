@@ -97,6 +97,8 @@ pub struct Decrypted {
 pub enum Error {
     #[error("this message has no key for this device")]
     NotForUs,
+    #[error("the sender's address is not known")]
+    NoRealJid,
     #[error("there is no session with the device that sent this")]
     NoSession,
     #[error(transparent)]
@@ -231,6 +233,62 @@ impl Omemo {
         }
         Ok(Decrypted { text: Some(String::from_utf8_lossy(&data).to_string()), republish, seen })
     }
+}
+
+// --- encrypted files (XEP-0454, the older `aesgcm://` form) -------------------------------------------------------------
+
+/// Encrypts a file for upload: AES-256-GCM under a fresh key, the tag appended. Returns the bytes to upload, and the key and IV
+/// that go in the link's fragment (and nowhere else).
+/// An encrypted file: the bytes to upload, the key and the IV.
+pub type EncryptedFile = (Vec<u8>, [u8; 32], [u8; 12]);
+
+pub fn encrypt_file(plain: &[u8]) -> Result<EncryptedFile, Error> {
+    use rand::RngCore;
+    let (mut key, mut iv) = ([0u8; 32], [0u8; 12]);
+    rand::thread_rng().fill_bytes(&mut key);
+    rand::thread_rng().fill_bytes(&mut iv);
+    let mut data = plain.to_vec();
+    let tag = AesGcm::<aes::Aes256, U12>::new(&key.into()).encrypt_in_place_detached(&iv.into(), b"", &mut data).map_err(|_| Error::Payload)?;
+    data.extend_from_slice(&tag);
+    Ok((data, key, iv))
+}
+
+/// The link an encrypted file is shared by: the upload's address with `aesgcm` as its scheme and the IV and key as its fragment.
+pub fn aesgcm_url(https_url: &str, key: &[u8; 32], iv: &[u8; 12]) -> String {
+    format!("aesgcm://{}#{}{}", https_url.trim_start_matches("https://"), curve::hex(iv), curve::hex(key))
+}
+
+/// Takes an `aesgcm://` link apart: the https address to fetch from, the IV and the key. Both IV sizes are accepted (12 bytes, and
+/// the 16 some older clients used).
+pub fn parse_aesgcm(url: &str) -> Option<(String, Vec<u8>, [u8; 32])> {
+    let rest = url.strip_prefix("aesgcm://")?;
+    let (path, fragment) = rest.split_once('#')?;
+    let bytes = curve::unhex(fragment)?;
+    let iv_len = match bytes.len() {
+        44 => 12,
+        48 => 16,
+        _ => return None,
+    };
+    let key: [u8; 32] = bytes[iv_len..].try_into().ok()?;
+    if path.is_empty() || path.chars().any(|c| c.is_whitespace()) {
+        return None;
+    }
+    Some((format!("https://{path}"), bytes[..iv_len].to_vec(), key))
+}
+
+/// Decrypts what was fetched from an `aesgcm://` link.
+pub fn decrypt_file(fetched: &[u8], iv: &[u8], key: &[u8; 32]) -> Result<Vec<u8>, Error> {
+    if fetched.len() < 16 {
+        return Err(Error::Payload);
+    }
+    let (body, tag) = fetched.split_at(fetched.len() - 16);
+    let mut data = body.to_vec();
+    let ok = match iv.len() {
+        12 => AesGcm::<aes::Aes256, U12>::new(key.into()).decrypt_in_place_detached(iv.into(), b"", &mut data, tag.into()).is_ok(),
+        16 => AesGcm::<aes::Aes256, U16>::new(key.into()).decrypt_in_place_detached(iv.into(), b"", &mut data, tag.into()).is_ok(),
+        _ => false,
+    };
+    if ok { Ok(data) } else { Err(Error::Payload) }
 }
 
 // --- talking to the server ---------------------------------------------------------------------------------------------
@@ -419,6 +477,25 @@ mod tests {
         let bundle = parse_bundle(&Element::from_str(&String::from(&bob.bundle_element())).unwrap()).unwrap();
         assert_eq!(bundle.identity, bob.store().identity().public);
         assert!(bundle.pre_key.is_some());
+    }
+
+    #[test]
+    fn an_encrypted_file_is_shared_by_a_link_that_carries_its_key_and_is_read_back_from_what_was_fetched() {
+        let plain = b"the contents of a file".to_vec();
+        let (uploaded, key, iv) = encrypt_file(&plain).unwrap();
+        assert_ne!(&uploaded[..plain.len()], &plain[..], "what is uploaded is not the file");
+        let url = aesgcm_url("https://up.example.org/f/abc/cat.png", &key, &iv);
+        let (fetch, iv2, key2) = parse_aesgcm(&url).unwrap();
+        assert_eq!(fetch, "https://up.example.org/f/abc/cat.png");
+        assert_eq!(decrypt_file(&uploaded, &iv2, &key2).unwrap(), plain);
+        let mut changed = uploaded.clone();
+        changed[0] ^= 1;
+        assert!(decrypt_file(&changed, &iv2, &key2).is_err(), "a changed file is not read");
+        assert!(parse_aesgcm("aesgcm://host/x#abcd").is_none() && parse_aesgcm("https://host/x#00").is_none());
+        // The 16-byte IV some older clients used.
+        let mut legacy = vec![0u8; 16];
+        legacy.extend_from_slice(&key);
+        assert_eq!(parse_aesgcm(&format!("aesgcm://h/x#{}", curve::hex(&legacy))).map(|p| p.1.len()), Some(16));
     }
 
     #[test]

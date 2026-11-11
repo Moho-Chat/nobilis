@@ -142,6 +142,15 @@ async fn disco(handle: &Handle, room: &BareJid) -> (Option<String>, HashSet<Stri
     }
 }
 
+/// Asks the room again what it supports and how it is set up: its settings change, and so does what it shows.
+pub async fn refresh(handle: &Handle, room: &BareJid) {
+    let (name, features) = disco(handle, room).await;
+    if let Some(r) = handle.session().rooms.get_mut(room) {
+        r.features = features;
+        r.name = name.or(r.name.take());
+    }
+}
+
 /// Joins a room (or rejoins it). The answer is the room's presences, handled as they arrive.
 pub async fn join(state: &AppState, handle: &Handle, room: &BareJid, nick: Option<&str>, password: Option<&str>) -> Result<(), String> {
     let (name, features) = disco(handle, room).await;
@@ -452,7 +461,8 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
     }
     let own_identity = handle.own().to_string();
     let mentioned = !is_own && mentions(&p, &own_nick, &room);
-    let conv = Conv { buffer, kind: "channel", from_name: if is_own { own_identity } else { nick.clone() }, sender_id, is_own, key: room.to_string(), mentioned };
+    let real_jid = if is_own { Some(handle.own().to_string()) } else { handle.session().rooms.get(&room).and_then(|r| r.occupants.get(&nick)).and_then(|o| o.jid.as_ref()).map(|j| j.to_string()) };
+    let conv = Conv { buffer, kind: "channel", from_name: if is_own { own_identity } else { nick.clone() }, sender_id, is_own, key: room.to_string(), mentioned, real_jid };
     messages::deliver(state, handle, &conv, p, origin).await;
 }
 
@@ -495,7 +505,7 @@ pub fn private_conversation(state: &AppState, handle: &Handle, message: &Message
     state.runtime.set_buffer_remote_id(state, &buffer.id, &counterpart.to_string());
     state.runtime.set_buffer_category(state, &buffer.id, Some(roster::DEFAULT_CATEGORY), 0);
     let own = handle.own().to_string();
-    Some(Conv { buffer, kind: "dm", from_name: if is_own { own } else { nick.clone() }, sender_id: format!("{room}/{nick}"), is_own, key: counterpart.to_string(), mentioned: false })
+    Some(Conv { buffer, kind: "dm", from_name: if is_own { own } else { nick.clone() }, sender_id: format!("{room}/{nick}"), is_own, key: counterpart.to_string(), mentioned: false, real_jid: None })
 }
 
 // --- asking ----------------------------------------------------------------------------------------------------------
