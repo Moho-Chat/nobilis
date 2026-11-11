@@ -415,6 +415,18 @@ pub async fn handle_groupchat(state: &AppState, handle: &Handle, message: Messag
             return;
         }
     }
+    // A moderator took a message away: the room says so, in its own name. Only the room itself may say it.
+    if nick.is_empty() {
+        if let (Some(target), Some(reason)) = (&p.retracts, &p.moderated) {
+            let target = handle.session().aliases.get(target).cloned().unwrap_or_else(|| target.clone());
+            let had = state.store.get_message(&buffer.id, &target).ok().flatten().is_some();
+            state.runtime.delete_message(state, &buffer.id, &target);
+            if had && !matches!(origin, Origin::Archive { .. }) {
+                card(state, handle, &buffer, "system", &format!("A moderator removed a message{}", reason.as_ref().filter(|r| !r.is_empty()).map(|r| format!(": {r}")).unwrap_or_default()));
+            }
+            return;
+        }
+    }
     // The room itself speaking (no nickname): its notices, shown as what they are.
     if nick.is_empty() {
         if let Some(body) = &p.body {

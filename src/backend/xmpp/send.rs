@@ -199,6 +199,11 @@ pub async fn delete(state: &AppState, buffer: &Buffer, msg_id: &str) -> Result<(
     let (handle, jid) = target(state, buffer)?;
     let original = state.store.get_message(&buffer.id, msg_id).ok().flatten().ok_or("that message is not here")?;
     if !original.is_own {
+        // In a room a moderator may remove what somebody else said; anywhere else there is no such thing.
+        if in_room(buffer) {
+            let stanza_id = handle.session().room_ids.get(msg_id).cloned().ok_or("the room has not said what it calls that message")?;
+            return super::muc_admin::moderate(&handle, &jid, &stanza_id, "").await;
+        }
         return Err("Only a message you sent can be taken back".to_string());
     }
     let id = xml::new_id();

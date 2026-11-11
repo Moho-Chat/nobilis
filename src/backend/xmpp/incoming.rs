@@ -175,7 +175,14 @@ fn read_payload(p: &mut Parsed, e: &Element) {
         ("gone", ns::CHATSTATES) => p.chat_state = Some(ChatState::Gone),
         ("replace", ns::CORRECT) => p.replaces = e.attr("id").map(str::to_string),
         // XEP-0424 version 0.4: the retraction names the message itself.
-        ("retract", ns::RETRACT) => p.retracts = e.attr("id").map(str::to_string),
+        ("retract", ns::RETRACT) => {
+            p.retracts = e.attr("id").map(str::to_string);
+            // A moderator's retraction (XEP-0425) says so inside it, with the reason.
+            if let Some(m) = e.children().find(|c| c.is("moderated", ns::MODERATED)) {
+                let reason = e.children().find(|c| c.name() == "reason").map(|r| r.text()).or_else(|| m.children().find(|c| c.name() == "reason").map(|r| r.text()));
+                p.moderated = Some(reason);
+            }
+        }
         // Version 0.3 wrapped it in an application of the message it retracts (XEP-0422).
         ("apply-to", ns::FASTEN) => {
             if let Some(target) = e.attr("id") {
@@ -183,9 +190,6 @@ fn read_payload(p: &mut Parsed, e: &Element) {
                     p.retracts = Some(target.to_string());
                 }
             }
-        }
-        ("moderated", ns::MODERATED) => {
-            p.moderated = Some(e.children().find(|c| c.name() == "reason").map(|r| r.text()));
         }
         ("reactions", ns::REACTIONS) => {
             if let Some(id) = e.attr("id") {
@@ -314,8 +318,9 @@ mod tests {
         let old = parse(&msg(&format!("{OPEN}<apply-to xmlns='urn:xmpp:fasten:0' id='m0'><retract xmlns='urn:xmpp:message-retract:0'/></apply-to></message>")));
         assert_eq!(old.retracts.as_deref(), Some("m0"));
         let mod_ = parse(&msg(&format!("{OPEN}<retract xmlns='urn:xmpp:message-retract:1' id='m0'><moderated xmlns='urn:xmpp:message-moderate:1'><reason>spam</reason></moderated></retract></message>")));
-        // The moderation is inside the retract element in the current form, and beside it in older ones.
         assert_eq!(mod_.retracts.as_deref(), Some("m0"));
+        assert_eq!(mod_.moderated, Some(Some("spam".to_string())));
+        assert_eq!(r.moderated, None, "an ordinary retraction is not a moderator's");
     }
 
     #[test]

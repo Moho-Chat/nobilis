@@ -83,6 +83,16 @@ pub async fn set_config(handle: &Handle, room: &BareJid, form: &Form, answers: &
     handle.request(Some(room_jid(room)), true, query).await.map(|_| ()).map_err(|e| e.words())
 }
 
+/// Removes somebody else's message from a room, for everyone (XEP-0425). `stanza_id` is the room's own id for it.
+pub async fn moderate(handle: &Handle, room: &BareJid, stanza_id: &str, reason: &str) -> Result<(), String> {
+    let mut m = Element::builder("moderate", ns::MODERATED).at("id", stanza_id).build();
+    m.append_child(xml::empty("retract", ns::RETRACT));
+    if !reason.is_empty() {
+        m.append_child(Element::builder("reason", ns::MODERATED).append(reason).build());
+    }
+    handle.request(Some(room_jid(room)), true, m).await.map(|_| ()).map_err(|e| e.words())
+}
+
 /// Takes the room away (owners only).
 pub async fn destroy(handle: &Handle, room: &BareJid, reason: &str) -> Result<(), String> {
     let mut d = Element::builder("destroy", MUC_OWNER).build();

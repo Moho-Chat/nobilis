@@ -6,6 +6,7 @@
 //! captcha, and a form with a picture to read out in it is refused as such.
 
 use super::dataform::{self, Field, Form};
+use super::xml::Attr;
 use super::transport::{Connector, SeenSlot, Settings};
 use super::{ns, xml};
 use futures::{SinkExt, StreamExt};
@@ -126,15 +127,23 @@ fn refusal(error: &tokio_xmpp::parsers::stanza_error::StanzaError) -> String {
     }
 }
 
+/// An invitation's token (XEP-0401), put in the request so the server knows who let this registration in.
+fn with_preauth(mut query: Element, token: &str) -> Element {
+    if !token.is_empty() {
+        query.append_child(Element::builder("preauth", "urn:xmpp:pars:0").at("token", token).build());
+    }
+    query
+}
+
 /// What the server needs to make an account.
-pub async fn form(settings: Settings, domain: &str) -> Result<Registration, String> {
-    let query = ask(settings, domain, false, xml::empty("query", REGISTER)).await?;
+pub async fn form(settings: Settings, domain: &str, preauth: &str) -> Result<Registration, String> {
+    let query = ask(settings, domain, false, with_preauth(xml::empty("query", REGISTER), preauth)).await?;
     read_query(&query)
 }
 
 /// Sends the answers. `Ok` when the server made the account.
-pub async fn submit(settings: Settings, domain: &str, form: &Form, answers: &serde_json::Value) -> Result<(), String> {
-    ask(settings, domain, true, submission(form, answers)).await.map(|_| ())
+pub async fn submit(settings: Settings, domain: &str, form: &Form, answers: &serde_json::Value, preauth: &str) -> Result<(), String> {
+    ask(settings, domain, true, with_preauth(submission(form, answers), preauth)).await.map(|_| ())
 }
 
 #[cfg(test)]
@@ -177,6 +186,13 @@ mod tests {
         let w = Element::from_str("<query xmlns='jabber:iq:register'><instructions>Use the page</instructions><x xmlns='jabber:x:oob'><url>https://example.org/signup</url></x></query>").unwrap();
         let r = read_query(&w).unwrap();
         assert_eq!((r.form.is_none(), r.web.as_deref()), (true, Some("https://example.org/signup")));
+    }
+
+    #[test]
+    fn an_invitations_token_rides_in_the_request_and_nothing_is_added_without_one() {
+        let with = with_preauth(xml::empty("query", REGISTER), "abc");
+        assert_eq!(with.children().find(|c| c.name() == "preauth").and_then(|p| p.attr("token")), Some("abc"));
+        assert_eq!(with_preauth(xml::empty("query", REGISTER), "").children().count(), 0);
     }
 
     #[test]

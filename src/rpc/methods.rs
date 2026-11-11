@@ -5168,7 +5168,7 @@ pub async fn dispatch(
         // The people on an XMPP account's roster, and what can be done with them. A request for somebody's presence is
         // what a contact is, so adding one sends it; the other side answers on its own time, and the answer arrives as a
         // roster push.
-        "xmppAddContact" | "xmppRemoveContact" | "xmppSetContact" | "xmppRequests" | "xmppAnswerRequest" => {
+        "xmppAddContact" | "xmppRemoveContact" | "xmppSetContact" | "xmppRequests" | "xmppAnswerRequest" | "xmppOpenChat" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
             let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
             if method == "xmppRequests" {
@@ -5180,6 +5180,12 @@ pub async fn dispatch(
                 None => return (None, Some(format!("{method} requires \"jid\""))),
             };
             let name = p_str_opt(params, "name").map(str::trim).filter(|n| !n.is_empty());
+            if method == "xmppOpenChat" {
+                // A conversation with somebody who is not on the roster: nothing is asked of them, and nothing is told them
+                // until something is said.
+                let buffer = backend::xmpp::roster::ensure_buffer(state, &handle, &jid);
+                return (Some(serde_json::json!({ "bufferId": buffer.id })), None);
+            }
             let result = match method {
                 "xmppAddContact" => backend::xmpp::roster::add_contact(&handle, &jid, name, p_str_opt(params, "group").map(str::trim).filter(|g| !g.is_empty())).await,
                 "xmppRemoveContact" => backend::xmpp::roster::remove_contact(&handle, &jid).await,
@@ -5251,7 +5257,8 @@ pub async fn dispatch(
                 ca_pem: p_str(params, "caPem", "").to_string(),
                 pin_sha256: backend::xmpp::transport::normalise_pin(p_str(params, "pinSha256", "")).unwrap_or_default(),
             };
-            let registration = match backend::xmpp::register::form(settings.clone(), &domain).await {
+            let preauth = p_str(params, "preauth", "").to_string();
+            let registration = match backend::xmpp::register::form(settings.clone(), &domain, &preauth).await {
                 Ok(r) => r,
                 Err(e) => return (None, Some(e)),
             };
@@ -5260,7 +5267,7 @@ pub async fn dispatch(
             }
             let Some(form) = registration.form else { return (None, Some("this server asks for its own page to be used".to_string())) };
             let answers = params.get("answers").cloned().unwrap_or(serde_json::Value::Null);
-            if let Err(e) = backend::xmpp::register::submit(settings.clone(), &domain, &form, &answers).await {
+            if let Err(e) = backend::xmpp::register::submit(settings.clone(), &domain, &form, &answers, &preauth).await {
                 return (None, Some(e));
             }
             let (Some(user), Some(password)) = (answers.get("username").and_then(|v| v.as_str()), answers.get("password").and_then(|v| v.as_str())) else {
