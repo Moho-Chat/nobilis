@@ -29,6 +29,10 @@ pub async fn run(state: &AppState, handle: &Handle) {
     };
     roster::set_own(handle, &show, &status).await;
     super::bookmarks::load(state, handle).await;
+    // The window may be hidden already: a new session is told.
+    if handle.session().inactive {
+        handle.set_active(false);
+    }
     mam::catch_up(state, handle).await;
     super::mds::load(state, handle).await;
     let _ = caps::NAME;

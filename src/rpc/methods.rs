@@ -5439,6 +5439,19 @@ pub async fn dispatch(
             }
         }
 
+        // Whether anybody is looking (client state indication): every XMPP account tells its server.
+        "xmppSetActive" => {
+            let active = p_bool(params, "active", true);
+            for account in state.accounts.all_xmpp() {
+                if let Some(handle) = state.runtime.xmpp_handle(&account.account_id()) {
+                    handle.set_active(active);
+                } else {
+                    // Not connected yet: it will be told when it is.
+                }
+            }
+            (Some(ok_node()), None)
+        }
+
         // The account's own picture: a file, or nothing to take it off.
         "xmppSetAvatar" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("xmppSetAvatar requires \"accountId\"".to_string())) };

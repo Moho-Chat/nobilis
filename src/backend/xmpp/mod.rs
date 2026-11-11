@@ -39,6 +39,7 @@ pub mod muc_admin;
 pub mod ns;
 pub mod roster;
 pub mod send;
+pub mod tap;
 pub mod register;
 pub mod session;
 pub mod transport;

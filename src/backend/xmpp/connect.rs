@@ -210,6 +210,7 @@ async fn run(state: &AppState, account_id: &str) {
         Ok(c) => c,
         Err(e) => return stopped(&Stop::Setup(format!("{e:#}"))),
     };
+    let tap = connector.tap.clone();
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
     let stream = StanzaStream::new(reconnector(state.clone(), account_id.to_string(), connector, identity, config.password.clone(), seen.clone(), stop_tx), 32);
     let (sender, mut receiver) = stream.split();
@@ -232,11 +233,17 @@ async fn run(state: &AppState, account_id: &str) {
                     return;
                 };
                 match event {
-                    Event::Stream(StreamEvent::Reset { bound_jid, .. }) => {
+                    Event::Stream(StreamEvent::Reset { bound_jid, features }) => {
                         tracing::info!("xmpp[{account_id}]: signed in as {bound_jid}");
                         // A stream that began afresh has lost what the server knew of this session: presence, carbons,
                         // the roster's push subscription. Everything is set up again.
-                        session.lock().unwrap_or_else(|e| e.into_inner()).present = false;
+                        {
+                            let mut s = session.lock().unwrap_or_else(|e| e.into_inner());
+                            s.present = false;
+                            // Client state indication, if the server offers it (it says so among the stream's features).
+                            let offered = features.others.iter().any(|e| e.is("csi", "urn:xmpp:csi:0"));
+                            s.csi = Some((tap.clone(), offered));
+                        }
                         let handle = Handle::new(account_id, bound_jid, sender.clone(), session.clone());
                         state.runtime.set_xmpp_handle(account_id, handle.clone());
                         state.runtime.set_own_identity(account_id, handle.own().as_str());

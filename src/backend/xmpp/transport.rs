@@ -181,6 +181,8 @@ pub fn tls_config(settings: &Settings, seen: &SeenSlot) -> Result<Arc<ClientConf
 pub struct Connector {
     pub settings: Settings,
     tls: Arc<ClientConfig>,
+    /// Where stream-level elements are queued to be written (client state indication).
+    pub tap: Arc<super::tap::Tap>,
 }
 
 impl std::fmt::Debug for Connector {
@@ -192,7 +194,7 @@ impl std::fmt::Debug for Connector {
 impl Connector {
     pub fn new(settings: Settings, seen: &SeenSlot) -> Result<Self> {
         let tls = tls_config(&settings, seen)?;
-        Ok(Self { settings, tls })
+        Ok(Self { settings, tls, tap: Arc::new(super::tap::Tap::default()) })
     }
 
     /// The TCP connection, through the account's route.
@@ -268,7 +270,7 @@ impl ServerConnector for Connector {
         let tcp = self.tcp(domain).await?;
         if self.settings.direct {
             let (tls, binding) = self.tls(tcp, domain).await?;
-            let pending = initiate_stream(Box::new(BufStream::new(tls)) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: Some(Cow::Borrowed(jid.to_bare().as_str())), id: None }, timeouts).await?;
+            let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(tls), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: Some(Cow::Borrowed(jid.to_bare().as_str())), id: None }, timeouts).await?;
             return Ok((pending, binding));
         }
         // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
@@ -291,7 +293,7 @@ impl ServerConnector for Connector {
         }
         let raw = plain.into_inner().into_inner();
         let (tls, binding) = self.tls(raw, domain).await?;
-        let pending = initiate_stream(Box::new(BufStream::new(tls)) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(tls), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
         Ok((pending, binding))
     }
 }
@@ -316,7 +318,7 @@ impl Connector {
         let mut request = address.as_str().into_client_request().map_err(|e| io_err(e.to_string()))?;
         request.headers_mut().insert("Sec-WebSocket-Protocol", "xmpp".parse().expect("a header value"));
         let (ws, _) = tokio_tungstenite::client_async(request, tls).await.map_err(|e| io_err(format!("the WebSocket: {e}")))?;
-        let io: Stream = Box::new(BufStream::new(super::websocket::WsIo::new(ws)));
+        let io: Stream = Box::new(super::tap::Tapped::new(BufStream::new(super::websocket::WsIo::new(ws)), self.tap.clone()));
         let pending = initiate_stream(io, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
         Ok((pending, binding))
     }

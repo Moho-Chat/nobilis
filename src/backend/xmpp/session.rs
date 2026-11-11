@@ -101,6 +101,10 @@ pub struct Session {
     pub omemo: Option<Arc<super::omemo::Omemo>>,
     /// The archive's id (and who stamped it) for each message, by the id it is kept under: what a read marker names.
     pub archive_ids: HashMap<String, (String, String)>,
+    /// Where to queue client state indication, and whether the server offers it.
+    pub csi: Option<(Arc<super::tap::Tap>, bool)>,
+    /// The window is hidden: the server is asked to hold back what is not urgent.
+    pub inactive: bool,
 }
 
 /// Somebody asked this account into a room.
@@ -142,6 +146,32 @@ impl Handle {
 
     pub fn session(&self) -> MutexGuard<'_, Session> {
         self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tells the server whether anybody is looking (XEP-0352): while nobody is, it holds back presence and typing and the like and
+    /// delivers them together when somebody is. A no-op where the server does not offer it.
+    pub fn set_active(&self, active: bool) {
+        let tap = {
+            let mut s = self.session();
+            s.inactive = !active;
+            match &s.csi {
+                Some((tap, true)) => tap.clone(),
+                _ => return,
+            }
+        };
+        tap.push(if active { b"<active xmlns='urn:xmpp:csi:0'/>".to_vec() } else { b"<inactive xmlns='urn:xmpp:csi:0'/>".to_vec() });
+        // Written at the next boundary in what the stream is writing: sending the account's presence again makes sure there is a
+        // next one, and is answered by nothing (a ping's answer would count as urgent and empty the queue the server just began).
+        let h = self.clone();
+        tokio::spawn(async move {
+            let (show, status) = {
+                let s = h.session();
+                (if s.own_show.is_empty() { "online".to_string() } else { s.own_show.clone() }, s.own_status.clone())
+            };
+            if h.session().present {
+                h.send_presence(super::roster::own_presence(&show, &status)).await;
+            }
+        });
     }
 
     pub async fn send(&self, stanza: Stanza) {
