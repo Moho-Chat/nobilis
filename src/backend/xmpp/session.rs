@@ -141,6 +141,11 @@ impl Handle {
         Self { account_id: account_id.to_string(), bound, sender, session }
     }
 
+    /// Whether this handle belongs to the connection that owns `session`.
+    pub fn is_of(&self, session: &Arc<Mutex<Session>>) -> bool {
+        Arc::ptr_eq(&self.session, session)
+    }
+
     /// The account's own address, without the resource.
     pub fn own(&self) -> BareJid {
         self.bound.to_bare()

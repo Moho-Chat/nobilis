@@ -143,7 +143,10 @@ hkdf = "0.12"
 cbc = { version = "0.1", features = ["alloc"] }
 aes = "0.8"
 hmac012 = { version = "0.12", package = "hmac" }
+sha1_010 = { version = "0.10", package = "sha1" }
+stringprep = "0.1"
 thiserror = "2"
+x509-parser = { version = "0.17", default-features = false }
 
 # Two calls, both in main.rs: see keep_the_heap_honest() there for why a chat
 # daemon has anything to say to its allocator.

@@ -213,18 +213,63 @@ impl Connector {
         Ok(TcpOrSocks::Tcp(dns.resolve().await?))
     }
 
-    async fn tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, stream: S, domain: &str) -> Result<(TlsStream<S>, sasl::common::ChannelBinding), Error> {
+    async fn tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, stream: S, domain: &str) -> Result<(TlsStream<S>, super::sasl::Bindings), Error> {
         let name = ServerName::try_from(domain.to_owned()).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
         let tls = TlsConnector::from(self.tls.clone()).connect(name, stream).await.map_err(Error::Io)?;
-        // The binding for SCRAM-*-PLUS, which TLS 1.3 gives (RFC 9266). TLS 1.2's tls-unique is not offered.
-        let binding = match tls.get_ref().1.protocol_version() {
-            Some(rustls::ProtocolVersion::TLSv1_3) => match tls.get_ref().1.export_keying_material(vec![0u8; 32], b"EXPORTER-Channel-Binding", None) {
-                Ok(data) => sasl::common::ChannelBinding::TlsExporter(data),
-                Err(_) => sasl::common::ChannelBinding::None,
-            },
-            _ => sasl::common::ChannelBinding::None,
-        };
-        Ok((tls, binding))
+        Ok(bindings_of(tls))
+    }
+}
+
+/// The channel bindings a TLS connection offers SCRAM-*-PLUS and FAST: `tls-exporter` (RFC 9266) on TLS 1.3, and
+/// `tls-server-end-point` (RFC 5929) from the server's certificate. TLS 1.2's `tls-unique` is not offered (rustls has no
+/// such value, and RFC 9266 retired it).
+fn bindings_of<S>(tls: TlsStream<S>) -> (TlsStream<S>, super::sasl::Bindings) {
+    let conn = tls.get_ref().1;
+    let exporter = match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => conn.export_keying_material(vec![0u8; 32], b"EXPORTER-Channel-Binding", None).ok(),
+        _ => None,
+    };
+    let endpoint = conn.peer_certificates().and_then(|c| c.first()).and_then(|c| super::sasl::endpoint_binding(c.as_ref()));
+    (tls, super::sasl::Bindings { exporter, endpoint })
+}
+
+/// A connection with TLS up and nothing said on it yet (or, for STARTTLS, nothing since TLS came up).
+pub trait Raw: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Raw for T {}
+
+impl Connector {
+    /// Reaches the server and brings TLS up: the route, DNS, STARTTLS or direct TLS, or a WebSocket. Signing in is the caller's.
+    pub async fn open(&self, jid: &Jid) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
+        let domain = jid.domain().as_str();
+        if self.settings.websocket {
+            return self.websocket_raw(jid).await;
+        }
+        let tcp = self.tcp(domain).await?;
+        if self.settings.direct {
+            let (tls, bindings) = self.tls(tcp, domain).await?;
+            return Ok((Box::new(BufStream::new(tls)), bindings));
+        }
+        // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
+        // listener could use (no address, no credentials, until TLS is up), and a server that does not offer it is refused.
+        let plain = initiate_stream(BufStream::new(tcp), tokio_xmpp::parsers::ns::JABBER_CLIENT, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, Timeouts::default()).await?;
+        let (features, mut plain): (_, XmppStream<_>) = plain.recv_features().await?;
+        if !features.can_starttls() {
+            return Err(Error::Io(io::Error::other("the server does not offer STARTTLS, and moho does not connect without encryption")));
+        }
+        plain.send(&XmppStreamElement::Starttls(starttls::Nonza::Request(Request))).await?;
+        loop {
+            match plain.next().await.map(|v| v.and_then(|v| v.into_read_error())) {
+                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Proceed(_)))) => break,
+                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Failure(_)))) => return Err(Error::Io(io::Error::other("the server refused STARTTLS"))),
+                Some(Ok(_)) | Some(Err(ReadError::SoftTimeout)) => {}
+                Some(Err(ReadError::HardError(e))) => return Err(e.into()),
+                Some(Err(ReadError::ParseError(e))) => return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidData, e))),
+                None | Some(Err(ReadError::StreamFooterReceived)) => return Err(Error::Disconnected),
+            }
+        }
+        let raw = plain.into_inner().into_inner();
+        let (tls, bindings) = self.tls(raw, domain).await?;
+        Ok((Box::new(BufStream::new(tls)), bindings))
     }
 }
 
@@ -262,46 +307,23 @@ pub fn websocket_in_xml(text: &str) -> Option<String> {
 impl ServerConnector for Connector {
     type Stream = Stream;
 
+    /// The library's way in (in-band registration uses it): TLS up, then the stream opened as the library expects.
     async fn connect(&self, jid: &Jid, ns: &'static str, timeouts: Timeouts) -> Result<(PendingFeaturesRecv<Self::Stream>, sasl::common::ChannelBinding), Error> {
+        let (raw, bindings) = self.open(jid).await?;
         let domain = jid.domain().as_str();
-        if self.settings.websocket {
-            return self.websocket(jid, ns, timeouts).await;
-        }
-        let tcp = self.tcp(domain).await?;
-        if self.settings.direct {
-            let (tls, binding) = self.tls(tcp, domain).await?;
-            let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(tls), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: Some(Cow::Borrowed(jid.to_bare().as_str())), id: None }, timeouts).await?;
-            return Ok((pending, binding));
-        }
-        // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
-        // listener could use (no credentials are, until TLS is up), and a server that does not offer it is refused.
-        let plain = initiate_stream(BufStream::new(tcp), ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
-        let (features, mut plain): (_, XmppStream<_>) = plain.recv_features().await?;
-        if !features.can_starttls() {
-            return Err(Error::Io(io::Error::other("the server does not offer STARTTLS, and moho does not connect without encryption")));
-        }
-        plain.send(&XmppStreamElement::Starttls(starttls::Nonza::Request(Request))).await?;
-        loop {
-            match plain.next().await.map(|v| v.and_then(|v| v.into_read_error())) {
-                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Proceed(_)))) => break,
-                Some(Ok(XmppStreamElement::Starttls(starttls::Nonza::Failure(_)))) => return Err(Error::Io(io::Error::other("the server refused STARTTLS"))),
-                Some(Ok(_)) | Some(Err(ReadError::SoftTimeout)) => {}
-                Some(Err(ReadError::HardError(e))) => return Err(e.into()),
-                Some(Err(ReadError::ParseError(e))) => return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidData, e))),
-                None | Some(Err(ReadError::StreamFooterReceived)) => return Err(Error::Disconnected),
-            }
-        }
-        let raw = plain.into_inner().into_inner();
-        let (tls, binding) = self.tls(raw, domain).await?;
-        let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(tls), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        let pending = initiate_stream(Box::new(super::tap::Tapped::new(BufStream::new(raw), self.tap.clone())) as Stream, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
+        let binding = match bindings.exporter {
+            Some(data) => sasl::common::ChannelBinding::TlsExporter(data),
+            None => sasl::common::ChannelBinding::None,
+        };
         Ok((pending, binding))
     }
 }
 
 impl Connector {
-    /// The stream over a WebSocket: found (or named), connected through the account's route, TLS as for any connection, then the
-    /// translation of `websocket.rs` under the same stream library.
-    async fn websocket(&self, jid: &Jid, ns: &'static str, timeouts: Timeouts) -> Result<(PendingFeaturesRecv<Stream>, sasl::common::ChannelBinding), Error> {
+    /// The WebSocket: found (or named), connected through the account's route, TLS as for any connection, then the translation
+    /// of `websocket.rs`, so everything above it reads and writes the TCP form.
+    async fn websocket_raw(&self, jid: &Jid) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let io_err = |m: String| Error::Io(io::Error::other(m));
         let domain = jid.domain().as_str();
@@ -314,13 +336,13 @@ impl Connector {
         let host = url.host_str().ok_or_else(|| io_err("the WebSocket address has no host".to_string()))?.to_string();
         let port = url.port().unwrap_or(443);
         let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, port).await.map_err(|e| io_err(format!("{e:#}")))?;
-        let (tls, binding) = self.tls(tcp, &host).await?;
+        // The TLS here may end at a proxy in front of the XMPP server, which then cannot see it: no channel binding is offered.
+        let (tls, _) = self.tls(tcp, &host).await?;
+        let bindings = super::sasl::Bindings::default();
         let mut request = address.as_str().into_client_request().map_err(|e| io_err(e.to_string()))?;
         request.headers_mut().insert("Sec-WebSocket-Protocol", "xmpp".parse().expect("a header value"));
         let (ws, _) = tokio_tungstenite::client_async(request, tls).await.map_err(|e| io_err(format!("the WebSocket: {e}")))?;
-        let io: Stream = Box::new(super::tap::Tapped::new(BufStream::new(super::websocket::WsIo::new(ws)), self.tap.clone()));
-        let pending = initiate_stream(io, ns, StreamHeader { to: Some(Cow::Borrowed(domain)), from: None, id: None }, timeouts).await?;
-        Ok((pending, binding))
+        Ok((Box::new(BufStream::new(super::websocket::WsIo::new(ws))), bindings))
     }
 }
 

@@ -5480,7 +5480,14 @@ pub async fn dispatch(
                 return (None, Some("setXmppPassword requires \"accountId\" and \"password\"".to_string()));
             };
             let password = password.to_string();
-            match state.accounts.mutate_xmpp(account_id, move |a| a.password = password) {
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                // A new password starts the sign-in over: the token and the floor belonged to the old one.
+                a.password = password;
+                a.fast_token.clear();
+                a.fast_mechanism.clear();
+                a.fast_expiry.clear();
+                a.sasl_floor.clear();
+            }) {
                 Ok(true) => {
                     if let Some(config) = state.accounts.get_xmpp(account_id) {
                         backend::xmpp::spawn(state.clone(), config);

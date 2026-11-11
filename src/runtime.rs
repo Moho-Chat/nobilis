@@ -4551,6 +4551,15 @@ impl Runtime {
         self.xmpp_handles.lock().unwrap().insert(account_id.to_string(), handle);
     }
 
+    /// Forgets the handle only if it is still the one of the connection that owns `session`: a connection being torn down
+    /// must not take its successor's handle with it.
+    pub fn clear_xmpp_handle_of(&self, account_id: &str, session: &std::sync::Arc<std::sync::Mutex<crate::backend::xmpp::session::Session>>) {
+        let mut handles = self.xmpp_handles.lock().unwrap();
+        if handles.get(account_id).is_some_and(|h| h.is_of(session)) {
+            handles.remove(account_id);
+        }
+    }
+
     pub fn clear_xmpp_handle(&self, account_id: &str) {
         self.xmpp_handles.lock().unwrap().remove(account_id);
     }

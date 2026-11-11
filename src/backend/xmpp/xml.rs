@@ -51,6 +51,11 @@ pub fn stamp(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string()).unwrap_or_default()
 }
 
+/// Text made safe to put in an attribute value or between tags.
+pub fn escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\'', "&apos;").replace('"', "&quot;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

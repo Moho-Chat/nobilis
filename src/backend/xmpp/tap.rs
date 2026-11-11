@@ -26,7 +26,7 @@ impl Tap {
 
 /// Follows the library's output to know whether it is between elements.
 #[derive(Default)]
-struct Boundary {
+pub(super) struct Boundary {
     depth: i32,
     in_tag: bool,
     quote: Option<u8>,
@@ -38,7 +38,7 @@ struct Boundary {
 }
 
 impl Boundary {
-    fn feed(&mut self, bytes: &[u8]) {
+    pub(super) fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {
             if let Some(q) = self.quote {
                 if b == q {
@@ -84,7 +84,7 @@ impl Boundary {
     }
 
     /// Between two elements of the stream, with nothing half written.
-    fn between(&self) -> bool {
+    pub(super) fn between(&self) -> bool {
         !self.in_tag && self.depth == 1
     }
 }

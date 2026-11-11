@@ -19,7 +19,7 @@ pub const FRAMING: &str = "urn:ietf:params:xml:ns:xmpp-framing";
 const STREAMS: &str = "http://etherx.jabber.org/streams";
 
 /// The attributes of a start tag, in order.
-fn attributes(tag: &str) -> Vec<(String, String)> {
+pub(super) fn attributes(tag: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let bytes = tag.as_bytes();
     let mut i = tag.find(char::is_whitespace).unwrap_or(tag.len());
@@ -51,12 +51,12 @@ fn attributes(tag: &str) -> Vec<(String, String)> {
     out
 }
 
-fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+pub(super) fn attr<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
     attrs.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
 }
 
 /// The end of the start tag that begins `s` (after its `>`), respecting quoted values.
-fn tag_end(s: &str) -> Option<usize> {
+pub(super) fn tag_end(s: &str) -> Option<usize> {
     let mut quote = None;
     for (i, c) in s.char_indices() {
         match (quote, c) {
@@ -153,7 +153,7 @@ fn with_namespace(frame: String) -> String {
 }
 
 /// Where the first whole element in `s` ends, if it has ended.
-fn element_end(s: &str) -> Option<usize> {
+pub(super) fn element_end(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     let mut i = 0;
     while i < s.len() {

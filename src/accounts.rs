@@ -619,6 +619,25 @@ pub struct XmppAccountConfig {
     pub use_tor: bool,
     #[serde(default)]
     pub strict_route: bool,
+    /// The id this client gives the server for itself when signing in (XEP-0388's user agent): a random UUID, made once and
+    /// kept, so the server can give the same device the same resource and tie a sign-in token (FAST) to it.
+    #[serde(default)]
+    pub user_agent_id: String,
+    /// A sign-in token the server gave (FAST, XEP-0484), the mechanism it is for, and when it expires (as the server wrote
+    /// it). As secret as the password; dropped when the password changes or the server refuses it.
+    #[serde(default)]
+    pub fast_token: String,
+    #[serde(default)]
+    pub fast_mechanism: String,
+    #[serde(default)]
+    pub fast_expiry: String,
+    /// The strongest kind of sign-in this account has had (`scram`, or empty): a server that later offers only PLAIN is
+    /// refused rather than sent the password. Cleared with a new password.
+    #[serde(default)]
+    pub sasl_floor: String,
+    /// When the account last signed in (RFC 3339), for the account's card.
+    #[serde(default)]
+    pub last_connected: String,
 }
 
 impl XmppAccountConfig {
@@ -1092,6 +1111,21 @@ impl AccountStore {
                 }
                 if config.resource.is_empty() {
                     config.resource = old.resource.clone();
+                }
+                if config.user_agent_id.is_empty() {
+                    config.user_agent_id = old.user_agent_id.clone();
+                }
+                if config.last_connected.is_empty() {
+                    config.last_connected = old.last_connected.clone();
+                }
+                // A password entered again starts the sign-in over: no token, no floor kept from the old one.
+                if config.password == old.password {
+                    if config.sasl_floor.is_empty() {
+                        config.sasl_floor = old.sasl_floor.clone();
+                    }
+                    if config.fast_token.is_empty() {
+                        (config.fast_token, config.fast_mechanism, config.fast_expiry) = (old.fast_token.clone(), old.fast_mechanism.clone(), old.fast_expiry.clone());
+                    }
                 }
             }
             xmpp.insert(id, config.clone());

@@ -37,6 +37,6 @@ delivered to clients that called `subscribe` for that buffer; everything else br
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
 
-The XMPP backend uses the xmpp-rs crates (`tokio-xmpp`, `xmpp-parsers`, `jid`, `minidom`, `sasl`), which are MPL-2.0: their own files stay
+The XMPP backend uses the xmpp-rs crates (`tokio-xmpp`, `xmpp-parsers`, `jid`, `minidom`, `sasl`, `xso`), which are MPL-2.0: their own files stay
 under that licence, and the daemon as a whole is distributed under the GPL as above, which MPL-2.0 section 3.3 allows. Nothing of
 theirs is modified. The OMEMO (Signal protocol) code in `src/backend/xmpp/omemo/` is written here from the specifications.

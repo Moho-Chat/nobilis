@@ -23,21 +23,26 @@ use crate::accounts::XmppAccountConfig;
 use crate::runtime::ConnState;
 use crate::state::AppState;
 use futures::StreamExt;
-use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_xmpp::jid::{BareJid, Jid};
 use tokio_xmpp::parsers::sasl::DefinedCondition;
 use tokio_xmpp::stanzastream::{Connection, Event, StanzaStream, StreamEvent};
-use tokio_xmpp::xmlstream::{StreamHeader, Timeouts, XmppStream};
+use tokio_xmpp::xmlstream::Timeouts;
 use tokio_xmpp::Error;
 
 const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(5);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
-/// Silence tolerated before the library probes the connection (a ping), and then before it gives the connection up.
-/// Tight enough that a connection a sleeping laptop left half-open is noticed in under a minute.
-const TIMEOUTS: Timeouts = Timeouts { read_timeout: Duration::from_secs(45), response_timeout: Duration::from_secs(25) };
+/// Silence tolerated before the library probes the connection (an XEP-0198 `<r/>`, or an XEP-0199 ping without stream
+/// management), and then before it gives the connection up: a connection that went half-open is noticed within 45 seconds,
+/// and the probe every 30 quiet seconds keeps NAT bindings alive the way a whitespace ping would.
+const TIMEOUTS: Timeouts = Timeouts { read_timeout: Duration::from_secs(30), response_timeout: Duration::from_secs(15) };
+/// How often the clocks are compared to notice that the computer slept, and how far apart they must drift to say it did.
+const WAKE_TICK: Duration = Duration::from_secs(5);
+const WAKE_DRIFT: Duration = Duration::from_secs(10);
+/// How long a connection has, after a wake, to answer a ping before it is taken for dead.
+const WAKE_PING: Duration = Duration::from_secs(10);
 
 /// Why an account stopped trying.
 #[derive(Debug, PartialEq, Clone)]
@@ -103,41 +108,155 @@ pub fn classify(error: &Error, seen: &Option<Seen>) -> Option<Stop> {
     }
 }
 
-/// Signs in on a fresh connection: connect, offer SASL, authenticate, and come back with a stream that is ready for
-/// resource binding. This is the library's own `client_auth`, which it does not export.
-async fn authenticate(connector: &Connector, jid: &Jid, password: &str) -> Result<(tokio_xmpp::parsers::stream_features::StreamFeatures, XmppStream<<Connector as tokio_xmpp::connect::ServerConnector>::Stream>), Error> {
-    use tokio_xmpp::connect::ServerConnector;
-    let username = jid.node().ok_or(Error::InvalidState)?.as_str();
-    let (pending, binding) = connector.connect(jid, tokio_xmpp::parsers::ns::JABBER_CLIENT, TIMEOUTS).await?;
-    let (features, stream) = pending.recv_features().await?;
-    let creds = sasl::common::Credentials::default().with_username(username).with_password(password).with_channel_binding(binding);
-    let stream = tokio_xmpp::client_login(stream, features.sasl_mechanisms, creds).await?;
-    let stream = stream.send_header(StreamHeader { to: Some(Cow::Borrowed(jid.domain().as_str())), from: None, id: None }).await?;
-    Ok(stream.recv_features().await?)
+/// What a failed sign-in means. `None` is "try again".
+pub fn classify_login(error: &super::login::LoginError, seen: &Option<Seen>) -> Option<Stop> {
+    use super::login::LoginError;
+    match error {
+        LoginError::Credentials(m) => Some(Stop::Credentials(m.clone())),
+        LoginError::Setup(m) => Some(Stop::Setup(m.clone())),
+        LoginError::Retry(_) => None,
+        LoginError::Stream(e) => {
+            let (words, retry) = super::login::stream_error_words(e);
+            (!retry).then_some(Stop::Setup(words))
+        }
+        LoginError::Transport(e) => classify(e, seen),
+    }
+}
+
+fn login_words(error: &super::login::LoginError) -> String {
+    use super::login::LoginError;
+    match error {
+        LoginError::Credentials(m) | LoginError::Setup(m) | LoginError::Retry(m) => m.clone(),
+        LoginError::Stream(e) => super::login::stream_error_words(e).0,
+        LoginError::Transport(e) => format!("{e}"),
+    }
+}
+
+/// One attempt: reach the server, sign in, and hand the library its connection. What the account learned (a token, how
+/// strongly it signed in, when) is written to it.
+async fn attempt(state: &AppState, account_id: &str, connector: &Connector, identity: &Jid, observed: &super::wire::ObservedSlot) -> Result<Connection, super::login::LoginError> {
+    use super::login::{Creds, LoginError};
+    let config = state.accounts.get_xmpp(account_id).ok_or_else(|| LoginError::Setup("the account was removed".to_string()))?;
+    let creds = Creds {
+        password: config.password.clone(),
+        floor: super::sasl::Floor::from_config(&config.sasl_floor),
+        fast: (!config.fast_token.is_empty()).then(|| (config.fast_token.clone(), config.fast_mechanism.clone())),
+        user_agent_id: config.user_agent_id.clone(),
+    };
+    let (raw, bindings) = connector.open(identity).await.map_err(LoginError::Transport)?;
+    let wire = super::wire::Wire::new(raw, observed.clone());
+    let resumable = observed.lock().unwrap_or_else(|e| e.into_inner()).resumable;
+    let tap = connector.tap.clone();
+    let outcome = super::login::login(wire, bindings, identity, &creds, resumable, move |w| Box::new(super::tap::Tapped::new(w, tap)) as Box<dyn tokio_xmpp::connect::AsyncReadAndWrite>, TIMEOUTS).await?;
+    observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error = None;
+    tracing::info!("xmpp[{account_id}]: signed in with {}{}{}", outcome.mechanism, if outcome.sasl2 { " over SASL2" } else { "" }, if outcome.bound_inline { ", bound inline (Bind2)" } else { "" });
+    {
+        let floor = outcome.floor;
+        let (token, drop_token) = (outcome.token.clone(), outcome.drop_token);
+        let _ = state.accounts.mutate_xmpp(account_id, move |a| {
+            if floor > super::sasl::Floor::from_config(&a.sasl_floor) {
+                a.sasl_floor = floor.as_config().to_string();
+            }
+            if drop_token {
+                a.fast_token.clear();
+                a.fast_mechanism.clear();
+                a.fast_expiry.clear();
+            }
+            if let Some(t) = token {
+                (a.fast_token, a.fast_mechanism, a.fast_expiry) = (t.token, t.mechanism, t.expiry);
+            }
+            a.last_connected = chrono::Utc::now().to_rfc3339();
+        });
+    }
+    Ok(outcome.connection)
 }
 
 /// What the library calls to get a connection, now and after every drop it cannot resume.
-fn reconnector(state: AppState, account_id: String, connector: Connector, identity: Jid, password: String, seen: SeenSlot, stop: mpsc::UnboundedSender<Stop>) -> Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static> {
+fn reconnector(state: AppState, account_id: String, connector: Connector, identity: Arc<Mutex<Jid>>, seen: SeenSlot, observed: super::wire::ObservedSlot, stop: mpsc::UnboundedSender<Stop>) -> Box<dyn FnMut(Option<String>, oneshot::Sender<Connection>) + Send + 'static> {
+    // When the last connection was handed over, and the wait before the next one if it fell over at once: a server (or a bug)
+    // that takes the sign-in and then drops the stream every time must not be signed in to as fast as the network allows.
+    let handed: Arc<Mutex<(Option<std::time::Instant>, Duration)>> = Arc::new(Mutex::new((None, RECONNECT_INITIAL_DELAY)));
     Box::new(move |_preferred_location, mut slot| {
-        let (state, account_id, connector, identity, password, seen, stop) = (state.clone(), account_id.clone(), connector.clone(), identity.clone(), password.clone(), seen.clone(), stop.clone());
+        let (state, account_id, connector, identity, seen, observed, stop, handed) = (state.clone(), account_id.clone(), connector.clone(), identity.clone(), seen.clone(), observed.clone(), stop.clone(), handed.clone());
         tokio::spawn(async move {
+            let quick = {
+                let mut h = handed.lock().unwrap_or_else(|e| e.into_inner());
+                match h.0 {
+                    Some(at) if at.elapsed() < Duration::from_secs(10) => {
+                        let wait = h.1;
+                        h.1 = (h.1 * 2).min(RECONNECT_MAX_DELAY);
+                        Some(wait)
+                    }
+                    _ => {
+                        h.1 = RECONNECT_INITIAL_DELAY;
+                        None
+                    }
+                }
+            };
+            if let Some(wait) = quick {
+                tracing::warn!("xmpp[{account_id}]: the last connection ended as soon as it was made; waiting {} s", wait.as_secs());
+                state.runtime.report_retry(&state, &account_id, "The server ended the connection straight after signing in", wait);
+                tokio::time::sleep(wait).await;
+            }
             let mut delay = RECONNECT_INITIAL_DELAY;
+            // Where `see-other-host` sent us, once per run of attempts.
+            let mut redirect: Option<(String, u16)> = None;
+            let mut redirected = false;
+            // How the last connection ended, if the server said.
+            // Read, not taken: the account's task says it too, and may get to it after this. It is cleared once signed in again.
+            let ended = observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error.clone();
+            if let Some(e) = &ended {
+                state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, Some(&super::login::stream_error_words(e).0));
+                match e.condition.as_str() {
+                    "conflict" => {
+                        // Another device took this resource. Binding the same one again would take it back, and round it
+                        // would go: this device gets a new one, and keeps it.
+                        let fresh = new_resource();
+                        tracing::info!("xmpp[{account_id}]: another device signed in as this one's resource; binding {fresh}");
+                        let kept = fresh.clone();
+                        let _ = state.accounts.mutate_xmpp(&account_id, move |a| a.resource = kept);
+                        let mut id = identity.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Ok(full) = id.to_bare().with_resource_str(&fresh) {
+                            *id = Jid::from(full);
+                        }
+                    }
+                    "see-other-host" => {
+                        redirect = super::login::other_host(&e.other_host);
+                        redirected = true;
+                    }
+                    _ => {}
+                }
+            }
             loop {
                 if slot.is_closed() {
                     return;
                 }
                 *seen.lock().unwrap() = None;
-                match authenticate(&connector, &identity, &password).await {
-                    Ok((features, stream)) => {
-                        let connection = Connection { stream: stream.box_stream(), features, identity };
+                let mut c = connector.clone();
+                if let Some((host, port)) = &redirect {
+                    c.settings.host = host.clone();
+                    c.settings.port = *port;
+                }
+                let me = identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                match attempt(&state, &account_id, &c, &me, &observed).await {
+                    Ok(connection) => {
+                        handed.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(std::time::Instant::now());
                         if slot.send(connection).is_err() {
                             tracing::debug!("xmpp[{account_id}]: the stream was dropped while connecting");
                         }
                         return;
                     }
                     Err(e) => {
+                        if let super::login::LoginError::Stream(se) = &e {
+                            if se.condition == "see-other-host" && !redirected {
+                                redirected = true;
+                                redirect = super::login::other_host(&se.other_host);
+                                tracing::info!("xmpp[{account_id}]: the server sent this account to {:?}", redirect);
+                                continue;
+                            }
+                        }
                         let shown = seen.lock().unwrap().clone();
-                        if let Some(why) = classify(&e, &shown) {
+                        if let Some(why) = classify_login(&e, &shown) {
                             tracing::info!("xmpp[{account_id}]: stopped: {}", why.message());
                             match (&why, shown) {
                                 (Stop::Certificate(_), Some(seen)) => super::transport::remember_refused(&account_id, seen),
@@ -149,10 +268,11 @@ fn reconnector(state: AppState, account_id: String, connector: Connector, identi
                             slot.closed().await;
                             return;
                         }
-                        tracing::warn!("xmpp[{account_id}]: {e}");
+                        let words = login_words(&e);
+                        tracing::warn!("xmpp[{account_id}]: {words}");
                         state.runtime.set_conn_state(&state, &account_id, ConnState::Connecting, None);
                         let wait = state.runtime.next_retry_delay(&account_id, &mut delay, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY);
-                        state.runtime.report_retry(&state, &account_id, &format!("{e}"), wait);
+                        state.runtime.report_retry(&state, &account_id, &words, wait);
                         tokio::time::sleep(wait).await;
                     }
                 }
@@ -204,7 +324,12 @@ async fn run(state: &AppState, account_id: &str) {
         }
         Err(e) => return stopped(&Stop::Setup(e)),
     };
+    if config.user_agent_id.is_empty() {
+        let id = super::login::new_uuid();
+        let _ = state.accounts.mutate_xmpp(account_id, move |a| a.user_agent_id = id);
+    }
     let seen: SeenSlot = Default::default();
+    let observed: super::wire::ObservedSlot = Default::default();
     let settings = Settings { account_id: account_id.to_string(), host: config.host.clone(), port: config.port, direct: config.security == "direct", websocket: config.security == "websocket", ca_pem: config.ca_pem.clone(), pin_sha256: config.pin_sha256.clone() };
     let connector = match Connector::new(settings, &seen) {
         Ok(c) => c,
@@ -212,13 +337,54 @@ async fn run(state: &AppState, account_id: &str) {
     };
     let tap = connector.tap.clone();
     let (stop_tx, mut stop_rx) = mpsc::unbounded_channel();
-    let stream = StanzaStream::new(reconnector(state.clone(), account_id.to_string(), connector, identity, config.password.clone(), seen.clone(), stop_tx), 32);
+    let stream = StanzaStream::new(reconnector(state.clone(), account_id.to_string(), connector, Arc::new(Mutex::new(identity)), seen.clone(), observed.clone(), stop_tx), 32);
     let (sender, mut receiver) = stream.split();
     let sender = Arc::new(sender);
     let session = Arc::new(Mutex::new(Session::default()));
+    // However this task ends - returning, or aborted by a disconnect - the handle it published goes with it, and with the
+    // last sender gone the library closes the stream (a footer, not a dropped socket). Without this a disconnected account
+    // stayed signed in at the server, holding its resource.
+    struct Release(AppState, String, Arc<Mutex<Session>>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.runtime.clear_xmpp_handle_of(&self.1, &self.2);
+        }
+    }
+    let _release = Release(state.clone(), account_id.to_string(), session.clone());
     let mut current: Option<Handle> = None;
+    // Monotonic time stops while the computer sleeps; the wall clock does not. When they drift apart the computer was asleep,
+    // and a connection that was up before is asked at once whether it still is - rather than in the 45 seconds the timers
+    // above would take.
+    let mut wake_tick = tokio::time::interval(WAKE_TICK);
+    let mut last_tick = (std::time::Instant::now(), std::time::SystemTime::now());
     loop {
         tokio::select! {
+            _ = wake_tick.tick() => {
+                let (mono, wall) = (std::time::Instant::now(), std::time::SystemTime::now());
+                let slept = wall.duration_since(last_tick.1).unwrap_or_default().saturating_sub(mono.duration_since(last_tick.0));
+                last_tick = (mono, wall);
+                if slept >= WAKE_DRIFT {
+                    if let Some(handle) = state.runtime.xmpp_handle(account_id).filter(|h| h.is_of(&session)) {
+                        tracing::info!("xmpp[{account_id}]: the computer slept for {} s; checking the connection", slept.as_secs());
+                        let observed = observed.clone();
+                        let account_id = account_id.to_string();
+                        tokio::spawn(async move {
+                            let domain = handle.own().domain().as_str().parse::<Jid>().ok();
+                            let ping = handle.request(domain, false, super::xml::empty("ping", "urn:xmpp:ping"));
+                            // Any answer, an error included, is a connection that works.
+                            let alive = match tokio::time::timeout(WAKE_PING, ping).await {
+                                Ok(Ok(_)) => true,
+                                Ok(Err(f)) => f.condition != "remote-server-timeout" && f.condition != "disconnected",
+                                Err(_) => false,
+                            };
+                            if !alive {
+                                tracing::info!("xmpp[{account_id}]: the connection did not survive the sleep; reconnecting");
+                                super::wire::cut(&observed);
+                            }
+                        });
+                    }
+                }
+            }
             stop = stop_rx.recv() => {
                 if let Some(stop) = stop {
                     state.runtime.clear_xmpp_handle(account_id);
@@ -235,6 +401,11 @@ async fn run(state: &AppState, account_id: &str) {
                 match event {
                     Event::Stream(StreamEvent::Reset { bound_jid, features }) => {
                         tracing::info!("xmpp[{account_id}]: signed in as {bound_jid}");
+                        // The resource is what was bound, however it was (Bind2 lets the server choose it): kept, so the next
+                        // start asks for the same one.
+                        if let Some(r) = bound_jid.resource().map(|r| r.to_string()) {
+                            let _ = state.accounts.mutate_xmpp(account_id, move |a| if a.resource != r { a.resource = r });
+                        }
                         // A stream that began afresh has lost what the server knew of this session: presence, carbons,
                         // the roster's push subscription. Everything is set up again.
                         {
@@ -255,8 +426,10 @@ async fn run(state: &AppState, account_id: &str) {
                         });
                     }
                     Event::Stream(StreamEvent::Suspended) => {
-                        tracing::info!("xmpp[{account_id}]: the connection dropped; the session is kept for resuming");
-                        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None)
+                        // If the server said why, it is said here too.
+                        let why = observed.lock().unwrap_or_else(|e| e.into_inner()).stream_error.clone().map(|e| super::login::stream_error_words(&e).0);
+                        tracing::info!("xmpp[{account_id}]: the connection dropped{}; the session is kept for resuming", why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default());
+                        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, why.as_deref())
                     }
                     Event::Stream(StreamEvent::Resumed) => {
                         tracing::info!("xmpp[{account_id}]: the session was resumed, nothing lost");
