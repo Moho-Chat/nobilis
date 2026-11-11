@@ -63,6 +63,25 @@ impl Stop {
     }
 }
 
+/// Why each stopped account stopped, in one word for its card (see `model::Account::stop_reason`).
+fn stop_reasons() -> &'static Mutex<std::collections::HashMap<String, String>> {
+    static REASONS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    REASONS.get_or_init(Default::default)
+}
+
+pub fn stop_reason(account_id: &str) -> String {
+    stop_reasons().lock().unwrap_or_else(|e| e.into_inner()).get(account_id).cloned().unwrap_or_default()
+}
+
+fn set_stop_reason(account_id: &str, reason: &str) {
+    let mut r = stop_reasons().lock().unwrap_or_else(|e| e.into_inner());
+    if reason.is_empty() {
+        r.remove(account_id);
+    } else {
+        r.insert(account_id.to_string(), reason.to_string());
+    }
+}
+
 /// A resource to bind when the account has none yet: `moho.` and eight characters, kept from then on.
 pub fn new_resource() -> String {
     use rand::Rng;
@@ -152,6 +171,7 @@ async fn attempt(state: &AppState, account_id: &str, connector: &Connector, iden
     tracing::info!("xmpp[{account_id}]: signed in with {}{}{}", outcome.mechanism, if outcome.sasl2 { " over SASL2" } else { "" }, if outcome.bound_inline { ", bound inline (Bind2)" } else { "" });
     {
         let floor = outcome.floor;
+        let how = format!("{}{}{}", outcome.mechanism, if outcome.sasl2 { " over SASL2" } else { "" }, if outcome.bound_inline { " with Bind2" } else { "" });
         let (token, drop_token) = (outcome.token.clone(), outcome.drop_token);
         let _ = state.accounts.mutate_xmpp(account_id, move |a| {
             if floor > super::sasl::Floor::from_config(&a.sasl_floor) {
@@ -166,6 +186,7 @@ async fn attempt(state: &AppState, account_id: &str, connector: &Connector, iden
                 (a.fast_token, a.fast_mechanism, a.fast_expiry) = (t.token, t.mechanism, t.expiry);
             }
             a.last_connected = chrono::Utc::now().to_rfc3339();
+            a.last_mechanism = how;
         });
     }
     Ok(outcome.connection)
@@ -302,12 +323,16 @@ async fn run(state: &AppState, account_id: &str) {
     state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None);
     super::transport::forget_refused(account_id);
     let Some(config) = state.accounts.get_xmpp(account_id) else { return };
+    set_stop_reason(account_id, "");
+    let pinned = !config.pin_sha256.is_empty();
     let stopped = |stop: &Stop| {
-        let (conn, advice) = match stop {
-            Stop::Credentials(_) => (ConnState::AuthFailed, " Enter the password again from Accounts."),
-            Stop::Certificate(_) => (ConnState::AuthFailed, " Trust the certificate or add its authority from Accounts."),
-            Stop::Setup(_) => (ConnState::AuthFailed, " Check the account's settings in Accounts."),
+        let (conn, advice, reason) = match stop {
+            Stop::Credentials(_) => (ConnState::AuthFailed, " Enter the password again from Accounts.", "password"),
+            Stop::Certificate(_) if pinned => (ConnState::AuthFailed, " The certificate is not the one that was trusted: look at what changed in Accounts.", "certificate-changed"),
+            Stop::Certificate(_) => (ConnState::AuthFailed, " Trust the certificate or add its authority from Accounts.", "certificate"),
+            Stop::Setup(_) => (ConnState::AuthFailed, " Check the account's settings in Accounts.", "setup"),
         };
+        set_stop_reason(account_id, reason);
         state.runtime.set_conn_state(state, account_id, conn, Some(&format!("{}.{advice}", stop.message().trim_end_matches('.'))));
     };
     let identity = match normalise_jid(&config.jid) {

@@ -5027,8 +5027,12 @@ pub async fn dispatch(
                 security: security.to_string(),
                 ca_pem: p_str(params, "caPem", "").to_string(),
                 pin_sha256: backend::xmpp::transport::normalise_pin(pin).unwrap_or_default(),
+                resource: p_str(params, "resource", "").trim().to_string(),
                 ..Default::default()
             };
+            if !config.resource.is_empty() && tokio_xmpp::jid::BareJid::new(&config.jid).ok().and_then(|b| b.with_resource_str(&config.resource).ok()).is_none() {
+                return (None, Some(format!("{:?} cannot be a resource", config.resource)));
+            }
             match state.accounts.add_xmpp(config) {
                 Ok(config) => {
                     let account_id = config.account_id();
@@ -5224,8 +5228,97 @@ pub async fn dispatch(
         "getXmppCertificate" => {
             let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("getXmppCertificate requires \"accountId\"".to_string())) };
             match backend::xmpp::transport::refused_by(account_id) {
-                Some(seen) => (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused })), None),
+                Some(seen) => {
+                    // What the certificate says, and - for one that replaced a pinned certificate - what is different.
+                    let details = backend::xmpp::transport::cert_details(&seen.der);
+                    let pinned: Option<backend::xmpp::transport::CertDetails> = state.accounts.get_xmpp(account_id).filter(|a| !a.pin_sha256.is_empty()).and_then(|a| serde_json::from_str(&a.pin_info).ok());
+                    let changed = match (&pinned, &details) {
+                        (Some(before), Some(now)) => backend::xmpp::transport::what_changed(before, now),
+                        _ => Vec::new(),
+                    };
+                    (Some(serde_json::json!({ "sha256": seen.sha256, "refused": seen.refused, "details": details, "pinned": pinned, "changed": changed })), None)
+                }
                 None => (Some(serde_json::json!({})), None),
+            }
+        }
+
+        // An account's connection settings, as the card's Connection tab shows them, and how it last signed in.
+        "getXmppSettings" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("getXmppSettings requires \"accountId\"".to_string())) };
+            let Some(a) = state.accounts.get_xmpp(account_id) else { return (None, Some("no such account".to_string())) };
+            let pinned: Option<backend::xmpp::transport::CertDetails> = serde_json::from_str(&a.pin_info).ok();
+            (
+                Some(serde_json::json!({
+                    "jid": a.jid, "host": a.host, "port": a.port, "security": if a.security.is_empty() { "starttls" } else { a.security.as_str() },
+                    "caPem": a.ca_pem, "pinSha256": a.pin_sha256, "pinned": pinned, "resource": a.resource,
+                    "lastConnected": a.last_connected, "lastMechanism": a.last_mechanism, "fastToken": !a.fast_token.is_empty(), "fastExpiry": a.fast_expiry,
+                    "scramOnly": a.sasl_floor == "scram",
+                })),
+                None,
+            )
+        }
+
+        // Changes how an account reaches its server, in place: the server and port, the security, the trusted authority, the
+        // pinned certificate, the resource. Checked before it is kept; the account connects again with it.
+        "editXmppAccount" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some("editXmppAccount requires \"accountId\"".to_string())) };
+            let Some(current) = state.accounts.get_xmpp(account_id) else { return (None, Some("no such account".to_string())) };
+            let host = p_str(params, "host", &current.host).trim().to_string();
+            let port = match params.get("port") {
+                Some(v) => match v.as_u64().and_then(|v| u16::try_from(v).ok()) {
+                    Some(p) => p,
+                    None => return (None, Some("the port must be a number from 0 to 65535".to_string())),
+                },
+                None => current.port,
+            };
+            let security = match p_str(params, "security", &current.security) {
+                "direct" => "direct",
+                "websocket" => "websocket",
+                _ => "starttls",
+            }
+            .to_string();
+            if security == "websocket" && !host.is_empty() && !host.starts_with("wss://") {
+                return (None, Some("over a WebSocket the server is a wss:// address, or empty to look it up".to_string()));
+            }
+            let ca_pem = p_str(params, "caPem", &current.ca_pem).trim().to_string();
+            let pin_raw = p_str(params, "pinSha256", &current.pin_sha256).to_string();
+            let pin = if pin_raw.trim().is_empty() {
+                String::new()
+            } else {
+                match backend::xmpp::transport::normalise_pin(&pin_raw) {
+                    Some(p) => p,
+                    None => return (None, Some("the pinned certificate must be a SHA-256 fingerprint (64 hex digits)".to_string())),
+                }
+            };
+            let resource = p_str(params, "resource", &current.resource).trim().to_string();
+            if !resource.is_empty() && tokio_xmpp::jid::BareJid::new(&current.jid).ok().and_then(|b| b.with_resource_str(&resource).ok()).is_none() {
+                return (None, Some(format!("{resource:?} cannot be a resource")));
+            }
+            // The trust settings are tried before they are kept: a CA that is not a certificate is said now, not at connecting.
+            let settings = backend::xmpp::transport::Settings { account_id: account_id.to_string(), host: host.clone(), port, direct: security == "direct", websocket: security == "websocket", ca_pem: ca_pem.clone(), pin_sha256: pin.clone() };
+            if let Err(e) = backend::xmpp::transport::tls_config(&settings, &Default::default()) {
+                return (None, Some(format!("{e:#}")));
+            }
+            let changed = (host != current.host) || port != current.port || security != current.security || ca_pem != current.ca_pem || pin != current.pin_sha256 || resource != current.resource;
+            let pin_changed = pin != current.pin_sha256;
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                (a.host, a.port, a.security, a.ca_pem, a.resource) = (host, port, security, ca_pem, resource);
+                if pin_changed {
+                    a.pin_sha256 = pin;
+                    a.pin_info.clear();
+                }
+            }) {
+                Ok(true) => {
+                    if changed {
+                        backend::xmpp::transport::forget_refused(account_id);
+                        if let Some(config) = state.accounts.get_xmpp(account_id) {
+                            backend::xmpp::spawn(state.clone(), config);
+                        }
+                    }
+                    (Some(serde_json::json!({ "changed": changed })), None)
+                }
+                Ok(false) => (None, Some("no such account".to_string())),
+                Err(e) => (None, Some(format!("{e:#}"))),
             }
         }
 
@@ -5240,7 +5333,11 @@ pub async fn dispatch(
                 return (None, Some("that is not the certificate the server showed last; connect again and look at it".to_string()));
             }
             let pinned = seen.sha256.clone();
-            match state.accounts.mutate_xmpp(account_id, move |a| a.pin_sha256 = pinned) {
+            let info = backend::xmpp::transport::cert_details(&seen.der).and_then(|d| serde_json::to_string(&d).ok()).unwrap_or_default();
+            match state.accounts.mutate_xmpp(account_id, move |a| {
+                a.pin_sha256 = pinned;
+                a.pin_info = info;
+            }) {
                 Ok(true) => {
                     backend::xmpp::transport::forget_refused(account_id);
                     if let Some(config) = state.accounts.get_xmpp(account_id) {

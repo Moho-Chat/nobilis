@@ -93,6 +93,71 @@ pub struct Settings {
     pub pin_sha256: String,
 }
 
+/// What a certificate says about itself, for the person deciding whether to trust it.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CertDetails {
+    pub subject: String,
+    pub issuer: String,
+    /// RFC 3339.
+    #[serde(rename = "notBefore")]
+    pub not_before: String,
+    #[serde(rename = "notAfter")]
+    pub not_after: String,
+    /// The names it is for (subject alternative names: DNS names and addresses).
+    pub names: Vec<String>,
+    #[serde(rename = "selfSigned")]
+    pub self_signed: bool,
+}
+
+/// Reads a certificate (DER). `None` when it cannot be read.
+pub fn cert_details(der: &[u8]) -> Option<CertDetails> {
+    use x509_parser::extensions::GeneralName;
+    use x509_parser::prelude::FromDer;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+    let time = |t: x509_parser::time::ASN1Time| chrono::DateTime::from_timestamp(t.timestamp(), 0).map(|d| d.to_rfc3339()).unwrap_or_default();
+    let mut names = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for n in &san.value.general_names {
+            match n {
+                GeneralName::DNSName(d) => names.push(d.to_string()),
+                GeneralName::IPAddress(ip) => names.push(match ip.len() {
+                    4 => std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
+                    16 => <[u8; 16]>::try_from(*ip).map(|b| std::net::Ipv6Addr::from(b).to_string()).unwrap_or_default(),
+                    _ => String::new(),
+                }),
+                GeneralName::OtherName(oid, _) if oid.to_id_string() == "1.3.6.1.5.5.7.8.5" => names.push("(an XMPP address)".to_string()),
+                _ => {}
+            }
+        }
+    }
+    Some(CertDetails {
+        subject: cert.subject().to_string(),
+        issuer: cert.issuer().to_string(),
+        not_before: time(cert.validity().not_before),
+        not_after: time(cert.validity().not_after),
+        names,
+        self_signed: cert.subject() == cert.issuer(),
+    })
+}
+
+/// What changed between the certificate that was pinned and the one shown now, in words; empty when nothing that is shown did.
+pub fn what_changed(before: &CertDetails, now: &CertDetails) -> Vec<String> {
+    let mut out = Vec::new();
+    if before.issuer != now.issuer {
+        out.push(format!("signed by {} (was {})", now.issuer, before.issuer));
+    }
+    if before.subject != now.subject {
+        out.push(format!("issued to {} (was {})", now.subject, before.subject));
+    }
+    if before.names != now.names {
+        out.push(format!("for {} (was {})", now.names.join(", "), before.names.join(", ")));
+    }
+    if before.not_after != now.not_after {
+        out.push(format!("valid until {} (was {})", now.not_after, before.not_after));
+    }
+    out
+}
+
 pub fn sha256_hex(der: &[u8]) -> String {
     Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -366,6 +431,21 @@ mod tests {
         assert_eq!(normalise_pin(&format!("  {}  ", hex.to_uppercase())).as_deref(), Some(hex.as_str()));
         assert_eq!(normalise_pin("abcd"), None);
         assert_eq!(normalise_pin(&"zz".repeat(32)), None);
+    }
+
+    #[test]
+    fn the_test_servers_certificate_is_read_and_a_change_is_said() {
+        let Ok(pem) = std::fs::read("/1tb/xmpp-test/pki/server.crt") else { return };
+        let der = CertificateDer::from_pem_slice(&pem).expect("PEM");
+        let d = cert_details(der.as_ref()).expect("readable");
+        assert!(d.names.iter().any(|n| n == "localhost"), "{d:?}");
+        assert!(!d.self_signed && d.not_after.starts_with("20"), "{d:?}");
+        let mut other = d.clone();
+        other.issuer = "CN=Somebody Else".into();
+        let said = what_changed(&d, &other);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].contains("Somebody Else"));
+        assert!(cert_details(b"not a certificate").is_none());
     }
 
     #[test]

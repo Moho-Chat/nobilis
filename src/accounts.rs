@@ -638,6 +638,13 @@ pub struct XmppAccountConfig {
     /// When the account last signed in (RFC 3339), for the account's card.
     #[serde(default)]
     pub last_connected: String,
+    /// How it last signed in, in words for the card (`SCRAM-SHA-512-PLUS over SASL2, with a FAST token`).
+    #[serde(default)]
+    pub last_mechanism: String,
+    /// What the pinned certificate was (subject, issuer, validity, names), kept when it is pinned so that a certificate that
+    /// later stops matching can be told apart from it in words.
+    #[serde(default)]
+    pub pin_info: String,
 }
 
 impl XmppAccountConfig {
@@ -1789,6 +1796,7 @@ pub fn irc_account_to_json(a: &IrcAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1830,6 +1838,7 @@ pub fn discord_account_to_json(a: &DiscordAccountConfig, state: &str) -> Account
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1870,6 +1879,7 @@ pub fn sneedchat_account_to_json(a: &SneedChatAccountConfig, state: &str) -> Acc
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1919,6 +1929,7 @@ pub fn kick_account_to_json(a: &KickAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -1967,6 +1978,7 @@ pub fn steam_account_to_json(a: &SteamAccountConfig, state: &str, persona_name: 
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -2010,6 +2022,7 @@ pub fn twitch_account_to_json(a: &TwitchAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: !a.web_token.is_empty(),
         moderation: crate::backend::twitch::auth::has_moderation(&a.scopes),
+        stop_reason: String::new(),
     }
 }
 
@@ -2054,6 +2067,7 @@ pub fn telegram_account_to_json(a: &TelegramAccountConfig, state: &str) -> Accou
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -2096,6 +2110,7 @@ pub fn stoat_account_to_json(a: &StoatAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
@@ -2137,6 +2152,7 @@ pub fn xmpp_account_to_json(a: &XmppAccountConfig, state: &str) -> Account {
         dehydration: false,
         web_session: false,
         moderation: false,
+        stop_reason: if state == "auth_failed" { crate::backend::xmpp::connect::stop_reason(&a.account_id()) } else { String::new() },
     }
 }
 
@@ -2181,6 +2197,7 @@ pub fn matrix_account_to_json(a: &MatrixAccountConfig, state: &str, has_key_back
         dehydration: a.dehydration_enabled,
         web_session: false,
         moderation: false,
+        stop_reason: String::new(),
     }
 }
 
