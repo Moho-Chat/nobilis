@@ -145,6 +145,8 @@ aes = "0.8"
 hmac012 = { version = "0.12", package = "hmac" }
 sha1_010 = { version = "0.10", package = "sha1" }
 stringprep = "0.1"
+hickory-resolver = "0.26"
+idna = "1"
 thiserror = "2"
 x509-parser = { version = "0.17", default-features = false }
 

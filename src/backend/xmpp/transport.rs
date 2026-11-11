@@ -17,7 +17,6 @@
 //! - STARTTLS (RFC 6120) or direct TLS (XEP-0368, ALPN `xmpp-client`), TLS 1.2 or later, and nothing else: there is no
 //!   plaintext mode and no switch that accepts any certificate.
 
-use crate::net::route::TcpOrSocks;
 use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -31,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::BufStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tokio_xmpp::connect::{DnsConfig, ServerConnector};
+use tokio_xmpp::connect::ServerConnector;
 use tokio_xmpp::jid::Jid;
 use tokio_xmpp::parsers::starttls::{self, Request};
 use tokio_xmpp::xmlstream::{initiate_stream, PendingFeaturesRecv, ReadError, StreamHeader, Timeouts, XmppStream, XmppStreamElement};
@@ -245,7 +244,9 @@ pub fn tls_config(settings: &Settings, seen: &SeenSlot) -> Result<Arc<ClientConf
 #[derive(Clone)]
 pub struct Connector {
     pub settings: Settings,
-    tls: Arc<ClientConfig>,
+    /// With ALPN `xmpp-client` (direct TLS, XEP-0368) and without (after STARTTLS).
+    tls_direct: Arc<ClientConfig>,
+    tls_starttls: Arc<ClientConfig>,
     /// Where stream-level elements are queued to be written (client state indication).
     pub tap: Arc<super::tap::Tap>,
 }
@@ -258,29 +259,129 @@ impl std::fmt::Debug for Connector {
 
 impl Connector {
     pub fn new(settings: Settings, seen: &SeenSlot) -> Result<Self> {
-        let tls = tls_config(&settings, seen)?;
-        Ok(Self { settings, tls, tap: Arc::new(super::tap::Tap::default()) })
+        let tls_direct = tls_config(&Settings { direct: true, ..settings.clone() }, seen)?;
+        let tls_starttls = tls_config(&Settings { direct: false, ..settings.clone() }, seen)?;
+        Ok(Self { settings, tls_direct, tls_starttls, tap: Arc::new(super::tap::Tap::default()) })
     }
 
-    /// The TCP connection, through the account's route.
-    async fn tcp(&self, domain: &str) -> Result<TcpOrSocks, Error> {
+    /// Where to try, in order. A named host (or a routed account, whose lookups are the proxy's) is the one place; otherwise
+    /// DNS SRV for both direct TLS and STARTTLS (XEP-0368), and the domain itself when it publishes neither.
+    async fn targets(&self, domain: &str) -> Vec<Target> {
         let s = &self.settings;
-        let default_port = if s.direct { PORT_DIRECT } else { PORT_STARTTLS };
         let router = crate::net::route::router();
-        if !s.host.is_empty() || router.routed(&s.account_id) {
+        let default_port = |direct| if direct { PORT_DIRECT } else { PORT_STARTTLS };
+        if !s.host.is_empty() || s.port != 0 || router.routed(&s.account_id) {
             // Named, or routed: the proxy resolves the name (an onion address cannot be resolved at all), and SRV is not
             // asked, since asking would be a lookup that does not go through the proxy.
-            let host = if s.host.is_empty() { domain } else { s.host.as_str() };
-            let port = if s.port != 0 { s.port } else { default_port };
-            return router.connect(&s.account_id, host, port).await.map_err(|e| Error::Io(io::Error::other(format!("{e:#}"))));
+            let host = if s.host.is_empty() { domain.to_string() } else { s.host.clone() };
+            let port = if s.port != 0 { s.port } else { default_port(s.direct) };
+            return vec![Target { host, port, direct: s.direct }];
         }
-        let dns = if s.direct { DnsConfig::srv_xmpps(domain) } else { DnsConfig::srv_default_client(domain) };
-        Ok(TcpOrSocks::Tcp(dns.resolve().await?))
+        if domain.parse::<std::net::IpAddr>().is_ok() {
+            return vec![Target { host: domain.to_string(), port: default_port(s.direct), direct: s.direct }];
+        }
+        let srv = lookup_srv(domain).await;
+        if !srv.is_empty() {
+            tracing::info!("xmpp[{}]: DNS says {}", s.account_id, srv.iter().map(|t| format!("{}:{}{}", t.host, t.port, if t.direct { " (TLS)" } else { "" })).collect::<Vec<_>>().join(", "));
+            return srv;
+        }
+        // No SRV: the domain itself, the mode the account prefers first.
+        let mut out = vec![Target { host: domain.to_string(), port: default_port(s.direct), direct: s.direct }];
+        if s.direct {
+            out.push(Target { host: domain.to_string(), port: PORT_STARTTLS, direct: false });
+        }
+        out
     }
+}
 
-    async fn tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, stream: S, domain: &str) -> Result<(TlsStream<S>, super::sasl::Bindings), Error> {
-        let name = ServerName::try_from(domain.to_owned()).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
-        let tls = TlsConnector::from(self.tls.clone()).connect(name, stream).await.map_err(Error::Io)?;
+/// One place to try connecting: a host, a port, and whether TLS starts at once there.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub host: String,
+    pub port: u16,
+    pub direct: bool,
+}
+
+/// A record as SRV gives it, for ordering.
+#[derive(Clone, Debug)]
+pub struct SrvRecord {
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub target: String,
+    pub direct: bool,
+}
+
+/// RFC 2782's order: lowest priority first; within a priority, a weighted random draw (a weight of 0 still gets drawn,
+/// last). XEP-0368: direct TLS (`_xmpps-client`) and STARTTLS (`_xmpp-client`) records go in one list, and of the same
+/// priority, direct TLS comes first. A service whose only record has the target "." is not offered at all.
+pub fn order_srv(mut records: Vec<SrvRecord>, mut random: impl FnMut(u32) -> u32) -> Vec<Target> {
+    for direct in [true, false] {
+        let of_kind: Vec<&SrvRecord> = records.iter().filter(|r| r.direct == direct).collect();
+        if of_kind.len() == 1 && (of_kind[0].target == "." || of_kind[0].target.is_empty()) {
+            records.retain(|r| r.direct != direct);
+        }
+    }
+    records.retain(|r| r.target != "." && !r.target.is_empty());
+    records.sort_by_key(|r| (r.priority, !r.direct));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < records.len() {
+        let key = (records[i].priority, records[i].direct);
+        let mut group: Vec<SrvRecord> = records[i..].iter().take_while(|r| (r.priority, r.direct) == key).cloned().collect();
+        i += group.len();
+        while !group.is_empty() {
+            let total: u32 = group.iter().map(|r| r.weight as u32 + 1).sum();
+            let mut pick = random(total);
+            let mut at = 0;
+            for (k, r) in group.iter().enumerate() {
+                let w = r.weight as u32 + 1;
+                if pick < w {
+                    at = k;
+                    break;
+                }
+                pick -= w;
+            }
+            let r = group.remove(at);
+            out.push(Target { host: r.target.trim_end_matches('.').to_string(), port: r.port, direct: r.direct });
+        }
+    }
+    out
+}
+
+/// The SRV records of both XMPP client services for a domain, ordered (see [`order_srv`]). Empty when DNS has none.
+async fn lookup_srv(domain: &str) -> Vec<Target> {
+    use hickory_resolver::proto::rr::RData;
+    let Ok(ascii) = ascii_domain(domain) else { return Vec::new() };
+    let Ok(builder) = hickory_resolver::TokioResolver::builder_tokio() else { return Vec::new() };
+    let Ok(resolver) = builder.build() else { return Vec::new() };
+    let mut records = Vec::new();
+    for (service, direct) in [("_xmpps-client._tcp", true), ("_xmpp-client._tcp", false)] {
+        let Ok(found) = resolver.srv_lookup(format!("{service}.{ascii}.")).await else { continue };
+        for record in found.answers() {
+            if let RData::SRV(srv) = &record.data {
+                records.push(SrvRecord { priority: srv.priority, weight: srv.weight, port: srv.port, target: srv.target.to_ascii(), direct });
+            }
+        }
+    }
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    order_srv(records, |n| rng.gen_range(0..n.max(1)))
+}
+
+/// A domain as DNS and TLS name it: IDNA (UTS 46) to its ASCII form, so `bücher.example` is `xn--bcher-kva.example`.
+pub fn ascii_domain(domain: &str) -> Result<String, Error> {
+    idna::domain_to_ascii(domain.trim_end_matches('.')).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, format!("{domain:?} is not a domain name: {e}"))))
+}
+
+impl Connector {
+
+    /// TLS over `stream`, the certificate checked against `domain` (the account's own domain, whichever host was reached:
+    /// RFC 6125 - a host named by DNS without DNSSEC is not a name to trust).
+    async fn tls<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(&self, stream: S, domain: &str, direct: bool) -> Result<(TlsStream<S>, super::sasl::Bindings), Error> {
+        let name = ServerName::try_from(ascii_domain(domain)?).map_err(|e| Error::Io(io::Error::new(io::ErrorKind::InvalidInput, e)))?;
+        let config = if direct { self.tls_direct.clone() } else { self.tls_starttls.clone() };
+        let tls = TlsConnector::from(config).connect(name, stream).await.map_err(Error::Io)?;
         Ok(bindings_of(tls))
     }
 }
@@ -309,9 +410,27 @@ impl Connector {
         if self.settings.websocket {
             return self.websocket_raw(jid).await;
         }
-        let tcp = self.tcp(domain).await?;
-        if self.settings.direct {
-            let (tls, bindings) = self.tls(tcp, domain).await?;
+        let mut last = Error::Disconnected;
+        for target in self.targets(domain).await {
+            match self.open_at(domain, &target).await {
+                Ok(opened) => {
+                    tracing::info!("xmpp[{}]: reached {}:{} ({})", self.settings.account_id, target.host, target.port, if target.direct { "direct TLS" } else { "STARTTLS" });
+                    return Ok(opened);
+                }
+                Err(e) => {
+                    tracing::info!("xmpp[{}]: {}:{} did not work: {e}", self.settings.account_id, target.host, target.port);
+                    last = e;
+                }
+            }
+        }
+        Err(last)
+    }
+
+    async fn open_at(&self, domain: &str, target: &Target) -> Result<(Box<dyn Raw>, super::sasl::Bindings), Error> {
+        let host = ascii_domain(&target.host).unwrap_or_else(|_| target.host.clone());
+        let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, target.port).await.map_err(|e| Error::Io(io::Error::other(format!("{e:#}"))))?;
+        if target.direct {
+            let (tls, bindings) = self.tls(tcp, domain, true).await?;
             return Ok((Box::new(BufStream::new(tls)), bindings));
         }
         // STARTTLS: open the stream in the clear only to be offered TLS and to ask for it; nothing is sent that a
@@ -333,7 +452,7 @@ impl Connector {
             }
         }
         let raw = plain.into_inner().into_inner();
-        let (tls, bindings) = self.tls(raw, domain).await?;
+        let (tls, bindings) = self.tls(raw, domain, false).await?;
         Ok((Box::new(BufStream::new(tls)), bindings))
     }
 }
@@ -402,7 +521,7 @@ impl Connector {
         let port = url.port().unwrap_or(443);
         let tcp = crate::net::route::router().connect(&self.settings.account_id, &host, port).await.map_err(|e| io_err(format!("{e:#}")))?;
         // The TLS here may end at a proxy in front of the XMPP server, which then cannot see it: no channel binding is offered.
-        let (tls, _) = self.tls(tcp, &host).await?;
+        let (tls, _) = self.tls(tcp, &host, false).await?;
         let bindings = super::sasl::Bindings::default();
         let mut request = address.as_str().into_client_request().map_err(|e| io_err(e.to_string()))?;
         request.headers_mut().insert("Sec-WebSocket-Protocol", "xmpp".parse().expect("a header value"));
@@ -420,6 +539,38 @@ mod tests {
         let xml = "<XRD xmlns='http://docs.oasis-open.org/ns/xri/xrd-1.0'><Link rel=\"urn:xmpp:alt-connections:xbosh\" href=\"https://e.org/bosh\"/><Link rel='urn:xmpp:alt-connections:websocket' href='wss://e.org:5443/ws'/></XRD>";
         assert_eq!(websocket_in_xml(xml).as_deref(), Some("wss://e.org:5443/ws"));
         assert_eq!(websocket_in_xml("<XRD/>"), None);
+    }
+
+    fn rec(priority: u16, weight: u16, target: &str, direct: bool) -> SrvRecord {
+        SrvRecord { priority, weight, port: if direct { 5223 } else { 5222 }, target: target.into(), direct }
+    }
+
+    #[test]
+    fn srv_records_are_tried_by_priority_with_direct_tls_first_on_a_tie() {
+        let order = order_srv(vec![rec(20, 0, "b.example.", false), rec(10, 0, "a.example.", false), rec(10, 0, "a.example.", true), rec(5, 0, "first.example.", false)], |_| 0);
+        let hosts: Vec<(String, bool)> = order.iter().map(|t| (t.host.clone(), t.direct)).collect();
+        assert_eq!(hosts, vec![("first.example".into(), false), ("a.example".into(), true), ("a.example".into(), false), ("b.example".into(), false)]);
+    }
+
+    #[test]
+    fn weight_decides_within_a_priority() {
+        let records = vec![rec(10, 0, "light.", false), rec(10, 100, "heavy.", false)];
+        // The draw lands in the heavy record's share (1 + 101 = 102; 50 is past the light one's 1).
+        assert_eq!(order_srv(records.clone(), |_| 50)[0].host, "heavy");
+        assert_eq!(order_srv(records, |_| 0)[0].host, "light");
+    }
+
+    #[test]
+    fn a_dot_target_says_the_service_is_not_offered() {
+        let order = order_srv(vec![rec(0, 0, ".", true), rec(10, 0, "xmpp.example.", false)], |_| 0);
+        assert_eq!(order, vec![Target { host: "xmpp.example".into(), port: 5222, direct: false }]);
+    }
+
+    #[test]
+    fn a_domain_is_given_to_dns_and_tls_in_its_ascii_form() {
+        assert_eq!(ascii_domain("bücher.example").unwrap(), "xn--bcher-kva.example");
+        assert_eq!(ascii_domain("Example.ORG.").unwrap(), "example.org");
+        assert!(ascii_domain("a..b").is_err() || ascii_domain("a..b").unwrap() != "a.b");
     }
 
     #[test]

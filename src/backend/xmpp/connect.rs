@@ -94,10 +94,15 @@ pub fn new_resource() -> String {
 /// A JID as typed, as the daemon keeps it: the bare form, prepared (case, Unicode normalisation, IDNA).
 pub fn normalise_jid(input: &str) -> Result<BareJid, String> {
     let jid = Jid::new(input.trim()).map_err(|e| format!("{input:?} is not an XMPP address: {e}"))?;
-    if jid.node().is_none() {
+    let Some(node) = jid.node() else {
         return Err(format!("{input:?} has no user part: an account is written user@server"));
-    }
-    Ok(jid.to_bare())
+    };
+    // RFC 7622: an internationalised domain is compared in its Unicode form (A-labels become U-labels), and a trailing dot
+    // is not part of it - so an address typed as `x@xn--bcher-kva.example` or `x@example.org.` is the account it names.
+    let domain = jid.domain().as_str().trim_end_matches('.');
+    let (unicode, checked) = idna::domain_to_unicode(domain);
+    let domain = if checked.is_ok() { unicode } else { domain.to_string() };
+    BareJid::new(&format!("{}@{domain}", node.as_str())).map_err(|e| format!("{input:?} is not an XMPP address: {e}"))
 }
 
 /// What a failed attempt means. `None` is "try again".
@@ -520,6 +525,14 @@ mod tests {
         assert!(normalise_jid("example.org").is_err(), "a domain alone is not an account");
         assert!(normalise_jid("").is_err());
         assert!(normalise_jid("a b@example.org").is_err());
+    }
+
+    #[test]
+    fn an_internationalised_domain_is_kept_in_one_form_however_it_was_typed() {
+        // RFC 7622: A-labels become U-labels, so the account typed either way is the same account.
+        assert_eq!(normalise_jid("idn@xn--bcher-kva.example").unwrap().as_str(), "idn@bücher.example");
+        assert_eq!(normalise_jid("idn@BÜCHER.example").unwrap().as_str(), "idn@bücher.example");
+        assert_eq!(normalise_jid("alice@example.org.").unwrap().as_str(), "alice@example.org", "a trailing dot is not part of the domain");
     }
 
     #[test]
