@@ -5114,7 +5114,8 @@ pub async fn dispatch(
                         if let Err(e) = backend::xmpp::muc::join(state, &handle, &jid, None, invite.password.as_deref()).await {
                             return (None, Some(e));
                         }
-                        let _ = backend::xmpp::bookmarks::save(&handle, &backend::xmpp::bookmarks::Bookmark { room: room.to_string(), autojoin: true, password: invite.password, ..Default::default() }).await;
+                        let before = backend::xmpp::bookmarks::fetch(&handle, room).await.unwrap_or_default();
+                        let _ = backend::xmpp::bookmarks::save(&handle, &backend::xmpp::bookmarks::Bookmark { room: room.to_string(), autojoin: true, password: invite.password.or(before.password), name: before.name, nick: before.nick, extensions: before.extensions }).await;
                     }
                     (Some(ok_node()), None)
                 }
@@ -5131,7 +5132,9 @@ pub async fn dispatch(
                     }
                     let nick_used = handle.session().rooms.get(&jid).map(|r| r.nick.clone());
                     if p_bool(params, "bookmark", true) {
-                        let b = backend::xmpp::bookmarks::Bookmark { room: jid.to_string(), autojoin: true, nick: nick_used, password: password.map(str::to_string), ..Default::default() };
+                        // What is already bookmarked for the room (its name, what other clients keep with it) is kept.
+                        let before = backend::xmpp::bookmarks::fetch(&handle, jid.as_str()).await.unwrap_or_default();
+                        let b = backend::xmpp::bookmarks::Bookmark { room: jid.to_string(), autojoin: true, nick: nick_used.or(before.nick), password: password.map(str::to_string).or(before.password), name: before.name, extensions: before.extensions };
                         if let Err(e) = backend::xmpp::bookmarks::save(&handle, &b).await {
                             tracing::info!("xmpp: the room was joined but not bookmarked: {e}");
                         }
