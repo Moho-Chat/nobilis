@@ -247,8 +247,14 @@ async fn run(state: &AppState, account_id: &str) {
                             async move { super::init::run(&state, &handle).await }
                         });
                     }
-                    Event::Stream(StreamEvent::Suspended) => state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None),
-                    Event::Stream(StreamEvent::Resumed) => state.runtime.set_conn_state(state, account_id, ConnState::Connected, None),
+                    Event::Stream(StreamEvent::Suspended) => {
+                        tracing::info!("xmpp[{account_id}]: the connection dropped; the session is kept for resuming");
+                        state.runtime.set_conn_state(state, account_id, ConnState::Connecting, None)
+                    }
+                    Event::Stream(StreamEvent::Resumed) => {
+                        tracing::info!("xmpp[{account_id}]: the session was resumed, nothing lost");
+                        state.runtime.set_conn_state(state, account_id, ConnState::Connected, None)
+                    }
                     Event::Stanza(stanza) => {
                         if let Some(handle) = &current {
                             super::dispatch::stanza(state, handle, stanza).await;

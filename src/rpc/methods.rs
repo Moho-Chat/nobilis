@@ -55,6 +55,13 @@ async fn apply_ignore(state: &AppState, account_id: &str, target: &str, ignored:
         }
         // Stoat has a real block too, told as well as recorded for the same reason: a blocked person's messages in a
         // server still arrive, and this client has to stop showing them.
+        // XMPP keeps the list on the account (XEP-0191): told to the server, which stops delivering what they send.
+        "xmpp" => {
+            let handle = state.runtime.xmpp_handle(account_id).ok_or_else(|| anyhow::anyhow!("that XMPP account is not connected"))?;
+            backend::xmpp::blocking::set(&handle, target, ignored).await.map_err(|e| anyhow::anyhow!(e))?;
+            state.ignores.set(account_id, target, ignored);
+            Ok("account")
+        }
         "stoat" => {
             let handle = state.runtime.stoat_handle(account_id).ok_or_else(|| anyhow::anyhow!("that Stoat account is not connected"))?;
             backend::stoat::people::block(state, &handle, target, ignored).await?;
@@ -5211,6 +5218,106 @@ pub async fn dispatch(
                 }
                 Ok(false) => (None, Some("no such account".to_string())),
                 Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Making an account on a server: what it asks for, then the answers. A captcha is refused in words. Made, it is signed in as.
+        "xmppRegistrationForm" | "xmppRegister" => {
+            let address = p_str(params, "jid", "").trim().to_string();
+            let domain = address.rsplit('@').next().unwrap_or("").to_string();
+            if domain.is_empty() {
+                return (None, Some("the server's address is needed".to_string()));
+            }
+            let routed_key = format!("xmpp-registration:{domain}");
+            crate::net::route::router().mark(&routed_key, params.get("useTor").and_then(|v| v.as_bool()).unwrap_or(false));
+            let settings = backend::xmpp::transport::Settings {
+                account_id: routed_key,
+                host: p_str(params, "host", "").trim().to_string(),
+                port: params.get("port").and_then(|v| v.as_u64()).and_then(|v| u16::try_from(v).ok()).unwrap_or(0),
+                direct: p_str(params, "security", "starttls") == "direct",
+                ca_pem: p_str(params, "caPem", "").to_string(),
+                pin_sha256: backend::xmpp::transport::normalise_pin(p_str(params, "pinSha256", "")).unwrap_or_default(),
+            };
+            let registration = match backend::xmpp::register::form(settings.clone(), &domain).await {
+                Ok(r) => r,
+                Err(e) => return (None, Some(e)),
+            };
+            if method == "xmppRegistrationForm" {
+                return (Some(serde_json::json!(registration)), None);
+            }
+            let Some(form) = registration.form else { return (None, Some("this server asks for its own page to be used".to_string())) };
+            let answers = params.get("answers").cloned().unwrap_or(serde_json::Value::Null);
+            if let Err(e) = backend::xmpp::register::submit(settings.clone(), &domain, &form, &answers).await {
+                return (None, Some(e));
+            }
+            let (Some(user), Some(password)) = (answers.get("username").and_then(|v| v.as_str()), answers.get("password").and_then(|v| v.as_str())) else {
+                return (Some(serde_json::json!({ "registered": true })), None);
+            };
+            let Ok(jid) = backend::xmpp::connect::normalise_jid(&format!("{user}@{domain}")) else { return (Some(serde_json::json!({ "registered": true })), None) };
+            let config = crate::accounts::XmppAccountConfig {
+                jid: jid.to_string(),
+                password: password.to_string(),
+                host: settings.host,
+                port: settings.port,
+                security: if settings.direct { "direct".into() } else { "starttls".into() },
+                ca_pem: settings.ca_pem,
+                pin_sha256: settings.pin_sha256,
+                ..Default::default()
+            };
+            match state.accounts.add_xmpp(config) {
+                Ok(config) => {
+                    let account_id = config.account_id();
+                    backend::xmpp::spawn(state.clone(), config);
+                    (Some(serde_json::json!({ "registered": true, "accountId": account_id })), None)
+                }
+                Err(e) => (None, Some(format!("{e:#}"))),
+            }
+        }
+
+        // Things an XMPP account does on the server it is on: its password, its end, what the server says it is, the people it
+        // has blocked, and the commands that things offer (a server's own administration, a gateway's menu).
+        "xmppChangePassword" | "xmppDeleteAccount" | "xmppServerInfo" | "xmppBlocklist" | "xmppBlock" | "xmppCommands" | "xmppCommand" => {
+            let Some(account_id) = p_str_opt(params, "accountId") else { return (None, Some(format!("{method} requires \"accountId\""))) };
+            let Some(handle) = state.runtime.xmpp_handle(account_id) else { return (None, Some("that XMPP account is not connected".to_string())) };
+            let result: Result<serde_json::Value, String> = match method {
+                "xmppChangePassword" => {
+                    let new = p_str(params, "password", "").to_string();
+                    match backend::xmpp::account::change_password(&handle, &new).await {
+                        Ok(()) => {
+                            // Kept, so the next connection signs in with it.
+                            let kept = new.clone();
+                            let _ = state.accounts.mutate_xmpp(account_id, move |a| a.password = kept);
+                            Ok(serde_json::json!({}))
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                "xmppDeleteAccount" => backend::xmpp::account::delete(&handle).await.map(|_| serde_json::json!({})),
+                "xmppServerInfo" => backend::xmpp::account::server_info(&handle).await,
+                "xmppBlocklist" => Ok(serde_json::json!({ "blocked": handle.session().blocked.iter().cloned().collect::<Vec<_>>() })),
+                "xmppBlock" => match p_str_opt(params, "jid") {
+                    Some(j) => backend::xmpp::blocking::set(&handle, j.trim(), p_bool(params, "block", true)).await.map(|_| serde_json::json!({})),
+                    None => Err("xmppBlock requires \"jid\"".to_string()),
+                },
+                _ => {
+                    // The address whose commands these are: the account's server by default.
+                    let to = p_str_opt(params, "to").filter(|t| !t.is_empty()).map(str::to_string).unwrap_or_else(|| handle.own().domain().as_str().to_string());
+                    match to.parse::<tokio_xmpp::jid::Jid>() {
+                        Err(_) => Err(format!("{to:?} is not an address")),
+                        Ok(to) if method == "xmppCommands" => backend::xmpp::adhoc::list(&handle, &to).await.map(|c| serde_json::json!({ "commands": c })),
+                        Ok(to) => {
+                            let node = p_str(params, "node", "");
+                            let session = p_str(params, "sessionId", "");
+                            let action = p_str(params, "action", "execute");
+                            let form: Option<backend::xmpp::dataform::Form> = params.get("form").and_then(|f| serde_json::from_value(f.clone()).ok());
+                            backend::xmpp::adhoc::run(&handle, &to, node, session, action, form.as_ref(), params.get("answers").unwrap_or(&serde_json::Value::Null)).await.map(|s| serde_json::json!(s))
+                        }
+                    }
+                }
+            };
+            match result {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
             }
         }
 

@@ -14,6 +14,7 @@ pub async fn run(state: &AppState, handle: &Handle) {
     if handle.request(None, true, xml::empty("enable", ns::CARBONS)).await.is_err() {
         tracing::info!("xmpp[{}]: the server does not do carbons", handle.account_id);
     }
+    super::blocking::load(handle).await;
     roster::fetch(state, handle).await;
     let (show, status) = {
         let s = handle.session();

@@ -70,6 +70,10 @@ fn retag(e: &Element) -> Element {
 
 /// A message that came in on the stream.
 pub async fn handle(state: &AppState, handle: &Handle, message: Message) {
+    // Somebody this account has blocked: the server should not deliver it, and if it did, it is not shown.
+    if message.from.as_ref().is_some_and(|f| super::blocking::is_blocked(handle, f)) {
+        return;
+    }
     if message.type_ == MessageType::Error {
         return failed(state, handle, &message);
     }

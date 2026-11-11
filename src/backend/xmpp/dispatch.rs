@@ -45,6 +45,11 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
                     handle.send(Stanza::Iq(reply)).await;
                 }
             }
+            // A change to the block list, made here or by another client of the account.
+            Iq::Set { from, id, payload, .. } if (payload.is("block", super::blocking::BLOCKING) || payload.is("unblock", super::blocking::BLOCKING)) && from.as_ref().is_none_or(|f| f.to_bare() == handle.own()) => {
+                super::blocking::pushed(handle, payload);
+                handle.send(Stanza::Iq(Iq::Result { from: None, to: None, id: id.clone(), payload: None })).await;
+            }
             _ => {
                 if let Some(reply) = iq::answer(&request) {
                     handle.send(Stanza::Iq(reply)).await;

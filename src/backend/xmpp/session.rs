@@ -95,6 +95,8 @@ pub struct Session {
     /// beats `vcard`, which is only asked for when PEP has not said).
     pub avatars: HashMap<BareJid, String>,
     pub avatar_source: HashMap<BareJid, String>,
+    /// Addresses this account has blocked (XEP-0191).
+    pub blocked: HashSet<String>,
 }
 
 /// Somebody asked this account into a room.
