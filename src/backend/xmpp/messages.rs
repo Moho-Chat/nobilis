@@ -276,8 +276,21 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, p: Parsed, 
         return;
     }
 
-    let text = readable(&p, &raw);
-    if text.trim().is_empty() {
+    let mut text = readable(&p, &raw);
+    // Files the sender shared: the stated description when there is one, else the address they sent as a link (XEP-0066).
+    let mut attachments: Vec<crate::model::Attachment> = p.files.iter().map(|f| super::media::attachment(&handle.account_id, f)).collect();
+    for (url, desc) in &p.oob {
+        if url.starts_with("https://") && !attachments.iter().any(|a| a.url.as_deref() == Some(url.as_str())) {
+            let f = incoming::FileRef { url: url.clone(), description: desc.clone(), name: url.rsplit('/').next().map(str::to_string), ..Default::default() };
+            attachments.push(super::media::attachment(&handle.account_id, &f));
+        }
+    }
+    // The address that was the whole of the message is not shown twice.
+    let shared: Vec<&str> = attachments.iter().filter_map(|a| a.url.as_deref()).collect();
+    if shared.iter().any(|u| text.trim() == *u) {
+        text = p.files.first().and_then(|f| f.description.clone()).or_else(|| p.oob.first().and_then(|(_, d)| d.clone())).unwrap_or_default();
+    }
+    if text.trim().is_empty() && attachments.is_empty() {
         return;
     }
     let reply = p.reply.as_ref().map(|r| {
@@ -288,7 +301,7 @@ pub async fn deliver(state: &AppState, handle: &Handle, conv: &Conv, p: Parsed, 
     if replay {
         state.runtime.set_replaying(&buffer.id, true);
     }
-    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, "chat", reply, Some(local.clone()), conv.mentioned, None, Vec::new(), Vec::new(), Some(conv.sender_id.clone()), sent_at, None, None);
+    let recorded = state.runtime.record_message_at(state, &handle.account_id, &buffer.name, conv.kind, &conv.from_name, &text, false, "chat", reply, Some(local.clone()), conv.mentioned, None, Vec::new(), attachments, Some(conv.sender_id.clone()), sent_at, None, None);
     if replay {
         state.runtime.set_replaying(&buffer.id, false);
     }

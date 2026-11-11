@@ -78,12 +78,57 @@ pub struct Parsed {
     pub fallbacks: Vec<Fallback>,
     /// Links the sender attached as files (XEP-0066), with their descriptions.
     pub oob: Vec<(String, Option<String>)>,
+    /// Files shared with their description (XEP-0447 with XEP-0446): what they are, how big, where from.
+    pub files: Vec<FileRef>,
     /// The sender says this is not to be kept (XEP-0334 `no-store` / `no-permanent-store`).
     pub no_store: bool,
     /// Something is encrypted that this client cannot read (XEP-0380 names what).
     pub encrypted: Option<String>,
     /// The message carries a body that is only there for clients that cannot show what it points at.
     pub styling_disabled: bool,
+}
+
+/// A file somebody shared: where it is and what it says it is.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileRef {
+    pub url: String,
+    pub name: Option<String>,
+    pub media_type: Option<String>,
+    pub size: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub description: Option<String>,
+    /// The hash the sender gave: algorithm and base64 digest.
+    pub hash: Option<(String, String)>,
+    /// How long, in seconds, for audio and video.
+    pub duration: Option<f64>,
+}
+
+/// The file described by a `<file-sharing/>` (XEP-0447), if it names a source we can fetch.
+fn read_sharing(e: &Element) -> Option<FileRef> {
+    let file = xml_child(e, "file", ns::FILE_METADATA)?;
+    let text = |name: &str| file.children().find(|c| c.name() == name).map(|c| c.text()).filter(|t| !t.is_empty());
+    let dims = file.children().find(|c| c.name() == "dimensions");
+    let url = xml_child(e, "sources", ns::SFS)
+        .and_then(|s| s.children().find(|c| c.is("url-data", ns::URL_DATA)))
+        .and_then(|u| u.attr("target"))?
+        .to_string();
+    let hash = file.children().find(|c| c.is("hash", ns::HASHES)).and_then(|h| Some((h.attr("algo")?.to_string(), h.text())));
+    Some(FileRef {
+        url,
+        name: text("name"),
+        media_type: text("media-type"),
+        size: text("size").and_then(|s| s.parse().ok()),
+        width: dims.and_then(|d| d.attr("width")).and_then(|v| v.parse().ok()),
+        height: dims.and_then(|d| d.attr("height")).and_then(|v| v.parse().ok()),
+        description: text("desc"),
+        hash,
+        duration: text("length").and_then(|s| s.parse::<f64>().ok()).map(|ms| ms / 1000.0),
+    })
+}
+
+fn xml_child<'a>(e: &'a Element, name: &str, ns: &str) -> Option<&'a Element> {
+    e.children().find(|c| c.is(name, ns))
 }
 
 /// Reads one message.
@@ -168,6 +213,11 @@ fn read_payload(p: &mut Parsed, e: &Element) {
                 if let (Some(start), Some(end)) = (start, end) {
                     p.fallbacks.push(Fallback { for_ns: for_ns.clone(), start, end });
                 }
+            }
+        }
+        ("file-sharing", ns::SFS) => {
+            if let Some(f) = read_sharing(e) {
+                p.files.push(f);
             }
         }
         ("x", ns::OOB) => {
@@ -305,5 +355,27 @@ mod tests {
         assert_eq!(p.encrypted.as_deref(), Some("OMEMO"));
         let bare = parse(&msg(&format!("{OPEN}<encrypted xmlns='eu.siacs.conversations.axolotl'><header sid='1'/></encrypted></message>")));
         assert_eq!(bare.encrypted.as_deref(), Some("OMEMO"));
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn a_shared_file_is_read_with_what_the_sender_says_about_it() {
+        let xml = "<message xmlns='jabber:client' from='bob@example.org/x' type='chat'><body>https://up.example.org/a/cat.png</body><file-sharing xmlns='urn:xmpp:sfs:0' disposition='inline'><file xmlns='urn:xmpp:file:metadata:0'><media-type>image/png</media-type><name>cat.png</name><size>1234</size><dimensions width='640' height='480'/><desc>a cat</desc><hash xmlns='urn:xmpp:hashes:2' algo='sha-256'>AAEC</hash></file><sources><url-data xmlns='http://jabber.org/protocol/url-data' target='https://up.example.org/a/cat.png'/></sources></file-sharing></message>";
+        let p = parse(&Message::try_from(Element::from_str(xml).unwrap()).unwrap());
+        assert_eq!(p.files.len(), 1);
+        let f = &p.files[0];
+        assert_eq!((f.url.as_str(), f.name.as_deref(), f.media_type.as_deref(), f.size, f.width, f.height), ("https://up.example.org/a/cat.png", Some("cat.png"), Some("image/png"), Some(1234), Some(640), Some(480)));
+        assert_eq!((f.description.as_deref(), f.hash.clone()), (Some("a cat"), Some(("sha-256".to_string(), "AAEC".to_string()))));
+    }
+
+    #[test]
+    fn a_file_with_no_source_we_can_read_is_not_a_file() {
+        let xml = "<message xmlns='jabber:client' type='chat'><file-sharing xmlns='urn:xmpp:sfs:0'><file xmlns='urn:xmpp:file:metadata:0'><name>x</name></file><sources><jingle-ibb xmlns='urn:xmpp:jingle:transports:ibb:1' sid='s'/></sources></file-sharing></message>";
+        assert!(parse(&Message::try_from(Element::from_str(xml).unwrap()).unwrap()).files.is_empty());
     }
 }

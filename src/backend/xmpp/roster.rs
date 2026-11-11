@@ -133,7 +133,7 @@ fn entry(handle: &Handle, jid: &BareJid) -> Value {
         "activity": text.map(|t| json!({ "kind": "custom", "text": t })).unwrap_or(Value::Null),
         "bot": false,
         "relationship": s.roster.get(jid).map(|c| c.subscription.clone()).unwrap_or_default(),
-        "avatarUrl": Value::Null,
+        "avatarUrl": s.avatars.get(jid).cloned().map(Value::String).unwrap_or(Value::Null),
         "roles": [],
     })
 }
@@ -168,6 +168,11 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
         PresenceType::None | PresenceType::Unavailable => {
             if bare == handle.own() {
                 return;
+            }
+            if let Some(x) = p.payloads.iter().find(|e| e.is("x", ns::VCARD_UPDATE)) {
+                let (s, h, b) = (state.clone(), handle.clone(), bare.clone());
+                let x = x.clone();
+                tokio::spawn(async move { super::avatars::presence_hash(&s, &h, &b, &x).await });
             }
             let resource = from.resource().map(|r| r.to_string()).unwrap_or_default();
             {

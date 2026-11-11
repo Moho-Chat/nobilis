@@ -12,8 +12,17 @@ pub async fn stanza(state: &AppState, handle: &Handle, stanza: Stanza) {
         Stanza::Message(m) => {
             // A change another client made to the bookmarks.
             if let Some(event) = m.payloads.iter().find(|p| p.is("event", ns::PUBSUB_EVENT)) {
-                if m.from.as_ref().is_some_and(|f| f.to_bare() == handle.own()) {
-                    super::bookmarks::notified(state, handle, event).await;
+                let from = m.from.as_ref().map(|f| f.to_bare());
+                // Each of these asks the server something, and the answer is read by this very task: so they are done on
+                // tasks of their own, never waited for here.
+                if from.as_ref() == Some(&handle.own()) {
+                    let (s, h, e) = (state.clone(), handle.clone(), event.clone());
+                    tokio::spawn(async move { super::bookmarks::notified(&s, &h, &e).await });
+                }
+                if let (Some(from), Some(items)) = (from, event.children().find(|c| c.name() == "items" && c.attr("node") == Some(ns::AVATAR_METADATA))) {
+                    handle.session().avatar_source.insert(from.clone(), "pep".into());
+                    let (s, h, items) = (state.clone(), handle.clone(), items.clone());
+                    tokio::spawn(async move { super::avatars::metadata_event(&s, &h, &from, &items).await });
                 }
                 return;
             }

@@ -89,6 +89,12 @@ pub struct Session {
     pub room_ids: HashMap<String, String>,
     /// Invitations to rooms that have not been answered.
     pub room_invites: Vec<RoomInvite>,
+    /// The server's file upload service (XEP-0363), once found, and the largest file it takes.
+    pub upload: Option<(Jid, Option<u64>)>,
+    /// The picture kept for each person, as the `file://` address the window loads, and where it was learned of (`pep`
+    /// beats `vcard`, which is only asked for when PEP has not said).
+    pub avatars: HashMap<BareJid, String>,
+    pub avatar_source: HashMap<BareJid, String>,
 }
 
 /// Somebody asked this account into a room.

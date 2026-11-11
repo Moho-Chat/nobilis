@@ -318,7 +318,10 @@ pub async fn handle_presence(state: &AppState, handle: &Handle, p: &Presence) {
             // can change from the room's settings afterwards.
             let form = Element::builder("x", ns::DATA).at("type", "submit").build();
             let query = Element::builder("query", MUC_OWNER).append(form).build();
-            let _ = handle.request(Some(Jid::from(room.clone())), true, query).await;
+            let (h, to) = (handle.clone(), Jid::from(room.clone()));
+            tokio::spawn(async move {
+                let _ = h.request(Some(to), true, query).await;
+            });
             card(state, handle, &buffer, "system", "You created this room");
         }
         let h = handle.clone();

@@ -100,6 +100,76 @@ pub async fn send(state: &AppState, buffer: &Buffer, body: &str, reply_to: Optio
     Ok(())
 }
 
+/// Sends files: each goes to the server's upload service and is then sent as a message holding its address. The caption, if
+/// there is one, is a message of its own before them, as the other clients do it.
+pub async fn send_files(state: &AppState, buffer: &Buffer, caption: &str, files: &[(String, bool)], reply_to: Option<&str>, progress: Option<&crate::upload::Progress>) -> Result<(), String> {
+    if files.is_empty() {
+        return send(state, buffer, caption, reply_to.map(str::to_string)).await;
+    }
+    let (handle, jid) = target(state, buffer)?;
+    let (service, most) = super::upload::service(&handle).await?;
+    let ca = state.accounts.get_xmpp(&buffer.account_id).map(|c| c.ca_pem).unwrap_or_default();
+    let total: u64 = files.iter().filter_map(|(p, _)| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+    if let Some(p) = progress {
+        p.at(crate::upload::Phase::Preparing, total as usize, "XMPP");
+    }
+    for (path, _) in files {
+        let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        if most.is_some_and(|m| size > m) {
+            return Err(format!("{} is {} MB and this server takes files of at most {} MB", path.rsplit('/').next().unwrap_or(path), size / 1_000_000, most.unwrap_or(0) / 1_000_000));
+        }
+    }
+    if !caption.trim().is_empty() {
+        send(state, buffer, caption, reply_to.map(str::to_string)).await?;
+    }
+    let mut done = 0u64;
+    for (path, _) in files {
+        let size = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?.len();
+        let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".to_string());
+        let content_type = super::upload::content_type_of(&name);
+        if let Some(p) = progress {
+            p.sent(done, total, "XMPP");
+        }
+        let slot = super::upload::request_slot(&handle, &service, &name, size, content_type).await?;
+        super::upload::put(&buffer.account_id, &ca, &slot, path, content_type, size).await?;
+        done += size;
+        let dims = if content_type.starts_with("image/") { imagesize::size(path).ok().map(|d| (d.width as u32, d.height as u32)) } else { None };
+        let id = xml::new_id();
+        let mut m = chat(&jid, &id, in_room(buffer));
+        m.bodies.insert(Default::default(), slot.get.clone());
+        m.payloads.extend(super::upload::file_payloads(&slot.get, &name, content_type, size, dims, None));
+        if !in_room(buffer) {
+            m.payloads.push(xml::empty("request", ns::RECEIPTS));
+        }
+        m.payloads.push(xml::empty("markable", ns::MARKERS));
+        if !in_room(buffer) {
+            handle.session().sent.insert(id.clone());
+            let own = handle.own().to_string();
+            let attachment = crate::model::Attachment {
+                kind: super::media::kind_of(Some(content_type), Some(&name)).to_string(),
+                mimetype: Some(content_type.to_string()),
+                filename: Some(name.clone()),
+                size: Some(size),
+                width: dims.map(|d| d.0),
+                height: dims.map(|d| d.1),
+                blurhash: None,
+                duration_secs: None,
+                waveform: None,
+                voice: false,
+                path: Some(format!("file://{path}")),
+                thumbnail_path: None,
+                url: Some(slot.get.clone()),
+            };
+            state.runtime.record_message_at(state, &buffer.account_id, &buffer.name, "dm", &own, "", false, "chat", None, Some(id), false, None, Vec::new(), vec![attachment], Some(own.clone()), None, None, None);
+        }
+        handle.send_message(m).await;
+    }
+    if let Some(p) = progress {
+        p.at(crate::upload::Phase::Waiting, total as usize, "XMPP");
+    }
+    Ok(())
+}
+
 /// Changes the text of a message of this account's (XEP-0308).
 pub async fn edit(state: &AppState, buffer: &Buffer, msg_id: &str, body: &str) -> Result<(), String> {
     let (handle, jid) = target(state, buffer)?;
